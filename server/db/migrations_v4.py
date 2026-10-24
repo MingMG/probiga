@@ -32,6 +32,12 @@ _MYSQL8_BINARY_REGEXP_RE = re.compile(
     r"(?P<negated>NOT\s+)?REGEXP\b",
     flags=re.IGNORECASE,
 )
+_MYSQL8_CONVERT_REGEXP_RE = re.compile(
+    r"\bconvert\((?P<operand>[a-z_][a-z0-9_]*(?:\.[a-z_][a-z0-9_]*)?)"
+    r"\s+using\s+utf8mb4\)\s+collate\s+utf8mb4_bin\s+"
+    r"(?P<negated>not\s+)?regexp\b",
+    flags=re.IGNORECASE,
+)
 
 
 def _uses_mysql8_icu_regexp(connection: Connection) -> bool:
@@ -2316,9 +2322,49 @@ def _claim_token_registry_index_signature(
     )
 
 
-def _normalize_trigger_body(value: Any) -> str:
+def normalize_v4_trigger_body(value: Any) -> str:
+    """Canonicalize V4 trigger bodies across native and ICU REGEXP forms."""
+
     normalized = str(value or "").strip().rstrip(";").replace("`", "")
-    return " ".join(normalized.casefold().split())
+    normalized = " ".join(normalized.casefold().split())
+    return _MYSQL8_CONVERT_REGEXP_RE.sub(
+        lambda match: (
+            f"binary {match.group('operand')} "
+            f"{match.group('negated') or ''}regexp"
+        ),
+        normalized,
+    )
+
+
+def _normalize_trigger_body(value: Any) -> str:
+    return normalize_v4_trigger_body(value)
+
+
+def optional_v4_trigger_statements(
+    connection: Connection,
+) -> tuple[str, ...]:
+    """Return the frozen V4 trigger DDL rendered for this MySQL session."""
+
+    statements: list[str] = []
+    names: set[str] = set()
+    for migration in MIGRATIONS:
+        for raw in tuple(migration["statements"]):
+            statement = str(raw).strip()
+            matched = re.match(
+                r"CREATE\s+TRIGGER\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+                statement,
+                flags=re.IGNORECASE,
+            )
+            if matched is None:
+                continue
+            name = matched.group(1)
+            if name in names:
+                raise RuntimeError(f"duplicate V4 trigger source: {name}")
+            names.add(name)
+            statements.append(
+                _mysql_regexp_compatible_statement(connection, statement)
+            )
+    return tuple(statements)
 
 
 def _normalize_sql_mode(value: Any) -> tuple[str, ...]:
@@ -4509,6 +4555,51 @@ def _run_v4_migrations_unlocked(
     return results
 
 
+def attest_applied_v4_migrations(
+    engine: Engine,
+) -> tuple[V4MigrationResult, ...]:
+    """Validate the applied V4 ledger and non-trigger table contracts read-only."""
+
+    if not _mysql_dialect(engine):
+        raise RuntimeError("V4 migration attestation requires MySQL or MariaDB")
+    with engine.connect() as connection:
+        if not _migration_table_exists(engine, connection=connection):
+            raise RuntimeError("V4 migration ledger is missing")
+        results: list[V4MigrationResult] = []
+        for migration in MIGRATIONS:
+            version = str(migration["version"])
+            statements = tuple(migration["statements"])
+            checksum = _checksum(statements)
+            applied = _applied_migration_record(
+                engine,
+                version,
+                connection=connection,
+            )
+            if applied is None:
+                raise RuntimeError(
+                    f"V4 migration has not been applied: {version}"
+                )
+            if (
+                applied.checksum != checksum
+                or applied.statement_count != len(statements)
+            ):
+                raise RuntimeError(
+                    "applied V4 migration ledger contract changed: "
+                    f"{version} checksum={applied.checksum} "
+                    f"statement_count={applied.statement_count}"
+                )
+            _validate_schema_on_connection(connection, statements)
+            results.append(
+                V4MigrationResult(
+                    version,
+                    "exists",
+                    len(statements),
+                    checksum,
+                )
+            )
+    return tuple(results)
+
+
 def run_v4_migrations(
     engine: Engine,
     *,
@@ -4553,6 +4644,9 @@ __all__ = [
     "MIGRATION_TABLE",
     "MIGRATION_TABLE_DDL",
     "MIGRATIONS",
+    "attest_applied_v4_migrations",
+    "normalize_v4_trigger_body",
+    "optional_v4_trigger_statements",
     "PIT_FACTOR_GUARD_MIGRATION_VERSION",
     "PIT_FACTOR_GUARD_TRIGGER_NAMES",
     "PIT_FACTOR_GUARD_TRIGGER_SPECS",

@@ -185,6 +185,9 @@ EXPECTED_OPTIONAL_V4_TRIGGER_COUNT = 32
 EXPECTED_OPTIONAL_V4_TRIGGER_NAMESET_HASH = (
     "ca55fb3f2722ae7dfe05a8f12071b07929160ffba39dc42c9b19f29e2139b095"
 )
+EXPECTED_OPTIONAL_V4_TRIGGER_SOURCE_HASH = (
+    "3861507c79c09db51ff2c4669fbe940ff8e8e4ddd83d7f5f90c9ec5c6b799b1a"
+)
 EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_COUNT = 175
 EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_NAMESET_HASH = (
     "a1d2a23569adc5318b5806e3040487cedcb9e31a60da3dae7756ed7bdf7044d7"
@@ -397,7 +400,8 @@ CUTOVER_DIAGNOSTIC_STAGES = frozenset({
     "stock_dividend_schema", "stock_dividend_task_identity",
     "runtime_stock_dividend_validation", "runtime_stock_dividend_task_validation",
     "qmt_reference_schema", "qmt_history_coverage_schema", "qmt_attestation_schema",
-    "pit_fact_schema", "legacy_completed_run_binding", "governance_base_schema",
+    "v4_triggers", "pit_fact_schema", "legacy_completed_run_binding",
+    "governance_base_schema",
     "supporting_triggers", "runtime_schema_bundle_validation",
     "governance_triggers", "governance_schema_seal", "qmt_reference_attestation",
     "qmt_history_and_shadow_validation", "qmt_attestation_validation",
@@ -1878,52 +1882,61 @@ def _frozen_full_release_trigger_names(
     return expected
 
 
-def _validated_applied_v4_trigger_names(engine: Engine) -> frozenset[str]:
-    """Return the complete optional V4 trigger group after read-only attestation."""
+def _optional_v4_trigger_contracts(
+    engine: Engine,
+) -> dict[str, TriggerContract]:
+    """Parse the frozen V4 trigger source in the target MySQL dialect."""
 
-    from server.db.migrations_v4 import MIGRATIONS, run_v4_migrations
+    from server.db.migrations_v4 import optional_v4_trigger_statements
 
-    results = tuple(run_v4_migrations(engine, dry_run=True))
-    migrations = tuple(MIGRATIONS)
-    if len(results) != len(migrations):
-        raise PrivilegedSchemaPreparationError(
-            "optional V4 migration plan is incomplete"
+    with engine.connect() as connection:
+        statements = optional_v4_trigger_statements(connection)
+    contracts: dict[str, TriggerContract] = {}
+    for statement in statements:
+        contract = _parse_create_trigger(
+            statement,
+            normalizer="v4",
+            owner="trading_v4",
         )
-    statuses: list[str] = []
-    names: list[str] = []
-    for migration, result in zip(migrations, results):
-        version = str(migration["version"])
-        status = str(result.status)
-        if str(result.version) != version or status not in {
-            "exists", "would_apply",
-        }:
+        if contract.name in contracts:
             raise PrivilegedSchemaPreparationError(
-                "optional V4 migration plan differs"
+                "optional V4 trigger source inventory is duplicated"
             )
-        statuses.append(status)
-        for raw in tuple(migration["statements"]):
-            matched = _CREATE_TRIGGER_RE.match(str(raw).strip())
-            if matched is not None:
-                names.append(matched.group(1))
-    if len(names) != len(set(names)):
-        raise PrivilegedSchemaPreparationError(
-            "optional V4 trigger source inventory is duplicated"
-        )
-    frozen_names = frozenset(names)
+        contracts[contract.name] = contract
+    return contracts
+
+
+def _frozen_optional_v4_trigger_contracts(
+    engine: Engine,
+) -> dict[str, TriggerContract]:
+    contracts = _optional_v4_trigger_contracts(engine)
+    names = frozenset(contracts)
     if (
-        len(frozen_names) != EXPECTED_OPTIONAL_V4_TRIGGER_COUNT
-        or _full_release_trigger_nameset_hash(frozen_names)
+        len(names) != EXPECTED_OPTIONAL_V4_TRIGGER_COUNT
+        or _full_release_trigger_nameset_hash(names)
         != EXPECTED_OPTIONAL_V4_TRIGGER_NAMESET_HASH
+        or _release_trigger_source_contract_hash(contracts)
+        != EXPECTED_OPTIONAL_V4_TRIGGER_SOURCE_HASH
     ):
         raise PrivilegedSchemaPreparationError(
             "optional V4 trigger source contract differs"
         )
-    if all(status == "exists" for status in statuses):
-        return frozen_names
-    if all(status == "would_apply" for status in statuses):
+    return contracts
+
+
+def _validated_optional_v4_trigger_names(engine: Engine) -> frozenset[str]:
+    """Return the optional V4 group only when its physical inventory is exact."""
+
+    frozen_names = frozenset(_frozen_optional_v4_trigger_contracts(engine))
+    with engine.connect() as connection:
+        observed_names = frozenset(_all_database_trigger_inventory(connection))
+    present = observed_names & frozen_names
+    if not present:
         return frozenset()
+    if present == frozen_names:
+        return frozen_names
     raise PrivilegedSchemaPreparationError(
-        "optional V4 migration ledger is partial"
+        "optional V4 trigger inventory is partial"
     )
 
 
@@ -2136,6 +2149,37 @@ def _ensure_frozen_release_triggers(
     }
 
 
+def _reconcile_optional_v4_triggers(
+    engine: Engine,
+    contracts: Mapping[str, TriggerContract],
+    *,
+    trigger_ddl_executor: Callable[[str], None],
+) -> dict[str, Any]:
+    """Restore absent V4 guards only after the applied ledger and tables agree."""
+
+    from server.db.migrations_v4 import attest_applied_v4_migrations
+
+    migrations = attest_applied_v4_migrations(engine)
+    if not migrations or any(item.status != "exists" for item in migrations):
+        raise PrivilegedSchemaPreparationError(
+            "optional V4 migration ledger is not applied"
+        )
+    detail = _ensure_frozen_release_triggers(
+        engine,
+        contracts,
+        expected_names=frozenset(contracts),
+        expected_source_contract_hash=(
+            EXPECTED_OPTIONAL_V4_TRIGGER_SOURCE_HASH
+        ),
+        trigger_ddl_executor=trigger_ddl_executor,
+    )
+    return {
+        **detail,
+        "migration_count": len(migrations),
+        "ledger_status": "APPLIED_EXACT",
+    }
+
+
 def _assert_no_preexisting_qmt_release_activation_rows(
     connection: Connection,
 ) -> None:
@@ -2171,6 +2215,10 @@ def _normalized_trigger_body(contract: TriggerContract, value: object) -> str:
         from server.db.migrations_v3 import _normalized_trigger_sql
 
         return _normalized_trigger_sql(value)
+    if contract.normalizer == "v4":
+        from server.db.migrations_v4 import normalize_v4_trigger_body
+
+        return normalize_v4_trigger_body(value)
     if contract.normalizer == "qmt":
         from tools.attest_qmt_daily_kline import _normalized_trigger_body
 
@@ -2422,7 +2470,7 @@ def _validate_full_database_trigger_inventory_exact(
             "full release trigger source contract differs"
         )
     optional_v4_names = (
-        _validated_applied_v4_trigger_names(connection.engine)
+        _validated_optional_v4_trigger_names(connection.engine)
         if include_applied_v4 else frozenset()
     )
     if set(base_expected_names) & set(optional_v4_names):
@@ -3838,7 +3886,7 @@ def _validate_legacy_activation_trigger_upgrade_inventory(
         ),
     }
     v2_contracts, _v2_bodies, _v2_orders = _v2_release_trigger_contract()
-    optional_v4_names = _validated_applied_v4_trigger_names(
+    optional_v4_names = _validated_optional_v4_trigger_names(
         connection.engine
     )
     legacy_names = frozenset({
@@ -4147,8 +4195,19 @@ def _privileged_trigger_inventory_lineage_preflight(
                     _non_v3_trigger_contracts()
                 ),
             }
-            optional_v4_names = _validated_applied_v4_trigger_names(
+            optional_v4_names = _validated_optional_v4_trigger_names(
                 boundary.migrator_engine
+            )
+            optional_v4_count = len(optional_v4_names)
+            expected_full_count = (
+                EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_COUNT
+                if optional_v4_count
+                else EXPECTED_FULL_RELEASE_TRIGGER_COUNT
+            )
+            expected_nameset_hash = (
+                EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_NAMESET_HASH
+                if optional_v4_count
+                else EXPECTED_FULL_RELEASE_TRIGGER_NAMESET_HASH
             )
             with boundary.migrator_engine.connect() as connection:
                 missing_previous_seal_inventory = (
@@ -4164,20 +4223,18 @@ def _privileged_trigger_inventory_lineage_preflight(
             if (
                 previous_identity["compatibility_hash"]
                 != identity["compatibility_hash"]
-                or len(optional_v4_names)
-                != EXPECTED_OPTIONAL_V4_TRIGGER_COUNT
-                or _full_release_trigger_nameset_hash(optional_v4_names)
-                != EXPECTED_OPTIONAL_V4_TRIGGER_NAMESET_HASH
+                or optional_v4_count
+                not in {0, EXPECTED_OPTIONAL_V4_TRIGGER_COUNT}
                 or missing_previous_seal_inventory.get("expected_count")
-                != EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_COUNT
+                != expected_full_count
                 or missing_previous_seal_inventory.get("observed_count")
-                != EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_COUNT
+                != expected_full_count
                 or missing_previous_seal_inventory.get("managed_count")
                 != EXPECTED_MANAGED_RELEASE_TRIGGER_COUNT
                 or missing_previous_seal_inventory.get(
                     "optional_v4_count"
                 )
-                != EXPECTED_OPTIONAL_V4_TRIGGER_COUNT
+                != optional_v4_count
                 or missing_previous_seal_inventory.get(
                     "managed_source_contract_sha256"
                 )
@@ -4185,7 +4242,7 @@ def _privileged_trigger_inventory_lineage_preflight(
                 or missing_previous_seal_inventory.get(
                     "nameset_sha256"
                 )
-                != EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_NAMESET_HASH
+                != expected_nameset_hash
                 or missing_previous_seal_inventory.get(
                     "metadata_frozen"
                 )
@@ -5032,9 +5089,13 @@ def _cutover_schema(
             **_final_v3_trigger_contracts(),
             **non_v3_contracts,
         }
+        optional_v4_contracts = _frozen_optional_v4_trigger_contracts(
+            boundary.migrator_engine
+        )
         trigger_create_allowlist = (
             *_all_v3_trigger_contracts(),
             *non_v3_contracts.values(),
+            *optional_v4_contracts.values(),
         )
         trigger_ddl_executor = _build_trigger_ddl_executor(
             boundary,
@@ -5158,6 +5219,12 @@ def _cutover_schema(
             boundary.migrator_engine,
             trigger_ddl_executor=trigger_ddl_executor,
             allow_legacy_manifest_candidates=True,
+        )
+        cutover_substage = "v4_triggers"
+        optional_v4_trigger_detail = _reconcile_optional_v4_triggers(
+            boundary.migrator_engine,
+            optional_v4_contracts,
+            trigger_ddl_executor=trigger_ddl_executor,
         )
         cutover_substage = "pit_fact_schema"
         pit_fact_schema = ensure_pit_fact_schema(
@@ -5308,6 +5375,7 @@ def _cutover_schema(
             "governance_trigger_source_contract": (
                 governance_trigger_source_detail
             ),
+            "optional_v4_triggers": optional_v4_trigger_detail,
             "supporting_trigger_source_contract": (
                 supporting_trigger_source_detail
             ),

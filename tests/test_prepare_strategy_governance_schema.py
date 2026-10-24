@@ -1119,7 +1119,7 @@ def _legacy_activation_upgrade_boundary(
     engine = _LegacyActivationUpgradeEngine(connection)
     monkeypatch.setattr(
         schema,
-        "_validated_applied_v4_trigger_names",
+        "_validated_optional_v4_trigger_names",
         lambda observed_engine: optional_v4_names
         if observed_engine is engine
         else pytest.fail("legacy upgrade checked the wrong engine"),
@@ -1521,8 +1521,10 @@ def test_privileged_inventory_lineage_preflight_binds_rollback_build(monkeypatch
     assert connection.alter_count == 0
 
 
+@pytest.mark.parametrize("optional_v4_state", ("absent", "present"))
 def test_privileged_inventory_lineage_recovers_missing_previous_seal_from_exact_inventory(
     monkeypatch,
+    optional_v4_state,
 ):
     from server.db import migrations_v4
     from server.engine.strategy_governance import (
@@ -1542,34 +1544,46 @@ def test_privileged_inventory_lineage_recovers_missing_previous_seal_from_exact_
         server_uuid=connection.server_uuid,
         database_name=connection.database_name,
     )["table_comment"]
-    optional_v4_names = frozenset(
-        matched.group(1)
-        for migration in migrations_v4.MIGRATIONS
-        for statement in migration["statements"]
-        if (
-            matched := schema._CREATE_TRIGGER_RE.match(
-                str(statement).strip()
+    optional_v4_names = (
+        frozenset(
+            matched.group(1)
+            for migration in migrations_v4.MIGRATIONS
+            for statement in migration["statements"]
+            if (
+                matched := schema._CREATE_TRIGGER_RE.match(
+                    str(statement).strip()
+                )
             )
+            is not None
         )
-        is not None
+        if optional_v4_state == "present"
+        else frozenset()
+    )
+    expected_count = (
+        schema.EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_COUNT
+        if optional_v4_names
+        else schema.EXPECTED_FULL_RELEASE_TRIGGER_COUNT
+    )
+    expected_nameset_hash = (
+        schema.EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_NAMESET_HASH
+        if optional_v4_names
+        else schema.EXPECTED_FULL_RELEASE_TRIGGER_NAMESET_HASH
     )
     inventory = {
-        "expected_count": schema.EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_COUNT,
-        "observed_count": schema.EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_COUNT,
+        "expected_count": expected_count,
+        "observed_count": expected_count,
         "managed_count": schema.EXPECTED_MANAGED_RELEASE_TRIGGER_COUNT,
-        "optional_v4_count": schema.EXPECTED_OPTIONAL_V4_TRIGGER_COUNT,
+        "optional_v4_count": len(optional_v4_names),
         "managed_source_contract_sha256": (
             schema.EXPECTED_MANAGED_RELEASE_TRIGGER_SOURCE_HASH
         ),
-        "nameset_sha256": (
-            schema.EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_NAMESET_HASH
-        ),
+        "nameset_sha256": expected_nameset_hash,
         "metadata_frozen": True,
         "read_only": True,
     }
     monkeypatch.setattr(
         schema,
-        "_validated_applied_v4_trigger_names",
+        "_validated_optional_v4_trigger_names",
         lambda _engine: optional_v4_names,
     )
     monkeypatch.setattr(
@@ -1634,7 +1648,7 @@ def test_privileged_inventory_lineage_recovery_rejects_inventory_drift(
     )
     monkeypatch.setattr(
         schema,
-        "_validated_applied_v4_trigger_names",
+        "_validated_optional_v4_trigger_names",
         lambda _engine: optional_v4_names,
     )
     monkeypatch.setattr(
@@ -2883,7 +2897,7 @@ def test_full_database_trigger_inventory_attests_complete_applied_v4_group(
     connection = _FullInventoryConnection(rows, managed)
     monkeypatch.setattr(
         schema,
-        "_validated_applied_v4_trigger_names",
+        "_validated_optional_v4_trigger_names",
         lambda engine: optional_v4_names
         if engine is connection.engine else pytest.fail("wrong engine"),
     )
@@ -2900,46 +2914,190 @@ def test_full_database_trigger_inventory_attests_complete_applied_v4_group(
 
 
 @pytest.mark.parametrize(
-    ("statuses", "expected_count"),
-    (("exists", 32), ("would_apply", 0)),
+    ("physical_group", "expected_count"),
+    (("all", 32), ("absent", 0)),
 )
-def test_optional_v4_trigger_group_is_all_or_absent(
+def test_optional_v4_trigger_group_uses_exact_physical_inventory(
     monkeypatch,
-    statuses,
+    physical_group,
     expected_count,
 ):
+    contracts = schema._optional_v4_trigger_contracts(
+        create_engine("sqlite://")
+    )
+    names = frozenset(contracts)
+    engine = MagicMock()
+    connection = object()
+    engine.connect.return_value.__enter__.return_value = connection
+    monkeypatch.setattr(
+        schema,
+        "_frozen_optional_v4_trigger_contracts",
+        lambda observed_engine: contracts
+        if observed_engine is engine else pytest.fail("wrong engine"),
+    )
+    observed = names if physical_group == "all" else frozenset()
+    monkeypatch.setattr(
+        schema,
+        "_all_database_trigger_inventory",
+        lambda observed_connection: {
+            name: {} for name in observed
+        } if observed_connection is connection else pytest.fail("wrong connection"),
+    )
     monkeypatch.setattr(
         migrations_v4,
         "run_v4_migrations",
-        lambda _engine, *, dry_run: [
-            SimpleNamespace(version=item["version"], status=statuses)
-            for item in migrations_v4.MIGRATIONS
-        ] if dry_run else pytest.fail("V4 attestation must be read-only"),
+        lambda *_args, **_kwargs: pytest.fail(
+            "optional trigger inventory must not infer state from the ledger"
+        ),
     )
 
-    names = schema._validated_applied_v4_trigger_names(object())
+    selected = schema._validated_optional_v4_trigger_names(engine)
 
-    assert len(names) == expected_count
+    assert len(selected) == expected_count
+    if expected_count:
+        assert selected == names
 
 
-def test_optional_v4_trigger_group_rejects_partial_ledger(monkeypatch):
+def test_optional_v4_trigger_group_rejects_partial_physical_inventory(
+    monkeypatch,
+):
+    contracts = schema._optional_v4_trigger_contracts(
+        create_engine("sqlite://")
+    )
+    names = sorted(contracts)
+    engine = MagicMock()
+    connection = object()
+    engine.connect.return_value.__enter__.return_value = connection
     monkeypatch.setattr(
-        migrations_v4,
-        "run_v4_migrations",
-        lambda _engine, *, dry_run: [
-            SimpleNamespace(
-                version=item["version"],
-                status="exists" if index == 0 else "would_apply",
-            )
-            for index, item in enumerate(migrations_v4.MIGRATIONS)
-        ] if dry_run else pytest.fail("V4 attestation must be read-only"),
+        schema,
+        "_frozen_optional_v4_trigger_contracts",
+        lambda _engine: contracts,
+    )
+    monkeypatch.setattr(
+        schema,
+        "_all_database_trigger_inventory",
+        lambda _connection: {names[0]: {}},
     )
 
     with pytest.raises(
         schema.PrivilegedSchemaPreparationError,
-        match="ledger is partial",
+        match="inventory is partial",
     ):
-        schema._validated_applied_v4_trigger_names(object())
+        schema._validated_optional_v4_trigger_names(engine)
+
+
+def test_optional_v4_trigger_source_contract_is_frozen() -> None:
+    contracts = schema._optional_v4_trigger_contracts(
+        create_engine("sqlite://")
+    )
+
+    assert len(contracts) == schema.EXPECTED_OPTIONAL_V4_TRIGGER_COUNT
+    assert (
+        schema._full_release_trigger_nameset_hash(contracts)
+        == schema.EXPECTED_OPTIONAL_V4_TRIGGER_NAMESET_HASH
+    )
+    assert (
+        schema._release_trigger_source_contract_hash(contracts)
+        == schema.EXPECTED_OPTIONAL_V4_TRIGGER_SOURCE_HASH
+    )
+
+
+def test_v4_trigger_normalization_is_stable_for_mysql8_rendering() -> None:
+    connection = MagicMock()
+    connection.dialect.name = "mysql"
+    connection.dialect.is_mariadb = False
+    connection.dialect.server_version_info = (8, 4, 11)
+    statement = next(
+        str(raw).strip()
+        for migration in migrations_v4.MIGRATIONS
+        for raw in migration["statements"]
+        if str(raw).strip().startswith("CREATE TRIGGER")
+        and "BINARY NEW." in str(raw)
+    )
+    rendered = migrations_v4._mysql_regexp_compatible_statement(
+        connection,
+        statement,
+    )
+
+    assert rendered != statement
+    assert migrations_v4.normalize_v4_trigger_body(
+        rendered
+    ) == migrations_v4.normalize_v4_trigger_body(statement)
+
+
+def test_reconcile_optional_v4_triggers_requires_exact_applied_ledger(
+    monkeypatch,
+):
+    contracts = schema._optional_v4_trigger_contracts(
+        create_engine("sqlite://")
+    )
+    migrations = tuple(
+        SimpleNamespace(status="exists") for _ in migrations_v4.MIGRATIONS
+    )
+    calls = []
+    monkeypatch.setattr(
+        migrations_v4,
+        "attest_applied_v4_migrations",
+        lambda engine: migrations,
+    )
+    monkeypatch.setattr(
+        schema,
+        "_ensure_frozen_release_triggers",
+        lambda engine, observed, **kwargs: calls.append(
+            (engine, observed, kwargs)
+        ) or {
+            "created_names": sorted(contracts),
+            "read_only": False,
+        },
+    )
+    engine = object()
+    executor = MagicMock()
+
+    detail = schema._reconcile_optional_v4_triggers(
+        engine,
+        contracts,
+        trigger_ddl_executor=executor,
+    )
+
+    assert detail["created_names"] == sorted(contracts)
+    assert detail["migration_count"] == len(migrations_v4.MIGRATIONS)
+    assert detail["ledger_status"] == "APPLIED_EXACT"
+    assert calls == [(
+        engine,
+        contracts,
+        {
+            "expected_names": frozenset(contracts),
+            "expected_source_contract_hash": (
+                schema.EXPECTED_OPTIONAL_V4_TRIGGER_SOURCE_HASH
+            ),
+            "trigger_ddl_executor": executor,
+        },
+    )]
+
+
+def test_reconcile_optional_v4_triggers_rejects_unapplied_ledger(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        migrations_v4,
+        "attest_applied_v4_migrations",
+        lambda _engine: (SimpleNamespace(status="would_apply"),),
+    )
+    monkeypatch.setattr(
+        schema,
+        "_ensure_frozen_release_triggers",
+        lambda *_args, **_kwargs: pytest.fail("must not create triggers"),
+    )
+
+    with pytest.raises(
+        schema.PrivilegedSchemaPreparationError,
+        match="ledger is not applied",
+    ):
+        schema._reconcile_optional_v4_triggers(
+            object(),
+            {},
+            trigger_ddl_executor=MagicMock(),
+        )
 
 
 @pytest.mark.parametrize("case", ("missing", "unexpected", "v2_body"))
@@ -3952,6 +4110,21 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
         schema,
         "_frozen_governance_release_trigger_contracts",
         lambda _contracts: {},
+    )
+    monkeypatch.setattr(
+        schema,
+        "_frozen_optional_v4_trigger_contracts",
+        lambda _engine: {},
+    )
+    monkeypatch.setattr(
+        schema,
+        "_reconcile_optional_v4_triggers",
+        lambda *_args, **_kwargs: {
+            "migration_count": 0,
+            "ledger_status": "NOT_APPLICABLE",
+            "created_names": [],
+            "created_count": 0,
+        },
     )
     monkeypatch.setattr(
         schema,
