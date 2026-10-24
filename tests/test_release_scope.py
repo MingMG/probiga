@@ -123,11 +123,13 @@ def test_sql_file_ddl_is_coordinated(repo):
 
 
 @pytest.mark.parametrize("path", [
+    "server/common/qmt_edge_release_recovery.py",
     "tools/prepare_strategy_governance_schema.py",
     "tools/prepare_strategy_governance_deferred_schema.py",
     "tools/prepare_strategy_governance_qmt_history.py",
+    "tools/run_qmt_windows_edge_release_bootstrap.py",
 ])
-def test_strategy_schema_preparation_changes_are_coordinated(repo, path):
+def test_cross_end_contract_changes_are_coordinated(repo, path):
     repo.write(path, "SCHEMA_CONTRACT_REVISION = 1\n")
     result = repo.classify(repo.commit())
     assert result["scope"] == "COORDINATED"

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Classify a complete, trusted Git release delta without importing project code.
 
-Explicit schema files and the strategy-schema preparation tools are cross-end.
-Application, UI, deployment, dependency, QMT and unrelated tool changes remain
-normal Linux code releases; the Windows/QMT updater tracks its own strategy
-source independently. Schema transitions live under ``server/db``, in ``.sql``
-files, or in the guarded strategy-schema preparation tools.
+Explicit schema files, the strategy-schema preparation tools and the protected
+QMT edge release protocol are cross-end. Application, UI, deployment,
+dependency and unrelated tool changes remain normal Linux code releases; the
+Windows/QMT updater tracks its own strategy source independently. Schema
+transitions live under ``server/db``, in ``.sql`` files, in the guarded
+strategy-schema preparation tools, or in the QMT edge release protocol.
 Run this installed trusted tool, never the copy from an untrusted target commit.
 """
 
@@ -187,9 +188,11 @@ _DDL_SQL = re.compile(
 )
 _DDL_CODE_ROOTS = ("server/db/", "db/")
 _SCHEMA_CONTRACT_CODE_FILES = frozenset({
+    "server/common/qmt_edge_release_recovery.py",
     "tools/prepare_strategy_governance_deferred_schema.py",
     "tools/prepare_strategy_governance_qmt_history.py",
     "tools/prepare_strategy_governance_schema.py",
+    "tools/run_qmt_windows_edge_release_bootstrap.py",
 })
 
 
