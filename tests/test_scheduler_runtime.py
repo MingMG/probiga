@@ -5164,9 +5164,15 @@ def test_release_analysis_recovery_request_is_claimed_and_removed(
         assert attached["request_id"] == request["request_id"]
         assert row["_trigger_source"] == "release_catchup"
         assert row["_scheduler_target_trade_date"] == "2026-10-23"
+        assert scheduler_runtime.read_release_analysis_recovery_status()[
+            "status"
+        ] == "ATTACHED"
         scheduler_runtime.finish_release_analysis_recovery_request(
             request["request_id"]
         )
+        assert scheduler_runtime.read_release_analysis_recovery_status()[
+            "status"
+        ] == "DISPATCHED"
     assert not request_path.exists()
 
 

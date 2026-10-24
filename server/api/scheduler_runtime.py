@@ -2429,6 +2429,60 @@ def _release_analysis_recovery_request_path() -> Path:
     return root / "release-analysis-recovery-request.json"
 
 
+def _release_analysis_recovery_status_path() -> Path:
+    path = _release_analysis_recovery_request_path()
+    return path.with_name(path.name + ".status.json")
+
+
+def _write_release_analysis_recovery_status(
+    request_id: str,
+    status: str,
+    reason: str,
+) -> None:
+    path = _release_analysis_recovery_status_path()
+    payload = json.dumps({
+        "schema": "probiga.release-analysis-recovery-status.v1",
+        "request_id": request_id,
+        "status": status,
+        "reason": reason,
+        "updated_at": _now_shanghai_naive().isoformat(
+            sep=" ",
+            timespec="seconds",
+        ),
+    }, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    temporary = path.with_name(f".{path.name}.tmp")
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+        0o600,
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def read_release_analysis_recovery_status() -> dict[str, object]:
+    path = _release_analysis_recovery_status_path()
+    try:
+        raw = path.read_bytes()
+        if len(raw) > 4096:
+            raise ValueError("status file is too large")
+        value = json.loads(raw)
+    except FileNotFoundError:
+        return {"status": "NOT_OBSERVED"}
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {"status": "INVALID"}
+    return value if isinstance(value, dict) else {"status": "INVALID"}
+
+
 def request_release_analysis_recovery(
     engine,
     target_trade_date: str,
@@ -2495,6 +2549,17 @@ def _attach_release_analysis_recovery_request(
     now: datetime,
 ) -> dict[str, object] | None:
     path = _release_analysis_recovery_request_path()
+    request_id = ""
+
+    def reject(reason: str) -> None:
+        if request_id:
+            _write_release_analysis_recovery_status(
+                request_id,
+                "BLOCKED",
+                reason,
+            )
+        logger.error("Release analysis recovery request is blocked: %s", reason)
+
     try:
         info = path.lstat()
         if (
@@ -2513,8 +2578,12 @@ def _attach_release_analysis_recovery_request(
     except FileNotFoundError:
         return None
     except (OSError, ValueError, json.JSONDecodeError) as exc:
-        logger.error("Release analysis recovery request is invalid: %s", exc)
+        reject(f"request_invalid:{type(exc).__name__}")
         return None
+    if not isinstance(request, dict):
+        reject("request_identity_differs")
+        return None
+    request_id = str(request.get("request_id") or "")
     expected_fields = {
         "schema",
         "request_id",
@@ -2530,12 +2599,12 @@ def _attach_release_analysis_recovery_request(
         is None
         or str(request.get("build_sha") or "") != _scheduler_build_commit_sha()
     ):
-        logger.error("Release analysis recovery request identity differs")
+        reject("request_identity_differs")
         return None
     target = str(request.get("target_trade_date") or "").strip()
     ready, reason, _ = release_analysis_recovery_readiness(engine, target)
     if not ready:
-        logger.error("Release analysis recovery request is blocked: %s", reason)
+        reject(f"readiness:{reason}")
         return None
     matches = [
         row for row in rows
@@ -2549,7 +2618,7 @@ def _attach_release_analysis_recovery_request(
         or str(matches[0].get("script_args") or "").strip()
         != "--top-n 80 --min-score 62 --json"
     ):
-        logger.error("Release analysis recovery task registration differs")
+        reject("analysis_task_registration_differs")
         return None
     row = matches[0]
     row.update({
@@ -2559,6 +2628,11 @@ def _attach_release_analysis_recovery_request(
         "_release_analysis_recovery_requested": True,
         "_release_analysis_recovery_request_id": str(request["request_id"]),
     })
+    _write_release_analysis_recovery_status(
+        request_id,
+        "ATTACHED",
+        "ready_for_scheduler_dispatch",
+    )
     return request
 
 
@@ -2569,6 +2643,11 @@ def finish_release_analysis_recovery_request(request_id: str) -> None:
     except (OSError, ValueError, json.JSONDecodeError):
         return
     if str(request.get("request_id") or "") == request_id:
+        _write_release_analysis_recovery_status(
+            request_id,
+            "DISPATCHED",
+            "scheduler_worker_started",
+        )
         try:
             path.unlink()
         except FileNotFoundError:

@@ -19,6 +19,7 @@ from server.common.release_data_readiness_contract import (
 from server.common.sql_reader import read_sql_rows
 from server.api.scheduler_runtime import (
     launch_scheduler_task,
+    read_release_analysis_recovery_status,
     request_release_analysis_recovery,
     read_scheduler_heartbeat,
     request_stop_owned_scheduler_task,
@@ -515,6 +516,11 @@ def recover_release_analysis(
         "request_id": request["request_id"],
         "readiness": request["readiness"],
     }
+
+
+@router.get("/scheduler/release-analysis/recovery-status")
+def release_analysis_recovery_status():
+    return read_release_analysis_recovery_status()
 
 
 @router.post("/scheduler/tasks/{task_id}/stop")
