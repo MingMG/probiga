@@ -534,7 +534,8 @@ def release_analysis_execution_progress(
     ) / "analysis-execution-diagnostics"
     try:
         progress = json.loads(
-            (root / f"{run_uid}.progress.json").read_text(encoding="utf-8")
+            (root / f"{run_uid}.progress.json").read_text(encoding="utf-8"),
+            parse_constant=lambda _value: None,
         )
     except (OSError, ValueError, json.JSONDecodeError):
         progress = None

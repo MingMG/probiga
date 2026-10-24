@@ -1102,7 +1102,7 @@ def _load_canonical_chase_risk_evidence(
     records: list[dict[str, Any]] = []
 
     stock_count = int(bars["stock_code"].nunique())
-    progress_interval = max(1, stock_count // 10)
+    progress_interval = max(1, stock_count // 100)
     for group_index, (stock_code, raw_group) in enumerate(
         bars.groupby("stock_code", sort=False), start=1
     ):
@@ -1115,6 +1115,7 @@ def _load_canonical_chase_risk_evidence(
                 trade_date=trade_date,
                 execution_risk_done=group_index,
                 execution_risk_total=stock_count,
+                current_stock_code=stock_code,
             )
         # V4 needs 21 observations for return-20/MA20 and only a 10-session
         # cooldown lookback.  Bind exactly that consumed window; older legacy
@@ -2236,8 +2237,9 @@ def _verify_full_market_turnover_inputs(
     codes: set[str] = set()
     blocked_codes: set[str] = set()
     records = frame.to_dict(orient="records")
-    progress_interval = max(1, len(records) // 10)
+    progress_interval = max(1, len(records) // 100)
     for index, source in enumerate(records, start=1):
+        code = str(source.get("stock_code") or "").strip().zfill(6)
         if index == 1 or index % progress_interval == 0:
             _emit_progress(
                 progress_callback,
@@ -2247,8 +2249,8 @@ def _verify_full_market_turnover_inputs(
                 trade_date=trade_date,
                 turnover_validation_done=index,
                 turnover_validation_total=len(records),
+                current_stock_code=code,
             )
-        code = str(source.get("stock_code") or "").strip().zfill(6)
         if code in codes:
             raise RuntimeError(
                 "DATA_BLOCKED: full-market turnover evidence is duplicated"
