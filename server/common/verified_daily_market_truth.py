@@ -100,6 +100,23 @@ def canonical_daily_rows(
     return sorted(result, key=lambda item: item["stock_code"])
 
 
+def is_suspended_daily_row(row: Mapping[str, Any]) -> bool:
+    """Return True only for an explicit provider zero-trade suspension row."""
+
+    try:
+        return bool(
+            str(row.get("quality_status") or "") == "SUSPENDED"
+            and str(row.get("permission_status") or "") == "NO_TRADE"
+            and Decimal(str(row.get("open"))) == 0
+            and Decimal(str(row.get("high"))) == 0
+            and Decimal(str(row.get("low"))) == 0
+            and Decimal(str(row.get("volume"))) == 0
+            and Decimal(str(row.get("amount"))) == 0
+        )
+    except (InvalidOperation, ValueError, TypeError):
+        return False
+
+
 def load_source_daily_rows(
     connection: Any,
     *,
@@ -118,7 +135,8 @@ def load_source_daily_rows(
                 text(
                     f"""
                     SELECT stock_code, trade_date, `open`, `close`, high, low,
-                           volume, amount, pre_close, data_source, quality_status
+                           volume, amount, pre_close, data_source, quality_status,
+                           permission_status
                       FROM sm_stock_kline
                      WHERE stock_code IN ({placeholders})
                        AND trade_date=:trade_date
@@ -301,12 +319,20 @@ def load_verified_daily_market_truth(
             "free daily-market database rows differ from their receipt"
         )
     for row in rows:
-        if (
-            str(row.get("data_source") or "") != source
-            or str(row.get("quality_status") or "") != "SOURCE_VERIFIED"
-        ):
+        suspended_row = is_suspended_daily_row(row)
+        if str(row.get("data_source") or "") != source:
             raise VerifiedDailyMarketBlocked(
                 "free daily-market row provenance differs"
+            )
+        if (
+            not suspended_row
+            and (
+                str(row.get("quality_status") or "") != "SOURCE_VERIFIED"
+                or str(row.get("permission_status") or "") != "SUPPORTED"
+            )
+        ):
+            raise VerifiedDailyMarketBlocked(
+                "free daily-market row quality differs"
             )
         values = [
             row.get("open"),
@@ -326,7 +352,7 @@ def load_verified_daily_market_truth(
             raise VerifiedDailyMarketBlocked(
                 "free daily-market row contains an invalid numeric value"
             )
-        if (
+        if not suspended_row and (
             float(row["open"]) <= 0
             or float(row["close"]) <= 0
             or float(row["high"]) < max(float(row["open"]), float(row["close"]))
@@ -578,6 +604,7 @@ __all__ = [
     "VerifiedDailyMarketBlocked",
     "VerifiedDailyMarketTruth",
     "canonical_daily_rows",
+    "is_suspended_daily_row",
     "load_source_daily_rows",
     "load_retained_qmt_daily_market_truth",
     "load_verified_daily_market_truth",

@@ -215,23 +215,31 @@ def fetch_target_snapshot(
             "free daily source returned out-of-catalog codes: "
             + ",".join(outside[:10])
         )
-    valid = (
-        frame["trade_date"].eq(target_date)
-        & frame[
-            ["open", "high", "low", "close", "pre_close", "volume_hands", "amount_cny"]
-        ]
-        .notna()
-        .all(axis=1)
+    complete_core = frame[
+        ["open", "high", "low", "close", "pre_close", "volume_hands", "amount_cny"]
+    ].notna().all(axis=1)
+    same_target = frame["trade_date"].eq(target_date)
+    suspended = (
+        complete_core
+        & frame[["open", "high", "low"]].eq(0).all(axis=1)
+        & frame["volume_hands"].eq(0)
+        & frame["amount_cny"].eq(0)
+    )
+    traded = (
+        complete_core
         & frame[["open", "high", "low", "close", "pre_close"]].gt(0).all(axis=1)
         & frame["high"].ge(frame[["open", "close"]].max(axis=1))
         & frame["low"].le(frame[["open", "close"]].min(axis=1))
         & frame["volume_hands"].ge(0)
         & frame["amount_cny"].ge(0)
     )
-    target = frame.loc[valid].copy()
+    target = frame.loc[same_target & (traded | suspended)].copy()
+    target["_suspended"] = (
+        same_target.loc[target.index] & suspended.loc[target.index]
+    )
     received = set(target["stock_code"])
     coverage = len(received) / len(requested)
-    if coverage < FREE_HISTORY_MIN_CATALOG_COVERAGE:
+    if coverage < FREE_DAILY_MIN_COVERAGE:
         raise FreeDailyBlocked(
             "free daily catalog coverage below threshold: "
             f"{len(received)}/{len(requested)} ({coverage:.2%})"
@@ -241,8 +249,12 @@ def fetch_target_snapshot(
     target["k_type"] = 1
     target["adjust_type"] = 0
     target["data_source"] = SOURCE
-    target["quality_status"] = "SOURCE_VERIFIED"
-    target["permission_status"] = "SUPPORTED"
+    target["quality_status"] = target["_suspended"].map(
+        {True: "SUSPENDED", False: "SOURCE_VERIFIED"}
+    )
+    target["permission_status"] = target["_suspended"].map(
+        {True: "NO_TRADE", False: "SUPPORTED"}
+    )
     target["received_at"] = target["source_time"]
     target["etl_sync_at"] = _now()
     target = target[
@@ -268,12 +280,20 @@ def fetch_target_snapshot(
             "permission_status",
             "received_at",
             "etl_sync_at",
+            "_suspended",
         ]
     ].rename(columns={"amount_cny": "amount"})
-    return target.sort_values("stock_code").reset_index(drop=True), {
+    traded_count = int((~target["_suspended"]).sum())
+    suspended_count = int(target["_suspended"].sum())
+    target = target.drop(columns=["_suspended"]).sort_values(
+        "stock_code"
+    ).reset_index(drop=True)
+    return target, {
         "requested_count": len(requested),
         "received_count": len(received),
         "coverage_ratio": coverage,
+        "traded_count": traded_count,
+        "suspended_count": suspended_count,
         "captured_at": target["received_at"].max().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -645,6 +665,8 @@ def publish_snapshot(
         "quote_fetch_complete",
         row_count=len(frame),
         coverage_ratio=evidence["coverage_ratio"],
+        traded_count=evidence["traded_count"],
+        suspended_count=evidence["suspended_count"],
     )
     canonical = canonical_daily_rows(frame.to_dict(orient="records"))
     codes = [row["stock_code"] for row in canonical]
@@ -659,7 +681,8 @@ def publish_snapshot(
         codes=sorted(set(codes)),
     )
     reused = False
-    if existing_counts == {SOURCE: len(frame)}:
+    incremental_codes: list[str] = []
+    if existing_counts and set(existing_counts) <= {SOURCE}:
         with engine.connect() as connection:
             existing_rows = load_source_daily_rows(
                 connection,
@@ -667,9 +690,35 @@ def publish_snapshot(
                 target_date=target_date,
                 codes=sorted(set(codes)),
             )
-        reused = canonical_daily_rows(existing_rows) == canonical
+        existing_canonical = canonical_daily_rows(existing_rows)
+        new_by_code = {row["stock_code"]: row for row in canonical}
+        if all(
+            new_by_code.get(row["stock_code"]) == row
+            for row in existing_canonical
+        ):
+            existing_codes = {
+                row["stock_code"] for row in existing_canonical
+            }
+            incremental_codes = sorted(set(codes) - existing_codes)
+            reused = existing_counts == {SOURCE: len(frame)}
     if reused:
         _progress("database_write_reused", row_count=len(frame))
+    elif incremental_codes:
+        _progress(
+            "database_write_incremental",
+            inserted_codes=incremental_codes,
+        )
+        replace_table_rows_exact_keys(
+            frame.loc[frame["stock_code"].isin(incremental_codes)],
+            "sm_stock_kline",
+            engine,
+            key_columns=("stock_code", "trade_date", "k_type", "adjust_type"),
+            lock_name=STOCK_KLINE_FREEZE_LOCK_NAME,
+        )
+        _progress(
+            "database_write_incremental_complete",
+            inserted_count=len(incremental_codes),
+        )
     else:
         _progress("database_write_start", row_count=len(frame))
         replace_table_rows_exact_keys(
