@@ -570,6 +570,14 @@ def _safe_cutover_failure_code(exc: BaseException) -> str:
             "lineage V2 trigger physical contract differs",
             "LINEAGE_V2_TRIGGER_DRIFT",
         ),
+        (
+            "historical QMT activation row contract differs",
+            "QMT_ACTIVATION_HISTORY_ROW_DRIFT",
+        ),
+        (
+            "historical QMT activation authority is not manifest-bound",
+            "QMT_ACTIVATION_HISTORY_UNBOUND",
+        ),
     )
     seen: set[int] = set()
     current: BaseException | None = exc
@@ -2275,6 +2283,126 @@ def _assert_no_preexisting_qmt_release_activation_rows(
             "preexisting QMT release activation rows are forbidden before "
             "activation trigger installation"
         )
+
+
+def _verified_qmt_activation_history(
+    connection: Connection,
+) -> dict[str, Any]:
+    """Bind every historical activation row to its immutable release role."""
+
+    from server.common.qmt_edge_release_receipt import (
+        QMT_EDGE_RELEASE_ACTIVATION_TASK_NAME,
+        QMT_EDGE_RELEASE_ACTIVATION_TRIGGER_SOURCE,
+        QMT_EDGE_RELEASE_REQUEST_TASK_TYPE,
+    )
+    from server.common.qmt_edge_release_recovery import (
+        ABORT_TASK_NAME,
+        CONTEXT_TASK_NAME,
+    )
+
+    rows = connection.execute(text(
+        "SELECT id, run_uid, task_name, status, exit_code, build_sha "
+        "FROM st_scheduled_task_history "
+        "WHERE BINARY task_type=BINARY :task_type "
+        "AND BINARY trigger_source=BINARY :trigger_source "
+        "ORDER BY id"
+    ), {
+        "task_type": QMT_EDGE_RELEASE_REQUEST_TASK_TYPE,
+        "trigger_source": QMT_EDGE_RELEASE_ACTIVATION_TRIGGER_SOURCE,
+    }).mappings().all()
+    if not rows:
+        return {
+            "history_count": 0,
+            "grant_count": 0,
+            "context_count": 0,
+            "abort_count": 0,
+            "unregistered_context_count": 0,
+            "verified": True,
+        }
+    role_by_prefix = {
+        "qmt-edge-grant-": (
+            QMT_EDGE_RELEASE_ACTIVATION_TASK_NAME,
+            True,
+        ),
+        "qmt-edge-context-": (CONTEXT_TASK_NAME, False),
+    }
+    seen_run_uids: set[str] = set()
+    grants_and_aborts: list[dict[str, Any]] = []
+    contexts: list[dict[str, Any]] = []
+    for raw in rows:
+        row = dict(raw)
+        run_uid = str(row.get("run_uid") or "")
+        task_name = str(row.get("task_name") or "")
+        build_sha = str(row.get("build_sha") or "")
+        matched_role = next(
+            (
+                (prefix, expected_name, requires_manifest)
+                for prefix, (expected_name, requires_manifest)
+                in role_by_prefix.items()
+                if run_uid.startswith(prefix)
+            ),
+            None,
+        )
+        is_abort = task_name == ABORT_TASK_NAME
+        if (
+            matched_role is None
+            or run_uid in seen_run_uids
+            or re.fullmatch(
+                re.escape(matched_role[0]) + r"[0-9a-f]{32}",
+                run_uid,
+            ) is None
+            or re.fullmatch(r"[0-9a-f]{40}", build_sha) is None
+            or str(row.get("status") or "") != "success"
+            or type(row.get("exit_code")) is not int
+            or int(row["exit_code"]) != 0
+            or (
+                task_name != matched_role[1]
+                and not (
+                    is_abort
+                    and matched_role[0] == "qmt-edge-grant-"
+                )
+            )
+        ):
+            raise PrivilegedSchemaPreparationError(
+                "historical QMT activation row contract differs"
+            )
+        seen_run_uids.add(run_uid)
+        if matched_role[0] == "qmt-edge-context-":
+            contexts.append(row)
+        else:
+            grants_and_aborts.append(row)
+    builds = tuple(sorted({
+        str(row["build_sha"]) for row in rows
+    }))
+    registered = frozenset(connection.execute(text(
+        "SELECT release_id FROM st_release_manifest "
+        "WHERE release_id IN :builds"
+    ), {"builds": builds}).scalars().all())
+    unregistered_contexts = [
+        row for row in contexts
+        if str(row["build_sha"]) not in registered
+    ]
+    if any(
+        str(row["build_sha"]) not in registered
+        for row in grants_and_aborts
+    ):
+        raise PrivilegedSchemaPreparationError(
+            "historical QMT activation authority is not manifest-bound"
+        )
+    return {
+        "history_count": len(rows),
+        "grant_count": sum(
+            str(row["task_name"]) == QMT_EDGE_RELEASE_ACTIVATION_TASK_NAME
+            for row in grants_and_aborts
+        ),
+        "context_count": len(contexts),
+        "abort_count": sum(
+            str(row["task_name"]) == ABORT_TASK_NAME
+            for row in grants_and_aborts
+        ),
+        "unregistered_context_count": len(unregistered_contexts),
+        "verified": True,
+    }
 
 
 def _normalized_trigger_body(contract: TriggerContract, value: object) -> str:
@@ -4372,6 +4500,7 @@ def _privileged_trigger_inventory_lineage_preflight(
     legacy_activation_trigger_upgrade_inventory: dict[str, Any] = {}
     missing_previous_seal_recovery = False
     missing_previous_seal_inventory: dict[str, Any] = {}
+    historical_qmt_activation_history: dict[str, Any] = {}
     if legacy_activation_trigger_upgrade:
         try:
             old_envelope = parse_privileged_trigger_inventory_seal_comment(
@@ -4454,8 +4583,8 @@ def _privileged_trigger_inventory_lineage_preflight(
                         optional_v4_contracts=optional_v4_contracts,
                     )
                 )
-                _assert_no_preexisting_qmt_release_activation_rows(
-                    connection
+                historical_qmt_activation_history = (
+                    _verified_qmt_activation_history(connection)
                 )
             live_inventory_tier = (
                 missing_previous_seal_inventory.get("live_inventory_tier")
@@ -4525,6 +4654,8 @@ def _privileged_trigger_inventory_lineage_preflight(
                 )
                 is not True
                 or missing_previous_seal_inventory.get("read_only")
+                is not True
+                or historical_qmt_activation_history.get("verified")
                 is not True
                 or not any(
                     entry["status"] == "VERIFIED"
@@ -4611,6 +4742,9 @@ def _privileged_trigger_inventory_lineage_preflight(
         "missing_previous_seal_recovery": missing_previous_seal_recovery,
         "missing_previous_seal_inventory": (
             missing_previous_seal_inventory
+        ),
+        "historical_qmt_activation_history": (
+            historical_qmt_activation_history
         ),
         "trusted_verified_trigger_seal_present": (
             trusted_verified_trigger_seal_present

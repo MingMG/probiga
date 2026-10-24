@@ -1780,8 +1780,8 @@ def test_privileged_inventory_lineage_recovers_missing_previous_seal_from_exact_
     )
     monkeypatch.setattr(
         schema,
-        "_assert_no_preexisting_qmt_release_activation_rows",
-        lambda _connection: None,
+        "_verified_qmt_activation_history",
+        lambda _connection: {"verified": True},
     )
 
     lineage = schema._privileged_trigger_inventory_lineage_preflight(
@@ -1855,8 +1855,8 @@ def test_privileged_inventory_lineage_recovery_rejects_inventory_drift(
     )
     monkeypatch.setattr(
         schema,
-        "_assert_no_preexisting_qmt_release_activation_rows",
-        lambda _connection: None,
+        "_verified_qmt_activation_history",
+        lambda _connection: {"verified": True},
     )
 
     with pytest.raises(
@@ -3289,6 +3289,125 @@ def test_reconcile_optional_v4_triggers_rejects_unapplied_ledger(
             {},
             trigger_ddl_executor=MagicMock(),
         )
+
+
+def _activation_history_result(rows):
+    result = MagicMock()
+    result.mappings.return_value.all.return_value = rows
+    return result
+
+
+def _release_id_result(release_ids):
+    result = MagicMock()
+    result.scalars.return_value.all.return_value = release_ids
+    return result
+
+
+def test_historical_qmt_activation_history_is_manifest_bound() -> None:
+    from server.common.qmt_edge_release_receipt import (
+        QMT_EDGE_RELEASE_ACTIVATION_TASK_NAME,
+    )
+    from server.common.qmt_edge_release_recovery import (
+        ABORT_TASK_NAME,
+        CONTEXT_TASK_NAME,
+    )
+
+    grant_build = "a" * 40
+    abort_build = "b" * 40
+    context_build = "c" * 40
+    rows = [
+        {
+            "id": 1,
+            "run_uid": f"qmt-edge-context-{'1' * 32}",
+            "task_name": CONTEXT_TASK_NAME,
+            "status": "success",
+            "exit_code": 0,
+            "build_sha": context_build,
+        },
+        {
+            "id": 2,
+            "run_uid": f"qmt-edge-grant-{'2' * 32}",
+            "task_name": QMT_EDGE_RELEASE_ACTIVATION_TASK_NAME,
+            "status": "success",
+            "exit_code": 0,
+            "build_sha": grant_build,
+        },
+        {
+            "id": 3,
+            "run_uid": f"qmt-edge-grant-{'3' * 32}",
+            "task_name": ABORT_TASK_NAME,
+            "status": "success",
+            "exit_code": 0,
+            "build_sha": abort_build,
+        },
+    ]
+    connection = MagicMock()
+    connection.execute.side_effect = [
+        _activation_history_result(rows),
+        _release_id_result([grant_build, abort_build]),
+    ]
+
+    detail = schema._verified_qmt_activation_history(connection)
+
+    assert detail == {
+        "history_count": 3,
+        "grant_count": 1,
+        "context_count": 1,
+        "abort_count": 1,
+        "unregistered_context_count": 1,
+        "verified": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error_match"),
+    (
+        (
+            "status",
+            "failed",
+            "activation row contract differs",
+        ),
+        (
+            "exit_code",
+            1,
+            "activation row contract differs",
+        ),
+        (
+            "build_sha",
+            "d" * 40,
+            "activation authority is not manifest-bound",
+        ),
+    ),
+)
+def test_historical_qmt_activation_history_rejects_authority_drift(
+    field,
+    value,
+    error_match,
+):
+    from server.common.qmt_edge_release_receipt import (
+        QMT_EDGE_RELEASE_ACTIVATION_TASK_NAME,
+    )
+
+    row = {
+        "id": 1,
+        "run_uid": f"qmt-edge-grant-{'1' * 32}",
+        "task_name": QMT_EDGE_RELEASE_ACTIVATION_TASK_NAME,
+        "status": "success",
+        "exit_code": 0,
+        "build_sha": "a" * 40,
+    }
+    row[field] = value
+    connection = MagicMock()
+    connection.execute.side_effect = [
+        _activation_history_result([row]),
+        _release_id_result([]),
+    ]
+
+    with pytest.raises(
+        schema.PrivilegedSchemaPreparationError,
+        match=error_match,
+    ):
+        schema._verified_qmt_activation_history(connection)
 
 
 @pytest.mark.parametrize("case", ("missing", "unexpected", "v2_body"))
