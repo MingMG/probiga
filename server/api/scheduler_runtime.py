@@ -8355,6 +8355,17 @@ def _terminal_journal():
         root=Path(__file__).resolve().parents[2], env={}))
 
 
+def _invalidate_mysql_pool_after_transport_failure(engine) -> None:
+    """Remove a socket that timed out mid-query before the next recovery retry."""
+
+    if str(getattr(getattr(engine, "dialect", None), "name", "")).lower() != "mysql":
+        return
+    try:
+        engine.dispose()
+    except Exception as exc:
+        logger.warning("Scheduler terminal MySQL pool disposal failed: %s", exc)
+
+
 def _terminal_history_row(connection, uid, *, for_update=False):
     suffix = " FOR UPDATE" if for_update and connection.dialect.name != "sqlite" else ""
     rows = connection.execute(text(
@@ -8963,6 +8974,8 @@ def _task_history_finish(
         # tuple/current stage fence and unknown-commit readback before reentry.
         from sqlalchemy.exc import DBAPIError
         from server.common.scheduler_terminal_journal import TerminalJournalError
+        if isinstance(exc, (DBAPIError, OSError)):
+            _invalidate_mysql_pool_after_transport_failure(engine)
         if isinstance(exc, (DBAPIError, OSError, TerminalJournalError,
                             _TerminalPersistencePending, DailyDeliveryFenceLost)):
             logger.warning("Scheduler terminal database transaction pending for %s", run_uid)

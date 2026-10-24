@@ -102,6 +102,17 @@ def disconnect_begin(monkeypatch, engine):
     return original
 
 
+def test_mysql_transport_failure_invalidates_pool_before_retry(case,monkeypatch):
+    case.start()
+    disposed=[]
+    monkeypatch.setattr(case.engine.dialect,"name","mysql")
+    monkeypatch.setattr(case.engine,"dispose",lambda:disposed.append(True))
+    disconnect_begin(monkeypatch,case.engine)
+    finish(case,output="ORIGINAL")
+    assert disposed==[True]
+    assert case.uid in runtime._pending_terminal_writes
+
+
 @pytest.mark.parametrize("status", ["success","failed","blocked","timeout","stopped"])
 def test_daily_db_failure_preserves_first_outcome_then_atomic_retry(case,monkeypatch,status):
     case.start()
