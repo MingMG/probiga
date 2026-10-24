@@ -19,6 +19,7 @@ from server.common.release_data_readiness_contract import (
 from server.common.sql_reader import read_sql_rows
 from server.api.scheduler_runtime import (
     launch_scheduler_task,
+    request_release_analysis_recovery,
     read_scheduler_heartbeat,
     request_stop_owned_scheduler_task,
     release_analysis_recovery_readiness,
@@ -504,18 +505,15 @@ def recover_release_analysis(
                 "evidence": evidence,
             },
         )
-    result = launch_scheduler_task(
-        row,
-        root=Path(__file__).resolve().parents[3],
-        engine=engine,
-        trigger_source="release_catchup",
-        target_trade_date=trade_date,
-    )
+    request = request_release_analysis_recovery(engine, trade_date)
     return {
-        **result,
+        "accepted": True,
+        "status": "queued",
+        "task_id": int(row["id"]),
         "trigger_source": "release_catchup",
         "target_trade_date": trade_date,
-        "readiness": evidence,
+        "request_id": request["request_id"],
+        "readiness": request["readiness"],
     }
 
 

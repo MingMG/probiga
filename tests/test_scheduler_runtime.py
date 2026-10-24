@@ -5077,7 +5077,7 @@ def test_release_analysis_recovery_rejects_incomplete_or_wrong_session():
     assert reason == "target_differs_from_authoritative_closed_session"
 
 
-def test_release_analysis_recovery_route_launches_target_bound_analysis():
+def test_release_analysis_recovery_route_queues_scheduler_owned_request():
     row = {
         "id": 37,
         "enabled": 1,
@@ -5095,16 +5095,67 @@ def test_release_analysis_recovery_route_launches_target_bound_analysis():
         ),
         patch.object(
             scheduler_router,
-            "launch_scheduler_task",
-            return_value={"accepted": True, "status": "running"},
-        ) as launch,
+            "request_release_analysis_recovery",
+            return_value={
+                "request_id": "d" * 32,
+                "readiness": evidence,
+            },
+        ) as request,
     ):
         result = scheduler_router.recover_release_analysis("2026-10-23")
+    assert result["status"] == "queued"
     assert result["trigger_source"] == "release_catchup"
     assert result["target_trade_date"] == "2026-10-23"
     assert result["readiness"] == evidence
-    assert launch.call_args.kwargs["trigger_source"] == "release_catchup"
-    assert launch.call_args.kwargs["target_trade_date"] == "2026-10-23"
+    assert result["request_id"] == "d" * 32
+    request.assert_called_once()
+
+
+def test_release_analysis_recovery_request_is_claimed_and_removed(
+    tmp_path: Path,
+) -> None:
+    request_path = tmp_path / "release-analysis-recovery-request.json"
+    row = {
+        "id": 37,
+        "task_type": "analysis_fast",
+        "enabled": 1,
+        "script_path": "tools/run_ai_recommendation_premarket.py",
+        "script_args": "--top-n 80 --min-score 62 --json",
+    }
+    evidence = {"target_trade_date": "2026-10-23"}
+    with (
+        patch.object(
+            scheduler_runtime,
+            "_release_analysis_recovery_request_path",
+            return_value=request_path,
+        ),
+        patch.object(
+            scheduler_runtime,
+            "_scheduler_build_commit_sha",
+            return_value="a" * 40,
+        ),
+        patch.object(
+            scheduler_runtime,
+            "release_analysis_recovery_readiness",
+            return_value=(True, "ready", evidence),
+        ),
+    ):
+        request = scheduler_runtime.request_release_analysis_recovery(
+            MagicMock(),
+            "2026-10-23",
+        )
+        attached = scheduler_runtime._attach_release_analysis_recovery_request(
+            MagicMock(),
+            [row],
+            now=datetime(2026, 10, 24, 23),
+        )
+        assert attached["request_id"] == request["request_id"]
+        assert row["_trigger_source"] == "release_catchup"
+        assert row["_scheduler_target_trade_date"] == "2026-10-23"
+        scheduler_runtime.finish_release_analysis_recovery_request(
+            request["request_id"]
+        )
+    assert not request_path.exists()
 
 
 def test_release_dependency_rejects_exact_build_receipt_for_old_target_date():

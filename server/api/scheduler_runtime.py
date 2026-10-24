@@ -2416,6 +2416,165 @@ def release_analysis_recovery_readiness(
     return True, "ready", evidence
 
 
+RELEASE_ANALYSIS_RECOVERY_REQUEST_SCHEMA = (
+    "probiga.release-analysis-recovery-request.v1"
+)
+
+
+def _release_analysis_recovery_request_path() -> Path:
+    root = Path(
+        os.environ.get("PROBIGA_JOB_LOG_ROOT")
+        or "/var/lib/probiga/jobs"
+    )
+    return root / "release-analysis-recovery-request.json"
+
+
+def request_release_analysis_recovery(
+    engine,
+    target_trade_date: str,
+) -> dict[str, object]:
+    """Persist one scheduler-owned analysis recovery request."""
+
+    ready, reason, evidence = release_analysis_recovery_readiness(
+        engine,
+        target_trade_date,
+    )
+    if not ready:
+        raise RuntimeError(f"release analysis recovery is not ready: {reason}")
+    build_sha = _scheduler_build_commit_sha()
+    if re.fullmatch(r"[0-9a-f]{40}", build_sha) is None or build_sha == "0" * 40:
+        raise RuntimeError("release analysis recovery build identity is invalid")
+    request = {
+        "schema": RELEASE_ANALYSIS_RECOVERY_REQUEST_SCHEMA,
+        "request_id": uuid.uuid4().hex,
+        "build_sha": build_sha,
+        "target_trade_date": target_trade_date,
+        "requested_at": _now_shanghai_naive().isoformat(
+            sep=" ",
+            timespec="seconds",
+        ),
+    }
+    path = _release_analysis_recovery_request_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{request['request_id']}.tmp")
+    encoded = json.dumps(
+        request,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o600,
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        if os.name == "posix":
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    return {**request, "readiness": evidence}
+
+
+def _attach_release_analysis_recovery_request(
+    engine,
+    rows: list[dict],
+    *,
+    now: datetime,
+) -> dict[str, object] | None:
+    path = _release_analysis_recovery_request_path()
+    try:
+        info = path.lstat()
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or (
+                os.name == "posix"
+                and stat.S_IMODE(info.st_mode) != 0o600
+            )
+        ):
+            raise RuntimeError("release recovery request file metadata differs")
+        raw = path.read_bytes()
+        if len(raw) > 4096:
+            raise RuntimeError("release recovery request is too large")
+        request = json.loads(raw)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        logger.error("Release analysis recovery request is invalid: %s", exc)
+        return None
+    expected_fields = {
+        "schema",
+        "request_id",
+        "build_sha",
+        "target_trade_date",
+        "requested_at",
+    }
+    if (
+        not isinstance(request, dict)
+        or set(request) != expected_fields
+        or request.get("schema") != RELEASE_ANALYSIS_RECOVERY_REQUEST_SCHEMA
+        or re.fullmatch(r"[0-9a-f]{32}", str(request.get("request_id") or ""))
+        is None
+        or str(request.get("build_sha") or "") != _scheduler_build_commit_sha()
+    ):
+        logger.error("Release analysis recovery request identity differs")
+        return None
+    target = str(request.get("target_trade_date") or "").strip()
+    ready, reason, _ = release_analysis_recovery_readiness(engine, target)
+    if not ready:
+        logger.error("Release analysis recovery request is blocked: %s", reason)
+        return None
+    matches = [
+        row for row in rows
+        if str(row.get("task_type") or "").strip() == "analysis_fast"
+    ]
+    if (
+        len(matches) != 1
+        or int(matches[0].get("enabled") or 0) != 1
+        or str(matches[0].get("script_path") or "").replace("\\", "/")
+        != "tools/run_ai_recommendation_premarket.py"
+        or str(matches[0].get("script_args") or "").strip()
+        != "--top-n 80 --min-score 62 --json"
+    ):
+        logger.error("Release analysis recovery task registration differs")
+        return None
+    row = matches[0]
+    row.update({
+        "_trigger_source": "release_catchup",
+        "_scheduler_target_available": True,
+        "_scheduler_target_trade_date": target,
+        "_release_analysis_recovery_requested": True,
+        "_release_analysis_recovery_request_id": str(request["request_id"]),
+    })
+    return request
+
+
+def finish_release_analysis_recovery_request(request_id: str) -> None:
+    path = _release_analysis_recovery_request_path()
+    try:
+        request = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return
+    if str(request.get("request_id") or "") == request_id:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def _parse_hhmm(value: str) -> int | None:
     try:
         hour, minute = str(value or "").strip().split(":")
@@ -9697,6 +9856,13 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
             now = _now_shanghai_naive()
             _attach_daily_recovery_targets(engine, rows, now=now)
             _attach_research_pool_recovery_target(engine, rows, now=now)
+            release_recovery_request = (
+                _attach_release_analysis_recovery_request(
+                    engine,
+                    rows,
+                    now=now,
+                )
+            )
             if _release_catchup_disabled_for_deferred_database():
                 release_authorized = False
                 release_authorization_reason = "governance_database_deferred"
@@ -9777,6 +9943,11 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                     row,
                     now=now,
                 )
+                release_recovery_requested = (
+                    row.get("_release_analysis_recovery_requested") is True
+                )
+                if release_recovery_requested:
+                    release_catchup_due = True
                 release_catchup_pending = _release_build_catchup_pending(row)
                 membership_ordinary_due = _membership_ordinary_publish_due(
                     row,
@@ -9918,7 +10089,7 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                     )
                     continue
 
-                if release_catchup_due:
+                if release_catchup_due and not release_recovery_requested:
                     release_dependencies_ready, release_dependency_reason = (
                         _release_catchup_dependencies_ready(row, rows, engine=engine)
                     )
@@ -10143,6 +10314,11 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                         task_type=str(row.get("task_type") or "").strip(),
                     )
                     logger.exception("Failed to start scheduler task thread for %s", task_name)
+                else:
+                    if release_recovery_requested and release_recovery_request:
+                        finish_release_analysis_recovery_request(
+                            str(release_recovery_request["request_id"])
+                        )
 
         except Exception as exc:
             logger.error("调度线程异常: %s", exc)
