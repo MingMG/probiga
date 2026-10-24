@@ -24,6 +24,8 @@ ABORT_SCHEMA = "probiga.qmt-edge-precutover-abort.v1"
 FORWARD_PROTOCOL = "probiga.qmt-edge-forward-only-supersession.v1"
 FORWARD_CONTEXT_SCHEMA = FORWARD_PROTOCOL
 FORWARD_SCOPE = "FORWARD_ONLY_SUPERSESSION"
+GRANTED_SUPERSESSION_PROTOCOL = "probiga.qmt-edge-granted-supersession.v1"
+GRANTED_SUPERSESSION_SCHEMA = GRANTED_SUPERSESSION_PROTOCOL
 MAX_FORWARD_SUPERSESSION_DEPTH = 32
 CONTEXT_TASK_NAME = "QMT edge protected pre-cutover context"
 ABORT_TASK_NAME = "QMT edge authorized pre-cutover abort"
@@ -222,6 +224,113 @@ def validate_forward_context(
     return rebuilt
 
 
+def build_granted_supersession_context(
+    *,
+    hold: Mapping[str, Any],
+    predecessor_hold: Mapping[str, Any],
+    predecessor_context: Mapping[str, Any],
+    predecessor_grant: Mapping[str, Any],
+    predecessor_seal_hash: str,
+    superseded_at: Any,
+) -> dict[str, Any]:
+    """Start one new target lineage from a fully validated prior grant.
+
+    This is the only transition that may cross a terminal activation grant.
+    The new hold immediately fences the prior writer; the caller must append a
+    separate target grant before any writer on the new build is authorized.
+    """
+
+    hold = ledger.validate_qmt_edge_release_quiescence_hold(
+        hold, expected_build_sha=str(hold.get("build_sha") or "")
+    )
+    predecessor_hold = ledger.validate_qmt_edge_release_quiescence_hold(
+        predecessor_hold,
+        expected_build_sha=str(predecessor_hold.get("build_sha") or ""),
+    )
+    predecessor_grant = ledger.validate_qmt_edge_release_activation_grant(
+        predecessor_grant, expected_hold=predecessor_hold
+    )
+    if (
+        predecessor_context.get("build_sha") != predecessor_hold["build_sha"]
+        or predecessor_context.get("deployment_attempt_id")
+        != predecessor_hold["deployment_attempt_id"]
+        or predecessor_context.get("hold_run_uid")
+        != predecessor_hold["hold_run_uid"]
+        or predecessor_context.get("hold_hash") != predecessor_hold["hold_hash"]
+        or predecessor_context.get("schema")
+        not in {CONTEXT_SCHEMA, FORWARD_CONTEXT_SCHEMA, GRANTED_SUPERSESSION_SCHEMA}
+    ):
+        raise ledger.QmtEdgeReleaseReceiptError(
+            "granted predecessor context binding differs"
+        )
+    if (
+        hold["build_sha"] == predecessor_hold["build_sha"]
+        or hold["deployment_attempt_id"]
+        == predecessor_hold["deployment_attempt_id"]
+    ):
+        raise ledger.QmtEdgeReleaseReceiptError(
+            "granted supersession repeats predecessor identity"
+        )
+    at = ledger._iso_datetime(superseded_at)
+    if at != hold["requested_at"] or at < predecessor_grant["granted_at"]:
+        raise ledger.QmtEdgeReleaseReceiptError(
+            "granted supersession timestamp differs"
+        )
+    body = {
+        "schema": GRANTED_SUPERSESSION_SCHEMA,
+        "protocol": GRANTED_SUPERSESSION_PROTOCOL,
+        "build_sha": hold["build_sha"],
+        "deployment_attempt_id": hold["deployment_attempt_id"],
+        "context_run_uid": context_uid(hold["deployment_attempt_id"]),
+        "hold_run_uid": hold["hold_run_uid"],
+        "hold_hash": hold["hold_hash"],
+        "supersedes_build_sha": predecessor_hold["build_sha"],
+        "supersedes_deployment_attempt_id": predecessor_hold[
+            "deployment_attempt_id"
+        ],
+        "supersedes_hold_run_uid": predecessor_hold["hold_run_uid"],
+        "supersedes_hold_hash": predecessor_hold["hold_hash"],
+        "supersedes_context_run_uid": predecessor_context["context_run_uid"],
+        "supersedes_context_hash": predecessor_context["context_hash"],
+        "supersedes_activation_run_uid": predecessor_grant["grant_run_uid"],
+        "supersedes_activation_hash": predecessor_grant["grant_hash"],
+        "supersedes_schema_seal_hash": ledger._sha256(
+            predecessor_seal_hash, label="predecessor seal"
+        ),
+        "superseded_at": at,
+        "real_order": False,
+    }
+    return {**body, "context_hash": canonical_digest(body)}
+
+
+def validate_granted_supersession_context(
+    value: Mapping[str, Any] | str,
+    *,
+    hold: Mapping[str, Any],
+    predecessor_hold: Mapping[str, Any],
+    predecessor_context: Mapping[str, Any],
+    predecessor_grant: Mapping[str, Any],
+) -> dict[str, Any]:
+    payload = _payload(value)
+    if payload.get("real_order") is not False:
+        raise ledger.QmtEdgeReleaseReceiptError(
+            "granted supersession boolean types differ"
+        )
+    rebuilt = build_granted_supersession_context(
+        hold=hold,
+        predecessor_hold=predecessor_hold,
+        predecessor_context=predecessor_context,
+        predecessor_grant=predecessor_grant,
+        predecessor_seal_hash=str(payload.get("supersedes_schema_seal_hash") or ""),
+        superseded_at=payload.get("superseded_at"),
+    )
+    if payload != rebuilt:
+        raise ledger.QmtEdgeReleaseReceiptError(
+            "granted supersession content differs"
+        )
+    return rebuilt
+
+
 def build_abort(*, context: Mapping[str, Any], aborted_at: Any) -> dict[str, Any]:
     body = {
         "schema": ABORT_SCHEMA, "protocol": PROTOCOL,
@@ -248,8 +357,14 @@ def _validate_row(connection: Any, row: Mapping[str, Any], payload: Mapping[str,
         expected_task_id=expected_task_id if expected_task_id is not None else ledger._reference_task_id(connection),
         task_name=CONTEXT_TASK_NAME if is_context else ABORT_TASK_NAME,
         status="success", event_at=payload[
-            ("superseded_at" if payload.get("schema") == FORWARD_CONTEXT_SCHEMA else "captured_at")
-            if is_context else "aborted_at"
+            (
+                "superseded_at"
+                if payload.get("schema")
+                in {FORWARD_CONTEXT_SCHEMA, GRANTED_SUPERSESSION_SCHEMA}
+                else "captured_at"
+            )
+            if is_context
+            else "aborted_at"
         ],
         exit_code=0, scheduler_instance_id=payload["deployment_attempt_id"],
         trigger_source=ledger.QMT_EDGE_RELEASE_ACTIVATION_TRIGGER_SOURCE,
@@ -275,8 +390,14 @@ def _insert(connection: Any, payload: Mapping[str, Any], *, kind: str) -> dict[s
         _validate_row(connection, existing, payload, kind=kind)
         return {"status": "idempotent", **payload}
     timestamp = payload[
-        ("superseded_at" if payload.get("schema") == FORWARD_CONTEXT_SCHEMA else "captured_at")
-        if is_context else "aborted_at"
+        (
+            "superseded_at"
+            if payload.get("schema")
+            in {FORWARD_CONTEXT_SCHEMA, GRANTED_SUPERSESSION_SCHEMA}
+            else "captured_at"
+        )
+        if is_context
+        else "aborted_at"
     ]
     connection.execute(text(
         "INSERT INTO st_scheduled_task_history (run_uid, task_id, task_name, task_type, "
@@ -342,7 +463,10 @@ def load_context(
     raw = _payload(row["output"])
     if raw.get("schema") == CONTEXT_SCHEMA:
         payload = validate_context(raw, hold=hold)
-    elif raw.get("schema") == FORWARD_CONTEXT_SCHEMA:
+    elif raw.get("schema") in {
+        FORWARD_CONTEXT_SCHEMA,
+        GRANTED_SUPERSESSION_SCHEMA,
+    }:
         visited = set() if _visited is None else set(_visited)
         current_uid = context_uid(hold["deployment_attempt_id"])
         if current_uid in visited or len(visited) >= MAX_FORWARD_SUPERSESSION_DEPTH:
@@ -359,10 +483,36 @@ def load_context(
         )
         if previous_context is None:
             raise ledger.QmtEdgeReleaseReceiptError("superseded protected context is missing")
-        payload = validate_forward_context(
-            raw, hold=hold, superseded_hold=previous_hold,
-            superseded_context=previous_context,
-        )
+        if raw.get("schema") == FORWARD_CONTEXT_SCHEMA:
+            payload = validate_forward_context(
+                raw,
+                hold=hold,
+                superseded_hold=previous_hold,
+                superseded_context=previous_context,
+            )
+        else:
+            activation_row = _row(
+                connection,
+                ledger.qmt_edge_release_activation_run_uid(
+                    previous_hold["deployment_attempt_id"]
+                ),
+            )
+            if activation_row is None:
+                raise ledger.QmtEdgeReleaseReceiptError(
+                    "granted predecessor activation is missing"
+                )
+            predecessor_grant = ledger._validated_release_activation_row(
+                activation_row,
+                expected_hold=previous_hold,
+                expected_task_id=expected_task_id,
+            )
+            payload = validate_granted_supersession_context(
+                raw,
+                hold=hold,
+                predecessor_hold=previous_hold,
+                predecessor_context=previous_context,
+                predecessor_grant=predecessor_grant,
+            )
     else:
         raise ledger.QmtEdgeReleaseReceiptError("recovery context schema differs")
     _validate_row(connection, row, payload, kind="context", expected_task_id=expected_task_id)
@@ -443,8 +593,11 @@ def writer_allowed_by_latest_context(connection: Any, *, build_sha: str, seal: M
         # Legacy bootstrap is permitted only before any protected context was
         # installed. A later legacy hold cannot revive a superseded writer.
         return not has_protected_context(connection)
-    if context["schema"] == FORWARD_CONTEXT_SCHEMA:
-        # Forward supersession cannot revive either the original prior or any
+    if context["schema"] in {
+        FORWARD_CONTEXT_SCHEMA,
+        GRANTED_SUPERSESSION_SCHEMA,
+    }:
+        # Supersession cannot revive either the original prior or any
         # superseded candidate. The target still needs the normal exact grant.
         return context["build_sha"] == build_sha
     if context["build_sha"] == build_sha:
@@ -475,6 +628,53 @@ def insert_forward_context(connection: Any, context: Mapping[str, Any]) -> dict[
         context, hold=hold, superseded_hold=previous_hold,
         superseded_context=previous_context,
     ), kind="context")
+
+
+def insert_granted_supersession_context(
+    connection: Any, context: Mapping[str, Any]
+) -> dict[str, Any]:
+    hold = latest_hold(connection)
+    if (
+        hold is None
+        or hold["deployment_attempt_id"] != context.get("deployment_attempt_id")
+    ):
+        raise ledger.QmtEdgeReleaseReceiptError(
+            "granted supersession context is not globally latest"
+        )
+    previous_hold = _hold_by_uid(
+        connection, str(context.get("supersedes_hold_run_uid") or "")
+    )
+    previous_context = load_context(connection, previous_hold)
+    if previous_context is None:
+        raise ledger.QmtEdgeReleaseReceiptError(
+            "granted predecessor context is missing"
+        )
+    activation_row = _row(
+        connection,
+        ledger.qmt_edge_release_activation_run_uid(
+            previous_hold["deployment_attempt_id"]
+        ),
+    )
+    if activation_row is None:
+        raise ledger.QmtEdgeReleaseReceiptError(
+            "granted predecessor activation is missing"
+        )
+    predecessor_grant = ledger._validated_release_activation_row(
+        activation_row,
+        expected_hold=previous_hold,
+        expected_task_id=ledger._reference_task_id(connection),
+    )
+    return _insert(
+        connection,
+        validate_granted_supersession_context(
+            context,
+            hold=hold,
+            predecessor_hold=previous_hold,
+            predecessor_context=previous_context,
+            predecessor_grant=predecessor_grant,
+        ),
+        kind="context",
+    )
 
 
 def insert_abort(connection: Any, *, expected_attempt: str, prior_build_sha: str, prior_seal_hash: str, now: datetime) -> dict[str, Any]:

@@ -40,6 +40,10 @@ class _MappingRows:
             "--activation-grant",
             ["--deployment-attempt-id", ATTEMPT_ID],
         ),
+        (
+            "--repair-activation",
+            ["--deployment-attempt-id", ATTEMPT_ID],
+        ),
         ("--activation-grant-latest", []),
         ("--request-compatibility-quiescence", ["--deployment-attempt-id", ATTEMPT_ID]),
         ("--request-recoverable-quiescence", ["--deployment-attempt-id", ATTEMPT_ID,
@@ -269,6 +273,7 @@ def test_grant_attests_the_same_transaction_before_any_ledger_read(
 
 @pytest.mark.parametrize("mode, function_name", [
     ("activation-grant", "append_release_activation_grant"),
+    ("repair-activation", "repair_release_activation"),
     ("request-compatibility-quiescence", "append_release_request_with_quiescence"),
 ])
 def test_activation_grant_cli_never_uses_runtime_engine(

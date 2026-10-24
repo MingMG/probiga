@@ -668,6 +668,111 @@ def test_latest_activation_recovers_lost_attempt_and_commit_output() -> None:
     assert detail["deployment_attempt_id"] == ATTEMPT_C
 
 
+def test_repair_activation_supersedes_only_a_granted_predecessor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _engine()
+    predecessor_prior = "9" * 40
+
+    def seal(build_sha: str) -> dict[str, str]:
+        return {
+            "attested_build_sha": build_sha,
+            "authority": "PRIVILEGED_CUTOVER_TABLE_METADATA_SEAL",
+            "trigger_inventory_server_uuid": (
+                "11111111-2222-3333-4444-555555555555"
+            ),
+            "trigger_inventory_seal_database": "probiga",
+            "trigger_inventory_contract_hash": "4" * 64,
+            "trigger_inventory_table_comment": "verified",
+        }
+
+    monkeypatch.setattr(
+        coordination,
+        "_validate_qmt_edge_release_activation_trigger_seal",
+        lambda _connection, *, expected_build_sha: seal(expected_build_sha),
+    )
+    monkeypatch.setattr(
+        bootstrap, "_assert_recovery_database_identity", lambda *_: None
+    )
+    with engine.begin() as connection:
+        request = coordination.build_qmt_edge_release_request(
+            build_sha=BUILD_SHA, requested_at=REQUESTED_AT
+        )
+        hold = coordination.build_qmt_edge_release_quiescence_hold(
+            build_sha=BUILD_SHA,
+            deployment_attempt_id=ATTEMPT_A,
+            requested_at=REQUESTED_AT,
+        )
+        coordination.insert_qmt_edge_release_request(connection, request)
+        coordination.insert_qmt_edge_release_quiescence_hold(connection, hold)
+        recovery.insert_context(
+            connection,
+            recovery.build_context(
+                hold=hold,
+                prior_build_sha=predecessor_prior,
+                prior_host_name="prior-win",
+                prior_pid=4321,
+                prior_instance_id="prior-win-4321",
+                prior_seal_hash="5" * 64,
+                captured_at=REQUESTED_AT,
+            ),
+        )
+    bootstrap.append_release_activation_grant(
+        engine,
+        expected_build_sha=BUILD_SHA,
+        deployment_attempt_id=ATTEMPT_A,
+        now=REQUESTED_AT + timedelta(minutes=1),
+    )
+
+    repaired = bootstrap.repair_release_activation(
+        engine,
+        expected_build_sha=OTHER_BUILD_SHA,
+        deployment_attempt_id=ATTEMPT_B,
+        now=REQUESTED_AT + timedelta(minutes=2),
+    )
+
+    assert repaired["status"] == "READY"
+    assert repaired["build_sha"] == OTHER_BUILD_SHA
+    assert repaired["deployment_attempt_id"] == ATTEMPT_B
+    assert repaired["database_writes"] is True
+    history = _history(engine)
+    assert any(
+        json.loads(row["output"])["schema"]
+        == recovery.GRANTED_SUPERSESSION_SCHEMA
+        for row in history
+    )
+    with engine.connect() as connection:
+        ready, detail = coordination.check_qmt_edge_release_activation(
+            connection,
+            expected_build_sha=OTHER_BUILD_SHA,
+        )
+        old_writer_allowed = recovery.writer_allowed_by_latest_context(
+            connection,
+            build_sha=BUILD_SHA,
+            seal=seal(BUILD_SHA),
+            expected_task_id=coordination._reference_task_id(connection),
+        )
+        new_writer_allowed = recovery.writer_allowed_by_latest_context(
+            connection,
+            build_sha=OTHER_BUILD_SHA,
+            seal=seal(OTHER_BUILD_SHA),
+            expected_task_id=coordination._reference_task_id(connection),
+        )
+    assert ready is True
+    assert detail["grant"]["grant_run_uid"] == f"qmt-edge-grant-{ATTEMPT_B}"
+    assert old_writer_allowed is False
+    assert new_writer_allowed is True
+
+    retry = bootstrap.repair_release_activation(
+        engine,
+        expected_build_sha=OTHER_BUILD_SHA,
+        deployment_attempt_id=ATTEMPT_B,
+        now=REQUESTED_AT + timedelta(minutes=3),
+    )
+    assert retry["database_writes"] is False
+    assert len(_history(engine)) == len(history)
+
+
 def test_bootstrap_cli_returns_pending_before_qmt_or_receipt_write(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

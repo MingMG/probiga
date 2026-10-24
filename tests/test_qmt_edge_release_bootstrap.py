@@ -748,16 +748,19 @@ def test_release_order_works_outside_cron_and_linux_never_calls_qmt() -> None:
     ).read_text(encoding="utf-8")
 
     schema = deploy.index("CUTOVER_STEP=prepare_strategy_governance_database_schema")
-    request = deploy.index("CUTOVER_STEP=request_qmt_windows_edge_release_bootstrap")
+    activation = deploy.index(
+        "CUTOVER_STEP=repair_qmt_windows_edge_activation"
+    )
     identity = deploy.index("CUTOVER_STEP=wait_for_qmt_windows_edge_identity")
     receipt = deploy.index("CUTOVER_STEP=wait_for_qmt_windows_edge_release_bootstrap")
     readiness = deploy.index(
         "CUTOVER_STEP=read_strategy_governance_qmt_history_readiness_after_schema"
     )
-    assert schema < request < identity < receipt < readiness
-    cutover = deploy[request:readiness]
+    assert schema < activation < identity < receipt < readiness
+    cutover = deploy[activation:readiness]
     assert "sync_guojin_qmt_reference_data.py" not in cutover
-    assert "--request --expected-build-sha" in cutover
+    assert "ensure_qmt_windows_edge_activation" in cutover
+    assert "--repair-activation" in deploy
     assert "--identity-only" in cutover
     assert "--release-bootstrap-only" in cutover
     assert "--writer-drain-timeout-seconds 660" in deploy

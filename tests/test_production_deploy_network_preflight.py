@@ -219,4 +219,6 @@ def test_transport_uses_reviewed_configuration_and_no_persistent_proxy_changes()
     assert "-c http.sslVerify=true" in function(ENGINE, "fetch_adata_git")
     assert "-c remote.origin.proxy=" in function(ENGINE, "fetch_adata_git")
     assert "/usr/bin/git --no-replace-objects -C /" in function(BROKER, "clean_git_ssh")
-    assert ENGINE.index("  prepare_adata_release\n") < ENGINE.index("CUTOVER_STEP=request_qmt_windows_edge_quiescence_before_service_stop")
+    assert ENGINE.index("  prepare_adata_release\n") < ENGINE.index(
+        "CUTOVER_STEP=ensure_inherited_qmt_windows_edge_activation"
+    )

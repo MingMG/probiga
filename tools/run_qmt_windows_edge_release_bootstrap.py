@@ -733,6 +733,183 @@ def append_latest_release_activation_grant(
     )
 
 
+def repair_release_activation(
+    engine: Any,
+    *,
+    expected_build_sha: str,
+    deployment_attempt_id: str,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Finish an exact activation after a completed coordinated cutover.
+
+    A prior terminal grant may be followed by a new target only through the
+    protected granted-supersession context. The new hold fences the predecessor
+    immediately and remains non-writing until its own exact grant is appended.
+    """
+
+    from server.common import qmt_edge_release_receipt as ledger
+
+    target = ledger._build_sha(expected_build_sha)
+    attempt = ledger._deployment_attempt_id(deployment_attempt_id)
+    at = (now or datetime.now()).replace(microsecond=0)
+    wrote = False
+    with recovery.release_control_connection(engine) as connection:
+        _attest_activation_grant_connection(connection)
+        ready, detail = check_qmt_edge_release_activation(
+            connection,
+            expected_build_sha=target,
+            expected_deployment_attempt_id=attempt,
+        )
+        if ready:
+            hold = detail["hold"]
+            grant = detail["grant"]
+            return {
+                "mode": "repair-activation",
+                "status": "READY",
+                "build_sha": target,
+                "deployment_attempt_id": hold["deployment_attempt_id"],
+                "activation_granted": True,
+                "reason_code": "",
+                "request_run_uid": hold["request_run_uid"],
+                "hold_run_uid": hold["hold_run_uid"],
+                "grant_run_uid": grant["grant_run_uid"],
+                "database_writes": False,
+            }
+
+        target_seal = ledger._validate_qmt_edge_release_activation_trigger_seal(
+            connection, expected_build_sha=target
+        )
+        _assert_recovery_database_identity(connection, target_seal)
+        latest = recovery.latest_hold(connection)
+        target_hold: dict[str, Any] | None = None
+        if latest is None:
+            if recovery.has_protected_context(connection):
+                raise RuntimeError(
+                    "RECOVERY_BLOCKED: protected history has no latest hold"
+                )
+            request = ledger.build_qmt_edge_release_request(
+                build_sha=target, requested_at=at
+            )
+            target_hold = ledger.build_qmt_edge_release_quiescence_hold(
+                build_sha=target,
+                deployment_attempt_id=attempt,
+                requested_at=at,
+            )
+            ledger.insert_qmt_edge_release_request(connection, request)
+            ledger.insert_qmt_edge_release_quiescence_hold(
+                connection, target_hold
+            )
+            wrote = True
+        elif latest["build_sha"] == target:
+            context = recovery.load_context(connection, latest)
+            if context is None and recovery.has_protected_context(connection):
+                raise RuntimeError(
+                    "RECOVERY_BLOCKED: target hold has no protected context"
+                )
+            target_hold = latest
+        else:
+            predecessor_context = recovery.load_context(connection, latest)
+            if predecessor_context is None:
+                raise RuntimeError(
+                    "RECOVERY_BLOCKED: predecessor context is missing"
+                )
+            terminal = _release_terminal(
+                connection, latest, predecessor_context
+            )
+            if terminal is None:
+                raise RuntimeError(
+                    "RECOVERY_BLOCKED: predecessor activation is pending"
+                )
+            if terminal[0] != "grant":
+                raise RuntimeError(
+                    "RECOVERY_BLOCKED: predecessor was aborted"
+                )
+            chain = recovery.load_context_chain(connection, latest)
+            if target in {
+                predecessor_hold["build_sha"]
+                for predecessor_hold, _context in chain
+            }:
+                raise RuntimeError(
+                    "RECOVERY_BLOCKED: target already appears in protected history"
+                )
+            predecessor_seal = (
+                ledger._validate_qmt_edge_release_activation_trigger_seal(
+                    connection, expected_build_sha=latest["build_sha"]
+                )
+            )
+            target_hold = ledger.build_qmt_edge_release_quiescence_hold(
+                build_sha=target,
+                deployment_attempt_id=attempt,
+                requested_at=at,
+            )
+            context = recovery.build_granted_supersession_context(
+                hold=target_hold,
+                predecessor_hold=latest,
+                predecessor_context=predecessor_context,
+                predecessor_grant=terminal[1],
+                predecessor_seal_hash=recovery.seal_identity_hash(
+                    predecessor_seal
+                ),
+                superseded_at=at,
+            )
+            request = ledger.build_qmt_edge_release_request(
+                build_sha=target, requested_at=at
+            )
+            ledger.insert_qmt_edge_release_quiescence_hold(
+                connection, target_hold
+            )
+            recovery.insert_granted_supersession_context(
+                connection, context
+            )
+            ledger.insert_qmt_edge_release_request(connection, request)
+            wrote = True
+
+        if target_hold is None:
+            raise RuntimeError("RECOVERY_BLOCKED: target hold is unavailable")
+        _require_existing_release_request(connection, target)
+        grant = ledger.build_qmt_edge_release_activation_grant(
+            hold=target_hold, granted_at=at
+        )
+        ledger.insert_qmt_edge_release_activation_grant(connection, grant)
+        wrote = True
+        ready, detail = check_qmt_edge_release_activation(
+            connection,
+            expected_build_sha=target,
+            expected_deployment_attempt_id=target_hold["deployment_attempt_id"],
+        )
+        if not ready or detail.get("status") != "READY":
+            raise RuntimeError(
+                "RECOVERY_BLOCKED: repaired activation did not read back"
+            )
+    final_hold = detail["hold"]
+    final_grant = detail["grant"]
+    return {
+        "mode": "repair-activation",
+        "status": "READY",
+        "build_sha": target,
+        "deployment_attempt_id": final_hold["deployment_attempt_id"],
+        "activation_granted": True,
+        "reason_code": "",
+        "request_run_uid": final_hold["request_run_uid"],
+        "hold_run_uid": final_hold["hold_run_uid"],
+        "grant_run_uid": final_grant["grant_run_uid"],
+        "database_writes": wrote,
+    }
+
+
+def _require_existing_release_request(
+    connection: Any, expected_build_sha: str
+) -> dict[str, Any]:
+    """Return the exact request already bound to the selected target hold."""
+
+    request = load_existing_qmt_edge_release_request(
+        connection, expected_build_sha=expected_build_sha
+    )
+    if request is None:
+        raise RuntimeError("RECOVERY_BLOCKED: target release request is missing")
+    return request
+
+
 def append_recoverable_release_request(
     engine: Any, runtime_engine: Any, *, expected_build_sha: str,
     prior_build_sha: str, deployment_attempt_id: str,
@@ -1800,6 +1977,7 @@ def main(argv: list[str] | None = None) -> int:
     modes.add_argument("--select-update-target", action="store_true")
     modes.add_argument("--activation-grant", action="store_true")
     modes.add_argument("--activation-grant-latest", action="store_true")
+    modes.add_argument("--repair-activation", action="store_true")
     modes.add_argument("--check-activation", action="store_true")
     modes.add_argument("--check-request", action="store_true")
     modes.add_argument("--check-ready", action="store_true")
@@ -1821,6 +1999,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--expected-scheduler-instance-id is only valid for bootstrap")
     if (
         args.request_quiescence or args.activation_grant
+        or args.repair_activation
         or args.request_compatibility_quiescence
         or args.request_recoverable_quiescence or args.abort_precutover
         or args.request_forward_quiescence
@@ -1834,6 +2013,7 @@ def main(argv: list[str] | None = None) -> int:
             args.request_quiescence
             or args.request_compatibility_quiescence
             or args.activation_grant
+            or args.repair_activation
             or args.check_activation
             or args.request_recoverable_quiescence
             or args.request_forward_quiescence
@@ -1855,7 +2035,15 @@ def main(argv: list[str] | None = None) -> int:
     engine = None
     runtime_engine = None
     try:
-        if args.activation_grant or args.activation_grant_latest or args.request_recoverable_quiescence or args.request_forward_quiescence or args.abort_precutover or args.request_compatibility_quiescence:
+        if (
+            args.activation_grant
+            or args.activation_grant_latest
+            or args.repair_activation
+            or args.request_recoverable_quiescence
+            or args.request_forward_quiescence
+            or args.abort_precutover
+            or args.request_compatibility_quiescence
+        ):
             engine = _create_activation_grant_engine()
             if args.request_recoverable_quiescence or args.request_forward_quiescence or args.abort_precutover:
                 runtime_engine = _create_recovery_runtime_engine()
@@ -1920,6 +2108,12 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif args.activation_grant:
             result = append_release_activation_grant(
+                engine,
+                expected_build_sha=args.expected_build_sha,
+                deployment_attempt_id=args.deployment_attempt_id,
+            )
+        elif args.repair_activation:
+            result = repair_release_activation(
                 engine,
                 expected_build_sha=args.expected_build_sha,
                 deployment_attempt_id=args.deployment_attempt_id,

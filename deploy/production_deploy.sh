@@ -7098,11 +7098,15 @@ controlled_guard_run_qmt_activation_tool() {
   expected_windows_sha="$(controlled_guard_component_sha "$guarded_sha" windows)" || return 1
   [[ "$expected_windows_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
   case "$mode" in
+    --check-activation)
+      test -z "$deployment_attempt_id" || return 1
+      mode_args=("$mode")
+      ;;
     --activation-grant-latest)
       test -z "$deployment_attempt_id" || return 1
       mode_args=("$mode")
       ;;
-    --activation-grant|--request-compatibility-quiescence)
+    --activation-grant|--repair-activation|--request-compatibility-quiescence)
       [[ "$deployment_attempt_id" =~ ^[0-9a-f]{32}$ ]] || return 1
       mode_args=("$mode" --deployment-attempt-id "$deployment_attempt_id")
       ;;
@@ -7228,6 +7232,83 @@ valid = (
 )
 raise SystemExit(0 if valid else 2)
 ' "$expected_sha" "$expected_mode" "$expected_attempt"
+}
+controlled_guard_validate_qmt_repair_json() {
+  local validation_python="$1"
+  local expected_sha="$2"
+  local expected_attempt="$3"
+  "$validation_python" -I -c '
+import json
+import sys
+
+payload = json.load(sys.stdin)
+expected_sha, expected_attempt = sys.argv[1:]
+expected_fields = {
+    "mode", "status", "build_sha", "deployment_attempt_id",
+    "activation_granted", "reason_code", "request_run_uid",
+    "hold_run_uid", "grant_run_uid", "database_writes",
+}
+valid = (
+    isinstance(payload, dict)
+    and set(payload) == expected_fields
+    and payload.get("mode") == "repair-activation"
+    and payload.get("status") == "READY"
+    and payload.get("build_sha") == expected_sha
+    and payload.get("deployment_attempt_id") == expected_attempt
+    and payload.get("activation_granted") is True
+    and payload.get("reason_code") == ""
+    and payload.get("request_run_uid") == f"qmt-edge-request-{expected_sha}"
+    and payload.get("hold_run_uid") == f"qmt-edge-hold-{expected_attempt}"
+    and payload.get("grant_run_uid") == f"qmt-edge-grant-{expected_attempt}"
+    and type(payload.get("database_writes")) is bool
+)
+raise SystemExit(0 if valid else 2)
+' "$expected_sha" "$expected_attempt"
+}
+ensure_qmt_windows_edge_activation() {
+  local expected_windows_sha
+  local repair_output
+  local check_output
+  expected_windows_sha="$(
+    controlled_guard_component_sha "$EXPECTED_SHA" windows
+  )" || return 1
+  [[ "$expected_windows_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  repair_output="$(controlled_guard_run_qmt_activation_tool \
+    "$PREPARED_CODE_ROOT" "$RELEASE_VENV_ROOT/$EXPECTED_SHA" \
+    "$EXPECTED_SHA" --repair-activation \
+    "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID")" || return 1
+  printf '%s\n' "$repair_output"
+  printf '%s' "$repair_output" | controlled_guard_validate_qmt_repair_json \
+    "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" \
+    "$expected_windows_sha" "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" || return 1
+  check_output="$(controlled_guard_run_qmt_activation_tool \
+    "$PREPARED_CODE_ROOT" "$RELEASE_VENV_ROOT/$EXPECTED_SHA" \
+    "$EXPECTED_SHA" --check-activation)" || return 1
+  printf '%s\n' "$check_output"
+  printf '%s' "$check_output" | \
+    "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -I -c '
+import json
+import sys
+
+payload = json.load(sys.stdin)
+expected = sys.argv[1]
+hold = payload.get("hold") if isinstance(payload, dict) else None
+grant = payload.get("grant") if isinstance(payload, dict) else None
+valid = (
+    payload.get("mode") == "check-activation"
+    and payload.get("status") == "READY"
+    and payload.get("build_sha") == expected
+    and payload.get("activation_granted") is True
+    and payload.get("reason_code") == ""
+    and payload.get("database_writes") is False
+    and isinstance(hold, dict)
+    and isinstance(grant, dict)
+    and hold.get("build_sha") == expected
+    and grant.get("build_sha") == expected
+    and grant.get("hold_hash") == hold.get("hold_hash")
+)
+raise SystemExit(0 if valid else 2)
+' "$expected_windows_sha" || return 1
 }
 controlled_guard_run_writer_fence() {
   local adata_sha="$5"
@@ -15359,6 +15440,8 @@ prebuild_reclaim_release_space
 CUTOVER_STEP=prepare_release
 prepare_release
 if [ "$RELEASE_SCOPE" = LINUX ]; then
+  CUTOVER_STEP=ensure_inherited_qmt_windows_edge_activation
+  ensure_qmt_windows_edge_activation
   CUTOVER_STEP=activate_linux_components
   activate_linux_release
   # This branch ends before schema preflight, writer fencing, task mutations,
@@ -15639,19 +15722,15 @@ CUTOVER_STEP=verify_qmt_local_history_provenance_schema_after_cutover
 run_prepared_python_tool \
   "$PREPARED_CODE_ROOT/tools/migrate_qmt_local_history_provenance.py" \
   --check-via-primary
-# The Windows updater stops the old edge before this schema cutover, consumes
-# only the post-schema request above, starts the new-SHA daemon, and performs
-# the native QMT capture.  Linux only polls read-only proofs; it never imports
-# or invokes the Windows QMT runtime.
+# A coordinated build must have an exact target hold, protected lineage and
+# post-cutover grant even when its Windows wait is deferred. The repair is
+# idempotent, fences the predecessor immediately, and never starts QMT.
+CUTOVER_STEP=repair_qmt_windows_edge_activation
+ensure_qmt_windows_edge_activation
+# A deferred release still leaves a terminal grant for the background Windows
+# updater. A blocking release additionally proves the exact new heartbeat and
+# native bootstrap receipt before Linux service activation continues.
 if [ "$QMT_EDGE_DEPLOY_BLOCKING" -eq 1 ]; then
-CUTOVER_STEP=request_qmt_windows_edge_release_bootstrap
-QMT_EDGE_REQUEST_OUTPUT="$(run_prepared_python_tool \
-  "$PREPARED_CODE_ROOT/tools/run_qmt_windows_edge_release_bootstrap.py" \
-  --request --expected-build-sha "$EXPECTED_SHA" --compact)"
-printf '%s\n' "$QMT_EDGE_REQUEST_OUTPUT"
-printf '%s' "$QMT_EDGE_REQUEST_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
-  'import json,re,sys; p=json.load(sys.stdin); ok=isinstance(p,dict) and p.get("mode")=="request" and p.get("status") in {"inserted","idempotent"} and p.get("build_sha")==sys.argv[1] and p.get("database_writes") is True and re.fullmatch(r"qmt-edge-request-[0-9a-f]{40}",str(p.get("request_run_uid") or "")); raise SystemExit(0 if ok else 2)' \
-  "$EXPECTED_SHA"
 CUTOVER_STEP=wait_for_qmt_windows_edge_identity
 QMT_EDGE_WAIT_DEADLINE=$((SECONDS + 900))
 QMT_EDGE_IDENTITY_OUTPUT=""
@@ -15689,7 +15768,7 @@ printf '%s' "$QMT_EDGE_BOOTSTRAP_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
   "$EXPECTED_SHA"
 else
   CUTOVER_STEP=defer_qmt_windows_edge_release_bootstrap
-  echo "QMT Windows edge bootstrap wait skipped; the pre-cutover request is scheduler-owned" >&2
+  echo "QMT Windows edge bootstrap wait skipped; exact activation remains scheduler-owned" >&2
 fi
 CUTOVER_STEP=read_strategy_governance_qmt_history_readiness_after_schema
 if [ "$QMT_HISTORY_DEPLOY_BLOCKING" -eq 1 ]; then

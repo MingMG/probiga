@@ -1600,12 +1600,12 @@ def test_qmt_history_and_reference_reads_start_only_after_schema_cutover() -> No
         "CUTOVER_STEP=verify_qmt_local_history_provenance_schema_after_cutover",
         schema_recover,
     )
-    release_request = normalized.index(
-        "CUTOVER_STEP=request_qmt_windows_edge_release_bootstrap",
+    release_activation = normalized.index(
+        "CUTOVER_STEP=repair_qmt_windows_edge_activation",
         provenance_check,
     )
     edge_identity = normalized.index(
-        "CUTOVER_STEP=wait_for_qmt_windows_edge_identity", release_request
+        "CUTOVER_STEP=wait_for_qmt_windows_edge_identity", release_activation
     )
     edge_bootstrap = normalized.index(
         "CUTOVER_STEP=wait_for_qmt_windows_edge_release_bootstrap",
@@ -1630,7 +1630,7 @@ def test_qmt_history_and_reference_reads_start_only_after_schema_cutover() -> No
     assert (
         schema_recover
         < provenance_check
-        < release_request
+        < release_activation
         < edge_identity
         < edge_bootstrap
         < readiness
@@ -1664,8 +1664,12 @@ def test_qmt_history_and_reference_reads_start_only_after_schema_cutover() -> No
     assert "deferring data catch-up" in announcement_body
     assert 'test "$QMT_ANNOUNCEMENT_RUN_STATUS" -eq 0' not in announcement_body
     assert "sync_guojin_qmt_reference_data.py" not in body
-    assert "run_qmt_windows_edge_release_bootstrap.py" in body
-    assert "--request --expected-build-sha \"$EXPECTED_SHA\"" in body
+    assert "ensure_qmt_windows_edge_activation" in body
+    activation_helper = _shell_function_bodies(deploy_script)[
+        "ensure_qmt_windows_edge_activation"
+    ]
+    assert "controlled_guard_run_qmt_activation_tool" in activation_helper
+    assert "--repair-activation" in activation_helper
     assert "--identity-only --expected-build-sha \"$EXPECTED_SHA\"" in body
     assert "--release-bootstrap-only" in body
     assert body.count("--expected-poll-seconds 60 --compact") == 2
@@ -3160,10 +3164,10 @@ def test_strategy_schema_preflight_cutover_and_recovery_order_fail_closed() -> N
     assert "sync_guojin_qmt_reference_data.py" not in preflight_command
     assert "--readiness-only" in recover_command
     assert "sync_guojin_qmt_reference_data.py" not in recover_command
-    assert "run_qmt_windows_edge_release_bootstrap.py" in recover_command
-    assert "--request --expected-build-sha \"$EXPECTED_SHA\"" in (
-        recover_command
-    )
+    assert "ensure_qmt_windows_edge_activation" in recover_command
+    assert "--repair-activation" in _shell_function_bodies(deploy_script)[
+        "ensure_qmt_windows_edge_activation"
+    ]
     assert "--identity-only --expected-build-sha \"$EXPECTED_SHA\"" in (
         recover_command
     )
