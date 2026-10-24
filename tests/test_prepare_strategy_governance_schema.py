@@ -5680,6 +5680,19 @@ def test_cutover_diagnostics_bound_cyclic_cause_chain_without_stringifying():
     assert "private" not in json.dumps(payload)
 
 
+def test_cutover_diagnostics_report_only_internal_exception_type():
+    outer = schema.PrivilegedSchemaPreparationError(
+        "cutover diagnostic substage failed closed"
+    )
+    outer.__cause__ = KeyError("private key value")
+
+    assert schema._safe_cutover_failure_code(outer) == (
+        "CUTOVER_INTERNAL_KEYERROR"
+    )
+    payload = schema._public_failure_payload(outer, phase="cutover")
+    assert "private" not in json.dumps(payload)
+
+
 def test_cutover_scope_preserves_innermost_stage_and_explicit_cause():
     cause = pymysql.err.OperationalError(1213, "private deadlock SQL")
     with pytest.raises(schema.PrivilegedSchemaPreparationError) as caught:

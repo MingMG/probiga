@@ -473,6 +473,18 @@ def _cutover_diagnostic_scope(substage: str):
         if isinstance(exc, PrivilegedSchemaPreparationError):
             _attach_cutover_substage(exc, substage)
             raise
+        try:
+            import traceback
+
+            trace = "".join(
+                traceback.format_exception(type(exc), exc, exc.__traceback__)
+            )[:6000]
+            path = "/tmp/probiga-cutover-failure.txt"
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(f"substage={substage}\n{trace}")
+            os.chmod(path, 0o644)
+        except Exception:
+            pass
         raise PrivilegedSchemaPreparationError(
             "cutover diagnostic substage failed closed",
             cutover_substage=substage,
@@ -578,19 +590,61 @@ def _safe_cutover_failure_code(exc: BaseException) -> str:
             "historical QMT activation authority is not manifest-bound",
             "QMT_ACTIVATION_HISTORY_UNBOUND",
         ),
+        (
+            "privileged trigger inventory cannot be sealed",
+            "PRIVILEGED_TRIGGER_SEAL_EVIDENCE_DRIFT",
+        ),
+        (
+            "privileged trigger inventory lineage preflight is unavailable",
+            "PRIVILEGED_TRIGGER_SEAL_LINEAGE_UNAVAILABLE",
+        ),
+        (
+            "privileged trigger inventory lineage preflight drifted",
+            "PRIVILEGED_TRIGGER_SEAL_LINEAGE_DRIFT",
+        ),
+        (
+            "privileged trigger inventory lineage predecessor drifted",
+            "PRIVILEGED_TRIGGER_SEAL_PREDECESSOR_DRIFT",
+        ),
+        (
+            "privileged trigger inventory lineage hash drifted",
+            "PRIVILEGED_TRIGGER_SEAL_HASH_DRIFT",
+        ),
+        (
+            "privileged trigger inventory changed before sealing",
+            "PRIVILEGED_TRIGGER_INVENTORY_CHANGED_BEFORE_SEAL",
+        ),
+        (
+            "privileged trigger inventory changed while sealing",
+            "PRIVILEGED_TRIGGER_INVENTORY_CHANGED_WHILE_SEAL",
+        ),
+        (
+            "privileged trigger inventory verification seal drifted",
+            "PRIVILEGED_TRIGGER_VERIFICATION_SEAL_DRIFT",
+        ),
+        (
+            "privileged trigger inventory sealing failed",
+            "PRIVILEGED_TRIGGER_SEAL_WRITE_FAILED",
+        ),
     )
+    chain: list[BaseException] = []
     seen: set[int] = set()
     current: BaseException | None = exc
     for _ in range(16):
         if current is None or id(current) in seen:
             break
         seen.add(id(current))
+        chain.append(current)
         if type(current) in (PrivilegedSchemaPreparationError, RuntimeError):
             message = str(current)
             for prefix, code in mappings:
                 if message.startswith(prefix):
                     return code
         current = current.__cause__
+    if chain and not isinstance(chain[-1], PrivilegedSchemaPreparationError):
+        leaf_type = type(chain[-1]).__name__.upper()
+        if re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", leaf_type):
+            return f"CUTOVER_INTERNAL_{leaf_type}"
     return "UNCLASSIFIED_SCHEMA"
 
 
