@@ -1561,6 +1561,11 @@ def test_lineage_live_inventory_accepts_only_exact_release_tiers(
     )
     monkeypatch.setattr(
         schema,
+        "_release_trigger_source_contract_hash",
+        lambda _contracts: schema.EXPECTED_MANAGED_RELEASE_TRIGGER_SOURCE_HASH,
+    )
+    monkeypatch.setattr(
+        schema,
         "validate_full_database_trigger_inventory",
         lambda *_args, **_kwargs: {
             "observed_count": len(observed),
@@ -1592,7 +1597,7 @@ def test_lineage_live_inventory_rejects_partial_release_tier(monkeypatch):
 
     with pytest.raises(
         schema.PrivilegedSchemaPreparationError,
-        match="not an exact release tier",
+        match="incomplete boundary",
     ):
         schema._validated_lineage_live_trigger_inventory(
             object(),
@@ -1601,7 +1606,46 @@ def test_lineage_live_inventory_rejects_partial_release_tier(monkeypatch):
         )
 
 
-@pytest.mark.parametrize("live_tier", ("managed", "base", "full"))
+def test_lineage_live_inventory_allows_repairable_partial_v4(monkeypatch):
+    managed = {"managed_trigger": object()}
+    v2_names = frozenset(schema._v2_release_trigger_contract()[0])
+    observed = {*managed, *v2_names, "trg_optional_v4_present"}
+    monkeypatch.setattr(
+        schema,
+        "_all_database_trigger_inventory",
+        lambda _connection: {name: {} for name in observed},
+    )
+    monkeypatch.setattr(
+        schema,
+        "validate_release_trigger_contracts",
+        lambda *_args, **_kwargs: {
+            "observed_count": len(managed),
+            "metadata_frozen": True,
+        },
+    )
+    monkeypatch.setattr(
+        schema,
+        "_release_trigger_source_contract_hash",
+        lambda _contracts: schema.EXPECTED_MANAGED_RELEASE_TRIGGER_SOURCE_HASH,
+    )
+
+    detail = schema._validated_lineage_live_trigger_inventory(
+        object(),
+        managed_contracts=managed,
+        optional_v4_names=frozenset({
+            "trg_optional_v4_present",
+            "trg_optional_v4_missing",
+        }),
+    )
+
+    assert detail["live_inventory_tier"] == "REPAIRABLE_V4_PARTIAL"
+    assert detail["optional_v4_count"] == 1
+    assert detail["managed_source_contract_sha256"] == (
+        schema._release_trigger_source_contract_hash(managed)
+    )
+
+
+@pytest.mark.parametrize("live_tier", ("managed", "base", "v4_partial", "full"))
 def test_privileged_inventory_lineage_recovers_missing_previous_seal_from_exact_inventory(
     monkeypatch,
     live_tier,
@@ -1631,21 +1675,23 @@ def test_privileged_inventory_lineage_recovers_missing_previous_seal_from_exact_
         ),
     }
     v2_names = frozenset(schema._v2_release_trigger_contract()[0])
-    optional_v4_names = (
-        frozenset(
-            matched.group(1)
-            for migration in migrations_v4.MIGRATIONS
-            for statement in migration["statements"]
-            if (
-                matched := schema._CREATE_TRIGGER_RE.match(
-                    str(statement).strip()
-                )
+    all_optional_v4_names = frozenset(
+        matched.group(1)
+        for migration in migrations_v4.MIGRATIONS
+        for statement in migration["statements"]
+        if (
+            matched := schema._CREATE_TRIGGER_RE.match(
+                str(statement).strip()
             )
-            is not None
         )
-        if live_tier == "full"
-        else frozenset()
+        is not None
     )
+    if live_tier == "full":
+        optional_v4_names = all_optional_v4_names
+    elif live_tier == "v4_partial":
+        optional_v4_names = frozenset({sorted(all_optional_v4_names)[0]})
+    else:
+        optional_v4_names = frozenset()
     expected_names = set(managed) | set(optional_v4_names)
     if live_tier != "managed":
         expected_names.update(v2_names)
@@ -1659,6 +1705,7 @@ def test_privileged_inventory_lineage_recovers_missing_previous_seal_from_exact_
         "v2_count": len(v2_names) if live_tier != "managed" else 0,
         "managed_count": schema.EXPECTED_MANAGED_RELEASE_TRIGGER_COUNT,
         "optional_v4_count": len(optional_v4_names),
+        "observed_optional_v4_names": sorted(optional_v4_names),
         "managed_source_contract_sha256": (
             schema.EXPECTED_MANAGED_RELEASE_TRIGGER_SOURCE_HASH
         ),
@@ -1668,13 +1715,16 @@ def test_privileged_inventory_lineage_recovers_missing_previous_seal_from_exact_
         "live_inventory_tier": {
             "managed": "MANAGED_102_PRE_V2",
             "base": "BASE_143",
+            "v4_partial": "REPAIRABLE_V4_PARTIAL",
             "full": "FULL_175",
         }[live_tier],
     }
     monkeypatch.setattr(
         schema,
-        "_validated_optional_v4_trigger_names",
-        lambda _engine: optional_v4_names,
+        "_frozen_optional_v4_trigger_contracts",
+        lambda _engine: {
+            name: object() for name in all_optional_v4_names
+        },
     )
     monkeypatch.setattr(
         schema,
@@ -1738,8 +1788,10 @@ def test_privileged_inventory_lineage_recovery_rejects_inventory_drift(
     )
     monkeypatch.setattr(
         schema,
-        "_validated_optional_v4_trigger_names",
-        lambda _engine: optional_v4_names,
+        "_frozen_optional_v4_trigger_contracts",
+        lambda _engine: {
+            name: object() for name in optional_v4_names
+        },
     )
     monkeypatch.setattr(
         schema,
@@ -1750,6 +1802,7 @@ def test_privileged_inventory_lineage_recovery_rejects_inventory_drift(
             ),
             "observed_count": 0,
             "live_inventory_tier": "FULL_175",
+                "observed_optional_v4_names": sorted(optional_v4_names),
             "read_only": True,
         },
     )

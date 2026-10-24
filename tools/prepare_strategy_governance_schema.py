@@ -526,6 +526,46 @@ def _safe_cutover_failure_category(exc: BaseException) -> tuple[str, int | None]
     return "INTERNAL_ERROR", None
 
 
+def _safe_cutover_failure_code(exc: BaseException) -> str:
+    """Map known schema failures to fixed codes without emitting error text."""
+
+    mappings = (
+        (
+            "previous privileged trigger seal is not rollback-compatible",
+            "PRIVILEGED_TRIGGER_SEAL_LINEAGE_MISMATCH",
+        ),
+        (
+            "previous privileged trigger inventory contains an incomplete boundary",
+            "PRIVILEGED_TRIGGER_INVENTORY_BOUNDARY_INCOMPLETE",
+        ),
+        (
+            "optional V4 trigger inventory is partial",
+            "OPTIONAL_V4_TRIGGER_INVENTORY_PARTIAL",
+        ),
+        (
+            "V4 job lease trigger drift detected",
+            "V4_JOB_LEASE_TRIGGER_DRIFT",
+        ),
+        (
+            "optional V4 trigger source contract differs",
+            "OPTIONAL_V4_TRIGGER_SOURCE_CONTRACT_DRIFT",
+        ),
+    )
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    for _ in range(16):
+        if current is None or id(current) in seen:
+            break
+        seen.add(id(current))
+        if type(current) in (PrivilegedSchemaPreparationError, RuntimeError):
+            message = str(current)
+            for prefix, code in mappings:
+                if message.startswith(prefix):
+                    return code
+        current = current.__cause__
+    return "UNCLASSIFIED_SCHEMA"
+
+
 @contextmanager
 def _preflight_diagnostic_scope(substage: str):
     """Attach one allow-listed diagnostic identity without exposing errors."""
@@ -1924,13 +1964,20 @@ def _frozen_optional_v4_trigger_contracts(
     return contracts
 
 
-def _validated_optional_v4_trigger_names(engine: Engine) -> frozenset[str]:
-    """Return the optional V4 group only when its physical inventory is exact."""
+def _physical_optional_v4_trigger_names(engine: Engine) -> frozenset[str]:
+    """Return the present members of the frozen optional V4 trigger group."""
 
     frozen_names = frozenset(_frozen_optional_v4_trigger_contracts(engine))
     with engine.connect() as connection:
         observed_names = frozenset(_all_database_trigger_inventory(connection))
-    present = observed_names & frozen_names
+    return observed_names & frozen_names
+
+
+def _validated_optional_v4_trigger_names(engine: Engine) -> frozenset[str]:
+    """Return the optional V4 group only when its physical inventory is exact."""
+
+    frozen_names = frozenset(_frozen_optional_v4_trigger_contracts(engine))
+    present = _physical_optional_v4_trigger_names(engine)
     if not present:
         return frozenset()
     if present == frozen_names:
@@ -3990,40 +4037,47 @@ def _validated_lineage_live_trigger_inventory(
     managed_contracts: Mapping[str, TriggerContract],
     optional_v4_names: frozenset[str],
 ) -> dict[str, Any]:
-    """Accept only the exact pre-V2, base, or full release inventory tiers."""
+    """Validate every pre-cutover trigger while allowing repairable V4 gaps."""
 
     managed_names = frozenset(managed_contracts)
     v2_names = frozenset(_v2_release_trigger_contract()[0])
     observed_names = frozenset(_all_database_trigger_inventory(connection))
-    managed_only_names = managed_names
-    base_names = frozenset({*managed_names, *v2_names})
-    full_names = frozenset({*base_names, *optional_v4_names})
-    if observed_names == managed_only_names:
-        tier = "MANAGED_102_PRE_V2"
-        detail = validate_release_trigger_contracts(
-            connection,
-            required=managed_contracts,
-            optional={},
-            controlled_contracts=managed_contracts,
+    allowed_names = frozenset({
+        *managed_names,
+        *v2_names,
+        *optional_v4_names,
+    })
+    observed_v2_names = observed_names & v2_names
+    if (
+        not managed_names <= observed_names
+        or not observed_names <= allowed_names
+        or (
+            observed_v2_names
+            and observed_v2_names != v2_names
         )
-    elif observed_names == base_names:
-        tier = "BASE_143"
-        detail = validate_full_database_trigger_inventory(
-            connection,
-            managed_contracts=managed_contracts,
-            include_applied_v4=False,
+        or (
+            observed_names & optional_v4_names
+            and observed_v2_names != v2_names
         )
-    elif observed_names == full_names:
-        tier = "FULL_175"
-        detail = validate_full_database_trigger_inventory(
-            connection,
-            managed_contracts=managed_contracts,
-            include_applied_v4=True,
-        )
-    else:
+    ):
         raise PrivilegedSchemaPreparationError(
-            "previous privileged trigger inventory is not an exact release tier"
+            "previous privileged trigger inventory contains an incomplete boundary"
         )
+    detail = validate_release_trigger_contracts(
+        connection,
+        required=managed_contracts,
+        optional={},
+        controlled_contracts=managed_contracts,
+    )
+    observed_optional_names = observed_names & optional_v4_names
+    if observed_optional_names == optional_v4_names and optional_v4_names:
+        tier = "FULL_175"
+    elif observed_optional_names:
+        tier = "REPAIRABLE_V4_PARTIAL"
+    elif observed_v2_names:
+        tier = "BASE_143"
+    else:
+        tier = "MANAGED_102_PRE_V2"
     return {
         **detail,
         "live_inventory_tier": tier,
@@ -4031,7 +4085,11 @@ def _validated_lineage_live_trigger_inventory(
         "observed_count": len(observed_names),
         "v2_count": len(v2_names & observed_names),
         "managed_count": len(managed_contracts),
-        "optional_v4_count": len(optional_v4_names),
+        "managed_source_contract_sha256": (
+            _release_trigger_source_contract_hash(managed_contracts)
+        ),
+        "optional_v4_count": len(observed_optional_names),
+        "observed_optional_v4_names": sorted(observed_optional_names),
         "nameset_sha256": _full_release_trigger_nameset_hash(observed_names),
         "metadata_frozen": True,
         "read_only": True,
@@ -4249,10 +4307,10 @@ def _privileged_trigger_inventory_lineage_preflight(
                     _non_v3_trigger_contracts()
                 ),
             }
-            optional_v4_names = _validated_optional_v4_trigger_names(
+            optional_v4_contracts = _frozen_optional_v4_trigger_contracts(
                 boundary.migrator_engine
             )
-            optional_v4_count = len(optional_v4_names)
+            optional_v4_names = frozenset(optional_v4_contracts)
             with boundary.migrator_engine.connect() as connection:
                 missing_previous_seal_inventory = (
                     _validated_lineage_live_trigger_inventory(
@@ -4267,12 +4325,20 @@ def _privileged_trigger_inventory_lineage_preflight(
             live_inventory_tier = (
                 missing_previous_seal_inventory.get("live_inventory_tier")
             )
+            present_optional_v4_names = frozenset(
+                missing_previous_seal_inventory.get(
+                    "observed_optional_v4_names",
+                    [],
+                )
+            )
+            optional_v4_count = len(present_optional_v4_names)
             includes_v2_guards = (
-                optional_v4_count > 0 or live_inventory_tier == "BASE_143"
+                live_inventory_tier
+                in {"BASE_143", "FULL_175", "REPAIRABLE_V4_PARTIAL"}
             )
             expected_live_names = {
                 *current_managed,
-                *optional_v4_names,
+                *present_optional_v4_names,
                 *(
                     _v2_release_trigger_contract()[0]
                     if includes_v2_guards
@@ -4286,9 +4352,14 @@ def _privileged_trigger_inventory_lineage_preflight(
                 previous_identity["compatibility_hash"]
                 != identity["compatibility_hash"]
                 or optional_v4_count
-                not in {0, EXPECTED_OPTIONAL_V4_TRIGGER_COUNT}
+                not in range(EXPECTED_OPTIONAL_V4_TRIGGER_COUNT + 1)
                 or live_inventory_tier
-                not in {"MANAGED_102_PRE_V2", "BASE_143", "FULL_175"}
+                not in {
+                    "MANAGED_102_PRE_V2",
+                    "BASE_143",
+                    "REPAIRABLE_V4_PARTIAL",
+                    "FULL_175",
+                }
                 or missing_previous_seal_inventory.get("expected_count")
                 != missing_previous_seal_inventory.get("observed_count")
                 or missing_previous_seal_inventory.get("expected_count")
@@ -5973,6 +6044,7 @@ def _public_failure_payload(exc: BaseException, *, phase: str) -> dict[str, Any]
         payload.update({
             "cutover_diagnostic_schema": CUTOVER_DIAGNOSTIC_SCHEMA,
             "cutover_substage": cutover_substage,
+            "cutover_error_code": _safe_cutover_failure_code(exc),
             "failure_category": category,
             "mysql_errno": mysql_errno,
         })
