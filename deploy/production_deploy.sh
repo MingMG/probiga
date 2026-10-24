@@ -759,6 +759,34 @@ def require_acquisition_shards(parent_fd, name, depth=0):
     finally:
         os.close(descriptor)
 
+def require_analysis_diagnostics(parent_fd, name):
+    observed = os.lstat(name, dir_fd=parent_fd)
+    if not (stat.S_ISDIR(observed.st_mode)
+            and observed.st_uid == expected_uid and observed.st_gid == expected_gid
+            and stat.S_IMODE(observed.st_mode) in {0o700, 0o755}):
+        raise SystemExit("unsafe analysis diagnostics root")
+    descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         dir_fd=parent_fd)
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (observed.st_dev, observed.st_ino):
+            raise SystemExit("analysis diagnostics directory changed")
+        for child in os.listdir(descriptor):
+            if re.fullmatch(
+                r"(?:[0-9a-f]{32}\.(?:progress\.json|stack\.log)"
+                r"|\.[0-9a-f]{32}\.progress\.json\.tmp)",
+                child,
+            ) is None:
+                raise SystemExit("unsafe analysis diagnostics entry")
+            metadata = os.lstat(child, dir_fd=descriptor)
+            if not (stat.S_ISREG(metadata.st_mode)
+                    and metadata.st_uid == expected_uid and metadata.st_gid == expected_gid
+                    and metadata.st_nlink == 1
+                    and stat.S_IMODE(metadata.st_mode) in {0o600, 0o644}):
+                raise SystemExit("unsafe analysis diagnostics file")
+    finally:
+        os.close(descriptor)
+
 directory_fd = os.open(
     root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 )
