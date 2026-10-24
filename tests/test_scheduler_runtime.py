@@ -1744,6 +1744,23 @@ class SchedulerRuntimeTest(unittest.TestCase):
                 )
             )
 
+    def test_free_daily_market_skips_on_non_trading_day(self):
+        row = {
+            "task_type": "free_stock_daily_canonical",
+            "script_path": "tools/sync_free_stock_daily.py",
+            "script_args": "--date latest --json",
+        }
+        with patch(
+            "server.api.scheduler_runtime._is_trade_day",
+            return_value=False,
+        ):
+            self.assertTrue(
+                scheduler_runtime._should_skip_non_trading_day(
+                    row,
+                    MagicMock(),
+                )
+            )
+
     def test_news_tasks_do_not_skip_on_non_trading_day(self):
         row = {
             "task_type": "news_sync",

@@ -427,6 +427,7 @@ NON_TRADING_DAY_SKIP_TYPES = {
     "qmt_index_kline",
     "qmt_index_minute",
     "qmt_stock_daily_canonical",
+    "free_stock_daily_canonical",
     "qmt_stock_minute_canonical",
     "qmt_stock_minute_flow_canonical",
     "quality_check_post",
