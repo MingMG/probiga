@@ -1407,7 +1407,7 @@ function Assert-QmtColdStartEvidence($Heartbeat, $Client) {
         [string](Get-HeartbeatProperty $Heartbeat "source") -cne `
             "gj_big_qmt_inner" -or
         [string](Get-HeartbeatProperty $Heartbeat "status") -cnotin @(
-            "running", "busy"
+            "running", "busy", "stopped"
         ) -or
         $HeartbeatPid -le 0 -or
         $HeartbeatPid -eq [int]$Client.Id -or

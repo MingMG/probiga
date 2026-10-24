@@ -424,6 +424,8 @@ $Fresh = $Stale | Select-Object *
 $Fresh.updated_ts = 995.0
 $Prior = $Mismatch | Select-Object *
 $Prior.updated_ts = 900.0
+$StoppedPrior = $Prior | Select-Object *
+$StoppedPrior.status = "stopped"
 $NotPrior = $Mismatch | Select-Object *
 $NotPrior.updated_ts = 960.0
 $Timer = [Diagnostics.Stopwatch]::StartNew()
@@ -442,6 +444,9 @@ $FreshReason = Get-ReasonCode {{
 $ColdStartReason = Get-ReasonCode {{
     Assert-QmtColdStartEvidence $Prior $LoggedIn
 }}
+$StoppedColdStartReason = Get-ReasonCode {{
+    Assert-QmtColdStartEvidence $StoppedPrior $LoggedIn
+}}
 $InvalidColdStartReason = Get-ReasonCode {{
     Assert-QmtColdStartEvidence $NotPrior $LoggedIn
 }}
@@ -452,6 +457,7 @@ $Timer.Stop()
     stale_reason = $StaleReason
     fresh_reason = $FreshReason
     cold_start_reason = $ColdStartReason
+    stopped_cold_start_reason = $StoppedColdStartReason
     invalid_cold_start_reason = $InvalidColdStartReason
     elapsed_ms = $Timer.ElapsedMilliseconds
 }} | ConvertTo-Json -Compress
@@ -463,6 +469,7 @@ $Timer.Stop()
     assert result["stale_reason"] == "QMT_HEARTBEAT_STALE"
     assert result["fresh_reason"] == "NONE"
     assert result["cold_start_reason"] == "NONE"
+    assert result["stopped_cold_start_reason"] == "NONE"
     assert result["invalid_cold_start_reason"] == (
         "QMT_COLD_START_EVIDENCE_INVALID"
     )
