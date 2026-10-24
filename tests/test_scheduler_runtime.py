@@ -5015,6 +5015,18 @@ def test_analysis_fast_owns_the_exclusive_full_market_lane():
         "task_type": "analysis_fast",
         "script_path": "tools/run_ai_recommendation_premarket.py",
     })
+    normal = {"id": 3, "task_type": "daily_review"}
+    recovery = {
+        "id": 37,
+        "task_type": "analysis_fast",
+        "_release_analysis_recovery_requested": True,
+    }
+    now = datetime(2026, 10, 25, 0, 30)
+    assert scheduler_runtime._scheduler_task_sort_key(
+        recovery,
+        now=now,
+    ) < scheduler_runtime._scheduler_task_sort_key(normal, now=now)
+
 
 
 def test_release_analysis_recovery_uses_complete_local_exact_date_data():

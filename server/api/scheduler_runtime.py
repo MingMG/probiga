@@ -4009,6 +4009,11 @@ def _scheduler_task_sort_key(row: dict, *, now: datetime) -> tuple[int, float, i
     worker slot first, while not-yet-due tasks remain at the end.
     """
     task_type = str(row.get("task_type") or "").strip()
+    if row.get("_release_analysis_recovery_requested") is True:
+        # An explicit operator recovery has a durable request id and complete
+        # local-data proof.  Do not let repeated optional release catch-ups
+        # consume a single scheduler worker indefinitely ahead of it.
+        return (0, -9 * 24 * 60 * 60.0, int(row.get("id") or 0))
     bounded_acquisition_repair = task_type in {
         "linux_recent_data_gap_repair",
         "notice_eastmoney_historical_repair",
