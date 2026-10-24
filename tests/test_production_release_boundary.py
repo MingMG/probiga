@@ -1684,6 +1684,67 @@ def test_qmt_history_and_reference_reads_start_only_after_schema_cutover() -> No
     ) == 1
 
 
+def test_linux_release_verifies_inherited_qmt_activation_without_repair(
+    tmp_path: Path,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the inherited-activation harness")
+    deploy = (ROOT / "deploy" / "production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    bodies = _shell_function_bodies(deploy)
+    inherited_check = (
+        'CUTOVER_STEP=ensure_inherited_qmt_windows_edge_activation\n'
+        '  ensure_qmt_windows_edge_activation 1\n'
+        '  CUTOVER_STEP=activate_linux_components'
+    )
+    assert inherited_check in _normalized_shell(deploy)
+    assert "--check-activation" in bodies[
+        "verify_qmt_windows_edge_activation"
+    ]
+    assert "--repair-activation" not in bodies[
+        "verify_qmt_windows_edge_activation"
+    ]
+    assert 'verify_qmt_windows_edge_activation "$expected_windows_sha"' in (
+        bodies["ensure_qmt_windows_edge_activation"]
+    )
+
+    repair_marker = tmp_path / "repair-called"
+    harness = f"""
+set -Eeuo pipefail
+EXPECTED_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+PREPARED_CODE_ROOT=/unused
+RELEASE_VENV_ROOT=/unused
+QMT_EDGE_DEPLOYMENT_ATTEMPT_ID=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+controlled_guard_component_sha() {{
+  printf '%s\\n' cccccccccccccccccccccccccccccccccccccccc
+}}
+controlled_guard_run_qmt_activation_tool() {{
+  case " $* " in
+    *" --repair-activation "*) : > "$REPAIR_MARKER"; return 1 ;;
+  esac
+  return 0
+}}
+verify_qmt_windows_edge_activation() {{
+  return 0
+}}
+REPAIR_MARKER={json.dumps(repair_marker.as_posix())}
+ensure_qmt_windows_edge_activation() {{
+{bodies["ensure_qmt_windows_edge_activation"]}
+}}
+ensure_qmt_windows_edge_activation 1
+"""
+    completed = subprocess.run(
+        [bash, "-c", harness],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert not repair_marker.exists()
+
+
 def test_rollback_restores_previous_immutable_runtime_without_checkout() -> None:
     deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
         encoding="utf-8"

@@ -7265,26 +7265,10 @@ valid = (
 raise SystemExit(0 if valid else 2)
 ' "$expected_sha" "$expected_attempt"
 }
-ensure_qmt_windows_edge_activation() {
-  local expected_windows_sha
-  local repair_output
+verify_qmt_windows_edge_activation() {
+  local expected_windows_sha="$1"
   local check_output
-  expected_windows_sha="$(
-    controlled_guard_component_sha "$EXPECTED_SHA" windows
-  )" || return 1
   [[ "$expected_windows_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
-  if ! repair_output="$(controlled_guard_run_qmt_activation_tool \
-    "$PREPARED_CODE_ROOT" "$RELEASE_VENV_ROOT/$EXPECTED_SHA" \
-    "$EXPECTED_SHA" --repair-activation \
-    "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID")"; then
-    printf '%s\n' "$repair_output" >&2
-    echo "QMT Windows edge activation repair failed before Linux activation" >&2
-    return 1
-  fi
-  printf '%s\n' "$repair_output"
-  printf '%s' "$repair_output" | controlled_guard_validate_qmt_repair_json \
-    "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" \
-    "$expected_windows_sha" "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" || return 1
   if ! check_output="$(controlled_guard_run_qmt_activation_tool \
     "$PREPARED_CODE_ROOT" "$RELEASE_VENV_ROOT/$EXPECTED_SHA" \
     "$EXPECTED_SHA" --check-activation)"; then
@@ -7317,6 +7301,36 @@ valid = (
 )
 raise SystemExit(0 if valid else 2)
 ' "$expected_windows_sha" || return 1
+}
+ensure_qmt_windows_edge_activation() {
+  local inherited_only="${1:-0}"
+  local expected_windows_sha
+  local repair_output
+  case "$inherited_only" in
+    0|1) ;;
+    *) return 2 ;;
+  esac
+  expected_windows_sha="$(
+    controlled_guard_component_sha "$EXPECTED_SHA" windows
+  )" || return 1
+  [[ "$expected_windows_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  if [ "$inherited_only" -eq 1 ]; then
+    verify_qmt_windows_edge_activation "$expected_windows_sha"
+    return
+  fi
+  if ! repair_output="$(controlled_guard_run_qmt_activation_tool \
+    "$PREPARED_CODE_ROOT" "$RELEASE_VENV_ROOT/$EXPECTED_SHA" \
+    "$EXPECTED_SHA" --repair-activation \
+    "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID")"; then
+    printf '%s\n' "$repair_output" >&2
+    echo "QMT Windows edge activation repair failed before Linux activation" >&2
+    return 1
+  fi
+  printf '%s\n' "$repair_output"
+  printf '%s' "$repair_output" | controlled_guard_validate_qmt_repair_json \
+    "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" \
+    "$expected_windows_sha" "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" || return 1
+  verify_qmt_windows_edge_activation "$expected_windows_sha"
 }
 controlled_guard_run_writer_fence() {
   local adata_sha="$5"
@@ -15449,7 +15463,7 @@ CUTOVER_STEP=prepare_release
 prepare_release
 if [ "$RELEASE_SCOPE" = LINUX ]; then
   CUTOVER_STEP=ensure_inherited_qmt_windows_edge_activation
-  ensure_qmt_windows_edge_activation
+  ensure_qmt_windows_edge_activation 1
   CUTOVER_STEP=activate_linux_components
   activate_linux_release
   # This branch ends before schema preflight, writer fencing, task mutations,
