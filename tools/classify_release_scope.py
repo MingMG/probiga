@@ -2,11 +2,11 @@
 """Classify a complete, trusted Git release delta without importing project code.
 
 Explicit schema files, the strategy-schema preparation tools and the protected
-QMT edge release protocol are cross-end. Application, UI, deployment,
+QMT release controller path are cross-end. Application, UI, deployment,
 dependency and unrelated tool changes remain normal Linux code releases; the
 Windows/QMT updater tracks its own strategy source independently. Schema
 transitions live under ``server/db``, in ``.sql`` files, in the guarded
-strategy-schema preparation tools, or in the QMT edge release protocol.
+strategy-schema preparation tools, or in the QMT release controller path.
 Run this installed trusted tool, never the copy from an untrusted target commit.
 """
 
@@ -187,12 +187,15 @@ _DDL_SQL = re.compile(
     re.IGNORECASE,
 )
 _DDL_CODE_ROOTS = ("server/db/", "db/")
-_SCHEMA_CONTRACT_CODE_FILES = frozenset({
+_CROSS_END_CONTRACT_CODE_FILES = frozenset({
     "server/common/qmt_edge_release_recovery.py",
     "tools/prepare_strategy_governance_deferred_schema.py",
     "tools/prepare_strategy_governance_qmt_history.py",
     "tools/prepare_strategy_governance_schema.py",
+    "tools/reload_big_qmt_strategy.ps1",
+    "tools/resume_qmt_prior_edge.ps1",
     "tools/run_qmt_windows_edge_release_bootstrap.py",
+    "tools/update_qmt_windows_edge.ps1",
 })
 
 
@@ -216,13 +219,13 @@ def _ddl_strings(path: str, blob: bytes) -> list[str]:
 def _contract(git: Git, tree: dict[str, Entry]) -> str:
     paths = [
         path for path in sorted(tree)
-        if path in _SCHEMA_CONTRACT_CODE_FILES
+        if path in _CROSS_END_CONTRACT_CODE_FILES
         or path.endswith(".sql")
         or (path.endswith(".py") and path.startswith(_DDL_CODE_ROOTS))
     ]
     records = []
     for path, blob in zip(paths, git.blobs([tree[path].oid for path in paths])):
-        if path in _SCHEMA_CONTRACT_CODE_FILES:
+        if path in _CROSS_END_CONTRACT_CODE_FILES:
             records.append({
                 "path": path,
                 "sha256": hashlib.sha256(blob).hexdigest(),

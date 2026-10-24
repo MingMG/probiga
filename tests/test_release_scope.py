@@ -127,7 +127,10 @@ def test_sql_file_ddl_is_coordinated(repo):
     "tools/prepare_strategy_governance_schema.py",
     "tools/prepare_strategy_governance_deferred_schema.py",
     "tools/prepare_strategy_governance_qmt_history.py",
+    "tools/reload_big_qmt_strategy.ps1",
+    "tools/resume_qmt_prior_edge.ps1",
     "tools/run_qmt_windows_edge_release_bootstrap.py",
+    "tools/update_qmt_windows_edge.ps1",
 ])
 def test_cross_end_contract_changes_are_coordinated(repo, path):
     repo.write(path, "SCHEMA_CONTRACT_REVISION = 1\n")
