@@ -15,6 +15,7 @@ from biz.analysis.sync_analysis_fast import (
     _complete_membership_proof_scope,
     _recent_dates,
     _refresh_exact_upper_limit_execution_evidence,
+    _verify_full_market_turnover_inputs,
     _write_kline_rolling_state,
     add_strategy_signals,
     apply_canonical_execution_eligibility,
@@ -61,6 +62,30 @@ from server.trading_v4.factors.chase_risk import (
 
 
 class SyncAnalysisFastTest(unittest.TestCase):
+    def test_blocked_turnover_evidence_remains_research_only(self):
+        evidence = build_turnover_evidence({
+            "status": "DATA_BLOCKED",
+            "stock_code": "000001",
+            "trade_date": "2026-10-23",
+            "decision_known_at": "2026-10-24 00:00:00",
+            "source_table": "st_market_field_capture_row",
+            "reason": "DATA_BLOCKED: direct turnover unavailable",
+        })
+        proof = _verify_full_market_turnover_inputs(
+            pd.DataFrame([{
+                "stock_code": "000001",
+                "turnover_evidence_json": evidence,
+            }]),
+            trade_date="2026-10-23",
+        )
+        self.assertEqual(proof["turnover_input_status"], "DATA_BLOCKED")
+        self.assertEqual(proof["turnover_blocked_count"], 1)
+        self.assertEqual(proof["turnover_full_market_count"], 1)
+        self.assertRegex(
+            proof["turnover_full_market_proof_root_sha256"],
+            r"^[0-9a-f]{64}$",
+        )
+
     def test_kline_snapshot_uses_engine_for_turnover_verification(self):
         engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
         bars = pd.DataFrame([{

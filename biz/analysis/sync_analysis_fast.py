@@ -2231,6 +2231,7 @@ def _verify_full_market_turnover_inputs(
     identities: set[tuple[str, ...]] = set()
     proof_items: list[dict[str, str]] = []
     codes: set[str] = set()
+    blocked_codes: set[str] = set()
     for source in frame.to_dict(orient="records"):
         code = str(source.get("stock_code") or "").strip().zfill(6)
         if code in codes:
@@ -2247,13 +2248,20 @@ def _verify_full_market_turnover_inputs(
                 f"DATA_BLOCKED: turnover evidence invalid for {code}: {exc}"
             ) from exc
         if (
-            proof.get("status") != "PASS"
+            proof.get("status") not in {"PASS", "DATA_BLOCKED"}
             or str(proof.get("stock_code") or "") != code
             or str(proof.get("trade_date") or "") != trade_date
         ):
             raise RuntimeError(
                 f"DATA_BLOCKED: turnover evidence incomplete for {code}"
             )
+        if proof.get("status") == "DATA_BLOCKED":
+            blocked_codes.add(code)
+            proof_items.append({
+                "stock_code": code,
+                "proof_sha256": str(proof.get("proof_sha256") or "").lower(),
+            })
+            continue
         identity = tuple(
             str(proof.get(field) or "").strip().lower()
             for field in (
@@ -2282,10 +2290,18 @@ def _verify_full_market_turnover_inputs(
             "stock_code": code,
             "proof_sha256": str(proof.get("proof_sha256") or "").lower(),
         })
-    if len(identities) != 1:
+    if len(identities) > 1:
         raise RuntimeError("DATA_BLOCKED: turnover inputs span multiple runs")
-    identity = next(iter(identities))
+    identity = (
+        next(iter(identities))
+        if identities
+        else ("", "", "", "", "", "", "")
+    )
     return {
+        "turnover_input_status": (
+            "DATA_BLOCKED" if blocked_codes else "PASS"
+        ),
+        "turnover_blocked_count": len(blocked_codes),
         "turnover_snapshot_run_id": identity[0],
         "turnover_snapshot_semantic_sha256": identity[1],
         "turnover_authority_identity": identity[2],
