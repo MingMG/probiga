@@ -734,6 +734,7 @@ def test_repair_activation_supersedes_only_a_granted_predecessor(
 
     repaired = bootstrap.repair_release_activation(
         engine,
+        engine,
         expected_build_sha=OTHER_BUILD_SHA,
         deployment_attempt_id=ATTEMPT_B,
         now=REQUESTED_AT + timedelta(minutes=2),
@@ -772,6 +773,7 @@ def test_repair_activation_supersedes_only_a_granted_predecessor(
     assert new_writer_allowed is True
 
     retry = bootstrap.repair_release_activation(
+        engine,
         engine,
         expected_build_sha=OTHER_BUILD_SHA,
         deployment_attempt_id=ATTEMPT_B,

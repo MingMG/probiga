@@ -867,14 +867,26 @@ def check_qmt_edge_release_activation(
     *,
     expected_build_sha: str,
     expected_deployment_attempt_id: str | None = None,
+    activation_seal: Mapping[str, Any] | None = None,
 ) -> tuple[bool, dict[str, Any]]:
     """Prove that the newest hold for a build has one exact activation grant."""
 
     sha = _build_sha(expected_build_sha)
-    seal = _validate_qmt_edge_release_activation_trigger_seal(
-        connection,
-        expected_build_sha=sha,
-    )
+    if activation_seal is None:
+        seal = _validate_qmt_edge_release_activation_trigger_seal(
+            connection,
+            expected_build_sha=sha,
+        )
+    else:
+        seal = dict(activation_seal)
+        if (
+            str(seal.get("attested_build_sha") or "") != sha
+            or seal.get("authority")
+            != "PRIVILEGED_CUTOVER_TABLE_METADATA_SEAL"
+        ):
+            raise QmtEdgeReleaseReceiptError(
+                "release activation trigger seal differs"
+            )
     from server.common.qmt_edge_release_recovery import writer_allowed_by_latest_context
 
     expected_task_id = _reference_task_id(connection)

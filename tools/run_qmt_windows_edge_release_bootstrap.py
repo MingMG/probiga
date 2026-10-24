@@ -735,6 +735,7 @@ def append_latest_release_activation_grant(
 
 def repair_release_activation(
     engine: Any,
+    runtime_engine: Any,
     *,
     expected_build_sha: str,
     deployment_attempt_id: str,
@@ -753,12 +754,20 @@ def repair_release_activation(
     attempt = ledger._deployment_attempt_id(deployment_attempt_id)
     at = (now or datetime.now()).replace(microsecond=0)
     wrote = False
+    with runtime_engine.connect() as runtime:
+        target_seal = (
+            ledger._validate_qmt_edge_release_activation_trigger_seal(
+                runtime, expected_build_sha=target
+            )
+        )
+        _assert_recovery_database_identity(runtime, target_seal)
     with recovery.release_control_connection(engine) as connection:
         _attest_activation_grant_connection(connection)
         ready, detail = check_qmt_edge_release_activation(
             connection,
             expected_build_sha=target,
             expected_deployment_attempt_id=attempt,
+            activation_seal=target_seal,
         )
         if ready:
             hold = detail["hold"]
@@ -776,10 +785,6 @@ def repair_release_activation(
                 "database_writes": False,
             }
 
-        target_seal = ledger._validate_qmt_edge_release_activation_trigger_seal(
-            connection, expected_build_sha=target
-        )
-        _assert_recovery_database_identity(connection, target_seal)
         latest = recovery.latest_hold(connection)
         target_hold: dict[str, Any] | None = None
         if latest is None:
@@ -870,6 +875,7 @@ def repair_release_activation(
             connection,
             expected_build_sha=target,
             expected_deployment_attempt_id=target_hold["deployment_attempt_id"],
+            activation_seal=target_seal,
         )
         if not ready or detail.get("status") != "READY":
             raise RuntimeError(
@@ -2042,7 +2048,12 @@ def main(argv: list[str] | None = None) -> int:
             or args.request_compatibility_quiescence
         ):
             engine = _create_activation_grant_engine()
-            if args.request_recoverable_quiescence or args.request_forward_quiescence or args.abort_precutover:
+            if (
+                args.repair_activation
+                or args.request_recoverable_quiescence
+                or args.request_forward_quiescence
+                or args.abort_precutover
+            ):
                 runtime_engine = _create_recovery_runtime_engine()
         else:
             if args.runtime_env_file:
@@ -2112,6 +2123,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.repair_activation:
             result = repair_release_activation(
                 engine,
+                runtime_engine,
                 expected_build_sha=args.expected_build_sha,
                 deployment_attempt_id=args.deployment_attempt_id,
             )

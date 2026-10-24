@@ -273,7 +273,6 @@ def test_grant_attests_the_same_transaction_before_any_ledger_read(
 
 @pytest.mark.parametrize("mode, function_name", [
     ("activation-grant", "append_release_activation_grant"),
-    ("repair-activation", "repair_release_activation"),
     ("request-compatibility-quiescence", "append_release_request_with_quiescence"),
 ])
 def test_activation_grant_cli_never_uses_runtime_engine(
@@ -327,6 +326,63 @@ def test_activation_grant_cli_never_uses_runtime_engine(
     if mode == "request-compatibility-quiescence":
         assert payload["compatibility_argument"] is True
     engine.dispose.assert_called_once_with()
+
+
+def test_repair_cli_uses_runtime_engine_only_for_read_only_seal_proof(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    activation_engine = MagicMock()
+    runtime_engine = MagicMock()
+    monkeypatch.delenv("PROBIGA_BUILD_COMMIT_SHA", raising=False)
+    monkeypatch.setattr(
+        bootstrap, "_create_activation_grant_engine", lambda: activation_engine
+    )
+    monkeypatch.setattr(
+        bootstrap, "_create_recovery_runtime_engine", lambda: runtime_engine
+    )
+    monkeypatch.setattr(
+        "tools.env_config.load_project_env",
+        lambda: pytest.fail("repair route loaded runtime environment"),
+    )
+    monkeypatch.setattr(
+        "tools.env_config.create_tool_engine",
+        lambda: pytest.fail("repair route created runtime engine"),
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "repair_release_activation",
+        lambda engine, runtime, **_kwargs: {
+            "mode": "repair-activation",
+            "status": "READY",
+            "build_sha": BUILD_SHA,
+            "deployment_attempt_id": ATTEMPT_ID,
+            "activation_granted": True,
+            "reason_code": "",
+            "request_run_uid": f"qmt-edge-request-{BUILD_SHA}",
+            "hold_run_uid": f"qmt-edge-hold-{ATTEMPT_ID}",
+            "grant_run_uid": f"qmt-edge-grant-{ATTEMPT_ID}",
+            "database_writes": True,
+            "engine_matches": engine is activation_engine,
+            "runtime_matches": runtime is runtime_engine,
+        },
+    )
+
+    result = bootstrap.main([
+        "--repair-activation",
+        "--expected-build-sha",
+        BUILD_SHA,
+        "--deployment-attempt-id",
+        ATTEMPT_ID,
+        "--compact",
+    ])
+
+    assert result == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["engine_matches"] is True
+    assert payload["runtime_matches"] is True
+    activation_engine.dispose.assert_called_once_with()
+    runtime_engine.dispose.assert_called_once_with()
 
 
 def test_forward_cli_binds_wrapper_environment_to_target_and_validates_prior_separately(
