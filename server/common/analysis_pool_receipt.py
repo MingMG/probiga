@@ -421,14 +421,20 @@ def decode_score_snapshot(value: Mapping[str, Any], *, trade_date: str | None = 
         raise ValueError("ANALYSIS_SCORE_SNAPSHOT_INVALID") from exc
     if not isinstance(payload, dict):
         raise ValueError("ANALYSIS_SCORE_SNAPSHOT_INVALID")
-    rebuilt_payload = _score_snapshot_payload(
-        trade_date=payload.get("trade_date"), decision_at=payload.get("decision_at"),
-        run_uid=payload.get("run_uid"), build_sha=payload.get("build_sha"),
-        analysis_rows=payload.get("analysis_rows") or [], scored_rows=payload.get("scored_rows") or [],
+    # The producer validates and canonicalizes the complete scored universe
+    # once when the immutable snapshot is sealed.  Readers authenticate the
+    # exact immutable bytes with both hashes and the envelope; rebuilding every
+    # row here duplicated that work and could exceed the publication lease.
+    canonical_raw = _snapshot_json_bytes(payload)
+    rebuilt = _score_snapshot_envelope(
+        payload,
+        canonical_raw,
+        compressed,
+        encoding=value["encoding"],
     )
-    canonical_raw = json.dumps(rebuilt_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
-    rebuilt = _score_snapshot_envelope(rebuilt_payload, canonical_raw, compressed, encoding=value["encoding"])
-    if raw != canonical_raw or dict(value) != rebuilt or (trade_date is not None and payload["trade_date"] != trade_date):
+    if raw != canonical_raw or dict(value) != rebuilt or (
+        trade_date is not None and payload["trade_date"] != trade_date
+    ):
         raise ValueError("ANALYSIS_SCORE_SNAPSHOT_BINDING_MISMATCH")
     return payload
 

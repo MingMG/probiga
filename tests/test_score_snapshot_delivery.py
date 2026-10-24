@@ -6,6 +6,7 @@ import pytest
 
 from server.api.routers import screener
 from server.common import daily_delivery_control
+from server.common import analysis_pool_receipt as receipts
 from server.common.analysis_pool_receipt import (
     build_pool_manifest, build_score_snapshot, decode_score_snapshot, build_upper_limit_evidence,
     build_preliminary_analysis_snapshot,
@@ -48,6 +49,21 @@ def test_score_snapshot_rejects_missing_stock_and_tampered_content():
         decode_score_snapshot(tampered)
     with pytest.raises(ValueError, match="BINDING_MISMATCH"):
         decode_score_snapshot(snapshot, trade_date="2026-09-07")
+
+
+def test_score_snapshot_reader_authenticates_bytes_without_rebuilding_universe(monkeypatch):
+    receipt = scored_publication()
+    snapshot = receipt["score_snapshot"]
+    first = decode_score_snapshot(snapshot)
+    monkeypatch.setattr(
+        receipts,
+        "_score_snapshot_payload",
+        lambda **_kwargs: pytest.fail("immutable snapshot was rebuilt by reader"),
+    )
+    second = decode_score_snapshot(snapshot)
+    assert second == first
+    second["scored_rows"][0]["stock_code"] = "000000"
+    assert decode_score_snapshot(snapshot)["scored_rows"][0]["stock_code"] == "600001"
 
 
 def test_mutable_daily_projection_cannot_change_a_published_score():
