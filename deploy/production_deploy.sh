@@ -7273,17 +7273,25 @@ ensure_qmt_windows_edge_activation() {
     controlled_guard_component_sha "$EXPECTED_SHA" windows
   )" || return 1
   [[ "$expected_windows_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
-  repair_output="$(controlled_guard_run_qmt_activation_tool \
+  if ! repair_output="$(controlled_guard_run_qmt_activation_tool \
     "$PREPARED_CODE_ROOT" "$RELEASE_VENV_ROOT/$EXPECTED_SHA" \
     "$EXPECTED_SHA" --repair-activation \
-    "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID")" || return 1
+    "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID")"; then
+    printf '%s\n' "$repair_output" >&2
+    echo "QMT Windows edge activation repair failed before Linux activation" >&2
+    return 1
+  fi
   printf '%s\n' "$repair_output"
   printf '%s' "$repair_output" | controlled_guard_validate_qmt_repair_json \
     "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" \
     "$expected_windows_sha" "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" || return 1
-  check_output="$(controlled_guard_run_qmt_activation_tool \
+  if ! check_output="$(controlled_guard_run_qmt_activation_tool \
     "$PREPARED_CODE_ROOT" "$RELEASE_VENV_ROOT/$EXPECTED_SHA" \
-    "$EXPECTED_SHA" --check-activation)" || return 1
+    "$EXPECTED_SHA" --check-activation)"; then
+    printf '%s\n' "$check_output" >&2
+    echo "QMT Windows edge activation readback failed before Linux activation" >&2
+    return 1
+  fi
   printf '%s\n' "$check_output"
   printf '%s' "$check_output" | \
     "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -I -c '
