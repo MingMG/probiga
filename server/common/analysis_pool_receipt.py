@@ -92,7 +92,11 @@ def _canonical_scalar(value: Any) -> Any:
         return "0" if normalized in {"-0", ""} else normalized
     if isinstance(value, bytes):
         return value.hex()
-    if isinstance(value, (str, int, bool)):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str):
         return value
     return str(value)
 
