@@ -1704,6 +1704,7 @@ def test_privileged_inventory_lineage_recovers_missing_previous_seal_from_exact_
     )
 
     evidence = _privileged_inventory_evidence()
+    _stub_privileged_inventory_revalidation(monkeypatch, evidence)
     boundary, connection = _privileged_inventory_seal_boundary(
         monkeypatch, evidence
     )
@@ -1803,6 +1804,24 @@ def test_privileged_inventory_lineage_recovers_missing_previous_seal_from_exact_
     ]
     assert pending["entries"][0]["status"] == "VERIFIED"
     assert pending["entries"][1]["status"] == "PENDING"
+    evidence["privileged_trigger_inventory_lineage_preflight"] = lineage
+
+    seal_result = schema._persist_privileged_trigger_inventory_seal(
+        boundary,
+        evidence,
+        build_sha=candidate_sha,
+    )
+    sealed = parse_privileged_trigger_inventory_seal_comment(
+        connection.comment,
+        expected_server_uuid=connection.server_uuid,
+    )
+
+    assert seal_result["attested_build_sha"] == candidate_sha
+    assert [entry["build_sha"] for entry in sealed["entries"]] == [
+        previous_sha,
+        candidate_sha,
+    ]
+    assert all(entry["status"] == "VERIFIED" for entry in sealed["entries"])
 
 
 def test_privileged_inventory_lineage_recovery_rejects_inventory_drift(

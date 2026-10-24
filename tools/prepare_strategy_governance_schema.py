@@ -611,6 +611,10 @@ def _safe_cutover_failure_code(exc: BaseException) -> str:
             "PRIVILEGED_TRIGGER_SEAL_HASH_DRIFT",
         ),
         (
+            "privileged trigger inventory lineage previous comment drifted",
+            "PRIVILEGED_TRIGGER_SEAL_PREVIOUS_COMMENT_DRIFT",
+        ),
+        (
             "privileged trigger inventory changed before sealing",
             "PRIVILEGED_TRIGGER_INVENTORY_CHANGED_BEFORE_SEAL",
         ),
@@ -4809,8 +4813,12 @@ def _privileged_trigger_inventory_lineage_preflight(
         "compatibility_hash": identity["compatibility_hash"],
         "contract_hash": identity["contract_hash"],
         "old_table_comment": old_comment,
+        "lineage_previous_table_comment": lineage_previous_comment,
         "old_table_comment_sha256": hashlib.sha256(
             old_comment.encode("utf-8")
+        ).hexdigest(),
+        "lineage_previous_table_comment_sha256": hashlib.sha256(
+            lineage_previous_comment.encode("utf-8")
         ).hexdigest(),
         "pending_table_comment": pending,
         "pending_table_comment_sha256": hashlib.sha256(
@@ -4987,6 +4995,46 @@ def _persist_privileged_trigger_inventory_seal(
     old_comment = str(lineage.get("old_table_comment") or "")
     pending_comment = str(lineage.get("pending_table_comment") or "")
     verified_comment = str(lineage.get("verified_table_comment") or "")
+    lineage_previous_comment = str(
+        lineage.get("lineage_previous_table_comment") or ""
+    )
+    missing_previous_seal_recovery = lineage.get(
+        "missing_previous_seal_recovery"
+    )
+    if (
+        type(missing_previous_seal_recovery) is not bool
+        or lineage.get("lineage_previous_table_comment_sha256")
+        != hashlib.sha256(
+            lineage_previous_comment.encode("utf-8")
+        ).hexdigest()
+        or (
+            not missing_previous_seal_recovery
+            and lineage_previous_comment != old_comment
+        )
+    ):
+        raise PrivilegedSchemaPreparationError(
+            "privileged trigger inventory lineage previous comment drifted"
+        )
+    if missing_previous_seal_recovery:
+        try:
+            recovered_previous_envelope = (
+                parse_privileged_trigger_inventory_seal_comment(
+                    lineage_previous_comment,
+                    expected_server_uuid=lineage.get("server_uuid"),
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise PrivilegedSchemaPreparationError(
+                "privileged trigger inventory lineage previous comment drifted"
+            ) from exc
+        if not any(
+            entry.get("build_sha") == lineage.get("previous_build_sha")
+            and entry.get("status") == "VERIFIED"
+            for entry in recovered_previous_envelope.get("entries", [])
+        ):
+            raise PrivilegedSchemaPreparationError(
+                "privileged trigger inventory lineage previous comment drifted"
+            )
     expected_lineage = {
         "schema": "probiga.privileged-trigger-inventory-lineage-preflight.v1",
         "build_sha": str(build_sha or "").strip().lower(),
@@ -5206,7 +5254,7 @@ def _persist_privileged_trigger_inventory_seal(
                 recomputed_pending_comment = (
                     compose_privileged_trigger_inventory_seal_comment(
                         seal,
-                        previous_comment=old_comment,
+                        previous_comment=lineage_previous_comment,
                         previous_build_sha=lineage_previous,
                         status="PENDING",
                     )
@@ -5214,7 +5262,7 @@ def _persist_privileged_trigger_inventory_seal(
                 recomputed_verified_comment = (
                     compose_privileged_trigger_inventory_seal_comment(
                         seal,
-                        previous_comment=old_comment,
+                        previous_comment=lineage_previous_comment,
                         previous_build_sha=lineage_previous,
                         status="VERIFIED",
                     )
