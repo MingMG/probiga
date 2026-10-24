@@ -60,11 +60,19 @@ def _analysis_diagnostics_root() -> Path | None:
     return Path(raw) if raw else None
 
 
-def _write_analysis_progress(run_uid: str, event: dict) -> None:
+def _prepare_analysis_diagnostics_root() -> Path | None:
     root = _analysis_diagnostics_root()
+    if root is None:
+        return None
+    root.mkdir(parents=True, exist_ok=True)
+    os.chmod(root, 0o700)
+    return root
+
+
+def _write_analysis_progress(run_uid: str, event: dict) -> None:
+    root = _prepare_analysis_diagnostics_root()
     if root is None or re.fullmatch(r"[0-9a-f]{32}", run_uid) is None:
         return
-    root.mkdir(parents=True, exist_ok=True)
     path = root / f"{run_uid}.progress.json"
     payload = json.dumps(
         {
@@ -77,18 +85,35 @@ def _write_analysis_progress(run_uid: str, event: dict) -> None:
         default=str,
     )
     temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(payload + "\n", encoding="utf-8")
-    temporary.replace(path)
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+        0o600,
+    )
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        stream.write(payload + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
 
 
 def _start_analysis_stack_diagnostics(run_uid: str) -> None:
     global _DIAGNOSTIC_STREAM
-    root = _analysis_diagnostics_root()
+    root = _prepare_analysis_diagnostics_root()
     if root is None or re.fullmatch(r"[0-9a-f]{32}", run_uid) is None:
         return
-    root.mkdir(parents=True, exist_ok=True)
     path = root / f"{run_uid}.stack.log"
-    _DIAGNOSTIC_STREAM = path.open("a", encoding="utf-8", buffering=1)
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+        0o600,
+    )
+    _DIAGNOSTIC_STREAM = os.fdopen(
+        descriptor,
+        "a",
+        encoding="utf-8",
+        buffering=1,
+    )
     faulthandler.dump_traceback_later(
         60,
         repeat=True,
