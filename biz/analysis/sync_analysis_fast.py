@@ -5096,7 +5096,23 @@ def _prepare_batch_outputs(
         "fact_cutoff_at": "",
         "receipt_root_hash": "",
     }
-    if decision_at is not None:
+    if decision_at is not None and allow_degraded_inputs:
+        degraded_reason = (
+            "PIT_INPUT_BATCH_DEFERRED_FOR_RESEARCH_ONLY_RECOVERY"
+        )
+        common_cutoff = {
+            "status": PIT_DATA_BLOCKED,
+            "reason": degraded_reason,
+            "fact_cutoff_at": decision_at.isoformat(timespec="seconds"),
+            "receipt_root_hash": canonical_sha256({
+                "schema": "probiga.analysis-degraded-pit-input.v1",
+                "trade_date": trade_date,
+                "decision_at": decision_at.isoformat(timespec="seconds"),
+                "reason": degraded_reason,
+            }),
+            "receipts": [],
+        }
+    elif decision_at is not None:
         common_cutoff = resolve_common_fact_cutoff(
             engine,
             codes=feature_codes,
@@ -5108,7 +5124,6 @@ def _prepare_batch_outputs(
             ),
             event_end_date=trade_date,
             require_qmt_event_batch=True,
-            include_event_facts=not allow_degraded_inputs,
         )
     fact_cutoff_at: datetime | str | None = (
         common_cutoff.get("fact_cutoff_at")
