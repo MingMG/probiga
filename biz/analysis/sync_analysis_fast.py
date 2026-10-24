@@ -4037,7 +4037,13 @@ def build_analysis_rows(df: pd.DataFrame, trade_date: str) -> list[dict[str, Any
         if latest_notice is None or pd.isna(latest_notice) or str(latest_notice).lower() == "nan":
             last_news_time = None
         else:
-            last_news_time = str(latest_notice)[:26].replace("T", " ")
+            latest_news_text = str(latest_notice)[:26].replace("T", " ")
+            try:
+                last_news_time = datetime.fromisoformat(
+                    latest_news_text
+                ).replace(microsecond=0)
+            except ValueError:
+                last_news_time = None
         item = {
             "stock_code": str(row.get("stock_code") or "").zfill(6),
             "stock_name": str(row.get("short_name") or "")[:20],
