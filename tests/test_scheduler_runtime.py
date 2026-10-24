@@ -2528,6 +2528,61 @@ class SchedulerRuntimeTest(unittest.TestCase):
         owner_absent.assert_not_called()
         connection.execute.assert_called_once()
 
+    def test_recover_interrupted_release_catchup_same_build_requires_dead_owner(
+        self,
+    ) -> None:
+        for owner_absent, expected in ((True, True), (False, False)):
+            with self.subTest(owner_absent=owner_absent):
+                self._assert_release_catchup_recovery(owner_absent, expected)
+
+    def _assert_release_catchup_recovery(
+        self, owner_absent: bool, expected: bool,
+    ) -> None:
+        started_at = datetime(2026, 8, 31, 20, 7, 0)
+        history_result = MagicMock()
+        history_result.mappings.return_value.all.return_value = [{
+            "run_uid": "release-run-43",
+            "run_at": started_at,
+            "status": "running",
+            "host_name": "prod-host",
+            "scheduler_instance_id": "prod-host-1234",
+            "build_sha": "b" * 40,
+            "trigger_source": "release_catchup",
+        }]
+        history_update = MagicMock(rowcount=1)
+        task_update = MagicMock(rowcount=1)
+        connection = MagicMock()
+        connection.execute.side_effect = [
+            history_result, history_update, task_update,
+        ]
+        engine = MagicMock()
+        engine.begin.return_value.__enter__.return_value = connection
+
+        with patch(
+            "server.api.scheduler_runtime.gethostname",
+            return_value="prod-host",
+        ), patch(
+            "server.api.scheduler_runtime._scheduler_build_commit_sha",
+            return_value="b" * 40,
+        ), patch(
+            "server.api.scheduler_runtime._owner_pid_is_absent",
+            return_value=owner_absent,
+        ):
+            recovered = scheduler_runtime._recover_interrupted_manual_claim(
+                engine,
+                {"id": 43},
+                started_at,
+            )
+
+        self.assertIs(recovered, expected)
+        if expected:
+            self.assertIn(
+                "release_catchup_owner_gone",
+                connection.execute.call_args_list[1].args[1]["output"],
+            )
+        else:
+            self.assertEqual(connection.execute.call_count, 1)
+
     def test_cleanup_releases_proven_interrupted_manual_claim(self):
         started_at = datetime.now() - timedelta(minutes=2)
         task_id = 44

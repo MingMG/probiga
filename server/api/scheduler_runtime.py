@@ -4500,13 +4500,25 @@ def _recover_interrupted_manual_claim(
                     return False
                 owner_evidence = "previous_build"
                 if previous_build == current_build:
-                    if not boot_checked:
-                        boot_started_at = _windows_boot_started_at()
-                        boot_checked = True
-                    if (boot_started_at is None or
-                            history_started_at >= boot_started_at - timedelta(minutes=1)):
-                        return False
-                    owner_evidence = "previous_windows_boot:" + boot_started_at.isoformat()
+                    if str(history.get("trigger_source") or "").strip() == "release_catchup":
+                        # Release catch-up runs synchronously in a short-lived
+                        # helper outside the daemon process registry.  Its
+                        # instance id still contains the actual owner PID, so
+                        # absence is sufficient after a short launch grace.
+                        if (
+                            _now_shanghai_naive() - history_started_at
+                            < timedelta(seconds=30)
+                        ):
+                            return False
+                        owner_evidence = "release_catchup_owner_gone"
+                    else:
+                        if not boot_checked:
+                            boot_started_at = _windows_boot_started_at()
+                            boot_checked = True
+                        if (boot_started_at is None or
+                                history_started_at >= boot_started_at - timedelta(minutes=1)):
+                            return False
+                        owner_evidence = "previous_windows_boot:" + boot_started_at.isoformat()
                 if not _owner_pid_is_absent(instance_id, host_name=host_name):
                     return False
                 recovered.append({"run_uid": run_uid, "output": (
