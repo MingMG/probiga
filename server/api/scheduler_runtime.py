@@ -9238,6 +9238,8 @@ def _run_task_impl(
             )
             / "analysis-execution-diagnostics"
         )
+        if row.get("_release_analysis_recovery_requested") is True:
+            child_env["PROBIGA_ANALYSIS_ALLOW_DEGRADED_INPUTS"] = "1"
     # Post-run strategy validation must be bound to this exact scheduler
     # audit row and build.  These private fields never cross the process
     # boundary or become user-controlled command-line arguments.

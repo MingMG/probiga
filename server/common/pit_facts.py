@@ -4387,6 +4387,7 @@ def resolve_common_fact_cutoff(
     event_start_date: date | str,
     event_end_date: date | str,
     require_qmt_event_batch: bool = False,
+    include_event_facts: bool = True,
 ) -> dict[str, Any]:
     """Resolve one immutable COMPLETE-coverage cutoff (T) for a live batch (E)."""
 
@@ -4438,7 +4439,7 @@ def resolve_common_fact_cutoff(
             f"{diagnostic}",
         }
     event_batch: dict[str, Any] = {}
-    if require_qmt_event_batch:
+    if require_qmt_event_batch and include_event_facts:
         try:
             from server.common.qmt_announcement_pit import (
                 validate_complete_announcement_batch,
@@ -4477,9 +4478,13 @@ def resolve_common_fact_cutoff(
     # Loading their full historical payloads again can exceed 500 MB, and those
     # candidates are never used below. Unsealed finance still needs this scan.
     fact_kind_filter = (
-        "fact_kind='event'"
-        if finance_batch
-        else "fact_kind IN ('finance','event')"
+        "fact_kind='finance'"
+        if not include_event_facts
+        else (
+            "fact_kind='event'"
+            if finance_batch
+            else "fact_kind IN ('finance','event')"
+        )
     )
     statement = text(
         f"SELECT * FROM {SOURCE_COVERAGE_TABLE} "
@@ -4595,7 +4600,8 @@ def resolve_common_fact_cutoff(
         }
     selected: list[dict[str, Any]] = []
     missing: list[str] = []
-    for kind in ("finance", "event"):
+    required_kinds = ("finance", "event") if include_event_facts else ("finance",)
+    for kind in required_kinds:
         for code in normalized_codes:
             if kind == "finance" and finance_batch:
                 sealed = dict(finance_batch["rows"][code])

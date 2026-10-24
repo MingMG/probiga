@@ -654,6 +654,15 @@ def main() -> int:
             "min_kline_coverage": float(args.min_kline_coverage),
             "auto_repair_missing_kline": bool(args.auto_repair_missing_kline),
             "progress_callback": _progress_callback,
+            "allow_degraded_inputs": (
+                str(
+                    os.environ.get(
+                        "PROBIGA_ANALYSIS_ALLOW_DEGRADED_INPUTS"
+                    )
+                    or ""
+                ).strip()
+                == "1"
+            ),
         }
         publisher_task_type = str(
             os.environ.get("PROBIGA_SCHEDULER_TASK_TYPE") or ""

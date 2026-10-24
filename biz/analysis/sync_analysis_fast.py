@@ -4961,6 +4961,7 @@ def _prepare_batch_outputs(
     refresh_upper_limit: bool = True,
     reuse_preliminary_snapshot: bool = False,
     return_scored: bool = False,
+    allow_degraded_inputs: bool = False,
 ) -> Any:
     scoped_codes = _normalize_stock_codes(stock_codes)
     decision_at: datetime | str | None = (
@@ -5107,6 +5108,7 @@ def _prepare_batch_outputs(
             ),
             event_end_date=trade_date,
             require_qmt_event_batch=True,
+            include_event_facts=not allow_degraded_inputs,
         )
     fact_cutoff_at: datetime | str | None = (
         common_cutoff.get("fact_cutoff_at")
@@ -5118,7 +5120,11 @@ def _prepare_batch_outputs(
         if common_cutoff.get("status") == PIT_AVAILABLE
         else None
     )
-    if decision_at is not None and common_cutoff.get("status") != PIT_AVAILABLE:
+    if (
+        decision_at is not None
+        and common_cutoff.get("status") != PIT_AVAILABLE
+        and not allow_degraded_inputs
+    ):
         raise RuntimeError("ANALYSIS_INPUT_BATCH_BLOCKED: " + str(common_cutoff.get("reason") or "PIT_INPUT_BATCH_UNAVAILABLE"))
 
     _emit_progress(progress_callback, stage="load_finance", percent=14, step="加载财务因子...", trade_date=trade_date)
@@ -5191,6 +5197,11 @@ def _prepare_batch_outputs(
     if common_cutoff.get("status") != PIT_AVAILABLE:
         notices["event_pit_status"] = PIT_DATA_BLOCKED
         notices["event_pit_reason"] = common_cutoff.get("reason")
+    elif allow_degraded_inputs:
+        notices["event_pit_status"] = PIT_DATA_BLOCKED
+        notices["event_pit_reason"] = (
+            "PIT_EVENT_BATCH_DEFERRED_FOR_RESEARCH_ONLY_RECOVERY"
+        )
     # ``st_news_flash`` has no immutable received/revision history.  It remains
     # available for display, but cannot alter strategy event scores until it is
     # migrated to the shared PIT contract.
@@ -5370,6 +5381,7 @@ def run_batch(
     publication_run_uid: str = "",
     publisher_task_type: str = "",
     publisher_build_sha: str = "",
+    allow_degraded_inputs: bool = False,
 ) -> BatchStats:
     publication_identity = (
         str(publication_run_uid or "").strip().lower(),
@@ -5471,6 +5483,7 @@ def run_batch(
                 publish and task_type == "analysis_fast"
             ),
             return_scored=True,
+            allow_degraded_inputs=allow_degraded_inputs,
         )
         score_snapshot = build_score_snapshot(
             trade_date=trade_date, decision_at=execution_time, run_uid=publication_run_uid,
