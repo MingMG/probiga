@@ -1521,10 +1521,90 @@ def test_privileged_inventory_lineage_preflight_binds_rollback_build(monkeypatch
     assert connection.alter_count == 0
 
 
-@pytest.mark.parametrize("optional_v4_state", ("absent", "present"))
+@pytest.mark.parametrize(
+    ("tier", "include_v2", "include_v4", "expected_tier"),
+    (
+        ("managed", False, False, "MANAGED_102_PRE_V2"),
+        ("base", True, False, "BASE_143"),
+        ("full", True, True, "FULL_175"),
+    ),
+)
+def test_lineage_live_inventory_accepts_only_exact_release_tiers(
+    monkeypatch,
+    tier,
+    include_v2,
+    include_v4,
+    expected_tier,
+):
+    del tier
+    managed = {"managed_trigger": object()}
+    v2_names = frozenset(schema._v2_release_trigger_contract()[0])
+    optional_v4_names = (
+        frozenset({"trg_optional_v4"}) if include_v4 else frozenset()
+    )
+    observed = set(managed) | set(optional_v4_names)
+    if include_v2:
+        observed.update(v2_names)
+    observed_rows = {name: {} for name in observed}
+    monkeypatch.setattr(
+        schema,
+        "_all_database_trigger_inventory",
+        lambda _connection: observed_rows,
+    )
+    monkeypatch.setattr(
+        schema,
+        "validate_release_trigger_contracts",
+        lambda *_args, **_kwargs: {
+            "observed_count": len(managed),
+            "metadata_frozen": True,
+        },
+    )
+    monkeypatch.setattr(
+        schema,
+        "validate_full_database_trigger_inventory",
+        lambda *_args, **_kwargs: {
+            "observed_count": len(observed),
+            "metadata_frozen": True,
+        },
+    )
+
+    detail = schema._validated_lineage_live_trigger_inventory(
+        object(),
+        managed_contracts=managed,
+        optional_v4_names=optional_v4_names,
+    )
+
+    assert detail["live_inventory_tier"] == expected_tier
+    assert detail["expected_count"] == len(observed)
+    assert detail["observed_count"] == len(observed)
+    assert detail["v2_count"] == (len(v2_names) if include_v2 else 0)
+
+
+def test_lineage_live_inventory_rejects_partial_release_tier(monkeypatch):
+    managed = {"managed_trigger": object()}
+    v2_names = sorted(schema._v2_release_trigger_contract()[0])
+    partial = {**managed, **{name: {} for name in v2_names[:-1]}}
+    monkeypatch.setattr(
+        schema,
+        "_all_database_trigger_inventory",
+        lambda _connection: partial,
+    )
+
+    with pytest.raises(
+        schema.PrivilegedSchemaPreparationError,
+        match="not an exact release tier",
+    ):
+        schema._validated_lineage_live_trigger_inventory(
+            object(),
+            managed_contracts=managed,
+            optional_v4_names=frozenset(),
+        )
+
+
+@pytest.mark.parametrize("live_tier", ("managed", "base", "full"))
 def test_privileged_inventory_lineage_recovers_missing_previous_seal_from_exact_inventory(
     monkeypatch,
-    optional_v4_state,
+    live_tier,
 ):
     from server.db import migrations_v4
     from server.engine.strategy_governance import (
@@ -1544,6 +1624,13 @@ def test_privileged_inventory_lineage_recovers_missing_previous_seal_from_exact_
         server_uuid=connection.server_uuid,
         database_name=connection.database_name,
     )["table_comment"]
+    managed = {
+        **schema._final_v3_trigger_contracts(),
+        **schema._frozen_non_v3_release_trigger_contracts(
+            schema._non_v3_trigger_contracts()
+        ),
+    }
+    v2_names = frozenset(schema._v2_release_trigger_contract()[0])
     optional_v4_names = (
         frozenset(
             matched.group(1)
@@ -1556,22 +1643,20 @@ def test_privileged_inventory_lineage_recovers_missing_previous_seal_from_exact_
             )
             is not None
         )
-        if optional_v4_state == "present"
+        if live_tier == "full"
         else frozenset()
     )
-    expected_count = (
-        schema.EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_COUNT
-        if optional_v4_names
-        else schema.EXPECTED_FULL_RELEASE_TRIGGER_COUNT
-    )
-    expected_nameset_hash = (
-        schema.EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_NAMESET_HASH
-        if optional_v4_names
-        else schema.EXPECTED_FULL_RELEASE_TRIGGER_NAMESET_HASH
+    expected_names = set(managed) | set(optional_v4_names)
+    if live_tier != "managed":
+        expected_names.update(v2_names)
+    expected_count = len(expected_names)
+    expected_nameset_hash = schema._full_release_trigger_nameset_hash(
+        expected_names
     )
     inventory = {
         "expected_count": expected_count,
         "observed_count": expected_count,
+        "v2_count": len(v2_names) if live_tier != "managed" else 0,
         "managed_count": schema.EXPECTED_MANAGED_RELEASE_TRIGGER_COUNT,
         "optional_v4_count": len(optional_v4_names),
         "managed_source_contract_sha256": (
@@ -1580,6 +1665,11 @@ def test_privileged_inventory_lineage_recovers_missing_previous_seal_from_exact_
         "nameset_sha256": expected_nameset_hash,
         "metadata_frozen": True,
         "read_only": True,
+        "live_inventory_tier": {
+            "managed": "MANAGED_102_PRE_V2",
+            "base": "BASE_143",
+            "full": "FULL_175",
+        }[live_tier],
     }
     monkeypatch.setattr(
         schema,
@@ -1588,7 +1678,7 @@ def test_privileged_inventory_lineage_recovers_missing_previous_seal_from_exact_
     )
     monkeypatch.setattr(
         schema,
-        "validate_full_database_trigger_inventory",
+        "_validated_lineage_live_trigger_inventory",
         lambda connection, **_kwargs: inventory,
     )
     monkeypatch.setattr(
@@ -1653,12 +1743,13 @@ def test_privileged_inventory_lineage_recovery_rejects_inventory_drift(
     )
     monkeypatch.setattr(
         schema,
-        "validate_full_database_trigger_inventory",
+        "_validated_lineage_live_trigger_inventory",
         lambda _connection, **_kwargs: {
             "expected_count": (
                 schema.EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_COUNT
             ),
             "observed_count": 0,
+            "live_inventory_tier": "FULL_175",
             "read_only": True,
         },
     )

@@ -3984,6 +3984,60 @@ def _validate_legacy_activation_trigger_upgrade_inventory(
     return {**detail, "upgrade_live_state": live_state}
 
 
+def _validated_lineage_live_trigger_inventory(
+    connection: Connection,
+    *,
+    managed_contracts: Mapping[str, TriggerContract],
+    optional_v4_names: frozenset[str],
+) -> dict[str, Any]:
+    """Accept only the exact pre-V2, base, or full release inventory tiers."""
+
+    managed_names = frozenset(managed_contracts)
+    v2_names = frozenset(_v2_release_trigger_contract()[0])
+    observed_names = frozenset(_all_database_trigger_inventory(connection))
+    managed_only_names = managed_names
+    base_names = frozenset({*managed_names, *v2_names})
+    full_names = frozenset({*base_names, *optional_v4_names})
+    if observed_names == managed_only_names:
+        tier = "MANAGED_102_PRE_V2"
+        detail = validate_release_trigger_contracts(
+            connection,
+            required=managed_contracts,
+            optional={},
+            controlled_contracts=managed_contracts,
+        )
+    elif observed_names == base_names:
+        tier = "BASE_143"
+        detail = validate_full_database_trigger_inventory(
+            connection,
+            managed_contracts=managed_contracts,
+            include_applied_v4=False,
+        )
+    elif observed_names == full_names:
+        tier = "FULL_175"
+        detail = validate_full_database_trigger_inventory(
+            connection,
+            managed_contracts=managed_contracts,
+            include_applied_v4=True,
+        )
+    else:
+        raise PrivilegedSchemaPreparationError(
+            "previous privileged trigger inventory is not an exact release tier"
+        )
+    return {
+        **detail,
+        "live_inventory_tier": tier,
+        "expected_count": len(observed_names),
+        "observed_count": len(observed_names),
+        "v2_count": len(v2_names & observed_names),
+        "managed_count": len(managed_contracts),
+        "optional_v4_count": len(optional_v4_names),
+        "nameset_sha256": _full_release_trigger_nameset_hash(observed_names),
+        "metadata_frozen": True,
+        "read_only": True,
+    }
+
+
 def _legacy_activation_trigger_upgrade_seal_state(
     envelope: Mapping[str, Any],
     *,
@@ -4199,36 +4253,53 @@ def _privileged_trigger_inventory_lineage_preflight(
                 boundary.migrator_engine
             )
             optional_v4_count = len(optional_v4_names)
-            expected_full_count = (
-                EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_COUNT
-                if optional_v4_count
-                else EXPECTED_FULL_RELEASE_TRIGGER_COUNT
-            )
-            expected_nameset_hash = (
-                EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_NAMESET_HASH
-                if optional_v4_count
-                else EXPECTED_FULL_RELEASE_TRIGGER_NAMESET_HASH
-            )
             with boundary.migrator_engine.connect() as connection:
                 missing_previous_seal_inventory = (
-                    validate_full_database_trigger_inventory(
+                    _validated_lineage_live_trigger_inventory(
                         connection,
                         managed_contracts=current_managed,
-                        include_applied_v4=True,
+                        optional_v4_names=optional_v4_names,
                     )
                 )
                 _assert_no_preexisting_qmt_release_activation_rows(
                     connection
                 )
+            live_inventory_tier = (
+                missing_previous_seal_inventory.get("live_inventory_tier")
+            )
+            includes_v2_guards = (
+                optional_v4_count > 0 or live_inventory_tier == "BASE_143"
+            )
+            expected_live_names = {
+                *current_managed,
+                *optional_v4_names,
+                *(
+                    _v2_release_trigger_contract()[0]
+                    if includes_v2_guards
+                    else {}
+                ),
+            }
+            expected_live_nameset_hash = _full_release_trigger_nameset_hash(
+                expected_live_names
+            )
             if (
                 previous_identity["compatibility_hash"]
                 != identity["compatibility_hash"]
                 or optional_v4_count
                 not in {0, EXPECTED_OPTIONAL_V4_TRIGGER_COUNT}
+                or live_inventory_tier
+                not in {"MANAGED_102_PRE_V2", "BASE_143", "FULL_175"}
                 or missing_previous_seal_inventory.get("expected_count")
-                != expected_full_count
-                or missing_previous_seal_inventory.get("observed_count")
-                != expected_full_count
+                != missing_previous_seal_inventory.get("observed_count")
+                or missing_previous_seal_inventory.get("expected_count")
+                != len(expected_live_names)
+                or missing_previous_seal_inventory.get("v2_count")
+                != (
+                    EXPECTED_FULL_RELEASE_TRIGGER_COUNT
+                    - EXPECTED_MANAGED_RELEASE_TRIGGER_COUNT
+                    if includes_v2_guards
+                    else 0
+                )
                 or missing_previous_seal_inventory.get("managed_count")
                 != EXPECTED_MANAGED_RELEASE_TRIGGER_COUNT
                 or missing_previous_seal_inventory.get(
@@ -4242,7 +4313,7 @@ def _privileged_trigger_inventory_lineage_preflight(
                 or missing_previous_seal_inventory.get(
                     "nameset_sha256"
                 )
-                != expected_nameset_hash
+                != expected_live_nameset_hash
                 or missing_previous_seal_inventory.get(
                     "metadata_frozen"
                 )
