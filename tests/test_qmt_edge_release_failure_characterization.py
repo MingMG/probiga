@@ -139,6 +139,7 @@ $SchedulerRuntimePath = {_ps_literal(runtime)}
 $SchedulerTaskName = "fake-scheduler"
 $PrecutoverRecoveryProtocol = "probiga.qmt-edge-precutover-recovery.v1"
 $ForwardOnlyRecoveryProtocol = "probiga.qmt-edge-forward-only-supersession.v1"
+$GrantedRecoveryProtocol = "probiga.qmt-edge-granted-supersession.v1"
 $script:ForwardOnlySchedulerGate = $false
 $ForwardContext = $null
 function Get-ScheduledTask([string]$TaskName) {{

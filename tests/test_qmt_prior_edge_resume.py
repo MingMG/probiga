@@ -354,6 +354,51 @@ def test_updater_reopens_disabled_scheduler_only_for_validated_forward_context(
         assert not observed["enabled"]
 
 
+@pytest.mark.parametrize(
+    "case",
+    ["granted", "wrong_kind", "wrong_host", "missing_prior", "wrong_hash"],
+)
+def test_updater_accepts_granted_handoff_only_with_complete_identity(case, tmp_path):
+    updater_source = (
+        ROOT / "tools/update_qmt_windows_edge.ps1"
+    ).read_text(encoding="utf-8")
+    start = updater_source.index("function Confirm-SelectedHandoff(")
+    end = updater_source.index("\n$SchedulerArgument = (", start + 1)
+    confirmation = updater_source[start:end]
+    granted = "probiga.qmt-edge-granted-supersession.v1"
+    original_prior = "9" * 40
+    observed = run_ps(
+        tmp_path,
+        f"$case={quote(case)}\n$ForwardOnlyRecoveryProtocol='{FORWARD_PROTOCOL}'\n"
+        f"$GrantedRecoveryProtocol='{granted}'\n$CurrentSha='{PRIOR}';$TargetSha='{TARGET}'\n"
+        "$script:ForwardOnlySchedulerGate=$false\n"
+        "$context=[pscustomobject]@{"
+        f"schema='{granted}';protocol='{granted}';build_sha=$TargetSha;"
+        f"original_prior_build_sha='{original_prior}';"
+        "original_prior_host_name=[Net.Dns]::GetHostName();"
+        "supersedes_build_sha=$CurrentSha;deployment_attempt_id=('c'*32);"
+        "context_hash=('d'*64);real_order=$false}\n"
+        "$priorBuildShas=@($context.original_prior_build_sha,$CurrentSha)\n"
+        "$handoffKind='GRANTED_SUPERSESSION'\n"
+        "if($case-eq'wrong_kind'){$handoffKind='FORWARD_ONLY_SUPERSESSION'}\n"
+        "if($case-eq'wrong_host'){$context.original_prior_host_name='other-host'}\n"
+        "if($case-eq'missing_prior'){$priorBuildShas=@($context.original_prior_build_sha)}\n"
+        "if($case-eq'wrong_hash'){$context.context_hash='bad'}\n"
+        "$selection=[pscustomobject]@{handoff_kind=$handoffKind;context=$context;"
+        "prior_build_shas=$priorBuildShas}\n"
+        + confirmation
+        + "$accepted=$false;$failure='';try{"
+        "$null=Confirm-SelectedHandoff $selection $TargetSha $CurrentSha;$accepted=$true}"
+        "catch{$failure=$_.Exception.Message}\n"
+        "[ordered]@{accepted=$accepted;gate=$script:ForwardOnlySchedulerGate;"
+        "failure=$failure}|ConvertTo-Json -Compress\n",
+    )
+    assert observed["accepted"] is (case == "granted"), observed
+    assert observed["gate"] is (case == "granted"), observed
+    if case != "granted":
+        assert observed["failure"]
+
+
 @pytest.mark.parametrize("case", ["inserted", "idempotent", "no_writes", "other_pid"])
 def test_bootstrap_requires_a_new_receipt_for_the_owned_child(case, tmp_path):
     observed = run_ps(tmp_path,

@@ -784,6 +784,8 @@ def test_repair_activation_supersedes_only_a_granted_predecessor(
     )
     assert selected["status"] == "SELECTED"
     assert selected["target_build_sha"] == OTHER_BUILD_SHA
+    assert selected["handoff_kind"] == recovery.GRANTED_SUPERSESSION_SCOPE
+    assert selected["context"]["schema"] == recovery.GRANTED_SUPERSESSION_SCHEMA
     assert set(selected["prior_build_shas"]) == {
         predecessor_prior,
         BUILD_SHA,

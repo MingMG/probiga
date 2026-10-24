@@ -1390,8 +1390,18 @@ def select_update_target(engine: Any, *, expected_build_sha: str) -> dict[str, A
             if expected_build_sha not in (*prior_build_shas, target):
                 raise RuntimeError("RECOVERY_BLOCKED: checkout outside protected handoff")
         result = {**base, "status": "SELECTED", "target_build_sha": target}
-        if context is not None and context["schema"] == recovery.FORWARD_CONTEXT_SCHEMA:
-            result.update({"handoff_kind": recovery.FORWARD_SCOPE, "context": context})
+        if context is not None:
+            if context["schema"] == recovery.FORWARD_CONTEXT_SCHEMA:
+                result.update(
+                    {"handoff_kind": recovery.FORWARD_SCOPE, "context": context}
+                )
+            elif context["schema"] == recovery.GRANTED_SUPERSESSION_SCHEMA:
+                result.update(
+                    {
+                        "handoff_kind": recovery.GRANTED_SUPERSESSION_SCOPE,
+                        "context": context,
+                    }
+                )
         return result
 
 

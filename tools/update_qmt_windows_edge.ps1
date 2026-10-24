@@ -19,6 +19,7 @@ $SchedulerTaskName = "ProBigA QMT Windows Edge Scheduler"
 $UpdateTaskName = "ProBigA QMT Windows Edge Updater"
 $PrecutoverRecoveryProtocol = "probiga.qmt-edge-precutover-recovery.v1"
 $ForwardOnlyRecoveryProtocol = "probiga.qmt-edge-forward-only-supersession.v1"
+$GrantedRecoveryProtocol = "probiga.qmt-edge-granted-supersession.v1"
 $script:ForwardOnlySchedulerGate = $false
 $ExpectedOrigin = "https://github.com/MingMG/probiga.git"
 $WindowsRoot = [System.Environment]::GetFolderPath(
@@ -404,6 +405,66 @@ function Confirm-ForwardGitPreflight() {
     Assert-DeployDirectoryWritable $ExpectedRoot 'permissions.checkout'
     Assert-DeployDirectoryWritable (Invoke-Git @('rev-parse','--absolute-git-dir')) 'permissions.git'
     $script:ForwardGitPreflightReady = $true
+}
+
+function Confirm-SelectedHandoff($Selection, [string]$TargetSha, [string]$CurrentSha) {
+    $Context = $Selection.context
+    $HandoffKind = [string]$Selection.handoff_kind
+    $ForwardSelection = $HandoffKind -ceq "FORWARD_ONLY_SUPERSESSION"
+    $GrantedSelection = $HandoffKind -ceq "GRANTED_SUPERSESSION"
+    $PriorBuildShas = @($Selection.prior_build_shas)
+    if (
+        $null -eq $Context -or
+        (!$ForwardSelection -and !$GrantedSelection) -or
+        $PriorBuildShas.Count -eq 0 -or
+        @($PriorBuildShas | Where-Object {
+            [string]$_ -cnotmatch "^[0-9a-f]{40}$"
+        }).Count -ne 0 -or
+        (
+            $CurrentSha -cne $TargetSha -and
+            $PriorBuildShas -notcontains $CurrentSha
+        ) -or
+        $PriorBuildShas -contains $TargetSha -or
+        [string]$Context.build_sha -cne $TargetSha -or
+        [string]$Context.original_prior_build_sha -cnotmatch "^[0-9a-f]{40}$" -or
+        $PriorBuildShas -notcontains [string]$Context.original_prior_build_sha -or
+        [string]$Context.original_prior_host_name -cne [Net.Dns]::GetHostName() -or
+        [string]$Context.deployment_attempt_id -cnotmatch "^[0-9a-f]{32}$" -or
+        [string]$Context.context_hash -cnotmatch "^[0-9a-f]{64}$" -or
+        $Context.real_order -ne $false -or
+        $Context.PSObject.Properties.Name -ccontains "prior_running"
+    ) {
+        throw "QMT Windows edge protected handoff selection differs"
+    }
+    if ($ForwardSelection) {
+        if (
+            [string]$Context.schema -cne $ForwardOnlyRecoveryProtocol -or
+            [string]$Context.protocol -cne $ForwardOnlyRecoveryProtocol -or
+            [string]$Context.scope -cne "FORWARD_ONLY_SUPERSESSION" -or
+            (
+                $CurrentSha -cne $TargetSha -and
+                [string]$Context.original_prior_build_sha -cne $CurrentSha
+            ) -or
+            (
+                $CurrentSha -ceq $TargetSha -and
+                [string]$Context.original_prior_build_sha -ceq $CurrentSha
+            )
+        ) {
+            throw "QMT Windows edge forward-only target selection differs"
+        }
+    }
+    else {
+        if (
+            [string]$Context.schema -cne $GrantedRecoveryProtocol -or
+            [string]$Context.protocol -cne $GrantedRecoveryProtocol -or
+            [string]$Context.supersedes_build_sha -cnotmatch "^[0-9a-f]{40}$" -or
+            $PriorBuildShas -notcontains [string]$Context.supersedes_build_sha
+        ) {
+            throw "QMT Windows edge granted target selection differs"
+        }
+    }
+    $script:ForwardOnlySchedulerGate = $true
+    return $Context
 }
 
 $SchedulerArgument = (
@@ -1162,28 +1223,8 @@ if ([string]$Selection.status -cne "SELECTED" -or $TargetSha -cnotmatch "^[0-9a-
 }
 $SelectionFields = @($Selection.PSObject.Properties.Name)
 if ($SelectionFields -ccontains "handoff_kind") {
-    $ForwardContext = $Selection.context
-    if (
-        [string]$Selection.handoff_kind -cne "FORWARD_ONLY_SUPERSESSION" -or
-        $null -eq $ForwardContext -or
-        [string]$ForwardContext.schema -cne $ForwardOnlyRecoveryProtocol -or
-        [string]$ForwardContext.protocol -cne $ForwardOnlyRecoveryProtocol -or
-        [string]$ForwardContext.scope -cne "FORWARD_ONLY_SUPERSESSION" -or
-        [string]$ForwardContext.build_sha -cne $TargetSha -or
-        [string]$ForwardContext.original_prior_build_sha -cnotmatch "^[0-9a-f]{40}$" -or
-        ($CurrentSha -cne $TargetSha -and
-            [string]$ForwardContext.original_prior_build_sha -cne $CurrentSha) -or
-        ($CurrentSha -ceq $TargetSha -and
-            [string]$ForwardContext.original_prior_build_sha -ceq $CurrentSha) -or
-        [string]$ForwardContext.original_prior_host_name -cne [Net.Dns]::GetHostName() -or
-        [string]$ForwardContext.deployment_attempt_id -cnotmatch "^[0-9a-f]{32}$" -or
-        [string]$ForwardContext.context_hash -cnotmatch "^[0-9a-f]{64}$" -or
-        $ForwardContext.real_order -ne $false -or
-        $ForwardContext.PSObject.Properties.Name -ccontains "prior_running"
-    ) {
-        throw "QMT Windows edge forward-only target selection differs"
-    }
-    $script:ForwardOnlySchedulerGate = $true
+    $ForwardContext = Confirm-SelectedHandoff `
+        $Selection $TargetSha $CurrentSha
 }
 elseif ($SelectionFields -ccontains "context") {
     throw "QMT Windows edge target selection context is unclassified"
@@ -1264,7 +1305,22 @@ if ($CurrentSha -cne $TargetSha) {
         $script:ForwardOnlySchedulerGate -and
         [string]$Transition.context.context_hash -ceq [string]$ForwardContext.context_hash
     )
-    if (!$LegacySwitch -and !$V1ProtectedContext -and !$ForwardProtectedContext) {
+    $GrantedProtectedContext = (
+        $null -ne $Transition.context -and
+        [string]$Transition.context.schema -ceq $GrantedRecoveryProtocol -and
+        [string]$Transition.context.protocol -ceq $GrantedRecoveryProtocol -and
+        [string]$Transition.context.build_sha -ceq $TargetSha -and
+        [string]$Transition.context.original_prior_host_name -ceq [Net.Dns]::GetHostName() -and
+        (
+            [string]$Transition.context.supersedes_build_sha -cmatch "^[0-9a-f]{40}$" -and
+            [string]$Transition.context.context_hash -ceq [string]$ForwardContext.context_hash -and
+            $script:ForwardOnlySchedulerGate
+        )
+    )
+    if (
+        !$LegacySwitch -and !$V1ProtectedContext -and
+        !$ForwardProtectedContext -and !$GrantedProtectedContext
+    ) {
         throw "RECOVERY_BLOCKED: prior release lacks a protected recovery context; controlled bootstrap required"
     }
     if ([string]$Transition.status -ceq "PENDING" -and $TransitionExit -eq 4) {
