@@ -969,6 +969,7 @@ def _load_canonical_chase_risk_evidence(
     preloaded_bars: pd.DataFrame | None = None,
     stock_codes: list[str] | None = None,
     progress_callback: ProgressCallback | None = None,
+    verification_engine: Engine | None = None,
 ) -> pd.DataFrame:
     """Build the complete conservative V4 execution-risk projection.
 
@@ -1075,7 +1076,7 @@ def _load_canonical_chase_risk_evidence(
         trade_date=trade_date,
     )
     turnover_snapshot = load_verified_turnover_evidence(
-        engine,
+        verification_engine or engine,
         target_date=target,
         decision_at=share_cutoff,
     )
@@ -1403,6 +1404,7 @@ def _attach_canonical_chase_risk_evidence(
     decision_known_at: datetime | str | None = None,
     preloaded_bars: pd.DataFrame | None = None,
     progress_callback: ProgressCallback | None = None,
+    verification_engine: Engine | None = None,
 ) -> pd.DataFrame:
     evidence = _load_canonical_chase_risk_evidence(
         engine,
@@ -1411,6 +1413,7 @@ def _attach_canonical_chase_risk_evidence(
         decision_known_at=decision_known_at,
         preloaded_bars=preloaded_bars,
         progress_callback=progress_callback,
+        verification_engine=verification_engine,
     )
     if frame.empty:
         return frame
@@ -1525,6 +1528,7 @@ def load_kline_features(
             connection, trade_date, lookback,
             decision_known_at=decision_known_at,
             progress_callback=progress_callback,
+            verification_engine=engine,
         )
 
 
@@ -1535,6 +1539,7 @@ def _load_kline_features_from_snapshot(
     *,
     decision_known_at: datetime | str | None,
     progress_callback: ProgressCallback | None,
+    verification_engine: Engine | None = None,
 ) -> pd.DataFrame:
     stage_started_at = time.monotonic()
     query_timeout_seconds = _bounded_env_int(
@@ -1864,6 +1869,7 @@ def _load_kline_features_from_snapshot(
         decision_known_at=decision_known_at,
         preloaded_bars=chase_bars,
         progress_callback=progress_callback,
+        verification_engine=verification_engine,
     )
     result.attrs["qmt_daily_input_window"] = daily_window
     _emit_progress(

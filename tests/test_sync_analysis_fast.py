@@ -2,7 +2,7 @@
 import unittest
 import tempfile
 from contextlib import nullcontext
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -61,6 +61,41 @@ from server.trading_v4.factors.chase_risk import (
 
 
 class SyncAnalysisFastTest(unittest.TestCase):
+    def test_kline_snapshot_uses_engine_for_turnover_verification(self):
+        engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+        bars = pd.DataFrame([{
+            "stock_code": "000001",
+            "trade_date": date(2026, 10, 23),
+            "open": 10,
+            "high": 10.5,
+            "low": 9.9,
+            "close": 10.3,
+            "volume": 100,
+            "amount": 1000,
+            "pre_close": 10,
+            "turnover_ratio": 1.2,
+            "data_source": "gj_big_qmt_inner",
+            "batch_id": "batch",
+            "data_version": "version",
+            "quality_status": "QMT_ATTESTED",
+            "permission_status": "SUPPORTED",
+            "received_at": datetime(2026, 10, 23, 15, 1),
+        }])
+        with engine.connect() as connection, patch(
+            "biz.analysis.sync_analysis_fast."
+            "load_verified_turnover_evidence",
+            return_value={},
+        ) as verify:
+            _load_canonical_chase_risk_evidence(
+                connection,
+                start_date="2026-09-25",
+                trade_date="2026-10-23",
+                decision_known_at=datetime(2026, 10, 24, 0, 0),
+                preloaded_bars=bars,
+                verification_engine=engine,
+            )
+        self.assertIs(verify.call_args.args[0], engine)
+
     def test_full_market_writer_uses_bounded_multi_values_statements(self):
         class RecordingConnection:
             def __init__(self):
