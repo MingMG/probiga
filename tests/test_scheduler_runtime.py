@@ -5010,6 +5010,96 @@ def test_release_catchup_requires_exact_build_evidence_for_dependencies():
         assert reason == "ready"
 
 
+def test_release_analysis_recovery_uses_complete_local_exact_date_data():
+    engine = MagicMock()
+    connection = engine.connect.return_value.__enter__.return_value
+    connection.execute.return_value.scalar.return_value = 5570
+    with patch.object(
+        scheduler_runtime,
+        "authoritative_closed_trade_date",
+        return_value="2026-10-23",
+    ):
+        ready, reason, evidence = (
+            scheduler_runtime.release_analysis_recovery_readiness(
+                engine,
+                "2026-10-23",
+            )
+        )
+    assert ready, reason
+    assert reason == "ready"
+    assert evidence == {
+        "target_trade_date": "2026-10-23",
+        "minimum_rows": 5000,
+        "kline": 5570,
+        "capital_flow": 5570,
+        "snapshot": 5570,
+    }
+
+
+def test_release_analysis_recovery_rejects_incomplete_or_wrong_session():
+    engine = MagicMock()
+    connection = engine.connect.return_value.__enter__.return_value
+    connection.execute.return_value.scalar.side_effect = [5570, 4999, 5570]
+    with patch.object(
+        scheduler_runtime,
+        "authoritative_closed_trade_date",
+        return_value="2026-10-23",
+    ):
+        ready, reason, evidence = (
+            scheduler_runtime.release_analysis_recovery_readiness(
+                engine,
+                "2026-10-23",
+            )
+        )
+    assert not ready
+    assert reason == "dataset_below_minimum:capital_flow"
+    assert evidence["capital_flow"] == 4999
+
+    with patch.object(
+        scheduler_runtime,
+        "authoritative_closed_trade_date",
+        return_value="2026-10-24",
+    ):
+        ready, reason, _ = (
+            scheduler_runtime.release_analysis_recovery_readiness(
+                engine,
+                "2026-10-23",
+            )
+        )
+    assert not ready
+    assert reason == "target_differs_from_authoritative_closed_session"
+
+
+def test_release_analysis_recovery_route_launches_target_bound_analysis():
+    row = {
+        "id": 37,
+        "enabled": 1,
+        "script_path": "tools/run_ai_recommendation_premarket.py",
+        "script_args": "--top-n 80 --min-score 62 --json",
+    }
+    evidence = {"target_trade_date": "2026-10-23"}
+    with (
+        patch.object(scheduler_router, "_read_sql", return_value=[row]),
+        patch.object(scheduler_router, "get_engine", return_value=MagicMock()),
+        patch.object(
+            scheduler_router,
+            "release_analysis_recovery_readiness",
+            return_value=(True, "ready", evidence),
+        ),
+        patch.object(
+            scheduler_router,
+            "launch_scheduler_task",
+            return_value={"accepted": True, "status": "running"},
+        ) as launch,
+    ):
+        result = scheduler_router.recover_release_analysis("2026-10-23")
+    assert result["trigger_source"] == "release_catchup"
+    assert result["target_trade_date"] == "2026-10-23"
+    assert result["readiness"] == evidence
+    assert launch.call_args.kwargs["trigger_source"] == "release_catchup"
+    assert launch.call_args.kwargs["target_trade_date"] == "2026-10-23"
+
+
 def test_release_dependency_rejects_exact_build_receipt_for_old_target_date():
     build_sha = "c" * 40
     downstream = {"id": 905, "task_type": "hot_fused"}

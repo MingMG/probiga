@@ -2357,6 +2357,65 @@ def _release_catchup_dependencies_ready(
     return True, "ready"
 
 
+def release_analysis_recovery_readiness(
+    engine,
+    target_trade_date: str,
+) -> tuple[bool, str, dict[str, object]]:
+    """Prove exact-date local inputs before recovering analysis publication.
+
+    A repository-only release does not invalidate an already durable market
+    session.  The scheduled dependency DAG normally replays its QMT upstreams
+    under the new build, which is both unnecessary and impossible when the
+    QMT edge is unavailable.  This narrow recovery gate admits the analysis
+    publisher only when the authoritative closed date and every required local
+    dataset are already present and independently countable.
+    """
+
+    target = str(target_trade_date or "").strip()
+    try:
+        if date.fromisoformat(target).isoformat() != target:
+            raise ValueError
+        current = datetime.now(PRODUCTION_TIMEZONE)
+        authoritative = authoritative_closed_trade_date(engine, now=current)
+    except (TypeError, ValueError) as exc:
+        return False, "invalid_target_trade_date", {"target_trade_date": target}
+    if authoritative != target:
+        return False, "target_differs_from_authoritative_closed_session", {
+            "target_trade_date": target,
+            "authoritative_trade_date": authoritative,
+        }
+    try:
+        with engine.connect() as connection:
+            counts = {
+                "kline": int(connection.execute(text(
+                    "SELECT COUNT(*) FROM sm_stock_kline "
+                    "WHERE trade_date=:target AND k_type=1 AND adjust_type=0"
+                ), {"target": target}).scalar() or 0),
+                "capital_flow": int(connection.execute(text(
+                    "SELECT COUNT(*) FROM sm_stock_capital_flow_daily "
+                    "WHERE trade_date=:target"
+                ), {"target": target}).scalar() or 0),
+                "snapshot": int(connection.execute(text(
+                    "SELECT COUNT(*) FROM sm_stock_snapshot "
+                    "WHERE trade_date=:target"
+                ), {"target": target}).scalar() or 0),
+            }
+    except Exception as exc:
+        return False, f"readiness_query_failed:{type(exc).__name__}", {
+            "target_trade_date": target,
+        }
+    minimum_rows = 5000
+    failed = sorted(name for name, count in counts.items() if count < minimum_rows)
+    evidence = {
+        "target_trade_date": target,
+        "minimum_rows": minimum_rows,
+        **counts,
+    }
+    if failed:
+        return False, "dataset_below_minimum:" + ",".join(failed), evidence
+    return True, "ready", evidence
+
+
 def _parse_hhmm(value: str) -> int | None:
     try:
         hour, minute = str(value or "").strip().split(":")
@@ -9280,6 +9339,8 @@ def launch_scheduler_task(
     *,
     root: Path | None = None,
     engine=None,
+    trigger_source: str = "manual",
+    target_trade_date: str = "",
 ) -> dict[str, object]:
     """Claim and launch one scheduler task without blocking an API worker.
 
@@ -9290,6 +9351,33 @@ def launch_scheduler_task(
     root = root or Path(__file__).resolve().parents[2]
     task_id = int(row["id"])
     task_name = str(row.get("task_name") or task_id)
+    trigger_source = str(trigger_source or "").strip()
+    target_trade_date = str(target_trade_date or "").strip()
+    if trigger_source not in {"manual", "release_catchup"}:
+        raise ValueError("scheduler launch trigger source is invalid")
+    if trigger_source == "release_catchup":
+        try:
+            canonical_target = date.fromisoformat(
+                target_trade_date
+            ).isoformat()
+        except ValueError:
+            canonical_target = ""
+        if canonical_target != target_trade_date:
+            return {
+                "accepted": False,
+                "status": "invalid_release_target_date",
+                "task_id": task_id,
+                "task_name": task_name,
+                "job_id": "",
+            }
+    elif target_trade_date:
+        return {
+            "accepted": False,
+            "status": "unexpected_release_target_date",
+            "task_id": task_id,
+            "task_name": task_name,
+            "job_id": "",
+        }
     requested_history_uid = str(
         row.get("_manual_history_run_uid") or ""
     ).strip().lower()
@@ -9420,7 +9508,12 @@ def launch_scheduler_task(
         }
 
     manual_row = dict(row)
-    manual_row["_trigger_source"] = "manual"
+    manual_row["_trigger_source"] = trigger_source
+    if trigger_source == "release_catchup":
+        manual_row.update({
+            "_scheduler_target_available": True,
+            "_scheduler_target_trade_date": target_trade_date,
+        })
     manual_history_uid = _task_history_start(
         engine,
         manual_row,

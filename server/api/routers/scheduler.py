@@ -4,6 +4,7 @@ import copy
 import threading
 import time
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy import text
@@ -20,6 +21,7 @@ from server.api.scheduler_runtime import (
     launch_scheduler_task,
     read_scheduler_heartbeat,
     request_stop_owned_scheduler_task,
+    release_analysis_recovery_readiness,
     scheduler_task_owned_by_current_host,
     scheduler_runtime_info,
     strategy_governance_task_block_reason,
@@ -445,8 +447,6 @@ def update_date_param(task_id: int, date_param: str = Query(default="")):
 
 @router.post("/scheduler/tasks/{task_id}/run")
 def run_task_now(task_id: int):
-    from pathlib import Path
-
     row = _read_sql("SELECT * FROM st_scheduled_tasks WHERE id = :id", {"id": task_id})
     if not row:
         return {"error": "任务不存在"}
@@ -461,6 +461,62 @@ def run_task_now(task_id: int):
         )
     root = Path(__file__).resolve().parents[3]
     return launch_scheduler_task(row[0], root=root, engine=get_engine())
+
+
+@router.post("/scheduler/release-analysis/recover")
+def recover_release_analysis(
+    trade_date: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
+):
+    """Run target-bound analysis from complete local data after a code release."""
+
+    rows = _read_sql(
+        "SELECT * FROM st_scheduled_tasks "
+        "WHERE task_type = 'analysis_fast' ORDER BY id LIMIT 2"
+    )
+    if len(rows) != 1:
+        raise HTTPException(
+            status_code=409,
+            detail="analysis_fast task registration is unavailable or ambiguous",
+        )
+    row = rows[0]
+    if (
+        int(row.get("enabled") or 0) != 1
+        or str(row.get("script_path") or "").replace("\\", "/")
+        != "tools/run_ai_recommendation_premarket.py"
+        or str(row.get("script_args") or "").strip()
+        != "--top-n 80 --min-score 62 --json"
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="analysis_fast task registration differs from release contract",
+        )
+    engine = get_engine()
+    ready, reason, evidence = release_analysis_recovery_readiness(
+        engine,
+        trade_date,
+    )
+    if not ready:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "status": "DATA_BLOCKED",
+                "reason": reason,
+                "evidence": evidence,
+            },
+        )
+    result = launch_scheduler_task(
+        row,
+        root=Path(__file__).resolve().parents[3],
+        engine=engine,
+        trigger_source="release_catchup",
+        target_trade_date=trade_date,
+    )
+    return {
+        **result,
+        "trigger_source": "release_catchup",
+        "target_trade_date": trade_date,
+        "readiness": evidence,
+    }
 
 
 @router.post("/scheduler/tasks/{task_id}/stop")
