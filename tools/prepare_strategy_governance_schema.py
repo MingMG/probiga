@@ -206,14 +206,14 @@ LEGACY_ACTIVATION_TRIGGER_UPGRADE_CONTRACT_HASH = (
 )
 LEGACY_ACTIVATION_TRIGGER_UPGRADE_SUPPORTING_COUNT = 81
 LEGACY_ACTIVATION_TRIGGER_UPGRADE_SUPPORTING_SOURCE_HASH = (
-    "076a2b84c15b9dbb54901c63f980c2f85ab17f7652d9334ab661d89ad990d0bc"
+    "b4f5f44da28a3ea33c8597bcc2d3a43f7a33a4c2b3f2c89310488b85a7d28509"
 )
 LEGACY_ACTIVATION_TRIGGER_UPGRADE_SUPPORTING_NAMESET_HASH = (
     "9f22808ad42bbc7df65f1aa1cbbf1c761664ca20865497a6174c4f5fa5372ff1"
 )
 LEGACY_ACTIVATION_TRIGGER_UPGRADE_MANAGED_COUNT = 101
 LEGACY_ACTIVATION_TRIGGER_UPGRADE_MANAGED_SOURCE_HASH = (
-    "7e42c91e534dd3d61d212f0c16fa7297c29b8f4756812de2e072874179537423"
+    "1b8a0b581f2ee10536359e77896cca04195de3ae3261bca2a7ebeadc65625f64"
 )
 LEGACY_ACTIVATION_TRIGGER_UPGRADE_MANAGED_NAMESET_HASH = (
     "aa40fd09c6afbe3186d3037e43c8854285aad80046641c2e468eb435200eb8ba"
@@ -2334,7 +2334,11 @@ def _all_database_trigger_inventory(
     # server-side statement completes. Read the full inventory in bounded
     # batches so final cutover validation always makes packet-sized progress.
     names = [
-        str(row[0])
+        str(
+            row["trigger_name"]
+            if isinstance(row, Mapping)
+            else row[0]
+        )
         for row in connection.execute(text(
             "SELECT TRIGGER_NAME FROM information_schema.TRIGGERS "
             "WHERE TRIGGER_SCHEMA=DATABASE() ORDER BY BINARY TRIGGER_NAME"

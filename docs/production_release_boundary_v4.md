@@ -34,6 +34,9 @@ triggers: 40 governance, 6 point-in-time data, 6 completed-run QMT attestation,
 10 immutable QMT reference, 4 QMT historical-coverage certification, and 2
 scheduler-history/release-receipt triggers. Missing, additional, renamed,
 cross-group substituted, or metadata-drifted triggers keep the release `BLOCKED`.
+Changes to the guarded strategy-schema preparation tools are part of this
+database contract and always select a coordinated release; they cannot take the
+Linux-only path and silently skip trigger installation.
 
 The runtime database grant transition is deliberately staged so an existing
 production account does not deadlock a no-downtime release. Preflight and resume

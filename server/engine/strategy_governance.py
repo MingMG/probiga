@@ -8698,6 +8698,8 @@ def review_metric_input(
             "CONFIRMED" if review_decision == "CONFIRM" else "REJECTED"
         )
         submitter = str(row.get("submitted_by") or "")
+        if submitter and submitter.casefold() == reviewer.casefold():
+            raise ValueError("指标证据必须由提交人以外的复核人确认或驳回")
         entity_type = str(row.get("entity_type") or "STRATEGY")
         entity_key = str(row.get("strategy_key") or "")
         entity_version = str(row.get("strategy_version") or "")

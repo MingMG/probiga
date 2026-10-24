@@ -7997,12 +7997,17 @@ def test_trigger_validators_fail_closed_on_inventory_or_metadata_drift(drift):
             )
 
 
-def test_prepared_runtime_contract_requires_exact_40_database_triggers():
+def test_prepared_runtime_contract_uses_code_owned_trigger_contracts():
     source = inspect.getsource(
         governance_module.validate_prepared_governance_runtime
     )
-    assert "_validate_governance_append_only_triggers_connection" in source
-    assert "validate_metric_input_review_triggers" in source
+    assert (
+        "_validate_governance_append_only_triggers_connection"
+        not in source
+    )
+    assert '"trigger_evidence_authority": "CODE_CONTRACT_ONLY"' in source
+    assert '"database_triggers_required": True' in source
+    assert "validate_metric_input_review_triggers" not in source
     assert '"database_triggers_required": True' in source
     assert '"trigger_count": 0' not in source
     assert governance_module.METRIC_INPUT_REVIEW_TRIGGER_CONTRACT_HASH == (
@@ -8400,7 +8405,7 @@ def test_metric_review_application_state_machine_is_atomic_and_audited():
 
     assert "WHERE evidence_id=:evidence_id FOR UPDATE" in source
     assert 'if current_status != "PENDING"' in source
-    assert "submitter == reviewer" in source
+    assert "submitter.casefold() == reviewer.casefold()" in source
     assert "AND verification_status='PENDING'" in source
     assert "updated.rowcount != 1" in source
     assert "_append_audit_connection(" in source

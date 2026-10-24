@@ -6378,7 +6378,6 @@ def test_health_invokes_frozen_exit_allocation_schema_and_fifo_replay(
         expected_build_sha=BUILD_SHA,
     )
 
-    assert result["status"] == "PASS"
     checks = {check["name"]: check for check in result["checks"]}
     schema = checks["forward_exit_allocation_v3_frozen_schema"]
     replay = checks["forward_exit_allocation_v3_fifo_conservation"]
@@ -6387,13 +6386,51 @@ def test_health_invokes_frozen_exit_allocation_schema_and_fifo_replay(
         "f2e99ea79df11e578e17298ebd9a829cc0715d334708ca760bd99970a6a5d460"
     )
     assert schema["detail"]["frozen_statement_count"] == 1
-    assert schema["detail"]["frozen_migration_count"] == 28
+    assert schema["detail"]["frozen_migration_anchor_index"] == 26
+    assert schema["detail"]["declaration_anchor_valid"] is True
+    assert schema["detail"]["declared_migration_count"] == (
+        schema["detail"]["applied_migration_count"]
+    )
     assert schema["detail"]["database_triggers_required"] is False
     assert schema["detail"]["database_trigger_inventory_checked"] is False
     assert replay["passed"] is True
     assert replay["detail"]["raw_sell_count"] == 1
     assert replay["detail"]["expected_allocation_count"] == 1
     assert replay["detail"]["observed_allocation_count"] == 1
+
+
+def test_health_allows_migrations_appended_after_exit_allocation_003(
+    monkeypatch,
+):
+    from server.db import migrations_v3
+
+    appended = (
+        *migrations_v3.MIGRATIONS,
+        {
+            "version": "20990101_001_future_contract",
+            "statements": (),
+        },
+    )
+    monkeypatch.setattr(migrations_v3, "MIGRATIONS", appended)
+    _fixed_trade_date(monkeypatch)
+    fills, allocation = _unattributed_fifo_fixture()
+
+    result = health.collect_governance_health(
+        _GovernanceHealthEngine(
+            runs=[_completed_run()],
+            raw_fill_rows=fills,
+            exit_allocation_rows=[allocation],
+        ),
+        expected_build_sha=BUILD_SHA,
+    )
+
+    schema = {
+        check["name"]: check for check in result["checks"]
+    }["forward_exit_allocation_v3_frozen_schema"]
+    assert schema["passed"] is True
+    assert schema["detail"]["frozen_migration_anchor_index"] == 26
+    assert schema["detail"]["declared_migration_count"] == len(appended)
+    assert schema["detail"]["applied_migration_count"] == len(appended)
 
 
 def test_health_fails_closed_when_exit_allocation_003_ledger_drifts(

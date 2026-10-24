@@ -122,6 +122,18 @@ def test_sql_file_ddl_is_coordinated(repo):
     assert repo.classify(repo.commit())["scope"] == "COORDINATED"
 
 
+@pytest.mark.parametrize("path", [
+    "tools/prepare_strategy_governance_schema.py",
+    "tools/prepare_strategy_governance_deferred_schema.py",
+    "tools/prepare_strategy_governance_qmt_history.py",
+])
+def test_strategy_schema_preparation_changes_are_coordinated(repo, path):
+    repo.write(path, "SCHEMA_CONTRACT_REVISION = 1\n")
+    result = repo.classify(repo.commit())
+    assert result["scope"] == "COORDINATED"
+    assert result["reason_codes"] == ["schema_contract_changed"]
+
+
 def test_symlinks_and_gitlinks_fail_even_under_docs(repo):
     blob = repo.git("hash-object", "-w", "--stdin", input=b"../../secret")
     repo.git("update-index", "--add", "--cacheinfo", "120000", blob, "docs/link")

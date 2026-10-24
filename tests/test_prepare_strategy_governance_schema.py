@@ -335,13 +335,23 @@ class _FullInventoryConnection(_InventoryConnection):
         self.managed_names = set(managed_names)
         self.engine = object()
 
-    def execute(self, statement, _params=None):
+    def execute(self, statement, params=None):
         sql = str(statement)
         self.statements.append(sql)
         if "WHERE TRIGGER_SCHEMA=DATABASE() AND (" in sql:
             return _InventoryResult([
                 row for row in self.rows
                 if str(row.get("trigger_name") or "") in self.managed_names
+            ])
+        if "AND TRIGGER_NAME IN (" in sql:
+            names = {
+                str(value)
+                for key, value in (params or {}).items()
+                if str(key).startswith("trigger_name_")
+            }
+            return _InventoryResult([
+                row for row in self.rows
+                if str(row.get("trigger_name") or "") in names
             ])
         return _InventoryResult(self.rows)
 
@@ -932,6 +942,16 @@ class _LegacyActivationUpgradeConnection(_SealMetadataConnection):
                     row for row in rows
                     if str(row.get("trigger_name") or "")
                     in self.managed_names
+                ]
+            elif "AND TRIGGER_NAME IN (" in sql:
+                names = {
+                    str(value)
+                    for key, value in (params or {}).items()
+                    if str(key).startswith("trigger_name_")
+                }
+                rows = [
+                    row for row in rows
+                    if str(row.get("trigger_name") or "") in names
                 ]
             return _InventoryResult(rows)
         if "FROM st_scheduled_task_history" in sql:

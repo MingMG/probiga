@@ -5226,7 +5226,7 @@ def _forward_exit_allocation_schema_check(
         "f2e99ea79df11e578e17298ebd9a829cc0715d334708ca760bd99970a6a5d460"
     )
     frozen_statement_count = 1
-    frozen_migration_count = 28
+    frozen_migration_anchor_index = 26
     errors: list[str] = []
     try:
         from server.db.migrations_v3 import (
@@ -5247,10 +5247,18 @@ def _forward_exit_allocation_schema_check(
             else ()
         )
         declared_checksum = _checksum(statements) if statements else ""
+        declared_versions = [
+            str(item["version"]) for item in MIGRATIONS
+        ]
+        declaration_anchor_valid = (
+            len(declared_versions) > frozen_migration_anchor_index
+            and declared_versions[frozen_migration_anchor_index]
+            == FORWARD_EXIT_ALLOCATION_MIGRATION_VERSION
+        )
         if len(declared) != 1:
             errors.append("003 migration declaration is not unique")
-        if len(MIGRATIONS) != frozen_migration_count:
-            errors.append("V3 migration declaration count differs")
+        if not declaration_anchor_valid:
+            errors.append("003 migration declaration order differs")
         if declared_checksum != frozen_checksum:
             errors.append("003 migration declaration checksum differs")
         if len(statements) != frozen_statement_count:
@@ -5260,9 +5268,7 @@ def _forward_exit_allocation_schema_check(
             connection,
             "SELECT COUNT(*) AS total_count FROM schema_migration_v3",
         )
-        if _integer(migration_total.get("total_count")) != (
-            frozen_migration_count
-        ):
+        if _integer(migration_total.get("total_count")) != len(MIGRATIONS):
             errors.append("applied V3 migration ledger count differs")
         ledger_rows = _rows(
             connection,
@@ -5501,7 +5507,10 @@ def _forward_exit_allocation_schema_check(
             "declared_checksum": declared_checksum,
             "frozen_statement_count": frozen_statement_count,
             "declared_statement_count": len(statements),
-            "frozen_migration_count": frozen_migration_count,
+            "frozen_migration_anchor_index": (
+                frozen_migration_anchor_index
+            ),
+            "declaration_anchor_valid": declaration_anchor_valid,
             "declared_migration_count": len(MIGRATIONS),
             "applied_migration_count": _integer(
                 migration_total.get("total_count")
@@ -5523,7 +5532,9 @@ def _forward_exit_allocation_schema_check(
         return False, {
             "frozen_checksum": frozen_checksum,
             "frozen_statement_count": frozen_statement_count,
-            "frozen_migration_count": frozen_migration_count,
+            "frozen_migration_anchor_index": (
+                frozen_migration_anchor_index
+            ),
             "error": _safe_exception_message(exc),
         }
 

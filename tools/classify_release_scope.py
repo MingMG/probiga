@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Classify a complete, trusted Git release delta without importing project code.
 
-Only explicit schema files are cross-end.  Application, UI, deployment,
-dependency, QMT, tool and runtime-DDL string changes are a normal Linux code
-release; the Windows/QMT updater tracks its own strategy source independently.
-Schema transitions live under ``server/db`` or in ``.sql`` files and are the
-only deltas that need the coordinated database cutover.
+Explicit schema files and the strategy-schema preparation tools are cross-end.
+Application, UI, deployment, dependency, QMT and unrelated tool changes remain
+normal Linux code releases; the Windows/QMT updater tracks its own strategy
+source independently. Schema transitions live under ``server/db``, in ``.sql``
+files, or in the guarded strategy-schema preparation tools.
 Run this installed trusted tool, never the copy from an untrusted target commit.
 """
 
@@ -186,6 +186,11 @@ _DDL_SQL = re.compile(
     re.IGNORECASE,
 )
 _DDL_CODE_ROOTS = ("server/db/", "db/")
+_SCHEMA_CONTRACT_CODE_FILES = frozenset({
+    "tools/prepare_strategy_governance_deferred_schema.py",
+    "tools/prepare_strategy_governance_qmt_history.py",
+    "tools/prepare_strategy_governance_schema.py",
+})
 
 
 def _ddl_strings(path: str, blob: bytes) -> list[str]:
@@ -208,11 +213,18 @@ def _ddl_strings(path: str, blob: bytes) -> list[str]:
 def _contract(git: Git, tree: dict[str, Entry]) -> str:
     paths = [
         path for path in sorted(tree)
-        if path.endswith(".sql")
+        if path in _SCHEMA_CONTRACT_CODE_FILES
+        or path.endswith(".sql")
         or (path.endswith(".py") and path.startswith(_DDL_CODE_ROOTS))
     ]
     records = []
     for path, blob in zip(paths, git.blobs([tree[path].oid for path in paths])):
+        if path in _SCHEMA_CONTRACT_CODE_FILES:
+            records.append({
+                "path": path,
+                "sha256": hashlib.sha256(blob).hexdigest(),
+            })
+            continue
         strings = _ddl_strings(path, blob)
         if strings:
             records.append([path, strings])
