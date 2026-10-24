@@ -215,3 +215,29 @@ def test_preliminary_snapshot_reuse_does_not_skip_current_window_validation(monk
             object(), "2026-09-18", 62, 80, reuse_preliminary_snapshot=True,
             publisher_build_sha="a" * 40, news_cutoff_time="2026-09-18T22:00:00",
         )
+
+
+def test_missing_preliminary_snapshot_falls_back_to_full_analysis(monkeypatch):
+    from biz.analysis import sync_analysis_fast as analysis
+
+    monkeypatch.setattr(analysis, "load_daily_input_window", lambda *_a, **_k: {})
+    monkeypatch.setattr(
+        analysis,
+        "load_latest_preliminary_analysis_receipt",
+        lambda *_a, **_k: None,
+    )
+
+    def normal_full_path(*_args, **_kwargs):
+        raise RuntimeError("normal full analysis path reached")
+
+    monkeypatch.setattr(analysis, "load_kline_features", normal_full_path)
+    with pytest.raises(RuntimeError, match="normal full analysis path reached"):
+        analysis._prepare_batch_outputs(
+            object(),
+            "2026-09-18",
+            62,
+            80,
+            reuse_preliminary_snapshot=True,
+            publisher_build_sha="a" * 40,
+            news_cutoff_time="2026-09-18T22:00:00",
+        )

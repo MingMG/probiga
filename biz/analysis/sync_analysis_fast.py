@@ -4900,58 +4900,75 @@ def _prepare_batch_outputs(
             collector_build_sha=publisher_build_sha,
         )
         if not preliminary_receipt:
-            raise RuntimeError(
-                "DATA_BLOCKED: task101 preliminary full snapshot is unavailable"
+            # Upper-limit evidence is optional.  When task101 could not run
+            # because MyQuant is unavailable, the same deterministic full
+            # scoring universe can be computed in-process without inventing
+            # upper evidence or blocking the canonical strategy pool.
+            logger.warning(
+                "task101 preliminary snapshot unavailable; computing the full "
+                "analysis without upper-limit evidence"
             )
-        snapshot = decode_preliminary_analysis_snapshot(
-            preliminary_receipt["analysis_snapshot"]
-        )
-        analysis_rows = [dict(row) for row in snapshot["analysis_rows"]]
-        candidates = pd.DataFrame(snapshot["candidate_rows"])
-        if len(candidates) != 80 or candidates["stock_code"].duplicated().any():
-            raise RuntimeError(
-                "DATA_BLOCKED: task101 preliminary candidate snapshot differs"
+            _emit_progress(
+                progress_callback,
+                stage="preliminary_snapshot_unavailable",
+                percent=5,
+                step="task101预分析快照不可用，改为完整分析且不合成upper证据",
+                trade_date=trade_date,
             )
-        candidates = _refresh_exact_upper_limit_execution_evidence(
-            engine=engine,
-            scored=candidates,
-            trade_date=trade_date,
-            decision_at=decision_at,
-            top_n=top_n,
-            min_score=min_score,
-            flow_date=str(snapshot.get("flow_date") or ""),
-            publisher_build_sha=publisher_build_sha,
-            preliminary_receipt=preliminary_receipt,
-        )
-        refreshed = {str(row["stock_code"]).zfill(6): row for row in candidates.to_dict("records")}
-        scored = pd.DataFrame([
-            refreshed.get(str(row["stock_code"]).zfill(6), row)
-            for row in snapshot["scored_rows"]
-        ])
-        analysis_rows = build_analysis_rows(scored, trade_date)
-        rec_rows = build_recommendation_rows(
-            candidates,
-            trade_date,
-            top_n=top_n,
-            min_score=min_score,
-        )
-        result = (
-            analysis_rows,
-            rec_rows,
-            float(snapshot.get("market_mood_score") or 0),
-            str(snapshot.get("flow_date") or ""),
-            str(snapshot.get("hot_date") or ""),
-        )
-        _emit_progress(
-            progress_callback,
-            stage="reuse_preliminary_snapshot",
-            percent=88,
-            step="复用task101全市场预分析快照，仅合并upper证据",
-            trade_date=trade_date,
-            preliminary_receipt_sha256=preliminary_receipt["receipt_sha256"],
-            analysis_count=len(analysis_rows),
-        )
-        return (*result, scored) if return_scored else result
+            reuse_preliminary_snapshot = False
+        else:
+            snapshot = decode_preliminary_analysis_snapshot(
+                preliminary_receipt["analysis_snapshot"]
+            )
+            analysis_rows = [dict(row) for row in snapshot["analysis_rows"]]
+            candidates = pd.DataFrame(snapshot["candidate_rows"])
+            if len(candidates) != 80 or candidates["stock_code"].duplicated().any():
+                raise RuntimeError(
+                    "DATA_BLOCKED: task101 preliminary candidate snapshot differs"
+                )
+            candidates = _refresh_exact_upper_limit_execution_evidence(
+                engine=engine,
+                scored=candidates,
+                trade_date=trade_date,
+                decision_at=decision_at,
+                top_n=top_n,
+                min_score=min_score,
+                flow_date=str(snapshot.get("flow_date") or ""),
+                publisher_build_sha=publisher_build_sha,
+                preliminary_receipt=preliminary_receipt,
+            )
+            refreshed = {
+                str(row["stock_code"]).zfill(6): row
+                for row in candidates.to_dict("records")
+            }
+            scored = pd.DataFrame([
+                refreshed.get(str(row["stock_code"]).zfill(6), row)
+                for row in snapshot["scored_rows"]
+            ])
+            analysis_rows = build_analysis_rows(scored, trade_date)
+            rec_rows = build_recommendation_rows(
+                candidates,
+                trade_date,
+                top_n=top_n,
+                min_score=min_score,
+            )
+            result = (
+                analysis_rows,
+                rec_rows,
+                float(snapshot.get("market_mood_score") or 0),
+                str(snapshot.get("flow_date") or ""),
+                str(snapshot.get("hot_date") or ""),
+            )
+            _emit_progress(
+                progress_callback,
+                stage="reuse_preliminary_snapshot",
+                percent=88,
+                step="复用task101全市场预分析快照，仅合并upper证据",
+                trade_date=trade_date,
+                preliminary_receipt_sha256=preliminary_receipt["receipt_sha256"],
+                analysis_count=len(analysis_rows),
+            )
+            return (*result, scored) if return_scored else result
 
     _emit_progress(progress_callback, stage="load_kline", percent=5, step="加载日K特征...", trade_date=trade_date)
     kline_all = load_kline_features(
