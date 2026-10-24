@@ -2033,6 +2033,11 @@ def load_flow_features(
     df["main_net_inflow_20d"] = grouped["main_net_inflow"].transform(lambda s: s.rolling(20, min_periods=1).sum())
     latest = df[df["trade_date"] == target].copy()
     latest = latest.rename(columns={"trade_date": "flow_trade_date"})
+    latest = latest[
+        latest["stock_code"].astype(str).str[:2].isin(
+            {"00", "30", "60", "68"}
+        )
+    ].copy()
     close_ready = datetime.combine(target, datetime_time(15, 10))
     if (
         latest.empty
