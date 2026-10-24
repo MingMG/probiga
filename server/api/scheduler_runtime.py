@@ -9348,6 +9348,11 @@ def _run_task_impl(
         lease_stop_event = threading.Event()
         lease_lost_event = threading.Event()
         lease_thread: threading.Thread | None = None
+        def stop_stage_lease() -> None:
+            lease_stop_event.set()
+            if lease_thread is not None:
+                lease_thread.join(timeout=2.0)
+
         if stage_attempt is not None:
             lease_thread = threading.Thread(
                 target=_renew_daily_stage_lease_until_stopped,
@@ -9365,42 +9370,38 @@ def _run_task_impl(
             )
             lease_thread.start()
         try:
-            try:
-                stdout, stderr = proc.communicate(timeout=timeout_seconds)
-            except subprocess.TimeoutExpired:
-                _terminate_process(proc)
-                stdout, stderr = proc.communicate()
-                with _running_lock:
-                    if _running_procs.get(task_id) is proc:
-                        _running_procs.pop(task_id, None)
-                duration = int((datetime.now() - start_t).total_seconds())
-                stopped_by_user = _task_stop_requested(int(task_id))
-                status = "stopped" if stopped_by_user else "timeout"
-                if stopped_by_user:
-                    output = (
-                        _task_stop_message(int(task_id)) + "\n"
-                        + _redact_history_output((stdout or "") + "\n---STDERR---\n" + (stderr or ""))
-                    )
-                else:
-                    output = (
-                        f"任务执行超过 {task_timeout_minutes} 分钟，已自动终止。\n"
-                        + _redact_history_output((stdout or "") + "\n---STDERR---\n" + (stderr or ""))
-                    )
-                logger.warning("任务 %s 超时终止 (%ds)", task_name, duration)
-                _task_history_finish(
-                    engine,
-                    history_run_uid,
-                    status=status,
-                    duration=duration,
-                    exit_code=getattr(proc, "returncode", None),
-                    output=output,
-                    task_type=task_type,
+            stdout, stderr = proc.communicate(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            _terminate_process(proc)
+            stdout, stderr = proc.communicate()
+            with _running_lock:
+                if _running_procs.get(task_id) is proc:
+                    _running_procs.pop(task_id, None)
+            duration = int((datetime.now() - start_t).total_seconds())
+            stopped_by_user = _task_stop_requested(int(task_id))
+            status = "stopped" if stopped_by_user else "timeout"
+            if stopped_by_user:
+                output = (
+                    _task_stop_message(int(task_id)) + "\n"
+                    + _redact_history_output((stdout or "") + "\n---STDERR---\n" + (stderr or ""))
                 )
-                return
-        finally:
-            lease_stop_event.set()
-            if lease_thread is not None:
-                lease_thread.join(timeout=2.0)
+            else:
+                output = (
+                    f"任务执行超过 {task_timeout_minutes} 分钟，已自动终止。\n"
+                    + _redact_history_output((stdout or "") + "\n---STDERR---\n" + (stderr or ""))
+                )
+            logger.warning("任务 %s 超时终止 (%ds)", task_name, duration)
+            _task_history_finish(
+                engine,
+                history_run_uid,
+                status=status,
+                duration=duration,
+                exit_code=getattr(proc, "returncode", None),
+                output=output,
+                task_type=task_type,
+            )
+            stop_stage_lease()
+            return
         with _running_lock:
             if _running_procs.get(task_id) is proc:
                 _running_procs.pop(task_id, None)
@@ -9541,6 +9542,8 @@ def _run_task_impl(
     # The summary projection belongs to the exact terminal transaction above.
     # A separate unconditional write could overwrite a later claim or advertise
     # success while the daily stage/audit transaction is still pending.
+    if "stop_stage_lease" in locals():
+        stop_stage_lease()
     logger.info("任务 %s 完成: %s (%ds)", task_name, status, duration)
 
 
