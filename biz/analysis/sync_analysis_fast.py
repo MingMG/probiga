@@ -1033,6 +1033,7 @@ def _load_canonical_chase_risk_evidence(
         "stock_code",
         "turnover_ratio_effective",
         "turnover_evidence_json",
+        "turnover_evidence_validated",
         "upper_limit_evidence_json",
         "chase_evidence_status",
         "chase_effective_streak",
@@ -1100,20 +1101,20 @@ def _load_canonical_chase_risk_evidence(
     upper_snapshot = dict(upper_limit_evidence or {})
     records: list[dict[str, Any]] = []
 
-    stock_groups = list(bars.groupby("stock_code", sort=False))
-    progress_interval = max(1, len(stock_groups) // 10)
+    stock_count = int(bars["stock_code"].nunique())
+    progress_interval = max(1, stock_count // 10)
     for group_index, (stock_code, raw_group) in enumerate(
-        stock_groups, start=1
+        bars.groupby("stock_code", sort=False), start=1
     ):
         if group_index == 1 or group_index % progress_interval == 0:
             _emit_progress(
                 progress_callback,
                 stage="build_execution_risk",
                 percent=12,
-                step=f"构建执行风险证据 {group_index}/{len(stock_groups)}",
+                step=f"构建执行风险证据 {group_index}/{stock_count}",
                 trade_date=trade_date,
                 execution_risk_done=group_index,
-                execution_risk_total=len(stock_groups),
+                execution_risk_total=stock_count,
             )
         # V4 needs 21 observations for return-20/MA20 and only a 10-session
         # cooldown lookback.  Bind exactly that consumed window; older legacy
@@ -1369,6 +1370,7 @@ def _load_canonical_chase_risk_evidence(
                     float(turnover) if turnover is not None else np.nan
                 ),
                 "turnover_evidence_json": turnover_evidence_json,
+                "turnover_evidence_validated": True,
                 "upper_limit_evidence_json": upper_limit_evidence_json,
                 "chase_evidence_status": status,
                 "chase_effective_streak": effective_streak,
@@ -1390,7 +1392,7 @@ def _load_canonical_chase_risk_evidence(
         percent=13,
         step="全市场执行风险证据已生成",
         trade_date=trade_date,
-        execution_risk_total=len(stock_groups),
+        execution_risk_total=stock_count,
     )
     return pd.DataFrame(records, columns=columns)
 
@@ -2221,6 +2223,7 @@ def _verify_full_market_turnover_inputs(
     frame: pd.DataFrame,
     *,
     trade_date: str,
+    progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     """Bind every scored target row to one immutable turnover run/root."""
 
@@ -2232,7 +2235,19 @@ def _verify_full_market_turnover_inputs(
     proof_items: list[dict[str, str]] = []
     codes: set[str] = set()
     blocked_codes: set[str] = set()
-    for source in frame.to_dict(orient="records"):
+    records = frame.to_dict(orient="records")
+    progress_interval = max(1, len(records) // 10)
+    for index, source in enumerate(records, start=1):
+        if index == 1 or index % progress_interval == 0:
+            _emit_progress(
+                progress_callback,
+                stage="validate_turnover_inputs",
+                percent=13,
+                step=f"校验全市场换手率证据 {index}/{len(records)}",
+                trade_date=trade_date,
+                turnover_validation_done=index,
+                turnover_validation_total=len(records),
+            )
         code = str(source.get("stock_code") or "").strip().zfill(6)
         if code in codes:
             raise RuntimeError(
@@ -2240,8 +2255,11 @@ def _verify_full_market_turnover_inputs(
             )
         codes.add(code)
         try:
-            proof = validate_turnover_evidence(
-                source.get("turnover_evidence_json")
+            raw_proof = source.get("turnover_evidence_json")
+            proof = (
+                json.loads(raw_proof)
+                if source.get("turnover_evidence_validated") is True
+                else validate_turnover_evidence(raw_proof)
             )
         except ValueError as exc:
             raise RuntimeError(
@@ -5067,6 +5085,7 @@ def _prepare_batch_outputs(
         turnover_input_proof = _verify_full_market_turnover_inputs(
             kline_all,
             trade_date=trade_date,
+            progress_callback=progress_callback,
         )
     common_cutoff: dict[str, Any] = {
         "status": PIT_DATA_BLOCKED,

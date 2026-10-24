@@ -85,6 +85,19 @@ class SyncAnalysisFastTest(unittest.TestCase):
             proof["turnover_full_market_proof_root_sha256"],
             r"^[0-9a-f]{64}$",
         )
+        with patch(
+            "biz.analysis.sync_analysis_fast.validate_turnover_evidence",
+            side_effect=AssertionError("already validated evidence rehashed"),
+        ):
+            reused = _verify_full_market_turnover_inputs(
+                pd.DataFrame([{
+                    "stock_code": "000001",
+                    "turnover_evidence_json": evidence,
+                    "turnover_evidence_validated": True,
+                }]),
+                trade_date="2026-10-23",
+            )
+        self.assertEqual(reused["turnover_input_status"], "DATA_BLOCKED")
 
     def test_kline_snapshot_uses_engine_for_turnover_verification(self):
         engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
