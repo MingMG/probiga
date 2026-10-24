@@ -5311,7 +5311,7 @@ def _prepare_batch_outputs(
     scored = apply_canonical_execution_eligibility(scored)
     _emit_progress(progress_callback, stage="build_rows", percent=88, step="生成分析与推荐结果...", trade_date=trade_date)
     scored = _build_text_fields(scored, flow_date=flow_date, trade_date=trade_date)
-    if refresh_upper_limit:
+    if refresh_upper_limit and not allow_degraded_inputs:
         scored = _refresh_exact_upper_limit_execution_evidence(
             engine=engine,
             scored=scored,
