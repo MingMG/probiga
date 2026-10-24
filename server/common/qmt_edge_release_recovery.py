@@ -522,10 +522,15 @@ def load_context(
                 raise ledger.QmtEdgeReleaseReceiptError(
                     "granted predecessor activation is missing"
                 )
+            activation_task_id = (
+                expected_task_id
+                if expected_task_id is not None
+                else ledger._reference_task_id(connection)
+            )
             predecessor_grant = ledger._validated_release_activation_row(
                 activation_row,
                 expected_hold=previous_hold,
-                expected_task_id=expected_task_id,
+                expected_task_id=activation_task_id,
             )
             payload = validate_granted_supersession_context(
                 raw,

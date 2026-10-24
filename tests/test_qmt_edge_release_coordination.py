@@ -751,6 +751,10 @@ def test_repair_activation_supersedes_only_a_granted_predecessor(
         for row in history
     )
     with engine.connect() as connection:
+        default_context = recovery.load_context(
+            connection,
+            recovery.latest_hold(connection),
+        )
         ready, detail = coordination.check_qmt_edge_release_activation(
             connection,
             expected_build_sha=OTHER_BUILD_SHA,
@@ -768,6 +772,7 @@ def test_repair_activation_supersedes_only_a_granted_predecessor(
             expected_task_id=coordination._reference_task_id(connection),
         )
     assert ready is True
+    assert default_context["build_sha"] == OTHER_BUILD_SHA
     assert detail["grant"]["grant_run_uid"] == f"qmt-edge-grant-{ATTEMPT_B}"
     assert old_writer_allowed is False
     assert new_writer_allowed is True
