@@ -45,6 +45,7 @@ _ROW_SOURCES_BY_PROVIDER = {
     "tencent_qt_verified": frozenset({"tencent_qt_verified"}),
     "sina_history": frozenset({"sina_history"}),
     "baostock_tencent": frozenset({"baostock", "tencent_qt"}),
+    "gj_big_qmt_inner": frozenset({"gj_big_qmt_inner"}),
 }
 _CODE_CHUNK_SIZE = 400
 

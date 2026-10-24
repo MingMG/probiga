@@ -3,8 +3,12 @@ import sys
 from types import ModuleType
 
 import pandas as pd
+from sqlalchemy import create_engine, text
 
-from server.common.verified_daily_market_truth import is_suspended_daily_row
+from server.common.verified_daily_market_truth import (
+    is_suspended_daily_row,
+    load_source_daily_rows,
+)
 from tools import sync_free_stock_daily as collector
 
 
@@ -58,6 +62,35 @@ def test_zero_ohlc_with_volume_is_not_mislabeled_suspended():
     }
 
     assert is_suspended_daily_row(row) is False
+
+
+def test_retained_qmt_daily_rows_are_a_supported_verified_source():
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    with engine.begin() as connection:
+        connection.execute(text("""
+            CREATE TABLE sm_stock_kline (
+                stock_code TEXT, trade_date TEXT, `open` NUMERIC, `close` NUMERIC,
+                high NUMERIC, low NUMERIC, volume NUMERIC, amount NUMERIC,
+                pre_close NUMERIC, data_source TEXT, quality_status TEXT,
+                permission_status TEXT, k_type INTEGER, adjust_type INTEGER
+            )
+        """))
+        connection.execute(text("""
+            INSERT INTO sm_stock_kline VALUES (
+                '000001','2026-09-28',10,10.5,10.6,9.9,100,1050,10,
+                'gj_big_qmt_inner','QMT_ATTESTED','SUPPORTED',1,0
+            )
+        """))
+    with engine.connect() as connection:
+        rows = load_source_daily_rows(
+            connection,
+            source="gj_big_qmt_inner",
+            target_date="2026-09-28",
+            codes=["000001"],
+        )
+    assert len(rows) == 1
+    assert rows[0]["data_source"] == "gj_big_qmt_inner"
+    assert rows[0]["quality_status"] == "QMT_ATTESTED"
 
 
 def test_baostock_primary_uses_tencent_for_bj_and_missing_codes(monkeypatch):
