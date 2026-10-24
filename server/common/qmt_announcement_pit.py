@@ -95,6 +95,7 @@ CNINFO_DATE_SHARD_SPLIT_VERSION = "MIDPOINT_INCLUSIVE_V1"
 DEFAULT_WINDOW_DAYS = 30
 DEFAULT_OVERLAP_DAYS = 3
 DEFAULT_BATCH_SIZE = 100
+VALIDATION_READ_BATCH_SIZE = 500
 _CODE_RE = re.compile(r"^(?:0|3|4|6|8|9)\d{5}$")
 _QMT_CODE_RE = re.compile(r"^(?:0|3|4|6|8|9)\d{5}\.(?:SH|SZ|BJ)$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -2542,8 +2543,10 @@ def validate_complete_historical_reconstruction_batch(
                     "announcement reconstruction requires a repeatable-read snapshot"
                 )
             by_batch: dict[str, dict[str, datetime]] = {}
-            for offset in range(0, len(requested), DEFAULT_BATCH_SIZE):
-                code_batch = requested[offset : offset + DEFAULT_BATCH_SIZE]
+            for offset in range(0, len(requested), VALIDATION_READ_BATCH_SIZE):
+                code_batch = requested[
+                    offset : offset + VALIDATION_READ_BATCH_SIZE
+                ]
                 rows = [
                     dict(row)
                     for row in connection.execute(
@@ -2782,9 +2785,13 @@ def validate_complete_historical_reconstruction_batch(
                         "AND batch_id=:batch_id AND stock_code IN :codes "
                         "ORDER BY stock_code"
                     ).bindparams(bindparam("codes", expanding=True))
-                    for offset in range(0, len(catalog_codes), DEFAULT_BATCH_SIZE):
+                    for offset in range(
+                        0,
+                        len(catalog_codes),
+                        VALIDATION_READ_BATCH_SIZE,
+                    ):
                         code_batch = catalog_codes[
-                            offset : offset + DEFAULT_BATCH_SIZE
+                            offset : offset + VALIDATION_READ_BATCH_SIZE
                         ]
                         for raw_row in connection.execute(
                             batch_payload_statement,
