@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import redirect_stdout
 from datetime import date, datetime, timedelta
 import json
 from pathlib import Path
@@ -26,6 +27,9 @@ from sqlalchemy import text
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+VENDOR_ROOT = ROOT / "third_party"
+if str(VENDOR_ROOT) not in sys.path:
+    sys.path.insert(0, str(VENDOR_ROOT))
 
 from server.common.batch_db import create_batch_engine, replace_table_rows_exact_keys
 from server.common.kline_data import get_kline_engine
@@ -45,12 +49,15 @@ from tools.env_config import load_project_env
 
 
 SOURCE = "tencent_qt"
+BAOSTOCK_SOURCE = "baostock"
+MULTI_SOURCE = "baostock_tencent"
 VERIFIED_HISTORY_SOURCE = "tencent_qt_verified"
 SINA_HISTORY_SOURCE = "sina_history"
 RESULT_SCHEMA = "probiga.free-stock-daily-result.v1"
 QUOTE_BATCH_SIZE = 100
 QUOTE_DEADLINE_SECONDS = 180
 HISTORY_DEADLINE_SECONDS = 600
+BAOSTOCK_DEADLINE_SECONDS = 1800
 DB_CODE_CHUNK_SIZE = 400
 _LINE_RE = re.compile(r'v_([^=]+)="(.*)";?$')
 
@@ -304,6 +311,174 @@ def _source_symbol(code: str) -> str:
     if code.startswith(("43", "83", "87", "92")):
         return "bj" + code
     return "sh" + code
+
+
+def _baostock_symbol(code: str) -> str | None:
+    if code.startswith(("43", "83", "87", "92")):
+        return None
+    return ("sz." if code.startswith(("00", "30")) else "sh.") + code
+
+
+def fetch_baostock_primary_snapshot(
+    codes: list[str],
+    *,
+    target_date: str,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Use Baostock for SH/SZ daily facts and Tencent for BJ plus gaps."""
+
+    import baostock as bs
+
+    fallback, tencent_evidence = fetch_target_snapshot(
+        codes,
+        target_date=target_date,
+    )
+    frame = fallback.copy()
+    by_code = {
+        str(row["stock_code"]).zfill(6): dict(row)
+        for row in frame.to_dict(orient="records")
+    }
+    requested = sorted({str(code).zfill(6) for code in codes if code})
+    fields = (
+        "date,code,open,high,low,close,preclose,volume,amount,"
+        "adjustflag,tradestatus,pctChg,turn"
+    )
+    deadline = time.monotonic() + BAOSTOCK_DEADLINE_SECONDS
+    baostock_rows = 0
+    failures: list[str] = []
+    processed = 0
+    with redirect_stdout(sys.stderr):
+        login = bs.login()
+        if login.error_code != "0":
+            raise FreeDailyBlocked(
+                f"Baostock login failed: {login.error_code} {login.error_msg}"
+            )
+        try:
+            for code in requested:
+                symbol = _baostock_symbol(code)
+                if symbol is None:
+                    continue
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Baostock daily deadline exceeded")
+                processed += 1
+                try:
+                    result = bs.query_history_k_data_plus(
+                        symbol,
+                        fields,
+                        target_date,
+                        target_date,
+                        frequency="d",
+                        adjustflag="3",
+                    )
+                    if result.error_code != "0":
+                        failures.append(f"{code}:{result.error_code}")
+                        continue
+                    row = result.get_row_data() if result.next() else []
+                    if not row:
+                        failures.append(f"{code}:no_row")
+                        continue
+                    (
+                        trade_date,
+                        _source_code,
+                        open_value,
+                        high_value,
+                        low_value,
+                        close_value,
+                        pre_close_value,
+                        volume_value,
+                        amount_value,
+                        _adjust_flag,
+                        trade_status,
+                        pct_value,
+                        turnover_value,
+                    ) = row
+                    if trade_date != target_date:
+                        failures.append(f"{code}:date_mismatch")
+                        continue
+                    suspended = str(trade_status) == "0"
+                    close_number = float(close_value)
+                    pre_close_number = float(pre_close_value or close_value)
+                    base = by_code.get(code, {})
+                    updated = {
+                        **base,
+                        "stock_code": code,
+                        "trade_time": f"{target_date} 15:00:00",
+                        "trade_date": target_date,
+                        "k_type": 1,
+                        "adjust_type": 0,
+                        "open": 0.0 if suspended else float(open_value),
+                        "high": 0.0 if suspended else float(high_value),
+                        "low": 0.0 if suspended else float(low_value),
+                        "close": close_number,
+                        "pre_close": pre_close_number,
+                        "volume": 0 if suspended else int(float(volume_value)),
+                        "amount": 0.0 if suspended else float(amount_value),
+                        "change": (
+                            0.0 if suspended else close_number - pre_close_number
+                        ),
+                        "change_pct": (
+                            0.0 if suspended else float(pct_value or 0)
+                        ),
+                        "turnover_ratio": (
+                            0.0 if suspended else float(turnover_value or 0)
+                        ),
+                        "data_source": BAOSTOCK_SOURCE,
+                        "quality_status": (
+                            "SUSPENDED" if suspended else "SOURCE_VERIFIED"
+                        ),
+                        "permission_status": (
+                            "NO_TRADE" if suspended else "SUPPORTED"
+                        ),
+                        "received_at": _now(),
+                        "etl_sync_at": _now(),
+                    }
+                    if suspended:
+                        updated["change"] = 0.0
+                        updated["change_pct"] = 0.0
+                        updated["turnover_ratio"] = 0.0
+                    by_code[code] = updated
+                    baostock_rows += 1
+                except Exception as exc:
+                    failures.append(f"{code}:{type(exc).__name__}")
+                if processed % 500 == 0:
+                    _progress(
+                        "baostock_progress",
+                        completed=processed,
+                        projected_total=sum(
+                            1 for item in requested if _baostock_symbol(item)
+                        ),
+                        rows=baostock_rows,
+                        failures=len(failures),
+                    )
+        finally:
+            bs.logout()
+    result_frame = pd.DataFrame(
+        sorted(by_code.values(), key=lambda row: row["stock_code"])
+    )
+    received = set(result_frame["stock_code"].astype(str))
+    coverage = len(received) / max(len(requested), 1)
+    if coverage < FREE_DAILY_MIN_COVERAGE:
+        raise FreeDailyBlocked(
+            "Baostock/Tencent daily coverage below threshold: "
+            f"{len(received)}/{len(requested)} ({coverage:.2%})"
+        )
+    suspended_count = int(
+        result_frame["permission_status"].eq("NO_TRADE").sum()
+    )
+    baostock_count = int(result_frame["data_source"].eq(BAOSTOCK_SOURCE).sum())
+    tencent_count = int(
+        result_frame["data_source"].eq(SOURCE).sum()
+    )
+    return result_frame.reset_index(drop=True), {
+        "requested_count": len(requested),
+        "received_count": len(received),
+        "coverage_ratio": coverage,
+        "traded_count": len(result_frame) - suspended_count,
+        "suspended_count": suspended_count,
+        "baostock_count": baostock_count,
+        "tencent_fallback_count": tencent_count,
+        "baostock_failures": failures[:20],
+        "captured_at": str(tencent_evidence["captured_at"]),
+    }
 
 
 def fetch_history_day(
@@ -810,6 +985,134 @@ def publish_snapshot(
     }
 
 
+def publish_baostock_snapshot(
+    engine: Any,
+    *,
+    target_date: str,
+    now: datetime,
+) -> dict[str, Any]:
+    """Publish Baostock SH/SZ facts with Tencent BJ/gap fallback."""
+
+    catalog = _latest_catalog(engine, target_date=target_date, now=now)
+    expected_codes = catalog.eligible_codes(target_date)
+    allowed_sources = {BAOSTOCK_SOURCE, SOURCE}
+    existing_counts = _source_counts(
+        engine,
+        target_date=target_date,
+        codes=expected_codes,
+    )
+    foreign = sorted(set(existing_counts) - allowed_sources)
+    if foreign:
+        raise FreeDailyBlocked(
+            "target partition already belongs to another source: "
+            + ",".join(foreign)
+        )
+    _progress(
+        "baostock_fetch_start",
+        expected_count=len(expected_codes),
+    )
+    frame, evidence = fetch_baostock_primary_snapshot(
+        expected_codes,
+        target_date=target_date,
+    )
+    _progress(
+        "baostock_fetch_complete",
+        row_count=len(frame),
+        coverage_ratio=evidence["coverage_ratio"],
+        baostock_count=evidence["baostock_count"],
+        tencent_fallback_count=evidence["tencent_fallback_count"],
+        traded_count=evidence["traded_count"],
+        suspended_count=evidence["suspended_count"],
+    )
+    canonical = canonical_daily_rows(frame.to_dict(orient="records"))
+    codes = [str(row["stock_code"]) for row in canonical]
+    row_hash = canonical_digest(canonical)
+    captured_at = str(evidence["captured_at"])
+    batch_id = (
+        f"daily-verified-{target_date.replace('-', '')}-"
+        f"{captured_at[11:].replace(':', '')}"
+    )
+    frame["batch_id"] = batch_id
+    frame["data_version"] = row_hash
+    expected_counts = {
+        str(source): int(count)
+        for source, count in frame["data_source"].value_counts().items()
+    }
+    reused = False
+    if existing_counts and set(existing_counts) <= allowed_sources:
+        with engine.connect() as connection:
+            existing_rows = load_source_daily_rows(
+                connection,
+                source=MULTI_SOURCE,
+                target_date=target_date,
+                codes=sorted(set(codes)),
+            )
+        existing_canonical = canonical_daily_rows(existing_rows)
+        new_by_code = {row["stock_code"]: row for row in canonical}
+        reused = (
+            len(existing_canonical) == len(canonical)
+            and all(
+                new_by_code.get(row["stock_code"]) == row
+                for row in existing_canonical
+            )
+        )
+    if reused:
+        _progress("database_write_reused", row_count=len(frame))
+    else:
+        _progress("database_write_start", row_count=len(frame))
+        replace_table_rows_exact_keys(
+            frame,
+            "sm_stock_kline",
+            engine,
+            key_columns=("stock_code", "trade_date", "k_type", "adjust_type"),
+            lock_name=STOCK_KLINE_FREEZE_LOCK_NAME,
+        )
+        _progress("database_write_complete", row_count=len(frame))
+    counts = _source_counts(
+        engine,
+        target_date=target_date,
+        codes=sorted(set(codes)),
+    )
+    if counts != expected_counts:
+        raise FreeDailyBlocked(
+            "Baostock/Tencent write readback differs: "
+            f"expected={expected_counts} actual={counts}"
+        )
+    receipt = _write_free_receipt(
+        engine,
+        target_date=target_date,
+        source=MULTI_SOURCE,
+        captured_at=captured_at,
+        row_count=len(frame),
+        codes=codes,
+        row_hash=row_hash,
+        coverage_ratio=float(evidence["coverage_ratio"]),
+        catalog=catalog,
+        now=now,
+        batch_id=batch_id,
+    )
+    _progress("receipt_written", row_count=len(frame))
+    return {
+        "schema": RESULT_SCHEMA,
+        "status": "COMPLETE",
+        "source": MULTI_SOURCE,
+        "target_date": target_date,
+        "batch_id": batch_id,
+        "catalog_batch_id": catalog.batch_id,
+        "row_count": len(frame),
+        "code_count": len(set(codes)),
+        "coverage_ratio": float(evidence["coverage_ratio"]),
+        "baostock_count": evidence["baostock_count"],
+        "tencent_fallback_count": evidence["tencent_fallback_count"],
+        "suspended_count": evidence["suspended_count"],
+        "row_hash": row_hash,
+        "receipt_id": receipt["receipt_id"],
+        "quality_status": "SOURCE_VERIFIED",
+        "qmt_attestation_claimed": False,
+        "database_writes": True,
+    }
+
+
 def publish_verified_history(
     engine: Any,
     *,
@@ -1250,6 +1553,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="backfill an empty historical partition from Sina with amount/turnover",
     )
+    parser.add_argument(
+        "--tencent-only",
+        action="store_true",
+        help="emergency mode: use Tencent without Baostock verification",
+    )
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     engine = create_batch_engine()
@@ -1261,20 +1569,40 @@ def main(argv: list[str] | None = None) -> int:
         else _date(args.date)
     )
     try:
+        advertised_source = (
+            SINA_HISTORY_SOURCE
+            if args.backfill_sina
+            else (
+                VERIFIED_HISTORY_SOURCE
+                if args.verify_history
+                else (SOURCE if args.tencent_only else MULTI_SOURCE)
+            )
+        )
         _progress(
             "start",
             target_date=target,
-            source=SOURCE,
+            source=advertised_source,
             expected_min_coverage=FREE_DAILY_MIN_COVERAGE,
         )
-        if args.verify_history and args.backfill_sina:
-            parser.error("--verify-history and --backfill-sina are mutually exclusive")
+        if sum(
+            bool(value)
+            for value in (
+                args.verify_history,
+                args.backfill_sina,
+                args.tencent_only,
+            )
+        ) > 1:
+            parser.error(
+                "--verify-history, --backfill-sina and --tencent-only are mutually exclusive"
+            )
         if args.backfill_sina:
             publisher = publish_sina_history
         elif args.verify_history:
             publisher = publish_verified_history
-        else:
+        elif args.tencent_only:
             publisher = publish_snapshot
+        else:
+            publisher = publish_baostock_snapshot
         result = publisher(history, target_date=target, now=now)
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0

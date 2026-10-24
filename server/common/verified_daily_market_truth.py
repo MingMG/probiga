@@ -30,11 +30,22 @@ VERIFIED_DAILY_TRUTH_SCHEMA = "probiga.daily-market-consumer-truth.v1"
 FREE_DAILY_DATASET = "stock_daily"
 FREE_DAILY_PARTITION_KEY = "__daily_partition__"
 FREE_DAILY_PROVIDERS = frozenset(
-    {"tencent_qt", "tencent_qt_verified", "sina_history"}
+    {
+        "tencent_qt",
+        "tencent_qt_verified",
+        "sina_history",
+        "baostock_tencent",
+    }
 )
 FREE_DAILY_MIN_COVERAGE = 0.99
 FREE_HISTORY_MIN_CATALOG_COVERAGE = 0.90
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_ROW_SOURCES_BY_PROVIDER = {
+    "tencent_qt": frozenset({"tencent_qt"}),
+    "tencent_qt_verified": frozenset({"tencent_qt_verified"}),
+    "sina_history": frozenset({"sina_history"}),
+    "baostock_tencent": frozenset({"baostock", "tencent_qt"}),
+}
 _CODE_CHUNK_SIZE = 400
 
 
@@ -124,6 +135,12 @@ def load_source_daily_rows(
     target_date: str,
     codes: list[str],
 ) -> list[Mapping[str, Any]]:
+    row_sources = _ROW_SOURCES_BY_PROVIDER.get(source)
+    if not row_sources:
+        raise ValueError("unsupported verified daily row source")
+    source_placeholders = ", ".join(
+        f":source_{index}" for index in range(len(row_sources))
+    )
     rows: list[Mapping[str, Any]] = []
     for offset in range(0, len(codes), _CODE_CHUNK_SIZE):
         chunk = codes[offset : offset + _CODE_CHUNK_SIZE]
@@ -142,13 +159,16 @@ def load_source_daily_rows(
                        AND trade_date=:trade_date
                        AND k_type=1
                        AND adjust_type=0
-                       AND data_source=:source
+                       AND data_source IN ({source_placeholders})
                      ORDER BY stock_code
                     """
                 ),
                 {
                     "trade_date": target_date,
-                    "source": source,
+                    **{
+                        f"source_{index}": row_source
+                        for index, row_source in enumerate(sorted(row_sources))
+                    },
                     **{
                         f"code_{index}": code
                         for index, code in enumerate(chunk)
@@ -220,7 +240,7 @@ def load_verified_daily_market_truth(
                    detail_json
               FROM acquisition_partition_state
              WHERE dataset=:dataset
-               AND source IN (:source_0, :source_1, :source_2)
+               AND source IN (:source_0, :source_1, :source_2, :source_3)
                AND target_date=:target_date
                AND partition_key=:partition_key
                AND status='complete'
@@ -233,6 +253,7 @@ def load_verified_daily_market_truth(
             "source_0": "tencent_qt",
             "source_1": "tencent_qt_verified",
             "source_2": "sina_history",
+            "source_3": "baostock_tencent",
             "target_date": start,
             "partition_key": FREE_DAILY_PARTITION_KEY,
         },
@@ -320,7 +341,9 @@ def load_verified_daily_market_truth(
         )
     for row in rows:
         suspended_row = is_suspended_daily_row(row)
-        if str(row.get("data_source") or "") != source:
+        if str(row.get("data_source") or "") not in _ROW_SOURCES_BY_PROVIDER[
+            source
+        ]:
             raise VerifiedDailyMarketBlocked(
                 "free daily-market row provenance differs"
             )
