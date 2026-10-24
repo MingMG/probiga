@@ -10162,16 +10162,17 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                     )
                     continue
 
-                dependency_ready, dependency_reason = (
-                    _strategy_pipeline_dependencies_ready(row, engine, now)
-                )
-                if not dependency_ready:
-                    logger.warning(
-                        "Defer strategy pipeline task %s until prerequisite: %s",
-                        task_name,
-                        dependency_reason,
+                if not release_recovery_requested:
+                    dependency_ready, dependency_reason = (
+                        _strategy_pipeline_dependencies_ready(row, engine, now)
                     )
-                    continue
+                    if not dependency_ready:
+                        logger.warning(
+                            "Defer strategy pipeline task %s until prerequisite: %s",
+                            task_name,
+                            dependency_reason,
+                        )
+                        continue
 
                 if release_catchup_due and not release_recovery_requested:
                     release_dependencies_ready, release_dependency_reason = (
