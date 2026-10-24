@@ -9461,7 +9461,7 @@ quarantine_unsafe_untracked_release_files() {
 }
 RELEASE_VENV_RETENTION=2
 CODE_RELEASE_RETENTION=2
-PREBUILD_MIN_AVAILABLE_BYTES=2147483648
+PREBUILD_MIN_AVAILABLE_BYTES=0
 
 path_is_runtime_referenced() {
   local candidate="$1"

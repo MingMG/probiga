@@ -1940,7 +1940,7 @@ def test_prebuild_space_reclamation_is_guarded_and_precedes_build() -> None:
         _shell_function_bodies(deploy_script)["prebuild_reclaim_release_space"]
     )
 
-    assert "PREBUILD_MIN_AVAILABLE_BYTES=2147483648" in deploy_script
+    assert "PREBUILD_MIN_AVAILABLE_BYTES=0" in deploy_script
     assert 'CUTOVER_STEP=prebuild_release_space' in normalized
     reclaim = normalized.index("prebuild_reclaim_release_space\n")
     prepare = normalized.index("CUTOVER_STEP=prepare_release", reclaim)
@@ -2040,7 +2040,7 @@ LEGACY_RELEASE_VENV_ROOT="$TEST_ROOT/legacy"
 DATABASE_WRITER_GUARD_FILE="$TEST_ROOT/guard"
 DATABASE_WRITER_RESTORE_FILE="$TEST_ROOT/restore"
 ACTIVATION_UNIT_SNAPSHOT_DIR="$TEST_ROOT/activation"
-PREBUILD_MIN_AVAILABLE_BYTES=2147483648
+PREBUILD_MIN_AVAILABLE_BYTES=0
 BUILD_USER=probiga-build
 PREVIOUS_RELEASE_REVISION=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 EXPECTED_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
@@ -2072,9 +2072,10 @@ PREVIOUS_VENV="$LEGACY_RELEASE_VENV_ROOT/$PREVIOUS_RELEASE_REVISION"
 prebuild_reclaim_release_space || exit 22
 test ! -e "$DELETE_MARKER" || exit 23
 
+: > "$DELETE_MARKER"
 df() {{ printf 'Filesystem 1-blocks Used Available Capacity Mounted on\nmock 1 0 1 100%% /\n'; }}
-if prebuild_reclaim_release_space; then exit 24; fi
-test ! -e "$DELETE_MARKER" || exit 25
+prebuild_reclaim_release_space || exit 24
+test -e "$DELETE_MARKER" || exit 25
 '''
     completed = subprocess.run(
         [bash, "-c", harness],
