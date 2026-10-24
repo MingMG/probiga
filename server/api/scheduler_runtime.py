@@ -139,7 +139,7 @@ if not logger.handlers:
 DEFAULT_TASK_TIMEOUT_MINUTES = int(os.environ.get("SCHEDULER_TASK_TIMEOUT_MINUTES", "180"))
 FAST_TASK_TIMEOUT_MINUTES = int(os.environ.get("SCHEDULER_FAST_TASK_TIMEOUT_MINUTES", "20"))
 LONG_TASK_TIMEOUT_MINUTES = int(os.environ.get("SCHEDULER_LONG_TASK_TIMEOUT_MINUTES", "360"))
-DAILY_STAGE_LEASE_SECONDS = 300
+DAILY_STAGE_LEASE_SECONDS = 900
 DAILY_STAGE_LEASE_HEARTBEAT_SECONDS = 15
 QMT_FULL_HISTORY_TASK_TIMEOUT_MINUTES = 8 * 60
 CRON_CATCHUP_WINDOW_SECONDS = int(os.environ.get("SCHEDULER_CRON_CATCHUP_WINDOW_SECONDS", "180"))
@@ -9512,6 +9512,8 @@ def _run_task_impl(
             output = output + f"\nDATA_EVIDENCE_FAILED: {exc}"
             history_output = output
 
+    if "stop_stage_lease" in locals():
+        stop_stage_lease()
     try:
         _task_history_finish(
             engine,
@@ -9542,8 +9544,6 @@ def _run_task_impl(
     # The summary projection belongs to the exact terminal transaction above.
     # A separate unconditional write could overwrite a later claim or advertise
     # success while the daily stage/audit transaction is still pending.
-    if "stop_stage_lease" in locals():
-        stop_stage_lease()
     logger.info("任务 %s 完成: %s (%ds)", task_name, status, duration)
 
 
