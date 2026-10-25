@@ -1534,6 +1534,84 @@ class SyncAnalysisFastTest(unittest.TestCase):
         self.assertEqual(rows[0]["recommend_status"], "SUSPENDED")
         self.assertEqual(rows[0]["signal_status"], "WATCH")
 
+    def test_recommendation_ranking_rejects_crowded_main_wave_without_entry(self):
+        crowded = {
+            "stock_code": "600001",
+            "short_name": "crowded",
+            "ai_score": 90,
+            "long_term_score": 70,
+            "short_term_score": 90,
+            "event_score": 60,
+            "quality_score": 90,
+            "final_trade_score": 70,
+            "entry_score": 30,
+            "capital_score": 90,
+            "main_wave_score": 95,
+            "main_wave_signal": "WATCH",
+            "signal_status": "WATCH",
+            "recommend_status": "SUSPENDED",
+            "recommend_reason": "main wave only",
+            "event_risk_level": "LOW",
+        }
+        balanced = {
+            **crowded,
+            "stock_code": "600002",
+            "ai_score": 70,
+            "short_term_score": 72,
+            "final_trade_score": 66,
+            "entry_score": 64,
+            "main_wave_score": 65,
+        }
+
+        rows = build_recommendation_rows(
+            pd.DataFrame([crowded, balanced]),
+            "2026-08-11",
+            top_n=80,
+            min_score=62,
+        )
+
+        self.assertEqual(
+            [item["stock_code"] for item in rows],
+            ["600002"],
+        )
+
+    def test_recommendation_top_n_is_a_cap_not_a_quota(self):
+        passing = {
+            "stock_code": "600001",
+            "short_name": "passing",
+            "ai_score": 70,
+            "long_term_score": 70,
+            "short_term_score": 70,
+            "event_score": 60,
+            "quality_score": 70,
+            "final_trade_score": 66,
+            "entry_score": 64,
+            "capital_score": 70,
+            "main_wave_score": 60,
+            "main_wave_signal": "WATCH",
+            "signal_status": "WATCH",
+            "recommend_status": "SUSPENDED",
+            "recommend_reason": "passing",
+            "event_risk_level": "LOW",
+        }
+        failing = {
+            **passing,
+            "stock_code": "600002",
+            "entry_score": 44,
+        }
+
+        rows = build_recommendation_rows(
+            pd.DataFrame([passing, failing]),
+            "2026-08-11",
+            top_n=80,
+            min_score=62,
+        )
+
+        self.assertEqual(
+            [item["stock_code"] for item in rows],
+            ["600001"],
+        )
+
     def test_missing_upper_history_keeps_ranked_pick_research_only(self):
         row = {
             "stock_code": "600001",

@@ -407,6 +407,15 @@ STRATEGY_PROFILES: dict[str, dict[str, Any]] = {
     },
 }
 
+EVIDENCE_RANKING_WEIGHTS = {
+    "entry_score": 0.45,
+    "final_trade_score": 0.30,
+    "long_term_score": 0.20,
+    "event_score": 0.05,
+}
+EVIDENCE_MIN_ENTRY_SCORE = 45.0
+EVIDENCE_MIN_FINAL_TRADE_SCORE = 60.0
+
 
 def clamp_score(value: float | int | None, low: float = 0.0, high: float = 100.0) -> float:
     """Clamp a scalar score into 0-100 range."""
@@ -4106,23 +4115,29 @@ def build_recommendation_rows(df: pd.DataFrame, trade_date: str, top_n: int, min
     signal_status_series = (
         df["signal_status"].fillna("BLOCK").astype(str).str.upper()
     )
-    # The recommendation table is also the ranked observation ledger.  Keep
-    # soft-risk SUSPENDED/WATCH rows visible for later V4/V5/V6 evaluation,
-    # while hard blocks and exit signals remain excluded.  Execution remains
-    # fail-closed in the selector and execution router.
+    # Build the ranking from factors with non-negative out-of-sample IC in the
+    # settled recommendation history.  Main-wave and raw technical strength
+    # are deliberately excluded: both were negatively related to subsequent
+    # 3/5/10-session returns and would promote crowded entries.
+    evidence_ranking_score = sum(
+        _numeric_col(df, column, 0.0) * float(weight)
+        for column, weight in EVIDENCE_RANKING_WEIGHTS.items()
+    )
+    # The recommendation table is also the ranked observation ledger. Keep
+    # soft-risk rows visible for evaluation, but do not fill the top-N quota
+    # with candidates that fail the validated entry, swing and evidence gates.
     ranked_observation_candidate = (
         recommend_status_series.isin({"ALLOW", "SUSPENDED"})
-        & (_numeric_col(df, "quality_score", 0.0) >= float(min_score))
-    )
-    main_wave_candidate = (
-        (_numeric_col(df, "main_wave_score", 0.0) >= float(STRATEGY_PROFILES["main_wave"]["min_score"]))
-        & recommend_status_series.isin({"ALLOW", "SUSPENDED"})
-        & (event_risk_series != "CRITICAL")
+        & (_numeric_col(df, "entry_score", 0.0) >= EVIDENCE_MIN_ENTRY_SCORE)
+        & (
+            _numeric_col(df, "final_trade_score", 0.0)
+            >= EVIDENCE_MIN_FINAL_TRADE_SCORE
+        )
+        & (evidence_ranking_score >= float(min_score))
     )
     eligible = df[
         (
             ranked_observation_candidate
-            | main_wave_candidate
         )
         & (recommend_status_series != "BLOCK")
         & (signal_status_series != "BLOCK")
@@ -4130,24 +4145,18 @@ def build_recommendation_rows(df: pd.DataFrame, trade_date: str, top_n: int, min
         & (event_risk_series != "CRITICAL")
         & (stock_code_series.str.match(r"^(0|3|6)"))
     ].copy()
-    eligible["ranking_score"] = pd.concat([
-        _numeric_col(eligible, "final_trade_score", 0.0),
-        _numeric_col(eligible, "main_wave_score", 0.0),
-    ], axis=1).max(axis=1)
+    eligible["ranking_score"] = evidence_ranking_score.loc[eligible.index]
     eligible["stock_code"] = (
         eligible["stock_code"].astype(str).str.strip().str.zfill(6)
     )
     eligible = eligible.sort_values(
         [
             "ranking_score",
-            "final_trade_score",
-            "main_wave_score",
             "entry_score",
-            "quality_score",
-            "capital_score",
+            "final_trade_score",
             "stock_code",
         ],
-        ascending=[False, False, False, False, False, False, True],
+        ascending=[False, False, False, True],
         kind="mergesort",
     ).head(int(top_n))
 
