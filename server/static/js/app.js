@@ -6292,6 +6292,9 @@
             // date mismatch by changing the request date client-side.
             loadRecommendedPage(d || currentDateValue(), c);
         },
+        'market-outlook': function (d, c) {
+            return window.MarketOutlook.load(d || recommendationDateValue() || currentDateValue(), c);
+        },
         hunter: function (d, c) {
             loadHunterPage(recommendationDateValue() || d, c);
         },
@@ -7451,6 +7454,7 @@
         {group:'交易决策', items:[
             {id:'quant-workbench',icon:'🧪',label:'量化工作台'},
             {id:'recommended',icon:'💎',label:'AI推荐买入'},
+            {id:'market-outlook',icon:'🔭',label:'明日推演'},
             {id:'trading',icon:'◎',label:'交易决策总览'},
             {id:'trading-day',icon:'◷',label:'今日看盘'}
             ,{id:'daily-pool',icon:'📋',label:'今日票池'}
@@ -7521,6 +7525,7 @@
             {id:'fused',icon:'📊',label:'热股排行'},
             {id:'trading-v3-candidates',modulePage:'v3',tradingView:'candidates',icon:'🎯',label:'策略选股结果'},
             {id:'recommended',icon:'💎',label:'AI推荐买入'},
+            {id:'market-outlook',icon:'🔭',label:'明日推演'},
             {id:'strategy-center',icon:'🏆',label:'策略研究与竞技'},
             {id:'qmt-strategy-results',icon:'◫',label:'QMT每日模拟'},
             {id:'sentiment',icon:'🧠',label:'市场观察'},
@@ -7618,6 +7623,7 @@
         PAGE_TITLES['workbench'] = '市场总览';
         PAGE_TITLES['quant-workbench'] = '🧪 量化工作台';
         PAGE_TITLES['daily-pool'] = '📋 今日票池';
+        PAGE_TITLES['market-outlook'] = '🔭 明日推演';
         PAGE_TITLES['trading-day'] = '今日看盘';
         PAGE_TITLES['trading'] = '◎ 交易与复盘';
         PAGE_TITLES['screen'] = '🎯 条件选股（研究）';
