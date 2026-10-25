@@ -649,6 +649,134 @@ def load_review_lifecycle_status(
     }
 
 
+def load_research_lab_status(engine: Any) -> dict[str, Any]:
+    """Project the registered strategy and backtest research workstation."""
+
+    try:
+        from server.trading_v2.job_worker import research_backtest_adapter
+        from server.trading_v2.repository import TradingV2ReadRepository
+
+        repository = TradingV2ReadRepository(engine)
+        strategies = repository.strategies()
+        backtests = repository.backtests(limit=10)
+        workers = repository.worker_heartbeats()
+    except Exception as exc:
+        return {
+            "status": "BLOCKED",
+            "reason": f"RESEARCH_REGISTRY_UNAVAILABLE:{type(exc).__name__}",
+            "strategy_count": 0,
+            "backtest_ready_count": 0,
+            "completed_backtest_count": 0,
+            "latest_backtest": None,
+            "worker": {},
+            "entry_tab": "strategy-backtest",
+            "automatic_real_order_submission": False,
+            "real_order_authority": False,
+        }
+    supported: list[dict[str, Any]] = []
+    for strategy in strategies:
+        try:
+            adapter = research_backtest_adapter(
+                strategy_id=str(strategy.get("strategy_id") or ""),
+                strategy_version=str(strategy.get("version") or ""),
+                instrument_scope=str(strategy.get("instrument_scope") or ""),
+            )
+        except Exception as exc:
+            adapter = {
+                "supported": False,
+                "status": "ADAPTER_CHECK_FAILED",
+                "reason": type(exc).__name__,
+            }
+        if adapter.get("supported") is True:
+            supported.append({
+                "strategy_id": strategy.get("strategy_id"),
+                "strategy_name": strategy.get("strategy_name"),
+                "version": strategy.get("version"),
+                "lifecycle_status": strategy.get("lifecycle_status"),
+                "adapter": adapter.get("adapter"),
+            })
+    completed = [
+        item for item in backtests
+        if str(item.get("status") or "").upper() == "COMPLETED"
+    ]
+    latest = completed[0] if completed else None
+    latest_summary = None
+    if latest:
+        result = latest.get("result") if isinstance(latest.get("result"), Mapping) else {}
+        performance = (
+            result.get("performance")
+            if isinstance(result.get("performance"), Mapping)
+            else {}
+        )
+        promotion = (
+            result.get("promotion_protocol")
+            if isinstance(result.get("promotion_protocol"), Mapping)
+            else {}
+        )
+        latest_summary = {
+            "backtest_uid": latest.get("backtest_uid"),
+            "strategy_id": (
+                (latest.get("strategy_definition") or {}).get("strategy_id")
+                if isinstance(latest.get("strategy_definition"), Mapping)
+                else ""
+            ),
+            "strategy_version": latest.get("strategy_version"),
+            "start_date": latest.get("start_date"),
+            "end_date": latest.get("end_date"),
+            "status": latest.get("status"),
+            "cagr": performance.get("cagr"),
+            "sharpe": performance.get("sharpe"),
+            "max_drawdown": performance.get("max_drawdown"),
+            "profit_factor": performance.get("monthly_profit_factor"),
+            "completed_trade_count": result.get("completed_trade_count"),
+            "promotion_status": promotion.get("status"),
+            "promotion_blockers": list(promotion.get("blockers") or []),
+        }
+    worker = workers[0] if workers else {}
+    heartbeat_at = _datetime_value(worker.get("heartbeat_at"))
+    worker_age_seconds = (
+        int((datetime.now() - heartbeat_at).total_seconds())
+        if heartbeat_at is not None
+        else None
+    )
+    worker_fresh = bool(
+        worker_age_seconds is not None and 0 <= worker_age_seconds <= 300
+    )
+    status = (
+        "READY"
+        if latest_summary and worker_fresh and supported
+        else "PARTIAL"
+        if latest_summary or supported
+        else "BLOCKED"
+    )
+    reason = ""
+    if not worker_fresh:
+        reason = "RESEARCH_WORKER_STALE"
+    elif not latest_summary:
+        reason = "NO_COMPLETED_BACKTEST"
+    elif not supported:
+        reason = "NO_RUNNABLE_BACKTEST_ADAPTER"
+    return {
+        "status": status,
+        "reason": reason,
+        "strategy_count": len(strategies),
+        "backtest_ready_count": len(supported),
+        "completed_backtest_count": len(completed),
+        "supported_strategies": supported,
+        "latest_backtest": latest_summary,
+        "worker": {
+            "worker_name": str(worker.get("worker_name") or ""),
+            "status": str(worker.get("status") or "MISSING"),
+            "heartbeat_at": worker.get("heartbeat_at"),
+            "heartbeat_age_seconds": worker_age_seconds,
+            "fresh": worker_fresh,
+        },
+        "entry_tab": "strategy-backtest",
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+
+
 def _require_operation(operation_id: str) -> dict[str, Any]:
     spec = quant_workbench_operation(operation_id)
     if spec is None:
@@ -994,6 +1122,11 @@ def quant_workbench_operation_status(operation_id: str):
     raise HTTPException(status_code=404, detail="量化工作台任务不存在")
 
 
+@router.get("/research-lab")
+def quant_workbench_research_lab():
+    return load_research_lab_status(get_engine())
+
+
 @router.post("/operations/{operation_id}/run")
 def run_quant_workbench_operation(
     operation_id: str,
@@ -1085,6 +1218,7 @@ __all__ = [
     "load_operation_status",
     "load_research_status",
     "load_review_lifecycle_status",
+    "load_research_lab_status",
     "load_risk_watch_status",
     "load_simulation_lifecycle_status",
     "load_strategy_pool_status",

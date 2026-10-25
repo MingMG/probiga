@@ -3917,6 +3917,30 @@
                     + '</article>';
             }
 
+            function renderResearchLab(lab) {
+                lab = lab || {};
+                var state = String(lab.status || 'BLOCKED').toUpperCase();
+                var latest = lab.latest_backtest || {};
+                var worker = lab.worker || {};
+                function metric(value, suffix, digits) {
+                    var number = Number(value);
+                    if (!isFinite(number)) return '—';
+                    return number.toFixed(digits == null ? 2 : digits) + (suffix || '');
+                }
+                var blockers = Array.isArray(latest.promotion_blockers) ? latest.promotion_blockers : [];
+                var headline = latest.strategy_version
+                    ? ('最新冻结回测：' + latest.strategy_version)
+                    : '尚无完成的正式回测';
+                var reason = lab.reason === 'RESEARCH_WORKER_STALE'
+                    ? '研究 Worker 心跳已过期，新回测无法可靠进入执行队列'
+                    : lab.reason === 'NO_COMPLETED_BACKTEST'
+                    ? '已有策略注册，但还没有完成的正式回测'
+                    : lab.reason || '研究资产与执行链路状态正常';
+                return '<div class="qwb-research-head"><div><span>RESEARCH LAB · 研究实验</span><h3>' + escHtml(headline) + '</h3><p>' + escHtml(reason) + '</p></div><b class="qwb-status ' + statusClass(state) + '">' + escHtml(statusText[state] || state) + '</b></div>'
+                    + '<div class="qwb-research-metrics"><article><span>注册策略</span><strong>' + escHtml(lab.strategy_count || 0) + '</strong><small>可回测 ' + escHtml(lab.backtest_ready_count || 0) + '</small></article><article><span>完成回测</span><strong>' + escHtml(lab.completed_backtest_count || 0) + '</strong><small>' + escHtml(latest.backtest_uid || '尚无') + '</small></article><article><span>CAGR / Sharpe</span><strong>' + escHtml(metric(latest.cagr == null ? null : Number(latest.cagr) * 100, '%', 1)) + '</strong><small>Sharpe ' + escHtml(metric(latest.sharpe, '', 2)) + '</small></article><article><span>最大回撤 / PF</span><strong>' + escHtml(metric(latest.max_drawdown == null ? null : Number(latest.max_drawdown) * 100, '%', 1)) + '</strong><small>PF ' + escHtml(metric(latest.profit_factor, '', 2)) + '</small></article><article><span>研究 Worker</span><strong class="' + (worker.fresh ? 'qwb-good-text' : 'qwb-bad-text') + '">' + escHtml(worker.fresh ? '在线' : '失效') + '</strong><small>' + escHtml(worker.heartbeat_at || '无心跳') + '</small></article></div>'
+                    + '<div class="qwb-research-foot"><span>晋级门禁：' + escHtml(blockers.length ? blockers.join(' · ') : (latest.promotion_status || '尚未产生晋级结论')) + '</span><button type="button" onclick="switchTab(\'strategy-backtest\')">打开研究工作台</button></div>';
+            }
+
             window.qwbRunLifecycleNext = function () {
                 var action = (window._quantWorkbenchData.summary || {}).next_action || {};
                 var ids = Array.isArray(action.operation_ids) ? action.operation_ids : [];
@@ -4120,6 +4144,8 @@
             stages.forEach(function (stage, index) { h += renderLifecycleStage(stage, index); });
             h += '</div></section>';
 
+            h += '<section class="qwb-research-lab" id="qwb-research-lab"><div class="qwb-research-loading">正在读取策略实验、冻结回测与 Worker 心跳...</div></section>';
+
             if (nextAction.stage_code) {
                 var nextOperation = null;
                 (nextAction.operation_ids || []).some(function (id) {
@@ -4156,6 +4182,13 @@
             h += '</div></details>';
             h += '<footer class="qwb-footer">能力合同 '+escHtml(res.schema||'-')+'。系统不解析个人 Skill 作为生产权限；accepted / delegated / 进程存活均不等于业务完成。</footer></div>';
             c.innerHTML = h;
+            fetchRawJsonWithTimeout('/api/quant-workbench/research-lab', 30000).then(function (lab) {
+                var mount = document.getElementById('qwb-research-lab');
+                if (mount) mount.innerHTML = renderResearchLab(lab);
+            }).catch(function (error) {
+                var mount = document.getElementById('qwb-research-lab');
+                if (mount) mount.innerHTML = '<div class="qwb-research-head"><div><span>RESEARCH LAB · 研究实验</span><h3>研究资产暂时不可读取</h3><p>' + escHtml(error && error.message ? error.message : '请求失败') + '</p></div><b class="qwb-status qwb-bad">阻断</b></div>';
+            });
         }).catch(function (err) {
             c.innerHTML = '<div class="loading" style="color:#b91c1c">量化工作台读取失败：'+escHtml(err&&err.message?err.message:err)+'</div>';
         });

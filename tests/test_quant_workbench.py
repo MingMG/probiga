@@ -609,6 +609,75 @@ def test_overview_exposes_one_integrated_lifecycle_and_next_action(monkeypatch):
     assert result["execution_policy"]["accepted_is_completion"] is False
 
 
+def test_research_lab_projects_real_backtest_metrics_and_worker_health(monkeypatch):
+    class FakeRepository:
+        def __init__(self, _engine):
+            pass
+
+        def strategies(self):
+            return [{
+                "strategy_id": "etf_trend_risk",
+                "strategy_name": "ETF趋势风险",
+                "version": "etf_trend_risk_v2.0.0",
+                "instrument_scope": "EXCHANGE_TRADED_FUND",
+                "lifecycle_status": "SHADOW",
+            }]
+
+        def backtests(self, limit=10):
+            assert limit == 10
+            return [{
+                "backtest_uid": "a" * 32,
+                "strategy_version": "etf_trend_risk_v2.0.0",
+                "start_date": "2021-01-04",
+                "end_date": "2026-07-24",
+                "status": "COMPLETED",
+                "result": {
+                    "completed_trade_count": 353,
+                    "performance": {
+                        "cagr": 0.0685,
+                        "sharpe": 0.84,
+                        "max_drawdown": -0.0793,
+                        "monthly_profit_factor": 2.06,
+                    },
+                    "promotion_protocol": {
+                        "status": "BLOCK",
+                        "blockers": ["STATISTICAL_GATE_BLOCKED"],
+                    },
+                },
+            }]
+
+        def worker_heartbeats(self):
+            return [{
+                "worker_name": "trading-v2-job-worker",
+                "status": "IDLE",
+                "heartbeat_at": "2026-09-07 09:11:01",
+            }]
+
+    monkeypatch.setattr(
+        "server.trading_v2.repository.TradingV2ReadRepository",
+        FakeRepository,
+    )
+    monkeypatch.setattr(
+        "server.trading_v2.job_worker.research_backtest_adapter",
+        lambda **_kwargs: {
+            "supported": True,
+            "adapter": "etf_trade_level_replay_v2",
+        },
+    )
+
+    result = quant_workbench.load_research_lab_status(object())
+
+    assert result["status"] == "PARTIAL"
+    assert result["reason"] == "RESEARCH_WORKER_STALE"
+    assert result["strategy_count"] == 1
+    assert result["backtest_ready_count"] == 1
+    assert result["completed_backtest_count"] == 1
+    assert result["latest_backtest"]["cagr"] == 0.0685
+    assert result["latest_backtest"]["completed_trade_count"] == 353
+    assert result["worker"]["fresh"] is False
+    assert result["real_order_authority"] is False
+
+
 def test_run_operation_rejects_unknown_and_uses_scheduler_for_direct_task(monkeypatch):
     with pytest.raises(HTTPException) as unknown:
         quant_workbench.run_quant_workbench_operation("not-registered")
@@ -754,6 +823,13 @@ const container = {
   get innerHTML() { return rendered; },
   set innerHTML(value) { rendered = String(value); }
 };
+global.document = {
+  getElementById: function(id) {
+    return id === 'qwb-research-lab'
+      ? { set innerHTML(value) { rendered += String(value); } }
+      : null;
+  }
+};
 function escHtml(value) {
   return String(value == null ? '' : value)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;')
@@ -763,7 +839,30 @@ function escAttr(value) { return escHtml(value); }
 function currentDateValue() { return '2026-10-23'; }
 function recommendationDateValue() { return '2026-10-23'; }
 function switchTab() {}
-function fetchRawJsonWithTimeout() {
+function fetchRawJsonWithTimeout(url) {
+  if (url.indexOf('/research-lab') >= 0) {
+    return Promise.resolve({
+      status: 'PARTIAL',
+      reason: 'RESEARCH_WORKER_STALE',
+      strategy_count: 12,
+      backtest_ready_count: 1,
+      completed_backtest_count: 1,
+      latest_backtest: {
+        backtest_uid: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+        strategy_version: 'etf_trend_risk_v2.0.0',
+        cagr: 0.0685,
+        sharpe: 0.84,
+        max_drawdown: -0.0793,
+        profit_factor: 2.06,
+        completed_trade_count: 353,
+        promotion_blockers: ['STATISTICAL_GATE_BLOCKED']
+      },
+      worker: {
+        fresh: false,
+        heartbeat_at: '2026-09-07 09:11:01'
+      }
+    });
+  }
   return Promise.resolve({
     schema: 'probiga.quant-workbench-capabilities.v1',
     operation_contract: 'probiga.quant-workbench-operations.v1',
@@ -846,6 +945,9 @@ setTimeout(function() {
   assert.match(rendered, /规范治理决策/);
   assert.match(rendered, /0 \/ 80 可执行/);
   assert.match(rendered, /打开策略治理/);
+  assert.match(rendered, /RESEARCH LAB/);
+  assert.match(rendered, /etf_trend_risk_v2.0.0/);
+  assert.match(rendered, /STATISTICAL_GATE_BLOCKED/);
   assert.match(rendered, /5578/);
   assert.match(rendered, /aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/);
   assert.match(rendered, /accepted 不等于 COMPLETE/);
