@@ -1815,7 +1815,17 @@ def load_latest_verified_upper_limit_evidence(
         preliminary_receipt_sha256=preliminary_receipt_sha256, preliminary_build_sha=preliminary_build_sha,
     )
     if not evidence:
-        return {}
+        from server.common.eastmoney_upper_limit_history import (
+            load_eastmoney_upper_limit_history,
+        )
+
+        return load_eastmoney_upper_limit_history(
+            engine,
+            target_date=target_date,
+            decision_at=decision_at,
+            stock_codes=stock_codes,
+            preliminary_receipt_sha256=preliminary_receipt_sha256,
+        )
     proof = validate_upper_limit_evidence(next(iter(evidence.values()))["upper_limit_evidence_json"])
     with engine.connect() as connection:
         run = connection.execute(text(f"SELECT * FROM {FIELD_CAPTURE_RUN_TABLE} WHERE run_id=:run_id"),

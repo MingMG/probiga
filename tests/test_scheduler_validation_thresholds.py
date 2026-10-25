@@ -22,6 +22,7 @@ from server.common.analysis_pool_receipt import (
     canonical_sha256,
     read_persisted_pool_manifest,
     validate_turnover_evidence,
+    validate_upper_limit_evidence,
 )
 from server.common.scheduler_validation import (
     TASK_OUTPUT_REQUIREMENTS,
@@ -797,6 +798,21 @@ def test_turnover_pass_requires_exact_target_direct_snapshot_proof():
         invalid.pop("proof_sha256", None)
         with pytest.raises(ValueError, match="direct turnover snapshot proof"):
             validate_turnover_evidence(build_turnover_evidence(invalid))
+
+
+def test_upper_limit_accepts_hash_bound_eastmoney_rule_evidence():
+    proof = json.loads(_upper_limit_evidence("600001"))
+    proof.pop("proof_sha256")
+    proof.update({
+        "source_table": "sm_stock_kline+eastmoney.push2ex.zt_pool",
+        "provider": "eastmoney.push2ex.zt_pool+cn_exchange_limit_rule.v1",
+        "transport_contract": "HTTPS_TLS_VERIFIED_DIRECT_V1",
+    })
+    validated = validate_upper_limit_evidence(build_upper_limit_evidence(proof))
+    assert validated["provider"] == (
+        "eastmoney.push2ex.zt_pool+cn_exchange_limit_rule.v1"
+    )
+    assert validated["status"] == "PASS"
 
 
 def _strategy_pool_engine(

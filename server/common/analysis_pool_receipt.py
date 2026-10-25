@@ -1023,14 +1023,27 @@ def validate_upper_limit_evidence(value: Any) -> dict[str, Any]:
             or not str(payload.get("stage_attempt_uid") or "")
         ):
             raise ValueError("upper-limit completion proof differs")
+    upper_limit_identity = (
+        str(payload.get("source_table") or ""),
+        str(payload.get("provider") or ""),
+        str(payload.get("transport_contract") or ""),
+    )
     if (
-        payload.get("source_table") != "st_market_field_capture_row"
-        or payload.get("capture_kind") != "DAILY_UPPER_LIMIT_HISTORY"
-        or payload.get("provider") != "myquant.gm.get_history_instruments"
+        payload.get("capture_kind") != "DAILY_UPPER_LIMIT_HISTORY"
+        or upper_limit_identity not in {
+            (
+                "st_market_field_capture_row",
+                "myquant.gm.get_history_instruments",
+                "MYQUANT_GM_SDK_FIXED_ACTION_V1",
+            ),
+            (
+                "sm_stock_kline+eastmoney.push2ex.zt_pool",
+                "eastmoney.push2ex.zt_pool+cn_exchange_limit_rule.v1",
+                "HTTPS_TLS_VERIFIED_DIRECT_V1",
+            ),
+        }
         or payload.get("source_field") != "upper_limit"
         or payload.get("unit") != "PRICE_CNY"
-        or payload.get("transport_contract")
-        != "MYQUANT_GM_SDK_FIXED_ACTION_V1"
         or payload.get("entitlement_status") != "SUPPORTED"
         or str(payload.get("timezone") or "") != "Asia/Shanghai"
         or not 1 <= int(payload.get("expected_stock_count") or 0) <= 80

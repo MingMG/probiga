@@ -1259,9 +1259,30 @@ def _load_canonical_chase_risk_evidence(
             and (group["low"] <= group[["open", "close", "high"]].min(axis=1)).all()
         )
         source_complete = bool(
-            (group["data_source"] == "gj_big_qmt_inner").all()
-            and (group["quality_status"] == "QMT_ATTESTED").all()
-            and (group["permission_status"] == "SUPPORTED").all()
+            group.apply(
+                lambda row: (
+                    (
+                        str(row["data_source"]) == "gj_big_qmt_inner"
+                        and (
+                            pd.isna(row["quality_status"])
+                            or str(row["quality_status"]) in {
+                                "QMT_ATTESTED",
+                                "VERIFIED",
+                            }
+                        )
+                        and (
+                            pd.isna(row["permission_status"])
+                            or str(row["permission_status"]) == "SUPPORTED"
+                        )
+                    )
+                    or (
+                        str(row["data_source"]) in {"sina_history", "baostock"}
+                        and str(row["quality_status"]) == "SOURCE_VERIFIED"
+                        and str(row["permission_status"]) == "SUPPORTED"
+                    )
+                ),
+                axis=1,
+            ).all()
             and group["received_at"].notna().all()
             and (group["received_at"] <= share_cutoff).all()
             and group["batch_id"].fillna("").astype(str).str.strip().ne("").all()

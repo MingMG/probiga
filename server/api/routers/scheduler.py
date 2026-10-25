@@ -526,6 +526,72 @@ def release_analysis_recovery_status():
     return read_release_analysis_recovery_status()
 
 
+@router.post("/scheduler/release-analysis/capture-turnover")
+def capture_target_turnover(
+    trade_date: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
+):
+    """Run the canonical closed-session turnover evidence collector."""
+
+    rows = _read_sql(
+        "SELECT * FROM st_scheduled_tasks "
+        "WHERE task_type='target_turnover_snapshot' ORDER BY id LIMIT 2"
+    )
+    if len(rows) != 1:
+        raise HTTPException(
+            status_code=409,
+            detail="target turnover task registration is unavailable or ambiguous",
+        )
+    row = rows[0]
+    if (
+        int(row.get("enabled") or 0) != 1
+        or str(row.get("script_path") or "").replace("\\", "/")
+        != "tools/sync_target_turnover_snapshot.py"
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="target turnover task registration differs from contract",
+        )
+    return launch_scheduler_task(
+        row,
+        root=Path(__file__).resolve().parents[3],
+        engine=get_engine(),
+        trigger_source="release_catchup",
+        target_trade_date=trade_date,
+    )
+
+
+@router.post("/scheduler/release-analysis/prepare-upper-history")
+def prepare_upper_limit_history(
+    trade_date: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
+):
+    """Freeze 21-session limit evidence before a strategy run starts."""
+
+    rows = _read_sql(
+        "SELECT DISTINCT stock_code FROM st_recommended_stocks "
+        "WHERE pick_date=:trade_date AND publication_status='ACTIVE' "
+        "ORDER BY stock_code",
+        {"trade_date": trade_date},
+    )
+    codes = [str(row.get("stock_code") or "").zfill(6) for row in rows]
+    if len(codes) != 80 or len(set(codes)) != 80:
+        raise HTTPException(
+            status_code=409,
+            detail="active strategy pool must contain exactly 80 distinct stocks",
+        )
+    from server.common.eastmoney_upper_limit_history import (
+        prepare_eastmoney_upper_limit_history,
+    )
+
+    try:
+        return prepare_eastmoney_upper_limit_history(
+            get_engine(),
+            target_date=trade_date,
+            stock_codes=codes,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @router.post("/scheduler/release-analysis/activate")
 def activate_release_analysis(
     run_uid: str = Query(..., pattern=r"^[0-9a-f]{32}$"),
