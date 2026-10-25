@@ -371,6 +371,25 @@ def require_analysis_diagnostics(parent_fd, name):
     finally:
         os.close(descriptor)
 
+def require_upper_limit_history(parent_fd, name):
+    observed = os.lstat(name, dir_fd=parent_fd)
+    if not (stat.S_ISDIR(observed.st_mode)
+            and observed.st_uid == expected_uid and observed.st_gid == expected_gid
+            and stat.S_IMODE(observed.st_mode) == 0o700):
+        raise SystemExit("unsafe upper-limit history root")
+    descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         dir_fd=parent_fd)
+    try:
+        for child in os.listdir(descriptor):
+            metadata = os.lstat(child, dir_fd=descriptor)
+            if not (stat.S_ISREG(metadata.st_mode)
+                    and metadata.st_uid == expected_uid and metadata.st_gid == expected_gid
+                    and metadata.st_nlink == 1
+                    and stat.S_IMODE(metadata.st_mode) == 0o600):
+                raise SystemExit("unsafe upper-limit history file")
+    finally:
+        os.close(descriptor)
+
 def inspect(parent, name, *, runs):
     before = os.lstat(name, dir_fd=parent)
     require(before, directory=True)
@@ -819,6 +838,9 @@ try:
         if name == "analysis-execution-diagnostics":
             require_analysis_diagnostics(directory_fd, name)
             continue
+        if name == "upper-limit-history":
+            require_upper_limit_history(directory_fd, name)
+            continue
         observed_mode = stat.S_IMODE(observed.st_mode)
         allowed_modes = {0o600, 0o644} if name in legacy_names else {0o600}
         if not (
@@ -935,6 +957,25 @@ def require_analysis_diagnostics(parent_fd, name):
     finally:
         os.close(descriptor)
 
+def require_upper_limit_history(parent_fd, name):
+    observed = os.lstat(name, dir_fd=parent_fd)
+    if not (stat.S_ISDIR(observed.st_mode)
+            and observed.st_uid == expected_uid and observed.st_gid == expected_gid
+            and stat.S_IMODE(observed.st_mode) == 0o700):
+        raise SystemExit("unsafe upper-limit history root")
+    descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         dir_fd=parent_fd)
+    try:
+        for child in os.listdir(descriptor):
+            metadata = os.lstat(child, dir_fd=descriptor)
+            if not (stat.S_ISREG(metadata.st_mode)
+                    and metadata.st_uid == expected_uid and metadata.st_gid == expected_gid
+                    and metadata.st_nlink == 1
+                    and stat.S_IMODE(metadata.st_mode) == 0o600):
+                raise SystemExit("unsafe upper-limit history file")
+    finally:
+        os.close(descriptor)
+
 def require_file(metadata, *, modes, name):
     if name == "acquisition-shards":
         require_acquisition_shards(directory_fd, name)
@@ -953,6 +994,9 @@ def require_file(metadata, *, modes, name):
         return
     if name == "analysis-execution-diagnostics":
         require_analysis_diagnostics(directory_fd, name)
+        return
+    if name == "upper-limit-history":
+        require_upper_limit_history(directory_fd, name)
         return
     mode = stat.S_IMODE(metadata.st_mode)
     if not (
@@ -1033,7 +1077,7 @@ PY
   validate_scheduler_terminal_job_log_tree || return 2
   validate_exposure_risk_job_checkpoint_tree quiescent || return 2
   unsafe_entry="$(find -P "$PROBIGA_JOB_LOG_ROOT" -mindepth 1 -maxdepth 1 \
-    \( \( -name acquisition-shards -o -name scheduler-terminal -o -name exposure-event-risk-watch-v1 -o -name analysis-execution-diagnostics \) -type d \) -prune -o \
+    \( \( -name acquisition-shards -o -name scheduler-terminal -o -name exposure-event-risk-watch-v1 -o -name analysis-execution-diagnostics -o -name upper-limit-history \) -type d \) -prune -o \
     \( ! -type f -o ! -user "$SERVICE_USER" -o ! -group "$SERVICE_USER" \
        -o ! -links 1 -o ! -perm 0600 -o -perm /7177 \) \
     -print -quit)" || return 2
