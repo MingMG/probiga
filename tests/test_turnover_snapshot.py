@@ -499,6 +499,24 @@ def test_parse_f61_retains_raw_payload_and_matches_qmt_fingerprint() -> None:
     assert len(row.snapshot_row_sha256) == 64
 
 
+def test_turnover_volume_matches_exactly_at_provider_lot_precision() -> None:
+    target = replace(
+        _targets(_engine())[0],
+        volume_shares=Decimal("1040"),
+    )
+
+    row = parse_eastmoney_turnover_response(
+        target=target,
+        raw_payload=_raw_payload(target.stock_code),
+        provider_http_date=HTTP_DATE,
+        captured_at=CAPTURED_AT,
+        decision_at=DECISION_AT,
+    )
+
+    assert row.source_volume_shares == Decimal("1000")
+    assert row.target.volume_shares == Decimal("1040")
+
+
 def test_turnover_blocks_beijing_post_close_volume_scope_difference() -> None:
     # The 2026-09-10 source responses have identical prices. QMT's 15:00
     # daily bar has 18,894 lots, while the provider's final row has 19,294.

@@ -21,7 +21,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import date, datetime
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Iterable, Mapping, Sequence
 from urllib.parse import urlencode, urlparse
@@ -65,7 +65,14 @@ from server.common.verified_daily_market_truth import (
 
 TURNOVER_SNAPSHOT_VERSION = "probiga.market-field-capture.v1"
 TURNOVER_CAPTURE_KIND = "DAILY_TURNOVER_F61"
-TURNOVER_MATCH_POLICY = "EXACT_QMT_OHLCV"
+TURNOVER_MATCH_POLICY = "EXACT_OHLC_LOT_VOLUME_V1"
+TURNOVER_ACCEPTED_MATCH_POLICIES = frozenset({
+    TURNOVER_MATCH_POLICY,
+    # Immutable runs published before volume precision was represented
+    # explicitly remain replayable; their rows still pass the current exact
+    # OHLC and rounded-lot volume comparison.
+    "EXACT_QMT_OHLCV",
+})
 TURNOVER_PROMOTION_MODE = "NULL_ONLY_EXACT_KEY"
 TURNOVER_DIRECT_TLS_TRANSPORT = "HTTPS_TLS_VERIFIED_DIRECT"
 TURNOVER_PINNED_TLS_TRANSPORT = "HTTPS_TLS_VERIFIED_PINNED_RESOLVE_V1"
@@ -126,6 +133,12 @@ def _decimal_text(value: Decimal | Any) -> str:
     if number == 0:
         return "0"
     return format(number.normalize(), "f")
+
+
+def _volume_at_lot_precision(value: Decimal) -> Decimal:
+    """Normalize share volume to the provider's 100-share lot precision."""
+
+    return value.quantize(Decimal("1E2"), rounding=ROUND_HALF_UP)
 
 
 def _local_datetime(value: Any, *, field: str) -> datetime:
@@ -942,6 +955,9 @@ def parse_eastmoney_turnover_response(
         raise _blocked(f"Eastmoney volume lot conversion is not integral: {target.stock_code}")
     if turnover_percent != turnover_percent.quantize(Decimal("0.01")):
         raise _blocked(f"Eastmoney f61 is not a percentage with 0.01 precision: {target.stock_code}")
+    target_volume_at_provider_precision = _volume_at_lot_precision(
+        target.volume_shares
+    )
     mismatches = [
         f"{field}(eastmoney={_decimal_text(source)},qmt={_decimal_text(qmt)})"
         for field, source, qmt in (
@@ -949,7 +965,11 @@ def parse_eastmoney_turnover_response(
             ("high", source_high, target.high),
             ("low", source_low, target.low),
             ("close", source_close, target.close),
-            ("volume_shares", source_volume_shares, target.volume_shares),
+            (
+                "volume_shares",
+                source_volume_shares,
+                target_volume_at_provider_precision,
+            ),
         )
         if source != qmt
     ]
@@ -1748,7 +1768,7 @@ def _verify_stage_readback(
         != TURNOVER_SOURCE_FIELD
         or str(persisted.get("unit") or "") != TURNOVER_UNIT
         or str(persisted.get("match_policy") or "")
-        != TURNOVER_MATCH_POLICY
+        not in TURNOVER_ACCEPTED_MATCH_POLICIES
         or str(persisted.get("promotion_mode") or "")
         != TURNOVER_PROMOTION_MODE
         or any(int(persisted.get(name) or -1) != count for name in (
@@ -2177,7 +2197,8 @@ def verify_turnover_publication_evidence(
                 TURNOVER_PINNED_TLS_TRANSPORT,
             }
             or not str(run.get("resolved_endpoint") or "").strip()
-            or str(run.get("match_policy") or "") != TURNOVER_MATCH_POLICY
+            or str(run.get("match_policy") or "")
+            not in TURNOVER_ACCEPTED_MATCH_POLICIES
             or str(run.get("promotion_mode") or "") != TURNOVER_PROMOTION_MODE
             or str(run.get("promotion_table") or "") != "sm_stock_kline"
             or str(run.get("promotion_column") or "") != "turnover_ratio"
