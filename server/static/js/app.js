@@ -3837,39 +3837,212 @@
     }
 
     function loadQuantWorkbenchPage(d, c) {
-        c.innerHTML = '<div class="loading">正在核对量化能力、任务身份与业务回执...</div>';
-        var outlookDate = recommendationDateValue() || d || currentDateValue();
-        Promise.all([
-            fetchRawJsonWithTimeout('/api/quant-workbench', 30000),
-            fetchJsonWithTimeout('/api/market-outlook?trade_date=' + encodeURIComponent(outlookDate), 15000).catch(function (error) {
-                return {status:'DATA_BLOCKED', reason:(error && error.message) || '明日推演暂不可用'};
-            })
-        ]).then(function (results) {
-            var res = results[0] || {};
-            var outlook = results[1] || {};
+        c.innerHTML = '<div class="loading">正在读取任务注册、运行回执和策略票池...</div>';
+        fetchRawJsonWithTimeout('/api/quant-workbench', 30000).then(function (res) {
+            res = res || {};
             var capabilities = Array.isArray(res.capabilities) ? res.capabilities : [];
+            var operations = Array.isArray(res.operations) ? res.operations : [];
             var evidence = res.evidence || {}, risk = evidence.risk_watch || {}, research = evidence.quant_research || {};
+            var summary = res.summary || {}, pool = summary.strategy_pool || {};
+            var target = summary.strategy_target || {};
             var progress = risk.progress || {}, receipt = risk.receipt || {};
-            var statusText = {AVAILABLE:'可用',PARTIAL:'部分可用',UNAVAILABLE:'暂不可用',NOT_STARTED:'未开始',RUNNING:'运行中',BLOCKED:'阻断',FAILED:'失败',COMPLETE:'完成'};
-            var statusClass = function (value) { value=String(value||'').toUpperCase(); return value==='AVAILABLE'||value==='COMPLETE'?'qwb-ok':value==='PARTIAL'||value==='RUNNING'?'qwb-warn':value==='UNAVAILABLE'||value==='BLOCKED'||value==='FAILED'?'qwb-bad':'qwb-muted'; };
+            var statusText = {AVAILABLE:'可用',PARTIAL:'部分可用',UNAVAILABLE:'暂不可用',NOT_STARTED:'未开始',RUNNING:'运行中',STALE_RUNNING:'回执陈旧',SUCCEEDED:'调度成功',BLOCKED:'阻断',FAILED:'失败',COMPLETE:'完成',ACTIVE:'有效',QUEUED:'排队中'};
+            var statusClass = function (value) { value=String(value||'').toUpperCase(); return value==='AVAILABLE'||value==='COMPLETE'||value==='SUCCEEDED'||value==='ACTIVE'?'qwb-ok':value==='PARTIAL'||value==='RUNNING'||value==='QUEUED'||value==='STALE_RUNNING'?'qwb-warn':value==='UNAVAILABLE'||value==='BLOCKED'||value==='FAILED'?'qwb-bad':'qwb-muted'; };
             var categoryOrder = ['MARKET_RESEARCH','DATA','STRATEGY_PORTFOLIO','RISK_PERFORMANCE','TRADING_REVIEW','DERIVATIVES_RELATIVE_VALUE','ENGINEERING_OPERATIONS'];
             var recommended = Array.isArray(res.recommended_workflows) ? res.recommended_workflows : [];
             var byCode = {};
             capabilities.forEach(function (item) { byCode[item.code] = item; });
             window._quantWorkbenchCapabilities = byCode;
+            window._quantWorkbenchOperations = {};
+            operations.forEach(function (item) { window._quantWorkbenchOperations[item.operation_id] = item; });
+            window._quantWorkbenchData = res;
             window.openQuantWorkflow = function (code) {
                 var item = (window._quantWorkbenchCapabilities || {})[code] || {};
                 if (!item.entry_tab) return;
                 switchTab(item.entry_tab);
             };
-            var h = '<div class="qwb-page">';
-            if (window.MarketOutlook && window.MarketOutlook.summary) {
-                h += window.MarketOutlook.summary(outlook);
+
+            function operationTime(value) {
+                var text = String(value || '').replace('T', ' ').slice(0, 19);
+                return text || '—';
             }
-            h += '<section class="qwb-hero"><div><span class="qwb-eyebrow">PROBIGA QUANT CAPABILITY CONTRACT · '+escHtml(res.version||'-')+'</span><h2>选择量化任务，而不是被动等待首页推荐</h2><p>28 个稳定编号绑定系统真实能力、证据入口和限制。查看不会触发采集、推送、部署或交易；所有研究候选均无真实下单权限。</p></div><div class="qwb-hero-state"><strong>'+escHtml(res.capability_count||capabilities.length)+'</strong><span>项能力 · '+escHtml(res.category_count||7)+' 类</span></div></section>';
-            h += '<section class="qwb-priority"><div class="qwb-section-head"><div><span>建议优先</span><h3>先把风险、数据和研究验证接牢</h3></div><small>按当前系统收益排序</small></div><div class="qwb-priority-grid">';
-            recommended.forEach(function (code, index) { var item=byCode[code]||{}; h+='<button type="button" '+(item.entry_tab?'onclick="openQuantWorkflow(\''+escAttr(code)+'\')"':'disabled')+'><em>#'+(index+1)+'</em><strong>'+escHtml(code)+' · '+escHtml(item.label||'-')+'</strong><span>'+escHtml(item.scope||'')+'</span></button>'; });
+
+            function operationButtonLabel(item) {
+                if (item.execution_mode === 'SCHEDULER_TARGET') return '生成票池';
+                if (item.operation_id === 'qmt_strategy_simulation') return '运行模拟';
+                return '立即运行';
+            }
+
+            function renderOperationCard(item) {
+                var state = String(item.state || 'BLOCKED').toUpperCase();
+                var run = item.latest_run || {};
+                var runText = run.run_uid ? ('运行身份 ' + escHtml(run.run_uid)) : '尚无运行身份';
+                var action = item.can_run
+                    ? '<button type="button" class="qwb-run" onclick="runQuantOperation(\'' + escAttr(item.operation_id) + '\')">' + escHtml(operationButtonLabel(item)) + '</button>'
+                    : '<button type="button" class="qwb-run" disabled>' + escHtml(state === 'STALE_RUNNING' ? '先停止陈旧任务' : '当前不可运行') + '</button>';
+                var stop = item.can_stop
+                    ? '<button type="button" class="qwb-stop" onclick="stopQuantOperation(\'' + escAttr(item.operation_id) + '\')">停止</button>'
+                    : '';
+                var result = item.result_entry_tab
+                    ? '<button type="button" class="qwb-result" onclick="openQuantOperationResult(\'' + escAttr(item.operation_id) + '\')">' + escHtml(item.result_label || '查看结果') + '</button>'
+                    : '';
+                var dateInput = item.requires_trade_date
+                    ? '<label class="qwb-date-field">目标交易日 <input type="date" id="qwb-date-' + escAttr(item.operation_id) + '" value="' + escAttr(target.default_trade_date || '') + '"><span>' + escHtml(target.ready ? '本地输入已就绪' : (target.reason || '等待完整交易日数据')) + '</span></label>'
+                    : '';
+                var receipt = run.receipt || {};
+                var receiptText = receipt.status ? ('回执 ' + escHtml(receipt.status) + (receipt.analysis_count != null ? ' · 分析 ' + escHtml(receipt.analysis_count) + ' 只' : '') + (receipt.recommendation_count != null ? ' · 票池 ' + escHtml(receipt.recommendation_count) + ' 只' : '')) : '等待任务回执';
+                return '<article class="qwb-operation-card' + (item.operation_id === 'strategy_pool' ? ' qwb-primary-operation' : '') + '" id="qwb-op-' + escAttr(item.operation_id) + '">'
+                    + '<div class="qwb-operation-head"><div><span>' + escHtml(item.category || '量化任务') + ' · 任务 #' + escHtml(item.task_id == null ? '—' : item.task_id) + '</span><h3>' + escHtml(item.label || item.task_type) + '</h3><p>' + escHtml(item.description || '') + '</p></div><b class="qwb-status ' + statusClass(state) + '">' + escHtml(statusText[state] || state) + '</b></div>'
+                    + '<div class="qwb-operation-meta"><span><b>注册</b> ' + escHtml(item.enabled ? '已启用' : '未启用') + '</span><span><b>计划</b> ' + escHtml(item.cron_time || '—') + '</span><span><b>最近运行</b> ' + escHtml(operationTime(run.run_at)) + '</span><span><b>耗时</b> ' + escHtml(run.duration_seconds == null ? '—' : run.duration_seconds + 's') + '</span></div>'
+                    + '<div class="qwb-operation-run"><code title="' + escAttr(run.run_uid || '') + '">' + runText + '</code><span>' + receiptText + '</span></div>'
+                    + (item.blocking_reason ? '<p class="qwb-blocker">' + escHtml(item.blocking_reason) + '</p>' : '')
+                    + dateInput
+                    + '<div class="qwb-operation-actions">' + action + stop + result + '<button type="button" class="qwb-refresh" onclick="refreshQuantOperation(\'' + escAttr(item.operation_id) + '\')">刷新状态</button><span class="qwb-operation-message" id="qwb-op-message-' + escAttr(item.operation_id) + '"></span></div>'
+                    + '</article>';
+            }
+
+            window.runQuantOperation = function (operationId) {
+                var item = (window._quantWorkbenchOperations || {})[operationId];
+                if (!item) return;
+                var message = document.getElementById('qwb-op-message-' + operationId);
+                var dateEl = document.getElementById('qwb-date-' + operationId);
+                var tradeDate = dateEl ? String(dateEl.value || '').trim() : '';
+                var qs = tradeDate ? '?trade_date=' + encodeURIComponent(tradeDate) : '';
+                if (message) message.innerHTML = '<b>正在提交到生产调度器...</b>';
+                var controller = new AbortController();
+                var timer = setTimeout(function () { controller.abort(); }, 30000);
+                fetch('/api/quant-workbench/operations/' + encodeURIComponent(operationId) + '/run' + qs, {
+                    method: 'POST',
+                    headers: {'Accept': 'application/json'},
+                    signal: controller.signal
+                }).then(function (response) {
+                    return response.json().then(function (body) {
+                        if (!response.ok) {
+                            var detail = body && body.detail;
+                            var messageText = detail && typeof detail === 'object'
+                                ? (detail.reason || detail.status || JSON.stringify(detail))
+                                : (detail || body.error || response.statusText);
+                            throw new Error(messageText);
+                        }
+                        return body;
+                    });
+                }).then(function (result) {
+                    clearTimeout(timer);
+                    if (!result.accepted) throw new Error(result.error || result.status || '调度器拒绝任务');
+                    var runUid = String(result.job_id || '');
+                    window._quantWorkbenchRequestedRun = window._quantWorkbenchRequestedRun || {};
+                    window._quantWorkbenchRequestedRun[operationId] = {
+                        runUid: runUid,
+                        priorRunUid: String(result.prior_run_uid || ''),
+                        acceptedAt: Date.now()
+                    };
+                    if (message) message.innerHTML = '<b>已提交</b> ' + escHtml(result.status || 'queued') + (runUid ? ' · ' + escHtml(runUid) : '') + '。正在跟踪真实回执。';
+                    window._startQuantOperationPoll(operationId);
+                }).catch(function (error) {
+                    clearTimeout(timer);
+                    if (message) message.innerHTML = '<b class="qwb-error">提交失败</b> ' + escHtml(error && error.name === 'AbortError' ? '请求超时' : (error.message || error));
+                });
+            };
+
+            window.stopQuantOperation = function (operationId) {
+                var message = document.getElementById('qwb-op-message-' + operationId);
+                if (message) message.innerHTML = '<b>正在请求停止...</b>';
+                fetch('/api/quant-workbench/operations/' + encodeURIComponent(operationId) + '/stop', {
+                    method: 'POST',
+                    headers: {'Accept': 'application/json'}
+                }).then(function (response) {
+                    return response.json().then(function (body) {
+                        if (!response.ok) throw new Error(body.detail || body.error || response.statusText);
+                        return body;
+                    });
+                }).then(function (result) {
+                    if (message) message.innerHTML = '<b>停止请求已提交</b> ' + escHtml(result.status || result.message || '');
+                    window.refreshQuantOperation(operationId);
+                }).catch(function (error) {
+                    if (message) message.innerHTML = '<b class="qwb-error">停止失败</b> ' + escHtml(error.message || error);
+                });
+            };
+
+            window.refreshQuantOperation = function (operationId) {
+                return fetchRawJsonWithTimeout('/api/quant-workbench/operations/' + encodeURIComponent(operationId), 15000).then(function (item) {
+                    if (!item || !item.operation_id) return null;
+                    window._quantWorkbenchOperations[operationId] = item;
+                    var card = document.getElementById('qwb-op-' + operationId);
+                    if (card) {
+                        var badge = card.querySelector('.qwb-status');
+                        var state = String(item.state || 'BLOCKED').toUpperCase();
+                        if (badge) {
+                            badge.className = 'qwb-status ' + statusClass(state);
+                            badge.textContent = statusText[state] || state;
+                        }
+                    }
+                    var message = document.getElementById('qwb-op-message-' + operationId);
+                    var run = item.latest_run || {};
+                    if (message) message.innerHTML = '<b>' + escHtml(statusText[String(item.state || '').toUpperCase()] || item.state || '') + '</b> ' + escHtml(run.run_uid || '') + (item.blocking_reason ? ' · ' + escHtml(item.blocking_reason) : '');
+                    return item;
+                }).catch(function () { return null; });
+            };
+
+            window.openQuantOperationResult = function (operationId) {
+                var item = (window._quantWorkbenchOperations || {})[operationId] || {};
+                if (!item.result_entry_tab) return;
+                if (operationId === 'strategy_pool') {
+                    var dateEl = document.getElementById('qwb-date-strategy_pool');
+                    var picker = document.getElementById('datePicker');
+                    var poolDate = String((pool || {}).trade_date || (dateEl || {}).value || '');
+                    if (picker && poolDate) picker.value = poolDate;
+                }
+                switchTab(item.result_entry_tab);
+            };
+
+            window._startQuantOperationPoll = function (operationId) {
+                var request = (window._quantWorkbenchRequestedRun || {})[operationId] || {};
+                if (window._quantWorkbenchPollTimers && window._quantWorkbenchPollTimers[operationId]) {
+                    clearInterval(window._quantWorkbenchPollTimers[operationId]);
+                }
+                window._quantWorkbenchPollTimers = window._quantWorkbenchPollTimers || {};
+                var startedAt = Date.now();
+                window._quantWorkbenchPollTimers[operationId] = setInterval(function () {
+                    window.refreshQuantOperation(operationId).then(function (item) {
+                        if (!item) return;
+                        var run = item.latest_run || {};
+                        var currentUid = String(run.run_uid || '');
+                        var expectedUid = String(request.runUid || '');
+                        var priorUid = String(request.priorRunUid || '');
+                        var newIdentityObserved = expectedUid
+                            ? currentUid === expectedUid
+                            : Boolean(currentUid && currentUid !== priorUid);
+                        var requestStatus = String(((item.request_status || {}).status) || '').toUpperCase();
+                        var terminal = ['SUCCEEDED','FAILED','BLOCKED','STALE_RUNNING'].indexOf(String(item.state || '').toUpperCase()) >= 0;
+                        if (newIdentityObserved && terminal) {
+                            clearInterval(window._quantWorkbenchPollTimers[operationId]);
+                            delete window._quantWorkbenchPollTimers[operationId];
+                            setTimeout(function () { loadQuantWorkbenchPage(currentDateValue(), c); }, 900);
+                        } else if (requestStatus === 'BLOCKED') {
+                            clearInterval(window._quantWorkbenchPollTimers[operationId]);
+                            var message = document.getElementById('qwb-op-message-' + operationId);
+                            if (message) message.innerHTML = '<b class="qwb-error">调度阻断</b> ' + escHtml((item.request_status || {}).reason || '');
+                        } else if (Date.now() - startedAt > 60 * 60 * 1000) {
+                            clearInterval(window._quantWorkbenchPollTimers[operationId]);
+                            var timeoutMessage = document.getElementById('qwb-op-message-' + operationId);
+                            if (timeoutMessage) timeoutMessage.innerHTML = '<b class="qwb-error">仍未观察到新终态</b> 请重新打开页面核对调度审计。';
+                        }
+                    });
+                }, 3000);
+            };
+
+            var h = '<div class="qwb-page">';
+            h += '<section class="qwb-hero qwb-console-hero"><div><span class="qwb-eyebrow">QUANT OPERATIONS CONSOLE · ' + escHtml(res.operation_contract || '-') + '</span><h2>在这里运行量化任务，并跟到真实结果</h2><p>选择任务、提交生产调度、观察运行身份和终态，再打开对应结果。调度成功只代表进程完成，页面会继续用任务回执和结果读回区分“跑完”与“有结果”。</p></div><div class="qwb-hero-state"><strong>' + escHtml(summary.runnable_count || 0) + '</strong><span>个任务当前可提交</span></div></section>';
+
+            h += '<section class="qwb-operation-summary"><article><span>已接入任务</span><strong>' + escHtml(summary.operation_count || operations.length) + '</strong><small>全部绑定真实调度身份</small></article><article><span>当前运行</span><strong>' + escHtml(summary.running_count || 0) + '</strong><small>依据持久化运行回执</small></article><article><span>最近失败</span><strong>' + escHtml(summary.failed_count || 0) + '</strong><small>可打开任务结果定位</small></article><article class="' + (String(pool.status).toUpperCase() === 'ACTIVE' ? 'qwb-pool-ready' : '') + '"><span>当前有效票池</span><strong>' + escHtml(pool.active_count || 0) + '</strong><small>' + escHtml(pool.trade_date || '尚无') + ' · ' + escHtml(pool.run_uid ? pool.run_uid.slice(0, 12) : '无运行身份') + '</small></article></section>';
+
+            h += '<section class="qwb-pool-strip"><div><span>正式策略票池</span><h3>' + escHtml(pool.status === 'ACTIVE' ? '已激活，可直接进入结果页' : '当前没有可证明有效的票池') + '</h3><p>' + (pool.status === 'ACTIVE' ? ('交易日 ' + escHtml(pool.trade_date) + '，分析 ' + escHtml(pool.analysis_count || '—') + ' 只，入池 ' + escHtml(pool.active_count) + ' 只，模型 ' + escHtml(pool.model_version || '—') + '，运行身份 ' + escHtml(pool.run_uid) + '。') : escHtml(pool.reason || '运行策略任务后在这里读回票池。')) + '</p></div><button type="button" onclick="openQuantOperationResult(\'strategy_pool\')"' + (pool.status === 'ACTIVE' ? '' : ' disabled') + '>查看票池</button></section>';
+
+            h += '<section class="qwb-operations"><div class="qwb-section-head"><div><span>可直接操作</span><h3>量化任务队列</h3></div><small>运行、停止、查看回执与结果</small></div><div class="qwb-operation-grid">';
+            operations.forEach(function (item) { h += renderOperationCard(item); });
             h += '</div></section>';
+
+            h += '<section class="qwb-flow-note"><strong>回执口径</strong><span>提交成功 → 运行身份出现 → 调度器终态 → 对应业务结果可打开</span><em>accepted 不等于 COMPLETE</em></section>';
             var riskStatus=String(risk.status||'BLOCKED').toUpperCase(), total=Number(progress.total_units||receipt.total_units||0), completed=Number(progress.completed_units||receipt.completed_units||0), pctDone=total>0?Math.min(100,Math.round(completed*100/total)):riskStatus==='COMPLETE'?100:0;
             h += '<section class="qwb-evidence-grid"><article class="qwb-evidence-card"><div class="qwb-card-head"><div><span>R3 / K4 · 官方公告风险</span><h3>当前暴露股票监测</h3></div><b class="qwb-status '+statusClass(riskStatus)+'">'+escHtml(statusText[riskStatus]||riskStatus)+'</b></div>';
             h += '<div class="qwb-progress"><i style="width:'+pctDone+'%"></i></div><div class="qwb-progress-meta"><span>'+completed+' / '+total+' 只</span><span>当前 '+escHtml(progress.current_unit||'—')+'</span><span>最后进展 '+escHtml(progress.last_progress_at||'—')+'</span></div>';
@@ -3880,11 +4053,13 @@
             candidates.slice(0,5).forEach(function (item) { var system=item.system_validation||{}, workflow=item.research_workflow||{}; h+='<a href="'+escAttr(item.source_url||'#')+'" target="_blank" rel="noreferrer"><strong>'+escHtml(item.title||'-')+'</strong><span>来源报告指标：'+escHtml(JSON.stringify(item.source_reported_metrics||{}))+'</span><span>本系统验证：'+escHtml(system.status||'NOT_REPRODUCED')+'</span><span>下一门禁：'+escHtml(workflow.next_gate||'INDEPENDENT_REPRODUCTION')+'</span></a>'; });
             if (!candidates.length) h+='<div class="qwb-empty">暂无已验收入库候选，或研究台账不可读。</div>';
             h += '</div><button type="button" onclick="openQuantWorkflow(\'R4\')">查看研究候选</button></article></section>';
-            categoryOrder.forEach(function (category) { var items=capabilities.filter(function(item){return item.category===category;}); if(!items.length)return; h+='<section class="qwb-category"><div class="qwb-section-head"><div><span>'+escHtml(items[0].category_label||category)+'</span><h3>'+escHtml(category)+'</h3></div></div><div class="qwb-capability-grid">'; items.forEach(function(item){var available=String(item.availability||'UNAVAILABLE').toUpperCase();h+='<article><div class="qwb-capability-title"><strong>'+escHtml(item.code)+' · '+escHtml(item.label)+'</strong><b class="qwb-status '+statusClass(available)+'">'+escHtml(statusText[available]||available)+'</b></div><p>'+escHtml(item.scope||'')+'</p><small>'+escHtml(item.limitations||'')+'</small>'+(item.entry_tab?'<button type="button" onclick="openQuantWorkflow(\''+escAttr(item.code)+'\')">打开正式入口</button>':'<button type="button" disabled>缺少正式数据或引擎</button>')+'</article>';}); h+='</div></section>'; });
+            h += '<details class="qwb-contract"><summary>查看 28 项量化能力与边界</summary><div class="qwb-contract-body">';
+            categoryOrder.forEach(function (category) { var items=capabilities.filter(function(item){return item.category===category;}); if(!items.length)return; h+='<section class="qwb-category"><div class="qwb-section-head"><div><span>'+escHtml(items[0].category_label||category)+'</span><h3>'+escHtml(category)+'</h3></div></div><div class="qwb-capability-grid">'; items.forEach(function(item){var available=String(item.availability||'UNAVAILABLE').toUpperCase();h+='<article><div class="qwb-capability-title"><strong>'+escHtml(item.code)+' · '+escHtml(item.label)+'</strong><b class="qwb-status '+statusClass(available)+'">'+escHtml(statusText[available]||available)+'</b></div><p>'+escHtml(item.scope||'')+'</p><small>'+escHtml(item.limitations||'')+'</small>'+(item.entry_tab?'<button type="button" onclick="openQuantWorkflow(\''+escAttr(item.code)+'\')">打开结果入口</button>':'<button type="button" disabled>缺少正式数据或引擎</button>')+'</article>';}); h+='</div></section>'; });
+            h += '</div></details>';
             h += '<footer class="qwb-footer">能力合同 '+escHtml(res.schema||'-')+'。系统不解析个人 Skill 作为生产权限；accepted / delegated / 进程存活均不等于业务完成。</footer></div>';
             c.innerHTML = h;
         }).catch(function (err) {
-            c.innerHTML = '<div class="loading" style="color:#b91c1c">量化能力合同读取失败：'+escHtml(err&&err.message?err.message:err)+'</div>';
+            c.innerHTML = '<div class="loading" style="color:#b91c1c">量化工作台读取失败：'+escHtml(err&&err.message?err.message:err)+'</div>';
         });
     }
 
