@@ -5030,6 +5030,17 @@ def test_analysis_fast_owns_the_exclusive_full_market_lane():
     ) < scheduler_runtime._scheduler_task_sort_key(normal, now=now)
 
 
+def test_formal_analysis_child_cannot_inherit_degraded_inputs() -> None:
+    environment = {
+        "PROBIGA_ANALYSIS_ALLOW_DEGRADED_INPUTS": "1",
+        "UNCHANGED": "value",
+    }
+
+    scheduler_runtime._enforce_exact_analysis_inputs(environment)
+
+    assert environment == {"UNCHANGED": "value"}
+
+
 
 def test_release_analysis_recovery_uses_complete_local_exact_date_data():
     engine = MagicMock()

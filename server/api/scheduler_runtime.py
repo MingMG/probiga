@@ -2435,6 +2435,12 @@ def _release_analysis_recovery_status_path() -> Path:
     return path.with_name(path.name + ".status.json")
 
 
+def _enforce_exact_analysis_inputs(child_env: dict[str, str]) -> None:
+    """Keep scheduler-owned formal analysis on complete PIT inputs."""
+
+    child_env.pop("PROBIGA_ANALYSIS_ALLOW_DEGRADED_INPUTS", None)
+
+
 def _write_release_analysis_recovery_status(
     request_id: str,
     status: str,
@@ -9315,6 +9321,7 @@ def _run_task_impl(
         }
     )
     if task_type == "analysis_fast":
+        _enforce_exact_analysis_inputs(child_env)
         child_env["PROBIGA_ANALYSIS_DIAGNOSTICS_ROOT"] = str(
             Path(
                 child_env.get("PROBIGA_JOB_LOG_ROOT")
@@ -9322,8 +9329,6 @@ def _run_task_impl(
             )
             / "analysis-execution-diagnostics"
         )
-        if row.get("_release_analysis_recovery_requested") is True:
-            child_env["PROBIGA_ANALYSIS_ALLOW_DEGRADED_INPUTS"] = "1"
     # Post-run strategy validation must be bound to this exact scheduler
     # audit row and build.  These private fields never cross the process
     # boundary or become user-controlled command-line arguments.
