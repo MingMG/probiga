@@ -1185,6 +1185,38 @@ def test_analysis_strategy_pool_terminal_accepts_hash_bound_empty_pool():
     ))
 
 
+def test_analysis_strategy_pool_recovers_from_persisted_completed_history():
+    engine, _receipt = _strategy_pool_engine(
+        actionable=False,
+        research_only=True,
+    )
+    _add_running_scheduler_audit(engine)
+
+    with patch(
+        "integrations.bigqmt.membership_snapshot."
+        "verify_existing_membership_snapshot",
+        return_value=_membership_proof(),
+    ):
+        recovered = scheduler_runtime.activate_persisted_analysis_pool(
+            engine,
+            _STRATEGY_RUN_UID,
+        )
+
+    assert recovered["status"] == "ACTIVE"
+    assert recovered["run_uid"] == _STRATEGY_RUN_UID
+    with engine.connect() as connection:
+        row = connection.execute(text("""
+            SELECT publication_status, recommend_status,
+                   ordinary_buy_eligible
+            FROM st_recommended_stocks
+        """)).mappings().one()
+    assert row == {
+        "publication_status": "ACTIVE",
+        "recommend_status": "SUSPENDED",
+        "ordinary_buy_eligible": "0",
+    }
+
+
 def test_successful_pool_activation_persists_one_activation_receipt(terminal_audit_case):
     engine, _receipt = _strategy_pool_engine(actionable=True)
     terminal_audit_case(engine)

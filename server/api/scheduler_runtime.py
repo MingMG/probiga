@@ -7238,14 +7238,18 @@ def _activate_analysis_strategy_pool(
     *,
     run_uid: str,
     task_type: str,
-    publication_receipt: dict,
+    publication_receipt: dict | None,
+    allow_failed_parent: bool = False,
 ) -> dict[str, object]:
     """Activate one validated pool in the scheduler-success transaction."""
 
     if task_type not in ANALYSIS_POOL_PUBLISHER_TASK_TYPES:
         return {}
     from server.common.analysis_pool_receipt import publication_receipt_is_valid, publication_is_complete_empty
-    if not publication_receipt_is_valid(publication_receipt) or publication_receipt.get("run_uid") != run_uid:
+    if publication_receipt is not None and (
+        not publication_receipt_is_valid(publication_receipt)
+        or publication_receipt.get("run_uid") != run_uid
+    ):
         raise RuntimeError("analysis pool activation score publication is unavailable")
     audit_rows = connection.execute(text("""
         SELECT task_type, status
@@ -7257,7 +7261,7 @@ def _activate_analysis_strategy_pool(
         len(audit_rows) != 1
         or str(audit_rows[0].get("task_type") or "").strip() != task_type
         or str(audit_rows[0].get("status") or "").strip().lower()
-        != "running"
+        not in ({"running", "failed"} if allow_failed_parent else {"running"})
     ):
         raise RuntimeError("analysis pool activation scheduler audit differs")
     history_rows = connection.execute(text("""
@@ -7340,7 +7344,15 @@ def _activate_analysis_strategy_pool(
         != membership["proof_sha256"]
     ):
         raise RuntimeError("analysis pool activation membership proof differs")
-    staged_manifest = read_persisted_pool_manifest(connection, trade_date, score_snapshot=publication_receipt["score_snapshot"])
+    staged_manifest = read_persisted_pool_manifest(
+        connection,
+        trade_date,
+        score_snapshot=(
+            publication_receipt["score_snapshot"]
+            if publication_receipt is not None
+            else None
+        ),
+    )
     empty_pool = expected_rows == 0
     expected_publisher_run_uids = [run_uid]
     expected_publication_statuses = [] if empty_pool else None
@@ -7349,8 +7361,11 @@ def _activate_analysis_strategy_pool(
         int(staged_manifest["analysis_count"]) != analysis_count
         or int(staged_manifest["recommendation_count"]) != expected_rows
         or int(staged_manifest["executable_count"]) != executable_count
-        or str(staged_manifest["canonical_pool_sha256"]).lower()
-        != history_hash
+        or (
+            publication_receipt is not None
+            and str(staged_manifest["canonical_pool_sha256"]).lower()
+            != history_hash
+        )
         or staged_manifest.get("publisher_run_uids")
         != expected_publisher_run_uids
         or (
@@ -7459,7 +7474,15 @@ def _activate_analysis_strategy_pool(
     }).scalar()
     if int(activated or 0) != expected_rows:
         raise RuntimeError("analysis pool activation readback differs")
-    activated_manifest = read_persisted_pool_manifest(connection, trade_date, score_snapshot=publication_receipt["score_snapshot"])
+    activated_manifest = read_persisted_pool_manifest(
+        connection,
+        trade_date,
+        score_snapshot=(
+            publication_receipt["score_snapshot"]
+            if publication_receipt is not None
+            else None
+        ),
+    )
     if (
         (activated_manifest.get("publication_statuses") != ["ACTIVE"] and not publication_is_complete_empty(activated_manifest))
         or activated_manifest.get("live_gate_alignment") is not True
@@ -7468,8 +7491,11 @@ def _activate_analysis_strategy_pool(
         or int(activated_manifest["analysis_count"]) != analysis_count
         or int(activated_manifest["recommendation_count"]) != expected_rows
         or int(activated_manifest["executable_count"]) != executable_count
-        or str(activated_manifest["canonical_pool_sha256"]).lower()
-        != history_hash
+        or (
+            publication_receipt is not None
+            and str(activated_manifest["canonical_pool_sha256"]).lower()
+            != history_hash
+        )
         or (
             executable_count == 0
             and not research_only_publication_is_safe(activated_manifest)
@@ -7478,6 +7504,33 @@ def _activate_analysis_strategy_pool(
     ):
         raise RuntimeError("analysis pool activated manifest differs")
     return activation_receipt()
+
+
+def activate_persisted_analysis_pool(engine, run_uid: str) -> dict[str, object]:
+    """Recover an exact completed publisher pool without replaying its score snapshot."""
+
+    normalized = str(run_uid or "").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{32}", normalized) is None:
+        raise ValueError("analysis publication run_uid is invalid")
+    with engine.begin() as connection:
+        history = connection.execute(text(
+            "SELECT publisher_task_type FROM st_recommended_run_history "
+            "WHERE run_uid=:run_uid LIMIT 2"
+        ), {"run_uid": normalized}).mappings().all()
+        if len(history) != 1:
+            raise RuntimeError("analysis publication history is unavailable or ambiguous")
+        receipt = _activate_analysis_strategy_pool(
+            connection,
+            run_uid=normalized,
+            task_type=str(history[0].get("publisher_task_type") or ""),
+            publication_receipt=None,
+            allow_failed_parent=True,
+        )
+    return {
+        **receipt,
+        "status": "ACTIVE",
+        "run_uid": normalized,
+    }
 
 
 def _completed_governance_payload(output: object) -> dict[str, object]:

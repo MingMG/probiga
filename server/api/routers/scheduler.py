@@ -20,6 +20,7 @@ from server.common.release_data_readiness_contract import (
 )
 from server.common.sql_reader import read_sql_rows
 from server.api.scheduler_runtime import (
+    activate_persisted_analysis_pool,
     launch_scheduler_task,
     read_release_analysis_recovery_status,
     request_release_analysis_recovery,
@@ -523,6 +524,18 @@ def recover_release_analysis(
 @router.get("/scheduler/release-analysis/recovery-status")
 def release_analysis_recovery_status():
     return read_release_analysis_recovery_status()
+
+
+@router.post("/scheduler/release-analysis/activate")
+def activate_release_analysis(
+    run_uid: str = Query(..., pattern=r"^[0-9a-f]{32}$"),
+):
+    """Recover activation from one fully persisted canonical publisher run."""
+
+    try:
+        return activate_persisted_analysis_pool(get_engine(), run_uid)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("/scheduler/release-analysis/execution-progress")
