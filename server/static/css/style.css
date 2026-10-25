@@ -5259,6 +5259,25 @@ tr:hover { background: #f8f9fb; }
 #tab-quant-workbench .qwb-flow-note { display:flex; align-items:center; gap:14px; padding:11px 14px; border:1px dashed #cbd9ea; border-radius:10px; background:#fbfdff; color:#6d7f94; font-size:10px; }
 #tab-quant-workbench .qwb-flow-note strong { color:#334b67; }
 #tab-quant-workbench .qwb-flow-note em { margin-left:auto; color:#b45309; font-style:normal; font-weight:700; }
+#tab-quant-workbench .qwb-executive-summary { display:grid; grid-template-columns:minmax(0,1.45fr) minmax(420px,.9fr); gap:22px; padding:24px 26px; border:1px solid #efc888; border-radius:17px; background:linear-gradient(125deg,#fffdf8 0%,#fff7e8 56%,#f4fff9 100%); box-shadow:0 12px 30px rgba(120,75,12,.08); }
+#tab-quant-workbench .qwb-executive-main>span { color:#a85a08; font-size:10px; font-weight:900; letter-spacing:.08em; }
+#tab-quant-workbench .qwb-executive-main h2 { margin:8px 0 9px; color:#2d2418; font-size:29px; line-height:1.2; }
+#tab-quant-workbench .qwb-executive-main p { max-width:900px; margin:0; color:#765f3d; font-size:12px; line-height:1.75; }
+#tab-quant-workbench .qwb-executive-actions { display:flex; gap:9px; margin-top:17px; }
+#tab-quant-workbench .qwb-executive-actions button { padding:10px 15px; border:1px solid #a85a08; border-radius:9px; background:#a85a08; color:#fff; font-size:11px; font-weight:800; cursor:pointer; }
+#tab-quant-workbench .qwb-executive-actions button.qwb-secondary { border-color:#b9c8da; background:#fff; color:#38516d; }
+#tab-quant-workbench .qwb-executive-actions button:disabled { border-color:#d8dee7; background:#eef1f5; color:#98a3b1; cursor:not-allowed; }
+#tab-quant-workbench .qwb-executive-kpis { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:9px; align-content:center; }
+#tab-quant-workbench .qwb-executive-kpis article { display:grid; min-width:0; gap:5px; padding:14px 12px; border:1px solid rgba(0,0,0,.06); border-radius:11px; background:rgba(255,255,255,.78); }
+#tab-quant-workbench .qwb-executive-kpis span { color:#7b8797; font-size:9px; font-weight:800; }
+#tab-quant-workbench .qwb-executive-kpis strong { overflow:hidden; color:#273b52; font-size:22px; line-height:1.1; text-overflow:ellipsis; white-space:nowrap; }
+#tab-quant-workbench .qwb-executive-kpis small { overflow:hidden; color:#8b96a5; font-size:8px; text-overflow:ellipsis; white-space:nowrap; }
+#tab-quant-workbench .qwb-executive-kpis .qwb-kpi-good { border-color:#c5ead6; background:#f5fdf8; }
+#tab-quant-workbench .qwb-executive-kpis .qwb-kpi-good strong { color:#07865e; }
+#tab-quant-workbench .qwb-executive-kpis .qwb-kpi-bad { border-color:#f0cece; background:#fff8f8; }
+#tab-quant-workbench .qwb-executive-kpis .qwb-kpi-bad strong { color:#b42318; }
+#tab-quant-workbench .qwb-executive-kpis .qwb-kpi-warn { border-color:#efdcb6; background:#fffdf7; }
+#tab-quant-workbench .qwb-executive-kpis .qwb-kpi-warn strong { color:#a85a08; font-size:14px; }
 #tab-quant-workbench .qwb-lifecycle { display:grid; gap:14px; padding:18px; border:1px solid #dce5ef; border-radius:15px; background:#fff; }
 #tab-quant-workbench .qwb-lifecycle-grid { display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); gap:8px; }
 #tab-quant-workbench .qwb-life-stage { display:flex; min-width:0; flex-direction:column; gap:8px; padding:12px 11px; border:1px solid #e1e7ef; border-radius:11px; background:#fbfcfe; }
@@ -5284,10 +5303,10 @@ tr:hover { background: #f8f9fb; }
 #tab-quant-workbench .qwb-contract>summary { padding:15px 18px; color:#40546c; font-size:12px; font-weight:800; cursor:pointer; }
 #tab-quant-workbench .qwb-contract-body { display:grid; gap:12px; padding:0 14px 14px; }
 @media(max-width:900px){#tab-quant-workbench .qwb-priority-grid{grid-template-columns:1fr 1fr}#tab-quant-workbench .qwb-evidence-grid{grid-template-columns:1fr}}
-@media(max-width:900px){#tab-quant-workbench .qwb-operation-summary{grid-template-columns:1fr 1fr}#tab-quant-workbench .qwb-operation-grid{grid-template-columns:1fr}}
+@media(max-width:900px){#tab-quant-workbench .qwb-executive-summary{grid-template-columns:1fr}#tab-quant-workbench .qwb-operation-summary{grid-template-columns:1fr 1fr}#tab-quant-workbench .qwb-operation-grid{grid-template-columns:1fr}}
 @media(max-width:1200px){#tab-quant-workbench .qwb-lifecycle-grid{grid-template-columns:repeat(4,minmax(0,1fr))}}
 @media(max-width:600px){#tab-quant-workbench .qwb-hero{padding:20px;flex-direction:column}#tab-quant-workbench .qwb-priority-grid,#tab-quant-workbench .qwb-capability-grid{grid-template-columns:1fr}#tab-quant-workbench .qwb-evidence-card dl{grid-template-columns:1fr}#tab-quant-workbench .qwb-operation-summary{grid-template-columns:1fr}#tab-quant-workbench .qwb-pool-strip{align-items:flex-start;flex-direction:column}#tab-quant-workbench .qwb-operation-run,#tab-quant-workbench .qwb-flow-note{align-items:flex-start;flex-direction:column}#tab-quant-workbench .qwb-flow-note em{margin-left:0}#tab-quant-workbench .qwb-operation-message{min-width:100%;text-align:left}}
-@media(max-width:600px){#tab-quant-workbench .qwb-lifecycle-grid{grid-template-columns:1fr 1fr}#tab-quant-workbench .qwb-next-action{align-items:flex-start;flex-direction:column}}
+@media(max-width:600px){#tab-quant-workbench .qwb-lifecycle-grid{grid-template-columns:1fr 1fr}#tab-quant-workbench .qwb-executive-kpis{grid-template-columns:1fr}#tab-quant-workbench .qwb-executive-actions{align-items:stretch;flex-direction:column}#tab-quant-workbench .qwb-next-action{align-items:flex-start;flex-direction:column}}
 
 /* Shared header tools and a reachable mobile menu. */
 .header { padding:12px 24px; gap:15px; min-height:64px; flex-wrap:wrap; }

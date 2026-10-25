@@ -785,6 +785,7 @@ function fetchRawJsonWithTimeout() {
       can_run: true,
       can_stop: false,
       state: 'SUCCEEDED',
+      request_status: {status: 'ATTACHED', reason: 'ready_for_scheduler_dispatch'},
       latest_run: {
         run_uid: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
         run_at: '2026-10-25 21:57:26',
@@ -834,6 +835,9 @@ function fetchRawJsonWithTimeout() {
 """ + loader + r"""
 loadQuantWorkbenchPage('2026-10-23', container);
 setTimeout(function() {
+  assert.match(rendered, /80 只票池已出，0 只可执行/);
+  assert.match(rendered, /规范治理结果仍停留在 2026-08-31/);
+  assert.match(rendered, /恢复请求已进入调度队列/);
   assert.match(rendered, /生成票池/);
   assert.match(rendered, /查看策略票池/);
   assert.match(rendered, /当前有效票池/);

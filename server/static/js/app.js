@@ -4091,8 +4091,30 @@
             var nextAction = summary.next_action || lifecycle.next_action || {};
             var nextStage = stages.find(function (stage) { return stage.code === nextAction.stage_code; }) || {};
             var lifecycleReady = Number(lifecycle.ready_stage_count || 0) + ' / ' + Number(lifecycle.stage_count || stages.length) + ' 阶段就绪';
+            var strategyOperation = (window._quantWorkbenchOperations || {}).strategy_pool || {};
+            var recovery = strategyOperation.request_status || {};
+            var recoveryState = String(recovery.status || 'NOT_OBSERVED').toUpperCase();
+            var recoveryText = {
+                ATTACHED: '恢复请求已进入调度队列',
+                DISPATCHED: '治理恢复已经派发',
+                BLOCKED: '治理恢复被阻断',
+                INVALID: '治理恢复回执无效',
+                NOT_OBSERVED: '尚未提交治理恢复'
+            }[recoveryState] || recoveryState;
+            var executionStage = stages.find(function (stage) { return stage.code === 'EXECUTION_GATE'; }) || {};
+            var executionEvidence = executionStage.evidence || {};
+            var governanceStage = stages.find(function (stage) { return stage.code === 'CANONICAL_DECISION'; }) || {};
+            var governanceEvidence = governanceStage.evidence || {};
+            var candidateCount = Number(executionEvidence.candidate_count || pool.active_count || 0);
+            var executableCount = Number(executionEvidence.executable_count || 0);
+            var primaryHeadline = pool.status === 'ACTIVE'
+                ? (candidateCount + ' 只票池已出，' + executableCount + ' 只可执行')
+                : '今日策略票池尚未形成';
+            var primaryReason = nextAction.reason === 'CANONICAL_DECISION_TRADE_DATE_STALE'
+                ? ('规范治理结果仍停留在 ' + (governanceEvidence.trade_date || '更早交易日') + '，没有推进到 ' + (pool.trade_date || target.default_trade_date || '当前交易日'))
+                : (nextStage.blocking_reason || nextAction.reason || '当前闭环存在断点');
             var h = '<div class="qwb-page">';
-            h += '<section class="qwb-hero qwb-console-hero"><div><span class="qwb-eyebrow">QUANT LIFECYCLE · ' + escHtml(lifecycle.schema || 'probiga.quant-workbench-lifecycle.v1') + '</span><h2>从数据到复盘，一条链路看清并继续推进</h2><p>这里不是功能目录。每个阶段都绑定真实数据、任务回执或结果页；绿色只代表该阶段证据成立，红色或黄色会直接指出当前断点和下一步。</p></div><div class="qwb-hero-state"><strong>' + escHtml(lifecycle.ready_stage_count || 0) + '</strong><span>' + escHtml(lifecycleReady) + '</span></div></section>';
+            h += '<section class="qwb-executive-summary"><div class="qwb-executive-main"><span>当前量化结论 · ' + escHtml(pool.trade_date || lifecycle.trade_date || target.default_trade_date || '') + '</span><h2>' + escHtml(primaryHeadline) + '</h2><p>' + escHtml(primaryReason) + '。当前全流程 ' + escHtml(lifecycleReady) + '。</p><div class="qwb-executive-actions"><button type="button" onclick="qwbRunLifecycleNext()">' + escHtml(nextAction.entry_label || '处理当前断点') + '</button><button type="button" class="qwb-secondary" onclick="openQuantOperationResult(\'strategy_pool\')"' + (pool.status === 'ACTIVE' ? '' : ' disabled') + '>查看 ' + escHtml(candidateCount) + ' 只票池</button></div></div><div class="qwb-executive-kpis"><article class="' + (pool.status === 'ACTIVE' ? 'qwb-kpi-good' : 'qwb-kpi-bad') + '"><span>正式票池</span><strong>' + escHtml(candidateCount) + '</strong><small>只 ACTIVE</small></article><article class="' + (executableCount > 0 ? 'qwb-kpi-good' : 'qwb-kpi-bad') + '"><span>执行门禁</span><strong>' + escHtml(executableCount) + '</strong><small>/ ' + escHtml(candidateCount) + ' 可执行</small></article><article class="qwb-kpi-warn"><span>规范治理</span><strong>' + escHtml(governanceEvidence.trade_date || '—') + '</strong><small>' + escHtml(recoveryText) + '</small></article></div></section>';
 
             h += '<section class="qwb-lifecycle"><div class="qwb-section-head"><div><span>DAILY VALUE CHAIN</span><h3>量化生产闭环</h3></div><b class="qwb-status ' + statusClass(lifecycle.overall_status) + '">' + escHtml(statusText[String(lifecycle.overall_status || '').toUpperCase()] || lifecycle.overall_status || '未知') + '</b></div><div class="qwb-lifecycle-grid">';
             stages.forEach(function (stage, index) { h += renderLifecycleStage(stage, index); });
