@@ -1639,7 +1639,10 @@ class SyncAnalysisFastTest(unittest.TestCase):
             "final_trade_score": 70,
             "entry_score": 65,
             "capital_score": 70,
-            "risk_reward_ratio": 2.0,
+            "entry_price_low": 9.8,
+            "entry_price_high": 10.0,
+            "stop_loss_price": 9.0,
+            "take_profit_1": 12.9,
             "turnover_ratio": 5.0,
             "amount": 200_000_000,
             "main_wave_score": 70,
@@ -1652,7 +1655,7 @@ class SyncAnalysisFastTest(unittest.TestCase):
         low_risk_reward = {
             **base,
             "stock_code": "600002",
-            "risk_reward_ratio": 0.9,
+            "take_profit_1": 10.3,
         }
         low_activity = {
             **base,
@@ -1672,7 +1675,7 @@ class SyncAnalysisFastTest(unittest.TestCase):
             [item["stock_code"] for item in rows],
             ["600001"],
         )
-        self.assertEqual(rows[0]["risk_reward_ratio"], 2.0)
+        self.assertEqual(rows[0]["risk_reward_ratio"], 3.33)
 
     def test_missing_upper_history_keeps_ranked_pick_research_only(self):
         row = {

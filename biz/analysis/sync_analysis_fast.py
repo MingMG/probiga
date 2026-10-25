@@ -4071,6 +4071,24 @@ def apply_canonical_execution_eligibility(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _planned_risk_reward_ratio(row: Mapping[str, Any]) -> float | None:
+    low = _safe_number(row.get("entry_price_low"), None)
+    high = _safe_number(row.get("entry_price_high"), None)
+    stop = _safe_number(row.get("stop_loss_price"), None)
+    target = _safe_number(row.get("take_profit_1"), None)
+    if any(value is None or value <= 0 for value in (low, high, stop, target)):
+        fallback = _safe_number(row.get("risk_reward_ratio"), None)
+        return (
+            round(float(fallback), 2)
+            if fallback is not None and fallback > 0
+            else None
+        )
+    entry = (float(low) + float(high)) / 2.0
+    if not 0 < float(stop) < entry < float(target):
+        return None
+    return round((float(target) - entry) / (entry - float(stop)), 2)
+
+
 def build_analysis_rows(df: pd.DataFrame, trade_date: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     score_cols = [
@@ -4116,6 +4134,7 @@ def build_analysis_rows(df: pd.DataFrame, trade_date: str) -> list[dict[str, Any
 
 
 def build_recommendation_rows(df: pd.DataFrame, trade_date: str, top_n: int, min_score: float) -> list[dict[str, Any]]:
+    df = df.copy()
     stock_code_series = df["stock_code"].astype(str).str.strip().str.zfill(6)
     main_wave_signal_series = (
         df["main_wave_signal"].fillna("").astype(str)
@@ -4135,7 +4154,11 @@ def build_recommendation_rows(df: pd.DataFrame, trade_date: str, top_n: int, min
     # settled recommendation history.  Main-wave and raw technical strength
     # are deliberately excluded: both were negatively related to subsequent
     # 3/5/10-session returns and would promote crowded entries.
-    risk_reward_ratio = _numeric_col(df, "risk_reward_ratio", 0.0)
+    risk_reward_ratio = df.apply(_planned_risk_reward_ratio, axis=1)
+    risk_reward_ratio = pd.to_numeric(
+        risk_reward_ratio, errors="coerce"
+    ).fillna(0.0)
+    df["risk_reward_ratio"] = risk_reward_ratio
     risk_reward_score = (risk_reward_ratio / 3.0 * 100.0).clip(0.0, 100.0)
     amount_percentile = (
         _numeric_col(df, "amount", 0.0).rank(pct=True, method="average") * 100.0
@@ -4300,7 +4323,7 @@ def build_recommendation_rows(df: pd.DataFrame, trade_date: str, top_n: int, min
             "stop_loss_price": _none_if_nan(row.get("stop_loss_price")),
             "take_profit_1": _none_if_nan(row.get("take_profit_1")),
             "take_profit_2": _none_if_nan(row.get("take_profit_2")),
-            "risk_reward_ratio": _none_if_nan(row.get("risk_reward_ratio")),
+            "risk_reward_ratio": _planned_risk_reward_ratio(row),
             "position_weight": _none_if_nan(row.get("position_weight")),
             "max_holding_days": int(row.get("max_holding_days") or 0),
             "entry_conditions_json": row.get("entry_conditions_json") or "[]",
