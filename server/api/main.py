@@ -9,6 +9,7 @@ import uuid
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.gzip import GZipMiddleware
 from sqlalchemy.exc import (
     DBAPIError,
     InterfaceError,
@@ -223,6 +224,11 @@ app = FastAPI(
     title="ProBigA",
     description="数据分析平台 API",
     lifespan=lifespan,
+)
+app.add_middleware(
+    GZipMiddleware,
+    minimum_size=1024,
+    compresslevel=5,
 )
 app.add_middleware(StrategyEvidenceRequestSizeMiddleware)
 

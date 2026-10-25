@@ -11565,7 +11565,24 @@
     function loadRecommendedPage(d, container) {
         var reqId = (window._recLoadReqId || 0) + 1;
         window._recLoadReqId = reqId;
-        var keepCurrent = silentRefreshDepth > 0 && hasRenderedContent(container);
+        var recommendedQuery = recQueryUrl(d);
+        var cachedPayload = null;
+        var cachedKey = 'probiga_recommended_page_v1:' + recommendedQuery;
+        try {
+            var cachedRaw = window.sessionStorage && window.sessionStorage.getItem(cachedKey);
+            if (cachedRaw) {
+                var parsedCache = JSON.parse(cachedRaw);
+                if (parsedCache && Array.isArray(parsedCache.data) && parsedCache.data.length) {
+                    cachedPayload = parsedCache;
+                }
+            }
+        } catch (cacheReadError) {
+            cachedPayload = null;
+        }
+        var keepCurrent = (silentRefreshDepth > 0 && hasRenderedContent(container)) || !!cachedPayload;
+        if (cachedPayload && !hasRenderedContent(container)) {
+            renderRecommendedPage(container, cachedPayload, d);
+        }
         setStatus(keepCurrent ? 'AI 推荐后台刷新中...' : '正在加载 AI 推荐...');
         if (!keepCurrent) {
             renderRecommendedLoadingState(container, d, {
@@ -11574,7 +11591,7 @@
             });
         }
         Promise.all([
-            fetchJsonWithTimeout(recQueryUrl(d), 45000),
+            fetchJsonWithTimeout(recommendedQuery, 45000),
             fetchJsonWithTimeout(recGateUrl(d), 15000).catch(function(e) {
                 return {
                     status: 'degraded',
@@ -11595,6 +11612,11 @@
             res.runtime_params = results[2] || {};
             setStatus('AI 推荐结果已就绪。');
             renderRecommendedPage(container, res, d);
+            try {
+                if (window.sessionStorage && Array.isArray(res.data) && res.data.length) {
+                    window.sessionStorage.setItem(cachedKey, JSON.stringify(res));
+                }
+            } catch (cacheWriteError) {}
         }).catch(function(err) {
             if (window._recLoadReqId !== reqId) return;
             fetch('/api/hot-data/recommended-stocks/progress')
