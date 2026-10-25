@@ -11,6 +11,9 @@ from server.api.routers import quant_workbench
 from server.common.quant_workbench_capabilities import (
     quant_workbench_capability_contract,
 )
+from server.common.quant_workbench_lifecycle import (
+    build_quant_workbench_lifecycle,
+)
 from server.common.quant_workbench_operations import (
     DIRECT_EXECUTION,
     SCHEDULER_TARGET_EXECUTION,
@@ -366,6 +369,246 @@ def test_strategy_pool_projection_requires_active_identity(monkeypatch):
     assert result["real_order_authority"] is False
 
 
+def test_lifecycle_joins_data_pool_decision_simulation_and_review_truthfully():
+    lifecycle = build_quant_workbench_lifecycle(
+        trade_date="2026-10-23",
+        target={
+            "ready": True,
+            "reason": "ready",
+            "evidence": {
+                "kline": 5578,
+                "capital_flow": 5570,
+                "snapshot": 5578,
+            },
+        },
+        outlook={
+            "status": "READY",
+            "market_mode": "PANIC_REBOUND",
+            "market_mode_label": "恐慌修复",
+            "tactical_style": "龙头反核确认",
+            "next_trade_date": "2026-10-26",
+            "stocks": [{"stock_code": "603278", "short_name": "大业股份"}],
+        },
+        pool={
+            "status": "ACTIVE",
+            "trade_date": "2026-10-23",
+            "active_count": 80,
+            "analysis_count": 5578,
+            "run_uid": "a" * 32,
+        },
+        decision_gate={
+            "candidate_count": 80,
+            "executable_count": 0,
+            "blocked_count": 80,
+            "top_reasons": [{"reason": "关键数据缺失", "count": 80}],
+        },
+        governance={
+            "trade_date": "2026-08-31",
+            "run_uid": "b" * 32,
+            "status": "COMPLETED",
+            "input_ready": True,
+            "observation_count": 80,
+            "confirmation_count": 0,
+            "tradable_count": 0,
+        },
+        simulation={"status": "PENDING", "reason": "尚无模拟输入"},
+        review={
+            "publish_status": "blocked",
+            "review_date": "2026-10-23",
+            "blocking_reason": "目标行情覆盖率不足",
+        },
+    )
+    stages = {item["code"]: item for item in lifecycle["stages"]}
+
+    assert lifecycle["schema"] == "probiga.quant-workbench-lifecycle.v1"
+    assert lifecycle["overall_status"] == "BLOCKED"
+    assert lifecycle["first_blocking_stage"] == "CANONICAL_DECISION"
+    assert lifecycle["next_action"]["entry_tab"] == "strategy-center"
+    assert stages["DATA"]["state"] == "READY"
+    assert stages["MARKET"]["state"] == "READY"
+    assert stages["STRATEGY_POOL"]["state"] == "READY"
+    assert stages["CANONICAL_DECISION"]["state"] == "STALE"
+    assert stages["EXECUTION_GATE"]["state"] == "BLOCKED"
+    assert stages["SIMULATION"]["state"] == "WAITING"
+    assert stages["REVIEW"]["state"] == "BLOCKED"
+    assert lifecycle["real_order_authority"] is False
+
+
+def test_decision_gate_counts_real_non_executable_reasons(monkeypatch):
+    rows = [
+        {
+            "stock_code": "603278",
+            "recommend_status": "ALLOW",
+            "recommend_reason": "",
+            "signal_status": "CONFIRM",
+            "signal_reason": "",
+            "chase_risk_status": "ALLOW",
+            "ordinary_buy_eligible": 1,
+        },
+        {
+            "stock_code": "002724",
+            "recommend_status": "BLOCK",
+            "recommend_reason": "关键数据缺失",
+            "signal_status": "WATCH",
+            "signal_reason": "",
+            "chase_risk_status": "DATA_BLOCKED",
+            "ordinary_buy_eligible": 0,
+        },
+    ]
+    monkeypatch.setattr(
+        quant_workbench,
+        "_rows",
+        lambda _engine, _statement, _params: rows,
+    )
+    monkeypatch.setattr(
+        quant_workbench,
+        "is_executable_recommendation",
+        lambda row: row["stock_code"] == "603278",
+    )
+
+    result = quant_workbench.load_decision_gate_status(
+        object(),
+        trade_date="2026-10-23",
+        run_uid="a" * 32,
+    )
+
+    assert result["candidate_count"] == 2
+    assert result["executable_count"] == 1
+    assert result["blocked_count"] == 1
+    assert result["top_reasons"][0] == {"reason": "关键数据缺失", "count": 1}
+    assert result["real_order_authority"] is False
+
+
+def test_review_loader_surfaces_first_blocked_quality_gate(monkeypatch):
+    monkeypatch.setattr(
+        quant_workbench,
+        "_rows",
+        lambda _engine, _statement, _params: [{
+            "review_date": "2026-10-23",
+            "publish_status": "blocked",
+            "quality_json": json.dumps({
+                "status": "blocked",
+                "gates": [
+                    {"name": "weekday", "status": "pass"},
+                    {
+                        "name": "target_coverage",
+                        "status": "blocked",
+                        "message": "目标日有效行情覆盖率0.00%低于门槛",
+                    },
+                ],
+            }),
+        }],
+    )
+
+    result = quant_workbench.load_review_lifecycle_status(
+        object(),
+        "2026-10-23",
+    )
+
+    assert result["status"] == "BLOCKED"
+    assert result["publish_status"] == "blocked"
+    assert result["blocking_reason"] == "目标日有效行情覆盖率0.00%低于门槛"
+    assert result["blocked_gates"][0]["name"] == "target_coverage"
+
+
+def test_overview_exposes_one_integrated_lifecycle_and_next_action(monkeypatch):
+    monkeypatch.setattr(quant_workbench, "get_engine", lambda: object())
+    monkeypatch.setattr(
+        quant_workbench,
+        "load_operation_status",
+        lambda _engine: [{
+            "operation_id": "strategy_pool",
+            "task_type": "analysis_fast",
+            "can_run": True,
+            "state": "FAILED",
+            "capability_codes": ["S3"],
+        }],
+    )
+    monkeypatch.setattr(
+        quant_workbench,
+        "load_strategy_pool_status",
+        lambda _engine: {
+            "status": "ACTIVE",
+            "trade_date": "2026-10-23",
+            "active_count": 80,
+            "analysis_count": 5578,
+            "run_uid": "a" * 32,
+        },
+    )
+    monkeypatch.setattr(
+        quant_workbench,
+        "load_strategy_target_status",
+        lambda _engine: {
+            "default_trade_date": "2026-10-23",
+            "ready": True,
+            "reason": "ready",
+            "evidence": {"kline": 5578},
+        },
+    )
+    monkeypatch.setattr(
+        quant_workbench,
+        "load_market_lifecycle_status",
+        lambda _engine, _date: {
+            "status": "READY",
+            "market_mode": "PANIC_REBOUND",
+            "market_mode_label": "恐慌修复",
+            "stocks": [],
+        },
+    )
+    monkeypatch.setattr(
+        quant_workbench,
+        "load_decision_gate_status",
+        lambda _engine, **_kwargs: {
+            "candidate_count": 80,
+            "executable_count": 0,
+            "blocked_count": 80,
+            "top_reasons": [],
+        },
+    )
+    monkeypatch.setattr(
+        quant_workbench,
+        "load_governance_lifecycle_status",
+        lambda _engine: {
+            "trade_date": "2026-08-31",
+            "run_uid": "b" * 32,
+            "status": "COMPLETED",
+            "input_ready": True,
+        },
+    )
+    monkeypatch.setattr(
+        quant_workbench,
+        "load_simulation_lifecycle_status",
+        lambda _engine, _date: {"status": "PENDING", "reason": "尚无模拟输入"},
+    )
+    monkeypatch.setattr(
+        quant_workbench,
+        "load_review_lifecycle_status",
+        lambda _engine, _date: {
+            "publish_status": "blocked",
+            "blocking_reason": "目标行情覆盖率不足",
+        },
+    )
+    monkeypatch.setattr(
+        quant_workbench,
+        "load_risk_watch_status",
+        lambda _engine: {"status": "COMPLETE"},
+    )
+    monkeypatch.setattr(
+        quant_workbench,
+        "load_research_status",
+        lambda _engine: {"status": "AVAILABLE", "candidates": []},
+    )
+
+    result = quant_workbench.quant_workbench_overview()
+
+    assert result["lifecycle"]["schema"] == "probiga.quant-workbench-lifecycle.v1"
+    assert result["lifecycle"]["overall_status"] == "BLOCKED"
+    assert result["summary"]["first_blocking_stage"] == "CANONICAL_DECISION"
+    assert result["summary"]["next_action"]["entry_tab"] == "strategy-center"
+    assert result["execution_policy"]["manual_run_available"] is True
+    assert result["execution_policy"]["accepted_is_completion"] is False
+
+
 def test_run_operation_rejects_unknown_and_uses_scheduler_for_direct_task(monkeypatch):
     with pytest.raises(HTTPException) as unknown:
         quant_workbench.run_quant_workbench_operation("not-registered")
@@ -559,6 +802,31 @@ function fetchRawJsonWithTimeout() {
         run_uid: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
       },
       strategy_target: {default_trade_date: '2026-10-23', ready: true}
+      ,next_action: {
+        stage_code: 'CANONICAL_DECISION',
+        stage_label: '规范治理决策',
+        reason: 'CANONICAL_DECISION_TRADE_DATE_STALE',
+        operation_ids: [],
+        entry_tab: 'strategy-center',
+        entry_label: '打开策略治理'
+      }
+    },
+    lifecycle: {
+      schema: 'probiga.quant-workbench-lifecycle.v1',
+      trade_date: '2026-10-23',
+      overall_status: 'BLOCKED',
+      ready_stage_count: 3,
+      stage_count: 7,
+      first_blocking_stage: 'CANONICAL_DECISION',
+      stages: [
+        {code:'DATA',label:'完整交易日数据',state:'READY',summary:'日线 5578',evidence:{kline:5578,capital_flow:5570,snapshot:5578},operation_ids:[],entry_tab:'datasource'},
+        {code:'MARKET',label:'市场状态与情景',state:'READY',summary:'恐慌修复',evidence:{market_mode_label:'恐慌修复'},operation_ids:[],entry_tab:'market-outlook'},
+        {code:'STRATEGY_POOL',label:'策略候选池',state:'READY',summary:'80 只 ACTIVE',evidence:{active_count:80,trade_date:'2026-10-23'},operation_ids:['strategy_pool'],entry_tab:'recommended'},
+        {code:'CANONICAL_DECISION',label:'规范治理决策',state:'STALE',summary:'规范运行日 2026-08-31',blocking_reason:'CANONICAL_DECISION_TRADE_DATE_STALE',evidence:{trade_date:'2026-08-31'},operation_ids:[],entry_tab:'strategy-center',entry_label:'打开策略治理'},
+        {code:'EXECUTION_GATE',label:'候选执行门禁',state:'BLOCKED',summary:'0 / 80 只通过全部执行门禁',evidence:{executable_count:0,candidate_count:80,top_reasons:[{reason:'关键数据缺失',count:80}]},operation_ids:[],entry_tab:'trading-v3-candidates'},
+        {code:'SIMULATION',label:'QMT 策略模拟',state:'WAITING',summary:'尚无模拟输入',evidence:{reason:'尚无模拟输入'},operation_ids:[],entry_tab:'qmt-strategy-results'},
+        {code:'REVIEW',label:'复盘与反馈',state:'BLOCKED',summary:'复盘阻断',evidence:{blocking_reason:'目标行情覆盖率不足'},operation_ids:[],entry_tab:'review'}
+      ]
     },
     evidence: {risk_watch: {}, quant_research: {}}
   });
@@ -569,6 +837,11 @@ setTimeout(function() {
   assert.match(rendered, /生成票池/);
   assert.match(rendered, /查看策略票池/);
   assert.match(rendered, /当前有效票池/);
+  assert.match(rendered, /量化生产闭环/);
+  assert.match(rendered, /当前第一断点/);
+  assert.match(rendered, /规范治理决策/);
+  assert.match(rendered, /0 \/ 80 可执行/);
+  assert.match(rendered, /打开策略治理/);
   assert.match(rendered, /5578/);
   assert.match(rendered, /aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/);
   assert.match(rendered, /accepted 不等于 COMPLETE/);

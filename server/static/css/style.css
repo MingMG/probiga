@@ -5259,12 +5259,35 @@ tr:hover { background: #f8f9fb; }
 #tab-quant-workbench .qwb-flow-note { display:flex; align-items:center; gap:14px; padding:11px 14px; border:1px dashed #cbd9ea; border-radius:10px; background:#fbfdff; color:#6d7f94; font-size:10px; }
 #tab-quant-workbench .qwb-flow-note strong { color:#334b67; }
 #tab-quant-workbench .qwb-flow-note em { margin-left:auto; color:#b45309; font-style:normal; font-weight:700; }
+#tab-quant-workbench .qwb-lifecycle { display:grid; gap:14px; padding:18px; border:1px solid #dce5ef; border-radius:15px; background:#fff; }
+#tab-quant-workbench .qwb-lifecycle-grid { display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); gap:8px; }
+#tab-quant-workbench .qwb-life-stage { display:flex; min-width:0; flex-direction:column; gap:8px; padding:12px 11px; border:1px solid #e1e7ef; border-radius:11px; background:#fbfcfe; }
+#tab-quant-workbench .qwb-life-stage.qwb-ok { border-color:#c9ead9; background:#f7fdf9; }
+#tab-quant-workbench .qwb-life-stage.qwb-warn { border-color:#f1dcad; background:#fffdf6; }
+#tab-quant-workbench .qwb-life-stage.qwb-bad { border-color:#f0cfcf; background:#fffafa; }
+#tab-quant-workbench .qwb-life-stage.qwb-life-first-blocker { box-shadow:0 0 0 2px rgba(37,99,235,.2); }
+#tab-quant-workbench .qwb-life-index { display:flex; justify-content:space-between; align-items:center; gap:5px; }
+#tab-quant-workbench .qwb-life-index b { color:#9aa9bb; font-size:10px; }
+#tab-quant-workbench .qwb-life-index i { padding:3px 6px; border-radius:999px; font-size:8px; font-style:normal; }
+#tab-quant-workbench .qwb-life-stage h4 { min-height:31px; margin:0; color:#2a3d54; font-size:11px; line-height:1.4; }
+#tab-quant-workbench .qwb-life-stage p { flex:1; margin:0; color:#687b91; font-size:9px; line-height:1.5; }
+#tab-quant-workbench .qwb-life-stage small { overflow:hidden; color:#8b98aa; font-size:8px; line-height:1.45; text-overflow:ellipsis; white-space:nowrap; }
+#tab-quant-workbench .qwb-life-stage button { width:100%; padding:6px 7px; border:1px solid #c8d8ea; border-radius:6px; background:#fff; color:#2563eb; font-size:9px; font-weight:700; cursor:pointer; }
+#tab-quant-workbench .qwb-next-action { display:flex; justify-content:space-between; align-items:center; gap:20px; padding:18px 20px; border:1px solid #f2ca88; border-radius:14px; background:linear-gradient(120deg,#fffaf0,#fff7e6); }
+#tab-quant-workbench .qwb-next-action span { color:#b45309; font-size:9px; font-weight:800; letter-spacing:.05em; }
+#tab-quant-workbench .qwb-next-action h3 { margin:5px 0; color:#633c05; font-size:16px; }
+#tab-quant-workbench .qwb-next-action p { margin:0; color:#8b6a32; font-size:10px; line-height:1.6; }
+#tab-quant-workbench .qwb-next-action>button { flex:none; padding:10px 15px; border:0; border-radius:8px; background:#b45309; color:#fff; font-size:10px; font-weight:800; cursor:pointer; }
+#tab-quant-workbench .qwb-next-action.qwb-all-ready { border-color:#bde7d4; background:linear-gradient(120deg,#f4fff9,#ecfdf5); }
+#tab-quant-workbench .qwb-next-action.qwb-all-ready span,#tab-quant-workbench .qwb-next-action.qwb-all-ready h3 { color:#087552; }
 #tab-quant-workbench .qwb-contract { border:1px solid #e1e7ef; border-radius:13px; background:#fff; }
 #tab-quant-workbench .qwb-contract>summary { padding:15px 18px; color:#40546c; font-size:12px; font-weight:800; cursor:pointer; }
 #tab-quant-workbench .qwb-contract-body { display:grid; gap:12px; padding:0 14px 14px; }
 @media(max-width:900px){#tab-quant-workbench .qwb-priority-grid{grid-template-columns:1fr 1fr}#tab-quant-workbench .qwb-evidence-grid{grid-template-columns:1fr}}
 @media(max-width:900px){#tab-quant-workbench .qwb-operation-summary{grid-template-columns:1fr 1fr}#tab-quant-workbench .qwb-operation-grid{grid-template-columns:1fr}}
+@media(max-width:1200px){#tab-quant-workbench .qwb-lifecycle-grid{grid-template-columns:repeat(4,minmax(0,1fr))}}
 @media(max-width:600px){#tab-quant-workbench .qwb-hero{padding:20px;flex-direction:column}#tab-quant-workbench .qwb-priority-grid,#tab-quant-workbench .qwb-capability-grid{grid-template-columns:1fr}#tab-quant-workbench .qwb-evidence-card dl{grid-template-columns:1fr}#tab-quant-workbench .qwb-operation-summary{grid-template-columns:1fr}#tab-quant-workbench .qwb-pool-strip{align-items:flex-start;flex-direction:column}#tab-quant-workbench .qwb-operation-run,#tab-quant-workbench .qwb-flow-note{align-items:flex-start;flex-direction:column}#tab-quant-workbench .qwb-flow-note em{margin-left:0}#tab-quant-workbench .qwb-operation-message{min-width:100%;text-align:left}}
+@media(max-width:600px){#tab-quant-workbench .qwb-lifecycle-grid{grid-template-columns:1fr 1fr}#tab-quant-workbench .qwb-next-action{align-items:flex-start;flex-direction:column}}
 
 /* Shared header tools and a reachable mobile menu. */
 .header { padding:12px 24px; gap:15px; min-height:64px; flex-wrap:wrap; }

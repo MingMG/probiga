@@ -3845,9 +3845,10 @@
             var evidence = res.evidence || {}, risk = evidence.risk_watch || {}, research = evidence.quant_research || {};
             var summary = res.summary || {}, pool = summary.strategy_pool || {};
             var target = summary.strategy_target || {};
+            var lifecycle = res.lifecycle || {}, stages = Array.isArray(lifecycle.stages) ? lifecycle.stages : [];
             var progress = risk.progress || {}, receipt = risk.receipt || {};
-            var statusText = {AVAILABLE:'可用',PARTIAL:'部分可用',UNAVAILABLE:'暂不可用',NOT_STARTED:'未开始',RUNNING:'运行中',STALE_RUNNING:'回执陈旧',SUCCEEDED:'调度成功',BLOCKED:'阻断',FAILED:'失败',COMPLETE:'完成',ACTIVE:'有效',QUEUED:'排队中'};
-            var statusClass = function (value) { value=String(value||'').toUpperCase(); return value==='AVAILABLE'||value==='COMPLETE'||value==='SUCCEEDED'||value==='ACTIVE'?'qwb-ok':value==='PARTIAL'||value==='RUNNING'||value==='QUEUED'||value==='STALE_RUNNING'?'qwb-warn':value==='UNAVAILABLE'||value==='BLOCKED'||value==='FAILED'?'qwb-bad':'qwb-muted'; };
+            var statusText = {AVAILABLE:'可用',READY:'已就绪',PARTIAL:'部分可用',UNAVAILABLE:'暂不可用',NOT_STARTED:'未开始',RUNNING:'运行中',STALE:'已过期',WAITING:'等待输入',STALE_RUNNING:'回执陈旧',SUCCEEDED:'调度成功',BLOCKED:'阻断',FAILED:'失败',COMPLETE:'完成',ACTIVE:'有效',QUEUED:'排队中'};
+            var statusClass = function (value) { value=String(value||'').toUpperCase(); return value==='AVAILABLE'||value==='READY'||value==='COMPLETE'||value==='SUCCEEDED'||value==='ACTIVE'?'qwb-ok':value==='PARTIAL'||value==='RUNNING'||value==='QUEUED'||value==='STALE_RUNNING'||value==='STALE'||value==='WAITING'?'qwb-warn':value==='UNAVAILABLE'||value==='BLOCKED'||value==='FAILED'?'qwb-bad':'qwb-muted'; };
             var categoryOrder = ['MARKET_RESEARCH','DATA','STRATEGY_PORTFOLIO','RISK_PERFORMANCE','TRADING_REVIEW','DERIVATIVES_RELATIVE_VALUE','ENGINEERING_OPERATIONS'];
             var recommended = Array.isArray(res.recommended_workflows) ? res.recommended_workflows : [];
             var byCode = {};
@@ -3872,6 +3873,62 @@
                 if (item.operation_id === 'qmt_strategy_simulation') return '运行模拟';
                 return '立即运行';
             }
+
+            function lifecycleEvidenceText(stage) {
+                stage = stage || {};
+                var value = stage.evidence || {};
+                if (stage.code === 'DATA') return '日线 ' + (value.kline || 0) + ' · 资金流 ' + (value.capital_flow || 0) + ' · 快照 ' + (value.snapshot || 0);
+                if (stage.code === 'MARKET') return (value.market_mode_label || value.market_mode || '等待市场状态') + (value.next_trade_date ? ' · 下一交易日 ' + value.next_trade_date : '');
+                if (stage.code === 'STRATEGY_POOL') return (value.active_count || 0) + ' 只 ACTIVE · ' + (value.trade_date || '无日期');
+                if (stage.code === 'CANONICAL_DECISION') return value.trade_date ? ('规范运行日 ' + value.trade_date + ' · ' + (value.run_uid || '无身份')) : '尚无规范治理运行';
+                if (stage.code === 'EXECUTION_GATE') {
+                    var reasons = Array.isArray(value.top_reasons) ? value.top_reasons : [];
+                    return (value.executable_count || 0) + ' / ' + (value.candidate_count || 0) + ' 可执行' + (reasons.length ? ' · ' + reasons[0].reason : '');
+                }
+                if (stage.code === 'SIMULATION') return value.reason || value.status || '等待模拟输入';
+                if (stage.code === 'REVIEW') return value.blocking_reason || (value.publish_status === 'ready' ? '复盘已发布' : '复盘尚未就绪');
+                return stage.summary || '';
+            }
+
+            function lifecycleAction(stage) {
+                stage = stage || {};
+                var ids = Array.isArray(stage.operation_ids) ? stage.operation_ids : [];
+                for (var i = 0; i < ids.length; i += 1) {
+                    var operation = (window._quantWorkbenchOperations || {})[ids[i]];
+                    if (operation && operation.can_run) {
+                        return '<button type="button" onclick="runQuantOperation(\'' + escAttr(operation.operation_id) + '\')">' + escHtml(operationButtonLabel(operation)) + '</button>';
+                    }
+                }
+                if (stage.entry_tab) {
+                    return '<button type="button" onclick="switchTab(\'' + escAttr(stage.entry_tab) + '\')">' + escHtml(stage.entry_label || '查看证据') + '</button>';
+                }
+                return '';
+            }
+
+            function renderLifecycleStage(stage, index) {
+                var state = String((stage || {}).state || 'BLOCKED').toUpperCase();
+                var first = lifecycle.first_blocking_stage === stage.code;
+                return '<article class="qwb-life-stage ' + statusClass(state) + (first ? ' qwb-life-first-blocker' : '') + '">'
+                    + '<div class="qwb-life-index"><b>' + String(index + 1).padStart(2, '0') + '</b><i class="qwb-status ' + statusClass(state) + '">' + escHtml(statusText[state] || state) + '</i></div>'
+                    + '<h4>' + escHtml(stage.label || stage.code) + '</h4>'
+                    + '<p>' + escHtml(stage.summary || '') + '</p>'
+                    + '<small title="' + escAttr(stage.blocking_reason || '') + '">' + escHtml(lifecycleEvidenceText(stage)) + '</small>'
+                    + lifecycleAction(stage)
+                    + '</article>';
+            }
+
+            window.qwbRunLifecycleNext = function () {
+                var action = (window._quantWorkbenchData.summary || {}).next_action || {};
+                var ids = Array.isArray(action.operation_ids) ? action.operation_ids : [];
+                for (var i = 0; i < ids.length; i += 1) {
+                    var operation = (window._quantWorkbenchOperations || {})[ids[i]];
+                    if (operation && operation.can_run) {
+                        window.runQuantOperation(operation.operation_id);
+                        return;
+                    }
+                }
+                if (action.entry_tab) switchTab(action.entry_tab);
+            };
 
             function renderOperationCard(item) {
                 var state = String(item.state || 'BLOCKED').toUpperCase();
@@ -4031,8 +4088,27 @@
                 }, 3000);
             };
 
+            var nextAction = summary.next_action || lifecycle.next_action || {};
+            var nextStage = stages.find(function (stage) { return stage.code === nextAction.stage_code; }) || {};
+            var lifecycleReady = Number(lifecycle.ready_stage_count || 0) + ' / ' + Number(lifecycle.stage_count || stages.length) + ' 阶段就绪';
             var h = '<div class="qwb-page">';
-            h += '<section class="qwb-hero qwb-console-hero"><div><span class="qwb-eyebrow">QUANT OPERATIONS CONSOLE · ' + escHtml(res.operation_contract || '-') + '</span><h2>在这里运行量化任务，并跟到真实结果</h2><p>选择任务、提交生产调度、观察运行身份和终态，再打开对应结果。调度成功只代表进程完成，页面会继续用任务回执和结果读回区分“跑完”与“有结果”。</p></div><div class="qwb-hero-state"><strong>' + escHtml(summary.runnable_count || 0) + '</strong><span>个任务当前可提交</span></div></section>';
+            h += '<section class="qwb-hero qwb-console-hero"><div><span class="qwb-eyebrow">QUANT LIFECYCLE · ' + escHtml(lifecycle.schema || 'probiga.quant-workbench-lifecycle.v1') + '</span><h2>从数据到复盘，一条链路看清并继续推进</h2><p>这里不是功能目录。每个阶段都绑定真实数据、任务回执或结果页；绿色只代表该阶段证据成立，红色或黄色会直接指出当前断点和下一步。</p></div><div class="qwb-hero-state"><strong>' + escHtml(lifecycle.ready_stage_count || 0) + '</strong><span>' + escHtml(lifecycleReady) + '</span></div></section>';
+
+            h += '<section class="qwb-lifecycle"><div class="qwb-section-head"><div><span>DAILY VALUE CHAIN</span><h3>量化生产闭环</h3></div><b class="qwb-status ' + statusClass(lifecycle.overall_status) + '">' + escHtml(statusText[String(lifecycle.overall_status || '').toUpperCase()] || lifecycle.overall_status || '未知') + '</b></div><div class="qwb-lifecycle-grid">';
+            stages.forEach(function (stage, index) { h += renderLifecycleStage(stage, index); });
+            h += '</div></section>';
+
+            if (nextAction.stage_code) {
+                var nextOperation = null;
+                (nextAction.operation_ids || []).some(function (id) {
+                    var candidate = (window._quantWorkbenchOperations || {})[id];
+                    if (candidate && candidate.can_run) { nextOperation = candidate; return true; }
+                    return false;
+                });
+                h += '<section class="qwb-next-action"><div><span>当前第一断点 · ' + escHtml(nextStage.label || nextAction.stage_label || nextAction.stage_code) + '</span><h3>' + escHtml(nextAction.reason || nextStage.blocking_reason || '需要处理当前门禁') + '</h3><p>' + escHtml(lifecycleEvidenceText(nextStage)) + '</p></div><button type="button" onclick="qwbRunLifecycleNext()">' + escHtml(nextOperation ? operationButtonLabel(nextOperation) : (nextAction.entry_label || '打开处理入口')) + '</button></section>';
+            } else {
+                h += '<section class="qwb-next-action qwb-all-ready"><div><span>流程状态</span><h3>全部阶段已就绪</h3><p>继续查看策略池、执行门禁、模拟结果和复盘证据。</p></div></section>';
+            }
 
             h += '<section class="qwb-operation-summary"><article><span>已接入任务</span><strong>' + escHtml(summary.operation_count || operations.length) + '</strong><small>全部绑定真实调度身份</small></article><article><span>当前运行</span><strong>' + escHtml(summary.running_count || 0) + '</strong><small>依据持久化运行回执</small></article><article><span>最近失败</span><strong>' + escHtml(summary.failed_count || 0) + '</strong><small>可打开任务结果定位</small></article><article class="' + (String(pool.status).toUpperCase() === 'ACTIVE' ? 'qwb-pool-ready' : '') + '"><span>当前有效票池</span><strong>' + escHtml(pool.active_count || 0) + '</strong><small>' + escHtml(pool.trade_date || '尚无') + ' · ' + escHtml(pool.run_uid ? pool.run_uid.slice(0, 12) : '无运行身份') + '</small></article></section>';
 

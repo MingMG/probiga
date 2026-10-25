@@ -13,6 +13,7 @@ from biz.intelligence.exposure_risk_watch import (
     read_exposure_watch_checkpoint_progress,
 )
 from biz.intelligence.quant_research import load_quant_research_candidates
+from server.api.qmt_strategy_results import read_strategy_results
 from server.api.scheduler_runtime import (
     launch_scheduler_task,
     read_release_analysis_recovery_status,
@@ -22,6 +23,8 @@ from server.api.scheduler_runtime import (
     scheduler_task_owned_by_current_host,
 )
 from server.api.routers._engine import get_engine
+from server.api.routers.market_outlook import build_market_outlook
+from server.common.analysis_pool_receipt import is_executable_recommendation
 from server.common.authoritative_market_clock import (
     PRODUCTION_TIMEZONE,
     authoritative_closed_trade_date,
@@ -32,6 +35,9 @@ from server.common.exposure_risk_watch_task_contract import (
 )
 from server.common.quant_workbench_capabilities import (
     quant_workbench_capability_contract,
+)
+from server.common.quant_workbench_lifecycle import (
+    build_quant_workbench_lifecycle,
 )
 from server.common.quant_workbench_operations import (
     DIRECT_EXECUTION,
@@ -104,6 +110,16 @@ def _project_receipt(output: Any) -> dict[str, Any]:
         "real_order_authority",
     )
     return {key: receipt[key] for key in fields if key in receipt}
+
+
+def _json_mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    try:
+        parsed = json.loads(str(value or ""))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return dict(parsed) if isinstance(parsed, Mapping) else {}
 
 
 def _operation_state(
@@ -385,6 +401,254 @@ def load_strategy_target_status(engine: Any) -> dict[str, Any]:
     }
 
 
+def load_market_lifecycle_status(engine: Any, trade_date: str) -> dict[str, Any]:
+    try:
+        result = build_market_outlook(engine, trade_date=trade_date)
+    except Exception as exc:
+        return {
+            "status": "DATA_BLOCKED",
+            "reason": f"MARKET_OUTLOOK_UNAVAILABLE:{type(exc).__name__}",
+            "stocks": [],
+        }
+    return dict(result) if isinstance(result, Mapping) else {
+        "status": "DATA_BLOCKED",
+        "reason": "MARKET_OUTLOOK_INVALID",
+        "stocks": [],
+    }
+
+
+def load_decision_gate_status(
+    engine: Any,
+    *,
+    trade_date: str,
+    run_uid: str,
+) -> dict[str, Any]:
+    if not trade_date:
+        return {
+            "status": "BLOCKED",
+            "trade_date": "",
+            "run_uid": run_uid,
+            "candidate_count": 0,
+            "executable_count": 0,
+            "blocked_count": 0,
+            "blocking_reason": "STRATEGY_POOL_TRADE_DATE_UNAVAILABLE",
+            "top_reasons": [],
+        }
+    try:
+        rows = _rows(
+            engine,
+            """
+            SELECT stock_code, short_name, recommend_status,
+                   recommend_reason, signal_status, signal_reason,
+                   chase_risk_status, ordinary_buy_eligible,
+                   event_risk_level
+              FROM st_recommended_stocks
+             WHERE pick_date=:trade_date
+               AND publication_status='ACTIVE'
+               AND (:run_uid='' OR publisher_run_uid=:run_uid)
+             ORDER BY stock_code
+            """,
+            {"trade_date": trade_date, "run_uid": run_uid},
+        )
+    except Exception as exc:
+        return {
+            "status": "BLOCKED",
+            "trade_date": trade_date,
+            "run_uid": run_uid,
+            "candidate_count": 0,
+            "executable_count": 0,
+            "blocked_count": 0,
+            "blocking_reason": f"DECISION_GATE_READ_FAILED:{type(exc).__name__}",
+            "top_reasons": [],
+        }
+    executable_count = sum(
+        1 for row in rows if is_executable_recommendation(row)
+    )
+    reason_counts: dict[str, int] = {}
+    for row in rows:
+        if is_executable_recommendation(row):
+            continue
+        label = str(
+            row.get("recommend_reason")
+            or row.get("signal_reason")
+            or (
+                "执行数据门禁未通过"
+                if str(row.get("chase_risk_status") or "").upper()
+                != "ALLOW"
+                else "普通买入资格未通过"
+            )
+        ).strip()
+        reason_counts[label] = reason_counts.get(label, 0) + 1
+    top_reasons = [
+        {"reason": reason, "count": count}
+        for reason, count in sorted(
+            reason_counts.items(),
+            key=lambda item: (-item[1], item[0]),
+        )[:6]
+    ]
+    blocked_count = max(0, len(rows) - executable_count)
+    return {
+        "status": "READY" if executable_count > 0 else "BLOCKED",
+        "trade_date": trade_date,
+        "run_uid": run_uid,
+        "candidate_count": len(rows),
+        "executable_count": executable_count,
+        "blocked_count": blocked_count,
+        "blocking_reason": (
+            "" if executable_count > 0 else "NO_CANDIDATE_PASSED_EXECUTION_GATES"
+        ),
+        "top_reasons": top_reasons,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+
+
+def load_governance_lifecycle_status(engine: Any) -> dict[str, Any]:
+    try:
+        rows = _rows(
+            engine,
+            """
+            SELECT run_uid, trade_date, market_state, source_status,
+                   input_ready, build_commit_sha, status, strategy_count,
+                   formal_count, shadow_count, combination_count,
+                   observation_count, confirmation_count, tradable_count,
+                   created_at, finished_at
+              FROM st_strategy_governance_run
+             WHERE is_canonical=1
+             ORDER BY trade_date DESC, created_at DESC, run_uid DESC
+             LIMIT 1
+            """,
+            {},
+        )
+    except Exception as exc:
+        return {
+            "status": "BLOCKED",
+            "trade_date": "",
+            "blocking_reason": f"GOVERNANCE_READ_FAILED:{type(exc).__name__}",
+        }
+    if not rows:
+        return {
+            "status": "BLOCKED",
+            "trade_date": "",
+            "blocking_reason": "CANONICAL_DECISION_NOT_RUN",
+        }
+    row = dict(rows[0])
+    row["trade_date"] = str(row.get("trade_date") or "")[:10]
+    row["status"] = str(row.get("status") or "").upper()
+    row["input_ready"] = bool(row.get("input_ready"))
+    row["run_uid"] = str(row.get("run_uid") or "")
+    return row
+
+
+def load_simulation_lifecycle_status(
+    engine: Any,
+    trade_date: str,
+) -> dict[str, Any]:
+    try:
+        result = read_strategy_results(trade_date, limit=5)
+    except Exception as exc:
+        return {
+            "status": "BLOCKED",
+            "trade_date": trade_date,
+            "reason": f"QMT_SIMULATION_READ_FAILED:{type(exc).__name__}",
+            "owner": "WINDOWS_QMT",
+        }
+    latest = result.get("latest")
+    schedule = dict(result.get("schedule") or {})
+    latest_status = str(
+        latest.get("status") if isinstance(latest, Mapping) else ""
+    ).upper()
+    status = (
+        latest_status
+        if latest_status
+        else str(result.get("status") or "UNAVAILABLE").upper()
+    )
+    if status == "AVAILABLE" and latest_status:
+        status = latest_status
+    return {
+        "status": status,
+        "trade_date": str(result.get("trade_date") or trade_date)[:10],
+        "run_uid": str(
+            latest.get("run_uid") if isinstance(latest, Mapping) else ""
+        ),
+        "latest_status": latest_status,
+        "selected_count": (
+            latest.get("selected_count") if isinstance(latest, Mapping) else None
+        ),
+        "blocked_count": (
+            latest.get("blocked_count") if isinstance(latest, Mapping) else None
+        ),
+        "reason": str(result.get("reason") or ""),
+        "owner": str(schedule.get("owner") or "WINDOWS_QMT"),
+        "last_run_status": schedule.get("last_run_status"),
+        "last_run_at": schedule.get("last_run_at"),
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+
+
+def load_review_lifecycle_status(
+    engine: Any,
+    trade_date: str,
+) -> dict[str, Any]:
+    try:
+        rows = _rows(
+            engine,
+            """
+            SELECT review_date, publish_status, quality_json
+              FROM st_quant_review_digest
+             WHERE review_date <= :trade_date
+             ORDER BY review_date DESC, adjust_type ASC
+             LIMIT 1
+            """,
+            {"trade_date": trade_date},
+        )
+    except Exception as exc:
+        return {
+            "status": "BLOCKED",
+            "review_date": "",
+            "publish_status": "blocked",
+            "blocking_reason": f"REVIEW_READ_FAILED:{type(exc).__name__}",
+            "blocked_gates": [],
+        }
+    if not rows:
+        return {
+            "status": "BLOCKED",
+            "review_date": "",
+            "publish_status": "missing",
+            "blocking_reason": "REVIEW_NOT_AVAILABLE",
+            "blocked_gates": [],
+        }
+    row = dict(rows[0])
+    quality = _json_mapping(row.get("quality_json"))
+    blocked_gates = [
+        {
+            "name": str(gate.get("name") or ""),
+            "message": str(gate.get("message") or gate.get("expected") or ""),
+        }
+        for gate in list(quality.get("gates") or [])
+        if isinstance(gate, Mapping)
+        and str(gate.get("status") or "").strip().lower() == "blocked"
+    ]
+    publish_status = str(row.get("publish_status") or "").strip().lower()
+    blocking_reason = ""
+    if publish_status != "ready":
+        blocking_reason = (
+            blocked_gates[0]["message"]
+            if blocked_gates
+            else "REVIEW_QUALITY_GATE_BLOCKED"
+        )
+    return {
+        "status": "READY" if publish_status == "ready" else "BLOCKED",
+        "review_date": str(row.get("review_date") or "")[:10],
+        "publish_status": publish_status,
+        "blocking_reason": blocking_reason,
+        "blocked_gates": blocked_gates[:8],
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+
+
 def _require_operation(operation_id: str) -> dict[str, Any]:
     spec = quant_workbench_operation(operation_id)
     if spec is None:
@@ -635,6 +899,32 @@ def quant_workbench_overview():
     operations = load_operation_status(engine)
     strategy_pool = load_strategy_pool_status(engine)
     strategy_target = load_strategy_target_status(engine)
+    lifecycle_trade_date = str(
+        strategy_pool.get("trade_date")
+        or strategy_target.get("default_trade_date")
+        or ""
+    )[:10]
+    market = load_market_lifecycle_status(engine, lifecycle_trade_date)
+    decision_gate = load_decision_gate_status(
+        engine,
+        trade_date=lifecycle_trade_date,
+        run_uid=str(strategy_pool.get("run_uid") or ""),
+    )
+    governance = load_governance_lifecycle_status(engine)
+    simulation = load_simulation_lifecycle_status(engine, lifecycle_trade_date)
+    review = load_review_lifecycle_status(engine, lifecycle_trade_date)
+    risk_watch = load_risk_watch_status(engine)
+    quant_research = load_research_status(engine)
+    lifecycle = build_quant_workbench_lifecycle(
+        trade_date=lifecycle_trade_date,
+        target=strategy_target,
+        outlook=market,
+        pool=strategy_pool,
+        decision_gate=decision_gate,
+        governance=governance,
+        simulation=simulation,
+        review=review,
+    )
     operation_by_capability: dict[str, dict[str, Any]] = {}
     for operation in operations:
         for code in operation.get("capability_codes") or ():
@@ -661,16 +951,27 @@ def quant_workbench_overview():
         ),
         "strategy_pool": strategy_pool,
         "strategy_target": strategy_target,
+        "lifecycle_status": lifecycle["overall_status"],
+        "ready_stage_count": lifecycle["ready_stage_count"],
+        "stage_count": lifecycle["stage_count"],
+        "first_blocking_stage": lifecycle["first_blocking_stage"],
+        "next_action": lifecycle["next_action"],
     }
     return {
         **contract,
         "operations": operations,
         "operation_contract": quant_workbench_operation_contract()["schema"],
         "summary": summary,
+        "lifecycle": lifecycle,
         "status": "AVAILABLE",
         "evidence": {
-            "risk_watch": load_risk_watch_status(engine),
-            "quant_research": load_research_status(engine),
+            "market": market,
+            "strategy_decision_gate": decision_gate,
+            "strategy_governance": governance,
+            "qmt_simulation": simulation,
+            "review": review,
+            "risk_watch": risk_watch,
+            "quant_research": quant_research,
         },
         "execution_policy": {
             "scheduler_authority": "standalone_scheduler",
@@ -778,9 +1079,14 @@ def stop_quant_workbench_operation(operation_id: str):
 
 
 __all__ = [
+    "load_decision_gate_status",
+    "load_governance_lifecycle_status",
+    "load_market_lifecycle_status",
     "load_operation_status",
     "load_research_status",
+    "load_review_lifecycle_status",
     "load_risk_watch_status",
+    "load_simulation_lifecycle_status",
     "load_strategy_pool_status",
     "load_strategy_target_status",
     "quant_workbench_overview",
