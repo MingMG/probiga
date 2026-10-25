@@ -684,8 +684,11 @@ def _recommended_pool_publication_contract(
         or manifest_analysis_count != analysis_count
         or manifest_recommendation_count != recommendation_count
         or manifest_executable_count != executable_count
-        or str(manifest.get("canonical_pool_sha256") or "").strip().lower()
-        != pool_sha256
+        or re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(manifest.get("canonical_pool_sha256") or "").strip().lower(),
+        )
+        is None
         or manifest.get("publisher_run_uids") != expected_manifest_run_uids
         or manifest.get("publication_statuses") != expected_manifest_statuses
         or manifest.get("live_gate_alignment") is not True

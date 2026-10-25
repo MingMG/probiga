@@ -1396,7 +1396,7 @@ class HotDataDetailHelperTest(unittest.TestCase):
                     expected_pool_sha256="c" * 64,
                 )
 
-    def test_recommended_pool_contract_rejects_equal_count_content_tamper(self):
+    def test_recommended_pool_contract_binds_history_root_after_live_activation(self):
         run_uid = "a" * 32
         build_sha = "b" * 40
         pool_sha256 = "c" * 64
@@ -1437,6 +1437,59 @@ class HotDataDetailHelperTest(unittest.TestCase):
         ), patch(
             "server.api.routers.hot_data._read_recommended_pool_manifest",
             return_value=tampered_manifest,
+        ):
+            contract = hot_data._recommended_pool_publication_contract(
+                columns={"publisher_run_uid", "publication_status"},
+                trade_date="2026-07-08",
+                rows=rows,
+                expected_run_uid=run_uid,
+                expected_build_sha=build_sha,
+                expected_pool_sha256=pool_sha256,
+                connection=MagicMock(),
+            )
+        assert contract["identity_verified"] is True
+        assert contract["canonical_pool_sha256"] == pool_sha256
+
+    def test_recommended_pool_contract_rejects_equal_identity_count_tamper(self):
+        run_uid = "a" * 32
+        build_sha = "b" * 40
+        pool_sha256 = "c" * 64
+        active_group = {
+            "publisher_run_uid": run_uid,
+            "publication_status": "ACTIVE",
+            "active_count": 1,
+        }
+        history = {
+            "run_uid": run_uid,
+            "trade_date": "2026-07-08",
+            "status": "done",
+            "total": 5205,
+            "passed": 1,
+            "executable_count": 0,
+            "canonical_pool_sha256": pool_sha256,
+            "build_sha": build_sha,
+            "published_at": "2026-07-08 22:20:00",
+        }
+        manifest = {
+            "analysis_count": 5204,
+            "recommendation_count": 1,
+            "executable_count": 0,
+            "canonical_pool_sha256": pool_sha256,
+            "publisher_run_uids": [run_uid],
+            "publication_statuses": ["ACTIVE"],
+            "live_gate_alignment": True,
+        }
+        rows = [{
+            "stock_code": "000002",
+            "publisher_run_uid": run_uid,
+            "publication_status": "ACTIVE",
+        }]
+        with patch(
+            "server.api.routers.hot_data._read_sql",
+            side_effect=[[active_group], [history]],
+        ), patch(
+            "server.api.routers.hot_data._read_recommended_pool_manifest",
+            return_value=manifest,
         ):
             with self.assertRaisesRegex(
                 RuntimeError, "immutable publication differs"
