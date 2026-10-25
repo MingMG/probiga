@@ -4349,12 +4349,17 @@ def build_recommendation_rows(df: pd.DataFrame, trade_date: str, top_n: int, min
     tactical_mode = market_mode_series.isin(
         {MODE_PANIC_REBOUND, MODE_SPECULATIVE}
     )
+    intraday_confirmation = (
+        (_numeric_col(df, "minute_rows", 0.0) > 0)
+        | _numeric_col(df, "minute_rebound_from_low_pct", 0.0).gt(0)
+    ).astype(float) * 12.0
     ranking_score = evidence_ranking_score.where(
         ~tactical_candidate_series,
         evidence_ranking_score * 0.40
         + tactical_score_series * 0.60
+        + intraday_confirmation
         + 5.0,
-    ).clip(0.0, 100.0)
+    ).clip(0.0, 120.0)
     df["ranking_score"] = ranking_score
     # The recommendation table is also the ranked observation ledger. Keep
     # soft-risk rows visible for evaluation, but do not fill the top-N quota
