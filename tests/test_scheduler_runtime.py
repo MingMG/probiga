@@ -5177,6 +5177,7 @@ def test_release_analysis_recovery_request_is_claimed_and_removed(
         assert attached["request_id"] == request["request_id"]
         assert row["_trigger_source"] == "release_catchup"
         assert row["_scheduler_target_trade_date"] == "2026-10-23"
+        assert row["_release_analysis_research_mode"] is False
         assert scheduler_runtime.read_release_analysis_recovery_status()[
             "status"
         ] == "ATTACHED"
@@ -5187,6 +5188,50 @@ def test_release_analysis_recovery_request_is_claimed_and_removed(
             "status"
         ] == "DISPATCHED"
     assert not request_path.exists()
+
+
+def test_research_recovery_request_is_explicit_and_isolated(
+    tmp_path: Path,
+) -> None:
+    request_path = tmp_path / "release-analysis-recovery-request.json"
+    row = {
+        "id": 37,
+        "task_type": "analysis_fast",
+        "enabled": 1,
+        "script_path": "tools/run_ai_recommendation_premarket.py",
+        "script_args": "--top-n 80 --min-score 62 --json",
+    }
+    with (
+        patch.object(
+            scheduler_runtime,
+            "_release_analysis_recovery_request_path",
+            return_value=request_path,
+        ),
+        patch.object(
+            scheduler_runtime,
+            "_scheduler_build_commit_sha",
+            return_value="a" * 40,
+        ),
+        patch.object(
+            scheduler_runtime,
+            "release_analysis_recovery_readiness",
+            return_value=(True, "ready", {"target_trade_date": "2026-10-23"}),
+        ),
+    ):
+        request = scheduler_runtime.request_release_analysis_recovery(
+            MagicMock(),
+            "2026-10-23",
+            mode="research",
+        )
+        attached = scheduler_runtime._attach_release_analysis_recovery_request(
+            MagicMock(),
+            [row],
+            now=datetime(2026, 10, 24, 23),
+        )
+
+    assert request["mode"] == "research"
+    assert attached["mode"] == "research"
+    assert row["_release_analysis_research_mode"] is True
 
 
 def test_release_dependency_rejects_exact_build_receipt_for_old_target_date():

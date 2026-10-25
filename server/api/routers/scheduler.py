@@ -471,6 +471,7 @@ def run_task_now(task_id: int):
 @router.post("/scheduler/release-analysis/recover")
 def recover_release_analysis(
     trade_date: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    mode: str = Query("formal", pattern=r"^(formal|research)$"),
 ):
     """Run target-bound analysis from complete local data after a code release."""
 
@@ -509,13 +510,14 @@ def recover_release_analysis(
                 "evidence": evidence,
             },
         )
-    request = request_release_analysis_recovery(engine, trade_date)
+    request = request_release_analysis_recovery(engine, trade_date, mode=mode)
     return {
         "accepted": True,
         "status": "queued",
         "task_id": int(row["id"]),
         "trigger_source": "release_catchup",
         "target_trade_date": trade_date,
+        "mode": mode,
         "request_id": request["request_id"],
         "readiness": request["readiness"],
     }

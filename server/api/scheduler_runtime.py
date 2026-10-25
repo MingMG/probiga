@@ -2418,8 +2418,9 @@ def release_analysis_recovery_readiness(
 
 
 RELEASE_ANALYSIS_RECOVERY_REQUEST_SCHEMA = (
-    "probiga.release-analysis-recovery-request.v1"
+    "probiga.release-analysis-recovery-request.v2"
 )
+RELEASE_ANALYSIS_RECOVERY_MODES = frozenset({"formal", "research"})
 
 
 def _release_analysis_recovery_request_path() -> Path:
@@ -2493,9 +2494,13 @@ def read_release_analysis_recovery_status() -> dict[str, object]:
 def request_release_analysis_recovery(
     engine,
     target_trade_date: str,
+    mode: str = "formal",
 ) -> dict[str, object]:
     """Persist one scheduler-owned analysis recovery request."""
 
+    normalized_mode = str(mode or "").strip().lower()
+    if normalized_mode not in RELEASE_ANALYSIS_RECOVERY_MODES:
+        raise RuntimeError("release analysis recovery mode is invalid")
     ready, reason, evidence = release_analysis_recovery_readiness(
         engine,
         target_trade_date,
@@ -2510,6 +2515,7 @@ def request_release_analysis_recovery(
         "request_id": uuid.uuid4().hex,
         "build_sha": build_sha,
         "target_trade_date": target_trade_date,
+        "mode": normalized_mode,
         "requested_at": _now_shanghai_naive().isoformat(
             sep=" ",
             timespec="seconds",
@@ -2596,6 +2602,7 @@ def _attach_release_analysis_recovery_request(
         "request_id",
         "build_sha",
         "target_trade_date",
+        "mode",
         "requested_at",
     }
     if (
@@ -2605,6 +2612,7 @@ def _attach_release_analysis_recovery_request(
         or re.fullmatch(r"[0-9a-f]{32}", str(request.get("request_id") or ""))
         is None
         or str(request.get("build_sha") or "") != _scheduler_build_commit_sha()
+        or str(request.get("mode") or "") not in RELEASE_ANALYSIS_RECOVERY_MODES
     ):
         reject("request_identity_differs")
         return None
@@ -2634,6 +2642,9 @@ def _attach_release_analysis_recovery_request(
         "_scheduler_target_trade_date": target,
         "_release_analysis_recovery_requested": True,
         "_release_analysis_recovery_request_id": str(request["request_id"]),
+        "_release_analysis_research_mode": (
+            str(request["mode"]) == "research"
+        ),
     })
     _write_release_analysis_recovery_status(
         request_id,
@@ -9322,6 +9333,8 @@ def _run_task_impl(
     )
     if task_type == "analysis_fast":
         _enforce_exact_analysis_inputs(child_env)
+        if row.get("_release_analysis_research_mode") is True:
+            child_env["PROBIGA_ANALYSIS_ALLOW_DEGRADED_INPUTS"] = "1"
         child_env["PROBIGA_ANALYSIS_DIAGNOSTICS_ROOT"] = str(
             Path(
                 child_env.get("PROBIGA_JOB_LOG_ROOT")
