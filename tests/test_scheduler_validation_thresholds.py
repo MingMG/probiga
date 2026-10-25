@@ -800,6 +800,21 @@ def test_turnover_pass_requires_exact_target_direct_snapshot_proof():
             validate_turnover_evidence(build_turnover_evidence(invalid))
 
 
+def test_turnover_pass_accepts_verified_free_daily_target_at_lot_precision():
+    proof = json.loads(_turnover_evidence("600001"))
+    proof.pop("proof_sha256")
+    proof.update({
+        "qmt_data_source": "tencent_qt",
+        "qmt_quality_status": "SOURCE_VERIFIED",
+        "qmt_volume_shares": "1040",
+    })
+
+    validated = validate_turnover_evidence(build_turnover_evidence(proof))
+
+    assert validated["qmt_data_source"] == "tencent_qt"
+    assert validated["qmt_volume_shares"] == "1040"
+
+
 def test_upper_limit_accepts_hash_bound_eastmoney_rule_evidence():
     proof = json.loads(_upper_limit_evidence("600001"))
     proof.pop("proof_sha256")

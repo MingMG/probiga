@@ -32,6 +32,9 @@ from server.common.analysis_snapshot_codec import (
     decode_snapshot_payload,
     encode_snapshot_payload,
 )
+from server.common.verified_daily_market_truth import (
+    VERIFIED_FREE_DAILY_ROW_SOURCES,
+)
 
 
 ANALYSIS_POOL_RECEIPT_SCHEMA = "probiga.analysis-strategy-pool-publication.v1"
@@ -813,6 +816,10 @@ def build_turnover_evidence(core: Mapping[str, Any]) -> str:
     )
 
 
+def _volume_at_lot_precision(value: Decimal) -> Decimal:
+    return value.quantize(Decimal("1E2"), rounding=ROUND_HALF_UP)
+
+
 def validate_turnover_evidence(value: Any) -> dict[str, Any]:
     try:
         payload = json.loads(value) if isinstance(value, str) else dict(value)
@@ -880,6 +887,18 @@ def validate_turnover_evidence(value: Any) -> dict[str, Any]:
         if provider_http_at.tzinfo is not None
         else provider_http_at
     )
+    target_source = str(payload.get("qmt_data_source") or "")
+    target_quality = str(payload.get("qmt_quality_status") or "")
+    target_permission = str(payload.get("qmt_permission_status") or "")
+    target_provenance_supported = (
+        target_source == "gj_big_qmt_inner"
+        and target_quality == "QMT_ATTESTED"
+        and target_permission == "SUPPORTED"
+    ) or (
+        target_source in VERIFIED_FREE_DAILY_ROW_SOURCES
+        and target_quality == "SOURCE_VERIFIED"
+        and target_permission == "SUPPORTED"
+    )
     if (
         payload.get("source_table") != "st_market_field_capture_row"
         or payload.get("formula") != TURNOVER_DIRECT_FORMULA
@@ -899,12 +918,11 @@ def validate_turnover_evidence(value: Any) -> dict[str, Any]:
         or provider_http_local > decision_known_at
         or qmt_received_at.tzinfo is not None
         or qmt_received_at > decision_known_at
-        or payload.get("qmt_data_source") != "gj_big_qmt_inner"
-        or payload.get("qmt_permission_status") != "SUPPORTED"
+        or not target_provenance_supported
         or not str(payload.get("qmt_batch_id") or "").strip()
         or not str(payload.get("qmt_data_version") or "").strip()
-        or payload.get("qmt_quality_status") != "QMT_ATTESTED"
-        or source_values != qmt_values
+        or source_values[:-1] != qmt_values[:-1]
+        or source_values[-1] != _volume_at_lot_precision(qmt_values[-1])
         or volume != source_values[-1]
         or any(not item.is_finite() or item <= 0 for item in source_values)
         or turnover
