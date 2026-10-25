@@ -3838,7 +3838,15 @@
 
     function loadQuantWorkbenchPage(d, c) {
         c.innerHTML = '<div class="loading">正在核对量化能力、任务身份与业务回执...</div>';
-        fetchRawJsonWithTimeout('/api/quant-workbench', 30000).then(function (res) {
+        var outlookDate = recommendationDateValue() || d || currentDateValue();
+        Promise.all([
+            fetchRawJsonWithTimeout('/api/quant-workbench', 30000),
+            fetchJsonWithTimeout('/api/market-outlook?trade_date=' + encodeURIComponent(outlookDate), 15000).catch(function (error) {
+                return {status:'DATA_BLOCKED', reason:(error && error.message) || '明日推演暂不可用'};
+            })
+        ]).then(function (results) {
+            var res = results[0] || {};
+            var outlook = results[1] || {};
             var capabilities = Array.isArray(res.capabilities) ? res.capabilities : [];
             var evidence = res.evidence || {}, risk = evidence.risk_watch || {}, research = evidence.quant_research || {};
             var progress = risk.progress || {}, receipt = risk.receipt || {};
@@ -3855,6 +3863,9 @@
                 switchTab(item.entry_tab);
             };
             var h = '<div class="qwb-page">';
+            if (window.MarketOutlook && window.MarketOutlook.summary) {
+                h += window.MarketOutlook.summary(outlook);
+            }
             h += '<section class="qwb-hero"><div><span class="qwb-eyebrow">PROBIGA QUANT CAPABILITY CONTRACT · '+escHtml(res.version||'-')+'</span><h2>选择量化任务，而不是被动等待首页推荐</h2><p>28 个稳定编号绑定系统真实能力、证据入口和限制。查看不会触发采集、推送、部署或交易；所有研究候选均无真实下单权限。</p></div><div class="qwb-hero-state"><strong>'+escHtml(res.capability_count||capabilities.length)+'</strong><span>项能力 · '+escHtml(res.category_count||7)+' 类</span></div></section>';
             h += '<section class="qwb-priority"><div class="qwb-section-head"><div><span>建议优先</span><h3>先把风险、数据和研究验证接牢</h3></div><small>按当前系统收益排序</small></div><div class="qwb-priority-grid">';
             recommended.forEach(function (code, index) { var item=byCode[code]||{}; h+='<button type="button" '+(item.entry_tab?'onclick="openQuantWorkflow(\''+escAttr(code)+'\')"':'disabled')+'><em>#'+(index+1)+'</em><strong>'+escHtml(code)+' · '+escHtml(item.label||'-')+'</strong><span>'+escHtml(item.scope||'')+'</span></button>'; });
