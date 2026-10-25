@@ -306,7 +306,9 @@ def _insert_stage(conn: Connection, chunk: list[tuple]) -> None:
         f"INSERT INTO `{STAGE_TABLE}` ({','.join(MINUTE_STAGE_COLUMNS)}) VALUES "
         + ",".join([MINUTE_STAGE_TEMPLATE] * len(chunk))
     )
-    conn.exec_driver_sql(sql, [value for row in chunk for value in row])
+    conn.exec_driver_sql(
+        sql, tuple(value for row in chunk for value in row)
+    )
     # Staging is a bulk landing area, not a transaction: committing per chunk
     # keeps one session batch from holding ~27M rows of undo log open.
     conn.commit()

@@ -94,6 +94,16 @@ from server.common.chase_risk_policy import (
     CanonicalChaseBar,
     assess_chase_risk,
 )
+from .intraday_reversal import load_index_stability, load_intraday_evidence
+from .tactical_market import (
+    MODE_DEFENSIVE,
+    MODE_PANIC_REBOUND,
+    MODE_SPECULATIVE,
+    attach_daily_tactical_features,
+    attach_intraday_tactical_features,
+    load_tactical_context,
+    tactical_candidate_codes,
+)
 
 logger = logging.getLogger(__name__)
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -358,7 +368,7 @@ def _analysis_execution_lock(engine: Engine, trade_date: str):
         connection.close()
 
 
-MODEL_VERSION = "ai-rec-v3-mainwave"
+MODEL_VERSION = "ai-rec-v3-tactical-v4"
 
 STRATEGY_PROFILES: dict[str, dict[str, Any]] = {
     "ultra_short": {
@@ -1876,6 +1886,7 @@ def _load_kline_features_from_snapshot(
         df[f"ma{window}"] = grouped["close"].transform(lambda s, w=window, m=min_periods: s.rolling(w, min_periods=m).mean())
     df["amount_ma5"] = grouped["amount"].transform(lambda s: s.rolling(5, min_periods=3).mean())
     df["amount_ma20"] = grouped["amount"].transform(lambda s: s.rolling(20, min_periods=8).mean())
+    df["previous_change_pct"] = grouped["change_pct"].shift(1)
     df["pct_5"] = grouped["close"].pct_change(5) * 100.0
     df["pct_20"] = grouped["close"].pct_change(20) * 100.0
     df["volatility_20"] = grouped["change_pct"].transform(lambda s: s.rolling(20, min_periods=8).std())
@@ -3173,6 +3184,14 @@ def _strategy_score(row: dict[str, Any], strategy: str) -> float:
 
 
 def select_primary_strategy(row: dict[str, Any]) -> str:
+    mode = str(row.get("market_mode") or "").upper()
+    if mode == MODE_DEFENSIVE:
+        return "swing"
+    if (
+        mode in {MODE_PANIC_REBOUND, MODE_SPECULATIVE}
+        and bool(row.get("tactical_candidate"))
+    ):
+        return "ultra_short"
     if str(row.get("main_wave_signal") or "").upper() in {"REDUCE", "SELL_ALERT"}:
         return "main_wave"
     scores = {name: _strategy_score(row, name) for name in STRATEGY_PROFILES}
@@ -3199,6 +3218,11 @@ def _position_weight(row: dict[str, Any], strategy: str, status: str) -> float:
         weight *= 1.12
     if risk_level == "MEDIUM":
         weight *= 0.75
+    if str(row.get("market_mode") or "").upper() in {
+        MODE_PANIC_REBOUND,
+        MODE_SPECULATIVE,
+    }:
+        weight = min(weight, 5.0 if status in {"CONFIRM", "BUY_READY"} else 3.0)
     return round(max(1.0, min(12.0, weight)), 2)
 
 
@@ -3239,6 +3263,15 @@ def build_strategy_trade_plan(row: dict[str, Any], strategy: str) -> dict[str, A
     trend_hold_score = _safe_number(row.get("trend_hold_score"), 0.0)
     main_wave_signal = str(row.get("main_wave_signal") or "NONE").upper()
     main_wave_reason = str(row.get("main_wave_reason") or "")
+    market_mode = str(row.get("market_mode") or "").upper()
+    tactical_candidate = bool(row.get("tactical_candidate"))
+    tactical_role = str(
+        row.get("tactical_intraday_role")
+        or row.get("tactical_daily_role")
+        or ""
+    )
+    tactical_trigger = str(row.get("tactical_trigger") or "")
+    tactical_invalidation = str(row.get("tactical_invalidation") or "")
     max_recent_trade_score = _safe_number(row.get("max_recent_trade_score"), 0.0)
     last_pick_date = _parse_date_value(row.get("last_pick_date"))
     current_trade_date = _parse_date_value(row.get("trade_date"))
@@ -3333,8 +3366,64 @@ def build_strategy_trade_plan(row: dict[str, Any], strategy: str) -> dict[str, A
         else None
     )
 
+    if (
+        tactical_candidate
+        and market_mode in {MODE_PANIC_REBOUND, MODE_SPECULATIVE}
+    ):
+        tactical_low = _safe_number(row.get("tactical_entry_low"), None)
+        tactical_high = _safe_number(row.get("tactical_entry_high"), None)
+        tactical_stop = _safe_number(row.get("tactical_stop_loss"), None)
+        tactical_target = _safe_number(row.get("tactical_take_profit"), None)
+        if (
+            tactical_low is not None
+            and tactical_high is not None
+            and tactical_low > 0
+            and tactical_high >= tactical_low
+        ):
+            entry_low, entry_high = tactical_low, tactical_high
+            ref_price = (entry_low + entry_high) / 2.0
+            if tactical_stop is not None and 0 < tactical_stop < ref_price:
+                stop_loss = tactical_stop
+                take_profit_1 = (
+                    tactical_target
+                    if tactical_target is not None and tactical_target > ref_price
+                    else ref_price * 1.08
+                )
+                take_profit_2 = max(
+                    take_profit_1,
+                    ref_price * 1.15,
+                )
+                risk_reward_ratio = (
+                    (take_profit_1 - ref_price) / (ref_price - stop_loss)
+                )
+        entry_conditions = [
+            tactical_trigger or "next session confirms leader strength",
+            "index remains stable after 14:30",
+            "leader does not break the board or reopen materially",
+            "follower reclaims prior close and VWAP with renewed volume",
+        ]
+        if row.get("intraday_event_json"):
+            entry_conditions.append(
+                "intraday_event=" + str(row.get("intraday_event_json"))[:1200]
+            )
+        invalidation = (
+            tactical_invalidation
+            or "leader breaks, follower loses prior-day low, or sector weakens"
+        )
+
     blockers: list[str] = []
-    if strategy == "main_wave" and main_wave_signal in {"SELL_ALERT", "REDUCE"}:
+    if market_mode == MODE_DEFENSIVE:
+        status = "BLOCK"
+        blockers.append("防守模式禁止新开仓")
+    elif (
+        tactical_candidate
+        and market_mode in {MODE_PANIC_REBOUND, MODE_SPECULATIVE}
+    ):
+        status = "WATCH"
+        blockers.append(
+            f"{tactical_role or '战术候选'}等待次日盘中触发，不允许按收盘价追入"
+        )
+    elif strategy == "main_wave" and main_wave_signal in {"SELL_ALERT", "REDUCE"}:
         status = "SELL_ALERT"
         blockers.append(main_wave_reason or "main-wave risk signal triggered")
     elif base_status == "BLOCK" or event_risk == "CRITICAL":
@@ -3387,7 +3476,12 @@ def build_strategy_trade_plan(row: dict[str, Any], strategy: str) -> dict[str, A
         status = "WATCH"
         blockers.append("final trade score or entry score has not reached confirm threshold")
 
-    if status == "BUY_READY":
+    if tactical_candidate:
+        reason = (
+            f"{market_mode} {tactical_role or '战术候选'}："
+            f"{tactical_trigger or '等待次日盘中确认'}"
+        )
+    elif status == "BUY_READY":
         reason = (
             f"main-wave buy ready: score {main_wave_score:.1f}, hold {trend_hold_score:.1f}; "
             f"{main_wave_reason or 'wait for pullback/volume confirmation'}"
@@ -3406,7 +3500,14 @@ def build_strategy_trade_plan(row: dict[str, Any], strategy: str) -> dict[str, A
         f"max holding {int(profile['max_holding_days'])} trading days",
         invalidation,
     ]
-    if strategy == "main_wave":
+    if tactical_candidate:
+        sell_rules = [
+            "次日未触发计划入场区则放弃，不追高",
+            "跌破战术止损位立即退出",
+            "龙头炸板且无法回封时，跟随票同步取消或退出",
+            "短线目标达到8%先兑现，持有不超过3个交易日",
+        ]
+    elif strategy == "main_wave":
         sell_rules = [
             "do not exit only because fixed profit target is reached",
             "reduce when distance from MA20 is excessive and cumulative wave gain is high",
@@ -3689,6 +3790,9 @@ def compute_scores(
     confidence: pd.DataFrame | None = None,
     rec_history: pd.DataFrame | None = None,
     failures: pd.DataFrame | None = None,
+    tactical_context: Mapping[str, Any] | None = None,
+    intraday_evidence: pd.DataFrame | None = None,
+    index_stability: Mapping[str, Any] | None = None,
 ) -> pd.DataFrame:
     flow = _ensure_columns(flow, {
         "main_net_inflow": np.nan,
@@ -3917,6 +4021,42 @@ def compute_scores(
         reasons.append(reason)
     df["recommend_status"] = statuses
     df["recommend_reason"] = reasons
+    if tactical_context is not None:
+        df = attach_daily_tactical_features(
+            df, context=tactical_context
+        )
+        df = attach_intraday_tactical_features(
+            df,
+            intraday=intraday_evidence,
+            index_stability=index_stability,
+        )
+        tactical_mask = (
+            df["tactical_candidate"].fillna(False).astype(bool)
+            & df["market_mode"].astype(str).str.upper().isin(
+                {MODE_PANIC_REBOUND, MODE_SPECULATIVE}
+            )
+        )
+        hard_risk = (
+            df.get("event_risk_level", pd.Series("LOW", index=df.index))
+            .fillna("LOW").astype(str).str.upper().eq("CRITICAL")
+            | df.get("short_name", pd.Series("", index=df.index))
+            .fillna("").astype(str)
+            .apply(lambda value: "ST" in value.upper() or "退" in value)
+        )
+        tactical_safe = tactical_mask & ~hard_risk
+        blocked_status = (
+            df["recommend_status"].fillna("BLOCK").astype(str).str.upper()
+            == "BLOCK"
+        )
+        df.loc[tactical_safe & blocked_status, "recommend_status"] = "SUSPENDED"
+        df.loc[tactical_safe & blocked_status, "recommend_reason"] = (
+            "短线行情路由：旧趋势/长期评分不阻断战术观察池，"
+            "等待次日盘中确认"
+        )
+        df.loc[tactical_safe, "main_wave_signal"] = "NOT_APPLICABLE_TACTICAL"
+        df.loc[tactical_safe, "main_wave_reason"] = (
+            "当前市场按短线/恐慌修复路由，主升浪信号不参与本次决策"
+        )
     df = add_strategy_signals(df, confidence=confidence, rec_history=rec_history, failures=failures)
     return df
 
@@ -3971,15 +4111,30 @@ def _build_text_fields(df: pd.DataFrame, flow_date: str, trade_date: str) -> pd.
             risks.append("当日涨幅过高")
         if float(row.get("volatility_20") or 0) >= 8:
             risks.append("短期波动偏大")
+        if row.get("tactical_candidate"):
+            strengths.append(
+                f"盘中战术证据：{row.get('tactical_intraday_role') or row.get('tactical_daily_role') or '候选'}"
+            )
+            risks.append(
+                "战术仓只做次日确认，不允许按前一日收盘价追入"
+            )
         if not strengths:
             strengths.append("暂无突出优势，作为基础覆盖样本")
 
         status = row.get("recommend_status") or "SUSPENDED"
+        mode_label = str(row.get("market_mode_label") or row.get("market_mode") or "")
         summary = (
+            f"市场状态: {mode_label or '未分类'}; "
             f"基础评分: 综合{row.get('ai_score'):.1f}, 短线{row.get('short_term_score'):.1f}, "
             f"长线{row.get('long_term_score'):.1f}; 状态{status}。"
         )
-        if status == "ALLOW":
+        if row.get("tactical_candidate"):
+            recommendation = (
+                f"{row.get('tactical_intraday_role') or '战术候选'}："
+                f"{row.get('tactical_trigger') or '等待次日盘中量价确认'}；"
+                "确认前只进入观察票池。"
+            )
+        elif status == "ALLOW":
             recommendation = "可进入候选池，盘中等待量价和资金二次确认，并设置止损。"
         elif status == "SUSPENDED":
             recommendation = "暂缓买入，等待评分或风险项改善后再复核。"
@@ -4150,6 +4305,18 @@ def build_recommendation_rows(df: pd.DataFrame, trade_date: str, top_n: int, min
     signal_status_series = (
         df["signal_status"].fillna("BLOCK").astype(str).str.upper()
     )
+    market_mode_series = (
+        df["market_mode"].fillna("").astype(str).str.upper()
+        if "market_mode" in df.columns
+        else pd.Series("", index=df.index)
+    )
+    tactical_candidate_series = (
+        df["tactical_candidate"].fillna(False).astype(bool)
+        if "tactical_candidate" in df.columns
+        else pd.Series(False, index=df.index)
+    )
+    tactical_score_series = _numeric_col(df, "tactical_score", 0.0)
+    df["tactical_score"] = tactical_score_series
     # Build the ranking from factors with non-negative out-of-sample IC in the
     # settled recommendation history.  Main-wave and raw technical strength
     # are deliberately excluded: both were negatively related to subsequent
@@ -4171,6 +4338,16 @@ def build_recommendation_rows(df: pd.DataFrame, trade_date: str, top_n: int, min
     ) + risk_reward_score * float(
         EVIDENCE_RANKING_WEIGHTS["risk_reward_score"]
     )
+    tactical_mode = market_mode_series.isin(
+        {MODE_PANIC_REBOUND, MODE_SPECULATIVE}
+    )
+    ranking_score = evidence_ranking_score.where(
+        ~tactical_candidate_series,
+        evidence_ranking_score * 0.40
+        + tactical_score_series * 0.60
+        + 5.0,
+    ).clip(0.0, 100.0)
+    df["ranking_score"] = ranking_score
     # The recommendation table is also the ranked observation ledger. Keep
     # soft-risk rows visible for evaluation, but do not fill the top-N quota
     # with candidates that fail the validated entry, swing and evidence gates.
@@ -4186,9 +4363,15 @@ def build_recommendation_rows(df: pd.DataFrame, trade_date: str, top_n: int, min
         & (amount_percentile >= EVIDENCE_MIN_AMOUNT_PERCENTILE)
         & (evidence_ranking_score >= float(min_score))
     )
+    tactical_observation_candidate = (
+        tactical_candidate_series
+        & tactical_mode
+        & (tactical_score_series >= 65.0)
+        & (pd.to_numeric(df.get("amount"), errors="coerce").fillna(0.0) >= 80_000_000)
+    )
     eligible = df[
         (
-            ranked_observation_candidate
+            ranked_observation_candidate | tactical_observation_candidate
         )
         & (recommend_status_series != "BLOCK")
         & (signal_status_series != "BLOCK")
@@ -4196,19 +4379,20 @@ def build_recommendation_rows(df: pd.DataFrame, trade_date: str, top_n: int, min
         & (event_risk_series != "CRITICAL")
         & (stock_code_series.str.match(r"^(0|3|6)"))
     ].copy()
-    eligible["ranking_score"] = evidence_ranking_score.loc[eligible.index]
+    eligible["ranking_score"] = ranking_score.loc[eligible.index]
     eligible["stock_code"] = (
         eligible["stock_code"].astype(str).str.strip().str.zfill(6)
     )
     eligible = eligible.sort_values(
         [
             "ranking_score",
+            "tactical_score",
             "entry_score",
             "final_trade_score",
             "risk_reward_ratio",
             "stock_code",
         ],
-        ascending=[False, False, False, False, True],
+        ascending=[False, False, False, False, False, True],
         kind="mergesort",
     ).head(int(top_n))
 
@@ -4280,11 +4464,17 @@ def build_recommendation_rows(df: pd.DataFrame, trade_date: str, top_n: int, min
             candidate_recommend_status = "SUSPENDED"
             ordinary_buy_eligible = False
         reason = (
+            f"市场{row.get('market_mode_label') or row.get('market_mode') or '未分类'}; "
+            f"{row.get('tactical_intraday_role') or row.get('tactical_daily_role') or ''}; "
             f"综合{row.get('ai_score'):.1f}: "
             f"短线{row.get('short_term_score'):.1f}/长线{row.get('long_term_score'):.1f}; "
             f"{row.get('recommend_reason')}"
         )
         sources = "fast_eod"
+        if row.get("market_mode"):
+            sources += f"+mode:{row.get('market_mode')}"
+        if row.get("tactical_candidate"):
+            sources += "+tactical"
         if row.get("source_flag") and not pd.isna(row.get("source_flag")):
             sources += f"+hot:{row.get('source_flag')}"
         rows.append({
@@ -4351,6 +4541,16 @@ def build_recommendation_rows(df: pd.DataFrame, trade_date: str, top_n: int, min
             "trend_stop_price": _none_if_nan(row.get("trend_stop_price")),
             "trend_reduce_price": _none_if_nan(row.get("trend_reduce_price")),
             "model_version": row.get("model_version") or MODEL_VERSION,
+            "tactical_score": round(float(row.get("tactical_score") or 0), 1),
+            "market_mode": str(row.get("market_mode") or ""),
+            "market_mode_label": str(row.get("market_mode_label") or ""),
+            "tactical_role": str(
+                row.get("tactical_intraday_role")
+                or row.get("tactical_daily_role")
+                or ""
+            ),
+            "tactical_trigger": str(row.get("tactical_trigger") or "")[:500],
+            "intraday_event_json": str(row.get("intraday_event_json") or ""),
             "membership_snapshot_date": row.get("industry_snapshot_date"),
             "membership_snapshot_source": str(
                 row.get("industry_snapshot_source") or ""
@@ -5356,12 +5556,42 @@ def _prepare_batch_outputs(
     )
     sector = _complete_membership_proof_scope(sector, feature_codes)
     market_mood_score = compute_market_mood(kline_all)
+    if kline_all.empty:
+        tactical_context = None
+        tactical_codes: list[str] = []
+        intraday_evidence = pd.DataFrame()
+        index_stability = {
+            "status": "DATA_BLOCKED",
+            "reason": "daily market frame is empty",
+        }
+    else:
+        tactical_context = load_tactical_context(
+            engine,
+            trade_date=trade_date,
+            frame=kline_all,
+        )
+        tactical_daily = attach_daily_tactical_features(
+            kline_all,
+            context=tactical_context,
+        )
+        tactical_codes = tactical_candidate_codes(tactical_daily)
+        intraday_evidence = load_intraday_evidence(
+            engine,
+            trade_date=trade_date,
+            stock_codes=tactical_codes,
+        )
+        index_stability = load_index_stability(
+            engine,
+            trade_date=trade_date,
+        )
 
     logger.info(
-        "Loaded data: scope=%s kline=%s finance=%s flow=%s notices=%s hot=%s confidence=%s history=%s failures=%s sector=%s market_mood=%.1f",
+        "Loaded data: scope=%s kline=%s finance=%s flow=%s notices=%s hot=%s confidence=%s history=%s failures=%s sector=%s market_mood=%.1f mode=%s tactical=%s",
         "all" if not scoped_codes else len(scoped_codes),
         len(kline), len(finance), len(flow), len(notices), len(hot),
         len(confidence), len(rec_history), len(failures), len(sector), market_mood_score,
+        tactical_context["mode"] if tactical_context else "UNKNOWN",
+        len(tactical_codes),
     )
 
     _emit_progress(progress_callback, stage="compute_scores", percent=78, step="计算全市场评分...", trade_date=trade_date)
@@ -5379,6 +5609,9 @@ def _prepare_batch_outputs(
         confidence=confidence,
         rec_history=rec_history,
         failures=failures,
+        tactical_context=tactical_context,
+        intraday_evidence=intraday_evidence,
+        index_stability=index_stability,
     )
     scored["hot_trade_date"] = hot_date
     flow_proof_fields = (

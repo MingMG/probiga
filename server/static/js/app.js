@@ -11465,6 +11465,31 @@
         window._recLastDate = dateStr;
         var rawItems = data.data || [];
         var currentStrategy = window._recStrategy || 'all';
+        var recMarketModeLabels = {
+            TREND: ['趋势行情', '趋势回踩与主升浪', '#166534'],
+            ROTATION: ['结构轮动', '题材轮动与强势回踩', '#1d4ed8'],
+            PANIC_REBOUND: ['恐慌修复', '龙头反核与同题材低吸', '#b91c1c'],
+            SPECULATIVE: ['妖股短线', '封板确认、跟随票恐慌低吸', '#9a3412'],
+            DEFENSIVE: ['防守', '禁止新开仓，等待市场止跌', '#475569']
+        };
+        function recMarketMode(items) {
+            for (var i = 0; i < items.length; i++) {
+                var match = String((items[i] || {}).sources || '').match(/(?:^|\+)mode:([A-Z_]+)/);
+                if (match && recMarketModeLabels[match[1]]) return match[1];
+            }
+            return '';
+        }
+        function recMarketModeBanner(items) {
+            var key = recMarketMode(items);
+            if (!key) return '';
+            var info = recMarketModeLabels[key];
+            return '<section style="margin-bottom:14px;padding:12px 14px;border-radius:12px;background:linear-gradient(135deg,#fff,#f8fafc);border:1px solid #dbe4ee;border-left:5px solid ' + info[2] + ';">' +
+                '<div style="display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;">' +
+                '<div><div style="font-size:11px;color:#64748b;font-weight:800;">当前市场状态路由</div>' +
+                '<div style="font-size:18px;color:#0f172a;font-weight:900;margin-top:3px;">' + safeText(info[0]) + '</div></div>' +
+                '<div style="font-size:13px;color:' + info[2] + ';font-weight:800;text-align:right;">' + safeText(info[1]) + '<br>' +
+                '<span style="font-size:11px;color:#64748b;font-weight:600;">短线模式不会套用主升浪追涨逻辑</span></div></div></section>';
+        }
         function recStrategyLabel(v) {
             var m = {all: '全部', ultra_short: '超短', short_term: '短线', swing: '波段', main_wave: '主升浪'};
             return m[v] || v || '-';
@@ -11619,6 +11644,7 @@
         }
 
         h += renderRecommendationThemeOverview(data);
+        h += recMarketModeBanner(items);
 
         // 检查是否是新格式
         var hasNewFormat = items.length > 0 && (items[0].long_term_score != null || items[0].short_term_score != null);
