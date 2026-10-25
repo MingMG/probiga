@@ -310,13 +310,27 @@ def load_turnover_universe_authority(
             end_date=target.isoformat(),
             decision_known_at=cutoff,
         )
-        catalog = load_stock_catalog(connection, decision_known_at=cutoff)
-        codes = tuple(catalog.eligible_codes(target.isoformat()))
+        target_rows = connection.execute(
+            text(
+                "SELECT stock_code, quality_status, permission_status "
+                "FROM sm_stock_kline "
+                "WHERE trade_date=:target_date AND k_type=1 AND adjust_type=0"
+            ),
+            {"target_date": target.isoformat()},
+        ).mappings().all()
+        if len(target_rows) != verified.row_count:
+            raise _blocked("verified free daily target coverage differs")
+        codes = tuple(sorted(
+            str(row["stock_code"]).zfill(6)
+            for row in target_rows
+            if str(row.get("quality_status") or "").upper() != "SUSPENDED"
+            and str(row.get("permission_status") or "").upper() != "NO_TRADE"
+        ))
+        if len(codes) != len(set(codes)):
+            raise _blocked("verified free daily target codes contain duplicates")
         stock_set = expected_stock_set_contract(target.isoformat(), codes)
         if (
             verified.target_date != target.isoformat()
-            or verified.row_count != len(codes)
-            or verified.code_count != len(codes)
             or int(stock_set["stock_count"]) != len(codes)
             or not codes
         ):
@@ -611,6 +625,8 @@ _QMT_TARGET_SQL = """
            quality_status, permission_status
     FROM sm_stock_kline
     WHERE trade_date=:target_date AND k_type=1 AND adjust_type=0
+      AND COALESCE(quality_status, '') <> 'SUSPENDED'
+      AND COALESCE(permission_status, '') <> 'NO_TRADE'
     ORDER BY stock_code, id
 """
 
