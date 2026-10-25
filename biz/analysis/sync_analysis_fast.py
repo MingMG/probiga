@@ -408,13 +408,18 @@ STRATEGY_PROFILES: dict[str, dict[str, Any]] = {
 }
 
 EVIDENCE_RANKING_WEIGHTS = {
-    "entry_score": 0.45,
-    "final_trade_score": 0.30,
-    "long_term_score": 0.20,
+    "entry_score": 0.35,
+    "final_trade_score": 0.25,
+    "long_term_score": 0.15,
+    "risk_reward_score": 0.15,
+    "sector_rotation_score": 0.05,
     "event_score": 0.05,
 }
 EVIDENCE_MIN_ENTRY_SCORE = 45.0
 EVIDENCE_MIN_FINAL_TRADE_SCORE = 60.0
+EVIDENCE_MIN_RISK_REWARD = 1.0
+EVIDENCE_MIN_TURNOVER_PCT = 3.0
+EVIDENCE_MIN_AMOUNT_PERCENTILE = 60.0
 
 
 def clamp_score(value: float | int | None, low: float = 0.0, high: float = 100.0) -> float:
@@ -3258,6 +3263,7 @@ def build_strategy_trade_plan(row: dict[str, Any], strategy: str) -> dict[str, A
             "stop_loss_price": None,
             "take_profit_1": None,
             "take_profit_2": None,
+            "risk_reward_ratio": None,
             "position_weight": None,
             "max_holding_days": int(profile["max_holding_days"]),
             "entry_conditions_json": "[]",
@@ -3321,6 +3327,11 @@ def build_strategy_trade_plan(row: dict[str, Any], strategy: str) -> dict[str, A
         stop_loss = min(stop_loss, trend_stop) if trend_stop > 0 else stop_loss
     take_profit_1 = ref_price * (1.0 + float(profile["take_profit_1_pct"]) / 100.0)
     take_profit_2 = ref_price * (1.0 + float(profile["take_profit_2_pct"]) / 100.0)
+    risk_reward_ratio = (
+        (take_profit_1 - ref_price) / (ref_price - stop_loss)
+        if 0 < stop_loss < ref_price
+        else None
+    )
 
     blockers: list[str] = []
     if strategy == "main_wave" and main_wave_signal in {"SELL_ALERT", "REDUCE"}:
@@ -3413,6 +3424,11 @@ def build_strategy_trade_plan(row: dict[str, Any], strategy: str) -> dict[str, A
         "stop_loss_price": _round_price(stop_loss),
         "take_profit_1": _round_price(take_profit_1),
         "take_profit_2": _round_price(take_profit_2),
+        "risk_reward_ratio": (
+            round(float(risk_reward_ratio), 2)
+            if risk_reward_ratio is not None
+            else None
+        ),
         "position_weight": _position_weight(row, strategy, status),
         "max_holding_days": int(profile["max_holding_days"]),
         "entry_conditions_json": json.dumps(entry_conditions, ensure_ascii=False),
@@ -3649,7 +3665,7 @@ def add_strategy_signals(
     for key in [
         "primary_strategy", "strategy_profile", "signal_status", "signal_reason",
         "entry_price_low", "entry_price_high", "stop_loss_price",
-        "take_profit_1", "take_profit_2", "position_weight",
+        "take_profit_1", "take_profit_2", "risk_reward_ratio", "position_weight",
         "max_holding_days", "entry_conditions_json", "sell_rules_json",
         "invalidation_reason", "cooldown_days_left", "cooldown_until",
     ]:
@@ -4119,9 +4135,18 @@ def build_recommendation_rows(df: pd.DataFrame, trade_date: str, top_n: int, min
     # settled recommendation history.  Main-wave and raw technical strength
     # are deliberately excluded: both were negatively related to subsequent
     # 3/5/10-session returns and would promote crowded entries.
+    risk_reward_ratio = _numeric_col(df, "risk_reward_ratio", 0.0)
+    risk_reward_score = (risk_reward_ratio / 3.0 * 100.0).clip(0.0, 100.0)
+    amount_percentile = (
+        _numeric_col(df, "amount", 0.0).rank(pct=True, method="average") * 100.0
+    )
+    turnover_pct = _numeric_col(df, "turnover_ratio", 0.0)
     evidence_ranking_score = sum(
         _numeric_col(df, column, 0.0) * float(weight)
         for column, weight in EVIDENCE_RANKING_WEIGHTS.items()
+        if column != "risk_reward_score"
+    ) + risk_reward_score * float(
+        EVIDENCE_RANKING_WEIGHTS["risk_reward_score"]
     )
     # The recommendation table is also the ranked observation ledger. Keep
     # soft-risk rows visible for evaluation, but do not fill the top-N quota
@@ -4133,6 +4158,9 @@ def build_recommendation_rows(df: pd.DataFrame, trade_date: str, top_n: int, min
             _numeric_col(df, "final_trade_score", 0.0)
             >= EVIDENCE_MIN_FINAL_TRADE_SCORE
         )
+        & (risk_reward_ratio >= EVIDENCE_MIN_RISK_REWARD)
+        & (turnover_pct >= EVIDENCE_MIN_TURNOVER_PCT)
+        & (amount_percentile >= EVIDENCE_MIN_AMOUNT_PERCENTILE)
         & (evidence_ranking_score >= float(min_score))
     )
     eligible = df[
@@ -4154,9 +4182,10 @@ def build_recommendation_rows(df: pd.DataFrame, trade_date: str, top_n: int, min
             "ranking_score",
             "entry_score",
             "final_trade_score",
+            "risk_reward_ratio",
             "stock_code",
         ],
-        ascending=[False, False, False, True],
+        ascending=[False, False, False, False, True],
         kind="mergesort",
     ).head(int(top_n))
 
@@ -4271,6 +4300,7 @@ def build_recommendation_rows(df: pd.DataFrame, trade_date: str, top_n: int, min
             "stop_loss_price": _none_if_nan(row.get("stop_loss_price")),
             "take_profit_1": _none_if_nan(row.get("take_profit_1")),
             "take_profit_2": _none_if_nan(row.get("take_profit_2")),
+            "risk_reward_ratio": _none_if_nan(row.get("risk_reward_ratio")),
             "position_weight": _none_if_nan(row.get("position_weight")),
             "max_holding_days": int(row.get("max_holding_days") or 0),
             "entry_conditions_json": row.get("entry_conditions_json") or "[]",

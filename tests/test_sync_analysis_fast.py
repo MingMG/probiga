@@ -900,7 +900,7 @@ class SyncAnalysisFastTest(unittest.TestCase):
                     is_executable_recommendation({**base, field: blocked})
                 )
 
-    def test_preliminary_top80_uses_stable_stock_code_tie_breaker(self):
+    def test_preliminary_top_n_uses_stable_stock_code_tie_breaker(self):
         rows = []
         for number in range(81, 0, -1):
             rows.append({
@@ -917,18 +917,21 @@ class SyncAnalysisFastTest(unittest.TestCase):
                 "ai_score": 70.0,
                 "short_term_score": 70.0,
                 "long_term_score": 70.0,
+                "risk_reward_ratio": 2.0,
+                "turnover_ratio": 5.0,
+                "amount": float(82 - number) * 1_000_000,
             })
 
         selected = build_recommendation_rows(
             pd.DataFrame(rows),
             "2026-08-27",
-            top_n=80,
+            top_n=10,
             min_score=62.0,
         )
 
         self.assertEqual(
             [row["stock_code"] for row in selected],
-            [f"{number:06d}" for number in range(1, 81)],
+            [f"{number:06d}" for number in range(1, 11)],
         )
 
     def test_flow_features_keep_only_exact_target_rows_per_stock(self):
@@ -1518,6 +1521,9 @@ class SyncAnalysisFastTest(unittest.TestCase):
             "final_trade_score": 77,
             "entry_score": 68,
             "capital_score": 70,
+            "risk_reward_ratio": 2.0,
+            "turnover_ratio": 5.0,
+            "amount": 100_000_000,
             "main_wave_score": 65,
             "main_wave_signal": "WATCH",
             "signal_status": "WATCH",
@@ -1546,6 +1552,9 @@ class SyncAnalysisFastTest(unittest.TestCase):
             "final_trade_score": 70,
             "entry_score": 30,
             "capital_score": 90,
+            "risk_reward_ratio": 2.0,
+            "turnover_ratio": 5.0,
+            "amount": 100_000_000,
             "main_wave_score": 95,
             "main_wave_signal": "WATCH",
             "signal_status": "WATCH",
@@ -1560,6 +1569,9 @@ class SyncAnalysisFastTest(unittest.TestCase):
             "short_term_score": 72,
             "final_trade_score": 66,
             "entry_score": 64,
+            "risk_reward_ratio": 2.0,
+            "turnover_ratio": 5.0,
+            "amount": 100_000_000,
             "main_wave_score": 65,
         }
 
@@ -1587,6 +1599,9 @@ class SyncAnalysisFastTest(unittest.TestCase):
             "final_trade_score": 66,
             "entry_score": 64,
             "capital_score": 70,
+            "risk_reward_ratio": 2.0,
+            "turnover_ratio": 5.0,
+            "amount": 100_000_000,
             "main_wave_score": 60,
             "main_wave_signal": "WATCH",
             "signal_status": "WATCH",
@@ -1612,6 +1627,53 @@ class SyncAnalysisFastTest(unittest.TestCase):
             ["600001"],
         )
 
+    def test_recommendation_requires_activity_and_risk_reward(self):
+        base = {
+            "stock_code": "600001",
+            "short_name": "candidate",
+            "ai_score": 80,
+            "long_term_score": 70,
+            "short_term_score": 75,
+            "event_score": 60,
+            "quality_score": 80,
+            "final_trade_score": 70,
+            "entry_score": 65,
+            "capital_score": 70,
+            "risk_reward_ratio": 2.0,
+            "turnover_ratio": 5.0,
+            "amount": 200_000_000,
+            "main_wave_score": 70,
+            "main_wave_signal": "WATCH",
+            "signal_status": "WATCH",
+            "recommend_status": "SUSPENDED",
+            "recommend_reason": "candidate",
+            "event_risk_level": "LOW",
+        }
+        low_risk_reward = {
+            **base,
+            "stock_code": "600002",
+            "risk_reward_ratio": 0.9,
+        }
+        low_activity = {
+            **base,
+            "stock_code": "600003",
+            "turnover_ratio": 2.9,
+            "amount": 50_000_000,
+        }
+
+        rows = build_recommendation_rows(
+            pd.DataFrame([base, low_risk_reward, low_activity]),
+            "2026-08-11",
+            top_n=80,
+            min_score=62,
+        )
+
+        self.assertEqual(
+            [item["stock_code"] for item in rows],
+            ["600001"],
+        )
+        self.assertEqual(rows[0]["risk_reward_ratio"], 2.0)
+
     def test_missing_upper_history_keeps_ranked_pick_research_only(self):
         row = {
             "stock_code": "600001",
@@ -1623,6 +1685,9 @@ class SyncAnalysisFastTest(unittest.TestCase):
             "final_trade_score": 89,
             "entry_score": 85,
             "capital_score": 84,
+            "risk_reward_ratio": 2.0,
+            "turnover_ratio": 5.0,
+            "amount": 100_000_000,
             "main_wave_score": 80,
             "main_wave_signal": "BUY_READY",
             "signal_status": "BUY_READY",
@@ -1656,6 +1721,9 @@ class SyncAnalysisFastTest(unittest.TestCase):
             "final_trade_score": 91,
             "entry_score": 86,
             "capital_score": 84,
+            "risk_reward_ratio": 2.0,
+            "turnover_ratio": 5.0,
+            "amount": 100_000_000,
             "main_wave_score": 82,
             "main_wave_signal": "SELL_ALERT",
             "signal_status": "WATCH",
