@@ -90,7 +90,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--datadir-root",
         action="append",
-        default=list(DEFAULT_DATADIRS),
+        default=None,
         help="cache root to harvest; repeat to name several, tried in order",
     )
     parser.add_argument("--apply", action="store_true", help="write to the database")
@@ -115,7 +115,10 @@ def main(argv: list[str] | None = None) -> int:
     end = dt.date.fromisoformat(args.end)
     if end < start:
         parser.error("--end must not precede --start")
-    datadir_roots = [Path(item) for item in args.datadir_root]
+    datadir_roots = [
+        Path(item)
+        for item in (args.datadir_root or DEFAULT_DATADIRS)
+    ]
     missing_roots = [str(root) for root in datadir_roots if not root.is_dir()]
     if missing_roots:
         parser.error(f"datadir root does not exist: {', '.join(missing_roots)}")

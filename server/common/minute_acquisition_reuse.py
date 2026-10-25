@@ -34,25 +34,42 @@ FIELDS = {
     "flow": ("main_net_inflow", "max_net_inflow", "lg_net_inflow", "mid_net_inflow", "sm_net_inflow"),
 }
 SOURCES = {
-    "stock": {"east_push2delay": 240, "gj_big_qmt_inner": 241},
+    "stock": {
+        "east_push2delay": 240,
+        "gj_big_qmt_inner": 241,
+        "sina_public_1m": 238,
+    },
     "flow": {"east_push2delay": 240, "gj_qmt_transactioncount1m": 241},
 }
 
 
 def _grid_hash(count: int) -> str:
-    start = datetime(2000, 1, 1, 9, 30 if count == 241 else 31)
-    end = datetime(2000, 1, 1, 15, 0)
-    values = []
-    while start <= end:
-        if start.hour < 12 or start.hour >= 13 and (start.hour != 13 or start.minute > 0):
-            if not (start.hour == 11 and start.minute > 30):
-                values.append(start.strftime("%H:%M:%S"))
-        start += timedelta(minutes=1)
+    """Return the exact time-grid hash for every accepted source clock.
+
+    The public Sina feed omits the two continuous-auction placeholders at
+    14:58 and 14:59 and emits the closing-auction result at 15:00.  That is a
+    stable 238-bar source contract, not an incomplete 240-bar QMT grid.
+    """
+    morning_start = datetime(2000, 1, 1, 9, 30 if count == 241 else 31)
+    morning = [
+        (morning_start + timedelta(minutes=offset)).strftime("%H:%M:%S")
+        for offset in range(121 if count == 241 else 120)
+    ]
+    afternoon_end = 14 if count == 238 else 15
+    afternoon = [
+        (datetime(2000, 1, 1, 13, 1) + timedelta(minutes=offset)).strftime(
+            "%H:%M:%S"
+        )
+        for offset in range(117 if count == 238 else 120)
+    ]
+    values = morning + afternoon
+    if count == 238:
+        values.append("15:00:00")
     assert len(values) == count
     return hashlib.sha256("".join(values).encode()).hexdigest()
 
 
-GRID_HASHES = {count: _grid_hash(count) for count in (240, 241)}
+GRID_HASHES = {count: _grid_hash(count) for count in (238, 240, 241)}
 
 
 def has_minute_code_coverage(connection, *, table: str, trade_date: str,
@@ -68,7 +85,7 @@ def has_minute_code_coverage(connection, *, table: str, trade_date: str,
     target = date.fromisoformat(trade_date)
     codes = sorted(set(expected_codes))
     counts = set(allowed_counts)
-    if not codes or not counts or not counts <= {240, 241}:
+    if not codes or not counts or not counts <= set(GRID_HASHES):
         return False
     statement = text(f"""
         SELECT /*+ MAX_EXECUTION_TIME(30000) */ stock_code,
