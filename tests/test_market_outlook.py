@@ -27,7 +27,7 @@ def _database(tmp_path):
         connection.execute(text(
             "CREATE TABLE st_recommended_stocks ("
             "stock_code TEXT, short_name TEXT, pick_date DATE, "
-            "publication_status TEXT, sources TEXT, "
+            "publication_status TEXT, publisher_run_uid TEXT, sources TEXT, "
             "short_term_score REAL, capital_score REAL, technical REAL, "
             "signal_status TEXT, signal_reason TEXT, "
             "entry_price_low REAL, entry_price_high REAL, "
@@ -115,7 +115,7 @@ def _database(tmp_path):
         })
         connection.execute(text(
             "INSERT INTO st_recommended_stocks VALUES "
-            "(:code,:name,'2026-10-23','ACTIVE',"
+            "(:code,:name,'2026-10-23','ACTIVE',:run_uid,"
             "'fast_eod+mode:PANIC_REBOUND+tactical',80.9,90.1,100,"
             "'WATCH',:reason,14.37,14.80,14.07,15.75,2.26,"
             ":conditions,'跌破止损或龙头炸板')"
@@ -123,6 +123,7 @@ def _database(tmp_path):
             {
                 "code": "603278",
                 "name": "大业股份",
+                "run_uid": "a" * 32,
                 "reason": "PANIC_REBOUND 龙头封板：13:10首次封板",
                 "conditions": event(
                     "603278", "龙头封板", -8.82, 20.63,
@@ -132,6 +133,7 @@ def _database(tmp_path):
             {
                 "code": "002724",
                 "name": "海洋王",
+                "run_uid": "a" * 32,
                 "reason": "PANIC_REBOUND 尾盘跟随封板：14:26首次封板",
                 "conditions": event(
                     "002724", "尾盘跟随封板", -9.99, 22.20,
@@ -169,7 +171,8 @@ def test_market_outlook_blocks_without_active_pool(tmp_path):
     with engine.begin() as connection:
         connection.execute(text(
             "CREATE TABLE st_recommended_stocks "
-            "(stock_code TEXT, pick_date DATE, publication_status TEXT)"
+            "(stock_code TEXT, pick_date DATE, publication_status TEXT, "
+            "publisher_run_uid TEXT)"
         ))
 
     payload = build_market_outlook(engine)
