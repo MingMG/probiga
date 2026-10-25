@@ -154,6 +154,7 @@ def test_tactical_reversal_enters_observation_pool_without_trend_gates():
             "tactical_candidate": True,
             "tactical_score": 60.0,
             "intraday_tactical_score": 100.0,
+            "minute_rows": 238,
             "tactical_intraday_role": role,
             "tactical_trigger": "回踩VWAP不破后低吸",
             "tactical_entry_low": entry - 0.1,
@@ -193,6 +194,7 @@ def test_tactical_reversal_enters_observation_pool_without_trend_gates():
         "short_name": "日线候选",
         "tactical_score": 100.0,
         "intraday_tactical_score": 50.0,
+        "minute_rows": 0,
         "technical_score": 120,
     })
     frame = pd.concat([frame, pd.DataFrame([filler])], ignore_index=True)
