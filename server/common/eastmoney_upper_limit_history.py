@@ -81,6 +81,22 @@ def _limit_ratio(stock_code: str, short_name: str) -> Decimal:
     return Decimal("0.10")
 
 
+def _pool_codes_from_rows(pool: Sequence[Any], target: date) -> list[str]:
+    rows_by_code: dict[str, str] = {}
+    for row in pool:
+        code = str((row or {}).get("c") or "").strip().zfill(6)
+        if len(code) != 6 or not code.isdigit():
+            raise _blocked(f"Eastmoney limit pool code is invalid for {target}")
+        canonical_row = _canonical_json(row)
+        existing = rows_by_code.get(code)
+        if existing is not None and existing != canonical_row:
+            raise _blocked(
+                f"Eastmoney limit pool has conflicting duplicates for {target}"
+            )
+        rows_by_code[code] = canonical_row
+    return sorted(rows_by_code)
+
+
 def _fetch_pool(target: date, timeout_seconds: float = 20.0) -> tuple[list[str], str]:
     session = requests.Session()
     session.trust_env = False
@@ -109,15 +125,7 @@ def _fetch_pool(target: date, timeout_seconds: float = 20.0) -> tuple[list[str],
         pool = []
     if not isinstance(pool, list):
         raise _blocked(f"Eastmoney limit pool payload differs for {target}")
-    codes = []
-    for row in pool:
-        code = str((row or {}).get("c") or "").strip().zfill(6)
-        if len(code) != 6 or not code.isdigit():
-            raise _blocked(f"Eastmoney limit pool code is invalid for {target}")
-        codes.append(code)
-    if len(codes) != len(set(codes)):
-        raise _blocked(f"Eastmoney limit pool contains duplicates for {target}")
-    return sorted(codes), response.text
+    return _pool_codes_from_rows(pool, target), response.text
 
 
 def _generate_eastmoney_upper_limit_history(
