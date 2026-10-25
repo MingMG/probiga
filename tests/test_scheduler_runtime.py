@@ -3543,6 +3543,7 @@ class SchedulerRuntimeTest(unittest.TestCase):
         proc = MagicMock()
         proc.returncode = 0
         proc.communicate.return_value = (publisher_output, "")
+        engine = MagicMock()
         with patch(
             "server.api.scheduler_runtime.load_qmt_daily_market_truth",
             side_effect=AssertionError("publisher owns reuse verification"),
@@ -3592,7 +3593,7 @@ class SchedulerRuntimeTest(unittest.TestCase):
             "server.api.scheduler_runtime.update_scheduler_task",
         ):
             scheduler_runtime._run_task_impl(
-                row, Path("E:/fake"), MagicMock(), history_run_uid="2" * 32,
+                row, Path("E:/fake"), engine, history_run_uid="2" * 32,
             )
         verify_daily.assert_not_called()
         self.assertFalse(start_attempt.call_args.kwargs["reuse_completed_stage"])
@@ -3602,6 +3603,7 @@ class SchedulerRuntimeTest(unittest.TestCase):
         self.assertEqual(finish_history.call_args.kwargs["status"], "success")
         self.assertIn("current-mature-attestation", finish_history.call_args.kwargs["output"])
         self.assertNotIn("old-early-attestation-checkpoint", finish_history.call_args.kwargs["output"])
+        engine.dispose.assert_called_once_with()
 
     def test_run_task_marks_missing_script_failed(self):
         engine = MagicMock()

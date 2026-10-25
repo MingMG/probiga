@@ -9467,6 +9467,19 @@ def _run_task_impl(
             if _running_procs.get(task_id) is proc:
                 _running_procs.pop(task_id, None)
 
+        # The child can spend several minutes computing while pooled parent
+        # connections sit idle through the local database relay.  Re-open the
+        # parent pool before postvalidation so a relay-closed socket cannot
+        # stall terminal publication until its lease expires.
+        try:
+            engine.dispose()
+        except Exception as exc:
+            logger.warning(
+                "Scheduler post-child database pool reset failed for %s: %s",
+                task_id,
+                exc,
+            )
+
         duration = int((datetime.now() - start_t).total_seconds())
         stopped_by_user = _task_stop_requested(int(task_id))
         timed_out = _task_timeout_requested(int(task_id))
