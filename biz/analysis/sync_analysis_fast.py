@@ -108,7 +108,11 @@ from .tactical_market import (
 logger = logging.getLogger(__name__)
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 
-_KLINE_FEATURE_DEFAULT_QUERY_TIMEOUT_SECONDS = 45
+# A five-session chunk can legitimately exceed 45 seconds on a cold InnoDB
+# buffer pool while still making bounded progress.  The whole job retains its
+# scheduler deadline; aborting one healthy chunk at 45 seconds only forces a
+# full restart and leaves no durable progress.
+_KLINE_FEATURE_DEFAULT_QUERY_TIMEOUT_SECONDS = 180
 _KLINE_FEATURE_DEFAULT_CHUNK_DAYS = 5
 _KLINE_ROLLING_STATE_SCHEMA = "probiga.kline-rolling-feature-state.v2"
 _KLINE_ROLLING_REBUILD_CODE_LIMIT = 500
