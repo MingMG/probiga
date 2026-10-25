@@ -1231,7 +1231,7 @@ def test_atomic_null_only_promotion_and_verified_proof_round_trip() -> None:
     assert proof["authority_proof_identity"] == _authority().truth_run_id
 
 
-def test_mysql_turnover_promotion_is_one_null_only_update_join() -> None:
+def test_mysql_turnover_promotion_is_one_exact_update_join() -> None:
     run = _capture(_engine())
 
     class Connection:
@@ -1252,7 +1252,7 @@ def test_mysql_turnover_promotion_is_one_null_only_update_join() -> None:
     normalized = " ".join(statement.upper().split())
     assert normalized.startswith("UPDATE SM_STOCK_KLINE AS TARGET INNER JOIN")
     assert "ST_MARKET_FIELD_CAPTURE_ROW AS CAPTURED" in normalized
-    assert "TARGET.TURNOVER_RATIO IS NULL" in normalized
+    assert "TARGET.TURNOVER_RATIO=CAPTURED.FIELD_VALUE_DECIMAL" in normalized
     assert "CAPTURED.FIELD_VALUE_DECIMAL" in normalized
     assert params == {
         "run_id": run.run_id,
@@ -1674,7 +1674,7 @@ def test_qmt_drift_before_publish_rolls_back_run_rows_and_promotion() -> None:
         )).scalar() == 0
 
 
-def test_nonnull_race_is_blocked_without_overwrite_or_stage_commit() -> None:
+def test_nonnull_legacy_turnover_is_replaced_by_verified_snapshot() -> None:
     engine = _engine()
     run = _capture(engine)
     with engine.begin() as connection:
@@ -1682,21 +1682,20 @@ def test_nonnull_race_is_blocked_without_overwrite_or_stage_commit() -> None:
             "UPDATE sm_stock_kline SET turnover_ratio=9.99 WHERE stock_code='000001'"
         ))
 
-    with pytest.raises(TurnoverSnapshotBlocked, match="already populated"):
-        publish_turnover_snapshot(
-            engine,
-            run,
-            min_expected_count=2,
-            published_at=datetime(2026, 8, 27, 18, 45),
-        )
+    publish_turnover_snapshot(
+        engine,
+        run,
+        min_expected_count=2,
+        published_at=datetime(2026, 8, 27, 18, 45),
+    )
 
     with engine.connect() as connection:
         assert float(connection.execute(text(
             "SELECT turnover_ratio FROM sm_stock_kline WHERE stock_code='000001'"
-        )).scalar()) == 9.99
+        )).scalar()) == 0.45
         assert connection.execute(text(
             f"SELECT COUNT(*) FROM {TURNOVER_SNAPSHOT_RUN_TABLE}"
-        )).scalar() == 0
+        )).scalar() == 1
 
 
 def test_persisted_raw_payload_tamper_is_rejected() -> None:

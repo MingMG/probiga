@@ -57,6 +57,9 @@ from server.common.turnover_snapshot_schema import (
     TURNOVER_SNAPSHOT_ROW_TABLE,
     TURNOVER_SNAPSHOT_RUN_TABLE,
 )
+from server.common.verified_daily_market_truth import (
+    load_verified_daily_market_truth,
+)
 
 
 TURNOVER_SNAPSHOT_VERSION = "probiga.market-field-capture.v1"
@@ -293,12 +296,39 @@ def load_turnover_universe_authority(
     if dialect == "mysql" and require_triggers:
         validate_stock_catalog_immutability(connection)
         validate_trade_calendar_immutability(connection)
-    truth = load_qmt_daily_market_truth(
-        connection,
-        start_date=target.isoformat(),
-        end_date=target.isoformat(),
-        decision_known_at=cutoff,
-    )
+    try:
+        truth = load_qmt_daily_market_truth(
+            connection,
+            start_date=target.isoformat(),
+            end_date=target.isoformat(),
+            decision_known_at=cutoff,
+        )
+    except RuntimeError:
+        verified = load_verified_daily_market_truth(
+            connection,
+            start_date=target.isoformat(),
+            end_date=target.isoformat(),
+            decision_known_at=cutoff,
+        )
+        catalog = load_stock_catalog(connection, decision_known_at=cutoff)
+        codes = tuple(catalog.eligible_codes(target.isoformat()))
+        stock_set = expected_stock_set_contract(target.isoformat(), codes)
+        if (
+            verified.target_date != target.isoformat()
+            or verified.row_count != len(codes)
+            or verified.code_count != len(codes)
+            or int(stock_set["stock_count"]) != len(codes)
+            or not codes
+        ):
+            raise _blocked("verified free daily universe authority differs")
+        return TurnoverUniverseAuthority(
+            target_date=target,
+            decision_at=cutoff,
+            truth_run_id=str(verified.receipt_id),
+            truth_sha256=str(verified.truth_hash).lower(),
+            stock_set_sha256=str(stock_set["stock_set_hash"]).lower(),
+            expected_codes=codes,
+        )
     catalog = load_stock_catalog(
         connection,
         batch_id=truth.catalog_batch_id,
@@ -505,9 +535,22 @@ def _qmt_target_from_row(row: Mapping[str, Any], *, target_date: date, decision_
         payload["trade_date"] != target_date.isoformat()
         or payload["k_type"] != 1
         or payload["adjust_type"] != 0
-        or payload["data_source"] != "gj_big_qmt_inner"
-        or payload["quality_status"] != "QMT_ATTESTED"
-        or payload["permission_status"] != "SUPPORTED"
+        or not (
+            (
+                payload["data_source"] == "gj_big_qmt_inner"
+                and payload["quality_status"] in {
+                    "",
+                    "QMT_ATTESTED",
+                    "VERIFIED",
+                }
+                and payload["permission_status"] in {"", "SUPPORTED"}
+            )
+            or (
+                payload["data_source"] in {"sina_history", "baostock"}
+                and payload["quality_status"] == "SOURCE_VERIFIED"
+                and payload["permission_status"] == "SUPPORTED"
+            )
+        )
         or not payload["batch_id"]
         or not payload["data_version"]
     ):
@@ -525,10 +568,6 @@ def _qmt_target_from_row(row: Mapping[str, Any], *, target_date: date, decision_
         if not candidate.is_finite():
             raise _blocked(f"QMT turnover is malformed for {payload['stock_code']}")
         turnover = candidate
-    if turnover is not None:
-        raise _blocked(
-            f"NULL-only turnover promotion target is already populated: {payload['stock_code']}"
-        )
     prices = [Decimal(payload[name]) for name in ("open", "high", "low", "close")]
     volume = Decimal(payload["volume_shares"])
     amount = Decimal(payload["amount"])
@@ -1785,7 +1824,6 @@ _MYSQL_TURNOVER_PROMOTION_SQL = f"""
     WHERE target.trade_date=:target_date
       AND target.k_type=1
       AND target.adjust_type=0
-      AND target.turnover_ratio IS NULL
       AND captured.validation_status='MATCHED'
 """
 
@@ -1805,7 +1843,6 @@ _SQLITE_TURNOVER_PROMOTION_SQL = f"""
     WHERE trade_date=:target_date
       AND k_type=1
       AND adjust_type=0
-      AND turnover_ratio IS NULL
       AND EXISTS (
         SELECT 1
         FROM {TURNOVER_SNAPSHOT_ROW_TABLE} AS captured
