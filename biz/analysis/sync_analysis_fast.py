@@ -4319,7 +4319,11 @@ def build_recommendation_rows(df: pd.DataFrame, trade_date: str, top_n: int, min
         if "tactical_candidate" in df.columns
         else pd.Series(False, index=df.index)
     )
-    tactical_score_series = _numeric_col(df, "tactical_score", 0.0)
+    tactical_score_series = (
+        _numeric_col(df, "intraday_tactical_score", 0.0)
+        if "intraday_tactical_score" in df.columns
+        else _numeric_col(df, "tactical_score", 0.0)
+    )
     df["tactical_score"] = tactical_score_series
     # Build the ranking from factors with non-negative out-of-sample IC in the
     # settled recommendation history.  Main-wave and raw technical strength
