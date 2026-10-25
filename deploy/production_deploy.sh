@@ -839,7 +839,26 @@ try:
             require_analysis_diagnostics(directory_fd, name)
             continue
         if name == "upper-limit-history":
-            require_upper_limit_history(directory_fd, name)
+            if not (stat.S_ISDIR(observed.st_mode)
+                    and observed.st_uid == expected_uid and observed.st_gid == expected_gid
+                    and stat.S_IMODE(observed.st_mode) == 0o700):
+                raise SystemExit("unsafe upper-limit history root")
+            upper_fd = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=directory_fd,
+            )
+            try:
+                for child in os.listdir(upper_fd):
+                    item = os.lstat(child, dir_fd=upper_fd)
+                    if not (stat.S_ISREG(item.st_mode)
+                            and item.st_uid == expected_uid
+                            and item.st_gid == expected_gid
+                            and item.st_nlink == 1
+                            and stat.S_IMODE(item.st_mode) == 0o600):
+                        raise SystemExit("unsafe upper-limit history file")
+            finally:
+                os.close(upper_fd)
             continue
         observed_mode = stat.S_IMODE(observed.st_mode)
         allowed_modes = {0o600, 0o644} if name in legacy_names else {0o600}
