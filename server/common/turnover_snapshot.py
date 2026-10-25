@@ -58,6 +58,7 @@ from server.common.turnover_snapshot_schema import (
     TURNOVER_SNAPSHOT_RUN_TABLE,
 )
 from server.common.verified_daily_market_truth import (
+    VERIFIED_FREE_DAILY_ROW_SOURCES,
     load_verified_daily_market_truth,
 )
 
@@ -560,7 +561,7 @@ def _qmt_target_from_row(row: Mapping[str, Any], *, target_date: date, decision_
                 and payload["permission_status"] in {"", "SUPPORTED"}
             )
             or (
-                payload["data_source"] in {"sina_history", "baostock"}
+                payload["data_source"] in VERIFIED_FREE_DAILY_ROW_SOURCES
                 and payload["quality_status"] == "SOURCE_VERIFIED"
                 and payload["permission_status"] == "SUPPORTED"
             )

@@ -47,6 +47,9 @@ _ROW_SOURCES_BY_PROVIDER = {
     "baostock_tencent": frozenset({"baostock", "tencent_qt"}),
     "gj_big_qmt_inner": frozenset({"gj_big_qmt_inner"}),
 }
+VERIFIED_FREE_DAILY_ROW_SOURCES = frozenset().union(
+    *(_ROW_SOURCES_BY_PROVIDER[source] for source in FREE_DAILY_PROVIDERS)
+)
 _CODE_CHUNK_SIZE = 400
 
 

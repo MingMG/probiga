@@ -1186,6 +1186,40 @@ def test_turnover_universe_must_match_catalog_bound_daily_truth() -> None:
             min_expected_count=2,
         )
 
+
+def test_verified_tencent_daily_row_can_be_frozen_as_turnover_target() -> None:
+    engine = _engine()
+    with engine.begin() as connection:
+        connection.execute(text("""
+            UPDATE sm_stock_kline
+            SET stock_code='920000',
+                data_source='tencent_qt',
+                quality_status='SOURCE_VERIFIED',
+                permission_status='SUPPORTED'
+            WHERE stock_code='600000'
+        """))
+    codes = ("000001", "920000")
+    authority = replace(
+        _authority(),
+        expected_codes=codes,
+        stock_set_sha256=expected_stock_set_contract(
+            TARGET_DATE, codes
+        )["stock_set_hash"],
+    )
+
+    with engine.connect() as connection:
+        targets = freeze_qmt_turnover_targets(
+            connection,
+            target_date=TARGET_DATE,
+            decision_at=DECISION_AT,
+            authority=authority,
+            min_expected_count=2,
+        )
+
+    assert [target.stock_code for target in targets] == list(codes)
+    assert targets[1].data_source == "tencent_qt"
+
+
 def test_atomic_null_only_promotion_and_verified_proof_round_trip() -> None:
     engine = _engine()
     run = _capture(engine)
