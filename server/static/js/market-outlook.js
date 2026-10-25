@@ -109,6 +109,37 @@
         return h;
     }
 
+    function renderSummary(data) {
+        if (!data || data.status !== 'READY') {
+            return '<section style="margin-bottom:14px;background:#fff7ed;border:1px solid #fed7aa;border-radius:12px;padding:13px 15px;color:#9a3412;">' +
+                '<strong>🔭 明日推演数据待补</strong><span style="font-size:12px;margin-left:8px;">' +
+                esc((data && data.reason) || '尚未生成可用的下一交易日推演') +
+                '</span></section>';
+        }
+        var current = data.current_market || {};
+        var stocks = (data.stocks || []).slice(0, 2);
+        return '<section style="margin-bottom:14px;background:linear-gradient(135deg,#0f172a,#1e3a5f);border-radius:14px;padding:15px 18px;color:#fff;">' +
+            '<div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap;">' +
+            '<div><div style="font-size:11px;color:#93c5fd;font-weight:800;">🔭 下一交易日推演 · ' + esc(data.next_trade_date || '—') + '</div>' +
+            '<div style="font-size:21px;font-weight:900;margin-top:3px;">' + esc(data.market_mode_label) + ' · ' + esc(data.tactical_style) + '</div></div>' +
+            '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;"><span style="font-size:12px;color:#dbeafe;">宽度 ' + number(current.breadth_pct, 1) + '% · 涨停 ' + number(current.limit_up_count, 0) + ' 家</span>' +
+            '<button type="button" onclick="switchTab(\'market-outlook\')" style="padding:7px 12px;border:0;border-radius:8px;background:#fff;color:#0f172a;font-weight:800;cursor:pointer;">打开完整推演</button></div></div>' +
+            '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px;margin-top:12px;">' +
+            (data.scenarios || []).map(function (scenario) {
+                return '<div style="background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.14);border-radius:8px;padding:9px 10px;">' +
+                    '<div style="font-size:11px;color:#bfdbfe;">' + esc(scenario.label) + '</div>' +
+                    '<strong style="font-size:19px;color:#fff;">' + esc(scenario.probability_pct) + '%</strong></div>';
+            }).join('') + '</div>' +
+            (stocks.length ? '<div style="margin-top:10px;font-size:12px;color:#dbeafe;line-height:1.65;"><strong style="color:#fff;">核心票：</strong>' +
+                stocks.map(function (stock) {
+                    return esc(stock.short_name) + ' ' + esc(stock.stock_code) +
+                        '（' + esc(stock.role || '观察') + '，失效 ' +
+                        number(stock.stop_loss_price, 2) + '，涨停参考 ' +
+                        number(stock.next_limit_up_price, 2) + '）';
+                }).join(' · ') + '</div>' : '') +
+            '</section>';
+    }
+
     function load(tradeDate, container) {
         if (!container) return;
         container.innerHTML = '<div class="loading">正在生成下一交易日推演…</div>';
@@ -124,5 +155,5 @@
             .finally(function () { clearTimeout(timer); });
     }
 
-    window.MarketOutlook = {load: load, render: render};
+    window.MarketOutlook = {load: load, render: render, summary: renderSummary};
 }());
