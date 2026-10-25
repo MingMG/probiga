@@ -165,7 +165,9 @@ def test_tactical_reversal_enters_observation_pool_without_trend_gates():
             "recommend_reason": "等待次日确认",
             "signal_status": "WATCH",
             "signal_reason": "等待盘中触发",
-            "main_wave_signal": "NOT_APPLICABLE_TACTICAL",
+            "main_wave_signal": (
+                "REDUCE" if code == "002724" else "NOT_APPLICABLE_TACTICAL"
+            ),
             "event_risk_level": "LOW",
             "ai_score": 70,
             "short_term_score": 80,

@@ -4388,7 +4388,10 @@ def build_recommendation_rows(df: pd.DataFrame, trade_date: str, top_n: int, min
         )
         & (recommend_status_series != "BLOCK")
         & (signal_status_series != "BLOCK")
-        & (~main_wave_signal_series.isin(["REDUCE", "SELL_ALERT"]))
+        & (
+            ~main_wave_signal_series.isin(["REDUCE", "SELL_ALERT"])
+            | tactical_candidate_series
+        )
         & (event_risk_series != "CRITICAL")
         & (stock_code_series.str.match(r"^(0|3|6)"))
     ].copy()
