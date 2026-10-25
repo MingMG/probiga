@@ -7450,6 +7450,7 @@
     var LAYOUT_OLD = [
         {group:'交易决策', items:[
             {id:'quant-workbench',icon:'🧪',label:'量化工作台'},
+            {id:'recommended',icon:'💎',label:'AI推荐买入'},
             {id:'trading',icon:'◎',label:'交易决策总览'},
             {id:'trading-day',icon:'◷',label:'今日看盘'}
             ,{id:'daily-pool',icon:'📋',label:'今日票池'}
@@ -7519,6 +7520,7 @@
             {id:'portfolio',icon:'📈',label:'自选股'},
             {id:'fused',icon:'📊',label:'热股排行'},
             {id:'trading-v3-candidates',modulePage:'v3',tradingView:'candidates',icon:'🎯',label:'策略选股结果'},
+            {id:'recommended',icon:'💎',label:'AI推荐买入'},
             {id:'strategy-center',icon:'🏆',label:'策略研究与竞技'},
             {id:'qmt-strategy-results',icon:'◫',label:'QMT每日模拟'},
             {id:'sentiment',icon:'🧠',label:'市场观察'},
@@ -11249,8 +11251,8 @@
             });
         }
         Promise.all([
-            fetchJsonWithTimeout(recQueryUrl(d), 8000),
-            fetchJsonWithTimeout(recGateUrl(d), 8000).catch(function(e) {
+            fetchJsonWithTimeout(recQueryUrl(d), 45000),
+            fetchJsonWithTimeout(recGateUrl(d), 15000).catch(function(e) {
                 return {
                     status: 'degraded',
                     ready: false,
@@ -11260,7 +11262,7 @@
                     error: '门禁状态检查超时，不影响已生成推荐列表展示；开始筛选时仍会执行严格门禁。' + (e && e.message ? ' ' + e.message : '')
                 };
             }),
-            fetchJsonWithTimeout(recRuntimeParamsUrl(d), 8000).catch(function(e) {
+            fetchJsonWithTimeout(recRuntimeParamsUrl(d), 15000).catch(function(e) {
                 return { params: [], params_map: {}, error: e && e.message ? e.message : String(e || '') };
             })
         ]).then(function(results) {
