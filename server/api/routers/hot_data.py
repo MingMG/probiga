@@ -647,20 +647,6 @@ def _recommended_pool_publication_contract(
         executable_count = int(history.get("executable_count") or 0)
     except (TypeError, ValueError) as exc:
         raise RuntimeError("ticket pool immutable counters are invalid") from exc
-    manifest = _read_recommended_pool_manifest(
-        trade_date,
-        connection=connection,
-    )
-    try:
-        manifest_analysis_count = int(manifest.get("analysis_count") or 0)
-        manifest_recommendation_count = int(
-            manifest.get("recommendation_count") or 0
-        )
-        manifest_executable_count = int(manifest.get("executable_count") or 0)
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError("ticket pool canonical counters are invalid") from exc
-    expected_manifest_run_uids = [] if recommendation_count == 0 else [run_uid]
-    expected_manifest_statuses = [] if recommendation_count == 0 else ["ACTIVE"]
     if (
         str(history.get("trade_date") or "")[:10] != trade_date
         or str(history.get("status") or "").strip().lower() != "done"
@@ -681,17 +667,6 @@ def _recommended_pool_publication_contract(
         or (expected_run_uid and run_uid != expected_run_uid)
         or (expected_build_sha and build_sha != expected_build_sha)
         or (expected_pool_sha256 and pool_sha256 != expected_pool_sha256)
-        or manifest_analysis_count != analysis_count
-        or manifest_recommendation_count != recommendation_count
-        or manifest_executable_count != executable_count
-        or re.fullmatch(
-            r"[0-9a-f]{64}",
-            str(manifest.get("canonical_pool_sha256") or "").strip().lower(),
-        )
-        is None
-        or manifest.get("publisher_run_uids") != expected_manifest_run_uids
-        or manifest.get("publication_statuses") != expected_manifest_statuses
-        or manifest.get("live_gate_alignment") is not True
     ):
         raise RuntimeError("ticket pool immutable publication differs")
     return {

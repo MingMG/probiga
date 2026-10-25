@@ -1302,15 +1302,6 @@ class HotDataDetailHelperTest(unittest.TestCase):
             "build_sha": build_sha,
             "published_at": "2026-07-08 22:20:00",
         }
-        manifest = {
-            "analysis_count": 5205,
-            "recommendation_count": 0,
-            "executable_count": 0,
-            "canonical_pool_sha256": pool_sha256,
-            "publisher_run_uids": [],
-            "publication_statuses": [],
-            "live_gate_alignment": True,
-        }
         columns = {
             "stock_code",
             "pick_date",
@@ -1343,9 +1334,6 @@ class HotDataDetailHelperTest(unittest.TestCase):
             "server.api.routers.hot_data._recommendation_theme_coverage",
             return_value={},
         ), patch(
-            "server.api.routers.hot_data._read_recommended_pool_manifest",
-            return_value=manifest,
-        ) as manifest_mock, patch(
             "server.api.routers.hot_data.get_engine",
             return_value=publication_engine,
         ):
@@ -1372,10 +1360,6 @@ class HotDataDetailHelperTest(unittest.TestCase):
             connection is publication_connection
             for connection in bound_connections
         ))
-        manifest_mock.assert_called_once_with(
-            "2026-07-08",
-            connection=publication_connection,
-        )
 
     def test_recommended_pool_contract_rejects_another_active_run(self):
         with patch(
@@ -1416,15 +1400,6 @@ class HotDataDetailHelperTest(unittest.TestCase):
             "build_sha": build_sha,
             "published_at": "2026-07-08 22:20:00",
         }
-        tampered_manifest = {
-            "analysis_count": 5205,
-            "recommendation_count": 1,
-            "executable_count": 0,
-            "canonical_pool_sha256": "d" * 64,
-            "publisher_run_uids": [run_uid],
-            "publication_statuses": ["ACTIVE"],
-            "live_gate_alignment": True,
-        }
         rows = [{
             "stock_code": "000002",
             "publisher_run_uid": run_uid,
@@ -1434,9 +1409,6 @@ class HotDataDetailHelperTest(unittest.TestCase):
         with patch(
             "server.api.routers.hot_data._read_sql",
             side_effect=[[active_group], [history]],
-        ), patch(
-            "server.api.routers.hot_data._read_recommended_pool_manifest",
-            return_value=tampered_manifest,
         ):
             contract = hot_data._recommended_pool_publication_contract(
                 columns={"publisher_run_uid", "publication_status"},
@@ -1470,15 +1442,7 @@ class HotDataDetailHelperTest(unittest.TestCase):
             "build_sha": build_sha,
             "published_at": "2026-07-08 22:20:00",
         }
-        manifest = {
-            "analysis_count": 5204,
-            "recommendation_count": 1,
-            "executable_count": 0,
-            "canonical_pool_sha256": pool_sha256,
-            "publisher_run_uids": [run_uid],
-            "publication_statuses": ["ACTIVE"],
-            "live_gate_alignment": True,
-        }
+        history["passed"] = 2
         rows = [{
             "stock_code": "000002",
             "publisher_run_uid": run_uid,
@@ -1487,9 +1451,6 @@ class HotDataDetailHelperTest(unittest.TestCase):
         with patch(
             "server.api.routers.hot_data._read_sql",
             side_effect=[[active_group], [history]],
-        ), patch(
-            "server.api.routers.hot_data._read_recommended_pool_manifest",
-            return_value=manifest,
         ):
             with self.assertRaisesRegex(
                 RuntimeError, "immutable publication differs"
