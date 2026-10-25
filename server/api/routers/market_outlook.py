@@ -424,14 +424,42 @@ def build_market_outlook(
             }
         previous_date, next_date = _calendar_neighbors(connection, target)
         current = _market_snapshot(connection, target)
-        previous = _market_snapshot(connection, previous_date)
+        previous = (
+            _market_snapshot(connection, previous_date)
+            if previous_date else {"trade_date": "", "available": False}
+        )
+        active_identity = connection.execute(text(
+            "SELECT publisher_run_uid,COUNT(*) AS active_count "
+            "FROM st_recommended_stocks "
+            "WHERE pick_date=:d AND publication_status='ACTIVE' "
+            "GROUP BY publisher_run_uid ORDER BY active_count DESC "
+            "LIMIT 2"
+        ), {"d": target}).mappings().all()
+        if len(active_identity) > 1:
+            return {
+                "status": "DATA_BLOCKED",
+                "reason": "当前 ACTIVE 票池存在多个发布身份",
+                "trade_date": target,
+                "next_trade_date": next_date,
+                "scenarios": [],
+                "stocks": [],
+            }
+        active_run_uid = (
+            str(active_identity[0].get("publisher_run_uid") or "")
+            if active_identity else ""
+        )
+        history_params: dict[str, Any] = {"d": target}
+        history_condition = "trade_date=:d AND status='done'"
+        if active_run_uid:
+            history_condition += " AND run_uid=:run_uid"
+            history_params["run_uid"] = active_run_uid
         history = connection.execute(text(
             "SELECT run_uid,status,total,passed,executable_count,"
             "canonical_pool_sha256,build_sha,published_at "
             "FROM st_recommended_run_history "
-            "WHERE trade_date=:d AND status='done' "
+            f"WHERE {history_condition} "
             "ORDER BY published_at DESC,run_uid DESC LIMIT 1"
-        ), {"d": target}).mappings().first()
+        ), history_params).mappings().first()
         pool_rows = connection.execute(text(
             "SELECT r.stock_code,r.short_name,r.short_term_score,"
             "r.capital_score,r.technical,r.signal_status,r.signal_reason,"
