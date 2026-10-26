@@ -139,6 +139,12 @@ MINUTE_GRID = tuple(
 RESULT_REPLAY_BUDGET = 24000
 SOURCE_DELAY_BUDGET_SECONDS = 180
 PUBLIC_MINUTE_SOURCE = "east_push2delay"
+TENCENT_MINUTE_SOURCE = "tencent_minute"
+PUBLIC_MINUTE_PROVIDER = "eastmoney.push2delay+tencent.minute"
+TENCENT_MINUTE_URL = (
+    "https://web.ifzq.gtimg.cn/appstock/app/minute/query"
+)
+TENCENT_MINUTE_MAX_CARRIED_RATIO = 0.10
 
 
 class MinuteSourceError(ValueError):
@@ -244,14 +250,123 @@ def _fetch_native_minutes(code, market, *, session, trade_date, kind):
 
 
 def fetch_minute_kline(code: str, market: int, *, session, trade_date: str):
-    return _fetch_native_minutes(code, market, session=session, trade_date=trade_date, kind="stock")
+    rows = _fetch_native_minutes(
+        code,
+        market,
+        session=session,
+        trade_date=trade_date,
+        kind="stock",
+    )
+    if rows:
+        return rows
+    return _fetch_tencent_minutes(
+        code,
+        market,
+        session=session,
+        trade_date=trade_date,
+    )
 
 
 def fetch_minute_flow(code: str, market: int, *, session, trade_date: str):
     return _fetch_native_minutes(code, market, session=session, trade_date=trade_date, kind="flow")
 
 
-def fetch_with_retries(fetcher, code: str, market: int) -> list[str] | None:
+def _tencent_minute_symbol(code: str) -> str:
+    if code.startswith("6"):
+        return "sh" + code
+    if code.startswith(("4", "8", "92")):
+        return "bj" + code
+    return "sz" + code
+
+
+def _fetch_tencent_minutes(code: str, market: int, *, session, trade_date):
+    """Build the exact public 240-minute grid from cumulative Tencent data."""
+    if type(market) is not int or market not in {0, 1}:
+        return None
+    symbol = _tencent_minute_symbol(code)
+    try:
+        response = session.get(
+            TENCENT_MINUTE_URL,
+            params={"code": symbol},
+            timeout=10,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except (requests.RequestException, ValueError):
+        return None
+    data = (payload.get("data") or {}).get(symbol) or {}
+    minute_data = data.get("data") or {}
+    if str(minute_data.get("date") or "") != trade_date.replace("-", ""):
+        return None
+    raw_rows = minute_data.get("data")
+    if not isinstance(raw_rows, list) or not raw_rows or len(raw_rows) > 400:
+        return None
+    quotes = (data.get("qt") or {}).get(symbol) or []
+    if not isinstance(quotes, list) or len(quotes) <= 4:
+        return None
+    try:
+        pre_close = _number(quotes[4], positive=True)
+    except MinuteSourceError:
+        return None
+    observed = {}
+    for raw in raw_rows:
+        if not isinstance(raw, str):
+            return None
+        parts = raw.split()
+        if len(parts) < 4:
+            return None
+        minute, price, volume, amount = parts[:4]
+        if len(minute) != 4 or not minute.isdigit():
+            return None
+        try:
+            observed[minute] = (
+                _number(price, positive=True),
+                _number(volume, nonnegative=True),
+                _number(amount, nonnegative=True),
+            )
+        except MinuteSourceError:
+            return None
+    target = date.fromisoformat(trade_date)
+    last = None
+    carried = 0
+    rows = []
+    for minute in MINUTE_GRID:
+        value = observed.get(minute.replace(":", ""))
+        if value is not None:
+            last = value
+        elif last is not None:
+            value = last
+            carried += 1
+        else:
+            return None
+        stamp = datetime.combine(
+            target,
+            datetime.strptime(minute, "%H:%M").time(),
+        )
+        price, volume, amount = value
+        change = price - pre_close
+        rows.append(
+            {
+                "trade_time": stamp,
+                "price": price,
+                "avg_price": None,
+                "volume": volume * 100,
+                "amount": amount,
+                "change": change,
+                "change_pct": change / pre_close * 100,
+            }
+        )
+    if carried / len(rows) > TENCENT_MINUTE_MAX_CARRIED_RATIO:
+        return None
+    return {
+        "source": TENCENT_MINUTE_SOURCE,
+        "pre_close": pre_close,
+        "carried_minutes": carried,
+        "rows": rows,
+    }
+
+
+def fetch_with_retries(fetcher, code: str, market: int):
     """Retry one stock without turning a transient source miss into stale data."""
     attempts = max(1, int(FETCH_ATTEMPTS))
     for attempt in range(attempts):
@@ -326,6 +441,20 @@ def _parse_minutes(code, klines, *, trade_date, kind):
     target = date.fromisoformat(trade_date)
     rows = []
     seen = set()
+    source = PUBLIC_MINUTE_SOURCE
+    if isinstance(klines, dict):
+        if kind != "stock" or klines.get("source") != TENCENT_MINUTE_SOURCE:
+            raise MinuteSourceError("INVALID_PAYLOAD")
+        source = TENCENT_MINUTE_SOURCE
+        for raw in klines.get("rows") or []:
+            row = dict(raw)
+            row.update(
+                stock_code=code,
+                trade_date=trade_date,
+                _source=source,
+            )
+            rows.append(row)
+        return sorted(rows, key=lambda row: row["trade_time"])
     for line in klines:
         parts = line.split(",")
         if len(parts) < (11 if kind == "stock" else 6):
@@ -339,7 +468,11 @@ def _parse_minutes(code, klines, *, trade_date, kind):
         if stamp.strftime("%H:%M") not in MINUTE_GRID or stamp in seen:
             raise MinuteSourceError("INVALID_MINUTE_GRID")
         seen.add(stamp)
-        row = {"stock_code": code, "trade_time": stamp}
+        row = {
+            "stock_code": code,
+            "trade_time": stamp,
+            "_source": source,
+        }
         if kind == "stock":
             opening, price, high, low = (_number(value, positive=True) for value in parts[1:5])
             if not low <= opening <= high or not low <= price <= high:
@@ -724,7 +857,8 @@ def validate_result(result):
     kind = result.get("dataset")
     if (result.get("schema") != RESULT_SCHEMA or kind not in DATASET_TABLES
             or result.get("table") != DATASET_TABLES[kind]
-            or result.get("provider") != "eastmoney.push2delay" or result.get("status") != "written"
+            or result.get("provider") != PUBLIC_MINUTE_PROVIDER
+            or result.get("status") != "written"
             or type(result.get("source_delay_budget_seconds")) is not int
             or result["source_delay_budget_seconds"] != SOURCE_DELAY_BUDGET_SECONDS):
         raise ValueError("invalid collection identity")
@@ -938,8 +1072,14 @@ def _collect_minutes(engine, codes, *, kind, table, trade_date, min_coverage,
                     if rows:
                         proofs[code] = [code, len(rows), _code_rows_digest(rows, kind), captured_at.isoformat(sep=" ")]
                         for row in rows:
-                            row.update(source_time=row["trade_time"], received_at=captured_at,
-                                       data_source=PUBLIC_MINUTE_SOURCE)
+                            row.update(
+                                source_time=row["trade_time"],
+                                received_at=captured_at,
+                                data_source=row.pop(
+                                    "_source",
+                                    PUBLIC_MINUTE_SOURCE,
+                                ),
+                            )
                         buffer.extend(rows)
                         missing.remove(code)
                     elif code in no_trade_codes:
@@ -957,7 +1097,8 @@ def _collect_minutes(engine, codes, *, kind, table, trade_date, min_coverage,
             append()
         coverage = (len(proofs) + len(no_trade)) / len(expected)
         result = {
-            **context, "schema": RESULT_SCHEMA, "provider": "eastmoney.push2delay",
+            **context, "schema": RESULT_SCHEMA,
+            "provider": PUBLIC_MINUTE_PROVIDER,
             "dataset": kind, "table": table, "trade_date": trade_date,
             "requested_limit": limit,
             "source_delay_budget_seconds": SOURCE_DELAY_BUDGET_SECONDS,

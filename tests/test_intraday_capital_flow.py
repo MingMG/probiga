@@ -76,6 +76,57 @@ def test_public_minute_no_trade_scope_binds_free_daily_sources(monkeypatch):
     assert proof["no_trade_count"] == 1
 
 
+def test_tencent_minute_fallback_forward_fills_cumulative_series():
+    c = _crawler()
+    symbol = "sz000001"
+    raw_rows = ["0930 11.00 100 1000"]
+    for index, minute in enumerate(c.MINUTE_GRID, start=1):
+        if minute == "10:00":
+            continue
+        raw_rows.append(
+            f"{minute.replace(':', '')} 11.01 {100 + index} {1000 + index}"
+        )
+    payload = {
+        "data": {
+            symbol: {
+                "data": {
+                    "date": "20261026",
+                    "data": raw_rows,
+                },
+                "qt": {symbol: ["51", "平安银行", "000001", "11.01", "11.00"]},
+            }
+        }
+    }
+
+    class Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return payload
+
+    class Session:
+        def get(self, *_args, **_kwargs):
+            return Response()
+
+    result = c._fetch_tencent_minutes(
+        "000001",
+        0,
+        session=Session(),
+        trade_date="2026-10-26",
+    )
+    rows = c.parse_kline("000001", result, trade_date="2026-10-26")
+
+    assert len(rows) == 240
+    assert result["carried_minutes"] == 1
+    assert all(row["_source"] == c.TENCENT_MINUTE_SOURCE for row in rows)
+    carried = next(row for row in rows if row["trade_time"].strftime("%H:%M") == "10:00")
+    previous = next(row for row in rows if row["trade_time"].strftime("%H:%M") == "09:59")
+    assert carried["price"] == previous["price"]
+    assert carried["volume"] == previous["volume"]
+    assert carried["amount"] == previous["amount"]
+
+
 def _collection(monkeypatch, kind, native, *, minimum=0.5, no_trade=(), context=None, limit=0):
     c = _crawler()
     context = context or _context()

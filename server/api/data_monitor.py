@@ -43,6 +43,9 @@ PUBLIC_MINUTE_TIME_GRID = tuple(
     for offset in range(120)
 )
 PUBLIC_MINUTE_SOURCE = "east_push2delay"
+PUBLIC_MINUTE_SOURCES = frozenset(
+    {PUBLIC_MINUTE_SOURCE, "tencent_minute"}
+)
 
 
 def now() -> datetime:
@@ -289,7 +292,7 @@ class Observer:
                     source_name = source["data_source"]
                     source_grid = (
                         list(PUBLIC_MINUTE_TIME_GRID)
-                        if source_name == PUBLIC_MINUTE_SOURCE
+                        if source_name in PUBLIC_MINUTE_SOURCES
                         else grid
                     )
                     for row in self.groups(
@@ -442,7 +445,7 @@ class Observer:
             str(row.get("data_source") or "")
             for row in rows
         }
-        if sources == {PUBLIC_MINUTE_SOURCE}:
+        if sources and sources <= PUBLIC_MINUTE_SOURCES:
             return list(PUBLIC_MINUTE_TIME_GRID)
         return list(minute_time_grid())
 
