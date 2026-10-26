@@ -438,22 +438,19 @@ def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: s
         args.remove("--latest-session")
         args.extend(["--trade-date", today])
         return args
-    if (
-        release_catchup
-        and task_type in RELEASE_EXPLICIT_TRADE_DATE_TARGET_TASK_TYPES
-    ):
+    if task_type in RELEASE_EXPLICIT_TRADE_DATE_TARGET_TASK_TYPES:
         if not _is_iso_date_arg(today):
-            raise ValueError("release catch-up provider target date is invalid")
+            raise ValueError("provider target date is invalid")
         explicit_dates = _option_values(args, "--trade-date")
         if explicit_dates and explicit_dates != [today]:
             raise ValueError(
-                "release catch-up provider date differs from authoritative target"
+                "provider date differs from authoritative target"
             )
         if any(
             _has_option(args, option) for option in ("--start-date", "--end-date")
         ):
             raise ValueError(
-                "release catch-up provider requires one authoritative target"
+                "provider requires one authoritative target"
             )
         if not explicit_dates:
             args.extend(["--trade-date", today])

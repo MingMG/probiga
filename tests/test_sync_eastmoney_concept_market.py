@@ -475,3 +475,31 @@ def test_concept_publication_routes_history_to_its_own_database_before_any_fetch
     assert market._publication_engine(primary, ["current", "kline"], history_engine=primary) is primary
     with pytest.raises(market.DataBlocked, match="different databases"):
         market.run_publisher(primary, object(), datasets=["all"], history_engine=history)
+
+
+def test_concept_provider_uses_verified_edge_with_bounded_curl(monkeypatch):
+    calls = []
+
+    class Completed:
+        returncode = 0
+        stdout = json.dumps({"data": {"total": 1, "diff": []}}).encode()
+        stderr = b""
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        return Completed()
+
+    monkeypatch.setattr(market.subprocess, "run", run)
+    payload = market.EastmoneyConceptProvider()._request_json(
+        market.DIRECTORY_URL,
+        {"pn": "1", "pz": "100", "fs": market.DIRECTORY_FILTER},
+    )
+    assert payload["data"]["total"] == 1
+    command, kwargs = calls[0]
+    assert "--resolve" in command
+    assert (
+        "push2delay.eastmoney.com:443:61.129.129.48"
+        in command
+    )
+    assert command[command.index("--max-time") + 1] == "20"
+    assert kwargs["timeout"] == 22

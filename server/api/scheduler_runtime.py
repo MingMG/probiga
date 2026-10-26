@@ -102,6 +102,7 @@ from server.common.scheduler_script_policy import (
 from server.common.scheduler_args import (
     ANALYSIS_DAILY_EVIDENCE_TASK_TYPES,
     ANALYSIS_DAILY_PIPELINE_DECISION_TIME,
+    RELEASE_EXPLICIT_TRADE_DATE_TARGET_TASK_TYPES,
     build_scheduler_task_args,
 )
 from server.common.scheduler_tasks import (
@@ -5329,6 +5330,12 @@ def _task_dispatch_date(
         return _stock_minute_postclose_target_date(engine, now=current)
     if task_type in FINALIZED_MINUTE_TASK_TYPES:
         return _release_catchup_previous_session_target_date(engine, now=current)
+    if task_type in RELEASE_EXPLICIT_TRADE_DATE_TARGET_TASK_TYPES:
+        return _release_catchup_closed_target_date(
+            engine,
+            now=current,
+            task_type=task_type,
+        )
     if (
         trigger_source == "release_catchup"
         and task_type in RELEASE_CATCHUP_AUTHORITATIVE_DATE_TASK_TYPES

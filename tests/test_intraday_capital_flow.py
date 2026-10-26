@@ -267,15 +267,59 @@ def test_invalid_native_minute_rejected(replacement):
 
 @pytest.mark.parametrize("kind", ["stock", "flow"])
 @pytest.mark.parametrize("bad_identity", [{"code": "000002", "market": 0}, {"code": "000001", "market": 1}, {"code": "000001", "market": False}])
-def test_native_source_identity_is_exact_and_never_retries_another_market(kind, bad_identity):
+def test_native_source_identity_is_exact_and_never_retries_another_market(
+    monkeypatch,
+    kind,
+    bad_identity,
+):
     c = _crawler()
     session = SimpleNamespace(get=MagicMock(return_value=SimpleNamespace(
         raise_for_status=lambda: None, json=lambda: {"data": {**bad_identity, "klines": [_line(kind)]}},
     )))
+    if kind == "flow":
+        monkeypatch.setattr(
+            c,
+            "_fetch_flow_payload_via_resolved_edge",
+            lambda params: {"data": {**bad_identity, "klines": [_line(kind)]}},
+        )
     with pytest.raises(c.MinuteSourceError, match="WRONG_IDENTITY"):
         c._fetch_native_minutes("000001", 0, session=session, trade_date="2026-09-11", kind=kind)
-    session.get.assert_called_once()
-    assert session.get.call_args.kwargs["params"]["secid"] == "0.000001"
+    if kind == "flow":
+        session.get.assert_not_called()
+    else:
+        session.get.assert_called_once()
+        assert session.get.call_args.kwargs["params"]["secid"] == "0.000001"
+
+
+def test_flow_source_uses_resolved_edge_with_hard_timeout(monkeypatch):
+    c = _crawler()
+    calls = []
+    payload = {"data": {"code": "000001", "market": 0, "klines": [_line("flow")]}}
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(payload).encode(),
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(c.subprocess, "run", run)
+    assert c.fetch_minute_flow(
+        "000001",
+        0,
+        session=object(),
+        trade_date="2026-09-11",
+    ) == [_line("flow")]
+    command, kwargs = calls[0]
+    assert "--resolve" in command
+    assert "push2delay.eastmoney.com:443:61.129.129.48" in command
+    assert command[command.index("--max-time") + 1] == "10"
+    assert kwargs["timeout"] == 12
+    assert any(
+        "secid=0.000001" in part
+        for part in command
+    )
 
 
 def test_tls_verification_is_enabled():

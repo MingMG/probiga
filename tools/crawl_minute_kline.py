@@ -17,6 +17,7 @@ import json
 import os
 import random
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -27,6 +28,7 @@ from datetime import date, datetime, timedelta, time as wall_time
 from decimal import Decimal, InvalidOperation
 from functools import partial
 from pathlib import Path
+from urllib.parse import urlencode
 
 import numpy as np
 import pandas as pd
@@ -141,6 +143,11 @@ SOURCE_DELAY_BUDGET_SECONDS = 180
 PUBLIC_MINUTE_SOURCE = "east_push2delay"
 TENCENT_MINUTE_SOURCE = "tencent_minute"
 PUBLIC_MINUTE_PROVIDER = "eastmoney.push2delay+tencent.minute"
+EASTMONEY_PUSH2DELAY_HOST = "push2delay.eastmoney.com"
+EASTMONEY_PUSH2DELAY_EDGE_IP = os.environ.get(
+    "PROBIGA_EASTMONEY_PUSH2DELAY_EDGE_IP",
+    "61.129.129.48",
+)
 TENCENT_MINUTE_URL = (
     "https://web.ifzq.gtimg.cn/appstock/app/minute/query"
 )
@@ -207,6 +214,55 @@ def _new_minute_session() -> requests.Session:
     return session
 
 
+def _fetch_flow_payload_via_resolved_edge(params: dict[str, str]) -> dict:
+    """Fetch minute flow from the provider edge with a hard subprocess timeout."""
+
+    endpoint = (
+        f"https://{EASTMONEY_PUSH2DELAY_HOST}"
+        "/api/qt/stock/fflow/kline/get"
+    )
+    command = [
+        os.environ.get("PROBIGA_CURL_BINARY", "curl"),
+        "--silent",
+        "--show-error",
+        "--fail",
+        "--compressed",
+        "--max-time",
+        "10",
+        "--max-filesize",
+        "2097152",
+        "-H",
+        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "-H",
+        "Accept: */*",
+        "-H",
+        "Referer: https://quote.eastmoney.com/",
+        "--resolve",
+        f"{EASTMONEY_PUSH2DELAY_HOST}:443:{EASTMONEY_PUSH2DELAY_EDGE_IP}",
+        f"{endpoint}?{urlencode(params)}",
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            timeout=12,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise MinuteSourceError("SOURCE_UNAVAILABLE") from exc
+    if completed.returncode != 0:
+        raise MinuteSourceError("SOURCE_UNAVAILABLE")
+    if not completed.stdout or len(completed.stdout) > 2_097_152:
+        raise MinuteSourceError("INVALID_PAYLOAD")
+    try:
+        payload = json.loads(completed.stdout)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise MinuteSourceError("INVALID_PAYLOAD") from exc
+    if not isinstance(payload, dict):
+        raise MinuteSourceError("INVALID_PAYLOAD")
+    return payload
+
+
 def _fetch_native_minutes(code, market, *, session, trade_date, kind):
     if type(market) is not int or market not in {0, 1, 90}:
         raise MinuteSourceError("INVALID_MARKET")
@@ -217,20 +273,26 @@ def _fetch_native_minutes(code, market, *, session, trade_date, kind):
         "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
         "lmt": "300", "end": date.fromisoformat(trade_date).strftime("%Y%m%d"),
     }
-    try:
-        response = session.get(
-            f"https://push2delay.eastmoney.com/api/qt/stock/{endpoint}/get",
-            params=params, timeout=10,
+    if kind == "flow":
+        payload = _fetch_flow_payload_via_resolved_edge(
+            {str(key): str(value) for key, value in params.items()}
         )
-        response.raise_for_status()
-    except requests.RequestException:
-        return None
-    try:
-        payload = response.json()
-    except ValueError:
-        raise MinuteSourceError("INVALID_PAYLOAD") from None
-    if not isinstance(payload, dict):
-        raise MinuteSourceError("INVALID_PAYLOAD")
+    else:
+        try:
+            response = session.get(
+                f"https://push2delay.eastmoney.com/api/qt/stock/{endpoint}/get",
+                params=params,
+                timeout=10,
+            )
+            response.raise_for_status()
+        except requests.RequestException:
+            return None
+        try:
+            payload = response.json()
+        except ValueError:
+            raise MinuteSourceError("INVALID_PAYLOAD") from None
+        if not isinstance(payload, dict):
+            raise MinuteSourceError("INVALID_PAYLOAD")
     data = payload.get("data")
     if data is None:
         return None

@@ -20,9 +20,11 @@ import json
 import math
 import os
 from pathlib import Path
+import subprocess
 import sys
 import time
 from typing import Any, Iterable, Mapping, Sequence
+from urllib.parse import urlencode, urlsplit
 import uuid
 from zoneinfo import ZoneInfo
 
@@ -74,6 +76,16 @@ CLOSED_DAILY_FIELD_MAP = {
     "amount": "f6", "change": "f4", "change_pct": "f3",
 }
 EASTMONEY_TOKEN = "b2884a393a59ad64002292a3e90d46a5"
+EASTMONEY_RESOLVED_EDGE_IP = os.environ.get(
+    "PROBIGA_EASTMONEY_PUSH2DELAY_EDGE_IP",
+    "61.129.129.48",
+)
+EASTMONEY_RESOLVABLE_HOSTS = frozenset(
+    {
+        "push2delay.eastmoney.com",
+        "push2his.eastmoney.com",
+    }
+)
 MIN_DIRECTORY_CODES = 100
 DEFAULT_PAGE_SIZE = 100
 DEFAULT_WORKERS = 8
@@ -226,6 +238,72 @@ def _minute_grid(target_date: str) -> tuple[datetime, ...]:
     return tuple(result)
 
 
+def _resolved_curl_json(
+    url: str,
+    params: Mapping[str, Any],
+    *,
+    host: str,
+    timeout: int,
+) -> dict[str, Any]:
+    """Fetch one Eastmoney response through its verified public edge IP."""
+
+    command = [
+        os.environ.get("PROBIGA_CURL_BINARY", "curl"),
+        "--silent",
+        "--show-error",
+        "--fail",
+        "--compressed",
+        "--max-time",
+        str(max(1, int(timeout))),
+        "--max-filesize",
+        "4194304",
+        "-H",
+        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "-H",
+        "Accept: application/json,text/plain,*/*",
+        "-H",
+        "Referer: https://quote.eastmoney.com/",
+        "--resolve",
+        f"{host}:443:{EASTMONEY_RESOLVED_EDGE_IP}",
+        (
+            f"{url}?"
+            + urlencode(
+                {str(key): str(value) for key, value in params.items()}
+            )
+        ),
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            timeout=max(2, int(timeout)) + 2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise DataBlocked(
+            "DATA_BLOCKED: Eastmoney resolved edge request is unavailable"
+        ) from exc
+    if completed.returncode != 0 or not completed.stdout:
+        raise DataBlocked(
+            "DATA_BLOCKED: Eastmoney resolved edge request failed"
+        )
+    if len(completed.stdout) > 4_194_304:
+        raise DataBlocked(
+            "DATA_BLOCKED: Eastmoney resolved edge response exceeds budget"
+        )
+    try:
+        payload = json.loads(completed.stdout)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise DataBlocked(
+            "DATA_BLOCKED: Eastmoney resolved edge response is invalid"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise DataBlocked(
+            "DATA_BLOCKED: Eastmoney resolved edge response is not an object"
+        )
+    return payload
+
+
 class EastmoneyConceptProvider:
     """Small provider adapter with no cross-provider fallback."""
 
@@ -255,6 +333,17 @@ class EastmoneyConceptProvider:
             session.trust_env = False
             for attempt in range(self.retries):
                 url = candidates[attempt % len(candidates)]
+                host = urlsplit(url).hostname
+                if host in EASTMONEY_RESOLVABLE_HOSTS:
+                    try:
+                        return _resolved_curl_json(
+                            url,
+                            params,
+                            host=host,
+                            timeout=self.timeout,
+                        )
+                    except DataBlocked as exc:
+                        last_error = exc
                 try:
                     response = session.get(
                         url,
