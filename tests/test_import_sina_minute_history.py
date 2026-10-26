@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import datetime as dt
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from decimal import Decimal
+from threading import Barrier
 
 import pytest
 import requests
@@ -19,6 +21,7 @@ from tools.import_sina_minute_history import (
     _market_suffix,
     _bounded_json_get,
     _proof_digest,
+    _paced_fetch,
     _readback_proofs,
     _load_anchors,
     _row_digest,
@@ -171,6 +174,42 @@ def test_bounded_json_response_enforces_a_total_deadline(monkeypatch):
             timeout=1,
         )
     assert closed == [True]
+
+
+def test_each_fetch_worker_uses_its_own_source_session(monkeypatch):
+    sessions = []
+    barrier = Barrier(2)
+
+    class Session:
+        pass
+
+    def new_session(_proxy):
+        session = Session()
+        sessions.append(session)
+        return session
+
+    def fetch(_anchor, *, session, **_kwargs):
+        barrier.wait(timeout=2)
+        return session
+
+    monkeypatch.setattr(
+        "tools.import_sina_minute_history._new_source_session",
+        new_session,
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        result = list(pool.map(
+            lambda _: _paced_fetch(
+                fetch,
+                _anchor(),
+                request_delay=0,
+            ),
+            range(2),
+        ))
+
+    assert len(sessions) == 2
+    assert {id(session) for session in result} == {
+        id(session) for session in sessions
+    }
 
 
 def test_streaming_readback_uses_per_code_proofs():

@@ -14,6 +14,7 @@ import gzip
 import hashlib
 import json
 import sys
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -707,12 +708,20 @@ def _paced_fetch(
     anchor: DailyAnchor,
     *,
     request_delay: float,
+    proxy: str = "",
     **kwargs,
 ):
+    session = getattr(_SOURCE_SESSION_LOCAL, "session", None)
+    if session is None:
+        session = _new_source_session(proxy)
+        _SOURCE_SESSION_LOCAL.session = session
     try:
-        return fetcher(anchor, **kwargs)
+        return fetcher(anchor, session=session, **kwargs)
     finally:
         time.sleep(max(0.0, request_delay))
+
+
+_SOURCE_SESSION_LOCAL = threading.local()
 
 
 def _receipt_id(trade_date: str, content_sha256: str) -> str:
@@ -951,7 +960,6 @@ def main(argv: list[str] | None = None) -> int:
         if len(buffer) >= 10000:
             flush_buffer()
 
-    session = _new_source_session(args.proxy)
     failures: dict[str, str] = {}
     remaining: list[str] = []
     for code in sorted(anchors):
@@ -982,91 +990,84 @@ def main(argv: list[str] | None = None) -> int:
             remaining.append(code)
     restored_count = len(proofs)
     started = time.monotonic()
-    try:
+    with ThreadPoolExecutor(max_workers=int(args.workers)) as pool:
+        futures = {
+            pool.submit(
+                _paced_fetch,
+                _fetch_one,
+                anchors[code],
+                trade_date=args.trade_date,
+                batch_id=batch_id,
+                timeout=float(args.timeout),
+                request_delay=float(args.request_delay),
+                proxy=args.proxy,
+            ): code
+            for code in remaining
+        }
+        for index, future in enumerate(as_completed(futures), 1):
+            code = futures[future]
+            try:
+                result, raw = future.result()
+                consume(code, result)
+                _write_cached_payload(
+                    checkpoint_dir,
+                    source=SOURCE,
+                    stock_code=code,
+                    payload=json.loads(raw),
+                    captured_at=result["captured_at"],
+                )
+            except Exception as exc:
+                failures[code] = f"{type(exc).__name__}: {exc}"
+            if index % 100 == 0:
+                print(
+                    f"minute source checked={restored_count + index}/"
+                    f"{len(anchors)} "
+                    f"complete={len(proofs)} failed={len(failures)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+    if failures:
+        fallback_failures: dict[str, str] = {}
+        fallback_codes = sorted(set(failures) & set(anchors))
         with ThreadPoolExecutor(max_workers=int(args.workers)) as pool:
             futures = {
                 pool.submit(
                     _paced_fetch,
-                    _fetch_one,
+                    _fetch_tencent_one,
                     anchors[code],
-                    session=session,
                     trade_date=args.trade_date,
                     batch_id=batch_id,
                     timeout=float(args.timeout),
                     request_delay=float(args.request_delay),
+                    proxy=args.proxy,
                 ): code
-                for code in remaining
+                for code in fallback_codes
             }
             for index, future in enumerate(as_completed(futures), 1):
                 code = futures[future]
                 try:
                     result, raw = future.result()
                     consume(code, result)
+                    failures.pop(code, None)
                     _write_cached_payload(
                         checkpoint_dir,
-                        source=SOURCE,
+                        source=TENCENT_SOURCE,
                         stock_code=code,
                         payload=json.loads(raw),
                         captured_at=result["captured_at"],
                     )
                 except Exception as exc:
-                    failures[code] = f"{type(exc).__name__}: {exc}"
+                    fallback_failures[code] = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
                 if index % 100 == 0:
                     print(
-                        f"minute source checked={restored_count + index}/"
-                        f"{len(anchors)} "
-                        f"complete={len(proofs)} failed={len(failures)}",
+                        f"minute fallback checked={index}/{len(fallback_codes)} "
+                        f"complete={len(proofs)} failed={len(fallback_failures)}",
                         file=sys.stderr,
                         flush=True,
                     )
-    finally:
-        session.close()
-
-    if failures:
-        fallback_failures: dict[str, str] = {}
-        fallback_codes = sorted(set(failures) & set(anchors))
-        session = _new_source_session(args.proxy)
-        try:
-            with ThreadPoolExecutor(max_workers=int(args.workers)) as pool:
-                futures = {
-                    pool.submit(
-                        _paced_fetch,
-                        _fetch_tencent_one,
-                        anchors[code],
-                        session=session,
-                        trade_date=args.trade_date,
-                        batch_id=batch_id,
-                        timeout=float(args.timeout),
-                        request_delay=float(args.request_delay),
-                    ): code
-                    for code in fallback_codes
-                }
-                for index, future in enumerate(as_completed(futures), 1):
-                    code = futures[future]
-                    try:
-                        result, raw = future.result()
-                        consume(code, result)
-                        failures.pop(code, None)
-                        _write_cached_payload(
-                            checkpoint_dir,
-                            source=TENCENT_SOURCE,
-                            stock_code=code,
-                            payload=json.loads(raw),
-                            captured_at=result["captured_at"],
-                        )
-                    except Exception as exc:
-                        fallback_failures[code] = (
-                            f"{type(exc).__name__}: {exc}"
-                        )
-                    if index % 100 == 0:
-                        print(
-                            f"minute fallback checked={index}/{len(fallback_codes)} "
-                            f"complete={len(proofs)} failed={len(fallback_failures)}",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-        finally:
-            session.close()
         failures.update(fallback_failures)
     flush_buffer()
 
