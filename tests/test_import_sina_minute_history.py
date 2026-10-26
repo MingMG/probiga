@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from decimal import Decimal
@@ -144,36 +145,21 @@ def test_source_checkpoint_round_trips_the_exact_payload(tmp_path):
 
 
 def test_bounded_json_response_enforces_a_total_deadline(monkeypatch):
-    closed = []
+    def timed_out(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired("curl", timeout=1)
 
-    class Response:
-        def raise_for_status(self):
-            pass
-
-        def iter_content(self, chunk_size):
-            yield b'{"ok":true}'
-
-        def close(self):
-            closed.append(True)
-
-    class Session:
-        def get(self, *_args, **_kwargs):
-            return Response()
-
-    ticks = iter([0.0, 2.0])
     monkeypatch.setattr(
-        "tools.import_sina_minute_history.time.monotonic",
-        lambda: next(ticks),
+        "tools.import_sina_minute_history.subprocess.run",
+        timed_out,
     )
 
     with pytest.raises(requests.Timeout, match="deadline exceeded"):
         _bounded_json_get(
-            Session(),
+            object(),
             "https://example.invalid",
             params={},
             timeout=1,
         )
-    assert closed == [True]
 
 
 def test_each_fetch_worker_uses_its_own_source_session(monkeypatch):

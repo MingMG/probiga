@@ -13,9 +13,11 @@ import datetime as dt
 import gzip
 import hashlib
 import json
+import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -504,37 +506,51 @@ def _bounded_json_get(
     timeout: float,
     max_bytes: int = 2_000_000,
 ) -> tuple[object, str]:
-    """Read one public JSON response under a total wall-clock deadline."""
-    deadline = time.monotonic() + timeout
-    response = session.get(
-        url,
-        params=params,
-        timeout=(min(5.0, timeout), min(10.0, timeout)),
-        stream=True,
-    )
+    """Read one public JSON response under curl's total request deadline."""
+    del session
+    query = urllib.parse.urlencode(params)
+    target = f"{url}?{query}" if query else url
+    command = [
+        "curl",
+        "--silent",
+        "--show-error",
+        "--fail",
+        "--max-time",
+        format(timeout, ".3f"),
+        "--connect-timeout",
+        format(min(5.0, timeout), ".3f"),
+        "--max-filesize",
+        str(max_bytes),
+        "--user-agent",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "--referer",
+        "https://finance.sina.com.cn/",
+        target,
+    ]
     try:
-        response.raise_for_status()
-        chunks: list[bytes] = []
-        size = 0
-        for chunk in response.iter_content(chunk_size=65536):
-            if time.monotonic() > deadline:
-                raise requests.Timeout("public minute response deadline exceeded")
-            if not chunk:
-                continue
-            size += len(chunk)
-            if size > max_bytes:
-                raise ImportErrorBase("public minute response exceeds size limit")
-            chunks.append(chunk)
-        if time.monotonic() > deadline:
-            raise requests.Timeout("public minute response deadline exceeded")
-        raw = b"".join(chunks)
-        try:
-            payload = json.loads(raw)
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ImportErrorBase("public minute response is not JSON") from exc
-        return payload, raw.decode("utf-8")
-    finally:
-        response.close()
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            timeout=timeout + 2,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise requests.Timeout(
+            "public minute response deadline exceeded"
+        ) from exc
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", "replace").strip()
+        raise requests.RequestException(
+            f"public minute request failed: {detail[:300]}"
+        )
+    raw = completed.stdout
+    if len(raw) > max_bytes:
+        raise ImportErrorBase("public minute response exceeds size limit")
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ImportErrorBase("public minute response is not JSON") from exc
+    return payload, raw.decode("utf-8")
 
 
 def _result_from_payload(
