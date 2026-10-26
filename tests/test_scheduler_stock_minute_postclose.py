@@ -13,6 +13,8 @@ from server.common.qmt_daily_market_truth import QMT_DAILY_CAPTURE_READY_TIME
 from tools.qmt_host_ownership_contract import (
     QMT_INDEX_MINUTE_TASK,
     QMT_STOCK_MINUTE_CANONICAL_TASK,
+    PUBLIC_STOCK_MINUTE_TASK,
+    PUBLIC_STOCK_MINUTE_FLOW_TASK,
 )
 
 
@@ -51,6 +53,21 @@ def test_stock_minute_dispatch_closes_today_while_index_retains_own_contract(cal
     assert index["_scheduler_historical_recovery"] is True
     assert runtime._task_dispatch_date(dict(QMT_STOCK_MINUTE_CANONICAL_TASK), calendar_engine, now=now) == "2026-09-21"
     assert runtime._task_dispatch_date(dict(QMT_INDEX_MINUTE_TASK), calendar_engine, now=now) == "2026-09-18"
+
+
+@pytest.mark.parametrize("task", [
+    PUBLIC_STOCK_MINUTE_TASK,
+    PUBLIC_STOCK_MINUTE_FLOW_TASK,
+])
+def test_public_minute_tasks_roll_over_to_the_last_closed_session(
+    calendar_engine,
+    task,
+):
+    assert runtime._task_dispatch_date(
+        dict(task),
+        calendar_engine,
+        now=datetime(2026, 9, 22, 0, 5),
+    ) == "2026-09-21"
 
 
 def test_prior_session_success_does_not_consume_today_postclose_run(calendar_engine):

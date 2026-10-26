@@ -5321,7 +5321,11 @@ def _task_dispatch_date(
         if parsed_scheduler_target.isoformat() != scheduler_target:
             raise RuntimeError("scheduler target trade date is invalid")
         return scheduler_target
-    if task_type == "qmt_stock_minute_canonical":
+    if task_type in {
+        "qmt_stock_minute_canonical",
+        "stock_minute",
+        "stock_minute_flow",
+    }:
         return _stock_minute_postclose_target_date(engine, now=current)
     if task_type in FINALIZED_MINUTE_TASK_TYPES:
         return _release_catchup_previous_session_target_date(engine, now=current)
