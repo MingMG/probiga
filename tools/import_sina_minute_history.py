@@ -600,11 +600,16 @@ def _result_from_payload(
     captured_at: dt.datetime,
     batch_id: str,
 ) -> dict:
-    parser = (
-        parse_sina_session
-        if source == SOURCE
-        else parse_tencent_session
-    )
+    if source == SOURCE:
+        parser = parse_sina_session
+    else:
+        symbol = _sina_symbol(anchor.stock_code)
+        cached_stock = (payload.get("data") or {}).get(symbol) if isinstance(payload, dict) else None
+        parser = (
+            parse_tencent_kline_session
+            if isinstance(cached_stock, dict) and "m1" in cached_stock
+            else parse_tencent_session
+        )
     rows = parser(
         payload,
         anchor=anchor,
@@ -1079,6 +1084,15 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _report_json(report: dict, *, compact: bool) -> str:
+    return json.dumps(
+        report,
+        ensure_ascii=False,
+        indent=None if compact else 1,
+        separators=(",", ":") if compact else None,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     load_project_env()
@@ -1357,7 +1371,7 @@ def main(argv: list[str] | None = None) -> int:
                 source_provider=provider,
             )
         _drop_kline_stage(stage_connection)
-        print(json.dumps(report, ensure_ascii=False, indent=1))
+        print(_report_json(report, compact=args.json))
         return 2
 
     receipt_id = _write_receipt(
@@ -1374,7 +1388,7 @@ def main(argv: list[str] | None = None) -> int:
     report["receipt_id"] = receipt_id
     if not args.apply:
         _drop_kline_stage(stage_connection)
-        print(json.dumps(report, ensure_ascii=False, indent=1))
+        print(_report_json(report, compact=args.json))
         return 0
 
     try:
@@ -1436,10 +1450,10 @@ def main(argv: list[str] | None = None) -> int:
             source_provider=provider,
         )
         _drop_kline_stage(stage_connection)
-        print(json.dumps(report, ensure_ascii=False, indent=1))
+        print(_report_json(report, compact=args.json))
         return 2
     _drop_kline_stage(stage_connection)
-    print(json.dumps(report, ensure_ascii=False, indent=1))
+    print(_report_json(report, compact=args.json))
     return 0
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -18,6 +19,7 @@ from tools.import_sina_minute_history import (
     ImportErrorBase,
     SOURCE,
     _read_cached_payload,
+    _report_json,
     _write_cached_payload,
     _market_suffix,
     _bounded_json_get,
@@ -219,6 +221,19 @@ def test_storage_normalization_matches_mysql_decimal_rounding():
     assert rows[0]["price"] == Decimal("1.234568")
     assert rows[0]["change"] == Decimal("0.000000")
     assert rows[0]["change_pct"] == Decimal("2.345679")
+
+
+def test_compact_report_is_one_machine_receipt_line():
+    text = _report_json(
+        {
+            "schema": "probiga.public-stock-minute-result.v1",
+            "status": "PASS",
+        },
+        compact=True,
+    )
+
+    assert "\n" not in text
+    assert json.loads(text)["status"] == "PASS"
 
 
 def test_streaming_readback_uses_per_code_proofs():
