@@ -16,7 +16,10 @@ from tools.import_sina_minute_history import (
     _read_cached_payload,
     _write_cached_payload,
     _market_suffix,
+    _proof_digest,
+    _readback_proofs,
     _load_anchors,
+    _row_digest,
     parse_sina_session,
     parse_tencent_session,
 )
@@ -133,6 +136,61 @@ def test_source_checkpoint_round_trips_the_exact_payload(tmp_path):
     )
 
     assert restored == (payload, captured)
+
+
+def test_streaming_readback_uses_per_code_proofs():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE sm_stock_minute ("
+                "stock_code TEXT, trade_time TEXT, price NUMERIC, "
+                "`change` NUMERIC, change_pct NUMERIC, volume NUMERIC, "
+                "amount NUMERIC, trade_date TEXT, data_source TEXT)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sm_stock_minute VALUES "
+                "('000001','2026-10-26 09:31:00',11.2,0.1,0.9,100,1120,"
+                "'2026-10-26','sina_public_1m'),"
+                "('000001','2026-10-26 09:32:00',11.3,0.1,0.9,200,2260,"
+                "'2026-10-26','sina_public_1m')"
+            )
+        )
+
+    rows, codes, digest = _readback_proofs(
+        engine,
+        trade_date="2026-10-26",
+        sources=[SOURCE],
+    )
+
+    assert rows == 2
+    assert codes == 1
+    assert digest == _proof_digest([[
+        "000001",
+        2,
+        _row_digest([
+            {
+                "stock_code": "000001",
+                "trade_time": dt.datetime(2026, 10, 26, 9, 31),
+                "price": Decimal("11.2"),
+                "change": Decimal("0.1"),
+                "change_pct": Decimal("0.9"),
+                "volume": Decimal("100"),
+                "amount": Decimal("1120"),
+            },
+            {
+                "stock_code": "000001",
+                "trade_time": dt.datetime(2026, 10, 26, 9, 32),
+                "price": Decimal("11.3"),
+                "change": Decimal("0.1"),
+                "change_pct": Decimal("0.9"),
+                "volume": Decimal("200"),
+                "amount": Decimal("2260"),
+            },
+        ]),
+    ]])
 
 
 def test_daily_anchors_exclude_explicit_suspensions():

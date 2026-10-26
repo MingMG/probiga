@@ -34,7 +34,12 @@ from server.common.config import get_kline_mysql_url  # noqa: E402
 from server.common.engine_factory import create_pooled_engine  # noqa: E402
 from server.common.minute_data import get_minute_engine  # noqa: E402
 from server.common.qmt_stock_catalog import load_target_stock_catalog  # noqa: E402
-from tools.crawl_minute_kline import save_kline  # noqa: E402
+from tools.crawl_minute_kline import (  # noqa: E402
+    _append_kline_stage,
+    _create_kline_stage,
+    _drop_kline_stage,
+    _publish_kline_stage,
+)
 from tools.env_config import load_project_env  # noqa: E402
 
 
@@ -297,6 +302,16 @@ def _row_digest(rows: Sequence[dict]) -> str:
     ]
     return hashlib.sha256(
         json.dumps(encoded, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _proof_digest(proofs: Sequence[Sequence[object]]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            list(proofs),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
     ).hexdigest()
 
 
@@ -725,46 +740,65 @@ def _write_receipt(
     return receipt_id
 
 
-def _readback(engine, *, trade_date: str, codes: Sequence[str]) -> tuple[int, int, str]:
+def _readback_proofs(
+    engine,
+    *,
+    trade_date: str,
+    sources: Sequence[str],
+) -> tuple[int, int, str]:
     statement = text(
         """
         SELECT stock_code, trade_time, price, `change`, change_pct, volume, amount
         FROM sm_stock_minute
-        WHERE trade_date=:trade_date AND data_source=:source
-          AND stock_code IN :codes
+        WHERE trade_date=:trade_date AND data_source IN :sources
         ORDER BY stock_code, trade_time
         """
-    ).bindparams(bindparam("codes", expanding=True))
+    ).bindparams(bindparam("sources", expanding=True))
+    proofs: list[list[object]] = []
     rows: list[dict] = []
+    current_code = None
+    row_count = 0
+
+    def finish_code() -> None:
+        if not rows:
+            return
+        proofs.append([
+            str(current_code),
+            len(rows),
+            _row_digest(rows),
+        ])
+        rows.clear()
+
     with engine.connect() as connection:
-        for offset in range(0, len(codes), 400):
-            batch = list(codes[offset:offset + 400])
-            rows.extend(
-                dict(row)
-                for row in connection.execute(
-                    statement,
-                    {
-                        "trade_date": trade_date,
-                        "source": SOURCE,
-                        "codes": batch,
-                    },
-                ).mappings()
-            )
-    normalized = [
-        {
-            "stock_code": str(row["stock_code"]).zfill(6),
-            "trade_time": row["trade_time"],
-            "price": row["price"],
-            "change": row["change"],
-            "change_pct": row["change_pct"],
-            "volume": row["volume"],
-            "amount": row["amount"],
-        }
-        for row in rows
-    ]
-    return len(normalized), len({row["stock_code"] for row in normalized}), _row_digest(
-        normalized
-    )
+        stream = connection.execution_options(
+            stream_results=True,
+        ).execute(
+            statement,
+            {
+                "trade_date": trade_date,
+                "sources": list(sources),
+            },
+        ).mappings()
+        for raw in stream:
+            code = str(raw["stock_code"]).zfill(6)
+            if code != current_code:
+                finish_code()
+                current_code = code
+            stamp = raw["trade_time"]
+            if not isinstance(stamp, dt.datetime):
+                stamp = dt.datetime.fromisoformat(str(stamp))
+            rows.append({
+                "stock_code": code,
+                "trade_time": stamp,
+                "price": raw["price"],
+                "change": raw["change"],
+                "change_pct": raw["change_pct"],
+                "volume": raw["volume"],
+                "amount": raw["amount"],
+            })
+            row_count += 1
+        finish_code()
+    return row_count, len(proofs), _proof_digest(proofs)
 
 
 def _selected_codes(args, primary_engine) -> list[str]:
@@ -836,8 +870,46 @@ def main(argv: list[str] | None = None) -> int:
     if checkpoint_dir is not None:
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+    stage, stage_connection = _create_kline_stage(
+        minute_engine,
+        "sm_stock_minute",
+    )
+    proofs: dict[str, list[object]] = {}
+    source_counts: dict[str, int] = {}
+    amount_missing_codes: set[str] = set()
+    buffer: list[dict] = []
+    staged_rows = 0
+
+    def flush_buffer() -> None:
+        nonlocal staged_rows
+        if not buffer:
+            return
+        written = _append_kline_stage(
+            stage_connection,
+            stage,
+            buffer,
+            "sm_stock_minute",
+        )
+        if written != len(buffer):
+            raise RuntimeError("minute stage row count mismatch")
+        staged_rows += written
+        buffer.clear()
+
+    def consume(code: str, result: dict) -> None:
+        if code in proofs:
+            raise RuntimeError("duplicate completed stock code")
+        rows = result["rows"]
+        proofs[code] = [code, len(rows), _row_digest(rows)]
+        for row in rows:
+            source = str(row["data_source"])
+            source_counts[source] = source_counts.get(source, 0) + 1
+            if row["amount"] is None:
+                amount_missing_codes.add(code)
+        buffer.extend(rows)
+        if len(buffer) >= 10000:
+            flush_buffer()
+
     session = _new_source_session(args.proxy)
-    results: dict[str, dict] = {}
     failures: dict[str, str] = {}
     remaining: list[str] = []
     for code in sorted(anchors):
@@ -852,21 +924,21 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             payload, captured_at = cached
             try:
-                results[code] = _result_from_payload(
+                consume(code, _result_from_payload(
                     anchors[code],
                     payload,
                     source=source,
                     trade_date=args.trade_date,
                     captured_at=captured_at,
                     batch_id=batch_id,
-                )
+                ))
                 restored = True
                 break
             except ImportErrorBase:
                 continue
         if not restored:
             remaining.append(code)
-    restored_count = len(results)
+    restored_count = len(proofs)
     started = time.monotonic()
     try:
         with ThreadPoolExecutor(max_workers=int(args.workers)) as pool:
@@ -887,7 +959,7 @@ def main(argv: list[str] | None = None) -> int:
                 code = futures[future]
                 try:
                     result, raw = future.result()
-                    results[code] = result
+                    consume(code, result)
                     _write_cached_payload(
                         checkpoint_dir,
                         source=SOURCE,
@@ -901,7 +973,7 @@ def main(argv: list[str] | None = None) -> int:
                     print(
                         f"minute source checked={restored_count + index}/"
                         f"{len(anchors)} "
-                        f"complete={len(results)} failed={len(failures)}",
+                        f"complete={len(proofs)} failed={len(failures)}",
                         file=sys.stderr,
                         flush=True,
                     )
@@ -931,7 +1003,7 @@ def main(argv: list[str] | None = None) -> int:
                     code = futures[future]
                     try:
                         result, raw = future.result()
-                        results[code] = result
+                        consume(code, result)
                         failures.pop(code, None)
                         _write_cached_payload(
                             checkpoint_dir,
@@ -947,37 +1019,26 @@ def main(argv: list[str] | None = None) -> int:
                     if index % 100 == 0:
                         print(
                             f"minute fallback checked={index}/{len(fallback_codes)} "
-                            f"complete={len(results)} failed={len(fallback_failures)}",
+                            f"complete={len(proofs)} failed={len(fallback_failures)}",
                             file=sys.stderr,
                             flush=True,
                         )
         finally:
             session.close()
         failures.update(fallback_failures)
+    flush_buffer()
 
     coverage = (
-        (len(results) + len(no_trade_codes)) / len(codes)
+        (len(proofs) + len(no_trade_codes)) / len(codes)
         if codes else 0.0
     )
     minimum_coverage = (
         1.0 if args.stock_code and not args.all_catalog
         else float(args.min_coverage)
     )
-    content_rows = [
-        row
-        for code in sorted(results)
-        for row in results[code]["rows"]
-    ]
-    content_sha256 = _row_digest(content_rows)
-    source_counts: dict[str, int] = {}
-    for row in content_rows:
-        source = str(row["data_source"])
-        source_counts[source] = source_counts.get(source, 0) + 1
-    amount_missing_codes = sorted({
-        str(row["stock_code"])
-        for row in content_rows
-        if row["amount"] is None
-    })
+    content_sha256 = _proof_digest(
+        [proofs[code] for code in sorted(proofs)]
+    )
     provider = (
         f"{SOURCE}+{TENCENT_SOURCE}"
         if TENCENT_SOURCE in source_counts
@@ -990,7 +1051,7 @@ def main(argv: list[str] | None = None) -> int:
         "fallback_source_url": TENCENT_SOURCE_URL,
         "provider": provider,
         "source_counts": source_counts,
-        "amount_missing_codes": amount_missing_codes,
+        "amount_missing_codes": sorted(amount_missing_codes),
         "amount_missing_count": len(amount_missing_codes),
         "trade_date": args.trade_date,
         "batch_id": batch_id,
@@ -998,10 +1059,10 @@ def main(argv: list[str] | None = None) -> int:
         "tradable_codes": len(anchors),
         "no_trade_codes": sorted(no_trade_codes),
         "no_trade_count": len(no_trade_codes),
-        "complete_codes": len(results),
+        "complete_codes": len(proofs),
         "failed_codes": len(failures),
         "failure_samples": dict(sorted(failures.items())[:20]),
-        "row_count": len(content_rows),
+        "row_count": staged_rows,
         "minutes_per_code": len(MINUTE_GRID),
         "content_sha256": content_sha256,
         "elapsed_seconds": round(time.monotonic() - started, 3),
@@ -1010,7 +1071,7 @@ def main(argv: list[str] | None = None) -> int:
         "schema": "probiga.public-stock-minute-result.v1",
         "status": (
             "READY"
-            if coverage >= minimum_coverage and content_rows
+            if coverage >= minimum_coverage and staged_rows
             else "FAILED"
         ),
         "apply": bool(args.apply),
@@ -1029,13 +1090,14 @@ def main(argv: list[str] | None = None) -> int:
                 minute_engine,
                 trade_date=args.trade_date,
                 expected_count=len(anchors),
-                observed_count=len(results),
-                row_count=len(content_rows),
+                observed_count=len(proofs),
+                row_count=staged_rows,
                 content_sha256=content_sha256,
                 status="FAILED",
                 evidence=report,
                 source_provider=provider,
             )
+        _drop_kline_stage(stage_connection)
         print(json.dumps(report, ensure_ascii=False, indent=1))
         return 2
 
@@ -1043,8 +1105,8 @@ def main(argv: list[str] | None = None) -> int:
         minute_engine,
         trade_date=args.trade_date,
         expected_count=len(anchors),
-        observed_count=len(results),
-        row_count=len(content_rows),
+        observed_count=len(proofs),
+        row_count=staged_rows,
         content_sha256=content_sha256,
         status="RUNNING",
         evidence=report,
@@ -1052,25 +1114,27 @@ def main(argv: list[str] | None = None) -> int:
     )
     report["receipt_id"] = receipt_id
     if not args.apply:
+        _drop_kline_stage(stage_connection)
         print(json.dumps(report, ensure_ascii=False, indent=1))
         return 0
 
     try:
-        written = save_kline(
+        written = _publish_kline_stage(
             minute_engine,
-            content_rows,
+            stage_connection,
+            stage,
             "sm_stock_minute",
             receipt_engine=minute_engine,
         )
-        readback_rows, readback_codes, readback_sha256 = _readback(
+        readback_rows, readback_codes, readback_sha256 = _readback_proofs(
             minute_engine,
             trade_date=args.trade_date,
-            codes=sorted(results),
+            sources=sorted(source_counts),
         )
         if (
-            written != len(content_rows)
-            or readback_rows != len(content_rows)
-            or readback_codes != len(results)
+            written != staged_rows
+            or readback_rows != staged_rows
+            or readback_codes != len(proofs)
             or readback_sha256 != content_sha256
         ):
             raise ImportErrorBase(
@@ -1084,7 +1148,7 @@ def main(argv: list[str] | None = None) -> int:
             "readback_sha256": readback_sha256,
             "acquisition_status": (
                 "COMPLETE"
-                if len(results) == len(anchors) and not failures
+                if len(proofs) == len(anchors) and not failures
                 else "PARTIAL"
             ),
         })
@@ -1092,7 +1156,7 @@ def main(argv: list[str] | None = None) -> int:
             minute_engine,
             trade_date=args.trade_date,
             expected_count=len(anchors),
-            observed_count=len(results),
+            observed_count=len(proofs),
             row_count=readback_rows,
             content_sha256=content_sha256,
             status="PASS",
@@ -1105,15 +1169,17 @@ def main(argv: list[str] | None = None) -> int:
             minute_engine,
             trade_date=args.trade_date,
             expected_count=len(anchors),
-            observed_count=len(results),
-            row_count=len(content_rows),
+            observed_count=len(proofs),
+            row_count=staged_rows,
             content_sha256=content_sha256,
             status="FAILED",
             evidence=report,
             source_provider=provider,
         )
+        _drop_kline_stage(stage_connection)
         print(json.dumps(report, ensure_ascii=False, indent=1))
         return 2
+    _drop_kline_stage(stage_connection)
     print(json.dumps(report, ensure_ascii=False, indent=1))
     return 0
 
