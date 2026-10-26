@@ -5,6 +5,7 @@ from dataclasses import replace
 from decimal import Decimal
 
 import pytest
+import requests
 from sqlalchemy import create_engine, text
 
 from tools.import_sina_minute_history import (
@@ -16,6 +17,7 @@ from tools.import_sina_minute_history import (
     _read_cached_payload,
     _write_cached_payload,
     _market_suffix,
+    _bounded_json_get,
     _proof_digest,
     _readback_proofs,
     _load_anchors,
@@ -136,6 +138,39 @@ def test_source_checkpoint_round_trips_the_exact_payload(tmp_path):
     )
 
     assert restored == (payload, captured)
+
+
+def test_bounded_json_response_enforces_a_total_deadline(monkeypatch):
+    closed = []
+
+    class Response:
+        def raise_for_status(self):
+            pass
+
+        def iter_content(self, chunk_size):
+            yield b'{"ok":true}'
+
+        def close(self):
+            closed.append(True)
+
+    class Session:
+        def get(self, *_args, **_kwargs):
+            return Response()
+
+    ticks = iter([0.0, 2.0])
+    monkeypatch.setattr(
+        "tools.import_sina_minute_history.time.monotonic",
+        lambda: next(ticks),
+    )
+
+    with pytest.raises(requests.Timeout, match="deadline exceeded"):
+        _bounded_json_get(
+            Session(),
+            "https://example.invalid",
+            params={},
+            timeout=1,
+        )
+    assert closed == [True]
 
 
 def test_streaming_readback_uses_per_code_proofs():

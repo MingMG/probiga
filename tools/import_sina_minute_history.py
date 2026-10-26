@@ -384,7 +384,8 @@ def _fetch_one(
     batch_id: str,
     timeout: float,
 ) -> tuple[dict, str]:
-    response = session.get(
+    payload, raw = _bounded_json_get(
+        session,
         SOURCE_URL,
         params={
             "symbol": _sina_symbol(anchor.stock_code),
@@ -394,10 +395,9 @@ def _fetch_one(
         },
         timeout=timeout,
     )
-    response.raise_for_status()
     captured_at = dt.datetime.now().replace(microsecond=0)
     rows = parse_sina_session(
-        response.json(),
+        payload,
         anchor=anchor,
         trade_date=trade_date,
         captured_at=captured_at,
@@ -409,7 +409,7 @@ def _fetch_one(
         "rows": rows,
         "digest": digest,
         "captured_at": captured_at,
-    }, response.text
+    }, raw
 
 
 def _cache_path(
@@ -493,6 +493,47 @@ def _new_source_session(proxy: str = "") -> requests.Session:
     if proxy:
         session.proxies.update({"http": proxy, "https": proxy})
     return session
+
+
+def _bounded_json_get(
+    session: requests.Session,
+    url: str,
+    *,
+    params: dict,
+    timeout: float,
+    max_bytes: int = 2_000_000,
+) -> tuple[object, str]:
+    """Read one public JSON response under a total wall-clock deadline."""
+    deadline = time.monotonic() + timeout
+    response = session.get(
+        url,
+        params=params,
+        timeout=(min(5.0, timeout), min(10.0, timeout)),
+        stream=True,
+    )
+    try:
+        response.raise_for_status()
+        chunks: list[bytes] = []
+        size = 0
+        for chunk in response.iter_content(chunk_size=65536):
+            if time.monotonic() > deadline:
+                raise requests.Timeout("public minute response deadline exceeded")
+            if not chunk:
+                continue
+            size += len(chunk)
+            if size > max_bytes:
+                raise ImportErrorBase("public minute response exceeds size limit")
+            chunks.append(chunk)
+        if time.monotonic() > deadline:
+            raise requests.Timeout("public minute response deadline exceeded")
+        raw = b"".join(chunks)
+        try:
+            payload = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ImportErrorBase("public minute response is not JSON") from exc
+        return payload, raw.decode("utf-8")
+    finally:
+        response.close()
 
 
 def _result_from_payload(
@@ -639,15 +680,15 @@ def _fetch_tencent_one(
     batch_id: str,
     timeout: float,
 ) -> tuple[dict, str]:
-    response = session.get(
+    payload, raw = _bounded_json_get(
+        session,
         TENCENT_SOURCE_URL,
         params={"code": _sina_symbol(anchor.stock_code)},
         timeout=timeout,
     )
-    response.raise_for_status()
     captured_at = dt.datetime.now().replace(microsecond=0)
     rows = parse_tencent_session(
-        response.json(),
+        payload,
         anchor=anchor,
         trade_date=trade_date,
         captured_at=captured_at,
@@ -658,7 +699,7 @@ def _fetch_tencent_one(
         "rows": rows,
         "digest": _row_digest(rows),
         "captured_at": captured_at,
-    }, response.text
+    }, raw
 
 
 def _paced_fetch(
