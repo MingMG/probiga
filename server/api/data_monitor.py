@@ -42,9 +42,30 @@ PUBLIC_MINUTE_TIME_GRID = tuple(
     for hour, minute in ((9, 31), (13, 1))
     for offset in range(120)
 )
+PUBLIC_STOCK_MINUTE_TIME_GRID = tuple(
+    (
+        datetime(2000, 1, 1, 9, 31)
+        + timedelta(minutes=offset)
+    ).strftime("%H:%M:%S")
+    for offset in range(120)
+) + tuple(
+    (
+        datetime(2000, 1, 1, 13, 1)
+        + timedelta(minutes=offset)
+    ).strftime("%H:%M:%S")
+    for offset in range(117)
+) + ("15:00:00",)
 PUBLIC_MINUTE_SOURCE = "east_push2delay"
 PUBLIC_MINUTE_SOURCES = frozenset(
-    {PUBLIC_MINUTE_SOURCE, "tencent_minute"}
+    {
+        PUBLIC_MINUTE_SOURCE,
+        "tencent_minute",
+        "sina_public_1m",
+        "tencent_minute_verified",
+    }
+)
+PUBLIC_STOCK_MINUTE_SOURCES = frozenset(
+    {"sina_public_1m", "tencent_minute_verified"}
 )
 
 
@@ -445,6 +466,8 @@ class Observer:
             str(row.get("data_source") or "")
             for row in rows
         }
+        if sources and sources <= PUBLIC_STOCK_MINUTE_SOURCES:
+            return list(PUBLIC_STOCK_MINUTE_TIME_GRID)
         if sources and sources <= PUBLIC_MINUTE_SOURCES:
             return list(PUBLIC_MINUTE_TIME_GRID)
         return list(minute_time_grid())
@@ -679,7 +702,9 @@ class Observer:
                                   missing_limit=missing_limit)
                     info["unit"] = "只" if spec.key == "flow" else "条"
                     grid_profile = (
-                        "CN_A_SHARE_PUBLIC_240_V1"
+                        "CN_A_SHARE_PUBLIC_238_V1"
+                        if grid == list(PUBLIC_STOCK_MINUTE_TIME_GRID)
+                        else "CN_A_SHARE_PUBLIC_240_V1"
                         if grid == list(PUBLIC_MINUTE_TIME_GRID)
                         else "CN_A_SHARE_QMT_NATIVE_241_V1"
                         if grid

@@ -579,6 +579,13 @@ def test_partial_receipt_independently_replays_catalog_and_real_split_database(m
     c = _crawler()
     from server.common import scheduler_validation as validation
     result, rows, _, _ = _collection(monkeypatch, kind, {"000001": [_line(kind)], "600000": None})
+    if old and kind == "stock":
+        assert validation.scheduler_output_status(
+            _task(kind, old=old),
+            c._result_json(result),
+            return_code=0,
+        ) == "failed"
+        return
     primary, target, load = _replay_database(monkeypatch, result, rows)
     output = c._result_json(result)
     task = _task(kind, old=old)
@@ -675,6 +682,13 @@ def test_fixed_closed_skip_and_task_type_binding(kind, old):
     from server.common import scheduler_validation as validation
     payload = json.dumps({"status": "skipped", "reason": "market_closed", "now": "2026-09-11 16:00:00"})
     task = _task(kind, old=old, explicit=False)
+    if old and kind == "stock":
+        assert validation.scheduler_output_status(
+            task,
+            payload,
+            return_code=0,
+        ) == "failed"
+        return
     assert validation.scheduler_output_status(task, payload, return_code=0) == "skipped"
     task["script_args"] = "--type " + ("flow" if kind == "stock" else "stock") + " --skip-closed"
     assert validation.scheduler_output_status(task, payload, return_code=0) == "failed"

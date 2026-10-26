@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import gzip
 import hashlib
 import json
 import sys
@@ -38,11 +39,16 @@ from tools.env_config import load_project_env  # noqa: E402
 
 
 SOURCE = "sina_public_1m"
-DATA_VERSION = "sina_public_1m_238_v1"
+DATA_VERSION = "sina_public_1m_238_v2"
+TENCENT_SOURCE = "tencent_minute_verified"
+TENCENT_DATA_VERSION = "tencent_minute_verified_238_v1"
 RECEIPT_TABLE = "st_qmt_minute_sync_receipt_v2"
 SOURCE_URL = (
     "https://quotes.sina.cn/cn/api/json_v2.php/"
     "CN_MarketDataService.getKLineData"
+)
+TENCENT_SOURCE_URL = (
+    "https://web.ifzq.gtimg.cn/appstock/app/minute/query"
 )
 MINUTE_GRID = (
     tuple(
@@ -74,26 +80,114 @@ class DailyAnchor:
     close: Decimal
     high: Decimal
     low: Decimal
+    volume: Decimal | None = None
+    amount: Decimal | None = None
 
 
-def _decimal(value: object, *, positive: bool = False) -> Decimal:
+def _decimal(
+    value: object,
+    *,
+    positive: bool = False,
+    nonnegative: bool = False,
+) -> Decimal:
     try:
         number = Decimal(str(value).strip())
     except (InvalidOperation, TypeError, ValueError) as exc:
         raise ImportErrorBase("invalid numeric source value") from exc
-    if not number.is_finite() or (positive and number <= 0):
+    if (
+        not number.is_finite()
+        or (positive and number <= 0)
+        or (nonnegative and number < 0)
+    ):
         raise ImportErrorBase("invalid numeric source value")
     return number
 
 
 def _market_suffix(stock_code: str) -> str:
+    if stock_code.startswith(("4", "8", "92")):
+        return "BJ"
     if stock_code.startswith(("5", "6", "9")):
         return "SH"
     if stock_code.startswith(("0", "1", "2", "3")):
         return "SZ"
-    if stock_code.startswith(("4", "8")):
-        return "BJ"
     raise ImportErrorBase(f"unsupported stock-code namespace: {stock_code}")
+
+
+def _validate_anchor_totals(rows: Sequence[dict], anchor: DailyAnchor) -> None:
+    if anchor.volume is not None:
+        minute_volume = sum((row["volume"] for row in rows), Decimal("0"))
+        volume_tolerance = max(
+            Decimal("100"),
+            abs(anchor.volume) * Decimal("0.000001"),
+        )
+        if abs(minute_volume - anchor.volume) > volume_tolerance:
+            raise ImportErrorBase(
+                "minute volume differs from the verified daily anchor"
+            )
+    if anchor.amount is not None:
+        amounts = [row["amount"] for row in rows]
+        if all(amount is not None for amount in amounts):
+            minute_amount = sum(amounts, Decimal("0"))
+            tolerance = max(
+                Decimal("1"),
+                abs(anchor.amount) * Decimal("0.0001"),
+            )
+            if abs(minute_amount - anchor.amount) > tolerance:
+                raise ImportErrorBase(
+                    "minute amount differs from the verified daily anchor"
+                )
+
+
+def _fill_sina_no_trade_minutes(
+    rows: Sequence[dict],
+    *,
+    anchor: DailyAnchor,
+    target: dt.date,
+    captured_at: dt.datetime,
+    batch_id: str,
+) -> list[dict]:
+    """Prove omitted Sina minutes are no-trade intervals, then fill them."""
+    by_clock = {
+        row["trade_time"].strftime("%H:%M:%S"): dict(row)
+        for row in rows
+    }
+    previous_price = anchor.pre_close
+    filled: list[dict] = []
+    for clock in MINUTE_GRID:
+        if clock in by_clock:
+            row = by_clock[clock]
+            previous_price = row["price"]
+        else:
+            stamp = dt.datetime.combine(
+                target,
+                dt.time.fromisoformat(clock),
+            )
+            change = previous_price - anchor.pre_close
+            row = {
+                "stock_code": anchor.stock_code,
+                "trade_time": stamp,
+                "trade_date": target,
+                "price": previous_price,
+                "avg_price": None,
+                "change": change,
+                "change_pct": (
+                    change / anchor.pre_close * Decimal("100")
+                ),
+                "volume": Decimal("0"),
+                "amount": Decimal("0"),
+                "etl_sync_at": captured_at,
+                "qmt_code": anchor.qmt_code,
+                "data_source": SOURCE,
+                "source_time": stamp,
+                "received_at": captured_at,
+                "batch_id": batch_id,
+                "data_version": DATA_VERSION,
+                "quality_status": "VERIFIED",
+                "permission_status": "SUPPORTED",
+            }
+        filled.append(row)
+    _validate_anchor_totals(filled, anchor)
+    return filled
 
 
 def _sina_symbol(stock_code: str) -> str:
@@ -163,9 +257,12 @@ def parse_sina_session(
     ordered = sorted(rows, key=lambda row: row["trade_time"])
     actual_grid = tuple(row["trade_time"].strftime("%H:%M:%S") for row in ordered)
     if actual_grid != MINUTE_GRID:
-        raise ImportErrorBase(
-            f"incomplete source grid: expected={len(MINUTE_GRID)} "
-            f"actual={len(actual_grid)}"
+        return _fill_sina_no_trade_minutes(
+            ordered,
+            anchor=anchor,
+            target=target,
+            captured_at=captured_at,
+            batch_id=batch_id,
         )
     if (
         ordered[0]["price"] <= 0
@@ -175,11 +272,14 @@ def parse_sina_session(
         or min(row["price"] for row in ordered) < anchor.low - Decimal("0.011")
     ):
         raise ImportErrorBase("source bars differ from the verified daily anchor")
+    _validate_anchor_totals(ordered, anchor)
     return ordered
 
 
 def _row_digest(rows: Sequence[dict]) -> str:
     def stable_decimal(value: object) -> str:
+        if value is None:
+            return "null"
         number = Decimal(str(value))
         return format(number.quantize(Decimal("0.000001")), "f")
 
@@ -205,11 +305,13 @@ def _load_anchors(
     *,
     trade_date: str,
     stock_codes: Sequence[str],
-) -> dict[str, DailyAnchor]:
+) -> tuple[dict[str, DailyAnchor], frozenset[str]]:
     anchors: dict[str, DailyAnchor] = {}
+    no_trade_codes: set[str] = set()
     statement = text(
         """
-        SELECT stock_code, close, high, low, pre_close
+        SELECT stock_code, close, high, low, pre_close, volume, amount,
+               quality_status, permission_status
         FROM sm_stock_kline
         WHERE trade_date=:trade_date AND k_type=1 AND adjust_type=0
           AND stock_code IN :stock_codes
@@ -224,8 +326,22 @@ def _load_anchors(
             ).mappings().all()
         for row in rows:
             code = str(row["stock_code"]).zfill(6)
-            if code in anchors:
+            if code in anchors or code in no_trade_codes:
                 continue
+            if (
+                row["quality_status"] == "SUSPENDED"
+                and row["permission_status"] == "NO_TRADE"
+            ):
+                _decimal(row["pre_close"], positive=True)
+                no_trade_codes.add(code)
+                continue
+            if (
+                row["quality_status"] == "SUSPENDED"
+                or row["permission_status"] == "NO_TRADE"
+            ):
+                raise ImportErrorBase(
+                    f"inconsistent daily no-trade evidence: {code}"
+                )
             anchor = DailyAnchor(
                 stock_code=code,
                 qmt_code=f"{code}.{_market_suffix(code)}",
@@ -233,14 +349,16 @@ def _load_anchors(
                 close=_decimal(row["close"], positive=True),
                 high=_decimal(row["high"], positive=True),
                 low=_decimal(row["low"], positive=True),
+                volume=_decimal(row["volume"], nonnegative=True),
+                amount=_decimal(row["amount"], nonnegative=True),
             )
             anchors[code] = anchor
-    missing = sorted(set(stock_codes) - set(anchors))
+    missing = sorted(set(stock_codes) - set(anchors) - no_trade_codes)
     if missing:
         raise ImportErrorBase(
             "verified daily anchors are missing: " + ",".join(missing[:20])
         )
-    return anchors
+    return anchors, frozenset(no_trade_codes)
 
 
 def _fetch_one(
@@ -279,6 +397,267 @@ def _fetch_one(
     }, response.text
 
 
+def _cache_path(
+    directory: Path | None,
+    *,
+    source: str,
+    stock_code: str,
+) -> Path | None:
+    if directory is None:
+        return None
+    return directory / f"{stock_code}.{source}.json.gz"
+
+
+def _read_cached_payload(
+    directory: Path | None,
+    *,
+    source: str,
+    stock_code: str,
+) -> tuple[object, dt.datetime] | None:
+    path = _cache_path(
+        directory,
+        source=source,
+        stock_code=stock_code,
+    )
+    if path is None or not path.is_file():
+        return None
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as handle:
+            wrapper = json.load(handle)
+        payload = wrapper["payload"]
+        captured_at = dt.datetime.fromisoformat(wrapper["captured_at"])
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return None
+    if captured_at.tzinfo is not None:
+        return None
+    return payload, captured_at
+
+
+def _write_cached_payload(
+    directory: Path | None,
+    *,
+    source: str,
+    stock_code: str,
+    payload: object,
+    captured_at: dt.datetime,
+) -> None:
+    path = _cache_path(
+        directory,
+        source=source,
+        stock_code=stock_code,
+    )
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with gzip.open(temporary, "wt", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "source": source,
+                "stock_code": stock_code,
+                "captured_at": captured_at.isoformat(sep=" "),
+                "payload": payload,
+            },
+            handle,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    temporary.replace(path)
+
+
+def _new_source_session(proxy: str = "") -> requests.Session:
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept": "*/*",
+        "Referer": "https://finance.sina.com.cn/",
+    })
+    session.trust_env = False
+    if proxy:
+        session.proxies.update({"http": proxy, "https": proxy})
+    return session
+
+
+def _result_from_payload(
+    anchor: DailyAnchor,
+    payload: object,
+    *,
+    source: str,
+    trade_date: str,
+    captured_at: dt.datetime,
+    batch_id: str,
+) -> dict:
+    parser = (
+        parse_sina_session
+        if source == SOURCE
+        else parse_tencent_session
+    )
+    rows = parser(
+        payload,
+        anchor=anchor,
+        trade_date=trade_date,
+        captured_at=captured_at,
+        batch_id=batch_id,
+    )
+    return {
+        "stock_code": anchor.stock_code,
+        "rows": rows,
+        "digest": _row_digest(rows),
+        "captured_at": captured_at,
+    }
+
+
+def parse_tencent_session(
+    payload: object,
+    *,
+    anchor: DailyAnchor,
+    trade_date: str,
+    captured_at: dt.datetime,
+    batch_id: str,
+) -> list[dict]:
+    """Build the 238-bar public session from cumulative Tencent snapshots."""
+    if not isinstance(payload, dict):
+        raise ImportErrorBase("Tencent payload is not an object")
+    symbol = _sina_symbol(anchor.stock_code)
+    stock = (payload.get("data") or {}).get(symbol)
+    if not isinstance(stock, dict):
+        raise ImportErrorBase("Tencent payload is missing the requested symbol")
+    minute_data = stock.get("data")
+    if not isinstance(minute_data, dict):
+        raise ImportErrorBase("Tencent minute data is missing")
+    if str(minute_data.get("date") or "") != trade_date.replace("-", ""):
+        raise ImportErrorBase("Tencent minute data has the wrong date")
+    raw_rows = minute_data.get("data")
+    if not isinstance(raw_rows, list) or not raw_rows or len(raw_rows) > 400:
+        raise ImportErrorBase("Tencent minute rows are invalid")
+    cumulative: dict[str, tuple[Decimal, Decimal | None]] = {}
+    prices: dict[str, Decimal] = {}
+    for raw in raw_rows:
+        if not isinstance(raw, str):
+            raise ImportErrorBase("Tencent minute row is not text")
+        parts = raw.split()
+        if len(parts) < 3 or len(parts[0]) != 4 or not parts[0].isdigit():
+            raise ImportErrorBase("Tencent minute row is invalid")
+        clock = parts[0]
+        if clock in cumulative:
+            raise ImportErrorBase("Tencent minute clock is duplicated")
+        prices[clock] = _decimal(parts[1], positive=True)
+        cumulative[clock] = (
+            _decimal(parts[2], nonnegative=True),
+            (
+                _decimal(parts[3], nonnegative=True)
+                if len(parts) >= 4
+                else None
+            ),
+        )
+    previous_volume = Decimal("0")
+    previous_amount: Decimal | None = Decimal("0")
+    opening_snapshot = cumulative.get("0930")
+    if opening_snapshot is None:
+        raise ImportErrorBase("Tencent opening snapshot is missing")
+    target = dt.date.fromisoformat(trade_date)
+    rows: list[dict] = []
+    for clock in MINUTE_GRID:
+        compact = clock.replace(":", "")[:4]
+        if compact not in cumulative or compact not in prices:
+            raise ImportErrorBase(f"Tencent minute snapshot is missing: {clock}")
+        price = prices[compact]
+        volume, amount = cumulative[compact]
+        volume_delta = volume - previous_volume
+        amount_delta = (
+            amount - previous_amount
+            if amount is not None and previous_amount is not None
+            else None
+        )
+        if volume_delta < 0 or (
+            amount_delta is not None and amount_delta < -1
+        ):
+            raise ImportErrorBase("Tencent cumulative series is not monotonic")
+        if amount_delta is not None and amount_delta < 0:
+            amount_delta = Decimal("0")
+        previous_volume, previous_amount = volume, amount
+        stamp = dt.datetime.combine(
+            target,
+            dt.time.fromisoformat(clock),
+        )
+        change = price - anchor.pre_close
+        rows.append({
+            "stock_code": anchor.stock_code,
+            "trade_time": stamp,
+            "trade_date": target,
+            "price": price,
+            "avg_price": None,
+            "change": change,
+            "change_pct": change / anchor.pre_close * Decimal("100"),
+            "volume": volume_delta * Decimal("100"),
+            "amount": amount_delta,
+            "etl_sync_at": captured_at,
+            "qmt_code": anchor.qmt_code,
+            "data_source": TENCENT_SOURCE,
+            "source_time": stamp,
+            "received_at": captured_at,
+            "batch_id": batch_id,
+            "data_version": TENCENT_DATA_VERSION,
+            "quality_status": "VERIFIED",
+            "permission_status": "SUPPORTED",
+        })
+    ordered = sorted(rows, key=lambda row: row["trade_time"])
+    actual_grid = tuple(row["trade_time"].strftime("%H:%M:%S") for row in ordered)
+    if actual_grid != MINUTE_GRID:
+        raise ImportErrorBase("Tencent session does not cover the canonical grid")
+    if (
+        abs(ordered[-1]["price"] - anchor.close) > Decimal("0.011")
+        or max(row["price"] for row in ordered) > anchor.high + Decimal("0.011")
+        or min(row["price"] for row in ordered) < anchor.low - Decimal("0.011")
+    ):
+        raise ImportErrorBase("Tencent bars differ from the verified daily anchor")
+    return ordered
+
+
+def _fetch_tencent_one(
+    anchor: DailyAnchor,
+    *,
+    session: requests.Session,
+    trade_date: str,
+    batch_id: str,
+    timeout: float,
+) -> tuple[dict, str]:
+    response = session.get(
+        TENCENT_SOURCE_URL,
+        params={"code": _sina_symbol(anchor.stock_code)},
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    captured_at = dt.datetime.now().replace(microsecond=0)
+    rows = parse_tencent_session(
+        response.json(),
+        anchor=anchor,
+        trade_date=trade_date,
+        captured_at=captured_at,
+        batch_id=batch_id,
+    )
+    return {
+        "stock_code": anchor.stock_code,
+        "rows": rows,
+        "digest": _row_digest(rows),
+        "captured_at": captured_at,
+    }, response.text
+
+
+def _paced_fetch(
+    fetcher,
+    anchor: DailyAnchor,
+    *,
+    request_delay: float,
+    **kwargs,
+):
+    try:
+        return fetcher(anchor, **kwargs)
+    finally:
+        time.sleep(max(0.0, request_delay))
+
+
 def _receipt_id(trade_date: str, content_sha256: str) -> str:
     return hashlib.sha256(
         f"{SOURCE}|{trade_date}|{content_sha256}".encode("ascii")
@@ -295,6 +674,7 @@ def _write_receipt(
     content_sha256: str,
     status: str,
     evidence: dict,
+    source_provider: str = SOURCE,
 ) -> str:
     receipt_id = _receipt_id(trade_date, content_sha256)
     with engine.begin() as connection:
@@ -332,7 +712,7 @@ def _write_receipt(
                     if expected_count else 0.0
                 ),
                 "row_count": int(row_count),
-                "source_provider": SOURCE,
+                "source_provider": source_provider,
                 "quality_status": status,
                 "evidence_json": json.dumps(
                     {**evidence, "grid_sha256": GRID_SHA256},
@@ -412,6 +792,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--workers", type=int, default=6)
     parser.add_argument("--timeout", type=float, default=20.0)
+    parser.add_argument("--request-delay", type=float, default=0.25)
+    parser.add_argument("--min-coverage", type=float, default=0.95)
+    parser.add_argument("--checkpoint-dir")
     parser.add_argument("--proxy", default="")
     parser.add_argument("--json", action="store_true")
     return parser
@@ -421,8 +804,13 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     load_project_env()
     dt.date.fromisoformat(args.trade_date)
-    if not 1 <= int(args.workers) <= 16 or not 1 <= float(args.timeout) <= 60:
-        raise ValueError("workers or timeout is outside the bounded range")
+    if (
+        not 1 <= int(args.workers) <= 16
+        or not 1 <= float(args.timeout) <= 60
+        or not 0 <= float(args.request_delay) <= 5
+        or not 0 < float(args.min_coverage) <= 1
+    ):
+        raise ValueError("collection bounds are outside the allowed range")
     primary_engine = create_batch_engine()
     kline_url = get_kline_mysql_url()
     kline_engine = (
@@ -433,47 +821,86 @@ def main(argv: list[str] | None = None) -> int:
     )
     minute_engine = get_minute_engine()
     codes = _selected_codes(args, primary_engine)
-    anchors = _load_anchors(
+    anchors, no_trade_codes = _load_anchors(
         kline_engine,
         trade_date=args.trade_date,
         stock_codes=codes,
     )
+    if not anchors:
+        raise ImportErrorBase("verified daily anchors contain no tradable codes")
     batch_id = f"{SOURCE}-{args.trade_date}-{uuid.uuid4().hex[:12]}"
+    checkpoint_dir = (
+        Path(args.checkpoint_dir).expanduser().resolve()
+        if args.checkpoint_dir else None
+    )
+    if checkpoint_dir is not None:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "Accept": "*/*",
-        "Referer": "https://finance.sina.com.cn/",
-    })
-    if args.proxy:
-        session.proxies.update({"http": args.proxy, "https": args.proxy})
+    session = _new_source_session(args.proxy)
     results: dict[str, dict] = {}
     failures: dict[str, str] = {}
+    remaining: list[str] = []
+    for code in sorted(anchors):
+        restored = False
+        for source in (SOURCE, TENCENT_SOURCE):
+            cached = _read_cached_payload(
+                checkpoint_dir,
+                source=source,
+                stock_code=code,
+            )
+            if cached is None:
+                continue
+            payload, captured_at = cached
+            try:
+                results[code] = _result_from_payload(
+                    anchors[code],
+                    payload,
+                    source=source,
+                    trade_date=args.trade_date,
+                    captured_at=captured_at,
+                    batch_id=batch_id,
+                )
+                restored = True
+                break
+            except ImportErrorBase:
+                continue
+        if not restored:
+            remaining.append(code)
+    restored_count = len(results)
     started = time.monotonic()
     try:
         with ThreadPoolExecutor(max_workers=int(args.workers)) as pool:
             futures = {
                 pool.submit(
+                    _paced_fetch,
                     _fetch_one,
                     anchors[code],
                     session=session,
                     trade_date=args.trade_date,
                     batch_id=batch_id,
                     timeout=float(args.timeout),
+                    request_delay=float(args.request_delay),
                 ): code
-                for code in codes
+                for code in remaining
             }
             for index, future in enumerate(as_completed(futures), 1):
                 code = futures[future]
                 try:
-                    result, _raw = future.result()
+                    result, raw = future.result()
                     results[code] = result
+                    _write_cached_payload(
+                        checkpoint_dir,
+                        source=SOURCE,
+                        stock_code=code,
+                        payload=json.loads(raw),
+                        captured_at=result["captured_at"],
+                    )
                 except Exception as exc:
                     failures[code] = f"{type(exc).__name__}: {exc}"
                 if index % 100 == 0:
                     print(
-                        f"minute source checked={index}/{len(codes)} "
+                        f"minute source checked={restored_count + index}/"
+                        f"{len(anchors)} "
                         f"complete={len(results)} failed={len(failures)}",
                         file=sys.stderr,
                         flush=True,
@@ -481,20 +908,96 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         session.close()
 
-    coverage = len(results) / len(codes) if codes else 0.0
-    minimum_coverage = 1.0 if args.stock_code and not args.all_catalog else 0.95
+    if failures:
+        fallback_failures: dict[str, str] = {}
+        fallback_codes = sorted(set(failures) & set(anchors))
+        session = _new_source_session(args.proxy)
+        try:
+            with ThreadPoolExecutor(max_workers=int(args.workers)) as pool:
+                futures = {
+                    pool.submit(
+                        _paced_fetch,
+                        _fetch_tencent_one,
+                        anchors[code],
+                        session=session,
+                        trade_date=args.trade_date,
+                        batch_id=batch_id,
+                        timeout=float(args.timeout),
+                        request_delay=float(args.request_delay),
+                    ): code
+                    for code in fallback_codes
+                }
+                for index, future in enumerate(as_completed(futures), 1):
+                    code = futures[future]
+                    try:
+                        result, raw = future.result()
+                        results[code] = result
+                        failures.pop(code, None)
+                        _write_cached_payload(
+                            checkpoint_dir,
+                            source=TENCENT_SOURCE,
+                            stock_code=code,
+                            payload=json.loads(raw),
+                            captured_at=result["captured_at"],
+                        )
+                    except Exception as exc:
+                        fallback_failures[code] = (
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                    if index % 100 == 0:
+                        print(
+                            f"minute fallback checked={index}/{len(fallback_codes)} "
+                            f"complete={len(results)} failed={len(fallback_failures)}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+        finally:
+            session.close()
+        failures.update(fallback_failures)
+
+    coverage = (
+        (len(results) + len(no_trade_codes)) / len(codes)
+        if codes else 0.0
+    )
+    minimum_coverage = (
+        1.0 if args.stock_code and not args.all_catalog
+        else float(args.min_coverage)
+    )
     content_rows = [
         row
         for code in sorted(results)
         for row in results[code]["rows"]
     ]
     content_sha256 = _row_digest(content_rows)
+    source_counts: dict[str, int] = {}
+    for row in content_rows:
+        source = str(row["data_source"])
+        source_counts[source] = source_counts.get(source, 0) + 1
+    amount_missing_codes = sorted({
+        str(row["stock_code"])
+        for row in content_rows
+        if row["amount"] is None
+    })
+    provider = (
+        f"{SOURCE}+{TENCENT_SOURCE}"
+        if TENCENT_SOURCE in source_counts
+        else SOURCE
+    )
     evidence = {
         "source": SOURCE,
         "source_url": SOURCE_URL,
+        "fallback_source": TENCENT_SOURCE,
+        "fallback_source_url": TENCENT_SOURCE_URL,
+        "provider": provider,
+        "source_counts": source_counts,
+        "amount_missing_codes": amount_missing_codes,
+        "amount_missing_count": len(amount_missing_codes),
         "trade_date": args.trade_date,
         "batch_id": batch_id,
         "expected_codes": len(codes),
+        "tradable_codes": len(anchors),
+        "no_trade_codes": sorted(no_trade_codes),
+        "no_trade_count": len(no_trade_codes),
         "complete_codes": len(results),
         "failed_codes": len(failures),
         "failure_samples": dict(sorted(failures.items())[:20]),
@@ -504,6 +1007,7 @@ def main(argv: list[str] | None = None) -> int:
         "elapsed_seconds": round(time.monotonic() - started, 3),
     }
     report = {
+        "schema": "probiga.public-stock-minute-result.v1",
         "status": (
             "READY"
             if coverage >= minimum_coverage and content_rows
@@ -512,6 +1016,11 @@ def main(argv: list[str] | None = None) -> int:
         "apply": bool(args.apply),
         "coverage": round(coverage, 8),
         "minimum_coverage": minimum_coverage,
+        "acquisition_status": (
+            "COMPLETE"
+            if coverage == 1.0 and not failures
+            else "PARTIAL"
+        ),
         **evidence,
     }
     if report["status"] != "READY":
@@ -519,12 +1028,13 @@ def main(argv: list[str] | None = None) -> int:
             _write_receipt(
                 minute_engine,
                 trade_date=args.trade_date,
-                expected_count=len(codes),
+                expected_count=len(anchors),
                 observed_count=len(results),
                 row_count=len(content_rows),
                 content_sha256=content_sha256,
                 status="FAILED",
                 evidence=report,
+                source_provider=provider,
             )
         print(json.dumps(report, ensure_ascii=False, indent=1))
         return 2
@@ -532,12 +1042,13 @@ def main(argv: list[str] | None = None) -> int:
     receipt_id = _write_receipt(
         minute_engine,
         trade_date=args.trade_date,
-        expected_count=len(codes),
+        expected_count=len(anchors),
         observed_count=len(results),
         row_count=len(content_rows),
         content_sha256=content_sha256,
         status="RUNNING",
         evidence=report,
+        source_provider=provider,
     )
     report["receipt_id"] = receipt_id
     if not args.apply:
@@ -566,32 +1077,40 @@ def main(argv: list[str] | None = None) -> int:
                 "database readback differs from the parsed source content"
             )
         report.update({
+            "status": "PASS",
             "written_rows": written,
             "readback_rows": readback_rows,
             "readback_codes": readback_codes,
             "readback_sha256": readback_sha256,
+            "acquisition_status": (
+                "COMPLETE"
+                if len(results) == len(anchors) and not failures
+                else "PARTIAL"
+            ),
         })
         _write_receipt(
             minute_engine,
             trade_date=args.trade_date,
-            expected_count=len(codes),
+            expected_count=len(anchors),
             observed_count=len(results),
             row_count=readback_rows,
             content_sha256=content_sha256,
             status="PASS",
             evidence=report,
+            source_provider=provider,
         )
     except Exception as exc:
         report["error"] = f"{type(exc).__name__}: {exc}"
         _write_receipt(
             minute_engine,
             trade_date=args.trade_date,
-            expected_count=len(codes),
+            expected_count=len(anchors),
             observed_count=len(results),
             row_count=len(content_rows),
             content_sha256=content_sha256,
             status="FAILED",
             evidence=report,
+            source_provider=provider,
         )
         print(json.dumps(report, ensure_ascii=False, indent=1))
         return 2

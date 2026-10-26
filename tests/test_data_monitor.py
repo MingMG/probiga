@@ -82,6 +82,10 @@ def test_public_minute_grid_has_exact_240_eastmoney_slots():
     assert len(dm.PUBLIC_MINUTE_TIME_GRID) == 240
     assert dm.PUBLIC_MINUTE_TIME_GRID[:2] == ('09:31:00', '09:32:00')
     assert dm.PUBLIC_MINUTE_TIME_GRID[-2:] == ('14:59:00', '15:00:00')
+    assert len(dm.PUBLIC_STOCK_MINUTE_TIME_GRID) == 238
+    assert dm.PUBLIC_STOCK_MINUTE_TIME_GRID[-3:] == (
+        '14:56:00', '14:57:00', '15:00:00'
+    )
 
 
 def test_calendar_requires_authoritative_record_not_weekday():

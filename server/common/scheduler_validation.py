@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import math
 import os
 import re
 import shlex
@@ -1340,6 +1341,11 @@ _PUBLIC_MINUTE_TASKS = {
     "intraday_minute_kline": "stock", "intraday_minute_flow": "flow",
     "stock_minute": "stock", "stock_minute_flow": "flow",
 }
+_PUBLIC_STOCK_MINUTE_SCHEMA = "probiga.public-stock-minute-result.v1"
+_PUBLIC_MINUTE_SOURCE_NAMES = {
+    "sina_public_1m",
+    "tencent_minute_verified",
+}
 
 
 def _minute_reuse_payload(task, output, return_code):
@@ -1448,7 +1454,113 @@ def _public_minute_options(task):
     return options
 
 
+def _is_imported_public_stock_minute(task):
+    return (
+        str(task.get("task_type") or "") == "stock_minute"
+        and str(task.get("script_path") or "").replace("\\", "/").strip()
+        == "tools/crawl_minute_kline.py"
+    )
+
+
+def _public_stock_minute_payload(task, output, return_code):
+    if not _is_imported_public_stock_minute(task) or return_code != 0:
+        return None
+    payload = _single_nested_machine_payload(
+        output,
+        schema=_PUBLIC_STOCK_MINUTE_SCHEMA,
+    )
+    if payload is None:
+        return None
+    options = _public_minute_options(task)
+    target = (
+        task.get("_scheduler_target_trade_date")
+        or payload.get("trade_date")
+    )
+    expected = payload.get("expected_codes")
+    tradable = payload.get("tradable_codes")
+    no_trade = payload.get("no_trade_count")
+    complete = payload.get("complete_codes")
+    failed = payload.get("failed_codes")
+    row_count = payload.get("row_count")
+    written = payload.get("written_rows")
+    readback_rows = payload.get("readback_rows")
+    readback_codes = payload.get("readback_codes")
+    source_counts = payload.get("source_counts")
+    no_trade_codes = payload.get("no_trade_codes")
+    if (
+        payload.get("status") != "PASS"
+        or payload.get("trade_date") != target
+        or payload.get("minutes_per_code") != 238
+        or type(expected) is not int
+        or type(tradable) is not int
+        or type(no_trade) is not int
+        or type(complete) is not int
+        or type(failed) is not int
+        or not (0 < tradable <= expected <= 10000)
+        or no_trade < 0
+        or complete < 0
+        or failed < 0
+        or tradable + no_trade != expected
+        or complete + failed != tradable
+        or type(row_count) is not int
+        or row_count != complete * 238
+        or written != row_count
+        or readback_rows != row_count
+        or readback_codes != complete
+        or payload.get("content_sha256")
+        != payload.get("readback_sha256")
+        or _is_hex(payload.get("receipt_id"), 64) is False
+        or not isinstance(no_trade_codes, list)
+        or len(no_trade_codes) != no_trade
+        or no_trade_codes != sorted(set(no_trade_codes))
+        or any(
+            not isinstance(code, str)
+            or len(code) != 6
+            or not code.isdigit()
+            for code in no_trade_codes
+        )
+        or not isinstance(source_counts, dict)
+        or not source_counts
+        or not set(source_counts) <= _PUBLIC_MINUTE_SOURCE_NAMES
+        or any(type(value) is not int or value <= 0 for value in source_counts.values())
+        or sum(source_counts.values()) != row_count
+    ):
+        raise ValueError("public stock minute receipt differs")
+    coverage = float(payload.get("coverage") or 0.0)
+    minimum = float(payload.get("minimum_coverage") or 0.0)
+    if (
+        not math.isfinite(coverage)
+        or not math.isfinite(minimum)
+        or options.trade_date != target
+        or abs(
+            coverage - (complete + no_trade) / expected
+        )
+        > 1e-8
+        or coverage < max(options.min_coverage, minimum)
+        or payload.get("acquisition_status")
+        != ("COMPLETE" if failed == 0 else "PARTIAL")
+    ):
+        raise ValueError("public stock minute coverage differs")
+    return payload
+
+
 def _public_minute_output_status(task, output, return_code):
+    if _is_imported_public_stock_minute(task):
+        try:
+            payload = _public_stock_minute_payload(
+                task,
+                output,
+                return_code,
+            )
+            if payload is None:
+                return "failed"
+            return (
+                "success"
+                if payload.get("acquisition_status") == "COMPLETE"
+                else "degraded"
+            )
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return "failed"
     try:
         from tools.crawl_minute_kline import validate_result
 
@@ -1480,6 +1592,98 @@ def _public_minute_output_status(task, output, return_code):
 
 
 def _validate_public_minute_result(task, *, engine, started_at, now, output):
+    if _is_imported_public_stock_minute(task):
+        try:
+            payload = _public_stock_minute_payload(task, output, 0)
+            target = payload["trade_date"]
+            source_counts = payload["source_counts"]
+            source_tokens = {
+                f"source_{index}": source
+                for index, source in enumerate(sorted(source_counts))
+            }
+            with engine.connect() as connection:
+                actual = connection.execute(
+                    text(
+                        "SELECT COUNT(*) AS row_count,"
+                        "COUNT(DISTINCT stock_code) AS code_count,"
+                        "MIN(trade_time) AS first_trade_time,"
+                        "MAX(trade_time) AS last_trade_time "
+                        "FROM sm_stock_minute "
+                        "WHERE trade_date=:target "
+                        "AND data_source IN ("
+                        + ",".join(f":{name}" for name in source_tokens)
+                        + ")"
+                    ),
+                    {"target": target, **source_tokens},
+                ).mappings().one()
+                persisted_counts = {
+                    str(row["data_source"]): int(row["row_count"])
+                    for row in connection.execute(
+                        text(
+                            "SELECT data_source, COUNT(*) AS row_count "
+                            "FROM sm_stock_minute "
+                            "WHERE trade_date=:target "
+                            "AND data_source IN ("
+                            + ",".join(f":{name}" for name in source_tokens)
+                            + ") GROUP BY data_source"
+                        ),
+                        {"target": target, **source_tokens},
+                    ).mappings()
+                }
+                receipt = connection.execute(
+                    text(
+                        "SELECT trade_date, expected_count, observed_count, "
+                        "row_count, source_provider, quality_status "
+                        "FROM st_qmt_minute_sync_receipt_v2 "
+                        "WHERE receipt_id=:receipt_id"
+                    ),
+                    {"receipt_id": payload["receipt_id"]},
+                ).mappings().one_or_none()
+            expected_first = datetime.fromisoformat(f"{target} 09:31:00")
+            expected_last = datetime.fromisoformat(f"{target} 15:00:00")
+            if (
+                int(actual["row_count"] or 0) != payload["row_count"]
+                or int(actual["code_count"] or 0)
+                != payload["complete_codes"]
+                or actual["first_trade_time"] != expected_first
+                or actual["last_trade_time"] != expected_last
+                or persisted_counts != source_counts
+                or receipt is None
+                or str(receipt["trade_date"]) != target
+                or int(receipt["expected_count"] or 0)
+                != payload["tradable_codes"]
+                or int(receipt["observed_count"] or 0)
+                != payload["complete_codes"]
+                or int(receipt["row_count"] or 0) != payload["row_count"]
+                or receipt["quality_status"] != "PASS"
+                or receipt["source_provider"]
+                != (
+                    "sina_public_1m+tencent_minute_verified"
+                    if "tencent_minute_verified" in source_counts
+                    else "sina_public_1m"
+                )
+            ):
+                raise ValueError("public stock minute database readback differs")
+            return SchedulerValidationResult(
+                checked=True,
+                ok=True,
+                message=(
+                    "public stock minute receipt and persisted partition "
+                    f"verified: date={target} rows={payload['row_count']} "
+                    f"codes={payload['complete_codes']} "
+                    f"no_trade={payload['no_trade_count']} "
+                    f"status={payload['acquisition_status']}"
+                ),
+            )
+        except Exception as exc:
+            return SchedulerValidationResult(
+                checked=True,
+                ok=False,
+                message=(
+                    "public stock minute validation failed: "
+                    + type(exc).__name__
+                ),
+            )
     try:
         from tools.crawl_minute_kline import replay_result
 

@@ -218,18 +218,16 @@ PUBLIC_STOCK_MINUTE_TASK = {
     "task_type": "stock_minute",
     "group_name": "行情数据",
     "script_path": "tools/crawl_minute_kline.py",
-    "script_args": (
-        "--type stock --min-coverage 0.99 --request-delay 0.03 "
-        "--request-jitter 0.02 --batch-every 0 --fetch-attempts 2"
-    ),
+    "script_args": "--type stock --min-coverage 0.99",
     "cron_time": "17:30",
     "interval_minutes": 0,
     "enabled": 1,
     "sort_order": 91,
     "date_param": "",
     "description": (
-        "盘后从东财 push2delay 获取完整240分钟网格，原子替换目标日股票分区，"
-        "与免费日线的停牌豁免绑定，不调用QMT。"
+        "盘后从新浪公开分钟源获取目标日成交分钟，仅在日线成交量与成交额"
+        "守恒时补齐零成交分钟；源端受限时逐股改用腾讯累计分钟快照，"
+        "原子替换完整代码分区，不调用QMT。"
     ),
 }
 

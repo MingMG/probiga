@@ -38,6 +38,7 @@ SOURCES = {
         "east_push2delay": 240,
         "gj_big_qmt_inner": 241,
         "sina_public_1m": 238,
+        "tencent_minute_verified": 238,
     },
     "flow": {"east_push2delay": 240, "gj_qmt_transactioncount1m": 241},
 }

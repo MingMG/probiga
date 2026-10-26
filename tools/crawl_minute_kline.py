@@ -1168,6 +1168,77 @@ def main():
     global DELAY, JITTER, BATCH_EVERY, BATCH_PAUSE, FETCH_ATTEMPTS, RETRY_DELAY
     args = _build_parser().parse_args()
     started = _now()
+    if args.type == "stock":
+        task_type = os.environ.get("PROBIGA_SCHEDULER_TASK_TYPE")
+        if task_type and PUBLIC_MINUTE_TASKS.get(task_type) != "stock":
+            print(_result_json({
+                "schema": RESULT_SCHEMA,
+                "status": "failed",
+                "error": "ValueError",
+                "reason": "scheduler task dataset differs",
+            }), flush=True)
+            return 2
+        target_date = args.trade_date or started.date().isoformat()
+        build = str(
+            os.environ.get("PROBIGA_SCHEDULER_BUILD_SHA")
+            or os.environ.get("PROBIGA_BUILD_COMMIT_SHA")
+            or ""
+        ).lower()
+        if not re.fullmatch(r"[0-9a-f]{40}", build) or build == "0" * 40:
+            raise ValueError("build identity unavailable")
+        from server.common.minute_acquisition_reuse import (
+            inspect_complete_partition,
+            result_for,
+        )
+
+        existing = inspect_complete_partition(
+            create_batch_engine(),
+            get_kline_engine(),
+            kind="stock",
+            trade_date=target_date,
+            now=started,
+        )
+        if existing is not None:
+            print(_result_json(result_for(
+                [existing],
+                task_type=task_type or "intraday_minute_kline",
+                build_sha=build,
+                started_at=started,
+            )), flush=True)
+            return 0
+        if args.limit:
+            print(_result_json({
+                "schema": RESULT_SCHEMA,
+                "status": "failed",
+                "error": "ValueError",
+                "reason": "public stock minute requires the full catalog",
+            }), flush=True)
+            return 2
+        from tools.import_sina_minute_history import main as import_public_stock_minute
+
+        checkpoint_root = Path(
+            os.environ.get(
+                "PROBIGA_JOB_LOG_ROOT",
+                "/var/lib/probiga/jobs",
+            )
+        )
+        return import_public_stock_minute([
+            "--trade-date",
+            target_date,
+            "--all-catalog",
+            "--apply",
+            "--workers",
+            "2",
+            "--timeout",
+            "20",
+            "--request-delay",
+            "0.4",
+            "--min-coverage",
+            str(args.min_coverage),
+            "--checkpoint-dir",
+            str(checkpoint_root / "public-stock-minute" / target_date),
+            "--json",
+        ])
     try:
         task_type = os.environ.get("PROBIGA_SCHEDULER_TASK_TYPE")
         if task_type and PUBLIC_MINUTE_TASKS.get(task_type) != args.type:
