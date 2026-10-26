@@ -26,6 +26,7 @@ from tools.import_sina_minute_history import (
     _readback_proofs,
     _load_anchors,
     _row_digest,
+    _source_circuit_tripped,
     parse_sina_session,
     parse_tencent_session,
 )
@@ -196,6 +197,11 @@ def test_each_fetch_worker_uses_its_own_source_session(monkeypatch):
     assert {id(session) for session in result} == {
         id(session) for session in sessions
     }
+
+
+def test_source_circuit_opens_after_twenty_consecutive_failures():
+    assert not _source_circuit_tripped(19)
+    assert _source_circuit_tripped(20)
 
 
 def test_streaming_readback_uses_per_code_proofs():

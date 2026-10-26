@@ -58,6 +58,7 @@ SOURCE_URL = (
 TENCENT_SOURCE_URL = (
     "https://web.ifzq.gtimg.cn/appstock/app/minute/query"
 )
+SOURCE_FAILURE_CIRCUIT = 20
 MINUTE_GRID = (
     tuple(
         (dt.datetime(2000, 1, 1, 9, 31) + dt.timedelta(minutes=index)).strftime(
@@ -78,6 +79,10 @@ GRID_SHA256 = hashlib.sha256("".join(MINUTE_GRID).encode("ascii")).hexdigest()
 
 class ImportErrorBase(RuntimeError):
     """A terminal source or validation failure for one stock."""
+
+
+def _source_circuit_tripped(consecutive_failures: int) -> bool:
+    return consecutive_failures >= SOURCE_FAILURE_CIRCUIT
 
 
 @dataclass(frozen=True)
@@ -1006,6 +1011,8 @@ def main(argv: list[str] | None = None) -> int:
             remaining.append(code)
     restored_count = len(proofs)
     started = time.monotonic()
+    consecutive_failures = 0
+    source_circuit_open = False
     with ThreadPoolExecutor(max_workers=int(args.workers)) as pool:
         futures = {
             pool.submit(
@@ -1025,6 +1032,7 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 result, raw = future.result()
                 consume(code, result)
+                consecutive_failures = 0
                 _write_cached_payload(
                     checkpoint_dir,
                     source=SOURCE,
@@ -1034,6 +1042,18 @@ def main(argv: list[str] | None = None) -> int:
                 )
             except Exception as exc:
                 failures[code] = f"{type(exc).__name__}: {exc}"
+                consecutive_failures += 1
+            if _source_circuit_tripped(consecutive_failures):
+                source_circuit_open = True
+                for pending in futures:
+                    pending.cancel()
+                print(
+                    "minute source circuit open: "
+                    f"consecutive_failures={consecutive_failures}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                break
             if index % 100 == 0:
                 print(
                     f"minute source checked={restored_count + index}/"
@@ -1041,6 +1061,13 @@ def main(argv: list[str] | None = None) -> int:
                     f"complete={len(proofs)} failed={len(failures)}",
                     file=sys.stderr,
                     flush=True,
+                )
+    if source_circuit_open:
+        for code in remaining:
+            if code not in proofs:
+                failures.setdefault(
+                    code,
+                    "MinuteSourceError: source circuit open",
                 )
 
     if failures:
