@@ -56,7 +56,10 @@ SOURCE_URL = (
     "CN_MarketDataService.getKLineData"
 )
 TENCENT_SOURCE_URL = (
-    "https://web.ifzq.gtimg.cn/appstock/app/minute/query"
+    "https://ifzq.gtimg.cn/appstock/app/minute/query"
+)
+TENCENT_KLINE_SOURCE_URL = (
+    "https://ifzq.gtimg.cn/appstock/app/kline/mkline"
 )
 SOURCE_FAILURE_CIRCUIT = 20
 MINUTE_GRID = (
@@ -694,6 +697,113 @@ def parse_tencent_session(
     return ordered
 
 
+def parse_tencent_kline_session(
+    payload: object,
+    *,
+    anchor: DailyAnchor,
+    trade_date: str,
+    captured_at: dt.datetime,
+    batch_id: str,
+) -> list[dict]:
+    """Build the 238-bar session from Tencent's 241-row m1 history."""
+    if not isinstance(payload, dict):
+        raise ImportErrorBase("Tencent K-line payload is not an object")
+    symbol = _sina_symbol(anchor.stock_code)
+    stock = (payload.get("data") or {}).get(symbol)
+    if not isinstance(stock, dict):
+        raise ImportErrorBase("Tencent K-line payload is missing the symbol")
+    raw_rows = stock.get("m1")
+    if not isinstance(raw_rows, list) or len(raw_rows) > 400:
+        raise ImportErrorBase("Tencent K-line rows are invalid")
+    target_prefix = trade_date.replace("-", "")
+    observed: dict[str, dict] = {}
+    for raw in raw_rows:
+        if not isinstance(raw, list) or len(raw) < 6:
+            raise ImportErrorBase("Tencent K-line row is invalid")
+        stamp = str(raw[0])
+        if len(stamp) != 12 or not stamp.isdigit():
+            raise ImportErrorBase("Tencent K-line timestamp is invalid")
+        if not stamp.startswith(target_prefix):
+            continue
+        clock = f"{stamp[8:10]}:{stamp[10:12]}:00"
+        if clock in observed:
+            raise ImportErrorBase("Tencent K-line clock is duplicated")
+        opening = _decimal(raw[1], positive=True)
+        closing = _decimal(raw[2], positive=True)
+        high = _decimal(raw[3], positive=True)
+        low = _decimal(raw[4], positive=True)
+        volume = _decimal(raw[5], nonnegative=True) * Decimal("100")
+        if not low <= opening <= high or not low <= closing <= high:
+            raise ImportErrorBase("Tencent K-line OHLC is inconsistent")
+        observed[clock] = {
+            "price": closing,
+            "high": high,
+            "low": low,
+            "volume": volume,
+        }
+    if not observed:
+        raise ImportErrorBase("Tencent K-line has no target-date rows")
+    target = dt.date.fromisoformat(trade_date)
+    rows: list[dict] = []
+    for clock in MINUTE_GRID:
+        if clock == "09:31:00":
+            opening_minute = observed.get("09:30:00")
+            first_minute = observed.get(clock)
+            if opening_minute is None or first_minute is None:
+                raise ImportErrorBase("Tencent opening K-line is missing")
+            price = first_minute["price"]
+            volume = opening_minute["volume"] + first_minute["volume"]
+        elif clock == "15:00:00":
+            closing_rows = [
+                observed.get("14:58:00"),
+                observed.get("14:59:00"),
+                observed.get(clock),
+            ]
+            if any(value is None for value in closing_rows):
+                raise ImportErrorBase("Tencent closing K-line is missing")
+            price = closing_rows[-1]["price"]
+            volume = sum(
+                value["volume"]
+                for value in closing_rows
+            )
+        else:
+            value = observed.get(clock)
+            if value is None:
+                raise ImportErrorBase(f"Tencent K-line is missing: {clock}")
+            price = value["price"]
+            volume = value["volume"]
+        stamp = dt.datetime.combine(target, dt.time.fromisoformat(clock))
+        change = price - anchor.pre_close
+        rows.append({
+            "stock_code": anchor.stock_code,
+            "trade_time": stamp,
+            "trade_date": target,
+            "price": price,
+            "avg_price": None,
+            "change": change,
+            "change_pct": change / anchor.pre_close * Decimal("100"),
+            "volume": volume,
+            "amount": None,
+            "etl_sync_at": captured_at,
+            "qmt_code": anchor.qmt_code,
+            "data_source": TENCENT_SOURCE,
+            "source_time": stamp,
+            "received_at": captured_at,
+            "batch_id": batch_id,
+            "data_version": "tencent_mkline_verified_238_v1",
+            "quality_status": "VERIFIED",
+            "permission_status": "SUPPORTED",
+        })
+    if (
+        abs(rows[-1]["price"] - anchor.close) > Decimal("0.011")
+        or max(row["price"] for row in rows) > anchor.high + Decimal("0.011")
+        or min(row["price"] for row in rows) < anchor.low - Decimal("0.011")
+    ):
+        raise ImportErrorBase("Tencent K-line differs from the daily anchor")
+    _validate_anchor_totals(rows, anchor)
+    return rows
+
+
 def _fetch_tencent_one(
     anchor: DailyAnchor,
     *,
@@ -702,20 +812,51 @@ def _fetch_tencent_one(
     batch_id: str,
     timeout: float,
 ) -> tuple[dict, str]:
-    payload, raw = _bounded_json_get(
-        session,
-        TENCENT_SOURCE_URL,
-        params={"code": _sina_symbol(anchor.stock_code)},
-        timeout=timeout,
-    )
     captured_at = dt.datetime.now().replace(microsecond=0)
-    rows = parse_tencent_session(
-        payload,
-        anchor=anchor,
-        trade_date=trade_date,
-        captured_at=captured_at,
-        batch_id=batch_id,
-    )
+    symbol = _sina_symbol(anchor.stock_code)
+    if not symbol.startswith("bj"):
+        try:
+            payload, raw = _bounded_json_get(
+                session,
+                TENCENT_KLINE_SOURCE_URL,
+                params={"param": f"{symbol},m1,,320"},
+                timeout=timeout,
+            )
+            rows = parse_tencent_kline_session(
+                payload,
+                anchor=anchor,
+                trade_date=trade_date,
+                captured_at=captured_at,
+                batch_id=batch_id,
+            )
+        except (ImportErrorBase, requests.RequestException):
+            payload, raw = _bounded_json_get(
+                session,
+                TENCENT_SOURCE_URL,
+                params={"code": symbol},
+                timeout=timeout,
+            )
+            rows = parse_tencent_session(
+                payload,
+                anchor=anchor,
+                trade_date=trade_date,
+                captured_at=captured_at,
+                batch_id=batch_id,
+            )
+    else:
+        payload, raw = _bounded_json_get(
+            session,
+            TENCENT_SOURCE_URL,
+            params={"code": symbol},
+            timeout=timeout,
+        )
+        rows = parse_tencent_session(
+            payload,
+            anchor=anchor,
+            trade_date=trade_date,
+            captured_at=captured_at,
+            batch_id=batch_id,
+        )
     return {
         "stock_code": anchor.stock_code,
         "rows": rows,
@@ -1137,7 +1278,7 @@ def main(argv: list[str] | None = None) -> int:
         "fallback_source_url": TENCENT_SOURCE_URL,
         "provider": provider,
         "source_counts": source_counts,
-        "amount_missing_codes": sorted(amount_missing_codes),
+        "amount_missing_samples": sorted(amount_missing_codes)[:20],
         "amount_missing_count": len(amount_missing_codes),
         "trade_date": args.trade_date,
         "batch_id": batch_id,

@@ -29,6 +29,7 @@ from tools.import_sina_minute_history import (
     _source_circuit_tripped,
     parse_sina_session,
     parse_tencent_session,
+    parse_tencent_kline_session,
 )
 
 
@@ -349,4 +350,41 @@ def test_tencent_fallback_preserves_missing_amounts_as_unknown():
         batch_id="tencent-test",
     )
 
+    assert all(row["amount"] is None for row in rows)
+
+
+def test_tencent_m1_history_maps_to_the_238_bar_contract():
+    target = dt.date(2026, 10, 23)
+    clocks = [
+        dt.datetime(2000, 1, 1, 9, 30) + dt.timedelta(minutes=index)
+        for index in range(121)
+    ] + [
+        dt.datetime(2000, 1, 1, 13, 1) + dt.timedelta(minutes=index)
+        for index in range(120)
+    ]
+    raw_rows = []
+    for clock in clocks:
+        stamp = dt.datetime.combine(target, clock.time()).strftime("%Y%m%d%H%M")
+        price = "11.50" if clock.strftime("%H:%M") == "15:00" else "11.20"
+        raw_rows.append([stamp, price, price, price, price, "1", {}, "0"])
+    payload = {
+        "data": {
+            "sh603278": {
+                "m1": raw_rows,
+            }
+        }
+    }
+
+    rows = parse_tencent_kline_session(
+        payload,
+        anchor=replace(_anchor(), volume=Decimal("24100")),
+        trade_date="2026-10-23",
+        captured_at=dt.datetime(2026, 10, 24, 9, 0),
+        batch_id="tencent-m1-test",
+    )
+
+    assert len(rows) == 238
+    assert sum(row["volume"] for row in rows) == Decimal("24100")
+    assert rows[0]["trade_time"].strftime("%H:%M") == "09:31"
+    assert rows[-1]["trade_time"].strftime("%H:%M") == "15:00"
     assert all(row["amount"] is None for row in rows)
