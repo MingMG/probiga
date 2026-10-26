@@ -393,7 +393,7 @@ def verified_no_trade_codes(engine, catalog, *, trade_date, decision_known_at):
             ):
                 return set(), None
             source_tokens = {
-                f":source_{index}": source
+                f"source_{index}": source
                 for index, source in enumerate(
                     sorted(VERIFIED_FREE_DAILY_ROW_SOURCES)
                 )
@@ -404,7 +404,7 @@ def verified_no_trade_codes(engine, catalog, *, trade_date, decision_known_at):
                     "WHERE trade_date=:trade_date AND k_type=1 "
                     "AND adjust_type=0 "
                     "AND data_source IN ("
-                    + ",".join(source_tokens)
+                    + ",".join(f":{name}" for name in source_tokens)
                     + ") "
                     "AND quality_status='SUSPENDED' "
                     "AND permission_status='NO_TRADE'"

@@ -32,6 +32,50 @@ def _line(kind, day="2026-09-11", minute="09:31"):
             else f"{day} {minute},-1,0,3,4,5")
 
 
+def test_public_minute_no_trade_scope_binds_free_daily_sources(monkeypatch):
+    c = _crawler()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE sm_stock_kline ("
+                "stock_code TEXT, trade_date TEXT, k_type INTEGER, "
+                "adjust_type INTEGER, data_source TEXT, "
+                "quality_status TEXT, permission_status TEXT)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sm_stock_kline VALUES "
+                "('000001','2026-10-26',1,0,'tencent_qt','SUSPENDED','NO_TRADE')"
+            )
+        )
+    catalog = SimpleNamespace(batch_id="batch", manifest_hash="c" * 64)
+    truth = SimpleNamespace(
+        catalog_batch_id="batch",
+        catalog_manifest_hash="c" * 64,
+        receipt_id="d" * 64,
+        truth_hash="e" * 64,
+        code_count=1,
+    )
+    monkeypatch.setattr(
+        c,
+        "load_verified_daily_market_truth",
+        lambda *_args, **_kwargs: truth,
+    )
+
+    no_trade, proof = c.verified_no_trade_codes(
+        engine,
+        catalog,
+        trade_date="2026-10-26",
+        decision_known_at=datetime(2026, 10, 26, 23),
+    )
+
+    assert no_trade == {"000001"}
+    assert proof["proof_provider"] == "verified_free_daily"
+    assert proof["no_trade_count"] == 1
+
+
 def _collection(monkeypatch, kind, native, *, minimum=0.5, no_trade=(), context=None, limit=0):
     c = _crawler()
     context = context or _context()
