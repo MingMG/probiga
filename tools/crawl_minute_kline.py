@@ -1218,8 +1218,8 @@ def main():
 
         checkpoint_root = Path(
             os.environ.get(
-                "PROBIGA_JOB_LOG_ROOT",
-                "/var/lib/probiga/jobs",
+                "PROBIGA_PUBLIC_MINUTE_CHECKPOINT_ROOT",
+                "/var/lib/probiga/public-stock-minute-checkpoints",
             )
         )
         return import_public_stock_minute([

@@ -479,6 +479,7 @@ def _write_cached_payload(
             allow_nan=False,
         )
     temporary.replace(path)
+    path.chmod(0o600)
 
 
 def _new_source_session(proxy: str = "") -> requests.Session:
