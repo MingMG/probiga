@@ -1,8 +1,10 @@
 from datetime import datetime
+import json
 import sys
 from types import ModuleType
 
 import pandas as pd
+import pytest
 from sqlalchemy import create_engine, text
 
 from server.common.verified_daily_market_truth import (
@@ -193,3 +195,36 @@ def test_baostock_primary_uses_tencent_for_bj_and_missing_codes(monkeypatch):
     assert rows.loc["920001", "data_source"] == "tencent_qt"
     assert evidence["baostock_count"] == 2
     assert evidence["tencent_fallback_count"] == 1
+
+
+def test_default_daily_publication_uses_fast_batch_source(monkeypatch, capsys):
+    class Engine:
+        def dispose(self):
+            pass
+
+    calls = []
+    monkeypatch.setattr(collector, "create_batch_engine", Engine)
+    monkeypatch.setattr(collector, "get_kline_engine", Engine)
+    monkeypatch.setattr(
+        collector,
+        "_latest_closed_session",
+        lambda *_args, **_kwargs: "2026-10-26",
+    )
+    monkeypatch.setattr(
+        collector,
+        "publish_snapshot",
+        lambda *_args, **_kwargs: calls.append("batch") or {
+            "status": "COMPLETE",
+        },
+    )
+    monkeypatch.setattr(
+        collector,
+        "publish_baostock_snapshot",
+        lambda *_args, **_kwargs: pytest.fail(
+            "Baostock must not gate the daily default path"
+        ),
+    )
+
+    assert collector.main(["--date", "latest", "--json"]) == 0
+    assert calls == ["batch"]
+    assert json.loads(capsys.readouterr().out)["status"] == "COMPLETE"

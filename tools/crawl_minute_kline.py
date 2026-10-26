@@ -43,8 +43,11 @@ from server.common.kline_data import get_kline_engine
 from server.common.minute_data import get_minute_engine
 from server.common.authoritative_market_clock import PRODUCTION_TIMEZONE
 from server.common.qmt_stock_catalog import load_target_stock_catalog
-from server.common.qmt_history_coverage import load_minute_native_no_trade_evidence, _native_no_trade_codes
-from server.common.qmt_daily_market_truth import QMT_DAILY_PROVIDER
+from server.common.verified_daily_market_truth import (
+    VERIFIED_FREE_DAILY_ROW_SOURCES,
+    VerifiedDailyMarketBlocked,
+    load_verified_daily_market_truth,
+)
 from server.common.mysql_lock import (
     STOCK_MINUTE_FREEZE_LOCK_NAME,
     mysql_named_lock,
@@ -375,31 +378,51 @@ def catalog_stock_codes(catalog, codes):
 
 
 def verified_no_trade_codes(engine, catalog, *, trade_date, decision_known_at):
-    """Only an independently replayed, catalog-bound native daily proof exempts a code."""
+    """Only an independently replayed free daily partition exempts a code."""
     try:
         with engine.connect() as connection:
-            evidence = load_minute_native_no_trade_evidence(
-                connection, trade_date=trade_date, decision_known_at=decision_known_at,
+            truth = load_verified_daily_market_truth(
+                connection,
+                start_date=trade_date,
+                end_date=trade_date,
+                decision_known_at=decision_known_at,
             )
-        if evidence is None:
-            return set(), None
-        truth = evidence["daily_truth"]
-        codes = _native_no_trade_codes(evidence, context={
-            "trade_date": trade_date, "provider": QMT_DAILY_PROVIDER,
-            "captured_at": decision_known_at.isoformat(sep=" "),
-            "catalog_batch_id": catalog.batch_id, "catalog_manifest_hash": catalog.manifest_hash,
-            "calendar_batch_id": truth["calendar_batch_id"],
-            "calendar_manifest_hash": truth["calendar_manifest_hash"],
-        })
+            if (
+                truth.catalog_batch_id != catalog.batch_id
+                or truth.catalog_manifest_hash != catalog.manifest_hash
+            ):
+                return set(), None
+            source_tokens = {
+                f":source_{index}": source
+                for index, source in enumerate(
+                    sorted(VERIFIED_FREE_DAILY_ROW_SOURCES)
+                )
+            }
+            rows = connection.execute(
+                text(
+                    "SELECT stock_code FROM sm_stock_kline "
+                    "WHERE trade_date=:trade_date AND k_type=1 "
+                    "AND adjust_type=0 "
+                    "AND data_source IN ("
+                    + ",".join(source_tokens)
+                    + ") "
+                    "AND quality_status='SUSPENDED' "
+                    "AND permission_status='NO_TRADE'"
+                ),
+                {"trade_date": trade_date, **source_tokens},
+            ).scalars().all()
+        codes = {str(code).zfill(6) for code in rows}
         return codes, {
-            "daily_run_id": truth["run_id"], "truth_hash": truth["truth_hash"],
-            "proof_sha256": truth["no_row_exception_proof_sha256"],
-            "calendar_batch_id": truth["calendar_batch_id"],
-            "calendar_manifest_hash": truth["calendar_manifest_hash"],
+            "proof_provider": "verified_free_daily",
+            "receipt_id": truth.receipt_id,
+            "truth_hash": truth.truth_hash,
+            "target_date": trade_date,
+            "code_count": truth.code_count,
+            "no_trade_count": len(codes),
         }
-    except (RuntimeError, ValueError, KeyError, TypeError):
-        # Lack of a completed daily proof never grants an exception. Intraday
-        # bars may still be collected; any absent symbol stays explicitly missing.
+    except (VerifiedDailyMarketBlocked, RuntimeError, ValueError, KeyError, TypeError):
+        # A missing or mismatched daily receipt never grants a no-trade
+        # exception. The minute task remains explicitly partial and retryable.
         return set(), None
 
 

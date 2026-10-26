@@ -226,6 +226,10 @@ CRITICAL_CRON_CATCHUP_TASK_TYPES.add("sim_trade_signal_prepare")
 CRITICAL_CRON_CATCHUP_TASK_TYPES.add(FINAL_POOL_WECOM_DELIVERY_TASK_TYPE)
 CRITICAL_CRON_CATCHUP_TASK_TYPES.update(
     {
+        "free_stock_daily_canonical",
+        "free_index_daily_canonical",
+        "stock_minute",
+        "stock_minute_flow",
         "target_turnover_snapshot",
         "analysis_upper_evidence_prepare",
         "alist_daily",
@@ -284,6 +288,10 @@ CRITICAL_CRON_CATCHUP_TASK_TYPES.update(
 )
 CRITICAL_CRON_CATCHUP_WINDOWS_SECONDS = {
     "qmt_local_history_2024": 24 * 60 * 60,
+    "free_stock_daily_canonical": 8 * 60 * 60,
+    "free_index_daily_canonical": 8 * 60 * 60,
+    "stock_minute": 8 * 60 * 60,
+    "stock_minute_flow": 8 * 60 * 60,
     "target_turnover_snapshot": 8 * 60 * 60,
     "analysis_upper_evidence_prepare": 8 * 60 * 60,
     # These source snapshots and quality gates must not disappear merely
@@ -429,6 +437,7 @@ NON_TRADING_DAY_SKIP_TYPES = {
     "qmt_index_minute",
     "qmt_stock_daily_canonical",
     "free_stock_daily_canonical",
+    "free_index_daily_canonical",
     "qmt_stock_minute_canonical",
     "qmt_stock_minute_flow_canonical",
     "quality_check_post",
@@ -585,6 +594,8 @@ LONG_RUNNING_TASK_TYPES = {
     "concept_flow",
     "eastmoney_concept_flow_snapshot",
     "etf_forward_daily",
+    "free_stock_daily_canonical",
+    "free_index_daily_canonical",
     "concept_ths_kline",
     "concept_ths_minute",
     "index_kline",
@@ -892,6 +903,14 @@ def _retryable_blocked_marker(value: object) -> str:
 def _task_status_is_retryable(row: dict) -> bool:
     status = str(row.get("last_run_status") or "").strip().lower()
     task_type = str(row.get("task_type") or "").strip()
+    if status == "pending":
+        # Dispatch may fail after updating the compact cursor but before the
+        # immutable execution row exists. Retry that orphan after the normal
+        # backoff instead of leaving the task pending for the rest of the day.
+        return (
+            _coerce_datetime(row.get("last_triggered_at")) is not None
+            and _coerce_datetime(row.get("last_run_at")) is None
+        )
     if status == "blocked" and task_type in FINALIZED_MINUTE_TASK_TYPES:
         output = str(row.get("last_run_output") or "")
         if any(payload.get("retryable") is False for payload in _iter_scheduler_output_payloads(output)):

@@ -35,6 +35,14 @@ CACHE_SECONDS = 1800
 MAX_CACHED_DAYS = 400
 MAX_PENDING_DAYS = 366
 MAX_DETAILS = 200
+PUBLIC_MINUTE_TIME_GRID = tuple(
+    (
+        datetime(2000, 1, 1, hour, minute) + timedelta(minutes=offset)
+    ).strftime("%H:%M:%S")
+    for hour, minute in ((9, 31), (13, 1))
+    for offset in range(120)
+)
+PUBLIC_MINUTE_SOURCE = "east_push2delay"
 
 
 def now() -> datetime:
@@ -65,13 +73,13 @@ class Dataset:
 
 
 DATASETS = (
-    Dataset("daily", "股票日线", "market", "sm_stock_kline", "kline", scope="全市场 · 日线 · 不复权", task_type="qmt_stock_daily_canonical"),
-    Dataset("minute", "股票分钟线", "market", "sm_stock_minute", "kline", scope="全市场 · 1 分钟", deadline="15:35", task_type="qmt_stock_minute_canonical"),
+    Dataset("daily", "股票日线", "market", "sm_stock_kline", "kline", scope="全市场 · 日线 · 不复权", task_type="free_stock_daily_canonical"),
+    Dataset("minute", "股票分钟线", "market", "sm_stock_minute", "kline", scope="全市场 · 公开源 1 分钟", deadline="18:30", task_type="stock_minute"),
     Dataset("flow", "每日资金流", "flow", "sm_stock_capital_flow_daily", "minute", scope="全市场 · 当日有成交", task_type="capital_flow_batch_fast"),
-    Dataset("minute_flow", "分钟资金流", "flow", "sm_stock_capital_flow_min", "minute", date_column="trade_time", scope="全市场 · 原生 1 分钟", deadline="24:00", task_type="qmt_stock_minute_flow_canonical"),
+    Dataset("minute_flow", "分钟资金流", "flow", "sm_stock_capital_flow_min", "minute", date_column="trade_time", scope="全市场 · 公开源 1 分钟", deadline="24:00", task_type="stock_minute_flow"),
     Dataset("alist", "龙虎榜列表", "event", "st_a_list_daily", "business", scope="当日完整披露清单", task_type="alist_daily", empty_allowed=True),
     Dataset("alist_info", "龙虎榜详情", "event", "st_a_list_info", "business", scope="当日席位明细", task_type="alist_info", empty_allowed=True),
-    Dataset("index", "指数行情", "market", "sm_index_kline", "kline", code="index_code", scope="原生指数目录 · 日线", task_type="qmt_index_kline"),
+    Dataset("index", "指数行情", "market", "sm_index_kline", "kline", code="index_code", scope="公开源价格指数 · 日线", task_type="free_index_daily_canonical"),
     Dataset("concept", "概念行情", "market", "sm_concept_east_kline", "kline", code="index_code", scope="东财原生概念目录 · 日线", task_type="eastmoney_concept_kline"),
     Dataset("hot", "东财热门榜单", "event", "st_hot_pop_rank_east", "business", date_column="snapshot_date", scope="东财人气榜 · Top 100", deadline="17:14", task_type="hot_pop_east"),
     Dataset("hot_ths", "同花顺热门榜单", "event", "st_hot_rank_ths", "business", date_column="snapshot_date", scope="同花顺热股榜 · Top 100", deadline="17:12", task_type="hot_rank_ths"),
@@ -278,7 +286,19 @@ class Observer:
                 sources = self.read(spec.store, f"SELECT DISTINCT data_source FROM `{table}` WHERE {predicate}", params)
                 combined = {}
                 for source in sources:
-                    for row in self.groups(spec, day, grid=grid, codes=codes, _source=source["data_source"]):
+                    source_name = source["data_source"]
+                    source_grid = (
+                        list(PUBLIC_MINUTE_TIME_GRID)
+                        if source_name == PUBLIC_MINUTE_SOURCE
+                        else grid
+                    )
+                    for row in self.groups(
+                        spec,
+                        day,
+                        grid=source_grid,
+                        codes=codes,
+                        _source=source_name,
+                    ):
                         previous = combined.get(row["code"])
                         if previous is None:
                             combined[row["code"]] = row
@@ -336,6 +356,17 @@ class Observer:
             valid += " AND ABS(main_net_inflow-max_net_inflow-lg_net_inflow)<=GREATEST(1000000,ABS(main_net_inflow)*0.001)"
         else:
             valid = "price>0 AND volume>=0 AND amount>=0"
+        if spec.key == "daily" and {
+            "quality_status",
+            "permission_status",
+        }.issubset(columns):
+            valid = (
+                f"(({valid}) OR ("
+                "quality_status='SUSPENDED' "
+                "AND permission_status='NO_TRADE' "
+                "AND `open`=0 AND high=0 AND low=0 AND volume=0 "
+                "AND amount=0))"
+            )
         if "quality_status" in columns:
             valid += " AND COALESCE(quality_status,'') NOT IN ('QUARANTINED','INVALID','FAILED','REJECTED')"
         if "permission_status" in columns:
@@ -345,7 +376,10 @@ class Observer:
             valid_sql = f"CASE WHEN COUNT(*)=1 AND MIN(CASE WHEN {valid} THEN 1 ELSE 0 END)=1 THEN 1 ELSE 0 END"
             time_sql = "NULL"
         else:
-            if grid != list(minute_time_grid()):
+            if grid not in (
+                list(minute_time_grid()),
+                list(PUBLIC_MINUTE_TIME_GRID),
+            ):
                 raise ValueError("unrecognized minute grid")
             clock = "TIME(trade_time)"
             valid += (f" AND (({clock} BETWEEN '09:30:00' AND '11:30:00') OR "
@@ -396,6 +430,22 @@ class Observer:
                        "WHERE trade_date=:day AND k_type=1 AND adjust_type=0 AND (volume>0 OR amount>0)", {"day": day})}
         return result, expected, traded
 
+    def minute_grid(self, spec: Dataset, day: str) -> list[str]:
+        """Return the exact grid proven by the stored provider inventory."""
+        table, predicate, params = self._partition(spec, day)
+        rows = self.read(
+            spec.store,
+            f"SELECT DISTINCT data_source FROM `{table}` WHERE {predicate}",
+            params,
+        )
+        sources = {
+            str(row.get("data_source") or "")
+            for row in rows
+        }
+        if sources == {PUBLIC_MINUTE_SOURCE}:
+            return list(PUBLIC_MINUTE_TIME_GRID)
+        return list(minute_time_grid())
+
     def _receipt(self, spec: Dataset, day: str, current: datetime) -> dict | None:
         """Inspect completed executions since the target day, including later repairs.
 
@@ -427,6 +477,14 @@ class Observer:
             if spec.key == "hot":
                 from server.common.hot_rank_source_contract import parse_hot_rank_receipt
                 payload = parse_hot_rank_receipt(output)
+            elif spec.task_type == "free_index_daily_canonical":
+                from server.common.scheduler_validation import (
+                    _single_nested_machine_payload,
+                )
+                payload = _single_nested_machine_payload(
+                    output,
+                    schema="probiga.free-index-daily-result.v1",
+                )
             else:
                 payload = parsers[spec.key](output)
             if not payload:
@@ -466,6 +524,30 @@ class Observer:
             expected = payload["database"]
             match = actual == expected
             expected_count = int(expected["row_count"])
+        elif (
+            spec.key == "index"
+            and spec.task_type == "free_index_daily_canonical"
+        ):
+            if (
+                payload.get("status") != "COMPLETE"
+                or payload.get("target_date") != day
+                or payload.get("qmt_attestation_claimed") is not False
+                or payload.get("database_writes") is not True
+                or int(payload.get("expected_count") or 0)
+                != int(payload.get("code_count") or 0)
+                or not payload.get("missing_codes") == []
+            ):
+                return dict(
+                    base,
+                    status="partial",
+                    reason="公开源指数回执不是完整目标日分区",
+                )
+            expected_count = int(payload["expected_count"])
+            match = (
+                observed == int(payload["row_count"])
+                == int(payload["code_count"])
+                and int(counts["codes"] or 0) == expected_count
+            )
         elif spec.key == "index":
             from tools import sync_qmt_index_edge as source
             if source.validate_task_result(payload, 0) != "complete" or payload.get("dataset") != "kline":
@@ -582,14 +664,28 @@ class Observer:
                     info = daily
                 elif spec.key in {"minute", "minute_flow", "flow"}:
                     scope = traded
-                    grid = list(minute_time_grid()) if spec.key != "flow" else None
+                    grid = (
+                        self.minute_grid(spec, day)
+                        if spec.key != "flow"
+                        else None
+                    )
                     groups = self.groups(spec, day, grid=grid, codes=expected)
                     info = assess(scope, groups, slots=len(grid) if grid else 1,
                                   expected_slots=grid, allowed=expected if spec.key == "flow" else None,
                                   reason="当日日线尚未完整核验，无法确定有成交股票范围" if scope is None else "",
                                   missing_limit=missing_limit)
                     info["unit"] = "只" if spec.key == "flow" else "条"
-                    info["evidence"] = {"basis": "已核验日线有成交集合", "grid_profile": "CN_A_SHARE_QMT_NATIVE_241_V1" if grid else None}
+                    grid_profile = (
+                        "CN_A_SHARE_PUBLIC_240_V1"
+                        if grid == list(PUBLIC_MINUTE_TIME_GRID)
+                        else "CN_A_SHARE_QMT_NATIVE_241_V1"
+                        if grid
+                        else None
+                    )
+                    info["evidence"] = {
+                        "basis": "已核验日线有成交集合",
+                        "grid_profile": grid_profile,
+                    }
                     if grid:
                         info["data_updated_at"] = max((iso(g.get("updated")) for g in groups if g.get("updated")), default=None)
                         info["source"] = ",".join(sorted({str(g["source"]) for g in groups if g.get("source")})) or None

@@ -78,6 +78,12 @@ def test_native_minute_grid_requires_every_slot_and_reports_lunch_ranges():
     assert result['missing'][0]['missing_times'] == ['11:10–11:30', '13:01–15:00']
 
 
+def test_public_minute_grid_has_exact_240_eastmoney_slots():
+    assert len(dm.PUBLIC_MINUTE_TIME_GRID) == 240
+    assert dm.PUBLIC_MINUTE_TIME_GRID[:2] == ('09:31:00', '09:32:00')
+    assert dm.PUBLIC_MINUTE_TIME_GRID[-2:] == ('14:59:00', '15:00:00')
+
+
 def test_calendar_requires_authoritative_record_not_weekday():
     calendar = dm.calendar_map([{'trade_date': DAY, 'trade_status': 1}, {'trade_date': DAY, 'trade_status': 0}])
     assert calendar[DAY] is None
@@ -208,7 +214,7 @@ def test_priority_recheck_overtakes_queued_history():
 
 def test_expired_pending_partition_gets_rechecked_at_deadline():
     m, q, clock = monitor()
-    clock[0] = datetime(2026, 9, 18, 15, 30)
+    clock[0] = datetime(2026, 9, 18, 18, 30)
     data = {s.key: dm.blank_cell(s, DAY, 'pending', 'not due') for s in dm.DATASETS}
     m.cache[DAY] = {'at': clock[0], 'data': data}
     clock[0] += timedelta(minutes=6)

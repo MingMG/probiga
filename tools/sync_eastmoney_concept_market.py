@@ -23,12 +23,11 @@ from pathlib import Path
 import sys
 import time
 from typing import Any, Iterable, Mapping, Sequence
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
 import uuid
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import requests
 from sqlalchemy import text
 
 
@@ -51,6 +50,21 @@ DIRECTORY_SCHEMA = "probiga.eastmoney-concept-directory.v1"
 DIRECTORY_URL = "https://push2delay.eastmoney.com/api/qt/clist/get"
 DAILY_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
 MINUTE_URL = "https://push2delay.eastmoney.com/api/qt/stock/kline/get"
+MINUTE_URLS = (
+    MINUTE_URL,
+    "https://push2.eastmoney.com/api/qt/stock/kline/get",
+    "https://82.push2.eastmoney.com/api/qt/stock/kline/get",
+)
+DIRECTORY_URLS = (
+    DIRECTORY_URL,
+    "https://push2.eastmoney.com/api/qt/clist/get",
+    "https://82.push2.eastmoney.com/api/qt/clist/get",
+)
+DAILY_URLS = (
+    DAILY_URL,
+    "https://33.push2his.eastmoney.com/api/qt/stock/kline/get",
+    "https://63.push2his.eastmoney.com/api/qt/stock/kline/get",
+)
 DIRECTORY_FILTER = "m:90+t:3"
 DIRECTORY_FIELDS = "f2,f3,f4,f5,f6,f12,f14,f15,f16,f17,f124"
 CLOSED_DAILY_SOURCE_SCHEMA = "probiga.eastmoney-concept-closed-quote.v1"
@@ -227,31 +241,46 @@ class EastmoneyConceptProvider:
             "Referer": "https://quote.eastmoney.com/",
         }
 
-    def _request_json(self, url: str, params: Mapping[str, Any]) -> dict[str, Any]:
+    def _request_json(
+        self,
+        urls: str | Sequence[str],
+        params: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        candidates = (urls,) if isinstance(urls, str) else tuple(urls)
+        if not candidates:
+            raise ValueError("Eastmoney endpoint inventory is empty")
         last_error: Exception | None = None
-        request = Request(
-            url + "?" + urlencode({key: str(value) for key, value in params.items()}),
-            headers=self.headers,
-            method="GET",
-        )
-        for attempt in range(self.retries):
-            try:
-                with urlopen(request, timeout=self.timeout) as response:
-                    payload = json.loads(response.read().decode("utf-8", errors="strict"))
-                if not isinstance(payload, dict):
-                    raise ValueError("response JSON is not an object")
-                return payload
-            except Exception as exc:  # bounded provider retry
-                last_error = exc
-                if attempt + 1 < self.retries:
-                    time.sleep(2**attempt)
+        with requests.Session() as session:
+            session.headers.update(self.headers)
+            session.trust_env = False
+            for attempt in range(self.retries):
+                url = candidates[attempt % len(candidates)]
+                try:
+                    response = session.get(
+                        url,
+                        params={
+                            str(key): str(value)
+                            for key, value in params.items()
+                        },
+                        timeout=self.timeout,
+                    )
+                    response.raise_for_status()
+                    payload = response.json()
+                    if not isinstance(payload, dict):
+                        raise ValueError("response JSON is not an object")
+                    return payload
+                except (requests.RequestException, ValueError) as exc:
+                    last_error = exc
+                    if attempt + 1 < self.retries:
+                        time.sleep(2**attempt)
         raise DataBlocked(
-            f"DATA_BLOCKED: Eastmoney request failed after {self.retries} attempts: {url}"
+            "DATA_BLOCKED: Eastmoney request failed after "
+            f"{self.retries} attempts across {len(candidates)} endpoints"
         ) from last_error
 
     def fetch_directory_page(self, page: int, page_size: int) -> dict[str, Any]:
         return self._request_json(
-            DIRECTORY_URL,
+            DIRECTORY_URLS,
             {
                 "fid": "f3",
                 "po": "1",
@@ -268,7 +297,7 @@ class EastmoneyConceptProvider:
 
     def fetch_daily(self, code: str, start_date: str, end_date: str) -> dict[str, Any]:
         return self._request_json(
-            DAILY_URL,
+            DAILY_URLS,
             {
                 "secid": f"90.{code}",
                 "fields1": "f1,f2,f3,f4,f5,f6",
@@ -283,7 +312,7 @@ class EastmoneyConceptProvider:
 
     def fetch_minute(self, code: str) -> dict[str, Any]:
         return self._request_json(
-            MINUTE_URL,
+            MINUTE_URLS,
             {
                 "secid": f"90.{code}",
                 "fields1": "f1,f2,f3,f4,f5,f6",

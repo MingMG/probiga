@@ -196,6 +196,80 @@ QMT_CANONICAL_HISTORY_GAP_REPAIR_TASK = {
     ),
 }
 
+FREE_STOCK_DAILY_TASK = {
+    "task_name": "免费全市场日线",
+    "task_type": "free_stock_daily_canonical",
+    "group_name": "行情数据",
+    "script_path": "tools/sync_free_stock_daily.py",
+    "script_args": "--date latest --json",
+    "cron_time": "16:30",
+    "interval_minutes": 0,
+    "enabled": 1,
+    "sort_order": 89,
+    "date_param": "",
+    "description": (
+        "腾讯批量行情为主、可选Baostock深度核验的完整日线公开源；"
+        "按股票目录和整日分区发布并提交独立读回回执，不调用QMT。"
+    ),
+}
+
+PUBLIC_STOCK_MINUTE_TASK = {
+    "task_name": "公开源全市场分钟线",
+    "task_type": "stock_minute",
+    "group_name": "行情数据",
+    "script_path": "tools/crawl_minute_kline.py",
+    "script_args": (
+        "--type stock --min-coverage 0.99 --request-delay 0.03 "
+        "--request-jitter 0.02 --batch-every 0 --fetch-attempts 2"
+    ),
+    "cron_time": "17:30",
+    "interval_minutes": 0,
+    "enabled": 1,
+    "sort_order": 91,
+    "date_param": "",
+    "description": (
+        "盘后从东财 push2delay 获取完整240分钟网格，原子替换目标日股票分区，"
+        "与免费日线的停牌豁免绑定，不调用QMT。"
+    ),
+}
+
+PUBLIC_STOCK_MINUTE_FLOW_TASK = {
+    "task_name": "公开源全市场分钟资金流",
+    "task_type": "stock_minute_flow",
+    "group_name": "行情数据",
+    "script_path": "tools/crawl_minute_kline.py",
+    "script_args": (
+        "--type flow --min-coverage 0.99 --request-delay 0.03 "
+        "--request-jitter 0.02 --batch-every 0 --fetch-attempts 2"
+    ),
+    "cron_time": "18:30",
+    "interval_minutes": 0,
+    "enabled": 1,
+    "sort_order": 92,
+    "date_param": "",
+    "description": (
+        "盘后从东财 push2delay 获取完整240分钟资金流网格，原子替换目标日"
+        "股票分区，与免费日线的停牌豁免绑定，不调用QMT。"
+    ),
+}
+
+FREE_INDEX_DAILY_TASK = {
+    "task_name": "公开源指数日线",
+    "task_type": "free_index_daily_canonical",
+    "group_name": "行情数据",
+    "script_path": "tools/sync_free_index_daily.py",
+    "script_args": "--date latest --json",
+    "cron_time": "17:10",
+    "interval_minutes": 0,
+    "enabled": 1,
+    "sort_order": 90,
+    "date_param": "",
+    "description": (
+        "沿最近已验证价格指数清单，从腾讯与东财交叉获取目标日完整日线；"
+        "原子写入并回读，不调用QMT。"
+    ),
+}
+
 LINUX_RECENT_DATA_GAP_REPAIR_TASK = {
     "task_name": "近期 Linux 衍生数据缺口精确修复",
     "task_type": "linux_recent_data_gap_repair",
@@ -477,6 +551,10 @@ LINUX_QMT_TASKS = (
 LINUX_PROVIDER_TASKS = (
     EXPOSURE_EVENT_RISK_WATCH_TASK,
     TARGET_TURNOVER_SNAPSHOT_TASK,
+    FREE_STOCK_DAILY_TASK,
+    FREE_INDEX_DAILY_TASK,
+    PUBLIC_STOCK_MINUTE_TASK,
+    PUBLIC_STOCK_MINUTE_FLOW_TASK,
     LINUX_RECENT_DATA_GAP_REPAIR_TASK,
     EASTMONEY_ALIST_DAILY_TASK,
     EASTMONEY_ALIST_INFO_TASK,
@@ -550,7 +628,6 @@ UNFROZEN_PROVIDER_TASK_TYPES = frozenset({
     "index_minute",
     "stock_current",
     "stock_kline",
-    "stock_minute",
     "stock_relations_qmt",
 })
 UNFROZEN_PROVIDER_SCRIPT_PATHS = frozenset({

@@ -229,6 +229,20 @@ def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: s
 
     args = script_args_raw.split() if script_args_raw else []
     args.extend(_date_param_args(date_param_raw))
+    if (
+        task_type in {"stock_minute", "stock_minute_flow"}
+        and normalized_path == "tools/crawl_minute_kline.py"
+    ):
+        if not _is_iso_date_arg(today):
+            raise ValueError("public minute target date is invalid")
+        explicit_dates = _option_values(args, "--trade-date")
+        if explicit_dates and explicit_dates != [today]:
+            raise ValueError(
+                "public minute target date differs from scheduler"
+            )
+        if not explicit_dates:
+            args.extend(["--trade-date", today])
+        return args
     if task_type in ANALYSIS_DAILY_EVIDENCE_TASK_TYPES:
         if not _is_iso_date_arg(today):
             raise ValueError("analysis evidence target date is invalid")

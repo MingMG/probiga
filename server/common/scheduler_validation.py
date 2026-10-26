@@ -132,6 +132,11 @@ _DIRECT_CAPITAL_FLOW_RESULT_SCHEMA = (
 )
 _CAPITAL_FLOW_BATCH_TASK_TYPE = "capital_flow_batch_fast"
 _CAPITAL_FLOW_BATCH_DATASET = "stock_capital_flow_daily"
+_FREE_STOCK_DAILY_TASK_TYPE = "free_stock_daily_canonical"
+_FREE_STOCK_DAILY_RESULT_SCHEMA = "probiga.free-stock-daily-result.v1"
+_FREE_INDEX_DAILY_TASK_TYPE = "free_index_daily_canonical"
+_FREE_INDEX_DAILY_RESULT_SCHEMA = "probiga.free-index-daily-result.v1"
+_FREE_INDEX_DAILY_RECEIPT_SCHEMA = "probiga.free-index-daily-receipt.v1"
 _DIRECT_CAPITAL_FLOW_PROVIDER = "gj_big_qmt_inner"
 _DIRECT_CAPITAL_FLOW_VERIFICATION_MODE = "direct_qmt_persisted_read_only"
 _CAPITAL_FLOW_EXECUTION_VERIFIED_EXISTING = "verified_existing_exact"
@@ -2561,6 +2566,35 @@ def scheduler_output_status(
     same-day retries.  ``blocked`` accurately represents both conditions.
     """
     task_type = str(task.get("task_type") or "").strip()
+    if task_type == _FREE_INDEX_DAILY_TASK_TYPE:
+        payload = _single_nested_machine_payload(
+            output,
+            schema=_FREE_INDEX_DAILY_RESULT_SCHEMA,
+        )
+        return (
+            "success"
+            if return_code == 0
+            and payload is not None
+            and payload.get("status") == "COMPLETE"
+            and payload.get("missing_codes") == []
+            and payload.get("qmt_attestation_claimed") is False
+            and payload.get("database_writes") is True
+            else "failed"
+        )
+    if task_type == _FREE_STOCK_DAILY_TASK_TYPE:
+        payload = _single_nested_machine_payload(
+            output,
+            schema=_FREE_STOCK_DAILY_RESULT_SCHEMA,
+        )
+        return (
+            "success"
+            if return_code == 0
+            and payload is not None
+            and payload.get("status") == "COMPLETE"
+            and payload.get("qmt_attestation_claimed") is False
+            and payload.get("database_writes") is True
+            else "failed"
+        )
     try:
         if _minute_reuse_payload(task, output, return_code) is not None:
             return "success"
@@ -3879,6 +3913,168 @@ def _validate_qmt_simulation_result(task, *, engine, output, started_at, now):
                                          message="QMT simulation receipt validation failed: " + type(exc).__name__)
 
 
+def _validate_free_stock_daily_result(
+    task: Mapping[str, Any],
+    *,
+    engine: Engine,
+    started_at: datetime,
+    now: datetime,
+    output: str | None,
+) -> SchedulerValidationResult:
+    try:
+        from server.common.verified_daily_market_truth import (
+            FREE_DAILY_PROVIDERS,
+            load_verified_daily_market_truth,
+        )
+
+        payload = _single_nested_machine_payload(
+            output,
+            schema=_FREE_STOCK_DAILY_RESULT_SCHEMA,
+        )
+        if payload is None:
+            raise ValueError("free daily receipt is missing")
+        target = str(payload.get("target_date") or "")
+        expected_target = str(
+            task.get("_scheduler_target_trade_date") or target
+        )
+        if (
+            payload.get("status") != "COMPLETE"
+            or payload.get("source") not in FREE_DAILY_PROVIDERS
+            or payload.get("qmt_attestation_claimed") is not False
+            or payload.get("database_writes") is not True
+            or target != expected_target
+            or _is_hex(payload.get("row_hash"), 64) is False
+            or _is_hex(payload.get("receipt_id"), 64) is False
+        ):
+            raise ValueError("free daily receipt identity differs")
+        if target != authoritative_closed_trade_date(engine, now=now):
+            raise ValueError("free daily target differs from closed session")
+        with engine.connect() as connection:
+            truth = load_verified_daily_market_truth(
+                connection,
+                start_date=target,
+                end_date=target,
+                decision_known_at=now,
+            )
+        if (
+            truth.provider != payload["source"]
+            or truth.receipt_id != payload["receipt_id"]
+            or truth.target_date != target
+            or truth.row_hash != payload["row_hash"]
+            or truth.row_count != int(payload["row_count"])
+            or truth.code_count != int(payload["code_count"])
+        ):
+            raise ValueError("free daily persisted readback differs")
+        return SchedulerValidationResult(
+            checked=True,
+            ok=True,
+            message=(
+                "free daily receipt and persisted partition verified: "
+                f"date={target} rows={truth.row_count} "
+                f"codes={truth.code_count} source={truth.provider}"
+            ),
+        )
+    except Exception as exc:
+        return SchedulerValidationResult(
+            checked=True,
+            ok=False,
+            message=(
+                "free daily collection validation failed: "
+                + type(exc).__name__
+            ),
+        )
+
+
+def _validate_free_index_daily_result(
+    task: Mapping[str, Any],
+    *,
+    engine: Engine,
+    started_at: datetime,
+    now: datetime,
+    output: str | None,
+) -> SchedulerValidationResult:
+    try:
+        payload = _single_nested_machine_payload(
+            output,
+            schema=_FREE_INDEX_DAILY_RESULT_SCHEMA,
+        )
+        if payload is None:
+            raise ValueError("free index receipt is missing")
+        target = str(payload.get("target_date") or "")
+        expected_target = str(
+            task.get("_scheduler_target_trade_date") or target
+        )
+        if (
+            payload.get("status") != "COMPLETE"
+            or payload.get("provider") != "tencent_east_verified"
+            or payload.get("qmt_attestation_claimed") is not False
+            or payload.get("database_writes") is not True
+            or payload.get("missing_codes") != []
+            or target != expected_target
+            or target
+            != authoritative_closed_trade_date(engine, now=now)
+            or int(payload.get("expected_count") or 0)
+            != int(payload.get("code_count") or 0)
+            or _is_hex(payload.get("receipt_id"), 64) is False
+        ):
+            raise ValueError("free index receipt identity differs")
+        with engine.connect() as connection:
+            actual = connection.execute(
+                text(
+                    "SELECT COUNT(*) AS row_count,"
+                    "COUNT(DISTINCT index_code) AS code_count "
+                    "FROM sm_index_kline "
+                    "WHERE trade_date=:target AND k_type=1"
+                ),
+                {"target": target},
+            ).mappings().one()
+            persisted = connection.execute(
+                text(
+                    "SELECT status,detail_json FROM "
+                    "acquisition_partition_state "
+                    "WHERE dataset='index_daily' "
+                    "AND source='tencent_east_verified' "
+                    "AND target_date=:target "
+                    "AND partition_key='__index_daily_partition__'"
+                ),
+                {"target": target},
+            ).mappings().one_or_none()
+            if persisted is None or persisted["status"] != "complete":
+                raise ValueError("free index partition receipt is missing")
+            detail = json.loads(str(persisted["detail_json"] or ""))
+        unsigned = dict(detail)
+        receipt_id = str(unsigned.pop("receipt_id") or "")
+        if (
+            detail.get("schema") != _FREE_INDEX_DAILY_RECEIPT_SCHEMA
+            or receipt_id != canonical_sha256(unsigned)
+            or receipt_id != payload["receipt_id"]
+            or detail.get("status") != "complete"
+            or int(detail.get("row_count") or 0)
+            != int(actual["row_count"] or 0)
+            or int(detail.get("code_count") or 0)
+            != int(actual["code_count"] or 0)
+        ):
+            raise ValueError("free index persisted readback differs")
+        return SchedulerValidationResult(
+            checked=True,
+            ok=True,
+            message=(
+                "free index receipt and persisted partition verified: "
+                f"date={target} rows={actual['row_count']} "
+                f"codes={actual['code_count']}"
+            ),
+        )
+    except Exception as exc:
+        return SchedulerValidationResult(
+            checked=True,
+            ok=False,
+            message=(
+                "free index collection validation failed: "
+                + type(exc).__name__
+            ),
+        )
+
+
 def validate_scheduler_task_result(
     task: Mapping[str, Any],
     *,
@@ -3888,6 +4084,24 @@ def validate_scheduler_task_result(
     output: str | None = None,
 ) -> SchedulerValidationResult:
     task_type = str(task.get("task_type") or "").strip()
+    if task_type == _FREE_INDEX_DAILY_TASK_TYPE:
+        current = now or datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None)
+        return _validate_free_index_daily_result(
+            task,
+            engine=engine,
+            started_at=started_at or current,
+            now=current,
+            output=output,
+        )
+    if task_type == _FREE_STOCK_DAILY_TASK_TYPE:
+        current = now or datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None)
+        return _validate_free_stock_daily_result(
+            task,
+            engine=engine,
+            started_at=started_at or current,
+            now=current,
+            output=output,
+        )
     if task_type == "qmt_strategy_simulation_daily":
         current = now or datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None)
         return _validate_qmt_simulation_result(

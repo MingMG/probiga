@@ -1554,9 +1554,9 @@ def main(argv: list[str] | None = None) -> int:
         help="backfill an empty historical partition from Sina with amount/turnover",
     )
     parser.add_argument(
-        "--tencent-only",
+        "--baostock-verify",
         action="store_true",
-        help="emergency mode: use Tencent without Baostock verification",
+        help="run the slower per-code Baostock cross-check before publication",
     )
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
@@ -1572,11 +1572,11 @@ def main(argv: list[str] | None = None) -> int:
         advertised_source = (
             SINA_HISTORY_SOURCE
             if args.backfill_sina
-            else (
-                VERIFIED_HISTORY_SOURCE
-                if args.verify_history
-                else (SOURCE if args.tencent_only else MULTI_SOURCE)
-            )
+            else VERIFIED_HISTORY_SOURCE
+            if args.verify_history
+            else MULTI_SOURCE
+            if args.baostock_verify
+            else SOURCE
         )
         _progress(
             "start",
@@ -1589,20 +1589,21 @@ def main(argv: list[str] | None = None) -> int:
             for value in (
                 args.verify_history,
                 args.backfill_sina,
-                args.tencent_only,
+                args.baostock_verify,
             )
         ) > 1:
             parser.error(
-                "--verify-history, --backfill-sina and --tencent-only are mutually exclusive"
+                "--verify-history, --backfill-sina and --baostock-verify "
+                "are mutually exclusive"
             )
         if args.backfill_sina:
             publisher = publish_sina_history
         elif args.verify_history:
             publisher = publish_verified_history
-        elif args.tencent_only:
-            publisher = publish_snapshot
-        else:
+        elif args.baostock_verify:
             publisher = publish_baostock_snapshot
+        else:
+            publisher = publish_snapshot
         result = publisher(history, target_date=target, now=now)
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0

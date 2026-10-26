@@ -70,6 +70,10 @@ def test_frozen_qmt_host_sets_are_exact_and_disjoint():
     }
     assert not WINDOWS_QMT_EDGE_TASK_TYPES & LINUX_QMT_TASK_TYPES
     assert LINUX_PROVIDER_TASK_TYPES == {
+        "free_stock_daily_canonical",
+        "free_index_daily_canonical",
+        "stock_minute",
+        "stock_minute_flow",
         "target_turnover_snapshot",
         "linux_recent_data_gap_repair",
         "alist_daily",

@@ -9,6 +9,7 @@ import re
 from sqlalchemy import text
 
 from tools.qmt_host_ownership_contract import (
+    LINUX_PROVIDER_TASKS_BY_TYPE,
     UNFROZEN_PROVIDER_SCRIPT_PATHS,
     UNFROZEN_PROVIDER_TASK_TYPES,
 )
@@ -17,9 +18,18 @@ from tools.qmt_host_ownership_contract import (
 def is_retired_provider_task(row: Mapping[str, object]) -> bool:
     task_type = str(row.get("task_type") or "").strip()
     script_path = str(row.get("script_path") or "").strip().replace("\\", "/")
+    contract = LINUX_PROVIDER_TASKS_BY_TYPE.get(task_type)
+    if (
+        contract is not None
+        and script_path == str(contract["script_path"])
+    ):
+        return False
     return task_type in UNFROZEN_PROVIDER_TASK_TYPES or (
         script_path in UNFROZEN_PROVIDER_SCRIPT_PATHS
-        and task_type not in {"intraday_minute_kline", "intraday_minute_flow"}
+        and task_type not in {
+            "intraday_minute_kline",
+            "intraday_minute_flow",
+        }
     )
 
 

@@ -65,7 +65,15 @@ def test_retirement_preserves_running_identity_and_historical_receipt():
     assert retire_superseded_provider_tasks(engine)["retired_tasks"] == []
 
 
-@pytest.mark.parametrize("task_type", ["intraday_minute_kline", "intraday_minute_flow"])
+@pytest.mark.parametrize(
+    "task_type",
+    [
+        "intraday_minute_kline",
+        "intraday_minute_flow",
+        "stock_minute",
+        "stock_minute_flow",
+    ],
+)
 def test_retirement_keeps_formal_public_minute_sources(task_type):
     engine = _engine(task_type=task_type, script="tools/crawl_minute_kline.py")
     before = _read(engine)
@@ -77,6 +85,50 @@ def test_retirement_keeps_formal_public_minute_sources(task_type):
 def test_retirement_covers_unknown_generic_script_alias():
     assert is_retired_provider_task({"task_type": "stock_minute_flow",
                                      "script_path": r"tools\run_single_table.py"})
+
+
+def test_pending_dispatch_without_history_becomes_retryable_after_backoff():
+    triggered = datetime(2026, 10, 26, 16, 30)
+    row = {
+        "task_type": "free_stock_daily_canonical",
+        "cron_time": "16:30",
+        "last_run_status": "pending",
+        "last_triggered_at": triggered,
+        "last_run_at": None,
+        "last_run_duration": None,
+    }
+    assert scheduler_runtime._task_status_is_retryable(row)
+    assert scheduler_runtime._cron_due(
+        row,
+        now=datetime(2026, 10, 26, 16, 46),
+    )
+    assert not scheduler_runtime._task_status_is_retryable(
+        {**row, "last_run_at": triggered}
+    )
+
+
+def test_public_minute_contract_binds_exact_trade_date():
+    for task_type, dataset in (
+        ("stock_minute", "stock"),
+        ("stock_minute_flow", "flow"),
+    ):
+        row = {
+            "task_type": task_type,
+            "script_path": "tools/crawl_minute_kline.py",
+            "script_args": f"--type {dataset} --min-coverage 0.99",
+        }
+        assert scheduler_runtime._build_task_args(
+            row,
+            "tools/crawl_minute_kline.py",
+            "2026-10-26",
+        ) == [
+            "--type",
+            dataset,
+            "--min-coverage",
+            "0.99",
+            "--trade-date",
+            "2026-10-26",
+        ]
 
 
 @pytest.mark.parametrize("router_name", ["scheduler", "datasource"])
