@@ -21,7 +21,7 @@ import urllib.parse
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Sequence
 
@@ -86,6 +86,32 @@ class ImportErrorBase(RuntimeError):
 
 def _source_circuit_tripped(consecutive_failures: int) -> bool:
     return consecutive_failures >= SOURCE_FAILURE_CIRCUIT
+
+
+def _normalize_storage_rows(rows: Sequence[dict]) -> list[dict]:
+    quantum = Decimal("0.000001")
+    fields = (
+        "price",
+        "avg_price",
+        "change",
+        "change_pct",
+        "volume",
+        "amount",
+    )
+    normalized: list[dict] = []
+    for raw in rows:
+        row = dict(raw)
+        for field in fields:
+            value = row.get(field)
+            if value is None:
+                continue
+            number = value if isinstance(value, Decimal) else Decimal(str(value))
+            if not number.is_finite():
+                raise ImportErrorBase("invalid numeric storage value")
+            number = number.quantize(quantum, rounding=ROUND_HALF_UP)
+            row[field] = abs(number) if number == 0 else number
+        normalized.append(row)
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -297,7 +323,10 @@ def _row_digest(rows: Sequence[dict]) -> str:
         if value is None:
             return "null"
         number = Decimal(str(value))
-        return format(number.quantize(Decimal("0.000001")), "f")
+        number = number.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+        if number == 0:
+            number = abs(number)
+        return format(number, "f")
 
     encoded = [
         [
@@ -414,6 +443,7 @@ def _fetch_one(
         captured_at=captured_at,
         batch_id=batch_id,
     )
+    rows = _normalize_storage_rows(rows)
     digest = _row_digest(rows)
     return {
         "stock_code": anchor.stock_code,
@@ -582,6 +612,7 @@ def _result_from_payload(
         captured_at=captured_at,
         batch_id=batch_id,
     )
+    rows = _normalize_storage_rows(rows)
     return {
         "stock_code": anchor.stock_code,
         "rows": rows,
@@ -857,6 +888,7 @@ def _fetch_tencent_one(
             captured_at=captured_at,
             batch_id=batch_id,
         )
+    rows = _normalize_storage_rows(rows)
     return {
         "stock_code": anchor.stock_code,
         "rows": rows,

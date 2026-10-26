@@ -25,6 +25,7 @@ from tools.import_sina_minute_history import (
     _paced_fetch,
     _readback_proofs,
     _load_anchors,
+    _normalize_storage_rows,
     _row_digest,
     _source_circuit_tripped,
     parse_sina_session,
@@ -203,6 +204,21 @@ def test_each_fetch_worker_uses_its_own_source_session(monkeypatch):
 def test_source_circuit_opens_after_twenty_consecutive_failures():
     assert not _source_circuit_tripped(19)
     assert _source_circuit_tripped(20)
+
+
+def test_storage_normalization_matches_mysql_decimal_rounding():
+    rows = _normalize_storage_rows([{
+        "price": Decimal("1.2345675"),
+        "avg_price": None,
+        "change": Decimal("-0.0000001"),
+        "change_pct": Decimal("2.3456785"),
+        "volume": Decimal("10000"),
+        "amount": Decimal("123.0"),
+    }])
+
+    assert rows[0]["price"] == Decimal("1.234568")
+    assert rows[0]["change"] == Decimal("0.000000")
+    assert rows[0]["change_pct"] == Decimal("2.345679")
 
 
 def test_streaming_readback_uses_per_code_proofs():
