@@ -98,6 +98,10 @@ from server.common.jq_minute_schema import (
     privileged_migrate_jq_minute_tables,
     validate_jq_minute_runtime,
 )
+from server.common.limit_up_event_schema import (
+    privileged_migrate_limit_up_event_schema,
+    validate_limit_up_event_runtime,
+)
 from server.common.portfolio_schema import (
     privileged_migrate_portfolio_schema,
     validate_portfolio_runtime_schema,
@@ -214,6 +218,7 @@ _MIGRATIONS: tuple[tuple[str, SchemaCallable], ...] = (
     ("commentary_profile", privileged_migrate_commentary_profile_table),
     ("screener", privileged_migrate_screener_tables),
     ("jq_minute", privileged_migrate_jq_minute_tables),
+    ("limit_up_event", privileged_migrate_limit_up_event_schema),
     ("market_radar", privileged_migrate_radar_tables),
     ("external_market", privileged_migrate_external_market_tables),
     ("premarket_theme", privileged_migrate_premarket_theme_tables),
@@ -257,6 +262,7 @@ _VALIDATORS: tuple[tuple[str, SchemaCallable], ...] = (
     ("commentary_profile", validate_commentary_profile_runtime),
     ("screener", validate_screener_runtime),
     ("jq_minute", validate_jq_minute_runtime),
+    ("limit_up_event", validate_limit_up_event_runtime),
     ("market_radar", validate_radar_runtime),
     ("external_market", validate_external_market_runtime),
     ("premarket_theme", validate_premarket_theme_runtime),

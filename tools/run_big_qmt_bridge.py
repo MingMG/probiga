@@ -21,7 +21,7 @@ import tempfile
 import threading
 import time
 import urllib.request
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, localcontext
 from pathlib import Path
 from typing import Any
@@ -70,6 +70,8 @@ from server.common.auxiliary_runtime_schema import (
     validate_qmt_realtime_sync_receipt_runtime_schema,
 )
 from server.common.mysql_lock import mysql_named_lock
+from server.common.limit_up_event_schema import validate_limit_up_event_runtime
+from server.common.limit_up_events import derive_limit_up_events, event_insert_sql
 from server.common.qmt_stock_catalog import load_target_stock_catalog
 from server.common.scheduler_tasks import (
     claim_scheduler_task_run,
@@ -82,6 +84,9 @@ _last_remote_portfolio_codes: list[str] = []
 _trade_day_cache: dict[str, bool] = {}
 _maintenance_process_lock = threading.Lock()
 _maintenance_processes: set[subprocess.Popen] = set()
+_limit_state_trade_date: date | None = None
+_limit_event_states: dict[str, dict[str, Any]] = {}
+_limit_event_schema_checked = False
 MEMBERSHIP_SNAPSHOT_TASK_TYPE = "qmt_membership_snapshot"
 ETF_FORWARD_TASK_TYPE = "etf_forward_daily"
 ETF_FORWARD_RETRY_MINUTES = 10
@@ -1455,7 +1460,136 @@ def _upsert_current_rows(connection, frame: pd.DataFrame) -> None:
         connection.execute(text(statement), parameters)
 
 
-def _replace_full_snapshot(engine, frame: pd.DataFrame) -> int:
+def _capture_limit_up_events(
+    engine,
+    frame: pd.DataFrame,
+    *,
+    now: datetime,
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Derive event candidates from one validated live full-market snapshot."""
+
+    global _limit_event_schema_checked, _limit_state_trade_date
+
+    if not _limit_event_schema_checked:
+        validate_limit_up_event_runtime(engine)
+        _limit_event_schema_checked = True
+    if _limit_state_trade_date != now.date():
+        _limit_event_states.clear()
+        _limit_event_states.update(
+            _load_limit_event_states(engine, now.date())
+        )
+        _limit_state_trade_date = now.date()
+
+    events: list[dict[str, Any]] = []
+    next_states: dict[str, dict[str, Any]] = {}
+    for row in frame.to_dict(orient="records"):
+        code = str(row.get("stock_code") or "").strip().zfill(6)
+        source_time = pd.to_datetime(row.get("source_time"), errors="coerce")
+        if pd.isna(source_time):
+            continue
+        quote = {
+            "stock_code": code,
+            "short_name": str(row.get("short_name") or code),
+            "snapshot_dt": source_time.to_pydatetime(),
+            "qmt_timetag": source_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "price": row.get("price"),
+            "pre_close": row.get("pre_close"),
+            "bid_price": [row.get("bid1")],
+            "bid_vol": [row.get("bid1_volume")],
+            "ask_price": [row.get("ask1")],
+            "ask_vol": [row.get("ask1_volume")],
+            "stale": 0,
+            "data_source": PROVIDER_ID,
+        }
+        derived, next_state = derive_limit_up_events(
+            quote,
+            _limit_event_states.get(code),
+            now=now,
+        )
+        if next_state is not None:
+            next_states[code] = next_state
+        events.extend(derived)
+    return events, next_states
+
+
+def _load_limit_event_states(
+    engine,
+    trade_date: date,
+) -> dict[str, dict[str, Any]]:
+    """Recover the last observable lifecycle state after a bridge restart."""
+
+    with engine.connect() as connection:
+        rows = connection.execute(
+            text(
+                """
+                WITH ranked AS (
+                    SELECT
+                        stock_code,
+                        event_type,
+                        event_at,
+                        bid1_volume_raw,
+                        ROW_NUMBER() OVER (
+                          PARTITION BY stock_code
+                          ORDER BY event_at DESC, event_id DESC
+                        ) AS rn
+                    FROM sm_limit_up_event
+                    WHERE trade_date = :trade_date
+                ),
+                sealed_history AS (
+                    SELECT stock_code, 1 AS ever_sealed
+                    FROM sm_limit_up_event
+                    WHERE trade_date = :trade_date
+                      AND event_type IN ('SEAL', 'RESEAL')
+                    GROUP BY stock_code
+                )
+                SELECT
+                    latest.stock_code,
+                    latest.event_type,
+                    latest.event_at,
+                    latest.bid1_volume_raw,
+                    COALESCE(history.ever_sealed, 0) AS ever_sealed
+                FROM ranked latest
+                LEFT JOIN sealed_history history
+                  ON history.stock_code = latest.stock_code
+                WHERE latest.rn = 1
+                LIMIT 1000
+                """
+            ),
+            {"trade_date": trade_date},
+        ).mappings().all()
+    result = {}
+    for row in rows:
+        event_type = str(row.get("event_type") or "")
+        sealed = event_type in {"SEAL", "RESEAL", "QUEUE_SNAPSHOT"}
+        result[str(row.get("stock_code") or "").zfill(6)] = {
+            "at_limit": event_type != "BREAK",
+            "sealed": sealed,
+            "ever_sealed": bool(row.get("ever_sealed")) or sealed,
+            "bid1_volume_raw": row.get("bid1_volume_raw"),
+            "last_queue_event_at": (
+                row.get("event_at") if sealed else None
+            ),
+        }
+    return result
+
+
+def _insert_limit_up_events(connection, events: list[dict[str, Any]]) -> None:
+    if not events:
+        return
+    statement = text(event_insert_sql())
+    for offset in range(0, len(events), 500):
+        connection.execute(
+            statement,
+            [dict(item) for item in events[offset : offset + 500]],
+        )
+
+
+def _replace_full_snapshot(
+    engine,
+    frame: pd.DataFrame,
+    *,
+    limit_up_events: list[dict[str, Any]] | None = None,
+) -> int:
     if frame.empty:
         raise ValueError("Big QMT full snapshot is empty")
     frame = _database_frame(engine, frame)
@@ -1467,6 +1601,7 @@ def _replace_full_snapshot(engine, frame: pd.DataFrame) -> int:
         with engine.begin() as conn:
             _upsert_current_rows(conn, frame)
             conn.execute(delete_sql, {"stock_codes": codes})
+            _insert_limit_up_events(conn, limit_up_events or [])
     return int(len(frame))
 
 
@@ -1819,7 +1954,18 @@ def ingest_once(
                 },
             )
         published_at = datetime.now().replace(microsecond=0)
-        result["full_rows"] = _replace_full_snapshot(engine, full_frame)
+        limit_up_events, next_limit_states = _capture_limit_up_events(
+            engine,
+            full_frame,
+            now=published_at,
+        )
+        result["full_rows"] = _replace_full_snapshot(
+            engine,
+            full_frame,
+            limit_up_events=limit_up_events,
+        )
+        _limit_event_states.update(next_limit_states)
+        result["limit_up_event_rows"] = len(limit_up_events)
         sync_receipt = _record_realtime_sync_receipt(
             engine,
             full_payload=full_payload,

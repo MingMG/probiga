@@ -28,6 +28,7 @@ from server.api.routers._engine import (
 )
 from server.api.routers import ai_bridge, auth, broad_etf_flow, commentary, datasource, deploy, health, hot_data, jq_minute, notify, qmt_ingest, qmt_strategy_results, quant_workbench, scheduler, sim_trade, strategy_center, screener, trading_v2, trading_v3
 from server.api.routers import market_outlook, market_radar, trading_day
+from server.briefing_tools.router import router as briefing_tools_router
 from server.api.scheduler_runtime import (
     start_embedded_scheduler,
     stop_embedded_scheduler,
@@ -268,6 +269,7 @@ app.include_router(market_outlook.router, prefix="/api")
 app.include_router(trading_day.router, prefix="/api")
 app.include_router(trading_v2.router, prefix="/api")
 app.include_router(trading_v3.router, prefix="/api")
+app.include_router(briefing_tools_router, prefix="/api")
 
 
 @app.middleware("http")

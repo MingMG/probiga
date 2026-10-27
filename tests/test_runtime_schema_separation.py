@@ -13,6 +13,7 @@ from biz.premarket import theme_forecast
 from biz.review import quant_digest
 from server.common import commentary_profile_schema
 from server.common import jq_minute_schema
+from server.common import limit_up_event_schema
 from server.common import screener_schema
 
 
@@ -189,6 +190,12 @@ class _MigrationEngine:
 _CASES = (
     ("radar", radar._RADAR_SCHEMA, radar.validate_radar_runtime, radar.ensure_radar_tables),
     (
+        "limit_up_event",
+        limit_up_event_schema.LIMIT_UP_EVENT_SCHEMA,
+        limit_up_event_schema.validate_limit_up_event_runtime,
+        None,
+    ),
+    (
         "premarket",
         theme_forecast._PREMARKET_THEME_SCHEMA,
         theme_forecast.validate_premarket_theme_runtime,
@@ -240,6 +247,10 @@ _CASES = (
 
 _MIGRATION_CASES = (
     (radar._RADAR_SCHEMA, radar.privileged_migrate_radar_tables),
+    (
+        limit_up_event_schema.LIMIT_UP_EVENT_SCHEMA,
+        limit_up_event_schema.privileged_migrate_limit_up_event_schema,
+    ),
     (
         theme_forecast._PREMARKET_THEME_SCHEMA,
         theme_forecast.privileged_migrate_premarket_theme_tables,

@@ -28,6 +28,7 @@ PUBLIC_API_PREFIXES = (
     "/api/health",
     "/api/ai-bridge/worker",
     "/api/qmt-ingest",
+    "/api/briefing-tools",
 )
 PUBLIC_PATHS = {
     "/login",

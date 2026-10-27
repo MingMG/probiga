@@ -93,6 +93,11 @@ def _prepare_ingest(monkeypatch, payload, now: datetime):
                         (payload, "full-file") if kind == "full" else ({}, ""))
     monkeypatch.setattr(consumer, "_write_status", lambda *args, **kw: None)
     monkeypatch.setattr(consumer, "_table_exists", lambda *args: False)
+    monkeypatch.setattr(
+        consumer,
+        "_capture_limit_up_events",
+        lambda *_args, **_kwargs: ([], {}),
+    )
     monkeypatch.setattr(bridge, "time", _FrozenClock(now))
     # Freeze the wall clock the consumer reads through datetime.now() too, so the
     # real session anchor is exercised rather than stubbed out.
@@ -113,7 +118,11 @@ def _frozen_datetime_class(now: datetime):
 def _ingest(monkeypatch, tmp_path, payload, now: datetime, *, publishes: bool):
     _prepare_ingest(monkeypatch, payload, now)
     if publishes:
-        monkeypatch.setattr(consumer, "_replace_full_snapshot", lambda _e, frame: len(frame))
+        monkeypatch.setattr(
+            consumer,
+            "_replace_full_snapshot",
+            lambda _e, frame, **_kwargs: len(frame),
+        )
         receipts: list[dict] = []
         monkeypatch.setattr(consumer, "_record_realtime_sync_receipt",
                             lambda _engine, **kw: receipts.append(kw) or {"quality_status": "PASS"})

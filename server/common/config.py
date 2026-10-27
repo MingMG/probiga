@@ -40,6 +40,10 @@ class Settings(BaseSettings):
     api_cache_max_entries: int = 512
     probiga_admin_auth_enabled: bool = True
     probiga_admin_token: str | None = None
+    probiga_briefing_tools_enabled: bool = False
+    probiga_briefing_tools_token: str | None = None
+    probiga_briefing_tools_timeout_seconds: int = 10
+    probiga_briefing_tools_max_rows: int = 200
     probiga_ai_bridge_token: str | None = None
     probiga_ai_bridge_lease_seconds: int = 900
     probiga_auth_session_hours: int = 24
@@ -246,6 +250,30 @@ def get_admin_auth_config() -> dict[str, str | bool | None]:
     return {
         "enabled": bool(settings.probiga_admin_auth_enabled),
         "token": token or None,
+    }
+
+
+def get_briefing_tools_config() -> dict[str, str | int | bool | None]:
+    """Return the dedicated credential and limits for AI market-data tools."""
+
+    settings = get_settings()
+    token = (settings.probiga_briefing_tools_token or "").strip()
+    return {
+        "enabled": bool(settings.probiga_briefing_tools_enabled),
+        "token": token or None,
+        "timeout_seconds": _bounded_int(
+            settings.probiga_briefing_tools_timeout_seconds,
+            default=10,
+            minimum=1,
+        ),
+        "max_rows": min(
+            200,
+            _bounded_int(
+                settings.probiga_briefing_tools_max_rows,
+                default=200,
+                minimum=1,
+            ),
+        ),
     }
 
 

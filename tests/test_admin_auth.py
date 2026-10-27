@@ -5,7 +5,11 @@ import pytest
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
-from server.api.admin_auth import admin_auth_status, validate_admin_request
+from server.api.admin_auth import (
+    admin_auth_status,
+    is_admin_protected_path,
+    validate_admin_request,
+)
 from server.common.config import get_settings
 
 
@@ -113,3 +117,10 @@ def test_public_health_remains_public(monkeypatch):
     get_settings.cache_clear()
 
     assert _client().get("/api/health").status_code == 200
+
+
+def test_briefing_tools_use_their_own_auth_surface():
+    assert not is_admin_protected_path(
+        "/api/briefing-tools/index-snapshot",
+        "GET",
+    )

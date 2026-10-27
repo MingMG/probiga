@@ -1171,7 +1171,12 @@ def test_full_snapshot_separates_unpriced_codes_from_transport_gaps(
     monkeypatch.setattr(
         run_big_qmt_bridge,
         "_replace_full_snapshot",
-        lambda _engine, value: len(value),
+        lambda _engine, value, **_kwargs: len(value),
+    )
+    monkeypatch.setattr(
+        run_big_qmt_bridge,
+        "_capture_limit_up_events",
+        lambda *_args, **_kwargs: ([], {}),
     )
 
     def record_receipt(_engine, **kwargs):
