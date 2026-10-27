@@ -1633,7 +1633,12 @@ def validate_release_data_readiness(
 
 
 def quarantine_legacy_canonical_market_writers(engine: Engine) -> int:
-    """Disable provider-generic stock writers already replaced by QMT."""
+    """Disable the retired provider-generic daily writer.
+
+    ``stock_minute`` is not retired: the public-source full-market minute task is
+    a current managed contract and must remain enabled.  Only the superseded
+    generic daily writer is quarantined here.
+    """
 
     columns = _table_columns(engine, "st_scheduled_tasks")
     required = {"task_type", "enabled"}
@@ -1649,18 +1654,18 @@ def quarantine_legacy_canonical_market_writers(engine: Engine) -> int:
         result = connection.execute(text(f"""
             UPDATE st_scheduled_tasks
                SET {assignment}
-             WHERE task_type IN ('stock_kline','stock_minute')
+             WHERE task_type = 'stock_kline'
                AND enabled<>0
         """))
     with engine.connect() as connection:
         enabled_count = int(connection.execute(text("""
             SELECT COUNT(*)
               FROM st_scheduled_tasks
-             WHERE task_type IN ('stock_kline','stock_minute')
+             WHERE task_type = 'stock_kline'
                AND enabled<>0
         """)).scalar() or 0)
     if enabled_count:
-        raise RuntimeError("legacy stock market writers remain enabled")
+        raise RuntimeError("legacy stock daily writer remains enabled")
     return max(0, int(getattr(result, "rowcount", 0) or 0))
 
 
@@ -1784,7 +1789,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         if selected_types is None:
             disabled = quarantine_legacy_canonical_market_writers(engine)
-            result["legacy stock_kline/stock_minute quarantine"] = (
+            result["legacy stock_kline quarantine"] = (
                 f"disabled={disabled}"
             )
         validate_managed_task_contracts(engine, task_types=selected_types)

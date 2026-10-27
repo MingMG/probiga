@@ -437,7 +437,7 @@ class QualityGateTaskTest(unittest.TestCase):
                 ensure_quality_gate.run(object(), task_types={"typo"})
         ensure.assert_not_called()
 
-    def test_release_quarantines_legacy_generic_stock_writers(self):
+    def test_release_quarantines_legacy_stock_daily_without_disabling_minute(self):
         engine = create_engine("sqlite+pysqlite:///:memory:")
         with engine.begin() as connection:
             connection.execute(text("""
@@ -464,14 +464,14 @@ class QualityGateTaskTest(unittest.TestCase):
             ensure_quality_gate.quarantine_legacy_canonical_market_writers(
                 engine
             )
-            == 2
+            == 1
         )
         with engine.connect() as connection:
             rows = dict(connection.execute(text(
                 "SELECT task_type,enabled FROM st_scheduled_tasks"
             )).all())
         self.assertEqual(rows["stock_kline"], 0)
-        self.assertEqual(rows["stock_minute"], 0)
+        self.assertEqual(rows["stock_minute"], 1)
         self.assertEqual(rows["capital_flow_batch_fast"], 1)
         self.assertEqual(rows["capital_flow"], 1)
         self.assertEqual(rows["intraday_minute_flow"], 1)
