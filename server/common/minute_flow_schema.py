@@ -16,7 +16,10 @@ MINUTE_FLOW_DATE_INDEX = "idx_scfm_trade_date"
 MINUTE_FLOW_DATE_INDEX_COLUMNS = (
     MINUTE_FLOW_DATE_COLUMN,
 )
-MINUTE_FLOW_DATE_EXPRESSION = "date(`trade_time`)"
+MINUTE_FLOW_DATE_EXPRESSIONS = (
+    "cast(`trade_time` as date)",
+    "date(`trade_time`)",
+)
 
 
 def _normalized_generation_expression(value: Any) -> str:
@@ -43,9 +46,11 @@ def validate_minute_flow_trade_date_metadata(
         str(column.get("DATA_TYPE") or column.get("data_type") or "").lower()
         != "date"
         or "VIRTUAL GENERATED" not in extra
-        or expression != _normalized_generation_expression(
-            MINUTE_FLOW_DATE_EXPRESSION
-        )
+        or expression
+        not in {
+            _normalized_generation_expression(value)
+            for value in MINUTE_FLOW_DATE_EXPRESSIONS
+        }
         or str(column.get("IS_NULLABLE") or column.get("is_nullable") or "").upper()
         != "YES"
     ):
@@ -187,7 +192,7 @@ def privileged_migrate_minute_flow_trade_date(engine) -> dict[str, Any]:
 
 __all__ = [
     "MINUTE_FLOW_DATE_COLUMN",
-    "MINUTE_FLOW_DATE_EXPRESSION",
+    "MINUTE_FLOW_DATE_EXPRESSIONS",
     "MINUTE_FLOW_DATE_INDEX",
     "MINUTE_FLOW_DATE_INDEX_COLUMNS",
     "MINUTE_FLOW_TABLE",
