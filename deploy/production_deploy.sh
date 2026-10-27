@@ -5807,8 +5807,14 @@ controlled_guard_assert_governance_restore_runtime() {
     \( ! -user root -o -perm /022 \) -print -quit)" || return 1
   V2_RECOVERY_STEP=rollback-validate-forward-service-access
   service_user="$(systemctl show -p User --value probiga)" || return 1
-  test -n "$service_user" || return 1
-  test "$service_user" != root || return 1
+  if [ -z "$service_user" ]; then
+    echo "recovery service access violation reason=empty_service_user" >&2
+    return 1
+  fi
+  if [ "$service_user" = root ]; then
+    echo "recovery service access violation reason=root_service_user" >&2
+    return 1
+  fi
   if sudo -u "$service_user" test -w "$code_root"; then
     echo "recovery service access violation path=code_root user=$service_user" >&2
     namei -l "$code_root" >&2 || true
@@ -5824,6 +5830,7 @@ controlled_guard_assert_governance_restore_runtime() {
     namei -l "$adata_source" >&2 || true
     return 1
   fi
+  echo "recovery service access verified user=$service_user" >&2
   return 0
 }
 controlled_guard_capture_current_governance_snapshot() {

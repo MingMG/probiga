@@ -4574,7 +4574,7 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
         '"$guarded_sha"'
     ) in restore_runtime
     assert "controlled_guard_assert_immutable_venv_tree" in restore_runtime
-    assert 'test "$service_user" != root' in restore_runtime
+    assert 'if [ "$service_user" = root ]' in restore_runtime
     for writable_path in ("code_root", "release_venv", "adata_source"):
         assert f"path={writable_path}" in restore_runtime
     assert "namei -l" in restore_runtime
