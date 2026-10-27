@@ -491,6 +491,11 @@ SCHEDULER_OWNER_UNAVAILABLE = "unavailable"
 PRIOR_SESSION_PUBLIC_MINUTE_TASK_TYPES = frozenset(
     {"stock_minute", "stock_minute_flow"}
 )
+# These public-source publishers run after the final close.  They are not
+# strategy-delivery dependencies, but they must be allowed to consume the
+# worker reserved for critical close data instead of waiting behind a
+# multi-hour auxiliary collector on a two-worker scheduler.
+POST_CLOSE_PUBLIC_MINUTE_TASK_TYPES = PRIOR_SESSION_PUBLIC_MINUTE_TASK_TYPES
 _running_procs: dict[int, subprocess.Popen] = {}
 _running_timeout_minutes: dict[int, int | None] = {}
 _running_task_ids: set[int] = set()
@@ -5629,7 +5634,10 @@ def _scheduler_lane_has_capacity(row: dict, *, max_general_tasks: int) -> bool:
         general_limit > 1
         and not (general_ids & _core_running_task_ids)
         and str(row.get("task_type") or "").strip()
-        not in DAILY_RESULT_CORE_TASK_TYPES
+        not in (
+            DAILY_RESULT_CORE_TASK_TYPES
+            | POST_CLOSE_PUBLIC_MINUTE_TASK_TYPES
+        )
     ):
         # Reserve one worker while no core task occupies it. Once a core job
         # is running it already holds that reservation; reserving another idle

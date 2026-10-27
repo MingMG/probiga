@@ -1326,6 +1326,26 @@ class SchedulerRuntimeTest(unittest.TestCase):
             {"task_type": "analysis_fast"}, max_general_tasks=2,
         ))
 
+    def test_post_close_public_minute_uses_reserved_worker_behind_notice(self):
+        scheduler_runtime._running_task_ids.add(63)
+
+        for task_type in ("stock_minute", "stock_minute_flow"):
+            with self.subTest(task_type=task_type):
+                self.assertTrue(
+                    scheduler_runtime._scheduler_lane_has_capacity(
+                        {"task_type": task_type},
+                        max_general_tasks=2,
+                    )
+                )
+
+        scheduler_runtime._running_task_ids.add(15)
+        self.assertFalse(
+            scheduler_runtime._scheduler_lane_has_capacity(
+                {"task_type": "stock_minute_flow"},
+                max_general_tasks=2,
+            )
+        )
+
     def test_running_finance_holds_reservation_without_blocking_independent_collection(self):
         scheduler_runtime._running_task_ids.add(123)
         scheduler_runtime._core_running_task_ids.add(123)
