@@ -5809,9 +5809,21 @@ controlled_guard_assert_governance_restore_runtime() {
   service_user="$(systemctl show -p User --value probiga)" || return 1
   test -n "$service_user" || return 1
   test "$service_user" != root || return 1
-  sudo -u "$service_user" test ! -w "$code_root" || return 1
-  sudo -u "$service_user" test ! -w "$release_venv_target" || return 1
-  sudo -u "$service_user" test ! -w "$adata_source" || return 1
+  if sudo -u "$service_user" test -w "$code_root"; then
+    echo "recovery service access violation path=code_root user=$service_user" >&2
+    namei -l "$code_root" >&2 || true
+    return 1
+  fi
+  if sudo -u "$service_user" test -w "$release_venv_target"; then
+    echo "recovery service access violation path=release_venv user=$service_user" >&2
+    namei -l "$release_venv_target" >&2 || true
+    return 1
+  fi
+  if sudo -u "$service_user" test -w "$adata_source"; then
+    echo "recovery service access violation path=adata_source user=$service_user" >&2
+    namei -l "$adata_source" >&2 || true
+    return 1
+  fi
   return 0
 }
 controlled_guard_capture_current_governance_snapshot() {
