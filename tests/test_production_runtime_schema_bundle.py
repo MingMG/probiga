@@ -6,7 +6,7 @@ from server.common import production_runtime_schema_bundle as bundle
 
 
 EXPECTED_BUNDLE_CONTRACT_HASH = (
-    "2e387bd7d098648ed0a54eb85d4deba396048ab57a8a500e717bc2e9f72093b1"
+    "390c15c3f6cbc316950b1d738b1fbd09255526b42b807b3d7e3e1e175d393f71"
 )
 
 
@@ -50,6 +50,7 @@ def test_bundle_names_are_unique_and_cover_every_seed_dependency():
         "qmt_catalog",
         "qmt_audit",
         "current_quote_storage",
+        "minute_flow_trade_date",
     } <= set(migration_names)
     metadata = bundle._contract_metadata()
     assert metadata["schema"] == bundle.BUNDLE_CONTRACT_SCHEMA

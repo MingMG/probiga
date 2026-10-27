@@ -32,13 +32,13 @@ $EditorSuffix = "-" + (
     [char]0x8F91 + [char]0x5668
 )
 $EditorTitle = "$StrategyName$EditorSuffix"
-$ExpectedOrigin = "https://github.com/MingMG/probiga.git"
 $ReleaseManifestName = "probiga_big_qmt_bridge.release.json"
 $DirectModelFilePrefix = "probiga_direct_acquisition_"
 $ReleaseManifestSchema = "probiga.bigqmt-strategy-manifest.v1"
 $ReleaseProtocol = "probiga.bigqmt-strategy-release.v2"
 $IdentityProtocol = "probiga.bigqmt-loaded-strategy-identity.v1"
 $ExpectedBuild = $ExpectedBuildSha.Trim().ToLowerInvariant()
+. (Join-Path $PSScriptRoot 'deploy_preflight.ps1')
 $ExpectedRoot = [System.IO.Path]::GetFullPath($RegisteredRoot)
 $Root = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $PythonExe = Join-Path $ExpectedRoot ".venv\Scripts\python.exe"
@@ -634,7 +634,7 @@ if (!$PreflightOnly) {
     ) -join "`n").Trim()
     if (
         [System.IO.Path]::GetFullPath($ActivationTopLevel) -ine $ExpectedRoot -or
-        $ActivationOrigin -ine $ExpectedOrigin -or
+        !(Test-DeployProductionOrigin $ActivationOrigin) -or
         $ActivationBranch -cne "main" -or
         $ActivationHead -cne $ExpectedBuild -or
         $ActivationDirty
@@ -3103,7 +3103,7 @@ try {
     ) -join "`n").Trim()
     if (
         [System.IO.Path]::GetFullPath($TopLevel) -ine $ExpectedRoot -or
-        $Origin -ine $ExpectedOrigin -or
+        !(Test-DeployProductionOrigin $Origin) -or
         $Branch -cne "main" -or
         $Head -cne $ExpectedBuild -or
         $Blob -notmatch "^[0-9a-f]{40}$|^[0-9a-f]{64}$" -or

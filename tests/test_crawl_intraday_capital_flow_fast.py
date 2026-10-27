@@ -221,7 +221,8 @@ def test_write_replaces_only_current_minute_in_one_transaction():
             text(
                 "CREATE TABLE sm_stock_capital_flow_min ("
                 "id INTEGER PRIMARY KEY AUTOINCREMENT, stock_code TEXT NOT NULL, "
-                "trade_time DATETIME, main_net_inflow REAL, max_net_inflow REAL, "
+                "trade_time DATETIME, trade_date TEXT, "
+                "main_net_inflow REAL, max_net_inflow REAL, "
                 "lg_net_inflow REAL, mid_net_inflow REAL, sm_net_inflow REAL, "
                 "snapshot_at DATETIME NOT NULL, etl_sync_at DATETIME NOT NULL, "
                 "source_time DATETIME, received_at DATETIME, data_source TEXT)"
@@ -235,9 +236,9 @@ def test_write_replaces_only_current_minute_in_one_transaction():
             conn.execute(
                 text(
                     "INSERT INTO sm_stock_capital_flow_min "
-                    "(stock_code, trade_time, main_net_inflow, max_net_inflow, "
+                    "(stock_code, trade_time, trade_date, main_net_inflow, max_net_inflow, "
                     "lg_net_inflow, mid_net_inflow, sm_net_inflow, snapshot_at, etl_sync_at) "
-                    "VALUES (:code, :trade_time, 1, 2, 3, 4, 5, :trade_time, :trade_time)"
+                    "VALUES (:code, :trade_time, '2026-08-11', 1, 2, 3, 4, 5, :trade_time, :trade_time)"
                 ),
                 {"code": code, "trade_time": trade_time},
             )

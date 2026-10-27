@@ -190,8 +190,7 @@ def _read_minute_close_fallback(
             JOIN (
                 SELECT stock_code, COUNT(*) AS bar_count, MAX(trade_time) AS last_time
                 FROM sm_stock_capital_flow_min
-                WHERE trade_time >= :d
-                  AND trade_time < DATE_ADD(:d, INTERVAL 1 DAY)
+                WHERE trade_date = :d
                 GROUP BY stock_code
             ) x ON x.stock_code = f.stock_code AND x.last_time = f.trade_time
         """), {"d": target_date}).mappings().all()

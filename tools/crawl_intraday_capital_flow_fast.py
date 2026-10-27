@@ -370,9 +370,14 @@ def write_current_minute_snapshot(
         conn.execute(
             text(
                 "DELETE FROM sm_stock_capital_flow_min "
-                "WHERE trade_time >= :minute_start AND trade_time < :minute_end"
+                "WHERE trade_date = :trade_date "
+                "AND trade_time >= :minute_start AND trade_time < :minute_end"
             ),
-            {"minute_start": minute_start, "minute_end": minute_end},
+            {
+                "trade_date": minute_start.date().isoformat(),
+                "minute_start": minute_start,
+                "minute_end": minute_end,
+            },
         )
         for offset in range(0, len(params), max(1, chunk_size)):
             chunk = params[offset : offset + max(1, chunk_size)]

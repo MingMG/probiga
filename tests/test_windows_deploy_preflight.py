@@ -89,6 +89,26 @@ def _config_bytes(repo: tuple[Path, dict[str, str]]) -> tuple[bytes, bytes]:
     return ((root / ".git/config").read_bytes(), Path(env["GIT_CONFIG_GLOBAL"]).read_bytes())
 
 
+def test_production_origin_accepts_only_canonical_https_and_ssh(powershell, repo):
+    _, env = repo
+    result = _ps(powershell, """
+@{
+    https=Test-DeployProductionOrigin 'https://github.com/MingMG/probiga.git'
+    ssh443=Test-DeployProductionOrigin 'ssh://git@ssh.github.com:443/MingMG/probiga.git'
+    ssh22=Test-DeployProductionOrigin 'git@github.com:MingMG/probiga.git'
+    wrong_repo=Test-DeployProductionOrigin 'ssh://git@ssh.github.com:443/MingMG/other.git'
+    credential=Test-DeployProductionOrigin 'https://user@github.com/MingMG/probiga.git'
+} | ConvertTo-Json -Compress
+""", env)
+    assert result == {
+        "https": True,
+        "ssh443": True,
+        "ssh22": True,
+        "wrong_repo": False,
+        "credential": False,
+    }
+
+
 @contextmanager
 def _rejecting_proxy():
     requests: list[str] = []

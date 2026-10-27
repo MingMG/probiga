@@ -15,7 +15,6 @@ Assert-DeployAdministrator
 
 $TaskName = "ProBigA QMT Windows Edge Scheduler"
 $UpdateTaskName = "ProBigA QMT Windows Edge Updater"
-$ExpectedOrigin = "https://github.com/MingMG/probiga.git"
 $WindowsRoot = [System.Environment]::GetFolderPath(
     [System.Environment+SpecialFolder]::Windows
 )
@@ -79,7 +78,7 @@ if ([System.IO.Path]::GetFullPath($TopLevel) -ine $ExpectedRoot) {
     throw "QMT Windows edge Git top level differs from production root"
 }
 $Origin = ((Invoke-Git @("remote", "get-url", "origin")) -join "").Trim()
-if ($Origin -ine $ExpectedOrigin) {
+if (!(Test-DeployProductionOrigin $Origin)) {
     throw "QMT Windows edge origin differs from the production repository"
 }
 Write-DeployGitContext $ExpectedRoot 'registration' $GitHubProxy

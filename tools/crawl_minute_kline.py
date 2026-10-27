@@ -1040,11 +1040,11 @@ def replay_result(result, engine, *, started_at, now):
         raise ValueError("native no-trade evidence contradicts collected bars")
     kind, table = result["dataset"], result["table"]
     fields = ", ".join(quote_identifier(field) for field in VALUE_FIELDS[kind])
-    date_column = ", trade_date" if kind == "stock" else ""
+    date_column = ", trade_date"
     query = text(
         f"SELECT stock_code, trade_time, {fields}, etl_sync_at, source_time, received_at, data_source{date_column} "
         f"FROM {quote_identifier(table)} "
-        "WHERE trade_time >= :day AND trade_time < :next_day AND stock_code IN :codes "
+        "WHERE trade_date = :day AND stock_code IN :codes "
         "ORDER BY stock_code, trade_time LIMIT :row_limit"
     ).bindparams(bindparam("codes", expanding=True))
     proofs, rows, current_code, count = [], [], None, 0
@@ -1059,7 +1059,7 @@ def replay_result(result, engine, *, started_at, now):
 
     with routed_read_engine(query, engine).connect() as connection:
         stream = connection.execution_options(stream_results=True).execute(query, {
-            "day": target, "next_day": (date.fromisoformat(target) + timedelta(days=1)).isoformat(),
+            "day": target,
             "codes": sorted(collected | no_trade), "row_limit": result["written_rows"] + 1,
         }).mappings()
         for row in stream:

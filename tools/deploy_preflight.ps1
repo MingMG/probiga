@@ -16,6 +16,19 @@ function ConvertTo-DeployArgument([string]$Value) {
     return '"' + (($Value -replace '(\\*)"', '$1$1\"') -replace '(\\+)$', '$1$1') + '"'
 }
 
+function Test-DeployProductionOrigin([string]$Origin) {
+    # HTTPS and GitHub SSH endpoints identify the same production repository.
+    # The configured transport may be rewritten by Git's url.*.insteadOf rules,
+    # so remote get-url must be checked against both canonical endpoint forms.
+    $Normalized = ([string]$Origin).Trim()
+    return @(
+        'https://github.com/MingMG/probiga.git'
+        'ssh://git@ssh.github.com:443/MingMG/probiga.git'
+        'ssh://git@github.com/MingMG/probiga.git'
+        'git@github.com:MingMG/probiga.git'
+    ) -contains $Normalized
+}
+
 function Assert-DeployProxy([string]$GitHubProxy) {
     if (!$GitHubProxy -or $GitHubProxy -ceq 'direct') { return }
     $Uri = $null

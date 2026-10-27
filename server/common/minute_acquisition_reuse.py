@@ -83,7 +83,6 @@ def has_minute_code_coverage(connection, *, table: str, trade_date: str,
     """
     if table not in TABLES.values():
         raise ValueError("minute coverage table differs")
-    target = date.fromisoformat(trade_date)
     codes = sorted(set(expected_codes))
     counts = set(allowed_counts)
     if not codes or not counts or not counts <= set(GRID_HASHES):
@@ -92,13 +91,13 @@ def has_minute_code_coverage(connection, *, table: str, trade_date: str,
         SELECT /*+ MAX_EXECUTION_TIME(30000) */ stock_code,
                COUNT(*) row_count,COUNT(DISTINCT trade_time) time_count
           FROM `{table}`
-         WHERE stock_code IN :codes AND trade_time>=:day AND trade_time<:next_day
+         WHERE trade_date=:day AND stock_code IN :codes
          GROUP BY stock_code ORDER BY stock_code
     """).bindparams(bindparam("codes", expanding=True))
     for offset in range(0, len(codes), 100):
         batch = codes[offset:offset + 100]
         rows = connection.execute(statement, {
-            "day": trade_date, "next_day": (target + timedelta(days=1)).isoformat(),
+            "day": trade_date,
             "codes": batch,
         }).mappings().all()
         if (len(rows) != len(batch)
@@ -139,7 +138,7 @@ def _query(kind: str) -> Any:
                SHA2(GROUP_CONCAT({row_hash} ORDER BY trade_time SEPARATOR ''),256) row_hash,
                LENGTH(GROUP_CONCAT({row_hash} ORDER BY trade_time SEPARATOR '')) hashed_bytes{closing_price}
           FROM `{TABLES[kind]}`
-         WHERE stock_code IN :codes AND trade_time>=:day AND trade_time<:next_day
+         WHERE trade_date=:day AND stock_code IN :codes
          GROUP BY stock_code ORDER BY stock_code
     """).bindparams(bindparam("codes", expanding=True))
 
@@ -302,12 +301,12 @@ def inspect_complete_partition(primary_engine, data_engine, *, kind: str,
         connection.exec_driver_sql("SET SESSION group_concat_max_len=32768")
         rows = []
         codes = sorted(expected)
-        # Both split databases have a (stock_code, trade_time) index. Bound
-        # every lookup to it instead of scanning decades of minute history.
+        # Both minute tables expose the generated trade_date access path.
+        # Bound every lookup to one day instead of scanning minute history.
         try:
             for offset in range(0, len(codes), 100):
                 rows.extend(connection.execute(_query(kind), {
-                    "day": trade_date, "next_day": (target + timedelta(days=1)).isoformat(),
+                    "day": trade_date,
                     "codes": codes[offset:offset + 100],
                 }).mappings().all())
         finally:

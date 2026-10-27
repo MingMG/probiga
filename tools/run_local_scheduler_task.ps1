@@ -6,6 +6,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+. (Join-Path $PSScriptRoot 'deploy_preflight.ps1')
 
 # The production checkout is an immutable code boundary. Every Python
 # process launched by this wrapper inherits this setting, so imports cannot
@@ -14,7 +15,6 @@ $env:PYTHONDONTWRITEBYTECODE = "1"
 
 $SchedulerTaskName = "ProBigA QMT Windows Edge Scheduler"
 $UpdateTaskName = "ProBigA QMT Windows Edge Updater"
-$ExpectedOrigin = "https://github.com/MingMG/probiga.git"
 $WindowsRoot = [System.Environment]::GetFolderPath(
     [System.Environment+SpecialFolder]::Windows
 )
@@ -133,7 +133,7 @@ if ([System.IO.Path]::GetFullPath($TopLevel) -ine $ExpectedRoot) {
     throw "scheduler Git top level differs from registered production root"
 }
 $Origin = ((Invoke-Git @("remote", "get-url", "origin")) -join "").Trim()
-if ($Origin -ine $ExpectedOrigin) {
+if (!(Test-DeployProductionOrigin $Origin)) {
     throw "scheduler origin differs from the production repository"
 }
 # The updater owns network synchronization. Starting an already deployed,

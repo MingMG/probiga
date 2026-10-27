@@ -100,7 +100,7 @@ DATASETS = (
     Dataset("daily", "股票日线", "market", "sm_stock_kline", "kline", scope="全市场 · 日线 · 不复权", task_type="free_stock_daily_canonical"),
     Dataset("minute", "股票分钟线", "market", "sm_stock_minute", "kline", scope="全市场 · 公开源 1 分钟", deadline="18:30", task_type="stock_minute"),
     Dataset("flow", "每日资金流", "flow", "sm_stock_capital_flow_daily", "minute", scope="全市场 · 当日有成交", task_type="capital_flow_batch_fast"),
-    Dataset("minute_flow", "分钟资金流", "flow", "sm_stock_capital_flow_min", "minute", date_column="trade_time", scope="全市场 · 公开源 1 分钟", deadline="24:00", task_type="stock_minute_flow"),
+    Dataset("minute_flow", "分钟资金流", "flow", "sm_stock_capital_flow_min", "minute", scope="全市场 · 公开源 1 分钟", deadline="24:00", task_type="stock_minute_flow"),
     Dataset("alist", "龙虎榜列表", "event", "st_a_list_daily", "business", scope="当日完整披露清单", task_type="alist_daily", empty_allowed=True),
     Dataset("alist_info", "龙虎榜详情", "event", "st_a_list_info", "business", scope="当日席位明细", task_type="alist_info", empty_allowed=True),
     Dataset("index", "指数行情", "market", "sm_index_kline", "kline", code="index_code", scope="公开源价格指数 · 日线", task_type="free_index_daily_canonical"),
@@ -279,8 +279,6 @@ class Observer:
     def _partition(self, spec: Dataset, day: str) -> tuple[str, str, dict]:
         predicate = f"`{spec.date_column}`=:day"
         params = {"day": day, "end": (date.fromisoformat(day)+timedelta(days=1)).isoformat()}
-        if spec.date_column == "trade_time":
-            predicate = "trade_time>=:day AND trade_time<:end"
         if spec.key == "daily":
             predicate += " AND k_type=1 AND adjust_type=0"
         elif spec.key in {"index", "concept"}:

@@ -935,22 +935,20 @@ def check_intraday_foundation(engine: Engine, trade_date: str) -> CheckResult:
     current_rows = int(current_row.get("row_count") or 0)
     current_coverage = round(current_stocks / max(expected_stocks, 1), 4)
 
-    flow_min_latest = _scalar(engine, "SELECT MAX(trade_time) FROM sm_stock_capital_flow_min")
+    flow_min_latest = _scalar(engine, "SELECT MAX(trade_date) FROM sm_stock_capital_flow_min")
     flow_min_date = _fmt_date(flow_min_latest)
     flow_day_start = (
         datetime.strptime(flow_min_date, "%Y-%m-%d")
         if flow_min_date
         else datetime.strptime(intraday_date, "%Y-%m-%d")
     )
-    flow_day_end = flow_day_start + timedelta(days=1)
     flow_min_row = _row(engine, """
         SELECT MAX(trade_time) AS latest_time,
                COUNT(DISTINCT stock_code) AS stock_count,
                COUNT(*) AS row_count
         FROM sm_stock_capital_flow_min
-        WHERE trade_time >= :day_start
-          AND trade_time < :day_end
-    """, {"day_start": flow_day_start, "day_end": flow_day_end})
+        WHERE trade_date = :day
+    """, {"day": flow_day_start.date().isoformat()})
     flow_min_date = _fmt_date(flow_min_row.get("latest_time")) or flow_min_date
     flow_min_stocks = int(flow_min_row.get("stock_count") or 0)
     flow_min_rows = int(flow_min_row.get("row_count") or 0)

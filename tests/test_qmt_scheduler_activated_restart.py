@@ -94,6 +94,8 @@ def test_scheduler_restart_requires_merged_activated_release_in_ps5_file(case, t
         "$ErrorActionPreference='Stop'\nSet-StrictMode -Version Latest\n"
         f"$ExpectedRoot={quote(repo)}\n$PythonExe={quote(native)}\n"
         "$ExpectedOrigin='https://github.com/MingMG/probiga.git'\n"
+        "function Test-DeployProductionOrigin([string]$Origin) "
+        "{ return $Origin -ieq $ExpectedOrigin }\n"
         f"$RealGit={quote(git)}\n"
         "$global:NetworkAttempts=0\nfunction git {\n"
         "  if (($args -contains 'fetch') -or ($args -contains 'ls-remote')) {\n"

@@ -1892,6 +1892,11 @@ def validate_stock_market_runtime_schema(engine: Engine) -> dict[str, Any]:
             "sm_stock_current": {"stock_code", "price", "snapshot_at", "etl_sync_at"},
             "sm_stock_kline": {"stock_code", "short_name", "trade_date", "close"},
             "sm_stock_minute": {"stock_code", "trade_time", "trade_date", "price"},
+            "sm_stock_capital_flow_min": {
+                "stock_code",
+                "trade_time",
+                "trade_date",
+            },
         },
     )
 

@@ -4103,7 +4103,7 @@ def test_controlled_database_guard_recovery_is_explicit_and_fail_closed() -> Non
         "243f0637910b6648b851351f7a4b3cf4cfd3b6e183001e69793dae2544dfb30d",
         "1fcde61ce5a5ea0cc16f1910d94da431d044c667383fafd2224217709f555943",
         "a5fa5a3da93040c4520dc1c79bf6e58b71f7c6efa890fcf7b41ba7915c292e92",
-        "2e387bd7d098648ed0a54eb85d4deba396048ab57a8a500e717bc2e9f72093b1",
+        "390c15c3f6cbc316950b1d738b1fbd09255526b42b807b3d7e3e1e175d393f71",
     ):
         assert frozen_contract_literal in resume_validator
         assert frozen_contract_literal in preflight_validator
@@ -6202,9 +6202,9 @@ def test_initial_database_preflight_rejects_unready_recovery_before_api_stop():
         "runtime_schema_bundle": {
             "schema": "probiga.production-runtime-schema-bundle.v1",
             "contract_hash": (
-                "2e387bd7d098648ed0a54eb85d4deba396048ab57a8a500e717bc2e9f72093b1"
+                "390c15c3f6cbc316950b1d738b1fbd09255526b42b807b3d7e3e1e175d393f71"
             ),
-            "migration_count": 35,
+            "migration_count": 36,
             "seed_count": 3,
             "trigger_installation_policy": "FROZEN_RELEASE_BROKER_ONLY",
             "broker_owned_trigger_migration_names": [
@@ -6214,7 +6214,7 @@ def test_initial_database_preflight_rejects_unready_recovery_before_api_stop():
                 "auxiliary_runtime",
             ],
             "validator_names": validator_names,
-            "validator_count": 38,
+            "validator_count": 39,
             "contracts": {
                 name: {
                     "status": (

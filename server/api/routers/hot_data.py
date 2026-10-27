@@ -2182,7 +2182,7 @@ def capital_flow_realtime(stock_code: str = Query()):
                        lg_net_inflow, mid_net_inflow, sm_net_inflow, data_source, source_time
                 FROM sm_stock_capital_flow_min
                 WHERE stock_code = :code
-                  AND trade_time >= CONCAT(CURDATE(), ' 00:00:00')
+                  AND trade_date = CURDATE()
                 ORDER BY trade_time
                 """,
                 {"code": code},
@@ -6756,8 +6756,7 @@ def _portfolio_min_flow_summary(
                lg_net_inflow, mid_net_inflow, sm_net_inflow, data_source, source_time
         FROM sm_stock_capital_flow_min
         WHERE stock_code IN ({placeholders})
-          AND trade_time >= :flow_date
-          AND trade_time < DATE_ADD(:flow_date, INTERVAL 1 DAY)
+          AND trade_date = :flow_date
         ORDER BY stock_code, trade_time
         """,
         params,

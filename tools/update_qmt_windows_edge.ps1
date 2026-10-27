@@ -21,7 +21,6 @@ $PrecutoverRecoveryProtocol = "probiga.qmt-edge-precutover-recovery.v1"
 $ForwardOnlyRecoveryProtocol = "probiga.qmt-edge-forward-only-supersession.v1"
 $GrantedRecoveryProtocol = "probiga.qmt-edge-granted-supersession.v1"
 $script:ForwardOnlySchedulerGate = $false
-$ExpectedOrigin = "https://github.com/MingMG/probiga.git"
 $WindowsRoot = [System.Environment]::GetFolderPath(
     [System.Environment+SpecialFolder]::Windows
 )
@@ -1178,7 +1177,7 @@ if ([System.IO.Path]::GetFullPath($TopLevel) -ine $ExpectedRoot) {
     throw "QMT Windows edge Git top level differs from registered production root"
 }
 $Origin = ((Invoke-Git @("remote", "get-url", "origin")) -join "").Trim()
-if ($Origin -ine $ExpectedOrigin) {
+if (!(Test-DeployProductionOrigin $Origin)) {
     throw "QMT Windows edge origin differs from the production repository"
 }
 $env:QMT_PYTHON = $QmtPythonExe

@@ -37,7 +37,6 @@ foreach ($Module in @("ScheduledTasks", "CimCmdlets")) {
 }
 $SchedulerTaskName = "ProBigA QMT Windows Edge Scheduler"
 $UpdaterTaskName = "ProBigA QMT Windows Edge Updater"
-$ExpectedOrigin = "https://github.com/MingMG/probiga.git"
 $RecoveryProtocol = "probiga.qmt-edge-precutover-recovery.v1"
 $ForwardRecoveryProtocol = "probiga.qmt-edge-forward-only-supersession.v1"
 $GrantedRecoveryProtocol = "probiga.qmt-edge-granted-supersession.v1"
@@ -129,7 +128,10 @@ function Assert-Roots() {
     # Establish the local trust boundary before any fetch invokes a remote or helper.
     $ControllerTop = Invoke-Git $ControllerRoot @("rev-parse", "--show-toplevel")
     $ControllerOrigin = Invoke-Git $ControllerRoot @("remote", "get-url", "origin")
-    if ([IO.Path]::GetFullPath($ControllerTop) -ine $ControllerRoot -or $ControllerOrigin -ine $ExpectedOrigin) {
+    if (
+        [IO.Path]::GetFullPath($ControllerTop) -ine $ControllerRoot -or
+        !(Test-DeployProductionOrigin $ControllerOrigin)
+    ) {
         throw "controller repository binding differs"
     }
     Write-DeployGitContext $ControllerRoot 'controller' $GitHubProxy
@@ -149,7 +151,8 @@ function Assert-Roots() {
     $ProductionDirty = Invoke-Git $ProductionRoot @("status", "--porcelain", "--untracked-files=normal")
     $ProductionCommonInvalid = (
         [IO.Path]::GetFullPath($ProductionTop) -ine $ProductionRoot -or
-        $ProductionOrigin -ine $ExpectedOrigin -or $ProductionBranch -cne "main" -or
+        !(Test-DeployProductionOrigin $ProductionOrigin) -or
+        $ProductionBranch -cne "main" -or
         $ProductionDirty -or $PriorBuildSha -ceq $TargetBuildSha -or
         !(Test-Ancestor $PriorBuildSha $TargetBuildSha)
     )

@@ -27,7 +27,10 @@ class RecordingConnection:
 def database():
     engine = create_engine("sqlite+pysqlite:///:memory:")
     with engine.begin() as connection:
-        connection.execute(text("CREATE TABLE sm_stock_capital_flow_min (stock_code TEXT,trade_time TEXT)"))
+        connection.execute(text(
+            "CREATE TABLE sm_stock_capital_flow_min "
+            "(stock_code TEXT,trade_time TEXT,trade_date TEXT)"
+        ))
     yield engine
     engine.dispose()
 
@@ -38,7 +41,13 @@ def put_minutes(connection, code, count, *, duplicate=False):
             for offset in range(count)]
     if duplicate:
         rows[-1]["at"] = rows[-2]["at"]
-    connection.execute(text("INSERT INTO sm_stock_capital_flow_min VALUES (:code,:at)"), rows)
+    connection.execute(
+        text(
+            "INSERT INTO sm_stock_capital_flow_min "
+            "(stock_code,trade_time,trade_date) VALUES (:code,:at,:day)"
+        ),
+        [dict(row, day=DAY) for row in rows],
+    )
 
 
 def probe(connection, codes, counts=(240, 241)):
@@ -56,8 +65,8 @@ def test_missing_first_batch_stops_after_one_index_bounded_select(database):
     assert len(observed.calls) == 1
     sql, params = observed.calls[0]
     assert params["codes"] == codes[:100]
-    assert params["day"] == DAY and params["next_day"] == "2026-08-26"
-    assert "stock_code IN" in sql and "trade_time>=:day" in sql
+    assert params["day"] == DAY
+    assert "stock_code IN" in sql and "trade_date=:day" in sql
     assert "SHA2" not in sql and "GROUP_CONCAT" not in sql
 
 
@@ -202,8 +211,15 @@ def test_native_fallback_can_validate_older_catalog_after_newer_catalog_rejects(
     from tools import sync_qmt_minute_flow_exact as flow
     configure_catalog(monkeypatch, ["000001", "000002"])
     with database.begin() as connection:
-        connection.execute(text("INSERT INTO sm_stock_capital_flow_min VALUES (:code,:at)"),
-            [{"code": "000001", "at": DAY + " " + minute} for minute in flow.GRID])
+        connection.execute(
+            text(
+                "INSERT INTO sm_stock_capital_flow_min "
+                "(stock_code,trade_time,trade_date) "
+                "VALUES (:code,:at,:day)"
+            ),
+            [{"code": "000001", "at": DAY + " " + minute, "day": DAY}
+             for minute in flow.GRID],
+        )
     monkeypatch.setattr(flow, "validate_runtime_schema", lambda *_args: None)
     monkeypatch.setattr(flow, "load_flow_universe", lambda *_args, **_kwargs: SimpleNamespace(
         qmt_by_stock={"000001": "000001.SZ"}, traded_stock_count=1,

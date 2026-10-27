@@ -801,8 +801,7 @@ def _stream_table_proof(connection: Any, *, table: str, trade_date: str) -> dict
         text(
             f"SELECT {','.join(quote_identifier(column) for column in FLOW_HASH_COLUMNS)} "
             f"FROM {target} "
-            "WHERE trade_time>=:trade_date "
-            "AND trade_time<DATE_ADD(:trade_date,INTERVAL 1 DAY) "
+            "WHERE trade_date=:trade_date "
             "ORDER BY stock_code,trade_time"
         ),
         {"trade_date": trade_date},
@@ -894,8 +893,7 @@ def _publish_stage(
             connection.execute(
                 text(
                     f"DELETE FROM {quote_identifier(TABLE)} "
-                    "WHERE trade_time>=:trade_date "
-                    "AND trade_time<DATE_ADD(:trade_date,INTERVAL 1 DAY)"
+                    "WHERE trade_date=:trade_date"
                 ),
                 {"trade_date": trade_date},
             )
@@ -937,7 +935,7 @@ def _publish_stage(
 
 def validate_runtime_schema(primary_engine: Any, minute_engine: Any) -> dict[str, Any]:
     validate_stock_catalog_runtime_schema(primary_engine)
-    required = {"id", *FLOW_INSERT_COLUMNS}
+    required = {"id", "trade_date", *FLOW_INSERT_COLUMNS}
     with minute_engine.connect() as connection:
         rows = connection.execute(
             text(

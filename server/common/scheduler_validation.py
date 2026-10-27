@@ -1797,13 +1797,15 @@ def _validate_intraday_flow_result(
         query = text(
             "SELECT stock_code, source_time, received_at, etl_sync_at, data_source "
             "FROM sm_stock_capital_flow_min "
-            "WHERE trade_time >= :minute_start AND trade_time < :minute_end "
+            "WHERE trade_date = :trade_date "
+            "AND trade_time >= :minute_start AND trade_time < :minute_end "
             "LIMIT :row_limit"
         )
         with routed_read_engine(query, engine).connect() as connection:
             rows = connection.execute(query, {
                 "minute_start": trade_time,
                 "minute_end": trade_time + timedelta(minutes=1),
+                "trade_date": trade_time.date().isoformat(),
                 "row_limit": len(expected) + 1,
             }).mappings().all()
         if (
@@ -3522,7 +3524,7 @@ TASK_OUTPUT_REQUIREMENTS: dict[str, tuple[TableRequirement, ...]] = {
         TableRequirement(
             "sm_stock_capital_flow_min",
             min_rows=100000,
-            date_col="trade_time",
+            date_col="trade_date",
             target="latest_trade_date",
             ready_time="15:30",
             distinct_col="stock_code",
@@ -3625,7 +3627,7 @@ TASK_OUTPUT_REQUIREMENTS: dict[str, tuple[TableRequirement, ...]] = {
             # The first 09:40 run has only a few bars per stock. Distinct
             # stock coverage is the useful early-session completeness gate.
             min_rows=5000,
-            date_col="trade_time",
+            date_col="trade_date",
             distinct_col="stock_code",
             min_distinct=5000,
         ),

@@ -136,6 +136,10 @@ from server.common.market_field_capture_schema import (
     privileged_migrate_market_field_capture_schema,
     validate_market_field_capture_runtime,
 )
+from server.common.minute_flow_schema import (
+    privileged_migrate_minute_flow_trade_date,
+    validate_minute_flow_trade_date_runtime,
+)
 from server.common.qmt_trade_calendar import (
     privileged_migrate_trade_calendar_schema,
     validate_trade_calendar_runtime_schema,
@@ -234,6 +238,7 @@ _MIGRATIONS: tuple[tuple[str, SchemaCallable], ...] = (
     ("qmt_catalog", privileged_migrate_catalog_schema),
     ("qmt_audit", privileged_migrate_audit_schema),
     ("notice", privileged_migrate_notice_tables),
+    ("minute_flow_trade_date", privileged_migrate_minute_flow_trade_date),
 )
 
 _SEEDS: tuple[tuple[str, SchemaCallable], ...] = (
@@ -281,6 +286,7 @@ _VALIDATORS: tuple[tuple[str, SchemaCallable], ...] = (
     ("qmt_catalog_seed", validate_catalog_registry_seed),
     ("qmt_audit", validate_audit_schema),
     ("notice", validate_notice_runtime_schema),
+    ("minute_flow_trade_date", validate_minute_flow_trade_date_runtime),
 )
 
 _RECOVERY_PLANNERS: tuple[tuple[str, SchemaCallable], ...] = (

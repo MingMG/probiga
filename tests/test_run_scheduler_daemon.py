@@ -501,7 +501,7 @@ def test_windows_edge_has_explicit_autostart_installer():
     assert "registration refused" in installer
     assert '[string]$ProductionRoot' in installer
     assert '"^[A-Za-z]:[\\\\/]"' in installer
-    assert "https://github.com/MingMG/probiga.git" in installer
+    assert "Test-DeployProductionOrigin $Origin" in installer
     assert '"System32\\WindowsPowerShell\\v1.0\\powershell.exe"' in installer
     assert '"System32\\wscript.exe"' in installer
     assert "-Execute $PowerShellExe" in installer
@@ -614,7 +614,7 @@ def test_windows_scheduler_wrapper_writes_only_to_protected_programdata():
     assert 'Join-Path $ExpectedRoot ".env"' in wrapper
     assert 'Join-Path $ExpectedRoot "runtime\\qmt-py313\\Scripts\\python.exe"' in wrapper
     assert "$env:QMT_PYTHON = $QmtPythonExe" in wrapper
-    assert "https://github.com/MingMG/probiga.git" in wrapper
+    assert "Test-DeployProductionOrigin $Origin" in wrapper
     assert '"System32\\WindowsPowerShell\\v1.0\\powershell.exe"' in wrapper
     assert "$Registered.Actions[0].Execute -ine $PowerShellExe" in wrapper
     assert "$Registered.Actions[0].WorkingDirectory -ine $ExpectedRoot" in wrapper
@@ -661,7 +661,14 @@ def test_windows_edge_updater_is_clean_fast_forward_only_and_restarts():
     assert "$env:QMT_PYTHON = $QmtPythonExe" in updater
     assert '$env:PYTHONDONTWRITEBYTECODE = "1"' in updater
     assert updater.index("PYTHONDONTWRITEBYTECODE") < updater.index("& $PythonExe")
-    assert "https://github.com/MingMG/probiga.git" in updater
+    assert "Test-DeployProductionOrigin $Origin" in updater
+    preflight = (
+        run_scheduler_daemon.ROOT
+        / "tools"
+        / "deploy_preflight.ps1"
+    ).read_text(encoding="utf-8")
+    assert "https://github.com/MingMG/probiga.git" in preflight
+    assert "ssh://git@ssh.github.com:443/MingMG/probiga.git" in preflight
     assert '"System32\\WindowsPowerShell\\v1.0\\powershell.exe"' in updater
     assert "$Registered.Actions[0].Execute -ine $PowerShellExe" in updater
     assert "$Registered.Actions[0].WorkingDirectory -ine $ExpectedRoot" in updater
@@ -999,6 +1006,10 @@ function Start-EdgeScheduler {{
 }}
 function Stop-EdgeScheduler {{ $script:Stopped = $true }}
 function Write-UpdateLog([string]$Message) {{ $script:Logs += $Message }}
+function Write-QmtDataStatus(
+    [string]$BuildSha, [string]$Status,
+    [bool]$StrategySourceUnchanged, [string]$Reason
+) {{ }}
 $PythonExe = {_powershell_single_quoted(executable)}
 $BootstrapTool = "unused"
 $ExpectedRoot = {_powershell_single_quoted(str(tmp_path))}

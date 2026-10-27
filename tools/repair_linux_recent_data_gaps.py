@@ -1488,9 +1488,13 @@ def publish_daily_flow_from_exact_minute(
                     "lg_net_inflow,mid_net_inflow,sm_net_inflow,data_source,"
                     "quality_status,permission_status "
                     "FROM sm_stock_capital_flow_min "
-                    "WHERE trade_time=:close_time ORDER BY stock_code"
+                    "WHERE trade_date=:trade_date AND trade_time=:close_time "
+                    "ORDER BY stock_code"
                 ),
-                {"close_time": f"{trade_date} 15:00:00"},
+                {
+                    "trade_date": trade_date,
+                    "close_time": f"{trade_date} 15:00:00",
+                },
             )
         )
     daily_rows = _daily_flow_rows_from_minute_close(

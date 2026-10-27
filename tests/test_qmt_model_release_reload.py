@@ -355,7 +355,7 @@ def test_release_reload_is_bound_to_clean_registered_exact_main() -> None:
     assert "$ExpectedBuild`:$StrategyRepositoryPath" in source
     assert "[string]$Release.strategy_git_blob -cne $Blob" in source
     assert '"status", "--porcelain", "--untracked-files=normal"' in source
-    assert '"https://github.com/MingMG/probiga.git"' in source
+    assert "Test-DeployProductionOrigin $Origin" in source
 
 
 def test_release_reload_requires_one_logged_in_interactive_qmt_client() -> None:
@@ -616,6 +616,7 @@ $ErrorActionPreference = "Stop"
 $PowerShellExe = (Get-Process -Id $PID).Path
 $StrategyReloader = {_powershell_literal(stub)}
 $ExpectedRoot = {_powershell_literal(tmp_path)}
+    $env:ProgramData = {_powershell_literal(tmp_path / "ProgramData")}
 function Write-UpdateLog([string]$Message) {{ }}
 {helper}
 $script:LASTEXITCODE = 99
@@ -787,6 +788,7 @@ $ExpectedOrigin = "https://github.com/MingMG/probiga.git"
 $ExpectedBuild = "{sha}"
 $PythonExe = "python.exe"
 $ReleaseBootstrap = "release-bootstrap.py"
+function Test-DeployProductionOrigin([string]$Origin) {{ return $Origin -ieq $ExpectedOrigin }}
 function Assert-OrdinaryDirectory([string]$Path, [string]$Description) {{ }}
 function Assert-OrdinaryFile([string]$Path, [string]$Description) {{ }}
 function Invoke-Git([string[]]$Arguments) {{
