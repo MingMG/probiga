@@ -488,6 +488,9 @@ SCHEDULER_OWNER_LINUX = "linux_standalone"
 SCHEDULER_OWNER_WINDOWS_QMT = "qmt_windows_edge"
 SCHEDULER_OWNER_WINDOWS_EGRESS = "windows_non_qmt_egress"
 SCHEDULER_OWNER_UNAVAILABLE = "unavailable"
+PRIOR_SESSION_PUBLIC_MINUTE_TASK_TYPES = frozenset(
+    {"stock_minute", "stock_minute_flow"}
+)
 _running_procs: dict[int, subprocess.Popen] = {}
 _running_timeout_minutes: dict[int, int | None] = {}
 _running_task_ids: set[int] = set()
@@ -2842,7 +2845,13 @@ def _critical_cron_catchup_allowed(row: dict, *, now: datetime, cron_time: str) 
     triggered_for_occurrence = bool(
         last_triggered
         and (
-            last_triggered.date() == now.date()
+            (
+                last_triggered.date() == now.date()
+                and (
+                    last_triggered >= scheduled_at
+                    or task_type not in PRIOR_SESSION_PUBLIC_MINUTE_TASK_TYPES
+                )
+            )
             or (
                 task_type in CROSS_MIDNIGHT_CRITICAL_CRON_TASK_TYPES
                 and scheduled_at.date() < now.date()
@@ -2945,6 +2954,7 @@ def _cron_due(row: dict, *, now: datetime) -> bool:
     """
     if row.get("_research_pool_target_complete") is True:
         return False
+    task_type = str(row.get("task_type") or "").strip()
     cron_min = _parse_hhmm(str(row.get("cron_time") or "17:10"))
     if cron_min is None:
         return False
@@ -2981,6 +2991,19 @@ def _cron_due(row: dict, *, now: datetime) -> bool:
         return (
             now - retry_at
         ).total_seconds() >= CRON_RETRY_INTERVAL_MINUTES * 60
+    if (
+        task_type in PRIOR_SESSION_PUBLIC_MINUTE_TASK_TYPES
+        and not prior_target_recovery
+        and last_triggered
+        and last_triggered.date() == now.date()
+        and last_triggered.time() < datetime_time(
+            cron_min // 60,
+            cron_min % 60,
+        )
+    ):
+        # An early recovery for an older target does not satisfy the later
+        # ordinary cron occurrence.
+        return True
     if prior_target_recovery:
         if not last_triggered:
             return True

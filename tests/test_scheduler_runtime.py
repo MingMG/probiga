@@ -8223,6 +8223,32 @@ def test_unlimited_bulk_history_does_not_occupy_ordinary_collection_slot():
     assert scheduler_runtime._task_lane_semaphore({"task_type": "qmt_local_history_2024"}) is not scheduler_runtime._task_lane_semaphore({"task_type": "qmt_reference_incremental"})
 
 
+@pytest.mark.parametrize(
+    ("task_type", "cron_time"),
+    [
+        ("stock_minute", "17:30"),
+        ("stock_minute_flow", "18:30"),
+    ],
+)
+def test_early_prior_session_minute_run_does_not_consume_evening_cron(
+    task_type,
+    cron_time,
+):
+    row = {
+        "task_type": task_type,
+        "cron_time": cron_time,
+        "last_triggered_at": datetime(2026, 10, 27, 5, 59, 45),
+        "last_run_status": "success",
+    }
+    now = datetime(2026, 10, 27, 20, 0)
+    assert scheduler_runtime._cron_due(row, now=now)
+    assert scheduler_runtime._critical_cron_catchup_allowed(
+        row,
+        now=now,
+        cron_time=cron_time,
+    )
+
+
 @pytest.mark.parametrize("task_type", [
     "qmt_local_history_2024", "qmt_local_gap_repair_execute",
     "qmt_canonical_history_gap_repair", "qmt_stock_daily_canonical",
