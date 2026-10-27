@@ -1,6 +1,36 @@
 from __future__ import annotations
 
+from sqlalchemy import create_engine, text
+
 from tools import sync_free_index_daily as collector
+
+
+def test_public_index_scope_excludes_unavailable_fixed_codes():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE sm_index_kline ("
+                "index_code TEXT, trade_date TEXT, k_type INTEGER)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sm_index_kline VALUES "
+                "('000001','2026-10-26',1),"
+                "('988006','2026-10-26',1),"
+                "('988007','2026-10-26',1),"
+                "('988106','2026-10-26',1),"
+                "('988107','2026-10-26',1),"
+                "('988201','2026-10-26',1)"
+            )
+        )
+    try:
+        assert collector._expected_codes(engine, "2026-10-27") == [
+            "000001"
+        ]
+    finally:
+        engine.dispose()
 
 
 def test_public_index_publisher_uses_persisted_scope_and_verified_rows(

@@ -31,6 +31,15 @@ RECEIPT_SCHEMA = "probiga.free-index-daily-receipt.v1"
 DATASET = "index_daily"
 PARTITION_KEY = "__index_daily_partition__"
 PROVIDER = "tencent_east_verified"
+EXCLUDED_UNSUPPORTED_INDEX_CODES = frozenset(
+    {
+        "988006",
+        "988007",
+        "988106",
+        "988107",
+        "988201",
+    }
+)
 
 
 def _now() -> datetime:
@@ -84,15 +93,17 @@ def _expected_codes(engine: Any, target_date: str) -> list[str]:
             raise RuntimeError(
                 "DATA_BLOCKED: no persisted verified index scope precedes target"
             )
+        codes = connection.execute(
+            text(
+                "SELECT DISTINCT index_code FROM sm_index_kline "
+                "WHERE trade_date=:prior AND k_type=1"
+            ),
+            {"prior": str(prior)[:10]},
+        ).scalars()
         return sorted(
-            str(code)
-            for code in connection.execute(
-                text(
-                    "SELECT DISTINCT index_code FROM sm_index_kline "
-                    "WHERE trade_date=:prior AND k_type=1"
-                ),
-                {"prior": str(prior)[:10]},
-            ).scalars()
+            str(code).zfill(6)
+            for code in codes
+            if str(code).zfill(6) not in EXCLUDED_UNSUPPORTED_INDEX_CODES
         )
 
 
