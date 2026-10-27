@@ -959,10 +959,17 @@ def validate_result(result):
     decision = datetime.fromisoformat(result["decision_known_at"])
     started = datetime.fromisoformat(result["started_at"])
     finished = datetime.fromisoformat(result["finished_at"])
+    collection_finished = datetime.fromisoformat(
+        result.get("collection_finished_at") or result["finished_at"]
+    )
     captured = datetime.fromisoformat(result["catalog_captured_at"])
-    if (any(stamp.tzinfo is not None for stamp in (decision, started, finished, captured))
-            or not captured <= decision == started <= finished
-            or target > started.date() or (finished - started).total_seconds() > 2700
+    if (any(stamp.tzinfo is not None for stamp in (
+            decision, started, collection_finished, finished, captured,
+        ))
+            or not captured <= decision == started <= collection_finished <= finished
+            or target > started.date()
+            or (collection_finished - started).total_seconds() > 2700
+            or (finished - collection_finished).total_seconds() > 6 * 60 * 60
             or not isinstance(result.get("catalog_batch_id"), str)
             or not 0 < len(result["catalog_batch_id"]) <= 64):
         raise ValueError("invalid execution time")
@@ -1158,6 +1165,8 @@ def _collect_minutes(engine, codes, *, kind, table, trade_date, min_coverage,
                     print(f"Minute {kind}: checked={index}/{len(selected)} collected={len(proofs)} missing={len(missing)}", file=sys.stderr, flush=True)
             append()
         coverage = (len(proofs) + len(no_trade)) / len(expected)
+        collection_finished_at = _now()
+        collection_finished_text = collection_finished_at.isoformat(sep=" ")
         result = {
             **context, "schema": RESULT_SCHEMA,
             "provider": PUBLIC_MINUTE_PROVIDER,
@@ -1173,7 +1182,9 @@ def _collect_minutes(engine, codes, *, kind, table, trade_date, min_coverage,
             "coverage": coverage, "min_coverage": min_coverage,
             "staged_rows": staged_rows, "written_rows": staged_rows,
             "business_rows_sha256": _digest([proofs[code] for code in sorted(proofs)]),
-            "failure_reason_counts": reasons, "finished_at": _now().isoformat(sep=" "),
+            "failure_reason_counts": reasons,
+            "collection_finished_at": collection_finished_text,
+            "finished_at": collection_finished_text,
         }
         # Budget and the entire prospective success receipt are checked before
         # publication. No truncated output can authorize a successful write.

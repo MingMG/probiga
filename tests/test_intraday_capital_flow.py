@@ -770,6 +770,32 @@ def test_complete_partial_history_budget_is_checked_before_publication(monkeypat
     assert json.loads(parsed["replay_output"]) == result
 
 
+def test_database_publication_time_is_not_charged_to_collection_window(
+    monkeypatch,
+):
+    c = _crawler()
+    result, _, _, _ = _collection(
+        monkeypatch,
+        "flow",
+        {"000001": [_line("flow")]},
+    )
+    started = datetime.fromisoformat(result["started_at"])
+    result["collection_finished_at"] = (
+        started + timedelta(minutes=44)
+    ).isoformat(sep=" ")
+    result["finished_at"] = (
+        started + timedelta(minutes=70)
+    ).isoformat(sep=" ")
+    sealed = c._seal_result(result)
+    assert c.validate_result(sealed) == "success"
+
+    result["collection_finished_at"] = (
+        started + timedelta(minutes=46)
+    ).isoformat(sep=" ")
+    with pytest.raises(ValueError, match="execution time"):
+        c.validate_result(c._seal_result(result))
+
+
 @pytest.mark.parametrize("kind", ["stock", "flow"])
 def test_future_same_day_source_minutes_remain_missing(monkeypatch, kind):
     c = _crawler()
