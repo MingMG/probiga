@@ -4871,7 +4871,10 @@ def test_forward_no_receipt_recovery_has_distinct_commit_and_retire_contract() -
     fenced_verify = preserve.index(
         'controlled_guard_verify_restored_runtime "$fenced_main_record"'
     )
-    full_gate = preserve.index('"$fenced_ai_timer_record" full', fenced_verify)
+    full_gate = preserve.index(
+        '"$fenced_ai_timer_record" forward-recovery',
+        fenced_verify,
+    )
     recovery_readiness = preserve.index("recover-input-readiness", full_gate)
     refence_on_gate_failure = preserve.index(
         "controlled_guard_refence_after_restore_failure", recovery_readiness

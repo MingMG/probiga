@@ -1086,7 +1086,7 @@ controlled_guard_cleanup() {{
 controlled_guard_verify_restored_runtime() {{
   test "$3" = "$GUARDED_SHA" || return 1
     case "$6" in
-    full)
+    full|forward-recovery)
       test "${{7:-}}" = recover-input-readiness || return 1
       test "$1:$2:$4:$5" = \
         "loaded,inactive,disabled:loaded,inactive,disabled:loaded,inactive,static:loaded,inactive,disabled" || \
@@ -1239,7 +1239,7 @@ activation_snapshot_assert_new_set() {{ printf 'assert-new\n' >> "$TRACE"; }}
 controlled_guard_verify_restored_runtime() {{
   test "$3" = "$GUARDED_SHA" || return 1
   case "$6" in
-    full)
+    full|forward-recovery)
       test "$7" = recover-input-readiness || return 1
       RESTORED_RUNTIME_FAILURE_CODE="$FAILURE_CODE"
       printf 'full-gate-%s\n' "$FAILURE_CODE" >> "$TRACE"

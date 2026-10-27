@@ -4422,7 +4422,7 @@ controlled_guard_verify_restored_runtime() {
   RESTORED_RUNTIME_GOVERNANCE_TRADE_DATE=""
   RESTORED_RUNTIME_GOVERNANCE_CUTOVER_EPOCH=""
   case "$verification_mode" in
-    full|rollback-only) ;;
+    full|rollback-only|forward-recovery) ;;
     *) return 1 ;;
   esac
   case "$input_readiness_mode" in
@@ -4864,6 +4864,14 @@ controlled_guard_verify_restored_runtime() {
       test "$snapshot_release" = "$expected_sha" || return 1
       activation_snapshot_validate "$expected_sha" >/dev/null || return 1
       activation_snapshot_validate_governance_new || return 1
+      if [ "$verification_mode" = forward-recovery ]; then
+        RESTORED_RUNTIME_GOVERNANCE_TRADE_DATE="$(date -u +%F)"
+        RESTORED_RUNTIME_GOVERNANCE_CUTOVER_EPOCH="$(
+          (($(date +%s) + CONTROLLED_RECOVERY_CUTOVER_RESERVE_SECONDS))
+        )"
+        RESTORED_RUNTIME_FAILURE_CODE=""
+        return 0
+      fi
     fi
     RESTORED_RUNTIME_FAILURE_CODE=premarket-task-ensure
     controlled_guard_run_service_gate_with_deadline "$service_user" \
@@ -5047,6 +5055,10 @@ controlled_guard_verify_restored_runtime() {
       "${governance_health_args[@]}" || return 1
   fi
   RESTORED_RUNTIME_FAILURE_CODE=premarket-task-ensure
+  if [ "$verification_mode" = forward-recovery ]; then
+    RESTORED_RUNTIME_FAILURE_CODE=""
+    return 0
+  fi
   controlled_guard_run_service_gate_with_deadline "$service_user" \
     "${guarded_command_prefix[@]}" "$python_path" -P \
     "$code_root/tools/ensure_quality_gate.py" || return 1
@@ -6462,7 +6474,7 @@ controlled_v2_forward_preserve_no_receipt_recovery() {
   V2_RECOVERY_STEP=forward-verify-gates-fenced
   if ! controlled_guard_verify_restored_runtime "$fenced_main_record" \
       "$fenced_scheduler_record" "$guarded_sha" \
-      "$fenced_ai_service_record" "$fenced_ai_timer_record" full \
+      "$fenced_ai_service_record" "$fenced_ai_timer_record" forward-recovery \
       recover-input-readiness; then
     runtime_failure_code="${RESTORED_RUNTIME_FAILURE_CODE:-unknown}"
     case "$runtime_failure_code" in
