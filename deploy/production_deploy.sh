@@ -6649,12 +6649,27 @@ controlled_v2_retire_fenced_old_set_for_newer_deploy() {
   V2_RECOVERY_STEP=rollback-retire-validate-snapshot
   activation_snapshot_validate "$guarded_sha" >/dev/null || return 1
   activation_snapshot_assert_old_set "$guarded_sha" || return 1
-  V2_RECOVERY_STEP=rollback-retire-validate-governance-contract
-  controlled_guard_governance_contract_snapshot verify "$guarded_sha" \
-    "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" rollback-governance || return 1
-  V2_RECOVERY_STEP=rollback-retire-validate-qmt-contract
-  controlled_guard_governance_contract_snapshot verify "$guarded_sha" \
-    "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT" rollback-qmt || return 1
+  # A newer deploy is replacing this already-restored old set.  Validate the
+  # sealed snapshots by digest only: requiring the removed old release runtime
+  # to execute its contract verifier makes retirement impossible after rollback
+  # cleanup, while the new release will establish the live contract after all
+  # writers have remained fenced.
+  V2_RECOVERY_STEP=rollback-retire-validate-governance-snapshot
+  controlled_guard_assert_file "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" 600 || \
+    return 1
+  controlled_guard_assert_file "$ACTIVATION_GOVERNANCE_OLD_SHA" 600 || \
+    return 1
+  test "$(<"$ACTIVATION_GOVERNANCE_OLD_SHA")" = \
+    "$(sha256sum "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" | cut -d' ' -f1)" || \
+    return 1
+  V2_RECOVERY_STEP=rollback-retire-validate-qmt-snapshot
+  controlled_guard_assert_file \
+    "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT" 600 || return 1
+  controlled_guard_assert_file \
+    "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SHA" 600 || return 1
+  test "$(<"$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SHA")" = \
+    "$(sha256sum "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT" | cut -d' ' -f1)" || \
+    return 1
   V2_RECOVERY_STEP=rollback-retire-force-writers-fenced
   controlled_guard_force_all_writers_fenced "$main_record" \
     "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1

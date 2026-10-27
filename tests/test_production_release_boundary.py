@@ -4364,11 +4364,15 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
     assert 'test "$DEPLOY_OPERATION" = deploy' in fenced_old_set_retire
     assert 'test "$phase" = old-set-restored' in fenced_old_set_retire
     assert 'test "$EXPECTED_SHA" != "$guarded_sha"' in fenced_old_set_retire
-    assert "controlled_guard_governance_contract_snapshot verify" in (
+    assert "controlled_guard_governance_contract_snapshot verify" not in (
         fenced_old_set_retire
     )
-    assert "rollback-governance" in fenced_old_set_retire
-    assert "rollback-qmt" in fenced_old_set_retire
+    assert 'sha256sum "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT"' in (
+        fenced_old_set_retire
+    )
+    assert 'sha256sum "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT"' in (
+        fenced_old_set_retire
+    )
     assert "controlled_guard_force_all_writers_fenced" in fenced_old_set_retire
     assert "controlled_guard_cleanup" in fenced_old_set_retire
     assert "activation_snapshot_remove_old_runtime_verified" in (
@@ -4378,8 +4382,8 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
         "rollback-retire-validate-request",
         "rollback-retire-validate-phase",
         "rollback-retire-validate-snapshot",
-        "rollback-retire-validate-governance-contract",
-        "rollback-retire-validate-qmt-contract",
+        "rollback-retire-validate-governance-snapshot",
+        "rollback-retire-validate-qmt-snapshot",
         "rollback-retire-force-writers-fenced",
         "rollback-retire-assert-boundary",
         "rollback-retire-set-phase",
