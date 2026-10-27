@@ -400,18 +400,56 @@ class Observer:
             valid_sql = f"CASE WHEN COUNT(*)=1 AND MIN(CASE WHEN {valid} THEN 1 ELSE 0 END)=1 THEN 1 ELSE 0 END"
             time_sql = "NULL"
         else:
-            if grid not in (
-                list(minute_time_grid()),
-                list(PUBLIC_MINUTE_TIME_GRID),
-            ):
+            native_grid = list(minute_time_grid())
+            public_grid = list(PUBLIC_MINUTE_TIME_GRID)
+            public_stock_grid = list(PUBLIC_STOCK_MINUTE_TIME_GRID)
+            if grid == native_grid:
+                grid_kind = "native"
+            elif grid == public_grid:
+                grid_kind = "public"
+            elif grid == public_stock_grid:
+                grid_kind = "public_stock"
+            else:
                 raise ValueError("unrecognized minute grid")
             clock = "TIME(trade_time)"
-            valid += (f" AND (({clock} BETWEEN '09:30:00' AND '11:30:00') OR "
-                      f"({clock} BETWEEN '13:01:00' AND '15:00:00')) "
-                      "AND SECOND(trade_time)=0 AND MICROSECOND(trade_time)=0 AND DATE(trade_time)=:day")
-            ordinal = ("CASE WHEN TIME(trade_time)<='11:30:00' "
-                       "THEN HOUR(trade_time)*60+MINUTE(trade_time)-569 "
-                       "ELSE HOUR(trade_time)*60+MINUTE(trade_time)-659 END")
+            if grid_kind == "native":
+                valid_time = (
+                    f"(({clock} BETWEEN '09:30:00' AND '11:30:00') OR "
+                    f"({clock} BETWEEN '13:01:00' AND '15:00:00'))"
+                )
+                ordinal = (
+                    f"CASE WHEN {clock}<='11:30:00' "
+                    "THEN HOUR(trade_time)*60+MINUTE(trade_time)-569 "
+                    "ELSE HOUR(trade_time)*60+MINUTE(trade_time)-659 END"
+                )
+            elif grid_kind == "public":
+                valid_time = (
+                    f"(({clock} BETWEEN '09:31:00' AND '11:30:00') OR "
+                    f"({clock} BETWEEN '13:01:00' AND '15:00:00'))"
+                )
+                ordinal = (
+                    f"CASE WHEN {clock}<='11:30:00' "
+                    "THEN HOUR(trade_time)*60+MINUTE(trade_time)-570 "
+                    "ELSE HOUR(trade_time)*60+MINUTE(trade_time)-660 END"
+                )
+            else:
+                valid_time = (
+                    f"(({clock} BETWEEN '09:31:00' AND '11:30:00') OR "
+                    f"({clock} BETWEEN '13:01:00' AND '14:57:00') OR "
+                    f"{clock}='15:00:00')"
+                )
+                ordinal = (
+                    f"CASE WHEN {clock}<='11:30:00' "
+                    "THEN HOUR(trade_time)*60+MINUTE(trade_time)-570 "
+                    f"WHEN {clock}<='14:57:00' "
+                    "THEN HOUR(trade_time)*60+MINUTE(trade_time)-660 "
+                    f"WHEN {clock}='15:00:00' THEN 238 END"
+                )
+            valid += (
+                f" AND {valid_time} "
+                "AND SECOND(trade_time)=0 AND MICROSECOND(trade_time)=0 "
+                "AND DATE(trade_time)=:day"
+            )
             # Return at most one compact row per stock, not a million raw bars.
             # Ordinals 1..241 take < 1024 bytes, MySQL's default GROUP_CONCAT limit.
             updated = "MAX(etl_sync_at)" if "etl_sync_at" in columns else "NULL"

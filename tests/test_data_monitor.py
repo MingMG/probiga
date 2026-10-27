@@ -88,6 +88,46 @@ def test_public_minute_grid_has_exact_240_eastmoney_slots():
     )
 
 
+def test_public_stock_minute_ordinals_use_the_238_bar_grid():
+    observer = object.__new__(dm.Observer)
+    observer._columns = {}
+    observer.columns = lambda *_args: {
+        'stock_code',
+        'data_source',
+        'trade_time',
+        'received_at',
+    }
+    queries = []
+
+    def read(_store, sql, _params=None):
+        queries.append(sql)
+        return [{
+            'code': '000001',
+            'n': 238,
+            'unique_n': 238,
+            'valid_n': 238,
+            'bad': 0,
+            'ordinals': '1,121,238',
+            'updated': CURRENT,
+            'source': 'sina_public_1m',
+        }]
+
+    observer.read = read
+    result = observer.groups(
+        dm.BY_KEY['minute'],
+        DAY,
+        grid=list(dm.PUBLIC_STOCK_MINUTE_TIME_GRID),
+        codes={'000001'},
+        _chunk=True,
+        _source='sina_public_1m',
+    )
+    assert result[0]['valid_times'] == (
+        '09:31:00,13:01:00,15:00:00'
+    )
+    assert "BETWEEN '13:01:00' AND '14:57:00'" in queries[0]
+    assert "TIME(trade_time)='15:00:00'" in queries[0]
+
+
 def test_calendar_requires_authoritative_record_not_weekday():
     calendar = dm.calendar_map([{'trade_date': DAY, 'trade_status': 1}, {'trade_date': DAY, 'trade_status': 0}])
     assert calendar[DAY] is None
