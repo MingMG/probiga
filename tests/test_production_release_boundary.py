@@ -4374,6 +4374,21 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
     assert "activation_snapshot_remove_old_runtime_verified" in (
         fenced_old_set_retire
     )
+    for recovery_step in (
+        "rollback-retire-validate-request",
+        "rollback-retire-validate-phase",
+        "rollback-retire-validate-snapshot",
+        "rollback-retire-validate-governance-contract",
+        "rollback-retire-validate-qmt-contract",
+        "rollback-retire-force-writers-fenced",
+        "rollback-retire-assert-boundary",
+        "rollback-retire-set-phase",
+        "rollback-retire-cleanup",
+        "rollback-retire-remove-transaction",
+    ):
+        assert f"V2_RECOVERY_STEP={recovery_step}" in (
+            fenced_old_set_retire
+        )
     fast_retire_call = recovery.index(
         "controlled_v2_retire_fenced_old_set_for_newer_deploy"
     )

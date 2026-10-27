@@ -6617,32 +6617,43 @@ controlled_v2_retire_fenced_old_set_for_newer_deploy() {
   local old_runtime_sha="$2"
   local phase
   local scheduler_record="$4"
+  V2_RECOVERY_STEP=rollback-retire-validate-request
   test "$DEPLOY_OPERATION" = deploy || return 1
   [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] || return 1
   [[ "$guarded_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
   [[ "$old_runtime_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
   test "$EXPECTED_SHA" != "$guarded_sha" || return 1
   test "$old_runtime_sha" != "$guarded_sha" || return 1
+  V2_RECOVERY_STEP=rollback-retire-validate-phase
   phase="$(activation_snapshot_phase)" || return 1
   test "$phase" = old-set-restored || return 1
+  V2_RECOVERY_STEP=rollback-retire-validate-snapshot
   activation_snapshot_validate "$guarded_sha" >/dev/null || return 1
   activation_snapshot_assert_old_set "$guarded_sha" || return 1
+  V2_RECOVERY_STEP=rollback-retire-validate-governance-contract
   controlled_guard_governance_contract_snapshot verify "$guarded_sha" \
     "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" rollback-governance || return 1
+  V2_RECOVERY_STEP=rollback-retire-validate-qmt-contract
   controlled_guard_governance_contract_snapshot verify "$guarded_sha" \
     "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT" rollback-qmt || return 1
+  V2_RECOVERY_STEP=rollback-retire-force-writers-fenced
   controlled_guard_force_all_writers_fenced "$main_record" \
     "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
+  V2_RECOVERY_STEP=rollback-retire-assert-boundary
   controlled_guard_assert_boundary "$guarded_sha" "$main_record" \
     "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
+  V2_RECOVERY_STEP=rollback-retire-set-phase
   activation_snapshot_set_phase "$guarded_sha" old-runtime-verified || return 1
+  V2_RECOVERY_STEP=rollback-retire-cleanup
   controlled_guard_cleanup "$guarded_sha" "$main_record" \
     "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
   if [ -e "$DATABASE_WRITER_RESTORE_FILE" ] || \
     [ -L "$DATABASE_WRITER_RESTORE_FILE" ]; then
+    V2_RECOVERY_STEP=rollback-retire-remove-restore
     rm -f -- "$DATABASE_WRITER_RESTORE_FILE" || return 1
     sync -f "$DATABASE_WRITER_GUARD_DIR" || return 1
   fi
+  V2_RECOVERY_STEP=rollback-retire-remove-transaction
   activation_snapshot_remove_old_runtime_verified || return 1
   test ! -e "$DATABASE_WRITER_GUARD_FILE" || return 1
   test ! -L "$DATABASE_WRITER_GUARD_FILE" || return 1
