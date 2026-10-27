@@ -14,6 +14,7 @@ from server.common.runtime_table_schema import (
 
 
 LIMIT_UP_EVENT_TABLE = "sm_limit_up_event"
+LIMIT_UP_EVENT_SCHEMA_VERSION = "probiga.limit-up-event.v1"
 
 
 LIMIT_UP_EVENT_SCHEMA = {
@@ -124,6 +125,7 @@ def privileged_migrate_limit_up_event_schema(engine) -> dict[str, object]:
     validate_limit_up_event_runtime(engine)
     return {
         "status": "PASS",
+        "schema": LIMIT_UP_EVENT_SCHEMA_VERSION,
         "table": LIMIT_UP_EVENT_TABLE,
         "append_only": True,
     }
@@ -142,6 +144,7 @@ def validate_limit_up_event_runtime(engine, *, connection=None) -> None:
 
 __all__ = [
     "LIMIT_UP_EVENT_SCHEMA",
+    "LIMIT_UP_EVENT_SCHEMA_VERSION",
     "LIMIT_UP_EVENT_TABLE",
     "privileged_migrate_limit_up_event_schema",
     "validate_limit_up_event_runtime",
