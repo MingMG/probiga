@@ -6156,7 +6156,7 @@ def test_initial_database_preflight_rejects_unready_recovery_before_api_stop():
         "qmt_catalog",
         "qmt_audit",
     ]
-    validator_names = [f"validator_{index}" for index in range(38)]
+    validator_names = [f"validator_{index}" for index in range(39)]
     payload = {
         "status": "ok",
         "phase": "preflight",
@@ -6225,7 +6225,7 @@ def test_initial_database_preflight_rejects_unready_recovery_before_api_stop():
                 }
                 for name in validator_names
             },
-            "contract_count": 38,
+            "contract_count": 39,
             "recovery_planner_names": planner_names,
             "recovery_planner_count": 6,
             "recovery_plans": {

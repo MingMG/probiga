@@ -14315,7 +14315,7 @@ contracts_exact = (
     and isinstance(contracts, dict)
     and set(contracts) == set(validator_names)
     and bundle.get("validator_count") == 39
-    and len(validator_names) == 38
+    and len(validator_names) == 39
     and bundle.get("contract_count") == len(contracts)
     and all(
         isinstance(item, dict)
