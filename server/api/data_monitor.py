@@ -380,6 +380,16 @@ class Observer:
             valid += " AND ABS(main_net_inflow-max_net_inflow-lg_net_inflow)<=GREATEST(1000000,ABS(main_net_inflow)*0.001)"
         else:
             valid = "price>0 AND volume>=0 AND amount>=0"
+            if (
+                spec.key == "minute"
+                and _source == "tencent_minute_verified"
+            ):
+                # The verified Tencent fallback proves OHLC and volume while
+                # leaving an unavailable per-minute amount explicitly NULL.
+                valid = (
+                    "price>0 AND volume>=0 "
+                    "AND (amount>=0 OR amount IS NULL)"
+                )
         if spec.key == "daily" and {
             "quality_status",
             "permission_status",

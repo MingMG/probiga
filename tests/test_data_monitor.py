@@ -126,6 +126,15 @@ def test_public_stock_minute_ordinals_use_the_238_bar_grid():
     )
     assert "BETWEEN '13:01:00' AND '14:57:00'" in queries[0]
     assert "TIME(trade_time)='15:00:00'" in queries[0]
+    observer.groups(
+        dm.BY_KEY['minute'],
+        DAY,
+        grid=list(dm.PUBLIC_STOCK_MINUTE_TIME_GRID),
+        codes={'000001'},
+        _chunk=True,
+        _source='tencent_minute_verified',
+    )
+    assert '(amount>=0 OR amount IS NULL)' in queries[-1]
 
 
 def test_calendar_requires_authoritative_record_not_weekday():
