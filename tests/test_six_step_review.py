@@ -72,6 +72,12 @@ def test_six_step_review_renders_evidence_and_causal_boundaries():
             "inflow": [{"code": "000001", "name": "甲", "value": 500_000_000, "sector": "半导体"}],
             "outflow": [{"code": "000002", "name": "乙", "value": -300_000_000, "sector": "银行"}],
             "north": 1_000_000_000,
+            "longhubang": [{
+                "code": "000001",
+                "name": "甲",
+                "value": 200_000_000,
+                "reason": "日涨幅偏离值达7%",
+            }],
             "notices": [{
                 "code": "000001",
                 "name": "甲",
@@ -111,6 +117,8 @@ def test_six_step_review_renders_evidence_and_causal_boundaries():
     assert "| 09:35 | 异动启动 | 甲(000001) |" in report
     assert "时间存在先后" in report
     assert "半导体" in report
+    assert "北向净额：+10.00亿元" in report
+    assert "龙虎榜净额靠前：甲(000001) +2.00亿元" in report
     assert "【观察池，不构成推荐】" in report
     assert "以上为信息整理，不构成投资建议。" in report
     assert "建议买入" not in report

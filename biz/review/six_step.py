@@ -44,6 +44,12 @@ def _pct(value: Any) -> str:
     return f"{_number(value):+.2f}%"
 
 
+def _rate(value: Any) -> str:
+    if value is None:
+        return "未获取"
+    return f"{_number(value):.2f}%"
+
+
 def _amount(value: Any) -> str:
     if value is None:
         return "未获取"
@@ -677,7 +683,35 @@ def _fund_section(
     )
     if not north_frame.empty:
         row = north_frame.iloc[0]
-        north = sum(_number(row.get(key)) for key in ("net_hgt", "net_sgt", "net_tgt"))
+        direct_total = row.get("net_tgt")
+        north = (
+            _number(direct_total)
+            if direct_total is not None and pd.notna(direct_total)
+            else _number(row.get("net_hgt")) + _number(row.get("net_sgt"))
+        )
+        if north == 0:
+            north = None
+
+    longhubang: list[dict[str, Any]] = []
+    dragon_frame = _read_frame(
+        engine,
+        text(
+            "SELECT stock_code, a_net_amount, reason FROM st_a_list_daily "
+            "WHERE trade_date=:d ORDER BY ABS(a_net_amount) DESC LIMIT 8"
+        ),
+        {"d": target.isoformat()},
+    )
+    if not dragon_frame.empty:
+        for row in dragon_frame.to_dict(orient="records"):
+            code = str(row.get("stock_code") or "").zfill(6)
+            longhubang.append(
+                {
+                    "code": code,
+                    "name": names.get(code, code),
+                    "value": _number(row.get("a_net_amount")),
+                    "reason": _plain(row.get("reason")),
+                }
+            )
 
     notices = _read_frame(
         engine,
@@ -715,6 +749,7 @@ def _fund_section(
         "inflow": inflow,
         "outflow": outflow,
         "north": north,
+        "longhubang": longhubang,
         "notices": notice_items,
     }
 
@@ -933,7 +968,8 @@ def render_six_step(payload: Mapping[str, Any]) -> str:
         f"- 成交与广度：两市成交额 {_amount(amount)}，较前一交易日 {_pct(amount_change)}；"
         f"上涨家数占比 {(_number(up_cov) * 100):.2f}%，个股涨跌幅中位数 {_pct(median)}。",
         f"- 情绪数据：涨停 {board.get('limit_up_count', '未获取')} 家、跌停 {board.get('limit_down_count', '未获取')} 家，"
-        f"炸板 {board.get('broken_board_count', '未获取')} 家，炸板率 {_pct(board.get('broken_rate'))}，"
+            f"炸板 {board.get('broken_board_count', '未获取')} 家，炸板率 "
+            f"{_rate(board.get('broken_rate'))}，"
         f"最高连板 {board.get('max_boards', '未获取')} 板。",
         f"- 一句话：今天是**{tone}**，情绪阶段为**{_plain(cycle_name)}**。",
         "",
@@ -1027,11 +1063,25 @@ def render_six_step(payload: Mapping[str, Any]) -> str:
         )
     else:
         lines.append("- 个股主力净流出：未获取")
-    lines.append(
-        "- 北向："
-        + (f"{_number(flows.get('north')) / 1e8:+.2f}亿元" if flows.get("north") is not None else "未获取")
-        + "；ETF 净流入/流出：未获取；龙虎榜：未获取。"
-    )
+    if flows.get("north") is not None:
+        lines.append(
+            f"- 北向净额：{_number(flows.get('north')) / 1e8:+.2f}亿元"
+            "（同花顺收盘净额口径）；ETF 净流入/流出：未获取。"
+        )
+    else:
+        lines.append("- 北向净额：未获取（公开源未披露有效净额）；ETF 净流入/流出：未获取。")
+    if flows.get("longhubang"):
+        lines.append(
+            "- 龙虎榜净额靠前："
+            + "、".join(
+                f"{item['name']}({item['code']}) "
+                f"{item['value'] / 1e8:+.2f}亿元"
+                for item in flows["longhubang"][:5]
+            )
+            + "。"
+        )
+    else:
+        lines.append("- 龙虎榜：未获取（当日榜单可能尚未发布）。")
     if flows.get("notices"):
         lines.append(
             "- 盘后公告："

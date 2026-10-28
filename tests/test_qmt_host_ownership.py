@@ -94,6 +94,7 @@ def test_frozen_qmt_host_sets_are_exact_and_disjoint():
         "news_sync",
         "stock_dividend_eastmoney",
         "exposure_event_risk_watch",
+        "north_flow_daily",
     }
     assert "intraday_realtime" not in WINDOWS_QMT_EDGE_TASK_TYPES
     assert "intraday_minute_kline" not in WINDOWS_QMT_EDGE_TASK_TYPES
@@ -117,7 +118,7 @@ def test_qmt_capable_canonical_tasks_own_the_datadir_paths():
     assert PUBLIC_STOCK_MINUTE_TASK["enabled"] == 0
     assert FREE_INDEX_DAILY_TASK["enabled"] == 1
     assert FREE_INDEX_DAILY_TASK["script_args"] == (
-        "--date latest --codes 000001,399001,399006,000688 --json"
+        "--date latest --codes 000001,399001,399006,000688,899050 --json"
     )
     assert QMT_STOCK_MINUTE_FLOW_CANONICAL_TASK["enabled"] == 0
 

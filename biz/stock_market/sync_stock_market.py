@@ -5675,11 +5675,21 @@ _CNINDEX_INDEX_KLINE_URL = (
 _CNINDEX_INDEX_CURRENT_URL = (
     "https://hq.cnindex.com.cn/market/market/getIndexLatestRealTimeData"
 )
+_EAST_INDEX_QUOTE_URL = "https://push2.eastmoney.com/api/qt/stock/get"
+_TENCENT_INDEX_QUOTE_URL = "https://qt.gtimg.cn/q="
 
 
 def _tencent_index_symbol(index_code: str) -> str:
     code = str(index_code or "").strip().zfill(6)
+    if code.startswith("899"):
+        return f"bj{code}"
     return f"sz{code}" if code.startswith(("399", "970", "980")) else f"sh{code}"
+
+
+def _east_index_secid(index_code: str) -> str:
+    code = str(index_code or "").strip().zfill(6)
+    market_id = 0 if code.startswith(("399", "899", "970", "980")) else 1
+    return f"{market_id}.{code}"
 
 
 def _fetch_tencent_index_kline(
@@ -5774,6 +5784,100 @@ def _fetch_tencent_index_kline(
     ]
 
 
+def _fill_index_close_quote(
+    frame: pd.DataFrame,
+    index_code: str,
+    target_date: str,
+) -> pd.DataFrame:
+    """Fill missing current-day amount/change fields from the verified quote."""
+
+    if frame is None or frame.empty:
+        return frame
+    code = str(index_code or "").strip().zfill(6)
+    target = pd.Timestamp(target_date).normalize()
+    mask = frame["trade_date"].eq(target)
+    if not bool(mask.any()):
+        return frame
+    target_row = frame.loc[mask].iloc[-1]
+    fill_fields = {
+        column
+        for column in ("amount", "change", "change_pct")
+        if target_row.get(column) is None or pd.isna(target_row.get(column))
+    }
+    needs_fill = bool(fill_fields)
+    if not needs_fill:
+        return frame
+    quote_at = None
+    close = amount = change = change_pct = None
+    try:
+        response = requests.get(
+            _EAST_INDEX_QUOTE_URL,
+            params={
+                "secid": _east_index_secid(code),
+                "fields": "f43,f47,f48,f57,f58,f60,f86,f169,f170",
+            },
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Referer": "https://quote.eastmoney.com/",
+            },
+            timeout=float(os.environ.get("EAST_INDEX_QUOTE_TIMEOUT", "15")),
+            proxies={},
+        )
+        response.raise_for_status()
+        data = (response.json() or {}).get("data") or {}
+        quote_at = datetime.fromtimestamp(int(data["f86"]))
+        close = float(data["f43"]) / 100.0
+        amount = float(data["f48"])
+        change = float(data["f169"]) / 100.0
+        change_pct = float(data["f170"]) / 100.0
+    except (requests.RequestException, TypeError, ValueError, KeyError, OSError):
+        pass
+    if quote_at is None:
+        try:
+            symbol = _tencent_index_symbol(code)
+            response = requests.get(
+                _TENCENT_INDEX_QUOTE_URL + symbol,
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Referer": "https://gu.qq.com/",
+                },
+                timeout=float(os.environ.get("TENCENT_INDEX_QUOTE_TIMEOUT", "15")),
+                proxies={},
+            )
+            response.raise_for_status()
+            body = response.text
+            raw = body.split('="', 1)[1].rsplit('";', 1)[0]
+            values = raw.split("~")
+            if len(values) < 38:
+                return frame
+            quote_at = datetime.strptime(values[30], "%Y%m%d%H%M%S")
+            close = float(values[3])
+            change = float(values[31])
+            change_pct = float(values[32])
+            amount = float(values[37]) * 10_000
+        except (requests.RequestException, TypeError, ValueError, IndexError, OSError):
+            return frame
+    if quote_at is None:
+        return frame
+    if quote_at.date() != target.date():
+        return frame
+    existing_close = float(frame.loc[mask, "close"].iloc[-1])
+    if abs(close - existing_close) > 0.011:
+        raise RuntimeError(
+            f"index quote close mismatch for {code}: "
+            f"quote={close} kline={existing_close}"
+        )
+    result = frame.copy()
+    row_index = result.index[mask][-1]
+    if "amount" in fill_fields:
+        result.at[row_index, "amount"] = amount
+    if "change" in fill_fields:
+        result.at[row_index, "change"] = change
+    if "change_pct" in fill_fields:
+        result.at[row_index, "change_pct"] = change_pct
+    return result
+
+
 def _fetch_east_index_kline(
     index_code: str,
     start_date: str,
@@ -5781,7 +5885,7 @@ def _fetch_east_index_kline(
 ) -> pd.DataFrame:
     """Fetch a second, amount-bearing daily-bar copy from Eastmoney."""
     code = str(index_code or "").strip().zfill(6)
-    secid = f"0.{code}" if code.startswith(("399", "970", "980")) else f"1.{code}"
+    secid = _east_index_secid(code)
     params = {
         "secid": secid,
         "klt": "101",
@@ -6089,7 +6193,7 @@ def _fetch_verified_external_index_kline(
         east = pd.DataFrame()
     if tencent.empty:
         if not east.empty:
-            return east, "east_only"
+            return _fill_index_close_quote(east, code, end_date), "east_only"
         try:
             official = _fetch_cnindex_index_kline(code, start_date, end_date)
         except Exception as exc:  # pylint: disable=broad-except
@@ -6097,14 +6201,22 @@ def _fetch_verified_external_index_kline(
             official = pd.DataFrame()
         return official, "cnindex_official" if not official.empty else "unavailable"
     if east.empty:
-        return tencent, "tencent_only"
+        return _fill_index_close_quote(tencent, code, end_date), "tencent_only"
     merged = tencent.merge(
         east,
         on=["index_code", "trade_date"],
         how="inner",
         suffixes=("_tencent", "_east"),
     )
-    if len(merged) != len(tencent) or len(merged) != len(east):
+    subset_cross_check = (
+        code.startswith("899")
+        and len(tencent) == 1
+        and len(merged) == 1
+    )
+    if (
+        len(merged) != len(tencent)
+        or (len(merged) != len(east) and not subset_cross_check)
+    ):
         raise RuntimeError(
             f"index K-line date coverage mismatch for {index_code}: "
             f"Tencent={len(tencent)} Eastmoney={len(east)} matched={len(merged)}"
@@ -6114,7 +6226,7 @@ def _fetch_verified_external_index_kline(
         right = pd.to_numeric(merged[f"{column}_east"], errors="coerce")
         if not np.allclose(left, right, rtol=0, atol=1e-6, equal_nan=False):
             raise RuntimeError(f"index K-line {column} mismatch for {index_code}")
-    return east, "cross_checked"
+    return _fill_index_close_quote(east, code, end_date), "cross_checked"
 
 
 def _latest_index_kline_date(engine: Engine) -> str:

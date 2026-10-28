@@ -247,13 +247,30 @@ PUBLIC_STOCK_MINUTE_FLOW_TASK = {
     ),
 }
 
+NORTH_FLOW_DAILY_TASK = {
+    "task_name": "北向资金收盘净额",
+    "task_type": "north_flow_daily",
+    "group_name": "行情数据",
+    "script_path": "tools/sync_north_flow_daily.py",
+    "script_args": "--date latest --apply --json",
+    "cron_time": "15:35",
+    "interval_minutes": 0,
+    "enabled": 1,
+    "sort_order": 19,
+    "date_param": "",
+    "description": (
+        "收盘后读取同花顺北向分时终值，绑定权威闭市日；"
+        "东财净买卖字段停更时保留可核验的北向净额，不把空值写成0。"
+    ),
+}
+
 FREE_INDEX_DAILY_TASK = {
     "task_name": "公开源指数日线",
     "task_type": "free_index_daily_canonical",
     "group_name": "行情数据",
     "script_path": "tools/sync_free_index_daily.py",
     "script_args": (
-        "--date latest --codes 000001,399001,399006,000688 --json"
+        "--date latest --codes 000001,399001,399006,000688,899050 --json"
     ),
     "cron_time": "17:10",
     "interval_minutes": 0,
@@ -261,8 +278,8 @@ FREE_INDEX_DAILY_TASK = {
     "sort_order": 90,
     "date_param": "",
     "description": (
-        "QMT指数DAT覆盖不足时，仅用公开源补齐四个核心指数日线；"
-        "北证50未获取时保持缺失，不伪造全量覆盖。"
+        "QMT指数DAT覆盖不足时，仅用公开源补齐五个核心指数日线；"
+        "任一指数缺失时保持失败关闭，不伪造全量覆盖。"
     ),
 }
 
@@ -551,6 +568,7 @@ LINUX_PROVIDER_TASKS = (
     FREE_INDEX_DAILY_TASK,
     PUBLIC_STOCK_MINUTE_TASK,
     PUBLIC_STOCK_MINUTE_FLOW_TASK,
+    NORTH_FLOW_DAILY_TASK,
     LINUX_RECENT_DATA_GAP_REPAIR_TASK,
     EASTMONEY_ALIST_DAILY_TASK,
     EASTMONEY_ALIST_INFO_TASK,
@@ -700,6 +718,7 @@ __all__ = [
     "LINUX_PROVIDER_TASKS_BY_TYPE",
     "LINUX_PROVIDER_TASK_TYPES",
     "LINUX_RECENT_DATA_GAP_REPAIR_TASK",
+    "NORTH_FLOW_DAILY_TASK",
     "LINUX_QMT_TASKS",
     "LINUX_QMT_TASKS_BY_TYPE",
     "LINUX_QMT_TASK_TYPES",

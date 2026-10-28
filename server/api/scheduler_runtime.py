@@ -237,6 +237,7 @@ CRITICAL_CRON_CATCHUP_TASK_TYPES.update(
         "analysis_upper_evidence_prepare",
         "alist_daily",
         "alist_info",
+        "north_flow_daily",
         "concept_flow",
         "eastmoney_concept_flow_snapshot",
         "eastmoney_concept_current",
@@ -303,6 +304,7 @@ CRITICAL_CRON_CATCHUP_WINDOWS_SECONDS = {
     # still prevents a second successful run.
     "alist_daily": 8 * 60 * 60,
     "alist_info": 8 * 60 * 60,
+    "north_flow_daily": 8 * 60 * 60,
     "concept_flow": 8 * 60 * 60,
     "eastmoney_concept_flow_snapshot": 8 * 60 * 60,
     "eastmoney_concept_current": 8 * 60 * 60,
