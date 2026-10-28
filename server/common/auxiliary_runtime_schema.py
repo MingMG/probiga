@@ -236,7 +236,8 @@ CREATE TABLE IF NOT EXISTS `qmt_datadir_minute_stage` (
   `volume` DECIMAL(50,6) NULL,
   `amount` DECIMAL(50,6) NULL,
   `qmt_code` VARCHAR(32) NULL,
-  KEY `idx_qdms_run_date` (`run_id`, `trade_date`)
+  KEY `idx_qdms_run_date` (`run_id`, `trade_date`),
+  KEY `idx_qdms_date_run` (`trade_date`, `run_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 """,
 )
