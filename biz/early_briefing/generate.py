@@ -594,7 +594,7 @@ def _collect_broad_etf_flow(target: str) -> dict:
     try:
         response = httpx.get(
             "http://127.0.0.1:8000/api/hot-data/broad-etf-flow",
-            params={"trade_date": target, "days": 5},
+            params={"trade_date": target, "days": 5, "refresh": "true"},
             timeout=15,
         )
         response.raise_for_status()

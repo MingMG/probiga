@@ -815,7 +815,11 @@ def _broad_etf_flow_snapshot(target: date) -> dict[str, Any]:
     try:
         response = requests.get(
             "http://127.0.0.1:8000/api/hot-data/broad-etf-flow",
-            params={"trade_date": target.isoformat(), "days": 5},
+            params={
+                "trade_date": target.isoformat(),
+                "days": 5,
+                "refresh": "true",
+            },
             timeout=15,
         )
         response.raise_for_status()
