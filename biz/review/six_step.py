@@ -28,6 +28,15 @@ EVENT_LABELS = {
 }
 NOTICE_RISK_WORDS = ("减持", "立案", "处罚", "问询", "终止", "亏损", "解禁", "质押")
 NOTICE_CATALYST_WORDS = ("中标", "回购", "增持", "重组", "收购", "签订", "订单", "业绩预增")
+ROBOT_SECTOR_NAMES = (
+    "机器人概念",
+    "工业机器人",
+    "自动化设备",
+    "机器人材料",
+    "服务机器人",
+    "减速器",
+)
+ROBOT_SECTOR_KEYWORDS = ("机器人", "自动化设备", "减速器")
 
 
 def _number(value: Any, default: float = 0.0) -> float:
@@ -303,66 +312,75 @@ def _memberships(
             for row in frame.to_dict(orient="records"):
                 add(row.get("stock_code"), row.get("sector_name"))
     membership_source = "东方财富板块/概念映射" if by_sector else ""
-    # The THS heat names are concept names. Use the newest exact-day QMT
-    # membership snapshot within the prior week when the current-day snapshot
-    # is unavailable; the report exposes that source date instead of
-    # pretending the mapping is same-day.
-    for offset in range(0, 8):
-        snapshot = target - timedelta(days=offset)
-        frames: list[pd.DataFrame] = []
-        if names:
-            frames.append(_read_frame(
+    # The THS heat names are concept names. Resolve the newest available QMT
+    # membership snapshot with one date probe and one bounded relation query.
+    # The earlier per-day loop issued up to 24 large scans on a missing
+    # current-day snapshot and could make the review take more than 20 minutes.
+    start = target - timedelta(days=7)
+    clauses: list[str] = []
+    params: dict[str, Any] = {
+        "start": start.isoformat(),
+        "target": target.isoformat(),
+    }
+    if names:
+        clauses.append("concept_name IN :names")
+        params["names"] = names
+    if codes:
+        clauses.append("stock_code IN :codes")
+        params["codes"] = codes
+    if sector_code_values:
+        clauses.append("concept_code IN :sector_codes")
+        params["sector_codes"] = sector_code_values
+    if clauses:
+        where = " OR ".join(clauses)
+        date_statement = text(
+            f"""
+            SELECT MAX(snapshot_date) AS snapshot_date
+            FROM qmt_concept_member_snapshot
+            WHERE snapshot_date >= :start AND snapshot_date <= :target
+              AND ({where})
+            """
+        )
+        for key in ("names", "codes", "sector_codes"):
+            if key in params:
+                date_statement = date_statement.bindparams(
+                    bindparam(key, expanding=True)
+                )
+        date_frame = _read_frame(engine, date_statement, params)
+        snapshot = (
+            pd.Timestamp(date_frame.iloc[0]["snapshot_date"]).date()
+            if not date_frame.empty
+            and pd.notna(date_frame.iloc[0].get("snapshot_date"))
+            else None
+        )
+        if snapshot is not None:
+            relation_statement = text(
+                f"""
+                SELECT stock_code, concept_code, concept_name
+                FROM qmt_concept_member_snapshot
+                WHERE snapshot_date=:snapshot AND ({where})
+                LIMIT 200000
+                """
+            )
+            for key in ("names", "codes", "sector_codes"):
+                if key in params:
+                    relation_statement = relation_statement.bindparams(
+                        bindparam(key, expanding=True)
+                    )
+            relation_frame = _read_frame(
                 engine,
-                text(
-                    """
-                    SELECT stock_code, concept_name AS sector_name
-                    FROM qmt_concept_member_snapshot
-                    WHERE snapshot_date=:d AND concept_name IN :names
-                    """
-                ).bindparams(bindparam("names", expanding=True)),
-                {"d": snapshot.isoformat(), "names": names},
-            ))
-        if codes:
-            frames.append(_read_frame(
-                engine,
-                text(
-                    """
-                    SELECT stock_code, concept_name AS sector_name
-                    FROM qmt_concept_member_snapshot
-                    WHERE snapshot_date=:d AND stock_code IN :codes
-                    """
-                ).bindparams(bindparam("codes", expanding=True)),
-                {"d": snapshot.isoformat(), "codes": codes},
-            ))
-        if sector_code_values:
-            frames.append(_read_frame(
-                engine,
-                text(
-                    """
-                    SELECT stock_code, concept_code AS sector_code,
-                           concept_name AS sector_name
-                    FROM qmt_concept_member_snapshot
-                    WHERE snapshot_date=:d AND concept_code IN :sector_codes
-                    """
-                ).bindparams(bindparam("sector_codes", expanding=True)),
-                {
-                    "d": snapshot.isoformat(),
-                    "sector_codes": sector_code_values,
-                },
-            ))
-        nonempty = [item for item in frames if not item.empty]
-        if not nonempty:
-            continue
-        for frame in nonempty:
-            for row in frame.to_dict(orient="records"):
-                raw_code = str(row.get("sector_code") or "").strip()
+                relation_statement,
+                {**params, "snapshot": snapshot.isoformat()},
+            )
+            for row in relation_frame.to_dict(orient="records"):
+                raw_code = str(row.get("concept_code") or "").strip()
                 sector_name = (
                     name_by_sector_code.get(raw_code)
-                    or row.get("sector_name")
+                    or row.get("concept_name")
                 )
                 add(row.get("stock_code"), sector_name)
-        membership_source = f"QMT概念快照 {snapshot.isoformat()}"
-        break
+            if not relation_frame.empty:
+                membership_source = f"QMT概念快照 {snapshot.isoformat()}"
     return by_stock, by_sector, membership_source
 
 
@@ -451,7 +469,6 @@ def _daily_leaders(
         convert(row, "炸板")
         for row in frame[frame["touched_limit"] & ~frame["is_limit_up"]]
         .sort_values(["change_pct_calc", "amount"], ascending=[True, False])
-        .head(10)
         .to_dict(orient="records")
     ]
     return leaders, broken
@@ -493,12 +510,37 @@ def _minute_times(
             if len(hit):
                 first = _clock(times[int(hit[0])])
                 last = _clock(times[int(hit[-1])])
-                broke = item["status"] == "炸板" or int(hit[-1]) < len(rows) - 1
-                result[item["code"]] = {
+                at_limit = (
+                    prices >= item["limit_price"] - 0.005
+                ).to_numpy()
+                transitions = [
+                    index
+                    for index in range(1, len(at_limit))
+                    if bool(at_limit[index - 1]) and not bool(at_limit[index])
+                ]
+                broke = item["status"] == "炸板" or bool(transitions)
+                timing = {
                     "first": first,
                     "last": last,
-                    "state": "炸板" if broke else "封板",
+                    "state": (
+                        "炸板"
+                        if item["status"] == "炸板"
+                        else "炸板后回封"
+                        if broke
+                        else "封板"
+                    ),
                 }
+                if transitions:
+                    final_break = int(transitions[-1])
+                    prior_hits = [
+                        int(index)
+                        for index in hit
+                        if int(index) < final_break
+                    ]
+                    if prior_hits:
+                        timing["last"] = _clock(times[prior_hits[-1]])
+                    timing["break"] = _clock(times[final_break])
+                result[item["code"]] = timing
         else:
             threshold = item["pre_close"] * 0.95
             hit = (prices <= threshold).to_numpy().nonzero()[0]
@@ -521,7 +563,7 @@ def _event_rows(engine: Any, target: date) -> list[dict[str, str]]:
             FROM st_intraday_alert_state
             WHERE trade_date=:d
             ORDER BY first_seen_at, severity DESC
-            LIMIT 40
+            LIMIT 200
             """
         ),
         {"d": target.isoformat()},
@@ -592,13 +634,17 @@ def _minute_event_rows(
         timing = times.get(item["code"], {})
         sectors = sorted(by_stock.get(item["code"], set()))
         rows.append({
-            "time": timing.get("first", "未获取"),
+            "time": timing.get("break") or timing.get("first", "未获取"),
             "event_type": "分歧转弱",
             "subject": f"{item['name']}({item['code']})",
             "sector": "、".join(sectors[:2]) or "未获取",
             "evidence": f"最高价触及涨停价，收盘涨幅 {_pct(item['change_pct'])}，成交额 {_amount(item['amount'])}",
             "cause": "同板块跟随与炸板先后时间未获取",
-            "result": f"{timing.get('state', '炸板')}；最后触及涨停 {timing.get('last', '未获取')}",
+            "result": (
+                f"{timing.get('state', '炸板')}；最后触及涨停 "
+                f"{timing.get('last', '未获取')}；炸板 "
+                f"{timing.get('break', '未获取')}"
+            ),
         })
     for item in smashers:
         timing = times.get(item["code"], {})
@@ -748,6 +794,14 @@ def _fund_section(
     return {
         "inflow": inflow,
         "outflow": outflow,
+        "flow_by_code": (
+            {
+                str(row["stock_code"]).zfill(6): _number(row["main_net_inflow"])
+                for row in frame.to_dict(orient="records")
+            }
+            if not frame.empty
+            else {}
+        ),
         "north": north,
         "longhubang": longhubang,
         "notices": notice_items,
@@ -857,6 +911,7 @@ def _mainline_rows(
     bars: pd.DataFrame,
     by_sector: Mapping[str, set[str]],
     names: Mapping[str, str],
+    flow_by_code: Mapping[str, float],
     previous_top_names: set[str],
 ) -> list[dict[str, Any]]:
     if bars.empty:
@@ -890,6 +945,23 @@ def _mainline_rows(
             continue
         subset = by_code[by_code.index.isin(members)]
         limit_count = int(subset["is_limit"].sum()) if not subset.empty else 0
+        up_ratio = (
+            float(subset["pct"].gt(0).mean() * 100.0)
+            if not subset.empty
+            else None
+        )
+        flow_values = [
+            _number(flow_by_code[str(code).zfill(6)])
+            for code in members
+            if str(code).zfill(6) in flow_by_code
+        ]
+        net_flow = sum(flow_values)
+        up_text = f"{up_ratio:.1f}%" if up_ratio is not None else "未获取"
+        flow_text = (
+            f"{net_flow / 1e8:+.2f}亿元"
+            if flow_values
+            else "未获取"
+        )
         leader = None
         if not subset.empty:
             lead = subset.sort_values(["is_limit", "amount"], ascending=[False, False]).iloc[0]
@@ -898,10 +970,16 @@ def _mainline_rows(
             **sector,
             "reason": (
                 f"板块{pct_text(sector['change_pct'])}；"
-                f"成分股涨停 {limit_count} 只；领涨股 {leader or '未获取'}"
+                f"成分股涨停 {limit_count} 只；"
+                f"上涨占比 {up_text}；"
+                f"主力净流入 {flow_text}；"
+                f"领涨股 {leader or '未获取'}"
             ),
             "leader": leader or "未获取",
             "limit_up_count": limit_count,
+            "member_count": len(members),
+            "up_ratio": up_ratio,
+            "net_flow": net_flow if flow_values else None,
             "persistence": (
                 "延续"
                 if sector["name"] in previous_top_names
@@ -916,6 +994,91 @@ def pct_text(value: Any) -> str:
     return _pct(value)
 
 
+def _priority_mainlines(
+    mainlines: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    eligible = [
+        item
+        for item in mainlines
+        if item.get("status") == "已获取"
+    ]
+    return sorted(
+        eligible,
+        key=lambda item: (
+            item.get("net_flow") is not None
+            and _number(item.get("net_flow")) > 0,
+            int(item.get("limit_up_count") or 0),
+            _number(item.get("up_ratio")),
+            _number(item.get("change_pct")),
+        ),
+        reverse=True,
+    )
+
+
+def _robot_direction_metrics(
+    bars: pd.DataFrame,
+    *,
+    by_sector: Mapping[str, set[str]],
+    names: Mapping[str, str],
+    flow_by_code: Mapping[str, float],
+    broken: list[dict[str, Any]],
+    late_breaks: list[dict[str, Any]],
+) -> dict[str, Any]:
+    sector_names = [
+        name
+        for name in by_sector
+        if any(keyword in name for keyword in ROBOT_SECTOR_KEYWORDS)
+    ]
+    members = {
+        code
+        for name in sector_names
+        for code in by_sector.get(name, set())
+    }
+    result: dict[str, Any] = {
+        "status": "未获取",
+        "sectors": sorted(sector_names),
+        "member_count": len(members),
+        "up_ratio": None,
+        "limit_up_count": None,
+        "broken_count": None,
+        "late_break_count": None,
+        "net_flow": None,
+    }
+    if not members or bars.empty:
+        return result
+    frame = bars.copy()
+    frame["stock_code"] = frame["stock_code"].astype(str).str.zfill(6)
+    frame["pct"] = (
+        pd.to_numeric(frame["close"], errors="coerce")
+        / pd.to_numeric(frame["pre_close"], errors="coerce")
+        - 1.0
+    ) * 100.0
+    subset = frame[frame["stock_code"].isin(members)]
+    if subset.empty:
+        return result
+    limit_count = sum(
+        _number(row["pct"]) >= _limit_pct(
+            str(row["stock_code"]),
+            names.get(str(row["stock_code"]), ""),
+        ) - 0.15
+        for row in subset.to_dict(orient="records")
+    )
+    flow_values = [
+        _number(flow_by_code[code])
+        for code in members
+        if code in flow_by_code
+    ]
+    result.update({
+        "status": "已获取",
+        "up_ratio": float(subset["pct"].gt(0).mean() * 100.0),
+        "limit_up_count": int(limit_count),
+        "broken_count": sum(item["code"] in members for item in broken),
+        "late_break_count": sum(item["code"] in members for item in late_breaks),
+        "net_flow": sum(flow_values) if flow_values else None,
+    })
+    return result
+
+
 def _render_timeline(rows: list[Mapping[str, str]]) -> str:
     lines = [
         "| 时间 | 事件类型 | 触发个股 | 带动/拖累板块 | 数据依据 | 因果链 | 结果 |",
@@ -926,7 +1089,24 @@ def _render_timeline(rows: list[Mapping[str, str]]) -> str:
             "| 未获取 | 未获取 | 未获取 | 未获取 | 分时事件与分钟数据均未获取 | 未获取 | 未获取 |"
         )
         return "\n".join(lines)
-    for row in rows[:20]:
+    ordered = sorted(
+        rows,
+        key=lambda item: (
+            _plain(item.get("time")) == "未获取",
+            _plain(item.get("time")),
+        ),
+    )
+    if len(ordered) <= 28:
+        selected = ordered
+    else:
+        selected_indexes = set(range(8))
+        selected_indexes.update(range(max(0, len(ordered) // 2 - 4), len(ordered) // 2 + 4))
+        selected_indexes.update(range(len(ordered) - 12, len(ordered)))
+        selected = [
+            row for index, row in enumerate(ordered)
+            if index in selected_indexes
+        ]
+    for row in selected:
         lines.append(
             "| "
             + " | ".join(
@@ -954,6 +1134,10 @@ def render_six_step(payload: Mapping[str, Any]) -> str:
     watch = payload.get("watch_pool") or []
     cycle = payload.get("cycle") or {}
     notes = payload.get("notes") or []
+    late_break_wave = payload.get("late_break_wave") or []
+    robot_breaks = payload.get("robot_breaks") or []
+    robot_direction = payload.get("robot_direction") or {}
+    break_sector_counts = payload.get("break_sector_counts") or []
 
     tone = breadth.get("status", "未获取")
     cycle_name = cycle.get("cycle", "未获取")
@@ -989,22 +1173,84 @@ def render_six_step(payload: Mapping[str, Any]) -> str:
     mapped_mainlines = [
         item for item in mainlines if item.get("status") == "已获取"
     ]
+    priority_mainlines = _priority_mainlines(mainlines)
     if mapped_mainlines:
         for item in mapped_mainlines[:5]:
             lines.append(
                 f"- {item['name']}：{_plain(item.get('reason'))}；"
                 f"持续性 {_plain(item.get('persistence'))}。"
             )
-        drivers = [item["name"] for item in mapped_mainlines[:5]]
+        drivers = [item["name"] for item in priority_mainlines[:3]]
         if drivers:
             lines.append(
-                "- 盘面归因：上涨贡献集中在"
+                "- 明日优先关注："
                 + "、".join(drivers)
-                + "及其前排个股。当前数据只能确认价格、成交额和板块内部跟随，"
-                "不能据此识别具体资金身份或单条新闻的因果。"
+                + "。排序依据为板块主力净流入是否为正、涨停家数、上涨占比和板块涨幅；"
+                "这是信息筛选顺序，不构成交易建议。"
+            )
+            lead = priority_mainlines[0] if priority_mainlines else mapped_mainlines[0]
+            lines.append(
+                f"- 今日主线结论：最强主线为 {_plain(lead.get('name'))}，"
+                f"板块领涨股为 {_plain(lead.get('leader'))}，"
+                f"持续性为 {_plain(lead.get('persistence'))}。"
             )
     else:
         lines.append("- 主线与板块驱动：未获取")
+    if late_break_wave:
+        lines.append(
+            "- 尾盘炸板潮（14:30—15:00）：全市场 "
+            f"{len(late_break_wave)} 只；"
+            + "、".join(
+                f"{item['name']}({item['code']}) {item['break']}"
+                for item in late_break_wave[:8]
+            )
+            + "。"
+        )
+    elif timeline:
+        lines.append("- 尾盘炸板潮（14:30—15:00）：未检测到。")
+    else:
+        lines.append("- 尾盘炸板潮（14:30—15:00）：分钟数据未获取。")
+    robot_status = robot_direction.get("status")
+    if robot_status == "已获取":
+        robot_flow = robot_direction.get("net_flow")
+        robot_flow_text = (
+            f"{_number(robot_flow) / 1e8:+.2f}亿元"
+            if robot_flow is not None
+            else "未获取"
+        )
+        lines.append(
+            "- 机器人方向：覆盖 "
+            + "、".join(robot_direction.get("sectors") or [])
+            + f" 共 {robot_direction.get('member_count', '未获取')} 只成员；"
+            f"上涨占比 {_rate(robot_direction.get('up_ratio'))}，"
+            f"涨停 {robot_direction.get('limit_up_count', '未获取')} 只，"
+            f"全天炸板 {robot_direction.get('broken_count', '未获取')} 只，"
+            f"尾盘炸板 {robot_direction.get('late_break_count', '未获取')} 只，"
+            f"主力净流入 {robot_flow_text}。"
+        )
+    else:
+        lines.append("- 机器人方向：板块成员映射未获取。")
+    if robot_breaks:
+        lines.append(
+            "- 机器人相关炸板明细："
+            + "；".join(
+                f"{item['name']}({item['code']}) 最后涨停 {item['last_limit']}"
+                f"→炸板 {item['break']}，收盘 {_pct(item['change_pct'])}"
+                for item in robot_breaks[:6]
+            )
+            + "。机器人方向尾盘承接转弱，但单日数据不能推断次日必然延续。"
+        )
+    elif robot_status == "已获取":
+        lines.append("- 机器人相关炸板明细：今日未检测到。")
+    if break_sector_counts:
+        lines.append(
+            "- 炸板较集中的映射方向："
+            + "、".join(
+                f"{item['sector']} {item['count']}只"
+                for item in break_sector_counts[:3]
+            )
+            + "。"
+        )
     lines.extend(["", "## 三、龙头与个股", ""])
     if leaders:
         for item in leaders[:5]:
@@ -1042,6 +1288,15 @@ def render_six_step(payload: Mapping[str, Any]) -> str:
         )
     else:
         lines.append("- 分水岭：未获取")
+    if late_break_wave:
+        lines.append(
+            "- 尾盘时间轴："
+            + "；".join(
+                f"{item['break']} {item['name']}({item['code']}) 炸板"
+                for item in late_break_wave[:8]
+            )
+            + "。"
+        )
     lines.extend(["", "## 五、资金与消息", ""])
     if flows.get("inflow"):
         lines.append(
@@ -1102,11 +1357,35 @@ def render_six_step(payload: Mapping[str, Any]) -> str:
             )
     else:
         lines.append("- 指数关键支撑/压力：未获取（目标日指数数据缺失或过期）")
+    priority_names = [item["name"] for item in priority_mainlines[:3]]
     lines.append(
-        "- 可能轮动方向："
-        + ("、".join(item["name"] for item in mapped_mainlines[:5]) or "未获取")
-        + "。"
+        "- 明日重点盯：" + ("、".join(priority_names) or "未获取") + "。"
     )
+    for item in priority_mainlines[:3]:
+        up_ratio = item.get("up_ratio")
+        net_flow = item.get("net_flow")
+        signal_parts = [
+            (
+                f"上涨占比不低于今日 {_rate(up_ratio)}"
+                if up_ratio is not None
+                else "上涨占比待获取"
+            ),
+            (
+                f"主力净流入保持正值（今日 {_number(net_flow) / 1e8:+.2f}亿元）"
+                if net_flow is not None and _number(net_flow) > 0
+                else "主力净流入转正"
+            ),
+            f"领涨股 {_plain(item.get('leader'))} 的封板与跟随情况",
+        ]
+        lines.append(
+            f"- {item['name']}盯盘信号：" + "；".join(signal_parts) + "。"
+        )
+    if robot_direction.get("status") == "已获取":
+        lines.append(
+            "- 机器人方向盯盘信号：观察尾盘炸板股能否修复，"
+            "方向上涨占比和主力净流入能否同步回到正值；若继续出现涨停后快速破板，"
+            "按转弱方向处理。"
+        )
     risks = []
     if _number(board.get("broken_rate")) >= 30:
         risks.append("炸板率偏高")
@@ -1120,6 +1399,14 @@ def render_six_step(payload: Mapping[str, Any]) -> str:
             for item in flows["notices"]
             if item["status"] == "风险词"
         )
+    if late_break_wave:
+        risks.append(
+            "尾盘炸板高位股（"
+            + "、".join(item["name"] for item in late_break_wave[:5])
+            + "）"
+        )
+    if robot_breaks:
+        risks.append("机器人方向二次分歧")
     lines.append("- 需要回避的风险：" + ("、".join(dict.fromkeys(risks)) or "未获取"))
     lines.extend(["", "### 明日观察池", ""])
     if watch:
@@ -1228,13 +1515,16 @@ def build_six_step_review(
     } if isinstance(target_bars, pd.DataFrame) and not target_bars.empty else set()
     candidate_sectors = sector_data["positive"][:30]
     sector_names = [item["name"] for item in candidate_sectors]
+    membership_sector_names = sorted(
+        set(sector_names).union(ROBOT_SECTOR_NAMES)
+    )
     leader_codes = [
         item["code"]
-        for item in leaders[:10] + broken[:10] + smashers[:8]
+        for item in leaders[:10] + broken + smashers[:8]
     ]
     by_stock, watch_by_sector, membership_source = _memberships(
         engine,
-        sector_names=sector_names,
+        sector_names=membership_sector_names,
         sector_codes={
             item["concept_code"]: item["name"]
             for item in candidate_sectors
@@ -1251,7 +1541,7 @@ def build_six_step_review(
     for item in smashers:
         item["sectors"] = sorted(by_stock.get(item["code"], set()))[:2]
     timing_items = {
-        item["code"]: item for item in leaders[:8] + broken[:8] + smashers[:8]
+        item["code"]: item for item in leaders[:8] + broken + smashers[:8]
     }
     minute_times = _minute_times(engine, target, list(timing_items.values()))
     event_rows = _event_rows(engine, target)
@@ -1270,11 +1560,13 @@ def build_six_step_review(
             "sectors": sectors[:2],
             **minute_times.get(item["code"], {}),
         }
+    flows = _fund_section(engine, target, names, by_stock)
     mainlines = _mainline_rows(
         sector_data["top"],
         bars=target_bars,
         by_sector=watch_by_sector,
         names=names,
+        flow_by_code=flows.get("flow_by_code") or {},
         previous_top_names=sector_data["previous_top_names"],
     )
     watch = _watch_pool(
@@ -1283,7 +1575,38 @@ def build_six_step_review(
         by_sector=watch_by_sector,
         names=names,
     )
-    flows = _fund_section(engine, target, names, by_stock)
+    late_break_wave: list[dict[str, Any]] = []
+    robot_breaks: list[dict[str, Any]] = []
+    for item in broken:
+        timing = minute_times.get(item["code"], {})
+        break_time = str(timing.get("break") or "")
+        sectors = sorted(by_stock.get(item["code"], set()))
+        detail = {
+            "code": item["code"],
+            "name": item["name"],
+            "break": break_time or "未获取",
+            "last_limit": timing.get("last", "未获取"),
+            "change_pct": item["change_pct"],
+            "sectors": sectors[:3],
+        }
+        if break_time >= "14:30":
+            late_break_wave.append(detail)
+        if any("机器人" in sector for sector in sectors):
+            robot_breaks.append(detail)
+    late_break_wave.sort(key=lambda item: item["break"])
+    robot_breaks.sort(key=lambda item: item["break"])
+    robot_direction = _robot_direction_metrics(
+        target_bars,
+        by_sector=watch_by_sector,
+        names=names,
+        flow_by_code=flows.get("flow_by_code") or {},
+        broken=broken,
+        late_breaks=late_break_wave,
+    )
+    break_sector_counts: Counter[str] = Counter()
+    for item in broken:
+        for sector in by_stock.get(item["code"], set()):
+            break_sector_counts[sector] += 1
     tone, cycle = _tone_and_cycle(target_bars, previous_bars)
     quality_notes = []
     if sector_data["status"] != "available":
@@ -1310,6 +1633,13 @@ def build_six_step_review(
         "leader_details": leader_details,
         "smashers": smashers,
         "timeline": event_rows,
+        "late_break_wave": late_break_wave,
+        "robot_breaks": robot_breaks,
+        "robot_direction": robot_direction,
+        "break_sector_counts": [
+            {"sector": sector, "count": count}
+            for sector, count in break_sector_counts.most_common(5)
+        ],
         "flows": flows,
         "watch_pool": watch,
         "notes": quality_notes,
