@@ -137,7 +137,7 @@ def test_core_snapshot_routes_pure_capital_flow_to_minute_db(monkeypatch):
         required_read = generate._read_required_sql
 
         def read_with_complete_non_stock_fixtures(engine, sql, params=None):
-            if "FROM sm_index_current" in sql:
+            if "FROM sm_index_kline" in sql:
                 return [
                     {
                         "index_code": code,

@@ -179,9 +179,10 @@ def _load_core_market_snapshot(engine, target_trade_date: str) -> dict:
     index_rows = _read_required_sql(
         engine,
         """
-        SELECT index_code, price, change_pct, trade_date
-        FROM sm_index_current
+        SELECT index_code, close AS price, change_pct, trade_date
+        FROM sm_index_kline
         WHERE trade_date=:target_date
+          AND k_type=1
           AND index_code IN ('000001','399001','399006','000688','000300')
         ORDER BY FIELD(index_code,'000001','399001','399006','000688','000300')
         """,
