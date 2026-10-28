@@ -195,8 +195,10 @@ _CROSS_END_CONTRACT_CODE_FILES = frozenset({
     "tools/prepare_strategy_governance_schema.py",
     "tools/reload_big_qmt_strategy.ps1",
     "tools/resume_qmt_prior_edge.ps1",
+    "tools/apply_public_market_profile.py",
     "tools/run_big_qmt_bridge.py",
     "tools/run_qmt_windows_edge_release_bootstrap.py",
+    "tools/start_local_live_services.ps1",
     "tools/update_qmt_windows_edge.ps1",
 })
 
