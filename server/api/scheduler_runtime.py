@@ -157,6 +157,17 @@ RELEASE_CATCHUP_BLOCKED_RETRY_INTERVAL_MINUTES = max(
 )
 _QMT_MEMBERSHIP_TASK_TYPE = "qmt_membership_snapshot"
 _QMT_MEMBERSHIP_PROVIDER = "gj_big_qmt_inner"
+QMT_DATADIR_DIRECT_TASK_TYPES = frozenset(
+    {
+        "qmt_index_kline",
+        "qmt_index_minute",
+        "qmt_stock_daily_canonical",
+        "qmt_stock_minute_canonical",
+        "qmt_stock_minute_flow_canonical",
+        "qmt_canonical_history_gap_repair",
+    }
+)
+QMT_DATADIR_DIRECT_DISPATCH_REASON = "qmt_datadir_direct_only"
 RELEASE_CATCHUP_AUTHORITATIVE_DATE_TASK_TYPES = (
     RELEASE_CATCHUP_CLOSED_TARGET_TASK_TYPES
 )
@@ -2168,12 +2179,13 @@ def _qmt_windows_dispatch_preflight(
     *,
     mode: str,
 ) -> tuple[bool, str]:
-    """Require the exact live QMT release receipt before business dispatch.
+    """Require activation before QMT dispatch and isolate DAT-only jobs.
 
     The updater starts the scheduler so its build-bound heartbeat can be used
     to create the release receipt.  During that bootstrap interval the
-    scheduler must publish only its heartbeat; no ordinary or catch-up QMT job
-    may escape before the Linux activation and exact Windows receipt agree.
+    scheduler may execute only the frozen cache importers.  They read QMT DAT
+    files and do not require a live xtquant or BigQMT IPC connection.  Jobs
+    that use an external QMT API still require the exact release receipt.
     """
 
     activation_granted, activation_reason = (
@@ -2184,7 +2196,27 @@ def _qmt_windows_dispatch_preflight(
     if not activation_granted:
         return False, activation_reason
     build_sha = _scheduler_build_commit_sha()
-    return _windows_release_activation_ready(engine, build_sha=build_sha)
+    release_ready, release_reason = _windows_release_activation_ready(
+        engine,
+        build_sha=build_sha,
+    )
+    if release_ready:
+        return True, release_reason
+    if release_reason == "qmt_release_bootstrap_unavailable":
+        return True, QMT_DATADIR_DIRECT_DISPATCH_REASON
+    return False, release_reason
+
+
+def _qmt_windows_task_dispatch_allowed(
+    task_type: object,
+    *,
+    authorization_reason: str,
+) -> bool:
+    """Apply a DAT-only authorization to the exact command contract."""
+
+    if authorization_reason != QMT_DATADIR_DIRECT_DISPATCH_REASON:
+        return True
+    return str(task_type or "").strip() in QMT_DATADIR_DIRECT_TASK_TYPES
 
 
 def _notice_history_continuation_started_at(row: dict, *, now: datetime) -> datetime | None:
@@ -10290,6 +10322,31 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                         qmt_dispatch_reason,
                     )
                     continue
+                if (
+                    owner == SCHEDULER_OWNER_WINDOWS_QMT
+                    and not _qmt_windows_task_dispatch_allowed(
+                        row.get("task_type"),
+                        authorization_reason=qmt_dispatch_reason,
+                    )
+                ):
+                    logger.info(
+                        "Defer QMT API task while DAT-only dispatch is active: "
+                        "%s (type=%s)",
+                        task_name,
+                        row.get("task_type"),
+                    )
+                    continue
+                if (
+                    owner == SCHEDULER_OWNER_WINDOWS_QMT
+                    and qmt_dispatch_reason == QMT_DATADIR_DIRECT_DISPATCH_REASON
+                    and str(row.get("task_type") or "").strip()
+                    in QMT_DATADIR_DIRECT_TASK_TYPES
+                ):
+                    # Code-only releases must not force a fresh capture of a
+                    # complete DAT partition.  These importers retain their
+                    # ordinary calendar schedule and atomic completeness gate.
+                    release_catchup_pending = False
+                    release_catchup_due = False
 
                 if (
                     release_catchup_pending

@@ -8083,7 +8083,7 @@ def test_qmt_business_dispatch_preflight_requires_exact_release_activation() -> 
     ) as release_ready:
         assert scheduler_runtime._qmt_windows_dispatch_preflight(
             engine, mode="standalone"
-        ) == (False, "qmt_release_bootstrap_unavailable")
+        ) == (True, scheduler_runtime.QMT_DATADIR_DIRECT_DISPATCH_REASON)
         activation_ready.assert_called_once_with(
             connection,
             expected_build_sha=build_sha,
@@ -8109,6 +8109,29 @@ def test_qmt_business_dispatch_preflight_requires_exact_release_activation() -> 
             engine, mode="standalone"
         ) == (False, "QMT_EDGE_RELEASE_ACTIVATION_PENDING")
         release_ready.assert_not_called()
+
+
+def test_qmt_datadir_direct_dispatch_is_limited_to_frozen_cache_importers() -> None:
+    reason = scheduler_runtime.QMT_DATADIR_DIRECT_DISPATCH_REASON
+    for task_type in scheduler_runtime.QMT_DATADIR_DIRECT_TASK_TYPES:
+        assert scheduler_runtime._qmt_windows_task_dispatch_allowed(
+            task_type,
+            authorization_reason=reason,
+        )
+    for task_type in (
+        "qmt_index_current",
+        "qmt_membership_snapshot",
+        "qmt_announcement_pit",
+        "qmt_intraday_realtime",
+    ):
+        assert not scheduler_runtime._qmt_windows_task_dispatch_allowed(
+            task_type,
+            authorization_reason=reason,
+        )
+    assert scheduler_runtime._qmt_windows_task_dispatch_allowed(
+        "qmt_index_current",
+        authorization_reason="ready",
+    )
 
 
 def test_analysis_fast_waits_for_full_release_dag_then_catches_up() -> None:
