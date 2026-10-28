@@ -115,7 +115,10 @@ def test_qmt_capable_canonical_tasks_own_the_datadir_paths():
     )
     assert FREE_STOCK_DAILY_TASK["enabled"] == 0
     assert PUBLIC_STOCK_MINUTE_TASK["enabled"] == 0
-    assert FREE_INDEX_DAILY_TASK["enabled"] == 0
+    assert FREE_INDEX_DAILY_TASK["enabled"] == 1
+    assert FREE_INDEX_DAILY_TASK["script_args"] == (
+        "--date latest --codes 000001,399001,399006,000688 --json"
+    )
     assert QMT_STOCK_MINUTE_FLOW_CANONICAL_TASK["enabled"] == 0
 
 

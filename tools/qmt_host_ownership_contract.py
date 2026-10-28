@@ -252,15 +252,17 @@ FREE_INDEX_DAILY_TASK = {
     "task_type": "free_index_daily_canonical",
     "group_name": "行情数据",
     "script_path": "tools/sync_free_index_daily.py",
-    "script_args": "--date latest --json",
+    "script_args": (
+        "--date latest --codes 000001,399001,399006,000688 --json"
+    ),
     "cron_time": "17:10",
     "interval_minutes": 0,
-    "enabled": 0,
+    "enabled": 1,
     "sort_order": 90,
     "date_param": "",
     "description": (
-        "QMT本地指数缓存已接管标准指数日线；保留任务定义但默认停用，"
-        "避免公开源覆盖同交易日标准分区。"
+        "QMT指数DAT覆盖不足时，仅用公开源补齐四个核心指数日线；"
+        "北证50未获取时保持缺失，不伪造全量覆盖。"
     ),
 }
 

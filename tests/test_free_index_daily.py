@@ -126,3 +126,55 @@ def test_public_index_publisher_reports_missing_codes_without_claiming_full(
 
     assert result["status"] == "PARTIAL"
     assert result["missing_codes"] == ["399001"]
+
+
+def test_public_index_publisher_accepts_explicit_core_scope(monkeypatch):
+    class Engine:
+        def dispose(self):
+            pass
+
+    calls = []
+    monkeypatch.setattr(collector, "create_batch_engine", Engine)
+    monkeypatch.setattr(collector, "get_kline_engine", Engine)
+    monkeypatch.setattr(
+        collector,
+        "_expected_codes",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("persisted scope must not be enumerated")
+        ),
+    )
+    monkeypatch.setattr(
+        collector,
+        "_read_target",
+        lambda *_args, **_kwargs: [
+            {
+                "index_code": "000001",
+                "trade_date": "2026-10-28",
+                "open": 1,
+                "close": 2,
+                "high": 3,
+                "low": 1,
+                "volume": 10,
+                "amount": 20,
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        collector,
+        "step_index_kline",
+        lambda _engine, codes, *_args, **_kwargs: calls.append(codes),
+    )
+    monkeypatch.setattr(
+        collector,
+        "_write_receipt",
+        lambda *_args, **_kwargs: {"receipt_id": "c" * 64},
+    )
+
+    result = collector.publish(
+        "2026-10-28",
+        codes=["000001"],
+    )
+
+    assert calls == [["000001"]]
+    assert result["status"] == "COMPLETE"
+    assert result["expected_count"] == 1

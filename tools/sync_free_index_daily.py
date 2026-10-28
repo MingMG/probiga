@@ -188,11 +188,25 @@ def _write_receipt(
     return receipt
 
 
-def publish(target_date: str, *, apply: bool = True) -> dict[str, Any]:
+def publish(
+    target_date: str,
+    *,
+    apply: bool = True,
+    codes: list[str] | None = None,
+) -> dict[str, Any]:
     engine = create_batch_engine()
     history = get_kline_engine()
     try:
-        expected = _expected_codes(engine, target_date)
+        requested = sorted({
+            str(code or "").strip().zfill(6)
+            for code in (codes or [])
+            if str(code or "").strip()
+        })
+        if requested and any(
+            len(code) != 6 or not code.isdigit() for code in requested
+        ):
+            raise ValueError("explicit index codes must be six digits")
+        expected = requested or _expected_codes(engine, target_date)
         if not expected:
             raise RuntimeError("DATA_BLOCKED: persisted index scope is empty")
         if apply:
@@ -248,6 +262,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--date", default="latest")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--codes",
+        default="",
+        help="comma-separated exact index codes; empty uses persisted index scope",
+    )
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     target = str(args.date or "latest")
@@ -265,7 +284,12 @@ def main(argv: list[str] | None = None) -> int:
                 )
         finally:
             engine.dispose()
-        result = publish(target, apply=not args.dry_run)
+        codes = [
+            item.strip()
+            for item in str(args.codes or "").split(",")
+            if item.strip()
+        ]
+        result = publish(target, apply=not args.dry_run, codes=codes)
     except Exception as exc:
         result = {
             "schema": RESULT_SCHEMA,

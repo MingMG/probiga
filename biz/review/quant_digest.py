@@ -1419,8 +1419,9 @@ def load_quant_digest_inputs(
     target_bars = reader(
         text(
             """
-            SELECT stock_code, trade_date, adjust_type, open, close, high, low,
-                   pre_close, amount, volume, etl_sync_at
+            SELECT stock_code, short_name, trade_date, adjust_type, open, close,
+                   high, low, pre_close, amount, volume, turnover_ratio,
+                   etl_sync_at
             FROM sm_stock_kline
             WHERE trade_date = :d AND k_type = 1 AND adjust_type = :adjust_type
             ORDER BY stock_code
@@ -1847,7 +1848,16 @@ def generate_quant_digest(
     })
     result["factor_validation_json"]["selection_review"] = selection
     if result.get("publish_status") == PUBLISH_READY:
-        result["compact_review"] += "\n\n" + selection["compact_review"]
+        from biz.review.six_step import build_six_step_review
+
+        result["compact_review"] = build_six_step_review(
+            engine,
+            date_str,
+            digest=result,
+            target_bars=inputs["target_bars"],
+            previous_bars=inputs["previous_bars"],
+            history_bars=inputs["history_bars"],
+        )
     if persist:
         persist_quant_digest(engine, result)
     return result
