@@ -52,7 +52,7 @@ except Exception:
 
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 EXPECTED_A_SHARE_INDEX_CODES = frozenset(
-    {"000001", "399001", "399006", "000688", "000300"}
+    {"000001", "399001", "399006", "000688", "899050"}
 )
 MIN_HOT_CONCEPT_ROWS = 20
 MIN_FUSED_HOT_STOCK_ROWS = 20
@@ -186,8 +186,8 @@ def _load_core_market_snapshot(engine, target_trade_date: str) -> dict:
         FROM sm_index_kline
         WHERE trade_date=:target_date
           AND k_type=1
-          AND index_code IN ('000001','399001','399006','000688','000300')
-        ORDER BY FIELD(index_code,'000001','399001','399006','000688','000300')
+          AND index_code IN ('000001','399001','399006','000688','899050')
+        ORDER BY FIELD(index_code,'000001','399001','399006','000688','899050')
         """,
         params,
     )
@@ -487,7 +487,13 @@ def collect_market_data(engine, target_trade_date: str | None = None) -> dict:
 
     # 1.2 A股指数
     rows = core["index_rows"]
-    nm = {"000001": "上证", "399001": "深成指", "399006": "创业板", "000688": "科创50", "000300": "沪深300"}
+    nm = {
+        "000001": "上证",
+        "399001": "深成指",
+        "399006": "创业板",
+        "000688": "科创50",
+        "899050": "北证50",
+    }
     data["A股指数"] = {nm.get(r["index_code"], r["index_code"]): f"{_fmt_pct(r.get('change_pct'))} ({r.get('price')})"
                        for r in rows if r.get("price")}
 

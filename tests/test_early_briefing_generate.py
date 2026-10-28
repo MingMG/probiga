@@ -13,6 +13,16 @@ from integrations.wecom.delivery import WeComDeliveryError
 TARGET_DATE = "2026-08-25"
 
 
+def test_expected_briefing_indices_use_the_five_configured_market_indices():
+    assert generate.EXPECTED_A_SHARE_INDEX_CODES == {
+        "000001",
+        "399001",
+        "399006",
+        "000688",
+        "899050",
+    }
+
+
 def _valid_market_data() -> dict:
     return {
         "A股数据日期": TARGET_DATE,
