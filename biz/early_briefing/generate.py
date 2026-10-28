@@ -948,9 +948,25 @@ def main():
 
 def _finalize_briefing(content: str, market_data: dict) -> str:
     briefing = str(content or "").strip()
+    replacements = {
+        "先跑预警": "风险升高提示",
+        "先跑/先减仓": "优先核对风险",
+        "冲高先减": "留意冲高后的承接",
+        "建议买入": "列为观察",
+        "建议卖出": "列为风险观察",
+    }
+    for source, target in replacements.items():
+        briefing = briefing.replace(source, target)
     completeness = str(market_data.get("数据完整性") or "").strip()
     if completeness and completeness not in briefing:
         briefing += f"\n\n> 数据口径：{completeness}"
+    etf = market_data.get("宽基ETF份额推算") or {}
+    if etf.get("数据状态") == "已获取" and "宽基ETF份额" not in briefing:
+        briefing += (
+            "\n\n> 宽基ETF份额推算："
+            f"{etf.get('当日净申购')}（{etf.get('覆盖')} 只，"
+            f"申赎主体{etf.get('申赎主体')}；仅为份额变化推算）"
+        )
     footer = "以上为信息整理，不构成投资建议。"
     if footer not in briefing:
         briefing += f"\n\n{footer}"

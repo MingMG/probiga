@@ -103,6 +103,24 @@ def test_early_briefing_contract_rejects_coverage_below_briefing_floor():
         generate._assert_market_data_contract(market_data, TARGET_DATE)
 
 
+def test_finalize_briefing_removes_action_language_and_adds_etf_evidence():
+    content = "科技触发先跑预警，建议买入高位股。"
+    rendered = generate._finalize_briefing(content, {
+        "数据完整性": "K线覆盖 99.82%",
+        "宽基ETF份额推算": {
+            "数据状态": "已获取",
+            "当日净申购": "+255.74亿元",
+            "覆盖": "4/4",
+            "申赎主体": "未确认",
+        },
+    })
+
+    assert "先跑" not in rendered
+    assert "建议买入" not in rendered
+    assert "宽基ETF份额推算：+255.74亿元" in rendered
+    assert "以上为信息整理，不构成投资建议。" in rendered
+
+
 def test_core_snapshot_rejects_mixed_kline_date(monkeypatch):
     reads = iter(
         [
