@@ -2060,7 +2060,7 @@ def bridge_tick(C):
         if _stopping:
             return
         _write_heartbeat(
-            "error" if _last_error or _direct_model is None else "running"
+            "error" if _last_error else "running"
         )
     finally:
         try:
