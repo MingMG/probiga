@@ -168,7 +168,7 @@ def _publish(
         f"""
         INSERT INTO `{TARGET_TABLE}`
           (stock_code, short_name, trade_time, trade_date, k_type, adjust_type,
-           open, close, high, low, volume, amount, change, change_pct,
+           open, close, high, low, volume, amount, `change`, change_pct,
            pre_close, etl_sync_at, qmt_code, data_source, source_time,
            received_at, batch_id, data_version, quality_status,
            permission_status)
@@ -182,7 +182,7 @@ def _publish(
           short_name=VALUES(short_name), trade_time=VALUES(trade_time),
           open=VALUES(open), close=VALUES(close), high=VALUES(high),
           low=VALUES(low), volume=VALUES(volume), amount=VALUES(amount),
-          change=VALUES(change), change_pct=VALUES(change_pct),
+          `change`=VALUES(`change`), change_pct=VALUES(change_pct),
           pre_close=VALUES(pre_close), etl_sync_at=VALUES(etl_sync_at),
           qmt_code=VALUES(qmt_code), data_source=VALUES(data_source),
           source_time=VALUES(source_time), received_at=VALUES(received_at),
