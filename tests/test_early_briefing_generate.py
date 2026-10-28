@@ -1,4 +1,5 @@
 import sys
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -267,3 +268,55 @@ def test_market_trend_prompt_view_drops_long_transition_history():
 
     assert prompt_view["indices"][0]["periods"]["daily"]["direction"] == "range"
     assert "history" not in prompt_view["indices"][0]["periods"]["daily"]
+
+
+def test_external_market_loader_uses_public_snapshot_evidence(monkeypatch):
+    snapshot = {
+        "acquisition_status": "COMPLETE",
+        "available_count": 2,
+        "expected_count": 2,
+        "missing_symbols": [],
+        "items": [
+            {
+                "symbol": "nasdaq",
+                "availability": "available",
+                "price": 26477.81,
+                "change_pct": 1.18,
+                "market_time": "2026-10-28 04:00:00",
+            },
+            {
+                "symbol": "a50",
+                "availability": "available",
+                "price": 13098.0,
+                "change_pct": 0.52,
+                "market_time": "2026-10-28 08:30:00",
+            },
+        ],
+    }
+    fetch = Mock(return_value=snapshot)
+    monkeypatch.setattr(generate, "fetch_external_market_snapshot", fetch)
+
+    result = generate._collect_external_market_data(
+        as_of=datetime(2026, 10, 28, 8, 30)
+    )
+
+    assert result["美股"]["纳斯达克"].startswith("+1.18%")
+    assert result["外围市场"]["富时中国A50"].startswith("+0.52%")
+    assert result["外围数据状态"] == "COMPLETE：2/2 项可用"
+    fetch.assert_called_once_with(as_of=datetime(2026, 10, 28, 8, 30))
+
+
+def test_fallback_renders_public_us_and_external_quotes():
+    content = generate._generate_fallback(
+        {
+            "A股数据日期": TARGET_DATE,
+            "美股": {"纳斯达克": "+1.18%（26,477.81）"},
+            "外围市场": {"富时中国A50": "+0.52%（13,098.00）"},
+            "外围数据状态": "COMPLETE：2/2 项可用",
+        },
+        [],
+    )
+
+    assert "纳斯达克 +1.18%" in content
+    assert "富时中国A50 +0.52%" in content
+    assert "COMPLETE：2/2 项可用" in content

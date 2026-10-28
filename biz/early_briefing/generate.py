@@ -43,6 +43,7 @@ from server.common.daily_stock_universe import (
 from server.common.tech_risk import append_tech_risk_markdown, fetch_tech_risk_signal
 from server.engine.market_trend import DEFAULT_INDEX_NAMES, build_market_trend
 from integrations.wecom.delivery import deliver_markdown
+from biz.market_context.external_market import fetch_external_market_snapshot
 try:
     from biz.research_radar.radar import build_research_radar, format_radar_markdown
 except Exception:
@@ -304,6 +305,71 @@ def _fmt_money(v) -> str:
     return f"{v:.0f}"
 
 
+def _format_external_quote(item: dict) -> str:
+    price = item.get("price")
+    price_text = f"{float(price):,.2f}" if price is not None else "未获取"
+    market_time = str(item.get("market_time") or "").strip()
+    time_text = f"，截至 {market_time}" if market_time else ""
+    return f"{_fmt_pct(item.get('change_pct'))}（{price_text}{time_text}）"
+
+
+def _collect_external_market_data(as_of: datetime | None = None) -> dict:
+    """Load the shared public external-market snapshot for the briefing."""
+
+    snapshot = fetch_external_market_snapshot(as_of=as_of or datetime.now())
+    available = {
+        str(item.get("symbol") or ""): item
+        for item in snapshot.get("items") or []
+        if item.get("availability") == "available"
+    }
+    us_labels = {
+        "nasdaq": "纳斯达克",
+        "sp500": "标普500",
+        "dow": "道琼斯",
+        "us_semiconductor": "半导体ETF",
+        "us_ai": "人工智能ETF",
+    }
+    market_labels = {
+        "hang_seng": "恒生指数",
+        "a50": "富时中国A50",
+        "usdcnh": "美元兑人民币",
+        "vix": "VIX",
+        "us10y": "美国10年期国债收益率",
+        "crude_oil": "原油",
+        "gold": "黄金",
+        "copper": "铜",
+        "nikkei": "日经225",
+        "kospi": "韩国KOSPI",
+    }
+    us = {
+        label: _format_external_quote(available[symbol])
+        for symbol, label in us_labels.items()
+        if symbol in available
+    }
+    external = {
+        label: _format_external_quote(available[symbol])
+        for symbol, label in market_labels.items()
+        if symbol in available
+    }
+    status = str(snapshot.get("acquisition_status") or "UNKNOWN")
+    available_count = int(snapshot.get("available_count") or len(available))
+    expected_count = int(snapshot.get("expected_count") or 0)
+    missing = [
+        str(symbol)
+        for symbol in snapshot.get("missing_symbols") or []
+        if symbol
+    ]
+    quality = (
+        f"{status}：{available_count}/{expected_count} 项可用"
+        + (f"；未获取 {','.join(missing)}" if missing else "")
+    )
+    return {
+        "美股": us or {"数据状态": f"未获取（{quality}）"},
+        "外围市场": external or {"数据状态": f"未获取（{quality}）"},
+        "外围数据状态": quality,
+    }
+
+
 # ═══════════════════════════════════════════
 # 1. 市场数据采集
 # ═══════════════════════════════════════════
@@ -408,23 +474,14 @@ def collect_market_data(engine, target_trade_date: str | None = None) -> dict:
     target = core["target_trade_date"]
     data = {"A股数据日期": target}
 
-    # 1.1 美股
+    # 1.1 外围市场
     try:
-        import akshare as ak
-        df = ak.stock_us_spot_em()
-        if df is not None and not df.empty:
-            targets = {".IXIC": "nasdaq", ".INX": "sp500", ".DJI": "dow",
-                       "NVDA": "nvda", "AAPL": "aapl", "MSFT": "msft", "TSLA": "tsla",
-                       "AMD": "amd", "AVGO": "avgo", "GOOGL": "googl", "AMZN": "amzn"}
-            us = {}
-            for _, r in df.iterrows():
-                c = str(r.get("代码", "")).strip()
-                if c in targets:
-                    us[targets[c]] = f"{_fmt_pct(r.get('涨跌幅'))} (${r.get('最新价')})"
-            data["美股"] = us
+        data.update(_collect_external_market_data())
     except Exception as e:
-        log.warning("美股: %s", e)
+        log.warning("外围市场: %s", e)
         data["美股"] = {"数据状态": f"暂不可用：{e}"}
+        data["外围市场"] = {"数据状态": f"暂不可用：{e}"}
+        data["外围数据状态"] = f"FAILED：{e}"
 
     # 1.2 A股指数
     rows = core["index_rows"]
@@ -900,20 +957,32 @@ def _generate_fallback(market_data: dict, news: list[str]) -> str:
     ]
 
     us = market_data.get("美股", {})
-    if us:
+    us_parts = [
+        f"{label} {value}"
+        for label, value in us.items()
+        if label != "数据状态"
+    ]
+    if us_parts:
         lines.append("**📈 美股隔夜**")
-        parts = []
-        for k in ["nasdaq", "sp500", "dow"]:
-            if k in us:
-                parts.append(f"{k.upper()} {us[k]}")
-        if parts: lines.append(" | ".join(parts))
-        techs = []
-        for k in ["nvda", "aapl", "msft", "tsla"]:
-            if k in us:
-                techs.append(f"{k.upper()} {us[k]}")
-        if techs: lines.append("科技: " + " ".join(techs))
-        if not parts and not techs and us.get("数据状态"):
-            lines.append(us["数据状态"])
+        lines.append(" | ".join(us_parts))
+        lines.append("")
+    elif us.get("数据状态"):
+        lines.append("**📈 美股隔夜**")
+        lines.append(str(us["数据状态"]))
+        lines.append("")
+
+    external = market_data.get("外围市场", {})
+    external_parts = [
+        f"{label} {value}"
+        for label, value in external.items()
+        if label != "数据状态"
+    ]
+    if external_parts:
+        lines.append("**🌍 隔夜与外围**")
+        lines.append(" | ".join(external_parts))
+        quality = str(market_data.get("外围数据状态") or "").strip()
+        if quality:
+            lines.append(f"> 数据状态：{quality}")
         lines.append("")
 
     a_idx = market_data.get("A股指数", {})
