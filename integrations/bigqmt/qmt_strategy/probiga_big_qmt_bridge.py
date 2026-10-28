@@ -34,6 +34,8 @@ MAX_TRACKED_CODES = 280
 MAX_QUOTE_POLL_CODES = 2000
 QUOTE_ACQUISITION_PROTOCOL = "probiga.qmt-full-tick-poll.v1"
 NATIVE_STOCK_SECTOR = "\u6caa\u6df1\u4eacA\u80a1"
+NATIVE_HISTORY_LOOKBACK_DAYS = 20
+NATIVE_HISTORY_BATCH_SIZE = 20
 MAX_ANNOUNCEMENT_BATCH_ROWS = 200000
 MAX_ANNOUNCEMENT_BATCH_JSON_BYTES = 64 * 1024 * 1024
 MINUTE_FLOW_NATIVE_FIELDS = (
@@ -117,6 +119,12 @@ _NATIVE_HISTORY_PRIVATE_HARD_CEILING = (35 * 1024 ** 3) // 10
 _NATIVE_HISTORY_HANDLE_CEILING = 20000
 _native_resource_state = {}
 _native_resource_api = None
+_native_history_download_day = ""
+_native_history_download_period_index = 0
+_native_history_download_pending = ()
+_native_history_download_status = "idle"
+_native_history_download_error = ""
+_native_history_download_batches = 0
 
 
 class _NativeHistoryResourceBlocked(RuntimeError):
@@ -841,6 +849,95 @@ def _refresh_full_snapshot(C):
         # rows cannot borrow a previous cycle's value to claim full coverage.
         _full_snapshot_pending = True
         _publish_full_quote_cycle()
+
+
+def _closed_history_date(now=None):
+    local = datetime.datetime.fromtimestamp(now or time.time())
+    day = local.date()
+    if local.time() < datetime.time(15, 10):
+        day -= datetime.timedelta(days=1)
+    while day.weekday() >= 5:
+        day -= datetime.timedelta(days=1)
+    return day
+
+
+def _download_history_batch(native, codes, period, start, end):
+    download_many = native.get("download_history_data2")
+    if callable(download_many):
+        try:
+            download_many(
+                stock_list=codes,
+                period=period,
+                start_time=start,
+                end_time=end,
+            )
+        except TypeError:
+            download_many(codes, period, start, end)
+        return
+    download_one = native.get("download_history_data")
+    if not callable(download_one):
+        raise RuntimeError("native history downloader is unavailable")
+    for code in codes:
+        download_one(code, period, start, end)
+
+
+def _download_native_history(C):
+    """Fill the local QMT cache through its native bulk downloader."""
+
+    global _native_history_download_day
+    global _native_history_download_period_index
+    global _native_history_download_pending
+    global _native_history_download_status
+    global _native_history_download_error
+    global _native_history_download_batches
+    if not _all_codes:
+        return
+    target = _closed_history_date()
+    target_text = target.isoformat()
+    if _native_history_download_day != target_text:
+        _native_history_download_day = target_text
+        _native_history_download_period_index = 0
+        _native_history_download_pending = tuple(_all_codes)
+        _native_history_download_status = "running"
+        _native_history_download_error = ""
+        _native_history_download_batches = 0
+    if _native_history_download_status == "complete":
+        return
+    periods = ("1d", "1m")
+    while _native_history_download_period_index < len(periods):
+        if not _native_history_download_pending:
+            _native_history_download_period_index += 1
+            _native_history_download_pending = tuple(_all_codes)
+            continue
+        break
+    if _native_history_download_period_index >= len(periods):
+        _native_history_download_status = "complete"
+        return
+    period = periods[_native_history_download_period_index]
+    batch = _native_history_download_pending[:NATIVE_HISTORY_BATCH_SIZE]
+    start = (
+        target - datetime.timedelta(days=NATIVE_HISTORY_LOOKBACK_DAYS)
+    ).strftime("%Y%m%d")
+    end = target.strftime("%Y%m%d")
+    try:
+        _download_history_batch(globals(), batch, period, start, end)
+    except Exception as exc:
+        _native_history_download_status = "error"
+        _native_history_download_error = (
+            type(exc).__name__ + ": " + str(exc)
+        )[-1000:]
+        return
+    _native_history_download_pending = _native_history_download_pending[
+        len(batch):
+    ]
+    _native_history_download_batches += 1
+    if not _native_history_download_pending:
+        _native_history_download_period_index += 1
+        if _native_history_download_period_index < len(periods):
+            _native_history_download_pending = tuple(_all_codes)
+        else:
+            _native_history_download_status = "complete"
+    _native_history_download_error = ""
 
 
 class _QuoteCacheContext:
@@ -2017,6 +2114,14 @@ def _write_heartbeat(status):
         "last_request_at": _last_request_at,
         "last_request_action": _last_request_action,
         "native_history_resources": dict(_native_resource_state),
+        "native_history_download_day": _native_history_download_day,
+        "native_history_download_status": _native_history_download_status,
+        "native_history_download_batches": _native_history_download_batches,
+        "native_history_download_remaining": (
+            len(_native_history_download_pending)
+            if _native_history_download_status == "running" else 0
+        ),
+        "native_history_download_error": _native_history_download_error,
         "last_error": _last_error,
         "direct_acquisition_model_sha256": getattr(
             _direct_model, "source_sha256", ""
@@ -2040,6 +2145,7 @@ def bridge_tick(C):
         try:
             _refresh_quote_universe(force=False, C=cached_context)
             _refresh_full_snapshot(C)
+            _download_native_history(cached_context)
             if _stopping:
                 return
             _write_tracked_snapshot(force=False)

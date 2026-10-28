@@ -1,3 +1,4 @@
+import datetime as dt
 from datetime import datetime
 
 import gzip
@@ -193,6 +194,37 @@ def test_strategy_universe_comes_from_qmt_native_sector(
     assert producer._load_native_universe(Context()) is True
     assert len(producer._all_codes) == 1001
     assert producer._tracked_codes == ["000001.SZ", "000002.SZ"]
+
+
+def test_native_history_downloader_fills_daily_then_minute_cache(
+    monkeypatch,
+):
+    calls = []
+    codes = ["000001.SZ", "000002.SZ", "000003.SZ"]
+    monkeypatch.setattr(producer, "_all_codes", codes)
+    monkeypatch.setattr(producer, "_closed_history_date", lambda: dt.date(2026, 10, 27))
+    monkeypatch.setattr(producer, "_native_history_download_day", "")
+    monkeypatch.setattr(producer, "_native_history_download_period_index", 0)
+    monkeypatch.setattr(producer, "_native_history_download_pending", ())
+    monkeypatch.setattr(producer, "_native_history_download_status", "idle")
+    monkeypatch.setattr(producer, "_native_history_download_error", "")
+    monkeypatch.setattr(producer, "_native_history_download_batches", 0)
+    monkeypatch.setattr(
+        producer,
+        "_download_history_batch",
+        lambda _native, batch, period, start, end: calls.append(
+            (list(batch), period, start, end)
+        ),
+    )
+
+    producer._download_native_history(object())
+    assert calls == [(codes, "1d", "20261007", "20261027")]
+    assert producer._native_history_download_period_index == 1
+    assert producer._native_history_download_status == "running"
+
+    producer._download_native_history(object())
+    assert calls[-1] == (codes, "1m", "20261007", "20261027")
+    assert producer._native_history_download_status == "complete"
 
 
 def test_daily_bar_time_is_normalized_to_market_close_for_every_qmt_shape():

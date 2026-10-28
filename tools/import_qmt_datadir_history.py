@@ -55,6 +55,9 @@ from integrations.qmt.datadir_import import (  # noqa: E402
     write_receipt,
 )
 from server.common.minute_data import get_minute_engine  # noqa: E402
+from server.common.authoritative_market_clock import (  # noqa: E402
+    authoritative_closed_trade_date,
+)
 from server.common.qmt_trade_calendar import load_trade_calendar_receipt  # noqa: E402
 from tools.env_config import load_project_env  # noqa: E402
 
@@ -85,8 +88,10 @@ def _batched(items: list, size: int):
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--start", required=True, help="first trading session (inclusive)")
-    parser.add_argument("--end", required=True, help="last trading session (inclusive)")
+    date_group = parser.add_mutually_exclusive_group(required=True)
+    date_group.add_argument("--latest-session", action="store_true")
+    date_group.add_argument("--start", help="first trading session (inclusive)")
+    parser.add_argument("--end", help="last trading session (inclusive)")
     parser.add_argument(
         "--datadir-root",
         action="append",
@@ -111,8 +116,15 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     load_project_env()
-    start = dt.date.fromisoformat(args.start)
-    end = dt.date.fromisoformat(args.end)
+    engine = get_minute_engine()
+    if args.latest_session:
+        latest = authoritative_closed_trade_date(engine)
+        start = end = dt.date.fromisoformat(latest)
+    else:
+        if not args.start or not args.end:
+            parser.error("--start and --end are required together")
+        start = dt.date.fromisoformat(args.start)
+        end = dt.date.fromisoformat(args.end)
     if end < start:
         parser.error("--end must not precede --start")
     datadir_roots = [
@@ -123,7 +135,6 @@ def main(argv: list[str] | None = None) -> int:
     if missing_roots:
         parser.error(f"datadir root does not exist: {', '.join(missing_roots)}")
 
-    engine = get_minute_engine()
     sessions = _sessions(engine, start, end)
     if not sessions:
         parser.error("the QMT calendar has no session in the requested range")
