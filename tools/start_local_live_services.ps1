@@ -964,6 +964,16 @@ if ((Test-LiveQuoteRuntimeEnabled) -and !(Test-BigQmtBridgeEnabled)) {
         -StdOutPath (Join-Path $DataDir "live_quote_runtime.out.log") `
         -StdErrPath (Join-Path $DataDir "live_quote_runtime.err.log")
 }
+elseif (!(Test-LiveQuoteRuntimeEnabled)) {
+    Stop-PublicQuoteService
+}
+
+# A source-profile switch must take effect in the running supervisor, not only
+# on the next process start.  The public scheduler tasks are the sole market
+# quote owners when the QMT embedded bridge is disabled.
+if (!(Test-BigQmtBridgeEnabled)) {
+    Stop-ManagedProcess "big_qmt_bridge"
+}
 
 if (!(Test-LegacyMiniQmtEnabled)) {
     Stop-LegacyQmtServices
