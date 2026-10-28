@@ -36,6 +36,7 @@ from integrations.qmt.datadir_import import (  # noqa: E402
     DEFAULT_CHUNK_ROWS,
     DEFAULT_MIN_COVERAGE,
     DEFAULT_SESSIONS_PER_BATCH,
+    DATASET,
     REASON_THIN_CACHE,
     SOURCE,
     STATUS_COMPLETE,
