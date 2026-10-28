@@ -584,6 +584,20 @@ WINDOWS_QMT_EDGE_TASK_TYPES = frozenset(WINDOWS_QMT_EDGE_TASKS_BY_TYPE)
 LINUX_QMT_TASK_TYPES = frozenset(LINUX_QMT_TASKS_BY_TYPE)
 LINUX_PROVIDER_TASK_TYPES = frozenset(LINUX_PROVIDER_TASKS_BY_TYPE)
 
+# These publishers only need the immutable QMT DAT cache.  They remain
+# Windows-host-owned, but do not depend on the live xtquant or BigQMT IPC
+# control plane after the release activation grant is proven.
+QMT_DATADIR_DIRECT_TASK_TYPES = frozenset(
+    {
+        "qmt_index_kline",
+        "qmt_index_minute",
+        "qmt_stock_daily_canonical",
+        "qmt_stock_minute_canonical",
+        "qmt_stock_minute_flow_canonical",
+        "qmt_canonical_history_gap_repair",
+    }
+)
+
 # Only these three long-running foundation tasks need recent execution proof.
 # The other edge jobs are still exact owned task contracts, but requiring a
 # cron success after every arbitrary release time would deadlock deployment.
@@ -634,6 +648,8 @@ UNFROZEN_PROVIDER_SCRIPT_PATHS = frozenset({
 
 if WINDOWS_QMT_EDGE_TASK_TYPES & LINUX_QMT_TASK_TYPES:
     raise RuntimeError("QMT host ownership contract overlaps")
+if not QMT_DATADIR_DIRECT_TASK_TYPES.issubset(WINDOWS_QMT_EDGE_TASK_TYPES):
+    raise RuntimeError("QMT DAT direct tasks are not Windows edge-owned")
 if WINDOWS_QMT_EDGE_TASK_TYPES & UNFROZEN_PROVIDER_TASK_TYPES:
     raise RuntimeError("frozen QMT task is also provider-unfrozen")
 if not set(WINDOWS_QMT_EDGE_FALLBACK_EGRESS_CONTRACTS_BY_TYPE).issubset(
@@ -688,6 +704,7 @@ __all__ = [
     "LINUX_QMT_TASKS_BY_TYPE",
     "LINUX_QMT_TASK_TYPES",
     "QMT_CATALOG_CAPABILITY_TASK",
+    "QMT_DATADIR_DIRECT_TASK_TYPES",
     "QMT_INTRADAY_REALTIME_TASK",
     "QMT_INDEX_CURRENT_TASK",
     "QMT_INDEX_KLINE_TASK",

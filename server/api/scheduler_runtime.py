@@ -123,6 +123,7 @@ from tools.qmt_host_ownership_contract import (
     LINUX_PROVIDER_TASK_TYPES,
     LINUX_QMT_TASKS_BY_TYPE,
     LINUX_QMT_TASK_TYPES,
+    QMT_DATADIR_DIRECT_TASK_TYPES,
     UNFROZEN_PROVIDER_SCRIPT_PATHS,
     UNFROZEN_PROVIDER_TASK_TYPES,
     WINDOWS_NON_QMT_EGRESS_TASKS_BY_TYPE,
@@ -157,16 +158,6 @@ RELEASE_CATCHUP_BLOCKED_RETRY_INTERVAL_MINUTES = max(
 )
 _QMT_MEMBERSHIP_TASK_TYPE = "qmt_membership_snapshot"
 _QMT_MEMBERSHIP_PROVIDER = "gj_big_qmt_inner"
-QMT_DATADIR_DIRECT_TASK_TYPES = frozenset(
-    {
-        "qmt_index_kline",
-        "qmt_index_minute",
-        "qmt_stock_daily_canonical",
-        "qmt_stock_minute_canonical",
-        "qmt_stock_minute_flow_canonical",
-        "qmt_canonical_history_gap_repair",
-    }
-)
 QMT_DATADIR_DIRECT_DISPATCH_REASON = "qmt_datadir_direct_only"
 RELEASE_CATCHUP_AUTHORITATIVE_DATE_TASK_TYPES = (
     RELEASE_CATCHUP_CLOSED_TARGET_TASK_TYPES
