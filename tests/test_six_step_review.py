@@ -237,6 +237,15 @@ def test_timeline_keeps_tail_events_when_many_early_rows_exist():
         "cause": "涨停后转弱",
         "result": "炸板",
     })
+    timeline.append({
+        "time": "未获取",
+        "event_type": "拖累候选",
+        "subject": "无分钟标的(000099)",
+        "sector": "测试",
+        "evidence": "只有日线数据",
+        "cause": "分钟先后未获取",
+        "result": "未获取",
+    })
 
     report = render_six_step({
         "date": "2026-10-28",
@@ -257,6 +266,8 @@ def test_timeline_keeps_tail_events_when_many_early_rows_exist():
     })
 
     assert "| 14:38 | 分歧转弱 | 双环传动(002472) |" in report
+    assert "| 未获取 | 拖累候选 | 无分钟标的(000099) |" not in report
+    assert "另有 1 个候选事件因分钟数据未获取" in report
 
 
 def test_membership_fallback_uses_one_date_probe_and_one_relation_query(monkeypatch):

@@ -1089,13 +1089,22 @@ def _render_timeline(rows: list[Mapping[str, str]]) -> str:
             "| 未获取 | 未获取 | 未获取 | 未获取 | 分时事件与分钟数据均未获取 | 未获取 | 未获取 |"
         )
         return "\n".join(lines)
-    ordered = sorted(
-        rows,
-        key=lambda item: (
-            _plain(item.get("time")) == "未获取",
-            _plain(item.get("time")),
-        ),
-    )
+    timed_rows = [
+        item for item in rows if _plain(item.get("time")) != "未获取"
+    ]
+    missing_time_count = len(rows) - len(timed_rows)
+    if not timed_rows:
+        lines.append(
+            "| 未获取 | 未获取 | 未获取 | 未获取 | "
+            "候选事件缺少分钟级时间证据 | 未获取 | 未获取 |"
+        )
+        if missing_time_count:
+            lines.append(
+                f"\n- 另有 {missing_time_count} 个候选事件因分钟数据未获取，"
+                "未纳入时间轴。"
+            )
+        return "\n".join(lines)
+    ordered = sorted(timed_rows, key=lambda item: _plain(item.get("time")))
     if len(ordered) <= 28:
         selected = ordered
     else:
@@ -1114,6 +1123,11 @@ def _render_timeline(rows: list[Mapping[str, str]]) -> str:
                 for key in ("time", "event_type", "subject", "sector", "evidence", "cause", "result")
             )
             + " |"
+        )
+    if missing_time_count:
+        lines.append(
+            f"\n- 另有 {missing_time_count} 个候选事件因分钟数据未获取，"
+            "未纳入时间轴。"
         )
     return "\n".join(lines)
 
