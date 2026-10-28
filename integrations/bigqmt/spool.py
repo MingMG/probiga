@@ -31,6 +31,7 @@ def _raise_response_error(action, response):
 
 PROVIDER_ID = "gj_big_qmt_inner"
 BRIDGE_DIR_NAME = "probiga_bridge"
+STRATEGY_CONFIG_NAME = "probiga_big_qmt_config.json"
 STRATEGY_FILE_NAME = "probiga_big_qmt_bridge.py"
 LEGACY_STRATEGY_FILE_NAMES = ("PROBIGA_BIGQMT_BRIDGE.py",)
 CONTROL_ACTIONS = {"ping", "capabilities"}
@@ -160,9 +161,11 @@ def bridge_dir(qmt_home: Path | str | None = None) -> Path:
 
 def bridge_paths(qmt_home: Path | str | None = None) -> dict[str, Path]:
     root = bridge_dir(qmt_home)
+    home = Path(qmt_home) if qmt_home else resolve_big_qmt_home(required=True)
+    assert home is not None
     return {
         "root": root,
-        "watchlist": root / "watchlist.json",
+        "watchlist": home / "python" / STRATEGY_CONFIG_NAME,
         "tracked": root / "tracked_quotes.json",
         "full": root / "full_quotes.json",
         "heartbeat": root / "heartbeat.json",

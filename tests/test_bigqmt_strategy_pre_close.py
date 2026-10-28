@@ -152,6 +152,9 @@ def test_direct_model_reuses_only_the_existing_strategy_lifecycle(tmp_path):
     timers = [item for item in lifecycle if item[0] == "schedule_run"]
     assert len(timers) == 1
     assert timers[0][3]["repeat_times"] == 0
+    assert loaded._config_path == str(
+        tmp_path / "python" / loaded.STRATEGY_CONFIG_NAME
+    )
     old_calls.clear()
     loaded.bridge_tick(context)
     assert lifecycle[-1][0] == "poll"
@@ -170,6 +173,33 @@ def test_direct_model_reuses_only_the_existing_strategy_lifecycle(tmp_path):
     stopped = json.loads((bridge_root / "heartbeat.json").read_text())
     assert direct.last_status == "stopped"
     assert stopped["status"] == "stopped"
+
+
+def test_strategy_config_reads_from_qmt_python_scope(
+    monkeypatch, tmp_path,
+):
+    python_dir = tmp_path / "python"
+    python_dir.mkdir()
+    config_path = python_dir / producer.STRATEGY_CONFIG_NAME
+    config_path.write_text(
+        json.dumps({
+            "schema_version": 1,
+            "all_codes": ["000001.SZ", "600519.SH"],
+            "tracked_codes": ["000001.SZ"],
+            "full_refresh_seconds": 30,
+            "tracked_flush_seconds": 1.0,
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(producer, "_config_path", str(config_path))
+    monkeypatch.setattr(producer, "_config_mtime", None)
+    monkeypatch.setattr(producer, "_config", {})
+    monkeypatch.setattr(producer, "_all_codes", [])
+    monkeypatch.setattr(producer, "_tracked_codes", [])
+
+    assert producer._load_config(force=True) is True
+    assert producer._all_codes == ["000001.SZ", "600519.SH"]
+    assert producer._tracked_codes == ["000001.SZ"]
 
 
 def test_daily_bar_time_is_normalized_to_market_close_for_every_qmt_shape():
@@ -613,4 +643,48 @@ def test_embedded_strategy_identity_loads_without_dunder_file(
     assert capabilities["strategy_build_sha"] == "a" * 40
     assert capabilities["strategy_loaded_identity_sha256"] == (
         rendered["identity_sha256"]
+    )
+
+
+def test_embedded_strategy_identity_ignores_editor_runtime_file_path(
+    monkeypatch, tmp_path,
+):
+    template = Path(producer.__file__).read_bytes()
+    source_hash = hashlib.sha256(template).hexdigest()
+    rendered = render_strategy_artifact(
+        template,
+        build_sha="a" * 40,
+        git_blob="b" * 40,
+        source_sha256=source_hash,
+    )
+    (tmp_path / "userdata").mkdir()
+    python_dir = tmp_path / "python"
+    python_dir.mkdir()
+    (python_dir / producer.STRATEGY_RELEASE_MANIFEST_NAME).write_text(
+        json.dumps({
+            "schema": producer.STRATEGY_RELEASE_MANIFEST_SCHEMA,
+            "strategy_release_protocol": producer.STRATEGY_RELEASE_PROTOCOL,
+            "strategy_identity_protocol": producer.STRATEGY_IDENTITY_PROTOCOL,
+            "strategy_build_sha": "a" * 40,
+            "strategy_git_blob": "b" * 40,
+            "strategy_source_sha256": source_hash,
+            "strategy_artifact_sha256": rendered["artifact_sha256"],
+            "strategy_loaded_identity_sha256": rendered["identity_sha256"],
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    namespace = {
+        "__name__": "_qmt_editor_runtime",
+        "__file__": "<qmt-model>",
+    }
+    exec(compile(rendered["source_bytes"], "<qmt-model>", "exec"), namespace)
+
+    capabilities = namespace["_execute_request"](
+        object(), "capabilities", {}
+    )
+
+    assert capabilities["strategy_identity_status"] == "BOUND"
+    assert capabilities["strategy_artifact_sha256"] == (
+        rendered["artifact_sha256"]
     )

@@ -43,6 +43,15 @@ def _request_payload(request_id: str, action: str) -> dict:
     }
 
 
+def test_strategy_config_lives_in_qmt_python_read_scope(tmp_path):
+    paths = spool.bridge_paths(tmp_path)
+
+    assert paths["watchlist"] == (
+        tmp_path / "python" / spool.STRATEGY_CONFIG_NAME
+    )
+    assert paths["watchlist"].parent == tmp_path / "python"
+
+
 def test_control_requests_preempt_already_queued_bulk_work(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,

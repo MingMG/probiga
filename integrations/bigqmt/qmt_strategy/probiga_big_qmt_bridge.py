@@ -9,7 +9,6 @@ import datetime
 import faulthandler
 import gzip
 import hashlib
-import importlib.util
 import json
 import math
 import os
@@ -34,6 +33,7 @@ DIRECT_ACQUISITION_MODEL_PREFIX = "probiga_direct_acquisition_"
 MAX_TRACKED_CODES = 280
 MAX_QUOTE_POLL_CODES = 2000
 QUOTE_ACQUISITION_PROTOCOL = "probiga.qmt-full-tick-poll.v1"
+STRATEGY_CONFIG_NAME = "probiga_big_qmt_config.json"
 MAX_ANNOUNCEMENT_BATCH_ROWS = 200000
 MAX_ANNOUNCEMENT_BATCH_JSON_BYTES = 64 * 1024 * 1024
 MINUTE_FLOW_NATIVE_FIELDS = (
@@ -313,17 +313,22 @@ def _load_direct_acquisition_model():
     module_name = (
         "probiga_direct_acquisition_" + DIRECT_ACQUISITION_MODEL_SHA256
     )
-    spec = importlib.util.spec_from_file_location(module_name, model_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError("direct acquisition model cannot be loaded")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    with open(model_path, "rb") as handle:
+        source = handle.read()
+    namespace = {
+        "__name__": module_name,
+        "__file__": model_path,
+    }
+    exec(compile(source, model_path, "exec"), namespace)
+    model_class = namespace.get("Model")
+    if not callable(model_class):
+        raise RuntimeError("direct acquisition model has no Model class")
     direct_root = os.path.join(
         os.path.dirname(_bridge_root), "probiga_direct_acquisition", "qmt"
     )
     if not os.path.isdir(direct_root):
         os.makedirs(direct_root)
-    return module.Model(
+    return model_class(
         direct_root,
         source_sha256=DIRECT_ACQUISITION_MODEL_SHA256,
         native_globals=dict((name, _guard_native_history(value, name)
@@ -415,6 +420,7 @@ def _freeze_loaded_strategy_identity():
         ):
             return unavailable
         script_path = globals().get("__file__")
+        script_identity_path = ""
         manifest_candidates = []
         if script_path:
             path = os.path.abspath(script_path)
@@ -467,11 +473,15 @@ def _freeze_loaded_strategy_identity():
             path = os.path.abspath(script_path)
             if (
                 os.path.basename(path).casefold()
-                != "probiga_big_qmt_bridge.py".casefold()
-                or not os.path.isfile(path)
-                or _file_sha256(path) != artifact_sha256
+                == "probiga_big_qmt_bridge.py".casefold()
+                and os.path.isfile(path)
             ):
-                return unavailable
+                script_identity_path = path
+        if (
+            script_identity_path
+            and _file_sha256(script_identity_path) != artifact_sha256
+        ):
+            return unavailable
         return {
             "strategy_identity_protocol": STRATEGY_IDENTITY_PROTOCOL,
             "strategy_identity_frozen": True,
@@ -625,7 +635,7 @@ def _load_config(force=False):
     with open(_config_path, "r", encoding="utf-8") as handle:
         payload = json.load(handle)
     if not isinstance(payload, dict):
-        raise ValueError("watchlist.json must contain an object")
+        raise ValueError("QMT strategy config must contain an object")
     all_codes = _normalize_codes(payload.get("all_codes"))
     tracked_codes = _normalize_codes(payload.get("tracked_codes"), MAX_TRACKED_CODES)
     with _lock:
@@ -2070,7 +2080,11 @@ def init(C):
         _model_started_ts = time.time()
         _heartbeat_seq = 0
         _bridge_root = _find_bridge_root()
-        _config_path = os.path.join(_bridge_root, "watchlist.json")
+        _config_path = os.path.join(
+            os.path.dirname(os.path.dirname(_bridge_root)),
+            "python",
+            STRATEGY_CONFIG_NAME,
+        )
         _requests_root = os.path.join(_bridge_root, "requests")
         _responses_root = os.path.join(_bridge_root, "responses")
         _inflight_root = os.path.join(_bridge_root, "inflight")

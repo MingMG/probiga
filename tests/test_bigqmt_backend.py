@@ -452,9 +452,9 @@ def test_level1_snapshot_rejects_unproven_or_stale_native_samples(monkeypatch, t
 
 
 def test_level1_refresh_touches_watchlist_without_changing_content(tmp_path):
-    root = tmp_path / "userdata" / "probiga_bridge"
+    root = tmp_path / "python"
     root.mkdir(parents=True)
-    watchlist = root / "watchlist.json"
+    watchlist = root / "probiga_big_qmt_config.json"
     content = '{"tracked_codes":["000001.SZ"]}'
     watchlist.write_text(content, encoding="utf-8")
     os_time = 1_700_000_000
