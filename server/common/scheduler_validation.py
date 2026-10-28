@@ -86,10 +86,6 @@ TRADING_V3_DECISION_TASK_TYPES = frozenset({
 TRADING_V3_DECISION_RESULT_SCHEMA = (
     "probiga.trading-v3-decision-result.v1"
 )
-_QMT_STOCK_TASK_DATASETS = {
-    "qmt_stock_daily_canonical": "daily",
-    "qmt_stock_minute_canonical": "minute",
-}
 _QMT_INDEX_TASK_DATASETS = {
     "qmt_index_current": "current",
     "qmt_index_kline": "kline",
@@ -920,50 +916,43 @@ def _sim_identity_set_hash(values: Any) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _qmt_stock_edge_payload(output: str | None) -> Mapping[str, Any] | None:
+def _qmt_datadir_payload(output: str | None) -> Mapping[str, Any] | None:
     return _single_nested_machine_payload(
         output,
-        schema="probiga.qmt-stock-edge-result.v1",
+        schema="probiga.qmt-datadir-import-result.v1",
     )
 
 
-def _qmt_stock_edge_output_status(
+def _qmt_datadir_output_status(
     task_type: str,
     output: str | None,
     *,
     return_code: int | None,
 ) -> str:
-    payload = _qmt_stock_edge_payload(output)
+    payload = _qmt_datadir_payload(output)
     if payload is None or return_code is None:
         return "failed"
-    expected_dataset = _QMT_STOCK_TASK_DATASETS.get(task_type)
-    if (
-        expected_dataset is None
-        or payload.get("dataset") != expected_dataset
-        or payload.get("task_type") != task_type
-    ):
-        return "failed"
-    try:
-        from tools.sync_qmt_stock_edge import validate_task_result
-
-        disposition = validate_task_result(payload, int(return_code))
-    except (ImportError, TypeError, ValueError, OverflowError):
-        return "failed"
-    if disposition == "blocked":
-        return "blocked"
     expected_build = str(
         os.environ.get("PROBIGA_SCHEDULER_BUILD_SHA")
         or os.environ.get("PROBIGA_BUILD_COMMIT_SHA")
         or ""
     ).strip().lower()
-    if (
-        disposition != "complete"
-        or not _is_hex(expected_build, 40)
-        or expected_build == "0" * 40
-        or payload.get("build_sha") != expected_build
-    ):
+    try:
+        from server.common.qmt_datadir_result import validate_task_result
+
+        disposition = validate_task_result(
+            task_type,
+            payload,
+            return_code=int(return_code),
+            expected_build_sha=expected_build,
+        )
+    except (ImportError, TypeError, ValueError, OverflowError):
         return "failed"
-    return "success"
+    if disposition == "complete":
+        return "success"
+    if disposition == "blocked":
+        return "blocked"
+    return "failed"
 
 
 def _qmt_index_edge_payload(output: str | None) -> Mapping[str, Any] | None:
@@ -2898,7 +2887,7 @@ def scheduler_output_status(
         "qmt_stock_daily_canonical",
         "qmt_stock_minute_canonical",
     }:
-        return _qmt_stock_edge_output_status(
+        return _qmt_datadir_output_status(
             task_type,
             output,
             return_code=return_code,
@@ -3268,8 +3257,14 @@ def scheduler_output_status(
         ):
             return "failed"
         return "success" if disposition == "complete" else "blocked"
-    if task_type in {"qmt_index_current", "qmt_index_kline", "qmt_index_minute"}:
+    if task_type == "qmt_index_current":
         return _qmt_index_edge_output_status(
+            task_type,
+            output,
+            return_code=return_code,
+        )
+    if task_type in {"qmt_index_kline", "qmt_index_minute"}:
+        return _qmt_datadir_output_status(
             task_type,
             output,
             return_code=return_code,
@@ -5121,17 +5116,14 @@ def validate_scheduler_task_result(
             "qmt_stock_daily_canonical",
             "qmt_stock_minute_canonical",
         }:
-            payload = _qmt_stock_edge_payload(output)
+            payload = _qmt_datadir_payload(output)
             if payload is None:
                 return SchedulerValidationResult(
                     checked=True,
                     ok=False,
                     message=f"{task_type}: exact machine receipt is missing",
                 )
-            if (
-                payload.get("dataset") != _QMT_STOCK_TASK_DATASETS[task_type]
-                or payload.get("task_type") != task_type
-            ):
+            if payload.get("task_type") != task_type:
                 return SchedulerValidationResult(
                     checked=True,
                     ok=False,
@@ -5148,12 +5140,14 @@ def validate_scheduler_task_result(
                     message=f"{task_type}: receipt session differs from release target",
                 )
             try:
-                from tools.sync_qmt_stock_edge import validate_persisted_result
+                from server.common.qmt_datadir_result import (
+                    validate_persisted_result,
+                )
 
                 proof = validate_persisted_result(
                     engine,
-                    payload,
-                    now=now,
+                    task_type=task_type,
+                    payload=payload,
                     expected_session=(
                         release_target_date.isoformat()
                         if release_target_date is not None
@@ -5170,7 +5164,7 @@ def validate_scheduler_task_result(
                 f"{task_type} exact persisted coverage verified: "
                 f"sessions={len(proof['sessions'])} rows={proof['row_count']}"
             )
-        if task_type in _QMT_INDEX_TASK_DATASETS:
+        if task_type == "qmt_index_current":
             payload = _qmt_index_edge_payload(output)
             if payload is None:
                 return SchedulerValidationResult(
@@ -5220,6 +5214,48 @@ def validate_scheduler_task_result(
                     engine,
                     payload,
                     now=now,
+                    expected_session=(
+                        release_target_date.isoformat()
+                        if release_target_date is not None
+                        else ""
+                    ),
+                )
+            except Exception as exc:
+                return SchedulerValidationResult(
+                    checked=True,
+                    ok=False,
+                    message=f"{task_type}: persisted exact coverage invalid: {exc}",
+                )
+            messages.append(
+                f"{task_type} exact persisted coverage verified: "
+                f"sessions={len(proof['sessions'])} rows={proof['row_count']}"
+            )
+        if task_type in {"qmt_index_kline", "qmt_index_minute"}:
+            payload = _qmt_datadir_payload(output)
+            if payload is None:
+                return SchedulerValidationResult(
+                    checked=True,
+                    ok=False,
+                    message=f"{task_type}: exact machine receipt is missing",
+                )
+            if (
+                release_target_date is not None
+                and payload.get("sessions") != [release_target_date.isoformat()]
+            ):
+                return SchedulerValidationResult(
+                    checked=True,
+                    ok=False,
+                    message=f"{task_type}: receipt session differs from release target",
+                )
+            try:
+                from server.common.qmt_datadir_result import (
+                    validate_persisted_result as validate_datadir_result,
+                )
+
+                proof = validate_datadir_result(
+                    engine,
+                    task_type=task_type,
+                    payload=payload,
                     expected_session=(
                         release_target_date.isoformat()
                         if release_target_date is not None

@@ -88,10 +88,10 @@ QMT_INDEX_CURRENT_TASK = {
 }
 
 QMT_INDEX_KLINE_TASK = {
-    "task_name": "Guojin QMT index daily exact publisher",
+    "task_name": "国金QMT本地缓存指数日线发布",
     "task_type": "qmt_index_kline",
     "group_name": "Guojin QMT",
-    "script_path": "tools/sync_qmt_index_edge.py",
+    "script_path": "tools/import_qmt_datadir_index.py",
     "script_args": "--dataset kline --latest-session --apply --json",
     "cron_time": "15:25",
     "interval_minutes": 0,
@@ -99,16 +99,16 @@ QMT_INDEX_KLINE_TASK = {
     "sort_order": 87,
     "date_param": "",
     "description": (
-        "Build-bound BigQMT index daily bars with exact code-by-session "
-        "coverage and an immutable calendar-rooted result manifest."
+        "读取QMT本地86400指数缓存，按交易日整分区替换，"
+        "覆盖率、全量行哈希与数据库回读通过后发布。"
     ),
 }
 
 QMT_INDEX_MINUTE_TASK = {
-    "task_name": "Guojin QMT index minute exact publisher",
+    "task_name": "国金QMT本地缓存指数分钟线发布",
     "task_type": "qmt_index_minute",
     "group_name": "Guojin QMT",
-    "script_path": "tools/sync_qmt_index_edge.py",
+    "script_path": "tools/import_qmt_datadir_index.py",
     "script_args": "--dataset minute --latest-session --apply --json",
     "cron_time": "15:35",
     "interval_minutes": 0,
@@ -116,44 +116,42 @@ QMT_INDEX_MINUTE_TASK = {
     "sort_order": 88,
     "date_param": "",
     "description": (
-        "Build-bound BigQMT index minutes.  Every eligible index must have "
-        "the exact native 241-minute grid before the whole date slice is replaced."
+        "读取QMT本地60周期指数缓存，按指数品种校验原生分钟网格，"
+        "完整后整日替换并回读行哈希。"
     ),
 }
 
 QMT_STOCK_DAILY_CANONICAL_TASK = {
-    "task_name": "Guojin QMT canonical stock daily exact publisher",
+    "task_name": "国金QMT本地缓存股票日线发布",
     "task_type": "qmt_stock_daily_canonical",
     "group_name": "Guojin QMT",
-    "script_path": "tools/sync_qmt_stock_edge.py",
-    "script_args": "--dataset daily --latest-session --apply --json",
+    "script_path": "tools/import_qmt_datadir_daily.py",
+    "script_args": "--latest-session --replace-existing --apply --json",
     "cron_time": "15:45",
     "interval_minutes": 0,
     "enabled": 1,
     "sort_order": 90,
     "date_param": "",
     "description": (
-        "Build-bound BigQMT full-stock daily publisher; requires one exact "
-        "catalog/session set, native response identities, a completed immutable "
-        "attestation, and an exact canonical database readback."
+        "读取QMT本地86400日线缓存，按股票目录与交易日原子替换，"
+        "覆盖率、全量行哈希和数据库回读全部通过后才发布。"
     ),
 }
 
 QMT_STOCK_MINUTE_CANONICAL_TASK = {
-    "task_name": "Guojin QMT canonical stock minute exact publisher",
+    "task_name": "国金QMT本地缓存股票分钟线发布",
     "task_type": "qmt_stock_minute_canonical",
     "group_name": "Guojin QMT",
-    "script_path": "tools/sync_qmt_stock_edge.py",
-    "script_args": "--dataset minute --latest-session --apply --json",
+    "script_path": "tools/import_qmt_datadir_history.py",
+    "script_args": "--latest-session --replace-existing --apply --json",
     "cron_time": "15:55",
     "interval_minutes": 0,
     "enabled": 1,
     "sort_order": 91,
     "date_param": "",
     "description": (
-        "Build-bound BigQMT full-stock minute publisher; atomically replaces "
-        "the full date scope only after every traded code has the exact native "
-        "241-bar grid and every no-trade code has persisted authority."
+        "读取QMT本地60分钟缓存，要求每只有效证券完整241格后按交易日原子替换，"
+        "并以回执、全量行哈希和数据库回读证明完整性。"
     ),
 }
 
@@ -165,13 +163,12 @@ QMT_STOCK_MINUTE_FLOW_CANONICAL_TASK = {
     "script_args": "--latest-session --apply --json",
     "cron_time": "16:10",
     "interval_minutes": 0,
-    "enabled": 1,
+    "enabled": 0,
     "sort_order": 92,
     "date_param": "",
     "description": (
-        "Build-bound BigQMT transactioncount1m full-stock minute-flow publisher; "
-        "requires the exact traded-stock catalog, native 241-minute grid, "
-        "non-zero VIP flow evidence, atomic date replacement and database readback."
+        "当前账户的原生 transactioncount1m 覆盖无法形成完整非零分区，"
+        "任务保持停用；分钟资金流继续由独立公开源任务提供。"
     ),
 }
 
@@ -204,12 +201,12 @@ FREE_STOCK_DAILY_TASK = {
     "script_args": "--date latest --json",
     "cron_time": "16:30",
     "interval_minutes": 0,
-    "enabled": 1,
+    "enabled": 0,
     "sort_order": 89,
     "date_param": "",
     "description": (
-        "腾讯批量行情为主、可选Baostock深度核验的完整日线公开源；"
-        "按股票目录和整日分区发布并提交独立读回回执，不调用QMT。"
+        "QMT本地日线缓存已接管股票日线；保留任务定义但默认停用，"
+        "避免公开源覆盖同交易日标准分区。"
     ),
 }
 
@@ -221,13 +218,12 @@ PUBLIC_STOCK_MINUTE_TASK = {
     "script_args": "--type stock --min-coverage 0.99",
     "cron_time": "17:30",
     "interval_minutes": 0,
-    "enabled": 1,
+    "enabled": 0,
     "sort_order": 91,
     "date_param": "",
     "description": (
-        "盘后从新浪公开分钟源获取目标日成交分钟，仅在日线成交量与成交额"
-        "守恒时补齐零成交分钟；源端受限时逐股改用腾讯累计分钟快照，"
-        "原子替换完整代码分区，不调用QMT。"
+        "QMT本地分钟缓存已接管股票分钟线；保留任务定义但默认停用，"
+        "避免公开源覆盖同交易日标准分区。"
     ),
 }
 
@@ -259,12 +255,12 @@ FREE_INDEX_DAILY_TASK = {
     "script_args": "--date latest --json",
     "cron_time": "17:10",
     "interval_minutes": 0,
-    "enabled": 1,
+    "enabled": 0,
     "sort_order": 90,
     "date_param": "",
     "description": (
-        "沿最近已验证价格指数清单，从腾讯与东财交叉获取目标日完整日线；"
-        "原子写入并回读，不调用QMT。"
+        "QMT本地指数缓存已接管标准指数日线；保留任务定义但默认停用，"
+        "避免公开源覆盖同交易日标准分区。"
     ),
 }
 

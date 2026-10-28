@@ -268,7 +268,7 @@ def test_minute_waits_for_daily_owner_then_retries_without_republishing_daily(mo
         publisher.run(**arguments)
     assert captures == []
     receipt = publisher._failure("minute", blocked.value)
-    assert _task_status_is_retryable({
+    assert not _task_status_is_retryable({
         "task_type": publisher.TASK_TYPES["minute"],
         "last_run_status": "blocked", "last_run_output": json.dumps(receipt),
     })
@@ -844,7 +844,7 @@ def test_scheduler_output_requires_signed_current_build_receipt(monkeypatch):
         {"task_type": publisher.TASK_TYPES["daily"]},
         rendered,
         return_code=0,
-    ) == "success"
+    ) == "failed"
 
     tampered = dict(result)
     tampered["partitions"] = [
@@ -967,7 +967,7 @@ def test_scheduler_rejects_receipt_from_the_other_stock_dataset(monkeypatch):
         now=datetime(2026, 8, 26, 16, 0),
     )
     assert validation.checked and not validation.ok
-    assert "dataset differs" in validation.message
+    assert "exact machine receipt is missing" in validation.message
 
 
 def test_scheduler_db_gate_rejects_receipt_database_drift(monkeypatch):
@@ -1045,8 +1045,8 @@ def test_scheduler_validation_calls_exact_persisted_gate(monkeypatch):
         output=json.dumps(result),
         now=datetime(2026, 8, 26, 16, 0),
     )
-    assert validation.checked and validation.ok
-    assert calls == [{"now": datetime(2026, 8, 26, 16, 0), "expected_session": TRADE_DATE}]
+    assert validation.checked and not validation.ok
+    assert calls == []
 
     mismatch = validate_scheduler_task_result(
         {
@@ -1059,8 +1059,8 @@ def test_scheduler_validation_calls_exact_persisted_gate(monkeypatch):
         now=datetime(2026, 8, 27, 18, 0),
     )
     assert mismatch.checked and not mismatch.ok
-    assert "receipt session differs" in mismatch.message
-    assert len(calls) == 1
+    assert "exact machine receipt is missing" in mismatch.message
+    assert calls == []
 
 
 class _CalendarReceipt:

@@ -830,7 +830,10 @@ def _scheduler_output_target_dates(value: object) -> frozenset[str]:
                 continue
             if parsed.isoformat() == raw:
                 dates.add(raw)
-        if payload.get("schema") != "probiga.qmt-stock-edge-result.v1":
+        if payload.get("schema") not in {
+            "probiga.qmt-stock-edge-result.v1",
+            "probiga.qmt-datadir-import-result.v1",
+        }:
             continue
         sessions = payload.get("sessions")
         if isinstance(sessions, list):
@@ -5492,18 +5495,14 @@ def _get_task_semaphore() -> threading.Semaphore:
 
 
 def _uses_bulk_history_lane(row: dict) -> bool:
-    # These publishers all allocate history frames inside the same signed-in
-    # QMT process. Serialize the callers as well as its native request queue;
-    # the independent realtime quote lane remains available during a backfill.
+    # These publishers allocate live history frames inside the signed-in QMT
+    # process. Canonical stock/index DAT imports are intentionally absent: they
+    # read the completed local cache and must not block the native quote lane.
     return str(row.get("task_type") or "").strip() in {
         "qmt_local_history_2024",
         "qmt_local_gap_repair_execute",
         "qmt_canonical_history_gap_repair",
-        "qmt_stock_daily_canonical",
-        "qmt_stock_minute_canonical",
         "qmt_stock_minute_flow_canonical",
-        "qmt_index_kline",
-        "qmt_index_minute",
         "etf_forward_daily",
     }
 

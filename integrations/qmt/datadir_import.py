@@ -284,19 +284,33 @@ def plan(
 
 
 def completed_sessions(engine: Engine) -> set[dt.date]:
-    """Return sessions whose receipt says the import finished."""
+    """Return sessions whose complete receipt proves the current grid contract."""
     try:
         with engine.connect() as conn:
             rows = conn.execute(
                 text(
-                    f"SELECT trade_date FROM `{RECEIPT_TABLE}` "
+                    f"SELECT trade_date, detail_json FROM `{RECEIPT_TABLE}` "
                     "WHERE dataset=:d AND status=:s"
                 ),
                 {"d": DATASET, "s": STATUS_COMPLETE},
             ).fetchall()
     except Exception:  # table is created on first apply
         return set()
-    return {row[0] for row in rows}
+    complete: set[dt.date] = set()
+    for trade_date, raw_detail in rows:
+        try:
+            detail = json.loads(raw_detail) if raw_detail else {}
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(detail, dict)
+            and detail.get("minute_grid_count") == len(CORE_GRID)
+            and detail.get("bad_grid_codes") == 0
+            and isinstance(detail.get("row_hash"), str)
+            and len(detail["row_hash"]) == 64
+        ):
+            complete.add(trade_date)
+    return complete
 
 
 def _insert_stage(conn: Connection, chunk: list[tuple]) -> None:
@@ -329,7 +343,12 @@ def harvest(
     exact decoded bytes that produced the session.
     """
     stats: dict[dt.date, dict] = {
-        session: {"rows": 0, "codes": [], "digest": hashlib.sha256()}
+        session: {
+            "rows": 0,
+            "codes": [],
+            "code_rows": {},
+            "digest": hashlib.sha256(),
+        }
         for session in sessions
     }
     chunk: list[tuple] = []
@@ -354,12 +373,14 @@ def harvest(
             entry["digest"].update(selected_digest)
         for session, count in per_session.items():
             stats[session]["rows"] += count
+            stats[session]["code_rows"][member.code] = count
         if len(chunk) >= chunk_rows:
             _insert_stage(conn, chunk)
             chunk = []
     _insert_stage(conn, chunk)
     for entry in stats.values():
         entry["codes"] = sorted(entry["codes"])
+        entry["code_rows"] = dict(sorted(entry["code_rows"].items()))
         entry["digest"] = entry["digest"].hexdigest()
     stats["_missing_files"] = missing
     return stats

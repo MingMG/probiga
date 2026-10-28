@@ -7,10 +7,12 @@ import datetime as dt
 import hashlib
 import json
 import math
+import os
 import sys
 import uuid
 from pathlib import Path
 
+import pandas as pd
 from sqlalchemy import text
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,6 +30,11 @@ from integrations.qmt.datadir_import import (  # noqa: E402
     load_universe,
     new_run_id,
 )
+from integrations.qmt.local_history import (  # noqa: E402
+    BIGQMT_PROVIDER_ID,
+    get_local_history_engine,
+    persist_daily_kline_capture,
+)
 from server.common.authoritative_market_clock import (  # noqa: E402
     authoritative_closed_trade_date,
 )
@@ -35,13 +42,50 @@ from server.common.batch_db import create_batch_engine  # noqa: E402
 from server.common.qmt_trade_calendar import (  # noqa: E402
     load_trade_calendar_receipt,
 )
+from server.common.qmt_datadir_result import (  # noqa: E402
+    build_result,
+    load_receipt,
+    partition_from_receipt,
+    persisted_fingerprint,
+)
 from tools.env_config import load_project_env  # noqa: E402
+from tools.attest_qmt_daily_kline import attest_range  # noqa: E402
 
 DATASET = "stock_daily"
 SOURCE = "qmt_datadir"
 TARGET_TABLE = "sm_stock_kline"
 RECEIPT_TABLE = "qmt_datadir_import_partition"
 MIN_COVERAGE = 0.95
+
+
+def _build_sha() -> str:
+    return str(
+        os.environ.get("PROBIGA_SCHEDULER_BUILD_SHA")
+        or os.environ.get("PROBIGA_BUILD_COMMIT_SHA")
+        or ""
+    ).strip().lower()
+
+
+def _task_result(
+    engine,
+    *,
+    sessions: list[dt.date],
+) -> dict:
+    partitions = []
+    for session in sessions:
+        receipt = load_receipt(
+            engine,
+            dataset=DATASET,
+            trade_date=session.isoformat(),
+        )
+        if receipt is not None:
+            partitions.append(partition_from_receipt(receipt))
+    return build_result(
+        dataset=DATASET,
+        sessions=[session.isoformat() for session in sessions],
+        partitions=partitions,
+        build_sha=_build_sha(),
+    )
 
 
 def _sessions(engine, start: dt.date, end: dt.date) -> list[dt.date]:
@@ -116,6 +160,7 @@ def _publish(
     run_id: str,
     source_root: Path,
     content_sha256: str,
+    eligible_code_count: int,
 ) -> dict:
     now = dt.datetime.now(CST).replace(tzinfo=None, microsecond=0)
     batch_id = f"qmt_dat_daily_{session:%Y%m%d}_{run_id}"
@@ -197,6 +242,11 @@ def _publish(
     with engine.begin() as connection:
         for offset in range(0, len(payload), 1000):
             connection.execute(statement, payload[offset:offset + 1000])
+        fingerprint = persisted_fingerprint(
+            connection,
+            dataset=DATASET,
+            trade_date=session.isoformat(),
+        )
         connection.execute(
             text(
                 f"DELETE FROM `{TARGET_TABLE}` "
@@ -231,24 +281,141 @@ def _publish(
                 "rows": len(rows),
                 "sha": content_sha256,
                 "run_id": run_id,
-                "detail": "{}",
+                "detail": json.dumps(
+                    {
+                        "readback_rows": fingerprint["row_count"],
+                        "readback_codes": fingerprint["code_count"],
+                        "row_hash": fingerprint["row_hash"],
+                        "eligible_code_count": int(eligible_code_count),
+                        "coverage": (
+                            len(covered_codes) / int(eligible_code_count)
+                            if int(eligible_code_count) else 0.0
+                        ),
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
             },
         )
-    with engine.connect() as connection:
-        durable = connection.execute(
-            text(
-                f"SELECT COUNT(*), COUNT(DISTINCT stock_code) "
-                f"FROM `{TARGET_TABLE}` WHERE trade_date=:d "
-                "AND k_type=1 AND adjust_type=0 AND data_source=:source"
-            ),
-            {"d": session, "source": SOURCE},
-        ).one()
     return {
         "row_count": len(rows),
         "code_count": len(covered_codes),
-        "readback_rows": int(durable[0]),
-        "readback_codes": int(durable[1]),
+        "readback_rows": int(fingerprint["row_count"]),
+        "readback_codes": int(fingerprint["code_count"]),
     }
+
+
+def _persist_source_and_attest(
+    engine,
+    *,
+    session: dt.date,
+    rows: list[tuple],
+    short_names: dict[str, str],
+    batch_id: str,
+) -> dict:
+    source_rows = []
+    for (
+        code,
+        _native_time,
+        _trade_date,
+        open_price,
+        close_price,
+        high,
+        low,
+        volume,
+        amount,
+        pre_close,
+        change,
+        change_pct,
+    ) in rows:
+        market = (
+            "SH" if code.startswith("6")
+            else "BJ" if code.startswith(("4", "8", "9"))
+            else "SZ"
+        )
+        source_time = dt.datetime.combine(session, dt.time(15, 0))
+        source_rows.append({
+            "stock_code": code,
+            "short_name": short_names.get(code, ""),
+            "qmt_code": f"{code}.{market}",
+            "trade_time": source_time,
+            "trade_date": session,
+            "open": open_price,
+            "close": close_price,
+            "high": high,
+            "low": low,
+            "volume": volume,
+            "amount": amount,
+            "change": change,
+            "change_pct": change_pct,
+            "pre_close": pre_close,
+            "pre_close_origin": "NATIVE_QMT",
+            "data_source": BIGQMT_PROVIDER_ID,
+            "source_time": source_time,
+            "received_at": dt.datetime.now(CST).replace(tzinfo=None),
+        })
+    local_engine = get_local_history_engine()
+    try:
+        persist_daily_kline_capture(
+            pd.DataFrame(source_rows),
+            source_engine=engine,
+            local_engine=local_engine,
+            batch_id=batch_id,
+            provider=BIGQMT_PROVIDER_ID,
+        )
+        proof = attest_range(
+            engine,
+            start_date=session.isoformat(),
+            end_date=session.isoformat(),
+            apply=True,
+            provider=BIGQMT_PROVIDER_ID,
+            local_history_engine=local_engine,
+            native_qmt_no_trade=True,
+        )
+    finally:
+        local_engine.dispose()
+    if (
+        proof.get("status") != "COMPLETED"
+        or int(proof.get("matched_rows") or 0)
+        != int(proof.get("target_rows") or -1)
+        or int(proof.get("missing_qmt_rows") or 0) != 0
+        or int(proof.get("mismatched_rows") or 0) != 0
+    ):
+        raise RuntimeError("QMT DAT daily attestation did not complete")
+    return proof
+
+
+def _attach_attestation(
+    engine,
+    *,
+    session: dt.date,
+    attestation_run_id: str,
+) -> None:
+    with engine.begin() as connection:
+        raw = connection.execute(
+            text(
+                f"SELECT detail_json FROM `{RECEIPT_TABLE}` "
+                "WHERE dataset=:dataset AND trade_date=:trade_date"
+            ),
+            {"dataset": DATASET, "trade_date": session},
+        ).scalar_one()
+        detail = json.loads(raw) if raw else {}
+        detail["attestation_run_id"] = attestation_run_id
+        connection.execute(
+            text(
+                f"UPDATE `{RECEIPT_TABLE}` SET detail_json=:detail "
+                "WHERE dataset=:dataset AND trade_date=:trade_date"
+            ),
+            {
+                "dataset": DATASET,
+                "trade_date": session,
+                "detail": json.dumps(
+                    detail,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            },
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -315,15 +482,30 @@ def main(argv: list[str] | None = None) -> int:
                 "codes": len(harvested["codes"]),
             })
             continue
+        run_id = new_run_id()
+        batch_id = f"qmt_dat_daily_{session:%Y%m%d}_{run_id}"
         published = _publish(
             engine,
             session=session,
             rows=harvested["rows"],
             covered_codes=harvested["codes"],
             short_names=short_names,
-            run_id=new_run_id(),
+            run_id=run_id,
             source_root=root,
             content_sha256=harvested["digest"],
+            eligible_code_count=eligible,
+        )
+        attestation = _persist_source_and_attest(
+            engine,
+            session=session,
+            rows=harvested["rows"],
+            short_names=short_names,
+            batch_id=batch_id,
+        )
+        _attach_attestation(
+            engine,
+            session=session,
+            attestation_run_id=str(attestation["run_id"]),
         )
         results.append({
             "session": session.isoformat(),
@@ -338,7 +520,11 @@ def main(argv: list[str] | None = None) -> int:
         "failures": failures,
         "results": results,
     }
-    print(json.dumps(payload, ensure_ascii=False, default=str))
+    if not args.apply:
+        print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+        return 0 if not failures else 1
+    task_result = _task_result(engine, sessions=sessions)
+    print(json.dumps(task_result, ensure_ascii=False, separators=(",", ":")))
     return 0 if not failures else 1
 
 

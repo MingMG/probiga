@@ -217,12 +217,22 @@ def test_native_history_downloader_fills_daily_then_minute_cache(
         ),
     )
 
-    producer._download_native_history(object())
-    assert calls == [(codes, "1d", "20261007", "20261027")]
+    class Context:
+        @staticmethod
+        def get_stock_list_in_sector(name, *_args):
+            return ["000300.SH", "399001.SZ"] if name == "\u6caa\u6df1\u6307\u6570" else []
+
+    indexes = ["000300.SH", "399001.SZ"]
+    producer._download_native_history(Context())
+    assert calls == [(indexes, "1d", "20261007", "20261027")]
     assert producer._native_history_download_period_index == 1
     assert producer._native_history_download_status == "running"
 
-    producer._download_native_history(object())
+    producer._download_native_history(Context())
+    assert calls[-1] == (indexes, "1m", "20261007", "20261027")
+    producer._download_native_history(Context())
+    assert calls[-1] == (codes, "1d", "20261007", "20261027")
+    producer._download_native_history(Context())
     assert calls[-1] == (codes, "1m", "20261007", "20261027")
     assert producer._native_history_download_status == "complete"
 

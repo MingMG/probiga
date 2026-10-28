@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -55,10 +56,17 @@ from integrations.qmt.datadir_import import (  # noqa: E402
     write_receipt,
 )
 from server.common.minute_data import get_minute_engine  # noqa: E402
+from server.common.qmt_index_minute_grid import CORE_GRID  # noqa: E402
 from server.common.authoritative_market_clock import (  # noqa: E402
     authoritative_closed_trade_date,
 )
 from server.common.qmt_trade_calendar import load_trade_calendar_receipt  # noqa: E402
+from server.common.qmt_datadir_result import (  # noqa: E402
+    build_result,
+    load_receipt,
+    partition_from_receipt,
+    persisted_fingerprint,
+)
 from tools.env_config import load_project_env  # noqa: E402
 
 DEFAULT_DATADIRS = (
@@ -83,6 +91,45 @@ def _sessions(engine, start: dt.date, end: dt.date) -> list[dt.date]:
 def _batched(items: list, size: int):
     for index in range(0, len(items), size):
         yield items[index:index + size]
+
+
+def _build_sha() -> str:
+    return str(
+        os.environ.get("PROBIGA_SCHEDULER_BUILD_SHA")
+        or os.environ.get("PROBIGA_BUILD_COMMIT_SHA")
+        or ""
+    ).strip().lower()
+
+
+def _minute_grid_shortfall(entry: dict) -> int:
+    expected = len(CORE_GRID)
+    return sum(
+        1
+        for count in entry["code_rows"].values()
+        if int(count) != expected
+    )
+
+
+def _task_result(
+    engine,
+    *,
+    sessions: list[dt.date],
+) -> dict:
+    partitions = []
+    for session in sessions:
+        receipt = load_receipt(
+            engine,
+            dataset=DATASET,
+            trade_date=session.isoformat(),
+        )
+        if receipt is not None:
+            partitions.append(partition_from_receipt(receipt))
+    return build_result(
+        dataset=DATASET,
+        sessions=[session.isoformat() for session in sessions],
+        partitions=partitions,
+        build_sha=_build_sha(),
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -173,7 +220,11 @@ def main(argv: list[str] | None = None) -> int:
     if not todo:
         print("nothing to import")
         if args.json:
-            print(json.dumps(report, ensure_ascii=False, indent=1))
+            print(json.dumps(
+                _task_result(engine, sessions=sessions),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ))
         return 0
 
     require_schema(engine)
@@ -216,6 +267,19 @@ def main(argv: list[str] | None = None) -> int:
                                            "imported_codes": 0, "eligible_codes":
                                            universe.eligible_codes(session)}
                     continue
+                bad_grid_codes = _minute_grid_shortfall(entry)
+                if bad_grid_codes:
+                    shortfalls[session] = {
+                        "run_id": run_id,
+                        "root": str(root),
+                        "reason": "incomplete_minute_grid",
+                        "rows": entry["rows"],
+                        "imported_codes": len(entry["codes"]),
+                        "eligible_codes": universe.eligible_codes(session),
+                        "digest": entry["digest"],
+                        "bad_grid_codes": bad_grid_codes,
+                    }
+                    continue
                 shortfall = coverage_shortfall(universe, session, len(entry["codes"]),
                                                args.min_coverage)
                 if shortfall is not None:
@@ -232,6 +296,7 @@ def main(argv: list[str] | None = None) -> int:
                 outcome = _publish_one(
                     engine, session=session, entry=entry, run_id=run_id, root=root,
                     replace=item.action == "REPLACE", replace_sources=replace_sources,
+                    eligible_codes=universe.eligible_codes(session),
                 )
                 published[session] = outcome
                 results.append(outcome)
@@ -256,7 +321,8 @@ def main(argv: list[str] | None = None) -> int:
                 content_sha256=failure.get("digest", ""), finished=True,
                 detail={"reason": failure.get("reason", "not_attempted"),
                         "eligible_codes": failure.get("eligible_codes", 0),
-                        "imported_codes": failure.get("imported_codes", 0)},
+                        "imported_codes": failure.get("imported_codes", 0),
+                        "bad_grid_codes": failure.get("bad_grid_codes", 0)},
             )
         print(f"{session} FAILED {failure.get('reason', 'not_attempted')} "
               f"imported_codes={failure.get('imported_codes', 0)} "
@@ -270,11 +336,25 @@ def main(argv: list[str] | None = None) -> int:
     report["results"] = results
     report["failures"] = failures
     if args.json:
-        print(json.dumps(report, ensure_ascii=False, indent=1))
+        print(json.dumps(
+            _task_result(engine, sessions=sessions),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ))
     return 1 if failures else 0
 
 
-def _publish_one(engine, *, session, entry, run_id, root, replace, replace_sources):
+def _publish_one(
+    engine,
+    *,
+    session,
+    entry,
+    run_id,
+    root,
+    replace,
+    replace_sources,
+    eligible_codes,
+):
     """Stage-to-canonical publication of one session, proven by readback."""
     with engine.begin() as conn:
         write_receipt(
@@ -293,13 +373,34 @@ def _publish_one(engine, *, session, entry, run_id, root, replace, replace_sourc
             )
         with engine.begin() as conn:
             rows, codes = readback_session(conn, session)
-            ok = rows == entry["rows"] and codes == len(entry["codes"])
+            fingerprint = persisted_fingerprint(
+                conn,
+                dataset=DATASET,
+                trade_date=session.isoformat(),
+            )
+            ok = (
+                rows == entry["rows"]
+                and codes == len(entry["codes"])
+                and fingerprint["row_count"] == rows
+                and fingerprint["code_count"] == codes
+            )
             write_receipt(
                 conn, session=session, root=str(root),
                 status=STATUS_COMPLETE if ok else STATUS_FAILED, run_id=run_id,
                 row_count=entry["rows"], code_count=len(entry["codes"]),
                 content_sha256=entry["digest"], finished=True,
-                detail={"readback_rows": rows, "readback_codes": codes},
+                detail={
+                    "readback_rows": rows,
+                    "readback_codes": codes,
+                    "row_hash": fingerprint["row_hash"],
+                    "eligible_code_count": int(eligible_codes),
+                    "coverage": (
+                        len(entry["codes"]) / int(eligible_codes)
+                        if int(eligible_codes) else 0.0
+                    ),
+                    "minute_grid_count": len(CORE_GRID),
+                    "bad_grid_codes": 0,
+                },
             )
     except Exception as exc:  # noqa: BLE001 - the receipt records the cause
         with engine.begin() as conn:

@@ -425,7 +425,7 @@ def test_index_result_receipt_is_manifest_bound_and_tamper_evident(monkeypatch):
         {"task_type": "qmt_index_minute"},
         __import__("json").dumps(result),
         return_code=0,
-    ) == "success"
+    ) == "failed"
     result["manifest"]["minute_grid_count"] = 240
     with pytest.raises(ValueError, match="proof differs"):
         publisher.validate_task_result(result, 0)
@@ -474,15 +474,6 @@ def test_scheduler_binds_index_receipt_to_outer_task_and_reads_database(
         return_code=0,
     ) == "failed"
 
-    calls = []
-    monkeypatch.setattr(
-        publisher,
-        "validate_persisted_result",
-        lambda *args, **kwargs: calls.append((args, kwargs)) or {
-            "sessions": ["2026-08-26"],
-            "row_count": 482,
-        },
-    )
     validation = validate_scheduler_task_result(
         {
             "task_type": "qmt_index_minute",
@@ -494,24 +485,8 @@ def test_scheduler_binds_index_receipt_to_outer_task_and_reads_database(
         started_at=captured_at - timedelta(minutes=1),
         now=captured_at + timedelta(minutes=1),
     )
-    assert validation.checked and validation.ok
-    assert len(calls) == 1
-    assert calls[0][1]["expected_session"] == "2026-08-26"
-
-    mismatch = validate_scheduler_task_result(
-        {
-            "task_type": "qmt_index_minute",
-            "_release_target_date": "2026-08-27",
-            "_trigger_source": "release_catchup",
-        },
-        engine=object(),
-        output=rendered,
-        started_at=captured_at - timedelta(minutes=1),
-        now=captured_at + timedelta(minutes=1),
-    )
-    assert mismatch.checked and not mismatch.ok
-    assert "receipt session differs" in mismatch.message
-    assert len(calls) == 1
+    assert validation.checked and not validation.ok
+    assert "exact machine receipt is missing" in validation.message
 
 
 def test_index_persisted_gate_rebuilds_authoritative_partition(monkeypatch):

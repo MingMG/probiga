@@ -226,3 +226,58 @@ def iter_daily_rows(
             change,
             change_pct,
         )
+
+
+def iter_index_minute_rows(
+    dat: DatFile,
+    selected: np.ndarray,
+    grid: frozenset[str],
+) -> Iterator[tuple[dt.date, tuple]]:
+    """Yield index minute bars with QMT's native index volume units."""
+    for record in selected:
+        moment = dt.datetime.fromtimestamp(int(record[WORD_TIME]), CST)
+        if moment.strftime("%H:%M:%S") not in grid:
+            continue
+        session = moment.date()
+        close = int(record[WORD_CLOSE])
+        change, change_pct = _change(close, int(record[WORD_PREV_CLOSE]))
+        yield session, (
+            dat.code,
+            moment.replace(tzinfo=None),
+            session,
+            _price(close),
+            Decimal(int(record[WORD_VOLUME])),
+            Decimal(int(record[WORD_AMOUNT])),
+            change,
+            change_pct,
+            dat.qmt_code,
+        )
+
+
+def iter_index_daily_rows(
+    dat: DatFile,
+    sessions: Sequence[dt.date],
+) -> Iterator[tuple[dt.date, tuple]]:
+    """Yield index daily bars without the stock lots-to-shares scaling."""
+    wanted = set(sessions)
+    for record in dat.records:
+        moment = dt.datetime.fromtimestamp(int(record[WORD_TIME]), CST)
+        session = moment.date()
+        if session not in wanted:
+            continue
+        change, change_pct = _change(int(record[WORD_CLOSE]), int(record[WORD_PREV_CLOSE]))
+        yield session, (
+            dat.code,
+            dt.datetime.combine(session, dt.time(15, 0)),
+            session,
+            _price(record[WORD_OPEN]),
+            _price(record[WORD_CLOSE]),
+            _price(record[WORD_HIGH]),
+            _price(record[WORD_LOW]),
+            Decimal(int(record[WORD_VOLUME])),
+            Decimal(int(record[WORD_AMOUNT])),
+            _price(record[WORD_PREV_CLOSE]),
+            change,
+            change_pct,
+            dat.qmt_code,
+        )

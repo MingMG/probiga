@@ -719,9 +719,11 @@ def test_optional_stock_minute_products_do_not_block_strategy_release():
     # validation when their own schedules run.
     installed = {str(task["task_type"]) for task in ensure_quality_gate.TASKS}
     assert optional <= installed
-    assert scheduler_validation._QMT_STOCK_TASK_DATASETS[
+    from server.common.qmt_datadir_result import DATASET_TASK_TYPES
+
+    assert DATASET_TASK_TYPES["stock_minute"] == (
         "qmt_stock_minute_canonical"
-    ] == "minute"
+    )
     assert scheduler_validation._QMT_MINUTE_FLOW_TASK_TYPE == (
         "qmt_stock_minute_flow_canonical"
     )

@@ -121,6 +121,7 @@ _native_resource_state = {}
 _native_resource_api = None
 _native_history_download_day = ""
 _native_history_download_period_index = 0
+_native_history_download_tasks = ()
 _native_history_download_pending = ()
 _native_history_download_status = "idle"
 _native_history_download_error = ""
@@ -881,11 +882,37 @@ def _download_history_batch(native, codes, period, start, end):
         download_one(code, period, start, end)
 
 
+def _native_history_tasks(C):
+    """Download canonical index bars before the larger stock universe."""
+    index_codes = (
+        _sector_members(C, "\u6caa\u6df1\u6307\u6570")
+        if callable(getattr(C, "get_stock_list_in_sector", None))
+        else []
+    )
+    index_codes = tuple(_normalize_codes(index_codes))
+    index_set = set(index_codes)
+    stock_codes = tuple(
+        code for code in _all_codes if code not in index_set
+    )
+    tasks = []
+    if index_codes:
+        tasks.extend((
+            ("index", index_codes, "1d"),
+            ("index", index_codes, "1m"),
+        ))
+    tasks.extend((
+        ("stock", stock_codes, "1d"),
+        ("stock", stock_codes, "1m"),
+    ))
+    return tuple(task for task in tasks if task[1])
+
+
 def _download_native_history(C):
     """Fill the local QMT cache through its native bulk downloader."""
 
     global _native_history_download_day
     global _native_history_download_period_index
+    global _native_history_download_tasks
     global _native_history_download_pending
     global _native_history_download_status
     global _native_history_download_error
@@ -895,25 +922,35 @@ def _download_native_history(C):
     target = _closed_history_date()
     target_text = target.isoformat()
     if _native_history_download_day != target_text:
+        tasks = _native_history_tasks(C)
         _native_history_download_day = target_text
         _native_history_download_period_index = 0
-        _native_history_download_pending = tuple(_all_codes)
+        _native_history_download_tasks = tasks
+        _native_history_download_pending = tasks[0][1] if tasks else ()
         _native_history_download_status = "running"
         _native_history_download_error = ""
         _native_history_download_batches = 0
     if _native_history_download_status == "complete":
         return
-    periods = ("1d", "1m")
-    while _native_history_download_period_index < len(periods):
+    while _native_history_download_period_index < len(_native_history_download_tasks):
         if not _native_history_download_pending:
             _native_history_download_period_index += 1
-            _native_history_download_pending = tuple(_all_codes)
+            _native_history_download_pending = (
+                _native_history_download_tasks[
+                    _native_history_download_period_index
+                ][1]
+                if _native_history_download_period_index
+                < len(_native_history_download_tasks)
+                else ()
+            )
             continue
         break
-    if _native_history_download_period_index >= len(periods):
+    if _native_history_download_period_index >= len(_native_history_download_tasks):
         _native_history_download_status = "complete"
         return
-    period = periods[_native_history_download_period_index]
+    period = _native_history_download_tasks[
+        _native_history_download_period_index
+    ][2]
     batch = _native_history_download_pending[:NATIVE_HISTORY_BATCH_SIZE]
     start = (
         target - datetime.timedelta(days=NATIVE_HISTORY_LOOKBACK_DAYS)
@@ -933,8 +970,10 @@ def _download_native_history(C):
     _native_history_download_batches += 1
     if not _native_history_download_pending:
         _native_history_download_period_index += 1
-        if _native_history_download_period_index < len(periods):
-            _native_history_download_pending = tuple(_all_codes)
+        if _native_history_download_period_index < len(_native_history_download_tasks):
+            _native_history_download_pending = _native_history_download_tasks[
+                _native_history_download_period_index
+            ][1]
         else:
             _native_history_download_status = "complete"
     _native_history_download_error = ""

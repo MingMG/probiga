@@ -8,6 +8,8 @@ import pytest
 from server.api import scheduler_runtime
 from tools import ensure_quality_gate, setup_guojin_qmt_catalog
 from tools.qmt_host_ownership_contract import (
+    FREE_INDEX_DAILY_TASK,
+    FREE_STOCK_DAILY_TASK,
     LINUX_PROVIDER_TASKS,
     LINUX_PROVIDER_TASK_TYPES,
     LINUX_QMT_TASKS,
@@ -18,6 +20,12 @@ from tools.qmt_host_ownership_contract import (
     WINDOWS_QMT_EDGE_TASKS,
     WINDOWS_QMT_EDGE_FALLBACK_EGRESS_CONTRACTS_BY_TYPE,
     WINDOWS_QMT_EDGE_TASK_TYPES,
+    QMT_INDEX_KLINE_TASK,
+    QMT_INDEX_MINUTE_TASK,
+    QMT_STOCK_DAILY_CANONICAL_TASK,
+    QMT_STOCK_MINUTE_CANONICAL_TASK,
+    QMT_STOCK_MINUTE_FLOW_CANONICAL_TASK,
+    PUBLIC_STOCK_MINUTE_TASK,
 )
 
 
@@ -90,6 +98,25 @@ def test_frozen_qmt_host_sets_are_exact_and_disjoint():
     assert "intraday_realtime" not in WINDOWS_QMT_EDGE_TASK_TYPES
     assert "intraday_minute_kline" not in WINDOWS_QMT_EDGE_TASK_TYPES
     assert "intraday_capital_flow_fast" not in WINDOWS_QMT_EDGE_TASK_TYPES
+
+
+def test_qmt_capable_canonical_tasks_own_the_datadir_paths():
+    assert QMT_STOCK_DAILY_CANONICAL_TASK["script_path"] == (
+        "tools/import_qmt_datadir_daily.py"
+    )
+    assert QMT_STOCK_MINUTE_CANONICAL_TASK["script_path"] == (
+        "tools/import_qmt_datadir_history.py"
+    )
+    assert QMT_INDEX_KLINE_TASK["script_path"] == (
+        "tools/import_qmt_datadir_index.py"
+    )
+    assert QMT_INDEX_MINUTE_TASK["script_path"] == (
+        "tools/import_qmt_datadir_index.py"
+    )
+    assert FREE_STOCK_DAILY_TASK["enabled"] == 0
+    assert PUBLIC_STOCK_MINUTE_TASK["enabled"] == 0
+    assert FREE_INDEX_DAILY_TASK["enabled"] == 0
+    assert QMT_STOCK_MINUTE_FLOW_CANONICAL_TASK["enabled"] == 0
 
 
 @pytest.mark.parametrize("row", WINDOWS_TASK_ROWS, ids=lambda row: row["task_type"])

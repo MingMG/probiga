@@ -179,13 +179,18 @@ def test_minute_backfill_runs_next_morning_with_exact_target_and_retry_budget(mo
            "last_run_at": datetime(2026, 9, 11, 16),
            "last_triggered_at": datetime(2026, 9, 11, 16), "last_run_status": "blocked",
            "last_run_output": ""}
-    if task_type == "qmt_stock_minute_canonical":
-        from tools.sync_qmt_stock_edge import _failure
-        payload = _failure("minute", ValueError("SAME_DAY_SOURCE_NOT_FINAL"))
-    else:
-        from tools.sync_qmt_index_edge import RESULT_SCHEMA, PROVIDER
-        payload = {"schema": RESULT_SCHEMA, "status": "BLOCKED", "dataset": "minute",
-                   "provider": PROVIDER, "reason": "DATA_BLOCKED: SAME_DAY_SOURCE_NOT_FINAL"}
+    from server.common.qmt_datadir_result import build_unavailable_result
+
+    dataset = (
+        "stock_minute"
+        if task_type == "qmt_stock_minute_canonical"
+        else "index_minute"
+    )
+    payload = build_unavailable_result(
+        dataset=dataset,
+        sessions=["2026-09-11"],
+        reason="same_day_source_not_final",
+    )
     row["last_run_output"] = json.dumps(payload)
     def forbidden(*args, **kwargs):
         raise AssertionError("minute collection cannot depend on a strategy delivery")

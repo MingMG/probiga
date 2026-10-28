@@ -97,13 +97,13 @@ class Dataset:
 
 
 DATASETS = (
-    Dataset("daily", "股票日线", "market", "sm_stock_kline", "kline", scope="全市场 · 日线 · 不复权", task_type="free_stock_daily_canonical"),
-    Dataset("minute", "股票分钟线", "market", "sm_stock_minute", "kline", scope="全市场 · 公开源 1 分钟", deadline="18:30", task_type="stock_minute"),
+    Dataset("daily", "股票日线", "market", "sm_stock_kline", "kline", scope="全市场 · QMT本地缓存 · 日线 · 不复权", task_type="qmt_stock_daily_canonical"),
+    Dataset("minute", "股票分钟线", "market", "sm_stock_minute", "kline", scope="全市场 · QMT本地缓存 · 1分钟", deadline="18:10", task_type="qmt_stock_minute_canonical"),
     Dataset("flow", "每日资金流", "flow", "sm_stock_capital_flow_daily", "minute", scope="全市场 · 当日有成交", task_type="capital_flow_batch_fast"),
     Dataset("minute_flow", "分钟资金流", "flow", "sm_stock_capital_flow_min", "minute", scope="全市场 · 公开源 1 分钟", deadline="24:00", task_type="stock_minute_flow"),
     Dataset("alist", "龙虎榜列表", "event", "st_a_list_daily", "business", scope="当日完整披露清单", task_type="alist_daily", empty_allowed=True),
     Dataset("alist_info", "龙虎榜详情", "event", "st_a_list_info", "business", scope="当日席位明细", task_type="alist_info", empty_allowed=True),
-    Dataset("index", "指数行情", "market", "sm_index_kline", "kline", code="index_code", scope="公开源价格指数 · 日线", task_type="free_index_daily_canonical"),
+    Dataset("index", "指数行情", "market", "sm_index_kline", "kline", code="index_code", scope="QMT本地缓存 · 价格指数 · 日线", task_type="qmt_index_kline"),
     Dataset("concept", "概念行情", "market", "sm_concept_east_kline", "kline", code="index_code", scope="东财原生概念目录 · 日线", task_type="eastmoney_concept_kline"),
     Dataset("hot", "东财热门榜单", "event", "st_hot_pop_rank_east", "business", date_column="snapshot_date", scope="东财人气榜 · Top 100", deadline="17:14", task_type="hot_pop_east"),
     Dataset("hot_ths", "同花顺热门榜单", "event", "st_hot_rank_ths", "business", date_column="snapshot_date", scope="同花顺热股榜 · Top 100", deadline="17:12", task_type="hot_rank_ths"),
