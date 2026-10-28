@@ -47,7 +47,6 @@ from integrations.bigqmt.spool import (
     read_json,
     read_snapshot,
     resolve_big_qmt_home,
-    write_watchlist,
 )
 from integrations.bigqmt.release_identity import (
     STRATEGY_RELEASE_MANIFEST_NAME,
@@ -1329,15 +1328,7 @@ def refresh_watchlist(engine, *, qmt_home: Path, tracked_limit: int) -> dict[str
     tracked = list(dict.fromkeys([*remote_portfolio, *local_tracked]))[
         : max(1, min(280, int(tracked_limit)))
     ]
-    path = write_watchlist(
-        all_codes=universe,
-        tracked_codes=tracked,
-        qmt_home=qmt_home,
-        full_refresh_seconds=int(os.environ.get("BIG_QMT_FULL_REFRESH_SECONDS", "30")),
-        tracked_flush_seconds=float(os.environ.get("BIG_QMT_TRACKED_FLUSH_SECONDS", "1")),
-    )
     return {
-        "path": str(path),
         "universe": universe,
         "tracked": tracked,
         "remote_portfolio": remote_portfolio,

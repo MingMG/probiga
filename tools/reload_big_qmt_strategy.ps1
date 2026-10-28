@@ -55,6 +55,9 @@ $ReloadStateRoot = [System.IO.Path]::GetFullPath(
 )
 $RecoveryStateSchema = "probiga.bigqmt-cold-start-recovery.v1"
 $RecoveryStatePath = Join-Path $ReloadStateRoot "cold-start-recovery.json"
+$IpcReloadAuthorizationPath = Join-Path `
+    $ReloadStateRoot `
+    "ipc-unavailable-reload-authorization.json"
 $TrustedReloadStateOwnerSids = @()
 $SupportedQmtClientVersion = "2.1.19.0"
 $StrategyEditorRunXOffset = 348
@@ -1219,6 +1222,30 @@ function Test-HeartbeatProperties($Heartbeat, [string[]]$Names) {
     return $true
 }
 
+function Test-IpcReloadAuthorization {
+    if (!(Test-Path -LiteralPath $IpcReloadAuthorizationPath -PathType Leaf)) {
+        return $false
+    }
+    $Item = Get-Item -LiteralPath $IpcReloadAuthorizationPath -Force
+    if (($Item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        return $false
+    }
+    try {
+        $Payload = Get-Content -LiteralPath $IpcReloadAuthorizationPath -Raw |
+            ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        return $false
+    }
+    return (
+        [string]$Payload.schema -ceq `
+            "probiga.qmt-ipc-unavailable-reload-authorization.v1" -and
+        ([string]$Payload.build_sha).ToLowerInvariant() -ceq $ExpectedBuild -and
+        [string]$Payload.reason_code -ceq "QMT_IPC_REQUEST_TIMEOUT" -and
+        $Payload.operator_authorized -eq $true
+    )
+}
+
 function Get-QmtClientTitledWindows([int]$ClientPid) {
     return @(
         [ProBigAQmtReleaseWindow]::VisibleTitledWindows([uint32]$ClientPid) |
@@ -1492,6 +1519,14 @@ function Get-LoadedStrategyCompatibility {
     } finally { $ErrorActionPreference = $PreviousPreference }
     try { $Payload = ($Output -join "`n") | ConvertFrom-Json -ErrorAction Stop }
     catch { throw 'QMT running strategy compatibility proof is malformed' }
+    if (
+        $Code -eq 2 -and
+        [string]$Payload.status -ceq 'UNAVAILABLE' -and
+        [string]$Payload.error_type -ceq 'TimeoutError' -and
+        (Test-IpcReloadAuthorization)
+    ) {
+        return $null
+    }
     if (!(Test-HeartbeatProperties $Payload @(
         'mode', 'status', 'expected_build_sha', 'database_writes', 'qmt_calls',
         'strategy_release'

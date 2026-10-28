@@ -46,6 +46,8 @@ $ProgramDataRoot = [System.IO.Path]::GetFullPath($env:ProgramData)
 $SchedulerStateRoot = [System.IO.Path]::GetFullPath(
     (Join-Path $ProgramDataRoot "ProBigA\scheduler")
 )
+$IpcReloadAuthorizationPath = Join-Path $ProgramDataRoot `
+    "ProBigA\qmt-model-reload\ipc-unavailable-reload-authorization.json"
 $PythonExe = Join-Path $ExpectedRoot ".venv\Scripts\python.exe"
 $QmtPythonExe = Join-Path $ExpectedRoot "runtime\qmt-py313\Scripts\python.exe"
 $BootstrapTool = Join-Path $ExpectedRoot "tools\run_qmt_windows_edge_release_bootstrap.py"
@@ -112,6 +114,30 @@ $LocalHistoryMigrationReceipt = Join-Path (
 function Write-UpdateLog([string]$Message) {
     $Timestamp = Get-Date -Format "yyyy-MM-ddTHH:mm:ssK"
     Add-Content -LiteralPath $LogPath -Value "$Timestamp $Message" -Encoding UTF8
+}
+
+function Test-IpcReloadAuthorization([string]$BuildSha) {
+    if (!(Test-Path -LiteralPath $IpcReloadAuthorizationPath -PathType Leaf)) {
+        return $false
+    }
+    $Item = Get-Item -LiteralPath $IpcReloadAuthorizationPath -Force
+    if (($Item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        return $false
+    }
+    try {
+        $Payload = Get-Content -LiteralPath $IpcReloadAuthorizationPath -Raw |
+            ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        return $false
+    }
+    return (
+        [string]$Payload.schema -ceq `
+            "probiga.qmt-ipc-unavailable-reload-authorization.v1" -and
+        ([string]$Payload.build_sha).ToLowerInvariant() -ceq $BuildSha -and
+        [string]$Payload.reason_code -ceq "QMT_IPC_REQUEST_TIMEOUT" -and
+        $Payload.operator_authorized -eq $true
+    )
 }
 
 function Get-QmtStrategySourceBlob([string]$BuildSha) {
@@ -1580,9 +1606,16 @@ elseif ($StrategyPreflightStatus -ceq "READY") {
     if ($StrategyAlreadyReady) {
         Write-UpdateLog "BigQMT exact strategy already loaded for $CurrentSha"
     }
-    elseif ($StrategyProbeExit -ne 4) {
+    elseif (
+        $StrategyProbeExit -ne 4 -and
+        !(Test-IpcReloadAuthorization $CurrentSha)
+    ) {
         Write-UpdateLog "BigQMT strategy preflight unavailable for ${CurrentSha}: $($StrategyProbeOutput -join ' ')"
         throw "BigQMT strategy preflight failed closed"
+    }
+    else {
+        Write-UpdateLog "BigQMT IPC unavailable; explicit operator-authorized exact reload will run for $CurrentSha"
+        $StrategyAlreadyReady = $false
     }
 }
 else {

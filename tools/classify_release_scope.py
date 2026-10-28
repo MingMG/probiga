@@ -189,6 +189,8 @@ _DDL_SQL = re.compile(
 _DDL_CODE_ROOTS = ("server/db/", "db/")
 _CROSS_END_CONTRACT_CODE_FILES = frozenset({
     "server/common/limit_up_event_schema.py",
+    "server/common/qmt_daily_market_truth.py",
+    "server/common/qmt_datadir_result.py",
     "server/common/qmt_edge_release_recovery.py",
     "tools/prepare_strategy_governance_deferred_schema.py",
     "tools/prepare_strategy_governance_qmt_history.py",
@@ -196,6 +198,10 @@ _CROSS_END_CONTRACT_CODE_FILES = frozenset({
     "tools/reload_big_qmt_strategy.ps1",
     "tools/resume_qmt_prior_edge.ps1",
     "tools/apply_public_market_profile.py",
+    "tools/import_qmt_datadir_daily.py",
+    "tools/import_qmt_datadir_history.py",
+    "tools/import_qmt_datadir_index.py",
+    "tools/qmt_host_ownership_contract.py",
     "tools/run_big_qmt_bridge.py",
     "tools/run_qmt_windows_edge_release_bootstrap.py",
     "tools/start_local_live_services.ps1",
