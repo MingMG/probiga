@@ -551,6 +551,7 @@ def collect_market_data(engine, target_trade_date: str | None = None) -> dict:
         target,
     )
     data["科技风险雷达"] = data["风险机会决策雷达"]
+    data["宽基ETF份额推算"] = _collect_broad_etf_flow(target)
     data["大盘中长期趋势"] = _collect_market_trend(engine, target)
     coverage = core["coverage"]
     missing_kline_count = int(coverage.get("missing_kline_count") or 0)
@@ -587,6 +588,35 @@ def collect_market_data(engine, target_trade_date: str | None = None) -> dict:
     _assert_market_data_contract(data, target)
 
     return data
+
+
+def _collect_broad_etf_flow(target: str) -> dict:
+    try:
+        response = httpx.get(
+            "http://127.0.0.1:8000/api/hot-data/broad-etf-flow",
+            params={"trade_date": target, "days": 5},
+            timeout=15,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        summary = payload.get("summary") or {}
+        coverage = payload.get("coverage") or {}
+        if payload.get("status") == "error" or summary.get("net_1d") is None:
+            return {"数据状态": "未获取"}
+        return {
+            "数据状态": "已获取",
+            "交易日": payload.get("trade_date"),
+            "当日净申购": f"{float(summary['net_1d']) / 1e8:+.2f}亿元",
+            "信号": summary.get("signal"),
+            "置信度": summary.get("confidence_label"),
+            "申赎主体": summary.get("identity_status"),
+            "覆盖": (
+                f"{coverage.get('available', '未获取')}/"
+                f"{coverage.get('expected', '未获取')}"
+            ),
+        }
+    except Exception:
+        return {"数据状态": "未获取"}
 
 
 # ═══════════════════════════════════════════
@@ -672,7 +702,12 @@ def call_deepseek(messages: list[dict]) -> str:
 
     resp = httpx.post(
         DEEPSEEK_URL,
-        json={"model": settings.deepseek_model, "messages": messages, "temperature": 0.7, "max_tokens": 8000},
+        json={
+            "model": settings.deepseek_model,
+            "messages": messages,
+            "temperature": 0.3,
+            "max_tokens": 2400,
+        },
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         timeout=180,
     )
@@ -682,36 +717,26 @@ def call_deepseek(messages: list[dict]) -> str:
 
 
 def build_system_prompt() -> str:
-    return """你是一个顶级A股市场分析师，每天早上为专业投资者撰写深度「A股盘前早报」。
+    return """你是A股市场信息整理助手。输出《A股盘前早报》，服务对象关注明日板块与观察点。
 
-你的分析框架（必须覆盖全部）：
-1. **隔夜美股深度映射**：不仅看三大指数涨跌，更要分析VIX、美债收益率、美元指数对A股北向资金和风险偏好的传导链
-2. **产业链逻辑完整推演**：从上游原材料→中游制造→下游应用的完整链条，标注具体的受益标的和替代关系
-3. **资金行为双重验证**：结合主力资金流向+龙虎榜+两融数据，判断资金态度是否与消息面一致
-4. **机构行为研判**：关注基金仓位变化、重仓股异动、期指持仓，预判机构调仓方向
-5. **情绪指标量化**：涨停家数、连板高度、炸板率、量比等微观情绪信号
-6. **多空博弈推演**：针对每个主线，列出多方逻辑和空方逻辑，给出倾向性判断
-7. **风险全景扫描**：政策风险、业绩雷、解禁、减持、外围黑天鹅
-8. **风险/机会自主判断**：必须综合「风险机会决策雷达」、外围映射、A股涨跌家数、板块强弱、资金流和实际持仓；若 risk.triggered=true，要醒目写出需要先跑/先减仓的板块和命中持仓；若 opportunity.status=focus/watch，要列出机会板块和具体观察个股
-9. **大盘中长期趋势**：逐指数区分日线、周线和月线；严格区分低位、止跌迹象和满足转强条件；未收盘周/月线只能写暂时变化
-
-写作风格：
-- 标题格式："## 📰 A股早报 | X月X日 星期X"
-- 每节用 **粗体标题** + emoji图标开头
-- 关键数字必须用 **加粗** 高亮，如 **+3.2%**、**16.7亿**
-- 逻辑链条用 → 符号串联，如 "上游涨价 → 中游利润压缩 → 下游需求萎缩"
-- 结论要有明确的倾向性（看多/看空/中性），不要模棱两可
-- 用简洁有力的短句，每段 2-4 句话
-- 直接点名具体个股，不要用"某公司"代替
-
-不要编造任何未提供的新闻或数据。基于我给你的数据深入分析，尽量详细、全面。"""
+硬性要求：
+- 全篇不超过800个中文字符，必须简洁，不写长篇研报。
+- 只输出七个部分：隔夜与外围、宏观与政策、市场与行业消息、板块—个股观察池、公司公告与事件、指数与技术面、早报结论。
+- 板块—个股观察池选3—5个板块，每板块2只股票，全篇不超过8只。
+- 每只股票只能来自输入数据，必须写出代码、名称和至少2个已返回字段；统一标【观察池，不构成推荐】。
+- 不得出现买入、卖出、加仓、减仓、仓位、目标价、止损价、收益承诺或“必涨”等建议。
+- 数字、代码、名称只能来自输入数据。缺失写“未获取”，不得用记忆补全。
+- 外部市场没数据时只写“外围数据未获取”，不得靠新闻推导具体指数涨跌。
+- 先用一句话说明偏多/偏空/中性，再给出明日优先关注板块和需要回避的风险。
+- 个股只做观察记录，因果只能基于输入中可验证的数据。
+- 结尾固定写：以上为信息整理，不构成投资建议。"""
 
 
 def build_user_prompt(data: dict, news: list[str]) -> str:
     now = datetime.now()
     date_label = f"{now.month}月{now.day}日 星期{['一','二','三','四','五','六','日'][now.weekday()]}"
 
-    prompt = f"""今天是 {date_label}，请基于以下市场数据和新闻，生成一份深度A股盘前早报。
+    prompt = f"""今天是 {date_label}，请基于以下市场数据和新闻，生成一份不超过800字的A股盘前早报。
 
 ## 市场数据
 
@@ -729,71 +754,27 @@ def build_user_prompt(data: dict, news: list[str]) -> str:
     prompt += "\n## 新闻快讯（今天重要消息）\n\n"
     prompt += "\n".join(news[:50])
 
-    prompt += f"""
+    prompt += """
 
-## 撰写要求
+## 固定输出结构
 
-请按以下结构深度分析（每节至少 3-5 段，带具体数据和逻辑链）：
+一、隔夜与外围：只写输入中已有数据，并给出一句话偏多/偏空/中性判断。
 
-### 📈 隔夜外盘深度
-美股三指涨跌 + VIX/美债/美元 + 中概股表现 + 对A股映射（北向资金预期、开盘情绪、板块联动）
+二、宏观与政策：最多3条，写明对应影响板块。
 
-### 🗺️ 全市场催化候选池（不得省略）
-先完成全市场扫描，再做优先级排序。必须逐项检查：外盘与风险偏好、政策与流动性、供给扰动、涨价、
-国产替代/贸易摩擦、订单与资本开支、需求景气、技术/产品发布、财报业绩、并购重组、会议展会和消费事件。
-- 凡是能形成“消息催化→产业传导→A股环节/个股映射→盘面验证”的方向都要列出，不得因为排名靠后而删除
-- 按 S/A/B/观察/逻辑转弱 分层；没有合格个股的主题仍须保留，并注明“暂无合格标的”
-- 对无法归类但重要的消息，单列“未归类高优先级催化”，不能静默丢弃
-- 每条写明：催化证据、产业链受益/受损环节、具体标的、盘面验证、证伪条件
+三、市场与行业消息：分成“利好方向”和“利空方向”，每条不超过一句。
 
-### 🎯 今日优先主线
-从上述全量候选池中再选 2-3 条最高优先级主线，但这只是交易优先级，不代替也不删减全市场候选池。
-每条主线必须包含：
-- 逻辑链：从消息→产业链受益环节→具体标的
-- 多方逻辑 vs 空方逻辑
-- 倾向性判断与今日验证点
+四、板块—个股观察池：3—5个板块，每板块2只股票。使用表格：
+| 板块 | 催化/来源 | 观察个股（代码+名称） | 入选依据（至少2个输入字段） | 今日观察点 | 主要风险 | 数据状态 |
 
-### 🧭 研报趋势雷达
-必须单独列出这一节，基于“研报趋势雷达”数据说明：
-- 博主/公众号热度只是情绪入口，券商/投行研报和财报公告是验证层
-- 展示全部已扫描主题及 S/A/B/观察/逻辑转弱排序，不得只截取前几名
-- 每条主线对应的核心股票池、验证指标、主要风险
-- 做覆盖审计：列出扫描维度数、活跃主题数、逻辑转弱主题数、暂无合格标的主题和未归类催化
-- 明确说明这不是买卖建议
+五、公司公告与事件：只列输入中的公告、业绩、回购、减持、停复牌等。
 
-### 🔥 板块轮动全景
-结合热门概念/行业数据，分析：
-- 领涨板块的持续性和逻辑
-- 领跌板块的调整原因
-- 资金切换方向（从哪流出、流入哪）
-- 板块内部分化（龙头 vs 跟风）
+六、指数与技术面：列五大指数；再写关键支撑/压力或“未获取”。
 
-### 💰 资金面深度
-- 主力资金 TOP 流入/流出 各 5 个
-- 龙虎榜分析（如有）
-- 北向资金态度研判
-- 两融/期指信号
+七、早报结论：最多3条，只写“明日优先看什么、看什么信号、回避什么风险”。
 
-### 📊 情绪与量价
-- 涨停/跌停家数、连板高度、炸板率
-- 成交额变化趋势
-- 涨跌比、量比分析
-
-### 🧭 大盘中长期趋势
-- 每个主要指数分别说明日线、周线和月线，不用一个指数代表整个市场
-- 固定说明短期变化、中期趋势、所处位置、综合判断和后续确认条件
-- 低位不能写成底部；止跌迹象不能写成已经转强
-- 周线/月线 confirmation_status=provisional 时必须写“暂时变化/尚未收盘确认”
-- 引用可复算指标、参数、数据截止时间；未知截图指标不能仿造
-
-### ⚠️ 风险全景
-分点列出：政策风险、业绩雷、解禁减持、高位回调、外围黑天鹅
-如果「风险机会决策雷达」的 risk 触发，必须把“对应板块先跑/先减仓、命中持仓先处理”列为第一风险；同时给出机会侧板块和候选个股，但不能用机会掩盖风险。
-
-### 📌 今日重点观测
-列出 5-8 个今日必须盯盘的变量（个股/板块/数据）
-
-请尽量详细深入分析，不要敷衍。基于实际数据，给出明确的倾向性结论。"""
+固定结尾：以上为信息整理，不构成投资建议。
+"""
 
     return prompt
 
@@ -947,9 +928,7 @@ def main():
             log.error("DeepSeek 调用失败: %s", e)
             briefing = _generate_fallback(market_data, deduped_news)
 
-    briefing = append_tech_risk(briefing, market_data)
-    briefing = append_market_trend(briefing, market_data)
-    briefing = append_research_radar(briefing, market_data)
+    briefing = _finalize_briefing(briefing, market_data)
 
     if args.output:
         with open(args.output, "w", encoding="utf-8") as f:
@@ -965,6 +944,17 @@ def main():
     push_to_wecom(briefing, engine=engine)
     log.info("完成")
     return 0
+
+
+def _finalize_briefing(content: str, market_data: dict) -> str:
+    briefing = str(content or "").strip()
+    completeness = str(market_data.get("数据完整性") or "").strip()
+    if completeness and completeness not in briefing:
+        briefing += f"\n\n> 数据口径：{completeness}"
+    footer = "以上为信息整理，不构成投资建议。"
+    if footer not in briefing:
+        briefing += f"\n\n{footer}"
+    return briefing
 
 
 def _generate_fallback(market_data: dict, news: list[str]) -> str:
