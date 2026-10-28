@@ -86,7 +86,11 @@ def _exchange_for_code(code: str) -> str:
     return _EXCHANGE_SUFFIX[p]
 
 
-def fetch_list_market_current(code_list: list[str]) -> pd.DataFrame:
+def fetch_list_market_current(
+    code_list: list[str],
+    *,
+    timeout_seconds: float = 30,
+) -> pd.DataFrame:
     """拉取多股最新行情（新浪）。"""
     codes = [str(c).strip().zfill(6) for c in code_list if str(c).strip()]
     if not codes:
@@ -97,7 +101,8 @@ def fetch_list_market_current(code_list: list[str]) -> pd.DataFrame:
         ex = _exchange_for_code(code).lower()
         api_url += f"s_{ex}{code},"
 
-    res = requests.get(api_url, headers=_HEADERS, timeout=30)
+    timeout = min(30.0, max(1.0, float(timeout_seconds)))
+    res = requests.get(api_url, headers=_HEADERS, timeout=timeout)
     if res.status_code != 200 or len(res.text) < 1:
         return pd.DataFrame(columns=_MARKET_CURRENT_COLUMNS)
 
