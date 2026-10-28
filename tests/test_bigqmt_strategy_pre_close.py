@@ -152,9 +152,6 @@ def test_direct_model_reuses_only_the_existing_strategy_lifecycle(tmp_path):
     timers = [item for item in lifecycle if item[0] == "schedule_run"]
     assert len(timers) == 1
     assert timers[0][3]["repeat_times"] == 0
-    assert loaded._config_path == str(
-        tmp_path / "python" / loaded.STRATEGY_CONFIG_NAME
-    )
     old_calls.clear()
     loaded.bridge_tick(context)
     assert lifecycle[-1][0] == "poll"
@@ -175,31 +172,27 @@ def test_direct_model_reuses_only_the_existing_strategy_lifecycle(tmp_path):
     assert stopped["status"] == "stopped"
 
 
-def test_strategy_config_reads_from_qmt_python_scope(
+def test_strategy_universe_comes_from_qmt_native_sector(
     monkeypatch, tmp_path,
 ):
-    python_dir = tmp_path / "python"
-    python_dir.mkdir()
-    config_path = python_dir / producer.STRATEGY_CONFIG_NAME
-    config_path.write_text(
-        json.dumps({
-            "schema_version": 1,
-            "all_codes": ["000001.SZ", "600519.SH"],
-            "tracked_codes": ["000001.SZ"],
-            "full_refresh_seconds": 30,
-            "tracked_flush_seconds": 1.0,
-        }),
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(producer, "_config_path", str(config_path))
-    monkeypatch.setattr(producer, "_config_mtime", None)
     monkeypatch.setattr(producer, "_config", {})
     monkeypatch.setattr(producer, "_all_codes", [])
     monkeypatch.setattr(producer, "_tracked_codes", [])
 
-    assert producer._load_config(force=True) is True
-    assert producer._all_codes == ["000001.SZ", "600519.SH"]
-    assert producer._tracked_codes == ["000001.SZ"]
+    universe = [f"{index:06d}.SZ" for index in range(1, 1002)]
+
+    class Context:
+        @staticmethod
+        def get_stock_list_in_sector(name, *_args):
+            if name == producer.NATIVE_STOCK_SECTOR:
+                return universe
+            if name == "我的自选":
+                return ["000001.SZ", "000002.SZ"]
+            return []
+
+    assert producer._load_native_universe(Context()) is True
+    assert len(producer._all_codes) == 1001
+    assert producer._tracked_codes == ["000001.SZ", "000002.SZ"]
 
 
 def test_daily_bar_time_is_normalized_to_market_close_for_every_qmt_shape():

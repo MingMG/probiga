@@ -33,7 +33,7 @@ DIRECT_ACQUISITION_MODEL_PREFIX = "probiga_direct_acquisition_"
 MAX_TRACKED_CODES = 280
 MAX_QUOTE_POLL_CODES = 2000
 QUOTE_ACQUISITION_PROTOCOL = "probiga.qmt-full-tick-poll.v1"
-STRATEGY_CONFIG_NAME = "probiga_big_qmt_config.json"
+NATIVE_STOCK_SECTOR = "\u6caa\u6df1A\u80a1"
 MAX_ANNOUNCEMENT_BATCH_ROWS = 200000
 MAX_ANNOUNCEMENT_BATCH_JSON_BYTES = 64 * 1024 * 1024
 MINUTE_FLOW_NATIVE_FIELDS = (
@@ -45,14 +45,12 @@ _lock = threading.RLock()
 # Only the cancellable timer/lifecycle owns native reads and publication.
 _execution_lock = threading.Lock()
 _bridge_root = None
-_config_path = None
 _requests_root = None
 _responses_root = None
 _inflight_root = None
 _checkpoints_root = None
 _dead_letter_root = None
 _cancelled_root = None
-_config_mtime = None
 _config = {}
 _all_codes = []
 _tracked_codes = []
@@ -625,24 +623,39 @@ def _time_text(value, period):
     return ""
 
 
-def _load_config(force=False):
-    global _config_mtime, _config, _all_codes, _tracked_codes
-    if not os.path.isfile(_config_path):
-        return False
-    mtime = os.path.getmtime(_config_path)
-    if not force and _config_mtime == mtime:
-        return False
-    with open(_config_path, "r", encoding="utf-8") as handle:
-        payload = json.load(handle)
-    if not isinstance(payload, dict):
-        raise ValueError("QMT strategy config must contain an object")
-    all_codes = _normalize_codes(payload.get("all_codes"))
-    tracked_codes = _normalize_codes(payload.get("tracked_codes"), MAX_TRACKED_CODES)
+def _load_native_universe(C):
+    """Discover the quote universe through the QMT API."""
+    global _config, _all_codes, _tracked_codes
+    all_codes = _sector_members(C, NATIVE_STOCK_SECTOR)
+    if len(all_codes) < 1000:
+        raise RuntimeError("QMT native A-share universe is incomplete")
+    tracked_codes = []
+    for sector_name in (
+        "\u6211\u7684\u81ea\u9009",
+        "\u6211\u7684\u81ea\u9009\u80a1",
+        "\u81ea\u9009\u80a1",
+    ):
+        try:
+            tracked_codes = _sector_members(C, sector_name)
+        except Exception:
+            tracked_codes = []
+        if tracked_codes:
+            break
+    if not tracked_codes:
+        tracked_codes = all_codes[:MAX_TRACKED_CODES]
+    tracked_codes = _normalize_codes(tracked_codes, MAX_TRACKED_CODES)
+    payload = {
+        "schema_version": 2,
+        "source": "ContextInfo.get_stock_list_in_sector",
+        "all_codes": all_codes,
+        "tracked_codes": tracked_codes,
+        "full_refresh_seconds": 30,
+        "tracked_flush_seconds": 1.0,
+    }
     with _lock:
         _config = payload
         _all_codes = all_codes
         _tracked_codes = tracked_codes
-        _config_mtime = mtime
     return True
 
 
@@ -745,13 +758,17 @@ def _quote_phase(now):
     return ("closed", closed.isoformat())
 
 
-def _refresh_quote_universe(force=False):
+def _refresh_quote_universe(force=False, C=None):
     global _managed_codes, _quote_phase_key, _poll_pending, _poll_cycle_quotes
     global _quote_cache, _tracked_quotes, _last_full_refresh
     global _full_poll_codes, _full_snapshot_pending
-    changed = _load_config(force=force)
-    wanted = frozenset(_all_codes) | frozenset(_tracked_codes)
     phase = _quote_phase(time.time())
+    changed = False
+    if C is not None and (
+        force or not _all_codes or phase != _quote_phase_key
+    ):
+        changed = _load_native_universe(C)
+    wanted = frozenset(_all_codes) | frozenset(_tracked_codes)
     if not (force or changed or wanted != _managed_codes or phase != _quote_phase_key):
         return
     phase_changed = phase != _quote_phase_key
@@ -2021,7 +2038,7 @@ def bridge_tick(C):
     try:
         cached_context = _QuoteCacheContext(C)
         try:
-            _refresh_quote_universe(force=False)
+            _refresh_quote_universe(force=False, C=cached_context)
             _refresh_full_snapshot(C)
             if _stopping:
                 return
@@ -2066,7 +2083,7 @@ def _poll_direct_acquisition(C):
 
 
 def init(C):
-    global _bridge_root, _config_path, _requests_root, _responses_root
+    global _bridge_root, _requests_root, _responses_root
     global _inflight_root, _checkpoints_root, _dead_letter_root, _cancelled_root
     global _last_error, _model_instance_id, _model_started_ts, _heartbeat_seq
     global _direct_model
@@ -2080,11 +2097,6 @@ def init(C):
         _model_started_ts = time.time()
         _heartbeat_seq = 0
         _bridge_root = _find_bridge_root()
-        _config_path = os.path.join(
-            os.path.dirname(os.path.dirname(_bridge_root)),
-            "python",
-            STRATEGY_CONFIG_NAME,
-        )
         _requests_root = os.path.join(_bridge_root, "requests")
         _responses_root = os.path.join(_bridge_root, "responses")
         _inflight_root = os.path.join(_bridge_root, "inflight")
@@ -2103,7 +2115,7 @@ def init(C):
         try:
             _direct_model = _load_direct_acquisition_model()
             _direct_model.heartbeat("idle")
-            _refresh_quote_universe(force=True)
+            _refresh_quote_universe(force=True, C=C)
             _atomic_write("capabilities.json", _capabilities_payload(C))
             _last_error = ""
             _write_heartbeat("starting")
