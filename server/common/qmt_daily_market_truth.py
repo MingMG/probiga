@@ -293,6 +293,101 @@ def load_qmt_daily_market_truth(
     if start > end:
         raise ValueError("QMT daily truth range is invalid")
     decision_time = _timestamp(decision_known_at)
+    if start == end:
+        from server.common.qmt_datadir_result import (
+            load_receipt,
+            persisted_fingerprint,
+        )
+
+        receipt = load_receipt(
+            connection,
+            dataset="stock_daily",
+            trade_date=start,
+        )
+        if receipt is not None:
+            if (
+                receipt.get("status") != "COMPLETE"
+                or not receipt.get("finished_at")
+            ):
+                raise QmtDailyMarketNotFinal(
+                    "QMT datadir daily receipt is not final"
+                )
+            finished_at = _timestamp(receipt["finished_at"])
+            if finished_at > decision_time:
+                raise QmtDailySourceAfterCutoff(
+                    "QMT datadir daily receipt is after the decision cutoff"
+                )
+            if datetime.fromisoformat(finished_at).time() < QMT_DAILY_FINAL_TIME:
+                raise QmtDailyMarketNotFinal(
+                    "QMT datadir daily receipt predates the market-data cutoff"
+                )
+            detail = receipt.get("detail") or {}
+            fingerprint = persisted_fingerprint(
+                connection,
+                dataset="stock_daily",
+                trade_date=start,
+            )
+            if (
+                fingerprint["row_count"]
+                != int(receipt.get("row_count") or 0)
+                or fingerprint["code_count"]
+                != int(receipt.get("code_count") or 0)
+                or fingerprint["row_hash"] != detail.get("row_hash")
+            ):
+                raise RuntimeError(
+                    "QMT datadir daily persisted partition differs"
+                )
+            catalog = load_stock_catalog(
+                connection,
+                decision_known_at=decision_time,
+            )
+            calendar = load_trade_calendar_receipt(
+                connection,
+                start_date=start,
+                end_date=end,
+                decision_known_at=decision_time,
+            )
+            if start not in calendar.sessions_between(start, end):
+                raise RuntimeError(
+                    "QMT datadir daily target is not an exchange session"
+                )
+            eligible = len(catalog.eligible_codes(start))
+            if (
+                int(detail.get("eligible_code_count") or 0) != eligible
+                or fingerprint["code_count"] < int(eligible * 0.95)
+            ):
+                raise RuntimeError(
+                    "QMT datadir daily catalog coverage differs"
+                )
+            truth_payload = {
+                "receipt_id": receipt.get("receipt_id"),
+                "run_id": receipt.get("run_id"),
+                "row_count": fingerprint["row_count"],
+                "code_count": fingerprint["code_count"],
+                "row_hash": fingerprint["row_hash"],
+                "catalog_batch_id": catalog.batch_id,
+                "catalog_manifest_hash": catalog.manifest_hash,
+                "catalog_member_set_hash": catalog.member_set_hash,
+                "calendar_batch_id": calendar.batch_id,
+                "calendar_manifest_hash": calendar.manifest_hash,
+                "calendar_session_set_hash": calendar.session_set_hash,
+            }
+            return QmtDailyMarketTruth(
+                run_id=str(receipt["run_id"]),
+                run_start_date=start,
+                run_end_date=end,
+                run_finished_at=finished_at,
+                decision_known_at=decision_time,
+                catalog_batch_id=catalog.batch_id,
+                catalog_manifest_hash=catalog.manifest_hash,
+                catalog_member_set_hash=catalog.member_set_hash,
+                calendar_batch_id=calendar.batch_id,
+                calendar_manifest_hash=calendar.manifest_hash,
+                calendar_session_set_hash=calendar.session_set_hash,
+                attested_row_count=fingerprint["row_count"],
+                requested_sessions=(start,),
+                truth_hash=canonical_digest(truth_payload),
+            )
     run = connection.execute(text("""
         SELECT run_id, provider, start_date, end_date, status,
                target_rows, qmt_rows, matched_rows, missing_qmt_rows,

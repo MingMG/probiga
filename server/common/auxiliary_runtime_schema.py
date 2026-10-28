@@ -707,10 +707,17 @@ def validate_qmt_datadir_import_runtime_schema(engine) -> dict[str, Any]:
 
 
 def privileged_migrate_qmt_datadir_import_schema(engine) -> dict[str, Any]:
-    _privileged_create(engine, _QMT_DATADIR_IMPORT_DDL)
+    # Import staging is disposable and interruption-safe only when a release
+    # starts from an empty landing table.  Scheduler writers are fenced before
+    # this privileged migration, so this cannot discard an active import.
+    _privileged_create(
+        engine,
+        (*_QMT_DATADIR_IMPORT_DDL, "TRUNCATE TABLE `qmt_datadir_minute_stage`"),
+    )
     return {
         **validate_qmt_datadir_import_runtime_schema(engine),
         "privileged_migration": True,
+        "stale_minute_stage_purged": True,
     }
 
 

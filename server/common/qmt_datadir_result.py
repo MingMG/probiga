@@ -192,7 +192,6 @@ def partition_from_receipt(receipt: Mapping[str, Any]) -> dict[str, Any]:
         "coverage": float(detail.get("coverage") or 0.0),
         "readback_rows": int(detail.get("readback_rows") or 0),
         "readback_codes": int(detail.get("readback_codes") or 0),
-        "attestation_run_id": str(detail.get("attestation_run_id") or ""),
     }
 
 
@@ -247,7 +246,6 @@ def validate_task_result(
             return "failed"
         row_count = int(partition.get("row_count") or 0)
         code_count = int(partition.get("code_count") or 0)
-        requires_attestation = dataset == "stock_daily"
         if (
             partition.get("status") != "COMPLETE"
             or not str(partition.get("source_root") or "")
@@ -260,10 +258,6 @@ def validate_task_result(
             or float(partition.get("coverage") or 0.0) < 0.95
             or int(partition.get("readback_rows") or 0) != row_count
             or int(partition.get("readback_codes") or 0) != code_count
-            or (
-                requires_attestation
-                and not str(partition.get("attestation_run_id") or "")
-            )
         ):
             return "failed"
     return "complete"
@@ -392,7 +386,6 @@ def validate_persisted_result(
             "coverage",
             "readback_rows",
             "readback_codes",
-            "attestation_run_id",
         ):
             if stored.get(key) != partition.get(key):
                 raise ValueError(f"QMT datadir receipt field differs: {key}")
@@ -405,19 +398,6 @@ def validate_persisted_result(
             or row_hash(rows) != partition["row_hash"]
         ):
             raise ValueError("QMT datadir persisted partition differs")
-        if dataset == "stock_daily":
-            from server.common.qmt_daily_market_truth import (
-                load_qmt_daily_market_truth,
-            )
-
-            truth = load_qmt_daily_market_truth(
-                engine,
-                start_date=trade_date,
-                end_date=trade_date,
-                decision_known_at=dt.datetime.now(),
-            )
-            if truth.run_id != partition["attestation_run_id"]:
-                raise ValueError("QMT datadir daily attestation differs")
         verified.append(
             {
                 "trade_date": trade_date,

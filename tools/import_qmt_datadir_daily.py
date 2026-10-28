@@ -12,7 +12,6 @@ import sys
 import uuid
 from pathlib import Path
 
-import pandas as pd
 from sqlalchemy import text
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,11 +29,6 @@ from integrations.qmt.datadir_import import (  # noqa: E402
     load_universe,
     new_run_id,
 )
-from integrations.qmt.local_history import (  # noqa: E402
-    BIGQMT_PROVIDER_ID,
-    get_local_history_engine,
-    persist_daily_kline_capture,
-)
 from server.common.authoritative_market_clock import (  # noqa: E402
     authoritative_closed_trade_date,
 )
@@ -49,7 +43,6 @@ from server.common.qmt_datadir_result import (  # noqa: E402
     persisted_fingerprint,
 )
 from tools.env_config import load_project_env  # noqa: E402
-from tools.attest_qmt_daily_kline import attest_range  # noqa: E402
 
 DATASET = "stock_daily"
 SOURCE = "qmt_datadir"
@@ -164,34 +157,22 @@ def _publish(
 ) -> dict:
     now = dt.datetime.now(CST).replace(tzinfo=None, microsecond=0)
     batch_id = f"qmt_dat_daily_{session:%Y%m%d}_{run_id}"
-    statement = text(
-        f"""
-        INSERT INTO `{TARGET_TABLE}`
-          (stock_code, short_name, trade_time, trade_date, k_type, adjust_type,
-           open, close, high, low, volume, amount, `change`, change_pct,
-           pre_close, etl_sync_at, qmt_code, data_source, source_time,
-           received_at, batch_id, data_version, quality_status,
-           permission_status)
-        VALUES
-          (:stock_code, :short_name, :trade_time, :trade_date, 1, 0,
-           :open, :close, :high, :low, :volume, :amount, :change,
-           :change_pct, :pre_close, :etl_sync_at, :qmt_code, :data_source,
-           :source_time, :received_at, :batch_id, :data_version,
-           'VERIFIED', 'SUPPORTED')
-        ON DUPLICATE KEY UPDATE
-          short_name=VALUES(short_name), trade_time=VALUES(trade_time),
-          open=VALUES(open), close=VALUES(close), high=VALUES(high),
-          low=VALUES(low), volume=VALUES(volume), amount=VALUES(amount),
-          `change`=VALUES(`change`), change_pct=VALUES(change_pct),
-          pre_close=VALUES(pre_close), etl_sync_at=VALUES(etl_sync_at),
-          qmt_code=VALUES(qmt_code), data_source=VALUES(data_source),
-          source_time=VALUES(source_time), received_at=VALUES(received_at),
-          batch_id=VALUES(batch_id), data_version=VALUES(data_version),
-          quality_status=VALUES(quality_status),
-          permission_status=VALUES(permission_status)
-        """
+    columns = (
+        "stock_code, short_name, trade_time, trade_date, k_type, adjust_type, "
+        "open, close, high, low, volume, amount, `change`, change_pct, "
+        "pre_close, etl_sync_at, qmt_code, data_source, source_time, "
+        "received_at, batch_id, data_version, quality_status, permission_status"
     )
-    payload = []
+    stage_columns = (
+        "stage.stock_code, stage.short_name, stage.trade_time, stage.trade_date, "
+        "stage.k_type, stage.adjust_type, stage.`open`, stage.`close`, "
+        "stage.high, stage.low, stage.volume, stage.amount, stage.`change`, "
+        "stage.change_pct, stage.pre_close, stage.etl_sync_at, "
+        "stage.qmt_code, stage.data_source, stage.source_time, "
+        "stage.received_at, stage.batch_id, stage.data_version, "
+        "stage.quality_status, stage.permission_status"
+    )
+    payload: list[tuple] = []
     for (
         code,
         _native_time,
@@ -212,48 +193,153 @@ def _publish(
             else "SZ"
         )
         source_time = dt.datetime.combine(session, dt.time(15, 0))
-        payload.append({
-            "stock_code": code,
-            "short_name": short_names.get(code, ""),
-            "trade_time": source_time,
-            "trade_date": session,
-            "open": open_price,
-            "close": close_price,
-            "high": high,
-            "low": low,
-            "volume": volume,
-            "amount": amount,
-            "change": change,
-            "change_pct": change_pct,
-            "pre_close": pre_close,
-            "etl_sync_at": now,
-            "qmt_code": f"{code}.{market}",
-            "data_source": SOURCE,
-            "source_time": source_time,
-            "received_at": now,
-            "batch_id": batch_id,
-            "data_version": hashlib.sha256(
+        payload.append((
+            code,
+            short_names.get(code, ""),
+            source_time,
+            session,
+            1,
+            0,
+            open_price,
+            close_price,
+            high,
+            low,
+            volume,
+            amount,
+            change,
+            change_pct,
+            pre_close,
+            now,
+            f"{code}.{market}",
+            SOURCE,
+            source_time,
+            now,
+            batch_id,
+            hashlib.sha256(
                 (
                     f"{code}|{session}|{open_price}|{close_price}|"
                     f"{high}|{low}|{volume}|{amount}|{pre_close}"
                 ).encode("utf-8")
             ).hexdigest()[:32],
-        })
+            "VERIFIED",
+            "SUPPORTED",
+        ))
+    row_template = "(" + ",".join(["%s"] * 24) + ")"
+    temp_table = f"tmp_qmt_daily_{run_id}"
     with engine.begin() as connection:
-        for offset in range(0, len(payload), 1000):
-            connection.execute(statement, payload[offset:offset + 1000])
+        connection.exec_driver_sql(
+            f"""
+            CREATE TEMPORARY TABLE `{temp_table}` (
+              stock_code VARCHAR(16) NOT NULL,
+              short_name VARCHAR(64) NULL,
+              trade_time DATETIME NOT NULL,
+              trade_date DATE NOT NULL,
+              k_type INT NOT NULL,
+              adjust_type INT NOT NULL,
+              `open` DECIMAL(50,6) NULL,
+              `close` DECIMAL(50,6) NULL,
+              high DECIMAL(50,6) NULL,
+              low DECIMAL(50,6) NULL,
+              volume DECIMAL(50,6) NULL,
+              amount DECIMAL(50,6) NULL,
+              `change` DECIMAL(50,6) NULL,
+              change_pct DECIMAL(50,6) NULL,
+              pre_close DECIMAL(50,6) NULL,
+              etl_sync_at DATETIME NOT NULL,
+              qmt_code VARCHAR(32) NULL,
+              data_source VARCHAR(32) NOT NULL,
+              source_time DATETIME NULL,
+              received_at DATETIME NOT NULL,
+              batch_id VARCHAR(64) NOT NULL,
+              data_version VARCHAR(64) NOT NULL,
+              quality_status VARCHAR(32) NOT NULL,
+              permission_status VARCHAR(32) NOT NULL
+            ) ENGINE=InnoDB
+            """
+        )
+        insert_stage = (
+            f"INSERT INTO `{temp_table}` ({columns}) VALUES "
+        )
+        for offset in range(0, len(payload), 500):
+            chunk = payload[offset:offset + 500]
+            statement = insert_stage + ",".join(
+                [row_template] * len(chunk)
+            )
+            connection.exec_driver_sql(
+                statement,
+                tuple(value for row in chunk for value in row),
+            )
+        connection.execute(
+            text(
+            f"""
+            UPDATE `{TARGET_TABLE}` AS target
+            JOIN `{temp_table}` AS stage
+              ON stage.stock_code=target.stock_code
+             AND stage.trade_date=target.trade_date
+             AND stage.k_type=target.k_type
+             AND stage.adjust_type=target.adjust_type
+            SET target.short_name=stage.short_name,
+                target.trade_time=stage.trade_time,
+                target.`open`=stage.`open`,
+                target.`close`=stage.`close`,
+                target.high=stage.high,
+                target.low=stage.low,
+                target.volume=stage.volume,
+                target.amount=stage.amount,
+                target.`change`=stage.`change`,
+                target.change_pct=stage.change_pct,
+                target.pre_close=stage.pre_close,
+                target.etl_sync_at=stage.etl_sync_at,
+                target.qmt_code=stage.qmt_code,
+                target.data_source=stage.data_source,
+                target.source_time=stage.source_time,
+                target.received_at=stage.received_at,
+                target.batch_id=stage.batch_id,
+                target.data_version=stage.data_version,
+                target.quality_status=stage.quality_status,
+                target.permission_status=stage.permission_status
+            WHERE target.trade_date=:d
+              AND target.k_type=1
+              AND target.adjust_type=0
+            """
+            ),
+            {"d": session},
+        )
+        connection.exec_driver_sql(
+            f"""
+            INSERT INTO `{TARGET_TABLE}` ({columns})
+            SELECT {stage_columns}
+            FROM `{temp_table}` AS stage
+            LEFT JOIN `{TARGET_TABLE}` AS target
+              ON target.stock_code=stage.stock_code
+             AND target.trade_date=stage.trade_date
+             AND target.k_type=stage.k_type
+             AND target.adjust_type=stage.adjust_type
+            WHERE target.id IS NULL
+            """
+        )
+        connection.execute(
+            text(
+            f"""
+            DELETE target
+            FROM `{TARGET_TABLE}` AS target
+            LEFT JOIN `{temp_table}` AS stage
+              ON stage.stock_code=target.stock_code
+             AND stage.trade_date=target.trade_date
+             AND stage.k_type=target.k_type
+             AND stage.adjust_type=target.adjust_type
+            WHERE target.trade_date=:d
+              AND target.k_type=1
+              AND target.adjust_type=0
+              AND stage.stock_code IS NULL
+            """
+            ),
+            {"d": session},
+        )
         fingerprint = persisted_fingerprint(
             connection,
             dataset=DATASET,
             trade_date=session.isoformat(),
-        )
-        connection.execute(
-            text(
-                f"DELETE FROM `{TARGET_TABLE}` "
-                "WHERE trade_date=:d AND k_type=1 AND adjust_type=0 "
-                "AND data_source<>:source"
-            ),
-            {"d": session, "source": SOURCE},
         )
         connection.execute(
             text(
@@ -303,119 +389,6 @@ def _publish(
         "readback_rows": int(fingerprint["row_count"]),
         "readback_codes": int(fingerprint["code_count"]),
     }
-
-
-def _persist_source_and_attest(
-    engine,
-    *,
-    session: dt.date,
-    rows: list[tuple],
-    short_names: dict[str, str],
-    batch_id: str,
-) -> dict:
-    source_rows = []
-    for (
-        code,
-        _native_time,
-        _trade_date,
-        open_price,
-        close_price,
-        high,
-        low,
-        volume,
-        amount,
-        pre_close,
-        change,
-        change_pct,
-    ) in rows:
-        market = (
-            "SH" if code.startswith("6")
-            else "BJ" if code.startswith(("4", "8", "9"))
-            else "SZ"
-        )
-        source_time = dt.datetime.combine(session, dt.time(15, 0))
-        source_rows.append({
-            "stock_code": code,
-            "short_name": short_names.get(code, ""),
-            "qmt_code": f"{code}.{market}",
-            "trade_time": source_time,
-            "trade_date": session,
-            "open": open_price,
-            "close": close_price,
-            "high": high,
-            "low": low,
-            "volume": volume,
-            "amount": amount,
-            "change": change,
-            "change_pct": change_pct,
-            "pre_close": pre_close,
-            "pre_close_origin": "NATIVE_QMT",
-            "data_source": BIGQMT_PROVIDER_ID,
-            "source_time": source_time,
-            "received_at": dt.datetime.now(CST).replace(tzinfo=None),
-        })
-    local_engine = get_local_history_engine()
-    try:
-        persist_daily_kline_capture(
-            pd.DataFrame(source_rows),
-            source_engine=engine,
-            local_engine=local_engine,
-            batch_id=batch_id,
-            provider=BIGQMT_PROVIDER_ID,
-        )
-        proof = attest_range(
-            engine,
-            start_date=session.isoformat(),
-            end_date=session.isoformat(),
-            apply=True,
-            provider=BIGQMT_PROVIDER_ID,
-            local_history_engine=local_engine,
-            native_qmt_no_trade=True,
-        )
-    finally:
-        local_engine.dispose()
-    if (
-        proof.get("status") != "COMPLETED"
-        or int(proof.get("matched_rows") or 0)
-        != int(proof.get("target_rows") or -1)
-        or int(proof.get("missing_qmt_rows") or 0) != 0
-        or int(proof.get("mismatched_rows") or 0) != 0
-    ):
-        raise RuntimeError("QMT DAT daily attestation did not complete")
-    return proof
-
-
-def _attach_attestation(
-    engine,
-    *,
-    session: dt.date,
-    attestation_run_id: str,
-) -> None:
-    with engine.begin() as connection:
-        raw = connection.execute(
-            text(
-                f"SELECT detail_json FROM `{RECEIPT_TABLE}` "
-                "WHERE dataset=:dataset AND trade_date=:trade_date"
-            ),
-            {"dataset": DATASET, "trade_date": session},
-        ).scalar_one()
-        detail = json.loads(raw) if raw else {}
-        detail["attestation_run_id"] = attestation_run_id
-        connection.execute(
-            text(
-                f"UPDATE `{RECEIPT_TABLE}` SET detail_json=:detail "
-                "WHERE dataset=:dataset AND trade_date=:trade_date"
-            ),
-            {
-                "dataset": DATASET,
-                "trade_date": session,
-                "detail": json.dumps(
-                    detail,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                ),
-            },
-        )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -483,7 +456,6 @@ def main(argv: list[str] | None = None) -> int:
             })
             continue
         run_id = new_run_id()
-        batch_id = f"qmt_dat_daily_{session:%Y%m%d}_{run_id}"
         published = _publish(
             engine,
             session=session,
@@ -494,18 +466,6 @@ def main(argv: list[str] | None = None) -> int:
             source_root=root,
             content_sha256=harvested["digest"],
             eligible_code_count=eligible,
-        )
-        attestation = _persist_source_and_attest(
-            engine,
-            session=session,
-            rows=harvested["rows"],
-            short_names=short_names,
-            batch_id=batch_id,
-        )
-        _attach_attestation(
-            engine,
-            session=session,
-            attestation_run_id=str(attestation["run_id"]),
         )
         results.append({
             "session": session.isoformat(),

@@ -173,7 +173,7 @@ def test_auxiliary_runtime_validator_fails_closed_when_table_is_missing() -> Non
             "privileged_migrate_qmt_datadir_import_schema",
             "validate_qmt_datadir_import_runtime_schema",
             "qmt_datadir_import_partition",
-            2,
+            3,
         ),
     ),
 )
@@ -201,7 +201,17 @@ def test_persistent_ddl_is_exposed_only_through_privileged_migrations(
     assert result["privileged_migration"] is True
     assert len(captured) == statement_count
     assert expected_table in "\n".join(captured)
-    assert all("CREATE TABLE IF NOT EXISTS" in statement for statement in captured)
+    if migration_name == "privileged_migrate_qmt_datadir_import_schema":
+        assert captured[-1] == "TRUNCATE TABLE `qmt_datadir_minute_stage`"
+        assert all(
+            "CREATE TABLE IF NOT EXISTS" in statement
+            for statement in captured[:-1]
+        )
+    else:
+        assert all(
+            "CREATE TABLE IF NOT EXISTS" in statement
+            for statement in captured
+        )
 
 
 def test_membership_compatibility_guard_is_read_only(monkeypatch) -> None:
