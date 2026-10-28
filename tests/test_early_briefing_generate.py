@@ -21,7 +21,7 @@ def _valid_market_data() -> dict:
             "status": "PASS",
             "target_trade_date": TARGET_DATE,
             "expected_stock_count": 5200,
-            "kline_coverage": 1.0,
+            "kline_coverage": 0.998,
             "traded_flow_coverage": 1.0,
             "index_count": 5,
             "hot_concept_count": 20,
@@ -83,6 +83,14 @@ def test_stale_contract_fails_before_news_or_delivery(monkeypatch):
 
     crawl.assert_not_called()
     push.assert_not_called()
+
+
+def test_early_briefing_contract_rejects_coverage_below_briefing_floor():
+    market_data = _valid_market_data()
+    market_data["_data_contract"]["kline_coverage"] = 0.97
+
+    with pytest.raises(RuntimeError, match="stale or incomplete"):
+        generate._assert_market_data_contract(market_data, TARGET_DATE)
 
 
 def test_core_snapshot_rejects_mixed_kline_date(monkeypatch):

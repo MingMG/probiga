@@ -337,27 +337,36 @@ def validate_daily_stock_coverage(
     *,
     kline_rows: Iterable[Mapping[str, Any]],
     flow_rows: Iterable[Mapping[str, Any]] | None = None,
+    min_kline_coverage: float = 1.0,
 ) -> dict[str, Any]:
-    """Fail closed unless target-date K/flow membership is complete.
+    """Validate target-date K/flow membership against the immutable catalog.
 
     Daily K coverage is exact after applying the immutable QMT no-row receipt;
-    suspension alone does not excuse a missing K-line row.
-    Capital-flow coverage is exact for the subset that traded; a stock with
-    both zero volume and zero amount is the only permitted omission.
+    callers that render a user-facing briefing may explicitly allow a bounded
+    gap and surface it in the returned audit. Capital-flow coverage remains
+    exact for the subset that traded; a stock with both zero volume and zero
+    amount is the only permitted flow omission.
     """
 
     expected = set(universe.expected_codes)
     if not expected:
         raise RuntimeError("DATA_BLOCKED: authoritative stock universe is empty")
+    try:
+        minimum = float(min_kline_coverage)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("min_kline_coverage must be numeric") from exc
+    if not 0.0 < minimum <= 1.0:
+        raise ValueError("min_kline_coverage must be within (0, 1]")
     kline = _rows_by_code(kline_rows, source_name="target-date daily K-line")
     kline_codes = set(kline)
     missing_kline = sorted(expected - kline_codes)
     unexpected_kline = sorted(kline_codes - expected)
-    if missing_kline or unexpected_kline:
+    kline_coverage = len(expected & kline_codes) / len(expected)
+    if unexpected_kline or (missing_kline and kline_coverage < minimum):
         raise RuntimeError(
             "DATA_BLOCKED: target-date daily K-line set differs from immutable catalog: "
             f"expected={len(expected)}, actual={len(kline_codes)}, "
-            f"coverage={len(expected & kline_codes) / len(expected):.6f}, "
+            f"coverage={kline_coverage:.6f}, minimum={minimum:.6f}, "
             f"missing_sample={missing_kline[:20]}, "
             f"unexpected_sample={unexpected_kline[:20]}, "
             f"catalog_hash={universe.expected_code_set_hash}"
@@ -381,7 +390,9 @@ def validate_daily_stock_coverage(
         "expected_code_set_hash": universe.expected_code_set_hash,
         "expected_count": len(expected),
         "kline_count": len(kline_codes),
-        "kline_coverage": 1.0,
+        "kline_coverage": kline_coverage,
+        "missing_kline_count": len(missing_kline),
+        "missing_kline_sample": missing_kline[:20],
         "traded_count": len(traded),
         "suspended_count": len(suspended),
         "suspension_rule": "volume=0 AND amount=0; K required, flow optional",

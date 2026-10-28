@@ -56,6 +56,7 @@ EXPECTED_A_SHARE_INDEX_CODES = frozenset(
 )
 MIN_HOT_CONCEPT_ROWS = 20
 MIN_FUSED_HOT_STOCK_ROWS = 20
+MIN_STOCK_KLINE_COVERAGE = 0.98
 
 HEADERS_UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
@@ -175,6 +176,7 @@ def _load_core_market_snapshot(engine, target_trade_date: str) -> dict:
         universe,
         kline_rows=kline_rows,
         flow_rows=flow_rows,
+        min_kline_coverage=MIN_STOCK_KLINE_COVERAGE,
     )
 
     index_rows = _read_required_sql(
@@ -283,7 +285,7 @@ def _assert_market_data_contract(data: dict, target_trade_date: str) -> dict:
         or int(contract.get("hot_concept_count") or 0) < MIN_HOT_CONCEPT_ROWS
         or int(contract.get("fused_stock_count") or 0) < MIN_FUSED_HOT_STOCK_ROWS
         or int(contract.get("expected_stock_count") or 0) <= 0
-        or float(contract.get("kline_coverage") or 0) != 1.0
+        or float(contract.get("kline_coverage") or 0) < MIN_STOCK_KLINE_COVERAGE
         or float(contract.get("traded_flow_coverage") or 0) != 1.0
     ):
         raise RuntimeError(
@@ -545,12 +547,26 @@ def collect_market_data(engine, target_trade_date: str | None = None) -> dict:
     data["科技风险雷达"] = data["风险机会决策雷达"]
     data["大盘中长期趋势"] = _collect_market_trend(engine, target)
     coverage = core["coverage"]
+    missing_kline_count = int(coverage.get("missing_kline_count") or 0)
+    data["数据完整性"] = (
+        f"K线覆盖 {float(coverage['kline_coverage']) * 100:.2f}%"
+        f"（{coverage['kline_count']}/{coverage['expected_count']}），"
+        "成交资金流覆盖 "
+        f"{float(coverage['traded_flow_coverage']) * 100:.2f}%"
+        + (
+            f"；缺 {missing_kline_count} 只 K 线，样本："
+            + "、".join(coverage.get("missing_kline_sample") or [])
+            if missing_kline_count
+            else ""
+        )
+    )
     data["_data_contract"] = {
         "status": "PASS",
         "target_trade_date": target,
         "expected_stock_count": int(coverage["expected_count"]),
         "kline_count": int(coverage["kline_count"]),
         "kline_coverage": float(coverage["kline_coverage"]),
+        "missing_kline_count": missing_kline_count,
         "flow_count": int(coverage["flow_count"]),
         "traded_flow_coverage": float(coverage["traded_flow_coverage"]),
         "catalog_manifest_hash": coverage["catalog_manifest_hash"],
@@ -953,8 +969,14 @@ def _generate_fallback(market_data: dict, news: list[str]) -> str:
     lines = [
         f"## A股早报 | {date_label}",
         f"> A股核心数据日期：{market_data.get('A股数据日期', '-')}",
+        (
+            f"> 数据完整性：{market_data['数据完整性']}"
+            if market_data.get("数据完整性")
+            else ""
+        ),
         "",
     ]
+    lines = [line for line in lines if line]
 
     us = market_data.get("美股", {})
     us_parts = [

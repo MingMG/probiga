@@ -111,6 +111,26 @@ def test_partial_kline_cannot_pass_against_a_larger_catalog() -> None:
         )
 
 
+def test_briefing_can_explicitly_allow_bounded_kline_gap() -> None:
+    universe = _universe("000001", "000002", "000003", "000004", "000005")
+
+    audit = validate_daily_stock_coverage(
+        universe,
+        kline_rows=[_bar("000001"), _bar("000002"), _bar("000003")],
+        flow_rows=[
+            {"stock_code": "000001"},
+            {"stock_code": "000002"},
+            {"stock_code": "000003"},
+        ],
+        min_kline_coverage=0.60,
+    )
+
+    assert audit["kline_coverage"] == pytest.approx(0.6)
+    assert audit["missing_kline_count"] == 2
+    assert audit["missing_kline_sample"] == ["000004", "000005"]
+    assert audit["traded_flow_coverage"] == 1.0
+
+
 def test_equal_row_counts_with_shifted_flow_codes_fail_closed() -> None:
     universe = _universe("000001", "000002", "000003")
 

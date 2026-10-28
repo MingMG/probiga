@@ -1,6 +1,9 @@
+from types import SimpleNamespace
+
 import pandas as pd
 
 from biz.review.six_step import (
+    _broad_etf_flow_snapshot,
     _limit_pct,
     _limit_price,
     _memberships,
@@ -122,6 +125,16 @@ def test_six_step_review_renders_evidence_and_causal_boundaries():
             "inflow": [{"code": "000001", "name": "甲", "value": 500_000_000, "sector": "半导体"}],
             "outflow": [{"code": "000002", "name": "乙", "value": -300_000_000, "sector": "银行"}],
             "north": 1_000_000_000,
+            "etf": {
+                "status": "已获取",
+                "trade_date": "2026-10-28",
+                "net_1d": 25_574_154_400,
+                "signal": "较强护盘型资金线索",
+                "confidence_label": "较低",
+                "identity_status": "未确认",
+                "available": 4,
+                "expected": 4,
+            },
             "longhubang": [{
                 "code": "000001",
                 "name": "甲",
@@ -176,6 +189,8 @@ def test_six_step_review_renders_evidence_and_causal_boundaries():
     assert "机器人方向二次分歧" in report
     assert "| 14:38 | 分歧转弱 | 双环传动(002472) |" in report
     assert "北向净额：+10.00亿元" in report
+    assert "宽基ETF份额推算净申购：+255.74亿元" in report
+    assert "申赎主体：未确认" in report
     assert "龙虎榜净额靠前：甲(000001) +2.00亿元" in report
     assert "【观察池，不构成推荐】" in report
     assert "以上为信息整理，不构成投资建议。" in report
@@ -300,6 +315,37 @@ def test_membership_fallback_uses_one_date_probe_and_one_relation_query(monkeypa
     assert by_stock["002472"] == {"机器人概念"}
     assert by_sector["机器人概念"] == {"002472"}
     assert source == "QMT概念快照 2026-10-23"
+
+
+def test_broad_etf_flow_snapshot_uses_measured_share_change(monkeypatch):
+    response = SimpleNamespace(
+        raise_for_status=lambda: None,
+        json=lambda: {
+            "status": "ok",
+            "trade_date": "2026-10-28",
+            "summary": {
+                "net_1d": 25_574_154_400,
+                "signal": "较强护盘型资金线索",
+                "confidence_label": "较低",
+                "identity_status": "未确认",
+                "coverage_pct": 100.0,
+            },
+            "coverage": {"available": 4, "expected": 4},
+        },
+    )
+    calls = []
+    monkeypatch.setattr(
+        "biz.review.six_step.requests.get",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or response,
+    )
+
+    snapshot = _broad_etf_flow_snapshot(pd.Timestamp("2026-10-28").date())
+
+    assert snapshot["status"] == "已获取"
+    assert snapshot["net_1d"] == 25_574_154_400
+    assert snapshot["available"] == 4
+    assert snapshot["identity_status"] == "未确认"
+    assert calls[0][1]["params"]["trade_date"] == "2026-10-28"
 
 
 def test_review_marks_missing_timeline_instead_of_inventing_causality():

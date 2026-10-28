@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import json
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Iterable, Mapping
 
 import pandas as pd
+import requests
 from sqlalchemy import bindparam, text
 
 
@@ -803,9 +805,83 @@ def _fund_section(
             else {}
         ),
         "north": north,
+        "etf": _broad_etf_flow_snapshot(target),
         "longhubang": longhubang,
         "notices": notice_items,
     }
+
+
+def _broad_etf_flow_snapshot(target: date) -> dict[str, Any]:
+    try:
+        response = requests.get(
+            "http://127.0.0.1:8000/api/hot-data/broad-etf-flow",
+            params={"trade_date": target.isoformat(), "days": 5},
+            timeout=15,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except (requests.RequestException, ValueError):
+        return {"status": "未获取"}
+    if not isinstance(payload, dict) or payload.get("status") == "error":
+        return {"status": "未获取"}
+    summary = payload.get("summary") or {}
+    coverage = payload.get("coverage") or {}
+    if summary.get("net_1d") is None:
+        return {"status": "未获取"}
+    return {
+        "status": "已获取",
+        "trade_date": payload.get("trade_date"),
+        "net_1d": _number(summary.get("net_1d")),
+        "net_3d": summary.get("net_3d"),
+        "net_5d": summary.get("net_5d"),
+        "signal": summary.get("signal"),
+        "confidence": summary.get("confidence"),
+        "confidence_label": summary.get("confidence_label"),
+        "identity_status": summary.get("identity_status"),
+        "coverage_pct": coverage.get("coverage_pct")
+        or summary.get("coverage_pct"),
+        "available": coverage.get("available"),
+        "expected": coverage.get("expected"),
+    }
+
+
+def _public_turnover_ratios(
+    target: date,
+    codes: Iterable[str],
+) -> dict[str, float]:
+    normalized = sorted({str(code).zfill(6) for code in codes if str(code).strip()})
+    if not normalized:
+        return {}
+    try:
+        from tools.crawl_stock_kline import fetch_kline, make_session
+    except Exception:
+        return {}
+    date_token = target.strftime("%Y%m%d")
+    session = make_session()
+
+    def load(code: str) -> tuple[str, float | None]:
+        try:
+            rows = fetch_kline(session, code, date_token, date_token)
+        except Exception:
+            return code, None
+        for row in rows or []:
+            if str(row.get("trade_date") or "")[:10] != target.isoformat():
+                continue
+            value = row.get("turnover_ratio")
+            if value is None:
+                continue
+            number = _number(value)
+            return (code, number) if number > 0 else (code, None)
+        return code, None
+
+    result: dict[str, float] = {}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [pool.submit(load, code) for code in normalized]
+        for future in as_completed(futures):
+            code, value = future.result()
+            if value is not None:
+                result[code] = value
+    return result
 
 
 def _watch_pool(
@@ -814,6 +890,7 @@ def _watch_pool(
     sectors: list[dict[str, Any]],
     by_sector: Mapping[str, set[str]],
     names: Mapping[str, str],
+    turnover_by_code: Mapping[str, float] | None = None,
 ) -> list[dict[str, Any]]:
     if bars.empty:
         return []
@@ -860,9 +937,12 @@ def _watch_pool(
             if code in selected_codes:
                 continue
             selected_codes.add(code)
+            turnover_value = row.get("turnover_ratio")
+            if pd.isna(turnover_value):
+                turnover_value = (turnover_by_code or {}).get(code)
             turnover = (
-                f"{_number(row.get('turnover_ratio')):.2f}%"
-                if pd.notna(row.get("turnover_ratio"))
+                f"{_number(turnover_value):.2f}%"
+                if turnover_value is not None and pd.notna(turnover_value)
                 else "未获取"
             )
             stocks.append({
@@ -881,6 +961,11 @@ def _watch_pool(
                     "高位连板波动"
                     if bool(row["is_limit"])
                     else "板块分歧或成交额萎缩"
+                ),
+                "turnover_ratio": (
+                    _number(turnover_value)
+                    if turnover_value is not None and pd.notna(turnover_value)
+                    else None
                 ),
                 "status": "已获取",
             })
@@ -1335,10 +1420,22 @@ def render_six_step(payload: Mapping[str, Any]) -> str:
     if flows.get("north") is not None:
         lines.append(
             f"- 北向净额：{_number(flows.get('north')) / 1e8:+.2f}亿元"
-            "（同花顺收盘净额口径）；ETF 净流入/流出：未获取。"
+            "（同花顺收盘净额口径）。"
         )
     else:
-        lines.append("- 北向净额：未获取（公开源未披露有效净额）；ETF 净流入/流出：未获取。")
+        lines.append("- 北向净额：未获取（公开源未披露有效净额）。")
+    etf = flows.get("etf") or {}
+    if etf.get("status") == "已获取":
+        lines.append(
+            f"- 宽基ETF份额推算净申购：{_number(etf.get('net_1d')) / 1e8:+.2f}亿元"
+            f"（{etf.get('trade_date') or '日期未获取'}，"
+            f"覆盖 {etf.get('available', '未获取')}/{etf.get('expected', '未获取')} 只；"
+            f"信号：{_plain(etf.get('signal'))}；"
+            f"置信度：{_plain(etf.get('confidence_label'))}；"
+            f"申赎主体：{_plain(etf.get('identity_status'))}）。"
+        )
+    else:
+        lines.append("- 宽基ETF份额推算净申购：未获取。")
     if flows.get("longhubang"):
         lines.append(
             "- 龙虎榜净额靠前："
@@ -1589,6 +1686,21 @@ def build_six_step_review(
         by_sector=watch_by_sector,
         names=names,
     )
+    missing_turnover_codes = [
+        stock["code"]
+        for sector in watch
+        for stock in sector.get("stocks") or []
+        if stock.get("turnover_ratio") is None
+    ]
+    public_turnover = _public_turnover_ratios(target, missing_turnover_codes)
+    if public_turnover:
+        watch = _watch_pool(
+            target_bars,
+            sectors=candidate_sectors,
+            by_sector=watch_by_sector,
+            names=names,
+            turnover_by_code=public_turnover,
+        )
     late_break_wave: list[dict[str, Any]] = []
     robot_breaks: list[dict[str, Any]] = []
     for item in broken:
@@ -1631,6 +1743,8 @@ def build_six_step_review(
         quality_notes.append(f"板块成员：{membership_source}")
     if not minute_times:
         quality_notes.append("目标日分钟数据未获取")
+    if public_turnover:
+        quality_notes.append("观察池换手率：东方财富历史日线")
     if not any(item.get("status") == "已获取" for item in indices):
         quality_notes.append("五大指数目标日数据未获取")
     payload = {
