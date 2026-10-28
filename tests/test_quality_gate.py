@@ -373,6 +373,52 @@ class QualityGateTaskTest(unittest.TestCase):
         validate_managed.assert_called_once_with(
             sentinel_engine,
             task_types=ensure_quality_gate.REVIEW_DELIVERY_TASK_TYPES,
+            intraday_alert_mode="shadow",
+        )
+
+    def test_main_live_intraday_mode_is_used_for_write_and_readback(self):
+        sentinel_engine = object()
+        with (
+            patch.object(
+                ensure_quality_gate,
+                "get_mysql_url",
+                return_value="mysql+pymysql://db",
+            ),
+            patch.object(
+                ensure_quality_gate,
+                "create_pooled_engine",
+                return_value=sentinel_engine,
+            ),
+            patch.object(
+                ensure_quality_gate,
+                "run",
+                return_value={"Intraday key market event alerts": "updated"},
+            ) as run,
+            patch.object(
+                ensure_quality_gate,
+                "validate_managed_task_contracts",
+                return_value={"intraday_market_alert": "validated"},
+            ) as validate_managed,
+        ):
+            self.assertEqual(
+                ensure_quality_gate.main([
+                    "--task-type",
+                    "intraday_market_alert",
+                    "--intraday-alert-mode",
+                    "live",
+                ]),
+                0,
+            )
+
+        run.assert_called_once_with(
+            sentinel_engine,
+            task_types={"intraday_market_alert"},
+            intraday_alert_mode="live",
+        )
+        validate_managed.assert_called_once_with(
+            sentinel_engine,
+            task_types={"intraday_market_alert"},
+            intraday_alert_mode="live",
         )
 
     def test_validate_cli_is_read_only(self):

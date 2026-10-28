@@ -776,6 +776,21 @@ def _managed_task_status(row: Mapping[str, Any]) -> str:
             and row.get("enabled") == 0 else "validated")
 
 
+def _task_definition_for_runtime(
+    task: Mapping[str, Any],
+    *,
+    intraday_alert_mode: str,
+) -> dict[str, Any]:
+    """Return the exact persisted payload for one runtime-selected task."""
+
+    if intraday_alert_mode not in {"shadow", "live"}:
+        raise ValueError("intraday_alert_mode must be shadow or live")
+    candidate = dict(task)
+    if candidate["task_type"] == "intraday_market_alert":
+        candidate["script_args"] = f"--mode {intraday_alert_mode} --json"
+    return candidate
+
+
 def upsert_task(engine: Engine, task: dict[str, Any]) -> str:
     columns = _table_columns(engine, "st_scheduled_tasks")
     payload = _task_payload(task, columns)
@@ -970,6 +985,7 @@ def validate_managed_task_contracts(
     engine: Engine,
     *,
     task_types: Iterable[str] | None = None,
+    intraday_alert_mode: str = "shadow",
 ) -> dict[str, str]:
     """Read back every selected release-owned scheduler row exactly once."""
 
@@ -980,7 +996,11 @@ def validate_managed_task_contracts(
     )
     expected = {
         str(task["task_type"]): {
-            key: task[key] for key in TASK_PAYLOAD_COLUMNS
+            key: _task_definition_for_runtime(
+                task,
+                intraday_alert_mode=intraday_alert_mode,
+            )[key]
+            for key in TASK_PAYLOAD_COLUMNS
         }
         for task in TASKS
         if str(task["task_type"]) in selected
@@ -1690,9 +1710,10 @@ def run(
     for task in TASKS:
         if task["task_type"] not in requested:
             continue
-        candidate = dict(task)
-        if candidate["task_type"] == "intraday_market_alert":
-            candidate["script_args"] = f"--mode {intraday_alert_mode} --json"
+        candidate = _task_definition_for_runtime(
+            task,
+            intraday_alert_mode=intraday_alert_mode,
+        )
         result[candidate["task_name"]] = upsert_task(engine, candidate)
     return result
 
@@ -1792,7 +1813,11 @@ def main(argv: list[str] | None = None) -> int:
             result["legacy stock_kline quarantine"] = (
                 f"disabled={disabled}"
             )
-        validate_managed_task_contracts(engine, task_types=selected_types)
+        validate_managed_task_contracts(
+            engine,
+            task_types=selected_types,
+            intraday_alert_mode=args.intraday_alert_mode,
+        )
         if (
             selected_types is not None
             and REQUIRED_DATA_COMPLETION_TASK_TYPES
