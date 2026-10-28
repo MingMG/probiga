@@ -60,7 +60,6 @@ from integrations.bigqmt.bridge import (
     SNAPSHOT_FRESHNESS_WINDOW_HHMM,
     level1_snapshot,
     native_snapshot_frame,
-    request_level1_refresh,
     session_freshness_reference,
 )
 from server.trading_v2.quotes import persist_quote_events
@@ -2269,7 +2268,6 @@ def run_daemon(*, qmt_home: Path, poll_seconds: float, tracked_limit: int,
     maintenance_state: dict[str, Any] = {"results": {}}
     last_maintenance_checks: dict[str, float] = {}
     last_tokens: dict[str, str] = {}
-    last_level1_refresh = 0.0
     while not stopped:
         try:
             interval = max(10.0, float(os.environ.get("BIG_QMT_WATCHLIST_REFRESH_SECONDS", "30")))
@@ -2291,31 +2289,6 @@ def run_daemon(*, qmt_home: Path, poll_seconds: float, tracked_limit: int,
                     now=datetime.now(),
                 )
                 result["level1_receipt"] = level1_receipt
-                refreshable = level1_receipt.get("reason") in {
-                    "no_fresh_live_snapshot",
-                    "tracked_snapshot_stale",
-                }
-                refresh_cooldown = max(
-                    5.0,
-                    float(
-                        os.environ.get(
-                            "BIG_QMT_LEVEL1_REFRESH_COOLDOWN_SECONDS",
-                            "20",
-                        )
-                    ),
-                )
-                current_mono = time.monotonic()
-                if (
-                    level1_receipt.get("status") != "PASS"
-                    and refreshable
-                    and current_mono - last_level1_refresh
-                    >= refresh_cooldown
-                ):
-                    result["level1_refresh"] = request_level1_refresh(
-                        qmt_home=qmt_home,
-                        now=datetime.now(),
-                    )
-                    last_level1_refresh = current_mono
             # Publish the first quote receipt before any optional slow job.
             # A post-close ETF run can take several minutes; running it before
             # ingest made a healthy cold consumer look dead to the supervisor.
