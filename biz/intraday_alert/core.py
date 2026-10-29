@@ -908,7 +908,9 @@ def advance_states(
                 "last_seen_at": now,
                 "updated_at": now,
             }
-            if previous.get("last_sent_state") in {"ENHANCED", "CONFIRMED"} and emitted < hard_cap:
+            if previous.get("last_sent_state") in {
+                "SUSPECTED", "ENHANCED", "CONFIRMED"
+            } and emitted < hard_cap:
                 emissions.append({**updated, "transition_name": "INVALIDATED"})
                 emitted += 1
                 updated["last_sent_state"] = "INVALIDATED"
@@ -954,7 +956,14 @@ def advance_states(
         cooldown_ready = cooldown_until is None or now >= cooldown_until
         upgrade = STATE_RANK.get(target, 0) > STATE_RANK.get(last_sent_state, 0)
         cap = hard_cap if int(event.get("severity") or 0) >= 3 else normal_cap
-        if target in {"ENHANCED", "CONFIRMED"} and state_changed and (upgrade or cooldown_ready) and emitted < cap:
+        first_material_suspected = (
+            target == "SUSPECTED"
+            and int(updated.get("severity") or 0) >= 2
+        )
+        if (
+            target in {"ENHANCED", "CONFIRMED"}
+            or first_material_suspected
+        ) and state_changed and (upgrade or cooldown_ready) and emitted < cap:
             emissions.append({**updated, "transition_name": target})
             emitted += 1
             updated["last_sent_state"] = target

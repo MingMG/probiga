@@ -114,6 +114,15 @@ def test_state_emits_transition_once_and_absence_does_not_claim_invalidation():
     assert emissions == []
 
 
+def test_material_suspected_event_is_sent_once_before_confirmation():
+    states, emissions = advance_states({}, [_event("SUSPECTED")], now=NOW)
+
+    assert [item["transition_name"] for item in emissions] == ["SUSPECTED"]
+    previous = {states[0]["event_key"]: states[0]}
+    _, emissions = advance_states(previous, [_event("SUSPECTED")], now=NOW)
+    assert emissions == []
+
+
 def test_explicit_opposite_evidence_invalidates_and_upgrade_bypasses_cooldown():
     states, _ = advance_states({}, [_event()], now=NOW)
     previous = {states[0]["event_key"]: states[0]}
