@@ -17,6 +17,8 @@ from server.common.release_data_readiness_contract import (
 NO_DEFAULT_DATE_TASK_TYPES = {
     "early_briefing",
     "evening_review",
+    "daily_data_closeout_repair",
+    "daily_data_closeout_verify",
     FINAL_POOL_WECOM_DELIVERY_TASK_TYPE,
     "intraday_market_alert",
     "market_overview_daily",
@@ -40,6 +42,7 @@ NO_DEFAULT_DATE_TASK_TYPES = {
 NO_DEFAULT_DATE_PATHS = {
     "biz/early_briefing/generate.py",
     "biz/evening_review/generate.py",
+    "tools/daily_data_closeout.py",
     "tools/run_intraday_market_alert.py",
     "biz/stock_market/sync_stock_snapshot.py",
     "tools/refresh_market_overview_daily.py",
@@ -379,7 +382,13 @@ def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: s
                 "release catch-up QMT range requires one latest-session selector"
             )
         args.remove("--latest-session")
-        args.extend(["--start-date", today, "--end-date", today])
+        if normalized_path in {
+            "tools/import_qmt_datadir_daily.py",
+            "tools/import_qmt_datadir_history.py",
+        }:
+            args.extend(["--start", today, "--end", today])
+        else:
+            args.extend(["--start-date", today, "--end-date", today])
         return args
     if release_catchup and task_type in RELEASE_QMT_TRADE_DATE_TARGET_TASK_TYPES:
         if not _is_iso_date_arg(today):
@@ -438,7 +447,7 @@ def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: s
         args.remove("--latest-session")
         args.extend(["--trade-date", today])
         return args
-    if task_type in RELEASE_EXPLICIT_TRADE_DATE_TARGET_TASK_TYPES:
+    if release_catchup and task_type in RELEASE_EXPLICIT_TRADE_DATE_TARGET_TASK_TYPES:
         if not _is_iso_date_arg(today):
             raise ValueError("provider target date is invalid")
         explicit_dates = _option_values(args, "--trade-date")

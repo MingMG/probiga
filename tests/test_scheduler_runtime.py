@@ -258,6 +258,8 @@ class SchedulerRuntimeTest(unittest.TestCase):
         scheduler_runtime._scheduler_stop_event = None
         scheduler_runtime._task_semaphore = None
         scheduler_runtime._fast_lane_semaphore = None
+        scheduler_runtime._bulk_history_semaphore = None
+        scheduler_runtime._provider_maintenance_semaphore = None
         scheduler_runtime._quote_lane_semaphore = None
         scheduler_runtime._alert_lane_semaphore = None
         scheduler_runtime._delivery_lane_semaphore = None
@@ -281,6 +283,7 @@ class SchedulerRuntimeTest(unittest.TestCase):
         scheduler_runtime._timeout_requested_task_ids.clear()
         scheduler_runtime._fast_lane_running_task_ids.clear()
         scheduler_runtime._bulk_history_running_task_ids.clear()
+        scheduler_runtime._provider_maintenance_running_task_ids.clear()
         scheduler_runtime._quote_lane_running_task_ids.clear()
         scheduler_runtime._alert_lane_running_task_ids.clear()
         scheduler_runtime._delivery_lane_running_task_ids.clear()
@@ -1292,25 +1295,21 @@ class SchedulerRuntimeTest(unittest.TestCase):
         })
 
     def test_auxiliary_jobs_leave_capacity_while_core_waits_for_dependencies(self):
-        core = {
-            "task_type": "stock_finance",
-            "_scheduler_target_available": False,
-            "_release_catchup_authorized": False,
-        }
+        provider = {"task_type": "stock_finance"}
         for limit in (2, 4):
             with self.subTest(limit=limit):
                 scheduler_runtime._running_task_ids.clear()
                 scheduler_runtime._running_task_ids.update(range(limit - 1))
-                for auxiliary in ("notice_eastmoney", "sector_heat_east"):
-                    self.assertFalse(scheduler_runtime._scheduler_lane_has_capacity(
-                        {"task_type": auxiliary}, max_general_tasks=limit,
-                    ))
                 self.assertTrue(scheduler_runtime._scheduler_lane_has_capacity(
-                    core, max_general_tasks=limit,
+                    provider, max_general_tasks=limit,
                 ))
-                scheduler_runtime._running_task_ids.add(123)
+                scheduler_runtime._running_task_ids.add(limit - 1)
                 self.assertFalse(scheduler_runtime._scheduler_lane_has_capacity(
-                    core, max_general_tasks=limit,
+                    {"task_type": "sector_heat_east"},
+                    max_general_tasks=limit,
+                ))
+                self.assertTrue(scheduler_runtime._scheduler_lane_has_capacity(
+                    provider, max_general_tasks=limit,
                 ))
 
     def test_core_tasks_can_use_existing_full_general_capacity(self):
@@ -1318,7 +1317,7 @@ class SchedulerRuntimeTest(unittest.TestCase):
         self.assertTrue(scheduler_runtime._scheduler_lane_has_capacity(
             {"task_type": "capital_flow_batch_fast"}, max_general_tasks=2,
         ))
-        self.assertFalse(scheduler_runtime._scheduler_lane_has_capacity(
+        self.assertTrue(scheduler_runtime._scheduler_lane_has_capacity(
             {"task_type": "notice_eastmoney"}, max_general_tasks=2,
         ))
         scheduler_runtime._running_task_ids.add(76)
@@ -1349,36 +1348,39 @@ class SchedulerRuntimeTest(unittest.TestCase):
     def test_running_finance_holds_reservation_without_blocking_independent_collection(self):
         scheduler_runtime._running_task_ids.add(123)
         scheduler_runtime._core_running_task_ids.add(123)
-        for task_type in ("sync_concept_ths", "stock_dividend_eastmoney", "notice_eastmoney_historical_repair"):
+        scheduler_runtime._provider_maintenance_running_task_ids.add(123)
+        for task_type in (
+            "sync_concept_ths",
+            "stock_dividend_eastmoney",
+            "notice_eastmoney_historical_repair",
+        ):
             self.assertTrue(scheduler_runtime._scheduler_lane_has_capacity(
                 {"task_type": task_type}, max_general_tasks=2,
             ))
-        scheduler_runtime._running_task_ids.add(27)
-        for task_type in ("stock_dividend_eastmoney", "analysis_fast"):
-            self.assertFalse(scheduler_runtime._scheduler_lane_has_capacity(
-                {"task_type": task_type}, max_general_tasks=2,
-            ))
-        scheduler_runtime._running_task_ids.discard(123)
-        # Even a stale core marker cannot spend the reservation after its task
-        # has exited. The remaining auxiliary job must leave room for the DAG.
+        scheduler_runtime._running_task_ids.update({27, 28})
         self.assertFalse(scheduler_runtime._scheduler_lane_has_capacity(
-            {"task_type": "stock_dividend_eastmoney"}, max_general_tasks=2,
+            {"task_type": "analysis_fast"}, max_general_tasks=2,
         ))
         self.assertTrue(scheduler_runtime._scheduler_lane_has_capacity(
-            {"task_type": "stock_finance"}, max_general_tasks=2,
+            {"task_type": "notice_eastmoney"}, max_general_tasks=2,
         ))
 
     def test_single_general_worker_retains_serial_core_and_auxiliary_execution(self):
-        for task_type in ("stock_finance", "notice_eastmoney", "sector_heat_east"):
+        for task_type in ("stock_finance", "notice_eastmoney"):
             with self.subTest(task_type=task_type):
                 scheduler_runtime._running_task_ids.clear()
                 self.assertTrue(scheduler_runtime._scheduler_lane_has_capacity(
                     {"task_type": task_type}, max_general_tasks=1,
                 ))
                 scheduler_runtime._running_task_ids.add(501)
-                self.assertFalse(scheduler_runtime._scheduler_lane_has_capacity(
+                self.assertTrue(scheduler_runtime._scheduler_lane_has_capacity(
                     {"task_type": task_type}, max_general_tasks=1,
                 ))
+        scheduler_runtime._running_task_ids.clear()
+        scheduler_runtime._running_task_ids.add(501)
+        self.assertFalse(scheduler_runtime._scheduler_lane_has_capacity(
+            {"task_type": "sector_heat_east"}, max_general_tasks=1,
+        ))
 
     def test_due_core_delivery_precedes_auxiliary_release_replays(self):
         now = datetime(2026, 9, 10, 10, 0)
@@ -1549,6 +1551,39 @@ class SchedulerRuntimeTest(unittest.TestCase):
             scheduler_runtime._scheduler_lane_has_capacity(
                 {"task_type": "evening_review"},
                 max_general_tasks=1,
+            )
+        )
+
+    def test_long_provider_syncs_cannot_consume_general_data_slots(self):
+        provider = {"task_type": "stock_finance"}
+        general = {"task_type": "qmt_stock_daily_canonical"}
+
+        self.assertTrue(
+            scheduler_runtime._uses_provider_maintenance_lane(provider)
+        )
+        self.assertIs(
+            scheduler_runtime._task_lane_semaphore(provider),
+            scheduler_runtime._get_provider_maintenance_semaphore(),
+        )
+        self.assertIsNot(
+            scheduler_runtime._task_lane_semaphore(provider),
+            scheduler_runtime._task_lane_semaphore(general),
+        )
+        scheduler_runtime._running_task_ids.update({601, 602})
+        scheduler_runtime._provider_maintenance_running_task_ids.update(
+            {601, 602}
+        )
+
+        self.assertFalse(
+            scheduler_runtime._scheduler_lane_has_capacity(
+                provider,
+                max_general_tasks=2,
+            )
+        )
+        self.assertTrue(
+            scheduler_runtime._scheduler_lane_has_capacity(
+                general,
+                max_general_tasks=2,
             )
         )
 

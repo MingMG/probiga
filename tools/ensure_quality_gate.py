@@ -667,6 +667,38 @@ TASKS = [
         "description": "盘后只读体检；确认采集、分析、推荐和调度链路是否跟上最新交易日。",
     },
     {
+        "task_name": "每日数据闭环自动补采",
+        "task_type": "daily_data_closeout_repair",
+        "group_name": "系统管理",
+        "script_path": "tools/daily_data_closeout.py",
+        "script_args": "--mode repair --json",
+        "cron_time": "21:50",
+        "interval_minutes": 0,
+        "enabled": 1,
+        "sort_order": 94,
+        "date_param": "",
+        "description": (
+            "收盘后只读核对日线、分钟线、资金流、指数、概念、热点和"
+            "关键采集回执；只对已结束且缺失的任务触发一次重试，并通过企微报告。"
+        ),
+    },
+    {
+        "task_name": "每日数据闭环最终复验",
+        "task_type": "daily_data_closeout_verify",
+        "group_name": "系统管理",
+        "script_path": "tools/daily_data_closeout.py",
+        "script_args": "--mode verify --json",
+        "cron_time": "23:20",
+        "interval_minutes": 0,
+        "enabled": 1,
+        "sort_order": 95,
+        "date_param": "",
+        "description": (
+            "再次核对落库覆盖与完整性回执，通过企微明确发送"
+            "“今日数据闭环完成”或全部剩余缺口。"
+        ),
+    },
+    {
         "task_name": "Intraday key market event alerts",
         "task_type": "intraday_market_alert",
         "group_name": "Intraday alerts",

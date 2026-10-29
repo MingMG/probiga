@@ -2607,7 +2607,7 @@ def _news_sync_output_status(
     payload = _news_sync_payload(output)
     if payload is None or return_code is None:
         return "failed"
-    expected_sources = ["cls", "eastmoney", "sina"]
+    required_sources = ["cls", "eastmoney", "sina"]
     try:
         started_at = _machine_timestamp(payload.get("batch_started_at"))
         finished_at = _machine_timestamp(payload.get("batch_finished_at"))
@@ -2620,7 +2620,17 @@ def _news_sync_output_status(
         source_results = payload["source_results"]
     except (KeyError, TypeError, ValueError, OverflowError):
         return "failed"
-    if not isinstance(source_results, Mapping) or set(source_results) != set(expected_sources):
+    if not isinstance(source_results, Mapping):
+        return "failed"
+    expected_sources = sorted(
+        set(required_sources)
+        | (
+            {"federal_reserve"}
+            if "federal_reserve" in source_results
+            else set()
+        )
+    )
+    if set(source_results) != set(expected_sources):
         return "failed"
     successful: list[str] = []
     nonempty: list[str] = []

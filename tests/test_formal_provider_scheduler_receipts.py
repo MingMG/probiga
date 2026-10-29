@@ -407,3 +407,67 @@ def test_news_scheduler_recomputes_fresh_persisted_batch_hash():
     )
     assert result.ok is True
     assert "rows=1" in result.message
+
+
+def test_news_sync_output_status_accepts_optional_federal_reserve_source():
+    started_at = datetime(2026, 10, 29, 19, 10, 39)
+    source_results = {
+        "cls": {
+            "status": "SUCCESS",
+            "outcome": "NONEMPTY",
+            "requested_pages": 2,
+            "fetched_count": 40,
+            "health_schema": "probiga.news-source-health.v1",
+            "latest_publish_time": "2026-10-29T19:10:30",
+            "latest_age_seconds": 9,
+            "max_age_seconds": 86400,
+        },
+        "eastmoney": {
+            "status": "SUCCESS",
+            "outcome": "NONEMPTY",
+            "requested_pages": 1,
+            "fetched_count": 20,
+            "health_schema": "probiga.news-source-health.v1",
+            "latest_publish_time": "2026-10-29T19:04:38",
+            "latest_age_seconds": 361,
+            "max_age_seconds": 86400,
+        },
+        "federal_reserve": {
+            "status": "SUCCESS",
+            "outcome": "NONEMPTY",
+            "requested_pages": 1,
+            "fetched_count": 1,
+            "health_schema": "probiga.news-source-health.v1",
+            "latest_publish_time": "2026-10-29T02:00:00",
+            "latest_age_seconds": 61839,
+            "max_age_seconds": 86400,
+        },
+        "sina": {
+            "status": "SUCCESS",
+            "outcome": "NONEMPTY",
+            "requested_pages": 1,
+            "fetched_count": 20,
+            "health_schema": "probiga.news-source-health.v1",
+            "latest_publish_time": "2026-10-29T19:10:30",
+            "latest_age_seconds": 9,
+            "max_age_seconds": 86400,
+        },
+    }
+    receipt = news._receipt(
+        status="PASS",
+        started_at=started_at,
+        finished_at=started_at,
+        source_results=source_results,
+        pages=2,
+        evidence={
+            "persisted_count": 81,
+            "latest_publish_time": "2026-10-29T19:10:30",
+            "row_hash": "5a843b4e1f6078a8d4b145f29e16c239e727129ad7fdf825b271530c1b6ec276",
+        },
+    )
+
+    assert scheduler_validation.scheduler_output_status(
+        {"task_type": "news_sync"},
+        json.dumps(receipt, ensure_ascii=False, sort_keys=True),
+        return_code=0,
+    ) == "success"

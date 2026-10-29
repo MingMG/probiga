@@ -515,6 +515,7 @@ _timeout_pending_task_ids: set[int] = set()
 _timeout_requested_task_ids: set[int] = set()
 _fast_lane_running_task_ids: set[int] = set()
 _bulk_history_running_task_ids: set[int] = set()
+_provider_maintenance_running_task_ids: set[int] = set()
 _quote_lane_running_task_ids: set[int] = set()
 _alert_lane_running_task_ids: set[int] = set()
 _delivery_lane_running_task_ids: set[int] = set()
@@ -534,6 +535,7 @@ _delegated_skip_logged_for: set[tuple[int, str]] = set()
 _task_semaphore: threading.Semaphore | None = None
 _fast_lane_semaphore: threading.Semaphore | None = None
 _bulk_history_semaphore: threading.Semaphore | None = None
+_provider_maintenance_semaphore: threading.Semaphore | None = None
 _quote_lane_semaphore: threading.Semaphore | None = None
 _alert_lane_semaphore: threading.Semaphore | None = None
 _delivery_lane_semaphore: threading.Semaphore | None = None
@@ -699,9 +701,18 @@ ALERT_LANE_TASK_TYPES = {
 # report, while report generation must not delay intraday safety checks.
 USER_DELIVERY_LANE_TASK_TYPES = {
     FINAL_POOL_WECOM_DELIVERY_TASK_TYPE,
+    "daily_data_closeout_repair",
+    "daily_data_closeout_verify",
     "news_daily",
     "daily_review",
     "evening_review",
+}
+PROVIDER_MAINTENANCE_LANE_TASK_TYPES = {
+    "notice_eastmoney",
+    "notice_eastmoney_historical_repair",
+    "stock_finance",
+    "stock_finance_historical_repair",
+    "stock_dividend_eastmoney",
 }
 PACKAGED_RESEARCH_POOL_SEED_SCRIPT = (
     "tools/run_trading_v3_research_pool.py"
@@ -4436,6 +4447,7 @@ def _cleanup_stale_running_tasks(engine) -> int:
                     _core_running_task_ids.discard(task_id)
                     _fast_lane_running_task_ids.discard(task_id)
                     _bulk_history_running_task_ids.discard(task_id)
+                    _provider_maintenance_running_task_ids.discard(task_id)
                     _quote_lane_running_task_ids.discard(task_id)
                     _alert_lane_running_task_ids.discard(task_id)
                     _delivery_lane_running_task_ids.discard(task_id)
@@ -4450,6 +4462,7 @@ def _cleanup_stale_running_tasks(engine) -> int:
                     _core_running_task_ids.discard(task_id)
                     _fast_lane_running_task_ids.discard(task_id)
                     _bulk_history_running_task_ids.discard(task_id)
+                    _provider_maintenance_running_task_ids.discard(task_id)
                     _quote_lane_running_task_ids.discard(task_id)
                     _alert_lane_running_task_ids.discard(task_id)
                     _delivery_lane_running_task_ids.discard(task_id)
@@ -5520,14 +5533,18 @@ def _get_task_semaphore() -> threading.Semaphore:
 
 
 def _uses_bulk_history_lane(row: dict) -> bool:
-    # These publishers allocate live history frames inside the signed-in QMT
-    # process. Canonical stock/index DAT imports are intentionally absent: they
-    # read the completed local cache and must not block the native quote lane.
+    # Serialize QMT history-frame and DAT-cache publishers. This protects both
+    # the signed-in terminal and the two-worker general marketplace pipeline;
+    # native quote and user-delivery lanes remain independent.
     return str(row.get("task_type") or "").strip() in {
         "qmt_local_history_2024",
         "qmt_local_gap_repair_execute",
         "qmt_canonical_history_gap_repair",
+        "qmt_stock_daily_canonical",
+        "qmt_stock_minute_canonical",
         "qmt_stock_minute_flow_canonical",
+        "qmt_index_kline",
+        "qmt_index_minute",
         "etf_forward_daily",
     }
 
@@ -5537,6 +5554,20 @@ def _get_bulk_history_semaphore() -> threading.Semaphore:
     if _bulk_history_semaphore is None:
         _bulk_history_semaphore = threading.Semaphore(1)
     return _bulk_history_semaphore
+
+
+def _uses_provider_maintenance_lane(row: dict) -> bool:
+    return (
+        str(row.get("task_type") or "").strip()
+        in PROVIDER_MAINTENANCE_LANE_TASK_TYPES
+    )
+
+
+def _get_provider_maintenance_semaphore() -> threading.Semaphore:
+    global _provider_maintenance_semaphore
+    if _provider_maintenance_semaphore is None:
+        _provider_maintenance_semaphore = threading.Semaphore(2)
+    return _provider_maintenance_semaphore
 
 
 def _uses_fast_lane(row: dict) -> bool:
@@ -5617,6 +5648,8 @@ def _get_delivery_lane_semaphore() -> threading.Semaphore:
 def _task_lane_semaphore(row: dict) -> threading.Semaphore:
     if _uses_bulk_history_lane(row):
         return _get_bulk_history_semaphore()
+    if _uses_provider_maintenance_lane(row):
+        return _get_provider_maintenance_semaphore()
     if _uses_quote_lane(row):
         return _get_quote_lane_semaphore()
     if _uses_alert_lane(row):
@@ -5642,12 +5675,15 @@ def _scheduler_lane_has_capacity(row: dict, *, max_general_tasks: int) -> bool:
         return len(_delivery_lane_running_task_ids) < 1
     if _uses_bulk_history_lane(row):
         return len(_bulk_history_running_task_ids) < 1
+    if _uses_provider_maintenance_lane(row):
+        return len(_provider_maintenance_running_task_ids) < 2
     if _uses_fast_lane(row):
         return len(_fast_lane_running_task_ids) < 1
     general_ids = (
         _running_task_ids
         - _fast_lane_running_task_ids
         - _bulk_history_running_task_ids
+        - _provider_maintenance_running_task_ids
         - _quote_lane_running_task_ids
         - _delivery_lane_running_task_ids
         - _alert_lane_running_task_ids
@@ -9794,6 +9830,7 @@ def _release_task_registry(task_id, history_run_uid):
             _service_stop_requested_task_ids, _timeout_pending_task_ids,
             _timeout_requested_task_ids, _running_task_ids, _core_running_task_ids,
             _fast_lane_running_task_ids, _bulk_history_running_task_ids,
+            _provider_maintenance_running_task_ids,
             _quote_lane_running_task_ids, _alert_lane_running_task_ids,
             _delivery_lane_running_task_ids, _exclusive_running_task_ids):
         values.discard(task_id)
@@ -9960,6 +9997,8 @@ def launch_scheduler_task(
             _fast_lane_running_task_ids.add(task_id)
         if _uses_bulk_history_lane(row):
             _bulk_history_running_task_ids.add(task_id)
+        if _uses_provider_maintenance_lane(row):
+            _provider_maintenance_running_task_ids.add(task_id)
         if _uses_quote_lane(row):
             _quote_lane_running_task_ids.add(task_id)
         if _uses_alert_lane(row):
@@ -9977,6 +10016,7 @@ def launch_scheduler_task(
             _core_running_task_ids.discard(task_id)
             _fast_lane_running_task_ids.discard(task_id)
             _bulk_history_running_task_ids.discard(task_id)
+            _provider_maintenance_running_task_ids.discard(task_id)
             _quote_lane_running_task_ids.discard(task_id)
             _alert_lane_running_task_ids.discard(task_id)
             _delivery_lane_running_task_ids.discard(task_id)
@@ -9988,6 +10028,7 @@ def launch_scheduler_task(
             _core_running_task_ids.discard(task_id)
             _fast_lane_running_task_ids.discard(task_id)
             _bulk_history_running_task_ids.discard(task_id)
+            _provider_maintenance_running_task_ids.discard(task_id)
             _quote_lane_running_task_ids.discard(task_id)
             _alert_lane_running_task_ids.discard(task_id)
             _delivery_lane_running_task_ids.discard(task_id)
@@ -10020,6 +10061,7 @@ def launch_scheduler_task(
             _core_running_task_ids.discard(task_id)
             _fast_lane_running_task_ids.discard(task_id)
             _bulk_history_running_task_ids.discard(task_id)
+            _provider_maintenance_running_task_ids.discard(task_id)
             _quote_lane_running_task_ids.discard(task_id)
             _alert_lane_running_task_ids.discard(task_id)
             _delivery_lane_running_task_ids.discard(task_id)
@@ -10048,6 +10090,7 @@ def launch_scheduler_task(
             _core_running_task_ids.discard(task_id)
             _fast_lane_running_task_ids.discard(task_id)
             _bulk_history_running_task_ids.discard(task_id)
+            _provider_maintenance_running_task_ids.discard(task_id)
             _quote_lane_running_task_ids.discard(task_id)
             _alert_lane_running_task_ids.discard(task_id)
             _delivery_lane_running_task_ids.discard(task_id)
@@ -10084,6 +10127,7 @@ def launch_scheduler_task(
             _core_running_task_ids.discard(task_id)
             _fast_lane_running_task_ids.discard(task_id)
             _bulk_history_running_task_ids.discard(task_id)
+            _provider_maintenance_running_task_ids.discard(task_id)
             _quote_lane_running_task_ids.discard(task_id)
             _alert_lane_running_task_ids.discard(task_id)
             _delivery_lane_running_task_ids.discard(task_id)
@@ -10517,6 +10561,7 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                         continue
                     uses_delivery_lane = _uses_delivery_lane(row)
                     uses_fast_lane = _uses_fast_lane(row)
+                    uses_provider_lane = _uses_provider_maintenance_lane(row)
                     uses_quote_lane = _uses_quote_lane(row)
                     uses_alert_lane = _uses_alert_lane(row)
                     uses_exclusive_lane = _uses_exclusive_lane(row)
@@ -10538,6 +10583,12 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                     ):
                         logger.debug("Scheduler delivery lane full; defer task %s", task_name)
                         continue
+                    if uses_provider_lane and not _scheduler_lane_has_capacity(
+                        row,
+                        max_general_tasks=max_pending_tasks,
+                    ):
+                        logger.debug("Scheduler provider lane full; defer task %s", task_name)
+                        continue
                     if uses_fast_lane and not _scheduler_lane_has_capacity(
                         row,
                         max_general_tasks=max_pending_tasks,
@@ -10548,6 +10599,7 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                         not uses_alert_lane
                         and not uses_delivery_lane
                         and not uses_fast_lane
+                        and not uses_provider_lane
                         and not uses_quote_lane
                         and not _scheduler_lane_has_capacity(
                             row,
@@ -10567,6 +10619,8 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                         _fast_lane_running_task_ids.add(int(task_id))
                     if _uses_bulk_history_lane(row):
                         _bulk_history_running_task_ids.add(int(task_id))
+                    if uses_provider_lane:
+                        _provider_maintenance_running_task_ids.add(int(task_id))
                     if uses_quote_lane:
                         _quote_lane_running_task_ids.add(int(task_id))
                     if uses_alert_lane:
@@ -10585,6 +10639,7 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                         _core_running_task_ids.discard(int(task_id))
                         _fast_lane_running_task_ids.discard(int(task_id))
                         _bulk_history_running_task_ids.discard(int(task_id))
+                        _provider_maintenance_running_task_ids.discard(int(task_id))
                         _quote_lane_running_task_ids.discard(int(task_id))
                         _alert_lane_running_task_ids.discard(int(task_id))
                         _delivery_lane_running_task_ids.discard(int(task_id))
@@ -10597,6 +10652,7 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                         _core_running_task_ids.discard(int(task_id))
                         _fast_lane_running_task_ids.discard(int(task_id))
                         _bulk_history_running_task_ids.discard(int(task_id))
+                        _provider_maintenance_running_task_ids.discard(int(task_id))
                         _quote_lane_running_task_ids.discard(int(task_id))
                         _alert_lane_running_task_ids.discard(int(task_id))
                         _delivery_lane_running_task_ids.discard(int(task_id))
@@ -10621,6 +10677,7 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                         _core_running_task_ids.discard(int(task_id))
                         _fast_lane_running_task_ids.discard(int(task_id))
                         _bulk_history_running_task_ids.discard(int(task_id))
+                        _provider_maintenance_running_task_ids.discard(int(task_id))
                         _quote_lane_running_task_ids.discard(int(task_id))
                         _alert_lane_running_task_ids.discard(int(task_id))
                         _delivery_lane_running_task_ids.discard(int(task_id))
@@ -10658,6 +10715,7 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                         _core_running_task_ids.discard(int(task_id))
                         _fast_lane_running_task_ids.discard(int(task_id))
                         _bulk_history_running_task_ids.discard(int(task_id))
+                        _provider_maintenance_running_task_ids.discard(int(task_id))
                         _quote_lane_running_task_ids.discard(int(task_id))
                         _alert_lane_running_task_ids.discard(int(task_id))
                         _delivery_lane_running_task_ids.discard(int(task_id))

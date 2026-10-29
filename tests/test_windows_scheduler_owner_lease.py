@@ -182,6 +182,7 @@ def lease_case(tmp_path, monkeypatch):
         ("_timeout_pending_task_ids", set()), ("_timeout_requested_task_ids", set()),
         ("_core_running_task_ids", set()),
         ("_fast_lane_running_task_ids", set()), ("_bulk_history_running_task_ids", set()),
+        ("_provider_maintenance_running_task_ids", set()),
         ("_quote_lane_running_task_ids", set()), ("_alert_lane_running_task_ids", set()),
         ("_delivery_lane_running_task_ids", set()), ("_exclusive_running_task_ids", set()),
     ):

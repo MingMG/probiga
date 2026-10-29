@@ -552,6 +552,39 @@ def test_release_qmt_range_tasks_replace_latest_with_exact_target(
     ]
 
 
+@pytest.mark.parametrize(
+    ("task_type", "script_path"),
+    (
+        ("qmt_stock_daily_canonical", "tools/import_qmt_datadir_daily.py"),
+        ("qmt_stock_minute_canonical", "tools/import_qmt_datadir_history.py"),
+    ),
+)
+def test_release_qmt_datadir_importers_use_their_start_end_contract(
+    task_type,
+    script_path,
+):
+    args = build_scheduler_task_args(
+        {
+            "task_type": task_type,
+            "script_args": "--latest-session --replace-existing --apply --json",
+            "date_param": "",
+            "_trigger_source": "release_catchup",
+        },
+        script_path,
+        "2026-08-26",
+    )
+
+    assert args == [
+        "--replace-existing",
+        "--apply",
+        "--json",
+        "--start",
+        "2026-08-26",
+        "--end",
+        "2026-08-26",
+    ]
+
+
 def test_release_membership_uses_read_only_exact_snapshot_verification():
     row = {
         "task_type": "qmt_membership_snapshot",
