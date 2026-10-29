@@ -14,6 +14,7 @@ import logging
 import math
 import re
 import statistics
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -1331,7 +1332,10 @@ def run_intraday_scan(
         return {"status": "skipped", "reason": "non_trading_day", "mode": normalized_mode}
 
     ensure_intraday_alert_tables(main_engine)
-    snapshot = load_validated_snapshot(current_engine, now=observed_at)
+    snapshot = _load_validated_snapshot_with_retry(
+        current_engine,
+        now=observed_at,
+    )
     observation_id = make_observation_id(snapshot.receipt)
     warnings = list(snapshot.warnings)
     membership, sector_metadata = load_sector_membership(main_engine, trade_date=observed_at.date())
@@ -1459,6 +1463,28 @@ def run_intraday_scan(
         "delivered": delivered,
         "warnings": warnings,
     }
+
+
+def _load_validated_snapshot_with_retry(
+    current_engine: Engine,
+    *,
+    now: datetime,
+    loader: Callable[..., ValidatedSnapshot] = load_validated_snapshot,
+) -> ValidatedSnapshot:
+    """Absorb the short snapshot/receipt publication race without stale reuse."""
+
+    for attempt in range(3):
+        try:
+            return loader(current_engine, now=now)
+        except QualityGateError as exc:
+            if exc.code not in {
+                "snapshot_batch_mismatch",
+                "snapshot_row_shortfall",
+                "receipt_stale",
+            } or attempt == 2:
+                raise
+            time.sleep(2)
+    raise AssertionError("bounded snapshot retry exhausted")
 
 
 __all__ = [

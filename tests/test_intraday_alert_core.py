@@ -14,6 +14,7 @@ from biz.intraday_alert.core import (
     prepare_benchmark_snapshot,
     validate_qmt_snapshot,
     _fetch_tencent_benchmark_quotes,
+    _load_validated_snapshot_with_retry,
 )
 
 
@@ -300,6 +301,28 @@ def test_tencent_benchmark_fallback_returns_exact_intraday_evidence(monkeypatch)
     assert quotes[0]["change_pct"] == -1.23
     assert quotes[0]["amount"] == 160_952_330_000
     assert quotes[0]["source_time"] == NOW.replace(second=0)
+
+
+def test_snapshot_publication_race_is_retried_within_bound(monkeypatch):
+    expected = object()
+    calls = []
+
+    def loader(_engine, *, now):
+        calls.append(now)
+        if len(calls) < 3:
+            raise QualityGateError("snapshot_batch_mismatch", "race")
+        return expected
+
+    monkeypatch.setattr("biz.intraday_alert.core.time.sleep", lambda _seconds: None)
+
+    result = _load_validated_snapshot_with_retry(
+        object(),
+        now=NOW,
+        loader=loader,
+    )
+
+    assert result is expected
+    assert calls == [NOW, NOW, NOW]
 
 
 def test_render_adapter_passes_complete_observation(monkeypatch):
