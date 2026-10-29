@@ -52,10 +52,18 @@ def _fetch_sina(client: Any, pages: int) -> list[dict[str, Any]]:
     return fetch_sina(client, pages)
 
 
+def _fetch_federal_reserve(client: Any, pages: int) -> list[dict[str, Any]]:
+    del client, pages
+    from biz.news.official_macro import fetch_official_macro_news
+
+    return fetch_official_macro_news()
+
+
 SOURCE_FETCHERS: dict[str, Callable[[Any, int], list[dict[str, Any]]]] = {
     "cls": _fetch_cls,
     "eastmoney": _fetch_eastmoney,
     "sina": _fetch_sina,
+    "federal_reserve": _fetch_federal_reserve,
 }
 
 

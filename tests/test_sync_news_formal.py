@@ -89,6 +89,7 @@ def test_formal_news_reports_each_source_and_verifies_db_readback(monkeypatch):
         "cls": lambda _client, pages: [_item("cls", "c1", 1), _item("cls", "c2", 2)],
         "eastmoney": lambda _client, pages: [],
         "sina": lambda _client, pages: (_ for _ in ()).throw(RuntimeError("blocked")),
+        "federal_reserve": lambda _client, pages: [_item("federal_reserve", "fed1")],
     }
 
     receipt = news.sync_news_formal(
@@ -100,16 +101,18 @@ def test_formal_news_reports_each_source_and_verifies_db_readback(monkeypatch):
     )
 
     assert receipt["status"] == "PARTIAL"
-    assert receipt["attempted_sources"] == ["cls", "eastmoney", "sina"]
-    assert receipt["successful_sources"] == ["cls"]
-    assert receipt["nonempty_sources"] == ["cls"]
+    assert receipt["attempted_sources"] == [
+        "cls", "eastmoney", "federal_reserve", "sina"
+    ]
+    assert receipt["successful_sources"] == ["cls", "federal_reserve"]
+    assert receipt["nonempty_sources"] == ["cls", "federal_reserve"]
     assert receipt["empty_sources"] == []
     assert receipt["failed_sources"] == ["eastmoney", "sina"]
     assert receipt["source_results"]["cls"]["fetched_count"] == 2
     assert receipt["source_results"]["eastmoney"]["status"] == "FAILED"
     assert "EMPTY_UNPROVEN" in receipt["source_results"]["eastmoney"]["error"]
     assert receipt["source_results"]["sina"]["status"] == "FAILED"
-    assert receipt["evidence"]["persisted_count"] == 2
+    assert receipt["evidence"]["persisted_count"] == 3
     assert receipt["evidence"]["latest_publish_time"] == "2026-08-26T17:02:00"
     assert len(receipt["evidence"]["row_hash"]) == 64
     assert receipt["delivery_attempted"] is False
@@ -154,6 +157,7 @@ def test_invalid_rows_fail_only_their_source_when_another_source_is_valid(monkey
         "cls": lambda _client, _pages: [bad],
         "eastmoney": lambda _client, _pages: [_item("eastmoney", "e1")],
         "sina": lambda _client, _pages: [],
+        "federal_reserve": lambda _client, _pages: [_item("federal_reserve", "f1")],
     }
 
     receipt = news.sync_news_formal(
@@ -165,9 +169,9 @@ def test_invalid_rows_fail_only_their_source_when_another_source_is_valid(monkey
 
     assert receipt["status"] == "PARTIAL"
     assert receipt["failed_sources"] == ["cls", "sina"]
-    assert receipt["successful_sources"] == ["eastmoney"]
-    assert receipt["nonempty_sources"] == ["eastmoney"]
-    assert receipt["evidence"]["persisted_count"] == 1
+    assert receipt["successful_sources"] == ["eastmoney", "federal_reserve"]
+    assert receipt["nonempty_sources"] == ["eastmoney", "federal_reserve"]
+    assert receipt["evidence"]["persisted_count"] == 2
 
 
 def test_readback_mismatch_raises_inside_transaction_and_rolls_back(monkeypatch):
@@ -211,7 +215,9 @@ def test_formal_news_cli_failure_is_one_hashed_receipt_and_nonzero(monkeypatch, 
     assert len(lines) == 1
     receipt = json.loads(lines[0])
     assert receipt["status"] == "FAILED"
-    assert receipt["failed_sources"] == ["cls", "eastmoney", "sina"]
+    assert receipt["failed_sources"] == [
+        "cls", "eastmoney", "federal_reserve", "sina"
+    ]
     assert receipt["delivery_attempted"] is False
     assert receipt["receipt_id"] == _receipt_hash(receipt)
 
@@ -275,12 +281,13 @@ def test_stale_source_cannot_hide_behind_fresh_other_sources(monkeypatch):
         "cls": lambda *_args: [stale],
         "eastmoney": lambda *_args: [_item("eastmoney", "e1")],
         "sina": lambda *_args: [_item("sina", "s1")],
+        "federal_reserve": lambda *_args: [_item("federal_reserve", "f1")],
     }
     receipt = news.sync_news_formal(engine, client=object(), fetchers=fetchers, now=NOW)
     assert receipt["status"] == "PARTIAL"
     assert receipt["failed_sources"] == ["cls"]
     assert "STALE_OR_FUTURE_FEED" in receipt["source_results"]["cls"]["error"]
-    assert receipt["evidence"]["persisted_count"] == 2
+    assert receipt["evidence"]["persisted_count"] == 3
     assert engine.committed
 
 
