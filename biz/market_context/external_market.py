@@ -8,9 +8,11 @@ instead of silently treating them as neutral.
 """
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import math
+import re
 import uuid
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -41,6 +43,11 @@ MAX_QUOTE_AGE_SECONDS = 96 * 60 * 60
 def _public_json(request: Request, *, timeout: int) -> dict[str, Any]:
     with build_opener(ProxyHandler({})).open(request, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def _public_text(request: Request, *, timeout: int, encoding: str) -> str:
+    with build_opener(ProxyHandler({})).open(request, timeout=timeout) as response:
+        return response.read().decode(encoding, errors="replace")
 
 EXTERNAL_MARKET_SYMBOLS: tuple[tuple[str, str], ...] = (
     ("nasdaq", "美股纳斯达克"),
@@ -128,6 +135,28 @@ _YAHOO_FALLBACK_MAP = {
     "jp_auto": "7203.T",
     "jp_battery": "6752.T",
     "taiwan_semiconductor": "2330.TW",
+}
+
+_TENCENT_QUOTE_MAP = {
+    "nasdaq": "usIXIC",
+    "sp500": "usINX",
+    "dow": "usDJI",
+    "hang_seng": "hkHSI",
+    "us_semiconductor": "usSOXX",
+    "us_ai": "usAIQ",
+    "us_robotics": "usBOTZ",
+    "crude_oil": "hf_CL",
+    "gold": "hf_GC",
+    "silver": "hf_SI",
+    "copper": "hf_HG",
+}
+
+_SINA_FALLBACK_MAP = {
+    "a50": "hf_CHA50CFD",
+    "usdcnh": "fx_susdcnh",
+    "usdjpy": "fx_susdjpy",
+    "usdkrw": "fx_usdkrw",
+    "usdhkd": "fx_usdhkd",
 }
 
 # Exact source-side market and instrument identities verified against the
@@ -421,6 +450,281 @@ def _fetch_yahoo_fallback_item(
     )
 
 
+def _validated_market_time(value: Any, *, captured_at: datetime) -> datetime:
+    parsed = _as_datetime(value)
+    if parsed is None:
+        raise ValueError("source quote timestamp is missing")
+    age = (_shanghai_naive(captured_at) - parsed).total_seconds()
+    if age < -300 or age > MAX_QUOTE_AGE_SECONDS:
+        raise ValueError(f"source quote timestamp is stale or future: age_seconds={age:.0f}")
+    return parsed
+
+
+def _fallback_item(
+    symbol: str,
+    *,
+    price: float,
+    previous_close: float,
+    change_pct: float,
+    market_time: datetime,
+    source: str,
+    raw_code: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "symbol": symbol,
+        "display_name": dict(EXTERNAL_MARKET_SYMBOLS)[symbol],
+        "price": price,
+        "previous_close": previous_close,
+        "change_pct": change_pct,
+        "market_time": market_time.isoformat(sep=" "),
+        "availability": "available",
+        "source": source,
+        "raw_code": raw_code,
+        "payload": payload or {},
+    }
+
+
+def _parse_tencent_quote(
+    symbol: str,
+    value: str,
+    *,
+    captured_at: datetime,
+) -> dict[str, Any]:
+    raw_code = _TENCENT_QUOTE_MAP[symbol]
+    if raw_code.startswith("hf_"):
+        parts = value.split(",")
+        if len(parts) < 13:
+            raise ValueError("Tencent commodity quote is truncated")
+        price = _number(parts[0])
+        change_pct = _number(parts[1])
+        previous = _number(parts[7])
+        market_time_text = f"{parts[12]} {parts[6]}"
+    else:
+        parts = value.split("~")
+        if len(parts) < 33:
+            raise ValueError("Tencent quote is truncated")
+        price = _number(parts[3])
+        previous = _number(parts[4])
+        change_pct = _number(parts[32])
+        market_time_text = parts[30]
+    if (
+        price is None
+        or price <= 0
+        or previous is None
+        or previous <= 0
+        or change_pct is None
+    ):
+        raise ValueError("Tencent quote lacks usable price or change")
+    market_time = _validated_market_time(
+        market_time_text,
+        captured_at=captured_at,
+    )
+    return _fallback_item(
+        symbol,
+        price=price,
+        previous_close=previous,
+        change_pct=change_pct,
+        market_time=market_time,
+        source="tencent.qt",
+        raw_code=raw_code,
+        payload={"source_timestamp": market_time_text},
+    )
+
+
+def _load_tencent_fallback_items(
+    symbols: Iterable[str],
+    *,
+    captured_at: datetime,
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    requested = [symbol for symbol in dict.fromkeys(symbols) if symbol in _TENCENT_QUOTE_MAP]
+    if not requested:
+        return {}, []
+    raw_codes = ",".join(_TENCENT_QUOTE_MAP[symbol] for symbol in requested)
+    request = Request(
+        "https://qt.gtimg.cn/q=" + raw_codes,
+        headers={"User-Agent": "Mozilla/5.0", "Referer": "https://gu.qq.com/"},
+    )
+    text = _public_text(request, timeout=12, encoding="gb18030")
+    by_code = {}
+    for raw_line in text.splitlines():
+        match = re.match(r'^v_([A-Za-z0-9_]+)="(.*)";?$', raw_line.strip())
+        if match:
+            by_code[match.group(1)] = match.group(2)
+    items: dict[str, dict[str, Any]] = {}
+    errors: list[str] = []
+    for symbol in requested:
+        raw_code = _TENCENT_QUOTE_MAP[symbol]
+        try:
+            value = by_code.get(raw_code)
+            if not value:
+                raise ValueError("requested instrument missing from response")
+            items[symbol] = _parse_tencent_quote(
+                symbol,
+                value,
+                captured_at=captured_at,
+            )
+        except Exception as exc:
+            errors.append(f"tencent {symbol}: {type(exc).__name__}: {exc}")
+    return items, errors
+
+
+def _parse_sina_quote(
+    symbol: str,
+    value: str,
+    *,
+    captured_at: datetime,
+) -> dict[str, Any]:
+    raw_code = _SINA_FALLBACK_MAP[symbol]
+    parts = value.split(",")
+    if raw_code.startswith("hf_"):
+        if len(parts) < 13:
+            raise ValueError("Sina futures quote is truncated")
+        price = _number(parts[0])
+        previous = _number(parts[7])
+        market_time_text = f"{parts[12]} {parts[6]}"
+        change_pct = (
+            (price - previous) / previous * 100.0
+            if price is not None and previous not in (None, 0.0)
+            else None
+        )
+    elif raw_code.startswith("fx_"):
+        if len(parts) < 11:
+            raise ValueError("Sina FX quote is truncated")
+        price = _number(parts[1])
+        previous = _number(parts[5])
+        change_pct = _number(parts[10])
+        market_time_text = f"{parts[-1]} {parts[0]}"
+    else:
+        raise ValueError("unsupported Sina quote kind")
+    if (
+        price is None
+        or price <= 0
+        or previous is None
+        or previous <= 0
+        or change_pct is None
+    ):
+        raise ValueError("Sina quote lacks usable price or change")
+    market_time = _validated_market_time(
+        market_time_text,
+        captured_at=captured_at,
+    )
+    return _fallback_item(
+        symbol,
+        price=price,
+        previous_close=previous,
+        change_pct=change_pct,
+        market_time=market_time,
+        source="sina.hq",
+        raw_code=raw_code,
+        payload={"source_timestamp": market_time_text},
+    )
+
+
+def _load_sina_fallback_items(
+    symbols: Iterable[str],
+    *,
+    captured_at: datetime,
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    requested = [symbol for symbol in dict.fromkeys(symbols) if symbol in _SINA_FALLBACK_MAP]
+    if not requested:
+        return {}, []
+    request = Request(
+        "https://hq.sinajs.cn/list="
+        + ",".join(_SINA_FALLBACK_MAP[symbol] for symbol in requested),
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://finance.sina.com.cn/",
+        },
+    )
+    text = _public_text(request, timeout=12, encoding="gb18030")
+    by_code = {}
+    for raw_line in text.splitlines():
+        match = re.match(r'^var hq_str_([A-Za-z0-9_]+)="(.*)";?$', raw_line.strip())
+        if match:
+            by_code[match.group(1)] = match.group(2)
+    items: dict[str, dict[str, Any]] = {}
+    errors: list[str] = []
+    for symbol in requested:
+        raw_code = _SINA_FALLBACK_MAP[symbol]
+        try:
+            value = by_code.get(raw_code)
+            if not value:
+                raise ValueError("requested instrument missing from response")
+            items[symbol] = _parse_sina_quote(
+                symbol,
+                value,
+                captured_at=captured_at,
+            )
+        except Exception as exc:
+            errors.append(f"sina {symbol}: {type(exc).__name__}: {exc}")
+    return items, errors
+
+
+def _load_us10y_item(*, captured_at: datetime) -> tuple[dict[str, Any] | None, list[str]]:
+    year = captured_at.year
+    url = (
+        "https://home.treasury.gov/resource-center/data-chart-center/"
+        "interest-rates/daily-treasury-rates.csv/"
+        f"{year}/all?type=daily_treasury_yield_curve&"
+        f"field_tdr_date_value={year}&page&_format=csv"
+    )
+    try:
+        text = _public_text(
+            Request(url, headers={"User-Agent": "Mozilla/5.0"}),
+            timeout=15,
+            encoding="utf-8",
+        )
+        lines = text.splitlines()
+        if not lines:
+            raise ValueError("Treasury yield CSV is empty")
+        header = next(csv.reader([lines[0]]))
+        try:
+            ten_year_index = header.index("10 Yr")
+        except ValueError as exc:
+            raise ValueError("Treasury yield CSV lacks the 10 Yr column") from exc
+        rows = []
+        for line in lines[1:]:
+            columns = next(csv.reader([line]))
+            if len(columns) <= ten_year_index:
+                continue
+            try:
+                row_date = datetime.strptime(columns[0], "%m/%d/%Y")
+                yield_10y = _number(columns[ten_year_index])
+            except (TypeError, ValueError):
+                continue
+            if row_date.date() <= captured_at.date() and yield_10y is not None:
+                rows.append((row_date, yield_10y))
+        rows.sort()
+        if len(rows) < 2:
+            raise ValueError("two usable Treasury observations are unavailable")
+        latest_date, latest = rows[-1]
+        _, previous = rows[-2]
+        market_time = _validated_market_time(
+            latest_date.replace(hour=18),
+            captured_at=captured_at,
+        )
+        return (
+            _fallback_item(
+                "us10y",
+                price=latest,
+                previous_close=previous,
+                change_pct=(latest - previous) / previous * 100.0,
+                market_time=market_time,
+                source="treasury.daily_yield_curve",
+                raw_code="10 Yr",
+                payload={
+                    "trade_date": latest_date.date().isoformat(),
+                    "ten_year_yield_pct": latest,
+                    "change_bp": round((latest - previous) * 100, 2),
+                },
+            ),
+            [],
+        )
+    except Exception as exc:
+        return None, [f"treasury us10y: {type(exc).__name__}: {exc}"]
+
+
 def _load_yahoo_fallback_items(
     symbols: Iterable[str],
     *,
@@ -589,12 +893,47 @@ def fetch_external_market_snapshot(as_of: datetime | None = None) -> dict[str, A
     errors.extend(twse_errors)
     if twse is not None:
         eastmoney["taiwan_semiconductor"] = twse
-    missing = [symbol for symbol, _name in EXTERNAL_MARKET_SYMBOLS if symbol not in eastmoney]
-    yahoo, yahoo_errors = _load_yahoo_fallback_items(missing, captured_at=captured_at)
-    errors.extend(yahoo_errors)
+    available = dict(eastmoney)
+    missing = [symbol for symbol, _name in EXTERNAL_MARKET_SYMBOLS if symbol not in available]
+    try:
+        tencent, tencent_errors = _load_tencent_fallback_items(
+            missing,
+            captured_at=captured_at,
+        )
+    except Exception as exc:
+        tencent, tencent_errors = {}, [
+            f"tencent batch: {type(exc).__name__}: {exc}"
+        ]
+    errors.extend(tencent_errors)
+    available.update(tencent)
+    missing = [symbol for symbol, _name in EXTERNAL_MARKET_SYMBOLS if symbol not in available]
+    try:
+        sina, sina_errors = _load_sina_fallback_items(
+            missing,
+            captured_at=captured_at,
+        )
+    except Exception as exc:
+        sina, sina_errors = {}, [
+            f"sina batch: {type(exc).__name__}: {exc}"
+        ]
+    errors.extend(sina_errors)
+    available.update(sina)
+    if "us10y" not in available:
+        treasury, treasury_errors = _load_us10y_item(captured_at=captured_at)
+        errors.extend(treasury_errors)
+        if treasury is not None:
+            available["us10y"] = treasury
+    missing = [symbol for symbol, _name in EXTERNAL_MARKET_SYMBOLS if symbol not in available]
+    if len(available) < 8:
+        yahoo, yahoo_errors = _load_yahoo_fallback_items(
+            missing,
+            captured_at=captured_at,
+        )
+        errors.extend(yahoo_errors)
+        available.update(yahoo)
     items = []
     for symbol, name in EXTERNAL_MARKET_SYMBOLS:
-        item = eastmoney.get(symbol) or yahoo.get(symbol)
+        item = available.get(symbol)
         if item is None:
             reasons = [error for error in errors if symbol in error]
             item = {"symbol": symbol, "display_name": name, "price": None,

@@ -120,6 +120,74 @@ def test_yahoo_fallback_uses_live_quote_before_cutoff() -> None:
     assert item["source"] == "yahoo.finance.chart"
 
 
+def test_tencent_fallback_parses_native_index_and_futures_quotes(monkeypatch) -> None:
+    payload = "\n".join([
+        'v_usIXIC="200~纳斯达克~.IXIC~26549.85~26477.81~26541.61~1~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~~2026-09-12 07:15:00~72.04~0.27~0~0";',
+        'v_hf_CL="101.84,-0.91,101.84,101.86,102.14,101.75,07:57:04,102.78,101.96,0,2,1,2026-09-12,纽约原油";',
+    ])
+    monkeypatch.setattr(
+        external,
+        "_public_text",
+        lambda *_args, **_kwargs: payload,
+    )
+
+    items, errors = external._load_tencent_fallback_items(
+        ["nasdaq", "crude_oil"],
+        captured_at=datetime(2026, 9, 12, 8, 30),
+    )
+
+    assert errors == []
+    assert items["nasdaq"]["price"] == 26549.85
+    assert items["nasdaq"]["change_pct"] == 0.27
+    assert items["crude_oil"]["change_pct"] == -0.91
+    assert items["crude_oil"]["source"] == "tencent.qt"
+
+
+def test_sina_fallback_parses_a50_and_offshore_renminbi(monkeypatch) -> None:
+    payload = "\n".join([
+        'var hq_str_hf_CHA50CFD="12982.240,,12984.000,12989.000,13032.000,12968.000,05:08:36,12992.000,12986.000,795706,3,8,2026-09-12,富时中国A50期货,37832";',
+        'var hq_str_fx_susdcnh="07:58:28,6.659000,6.659100,6.661400,41,6.661700,6.662100,6.658000,6.659000,离岸人民币,-0.040000,-0.002400,0,,7.0,6.6,,2026-09-12";',
+    ])
+    monkeypatch.setattr(
+        external,
+        "_public_text",
+        lambda *_args, **_kwargs: payload,
+    )
+
+    items, errors = external._load_sina_fallback_items(
+        ["a50", "usdcnh"],
+        captured_at=datetime(2026, 9, 12, 8, 30),
+    )
+
+    assert errors == []
+    assert items["a50"]["price"] == 12982.24
+    assert items["a50"]["change_pct"] == pytest.approx(-0.0751, abs=0.0001)
+    assert items["usdcnh"]["price"] == 6.659
+    assert items["usdcnh"]["change_pct"] == -0.04
+
+
+def test_treasury_fallback_reads_the_10_year_column(monkeypatch) -> None:
+    csv_text = "\n".join([
+        'Date,"1 Mo","1.5 Month","2 Mo","3 Mo","4 Mo","6 Mo","1 Yr","2 Yr","3 Yr","5 Yr","7 Yr","10 Yr","20 Yr","30 Yr"',
+        "10/28/2026,4.07,4.10,4.16,4.18,4.22,4.32,4.47,4.67,4.80,4.85,4.95,5.05,5.41,5.37",
+        "10/27/2026,4.10,4.11,4.18,4.22,4.31,4.34,4.50,4.70,4.80,4.82,4.91,4.99,5.34,5.30",
+    ])
+    monkeypatch.setattr(
+        external,
+        "_public_text",
+        lambda *_args, **_kwargs: csv_text,
+    )
+
+    item, errors = external._load_us10y_item(
+        captured_at=datetime(2026, 10, 29, 8, 0),
+    )
+
+    assert errors == []
+    assert item["price"] == 5.05
+    assert item["previous_close"] == 4.99
+    assert item["payload"]["change_bp"] == 6.0
+
+
 def test_yahoo_fallback_rejects_future_live_quote_during_replay() -> None:
     item = _parse_yahoo_chart_payload(
         "nasdaq",
@@ -222,6 +290,9 @@ def test_snapshot_accounts_for_every_configured_symbol(monkeypatch, available_co
     available = {symbol: _item(symbol, 1.0) for symbol, _ in EXTERNAL_MARKET_SYMBOLS[:available_count]}
     monkeypatch.setattr(external, "_load_eastmoney_quote_items", lambda **_kw: (available, []))
     monkeypatch.setattr(external, "_load_twse_quote_item", lambda **_kw: (None, []))
+    monkeypatch.setattr(external, "_load_tencent_fallback_items", lambda *_a, **_kw: ({}, []))
+    monkeypatch.setattr(external, "_load_sina_fallback_items", lambda *_a, **_kw: ({}, []))
+    monkeypatch.setattr(external, "_load_us10y_item", lambda **_kw: (None, []))
     monkeypatch.setattr(external, "_load_yahoo_fallback_items", lambda *_a, **_kw: ({}, ["yahoo: HTTPError: 403"]))
     snapshot = external.fetch_external_market_snapshot(AS_OF)
     assert snapshot["acquisition_status"] == expected_status
@@ -230,7 +301,7 @@ def test_snapshot_accounts_for_every_configured_symbol(monkeypatch, available_co
     assert len(snapshot["missing_symbols"]) == 41 - available_count
     assert (snapshot["external_market_data_quality"] == "PASS") == (available_count == 41)
     if available_count < 41:
-        assert "403" in snapshot["items"][-1]["payload"]["error"]
+        assert snapshot["items"][-1]["payload"]["error"]
 
 
 def _twse_payload(**changes):

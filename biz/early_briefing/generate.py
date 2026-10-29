@@ -44,6 +44,10 @@ from server.common.tech_risk import append_tech_risk_markdown, fetch_tech_risk_s
 from server.engine.market_trend import DEFAULT_INDEX_NAMES, build_market_trend
 from integrations.wecom.delivery import deliver_markdown
 from biz.market_context.external_market import fetch_external_market_snapshot
+from biz.news.official_macro import (
+    fetch_official_macro_news,
+    format_official_macro_news,
+)
 try:
     from biz.research_radar.radar import build_research_radar, format_radar_markdown
 except Exception:
@@ -894,7 +898,7 @@ def main():
     _assert_market_data_contract(market_data, target_trade_date)
 
     log.info("2/4 爬取新闻快讯...")
-    news = crawl_all_news()
+    news = format_official_macro_news(fetch_official_macro_news()) + crawl_all_news()
 
     # 补充 DB 快讯（去重）
     db_news = market_data.pop("DB快讯", [])

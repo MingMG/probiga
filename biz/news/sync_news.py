@@ -22,6 +22,7 @@ if str(ROOT) not in sys.path:
 
 from server.common.batch_db import create_batch_engine
 from server.common.config import get_wecom_webhook
+from biz.news.official_macro import fetch_official_macro_news
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -766,6 +767,12 @@ def main():
                 log.info("  新浪财经: %d 条", len(sina_items))
             except Exception as e:
                 log.warning("  新浪财经失败: %s", e)
+            try:
+                fed_items = fetch_official_macro_news()
+                all_items.extend(fed_items)
+                log.info("  美联储官方: %d 条", len(fed_items))
+            except Exception as e:
+                log.warning("  美联储官方失败: %s", e)
 
         if all_items:
             saved = save_to_db(engine, all_items)
