@@ -316,6 +316,14 @@ def _format_external_quote(item: dict) -> str:
     price_text = f"{float(price):,.2f}" if price is not None else "未获取"
     market_time = str(item.get("market_time") or "").strip()
     time_text = f"，截至 {market_time}" if market_time else ""
+    if item.get("symbol") == "us10y":
+        change_bp = (item.get("payload") or {}).get("change_bp")
+        change_text = (
+            f"{float(change_bp):+.0f}bp"
+            if change_bp is not None
+            else _fmt_pct(item.get("change_pct"))
+        )
+        return f"{price_text}%（{change_text}{time_text}）"
     return f"{_fmt_pct(item.get('change_pct'))}（{price_text}{time_text}）"
 
 

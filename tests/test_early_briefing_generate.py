@@ -342,6 +342,19 @@ def test_external_market_loader_uses_public_snapshot_evidence(monkeypatch):
     fetch.assert_called_once_with(as_of=datetime(2026, 10, 28, 8, 30))
 
 
+def test_external_market_loader_formats_treasury_change_in_basis_points():
+    rendered = generate._format_external_quote({
+        "symbol": "us10y",
+        "price": 5.05,
+        "change_pct": 1.2,
+        "market_time": "2026-10-28 18:00:00",
+        "payload": {"change_bp": 6},
+    })
+
+    assert rendered.startswith("5.05%（+6bp")
+    assert "+1.20%" not in rendered
+
+
 def test_fallback_renders_public_us_and_external_quotes():
     content = generate._generate_fallback(
         {
