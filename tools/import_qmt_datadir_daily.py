@@ -269,32 +269,53 @@ def _publish(
                 statement,
                 tuple(value for row in chunk for value in row),
             )
+        connection.execute(
+            text(
+            f"""
+            UPDATE `{TARGET_TABLE}` AS target
+            JOIN `{temp_table}` AS stage
+              ON stage.stock_code=target.stock_code
+             AND stage.trade_date=target.trade_date
+             AND stage.k_type=target.k_type
+             AND stage.adjust_type=target.adjust_type
+            SET target.short_name=stage.short_name,
+                target.trade_time=stage.trade_time,
+                target.`open`=stage.`open`,
+                target.`close`=stage.`close`,
+                target.high=stage.high,
+                target.low=stage.low,
+                target.volume=stage.volume,
+                target.amount=stage.amount,
+                target.`change`=stage.`change`,
+                target.change_pct=stage.change_pct,
+                target.pre_close=stage.pre_close,
+                target.etl_sync_at=stage.etl_sync_at,
+                target.qmt_code=stage.qmt_code,
+                target.data_source=stage.data_source,
+                target.source_time=stage.source_time,
+                target.received_at=stage.received_at,
+                target.batch_id=stage.batch_id,
+                target.data_version=stage.data_version,
+                target.quality_status=stage.quality_status,
+                target.permission_status=stage.permission_status
+            WHERE target.trade_date=:d
+              AND target.k_type=1
+              AND target.adjust_type=0
+            """
+            ),
+            {"d": session},
+        )
         connection.exec_driver_sql(
             f"""
             INSERT INTO `{TARGET_TABLE}` ({columns})
             SELECT {stage_columns}
             FROM `{temp_table}` AS stage
-            ON DUPLICATE KEY UPDATE
-              short_name=VALUES(short_name),
-              trade_time=VALUES(trade_time),
-              `open`=VALUES(`open`),
-              `close`=VALUES(`close`),
-              high=VALUES(high),
-              low=VALUES(low),
-              volume=VALUES(volume),
-              amount=VALUES(amount),
-              `change`=VALUES(`change`),
-              change_pct=VALUES(change_pct),
-              pre_close=VALUES(pre_close),
-              etl_sync_at=VALUES(etl_sync_at),
-              qmt_code=VALUES(qmt_code),
-              data_source=VALUES(data_source),
-              source_time=VALUES(source_time),
-              received_at=VALUES(received_at),
-              batch_id=VALUES(batch_id),
-              data_version=VALUES(data_version),
-              quality_status=VALUES(quality_status),
-              permission_status=VALUES(permission_status)
+            LEFT JOIN `{TARGET_TABLE}` AS target
+              ON target.stock_code=stage.stock_code
+             AND target.trade_date=stage.trade_date
+             AND target.k_type=stage.k_type
+             AND target.adjust_type=stage.adjust_type
+            WHERE target.id IS NULL
             """
         )
         connection.execute(

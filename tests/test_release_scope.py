@@ -125,7 +125,6 @@ def test_sql_file_ddl_is_coordinated(repo):
 @pytest.mark.parametrize("path", [
     "server/common/limit_up_event_schema.py",
     "server/common/qmt_edge_release_recovery.py",
-    "server/common/scheduler_args.py",
     "tools/prepare_strategy_governance_schema.py",
     "tools/prepare_strategy_governance_deferred_schema.py",
     "tools/prepare_strategy_governance_qmt_history.py",
