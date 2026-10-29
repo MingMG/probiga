@@ -482,7 +482,7 @@ def test_windows_daemon_checks_activation_before_runtime_or_heartbeat():
     source = (
         run_scheduler_daemon.ROOT / "tools" / "run_scheduler_daemon.py"
     ).read_text(encoding="utf-8")
-    main = source.index("def main() -> int:")
+    main = source.index("def main(argv: list[str] | None = None) -> int:")
     gate = source.index(
         "_windows_release_activation_granted(build_sha)",
         main,

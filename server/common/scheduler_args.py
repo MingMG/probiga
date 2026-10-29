@@ -382,10 +382,14 @@ def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: s
                 "release catch-up QMT range requires one latest-session selector"
             )
         args.remove("--latest-session")
-        if normalized_path in {
+        qmt_datadir_importers = {
             "tools/import_qmt_datadir_daily.py",
             "tools/import_qmt_datadir_history.py",
-        }:
+        }
+        if any(
+            normalized_path == path or normalized_path.endswith("/" + path)
+            for path in qmt_datadir_importers
+        ):
             args.extend(["--start", today, "--end", today])
         else:
             args.extend(["--start-date", today, "--end-date", today])

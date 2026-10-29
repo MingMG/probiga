@@ -553,15 +553,29 @@ def test_release_qmt_range_tasks_replace_latest_with_exact_target(
 
 
 @pytest.mark.parametrize(
-    ("task_type", "script_path"),
+    ("task_type", "runner_script_path"),
     (
-        ("qmt_stock_daily_canonical", "tools/import_qmt_datadir_daily.py"),
-        ("qmt_stock_minute_canonical", "tools/import_qmt_datadir_history.py"),
+        (
+            "qmt_stock_daily_canonical",
+            "tools/import_qmt_datadir_daily.py",
+        ),
+        (
+            "qmt_stock_minute_canonical",
+            "tools/import_qmt_datadir_history.py",
+        ),
+        (
+            "qmt_stock_daily_canonical",
+            "/opt/ProBigA-releases/abc/tools/import_qmt_datadir_daily.py",
+        ),
+        (
+            "qmt_stock_minute_canonical",
+            "/opt/ProBigA-releases/abc/tools/import_qmt_datadir_history.py",
+        ),
     ),
 )
 def test_release_qmt_datadir_importers_use_their_start_end_contract(
     task_type,
-    script_path,
+    runner_script_path,
 ):
     args = build_scheduler_task_args(
         {
@@ -570,7 +584,7 @@ def test_release_qmt_datadir_importers_use_their_start_end_contract(
             "date_param": "",
             "_trigger_source": "release_catchup",
         },
-        script_path,
+        runner_script_path,
         "2026-08-26",
     )
 
