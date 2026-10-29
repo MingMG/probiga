@@ -64,6 +64,30 @@ def test_daemon_never_publishes_stopped_receipt_before_owned_worker_drain(
         assert events == ["dispatch_stopped", "release_mutex"]
 
 
+def test_daemon_check_runtime_stops_before_loop(monkeypatch, capsys):
+    from server.api import scheduler_runtime
+
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "development")
+    monkeypatch.setattr(run_scheduler_daemon, "_load_windows_runtime_env", lambda: None)
+    monkeypatch.setattr(run_scheduler_daemon, "_acquire_windows_singleton", lambda: None)
+    monkeypatch.setattr(run_scheduler_daemon, "_windows_release_activation_granted", lambda _sha: True)
+    monkeypatch.setattr(run_scheduler_daemon, "_release_windows_singleton", lambda _singleton: None)
+    monkeypatch.setattr(scheduler_runtime, "scheduler_runtime_info", lambda: {
+        "scheduler_max_concurrent_tasks": 2,
+        "scheduler_poll_seconds": 60,
+    })
+    monkeypatch.setattr(
+        scheduler_runtime,
+        "run_scheduler_forever",
+        lambda **_kwargs: pytest.fail("runtime check must not start the loop"),
+    )
+
+    assert run_scheduler_daemon.main(["--check-runtime"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "PASS"
+    assert payload["schema"] == "probiga.scheduler-runtime-preflight.v1"
+
+
 def _powershell_function(source: str, name: str) -> str:
     start = source.index(f"function {name}")
     brace = source.index("{", start)

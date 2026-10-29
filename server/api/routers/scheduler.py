@@ -3,6 +3,9 @@
 import copy
 import json
 import os
+import re
+import subprocess
+import sys
 import threading
 import time
 from datetime import date, datetime, timedelta
@@ -363,6 +366,74 @@ def reconcile_managed_contracts():
         "validation": validation,
         "legacy_stock_kline_disabled": disabled,
     }
+
+
+@router.post("/scheduler/runtime-preflight")
+def scheduler_runtime_preflight():
+    """Run the standalone scheduler's checked startup path without its loop."""
+
+    root = Path(__file__).resolve().parents[3]
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-P",
+                str(root / "tools" / "run_scheduler_daemon.py"),
+                "--check-runtime",
+            ],
+            cwd=str(root),
+            env={**os.environ, "PYTHONPATH": str(root)},
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=45,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise HTTPException(
+            status_code=504,
+            detail={
+                "status": "FAIL",
+                "stage": "scheduler_runtime_preflight",
+                "error_type": "TimeoutExpired",
+            },
+        ) from None
+    except OSError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "FAIL",
+                "stage": "scheduler_runtime_preflight",
+                "error_type": type(exc).__name__,
+            },
+        ) from exc
+    diagnostic = re.sub(
+        r"https?://\S+",
+        "[redacted-url]",
+        completed.stderr[-4000:],
+    )
+    if completed.returncode != 0:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "FAIL",
+                "stage": "scheduler_runtime_preflight",
+                "returncode": completed.returncode,
+                "diagnostic": diagnostic,
+            },
+        )
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "FAIL",
+                "stage": "scheduler_runtime_preflight_output",
+                "error_type": type(exc).__name__,
+            },
+        ) from exc
+    return payload
 
 
 @router.get("/scheduler/daily-delivery")

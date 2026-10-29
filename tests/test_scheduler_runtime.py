@@ -4815,6 +4815,26 @@ class SchedulerRuntimeTest(unittest.TestCase):
         validate_managed.assert_called_once_with(engine)
         validate_required.assert_called_once_with(engine)
 
+    def test_scheduler_runtime_preflight_returns_checked_payload(self):
+        completed = type(
+            "Completed",
+            (),
+            {
+                "returncode": 0,
+                "stdout": json.dumps({"status": "PASS"}),
+                "stderr": "",
+            },
+        )()
+        with patch(
+            "server.api.routers.scheduler.subprocess.run",
+            return_value=completed,
+        ) as run:
+            result = scheduler_router.scheduler_runtime_preflight()
+
+        self.assertEqual(result, {"status": "PASS"})
+        command = run.call_args.args[0]
+        self.assertEqual(command[-1], "--check-runtime")
+
     def test_scheduler_tasks_payload_warns_when_embedded_scheduler_runs(self):
         with patch("server.api.routers.scheduler._read_sql", return_value=[]), patch(
             "server.api.routers.scheduler.scheduler_runtime_info",

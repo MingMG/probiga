@@ -591,7 +591,12 @@ def _finish_windows_shutdown_monitor(
         runtime_path.unlink(missing_ok=True)
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    arguments = list(argv or [])
+    if arguments not in ([], ["--check-runtime"]):
+        print("unsupported scheduler daemon arguments", file=sys.stderr)
+        return 2
+    check_runtime_only = arguments == ["--check-runtime"]
     _load_windows_runtime_env()
     singleton = _acquire_windows_singleton()
     control = None
@@ -630,6 +635,20 @@ def main() -> int:
             )
 
         info = scheduler_runtime_info()
+        if check_runtime_only:
+            print(
+                json.dumps(
+                    {
+                        "status": "PASS",
+                        "schema": "probiga.scheduler-runtime-preflight.v1",
+                        "build_sha": build_sha,
+                        "scheduler_runtime": info,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 0
         control = _start_windows_shutdown_monitor(build_sha=build_sha)
         print(
             "ProBigA scheduler daemon starting "
@@ -652,4 +671,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))
