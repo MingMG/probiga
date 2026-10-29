@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import math
+import re
 import statistics
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -355,7 +356,7 @@ def _eastmoney_time(value: Any, fallback: datetime) -> datetime | None:
 
 
 def fetch_benchmark_quotes(*, now: datetime, timeout: float = 8.0) -> list[dict[str, Any]]:
-    """Fetch multiple broad indexes and ETF products from Eastmoney.
+    """Fetch multiple broad indexes and ETF products with a Tencent fallback.
 
     This feed is corroborating evidence only; a failure never weakens the QMT
     full-market quality gate and simply makes benchmark-dependent rules absent.
@@ -368,26 +369,27 @@ def fetch_benchmark_quotes(*, now: datetime, timeout: float = 8.0) -> list[dict[
         "fields": "f12,f14,f2,f3,f5,f6,f18,f124",
         "secids": ",".join(item["secid"] for item in BENCHMARKS),
     }
-    with httpx.Client(timeout=timeout, trust_env=False) as client:
-        response = client.get(endpoint, params=params)
-        response.raise_for_status()
-        payload = response.json()
-    diff = (payload.get("data") or {}).get("diff") or []
-    if isinstance(diff, Mapping):
-        diff = list(diff.values())
     quotes: list[dict[str, Any]] = []
-    for raw in diff:
-        if not isinstance(raw, Mapping):
-            continue
-        code = str(raw.get("f12") or "").strip().zfill(6)
-        metadata = _BENCHMARK_BY_CODE.get(code)
-        price = _finite(raw.get("f2"), -1)
-        change_pct = _finite(raw.get("f3"), float("nan"))
-        amount = _finite(raw.get("f6"), -1)
-        if not metadata or price <= 0 or amount < 0 or not math.isfinite(change_pct):
-            continue
-        quotes.append(
-            {
+    errors: list[str] = []
+    try:
+        with httpx.Client(timeout=timeout, trust_env=False) as client:
+            response = client.get(endpoint, params=params)
+            response.raise_for_status()
+            payload = response.json()
+        diff = (payload.get("data") or {}).get("diff") or []
+        if isinstance(diff, Mapping):
+            diff = list(diff.values())
+        for raw in diff:
+            if not isinstance(raw, Mapping):
+                continue
+            code = str(raw.get("f12") or "").strip().zfill(6)
+            metadata = _BENCHMARK_BY_CODE.get(code)
+            price = _finite(raw.get("f2"), -1)
+            change_pct = _finite(raw.get("f3"), float("nan"))
+            amount = _finite(raw.get("f6"), -1)
+            if not metadata or price <= 0 or amount < 0 or not math.isfinite(change_pct):
+                continue
+            quotes.append({
                 "instrument_code": code,
                 "instrument_name": str(raw.get("f14") or metadata["name"]),
                 "instrument_type": metadata["type"],
@@ -397,8 +399,76 @@ def fetch_benchmark_quotes(*, now: datetime, timeout: float = 8.0) -> list[dict[
                 "source_provider": "eastmoney_ulist",
                 "source_time": _eastmoney_time(raw.get("f124"), now),
                 "quality_status": "PASS",
-            }
+            })
+    except Exception as exc:
+        errors.append(f"eastmoney: {type(exc).__name__}: {exc}")
+
+    missing = [
+        item for item in BENCHMARKS
+        if item["code"] not in {quote["instrument_code"] for quote in quotes}
+    ]
+    if missing:
+        try:
+            tencent = _fetch_tencent_benchmark_quotes(
+                missing,
+                observed_at=now,
+                timeout=timeout,
+            )
+            quotes.extend(tencent)
+        except Exception as exc:
+            errors.append(f"tencent: {type(exc).__name__}: {exc}")
+    if not quotes:
+        raise RuntimeError("; ".join(errors) or "benchmark sources returned no quotes")
+    return quotes
+
+
+def _fetch_tencent_benchmark_quotes(
+    benchmarks: Sequence[Mapping[str, str]],
+    *,
+    observed_at: datetime,
+    timeout: float,
+) -> list[dict[str, Any]]:
+    code_map = {
+        f"{'sz' if str(item['code']).startswith(('159', '399')) else 'sh'}{item['code']}": item
+        for item in benchmarks
+    }
+    url = "https://qt.gtimg.cn/q=" + ",".join(code_map)
+    with httpx.Client(timeout=timeout, trust_env=False) as client:
+        response = client.get(
+            url,
+            headers={"Referer": "https://gu.qq.com/", "User-Agent": "Mozilla/5.0"},
         )
+        response.raise_for_status()
+        text = response.content.decode("gb18030", errors="replace")
+    quotes: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        match = re.match(r'v_([a-z]{2}\d{6})="(.*)";?$', line.strip())
+        if not match:
+            continue
+        metadata = code_map.get(match.group(1))
+        parts = match.group(2).split("~")
+        if metadata is None or len(parts) < 38:
+            continue
+        price = _finite(parts[3], -1)
+        change_pct = _finite(parts[32], float("nan"))
+        amount = _finite(parts[37], -1) * 10_000.0
+        try:
+            source_time = datetime.strptime(parts[30], "%Y%m%d%H%M%S")
+        except (TypeError, ValueError):
+            source_time = None
+        if price <= 0 or amount < 0 or not math.isfinite(change_pct):
+            continue
+        quotes.append({
+            "instrument_code": str(metadata["code"]),
+            "instrument_name": str(parts[1] or metadata["name"]),
+            "instrument_type": metadata["type"],
+            "price": price,
+            "change_pct": change_pct,
+            "amount": amount,
+            "source_provider": "tencent_qt",
+            "source_time": source_time,
+            "quality_status": "PASS",
+        })
     return quotes
 
 

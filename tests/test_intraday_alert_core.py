@@ -13,6 +13,7 @@ from biz.intraday_alert.core import (
     make_observation_id,
     prepare_benchmark_snapshot,
     validate_qmt_snapshot,
+    _fetch_tencent_benchmark_quotes,
 )
 
 
@@ -244,6 +245,52 @@ def test_stale_benchmark_quote_is_excluded():
     )
     assert result["available"] is False
     assert connection.inserts == []
+
+
+def test_tencent_benchmark_fallback_returns_exact_intraday_evidence(monkeypatch):
+    parts = ["0"] * 40
+    parts[0] = "1"
+    parts[1] = "沪深300"
+    parts[2] = "000300"
+    parts[3] = "4033.55"
+    parts[4] = "4083.87"
+    parts[30] = "20260813101500"
+    parts[32] = "-1.23"
+    parts[37] = "16095233"
+    payload = f'v_sh000300="{"~".join(parts)}";'.encode("gb18030")
+
+    class Response:
+        content = payload
+
+        def raise_for_status(self):
+            return None
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get(self, *_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr("biz.intraday_alert.core.httpx.Client", Client)
+
+    quotes = _fetch_tencent_benchmark_quotes(
+        [{"code": "000300", "name": "沪深300", "type": "INDEX"}],
+        observed_at=NOW,
+        timeout=2,
+    )
+
+    assert len(quotes) == 1
+    assert quotes[0]["instrument_code"] == "000300"
+    assert quotes[0]["change_pct"] == -1.23
+    assert quotes[0]["amount"] == 160_952_330_000
+    assert quotes[0]["source_time"] == NOW.replace(second=0)
 
 
 def test_render_adapter_passes_complete_observation(monkeypatch):
