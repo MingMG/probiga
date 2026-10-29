@@ -2799,6 +2799,91 @@ def news_important(pages: int = Query(default=2, ge=1, le=5)):
         return {"data": [], "total": 0, "error": str(e)}
 
 
+@router.get("/hot-data/intraday-alert-feed")
+def intraday_alert_feed(
+    trade_date: str = Query(default=""),
+    limit: int = Query(default=30, ge=1, le=100),
+):
+    """Read-only projection of the event-driven intraday broadcast ledger."""
+
+    try:
+        selected_date = str(trade_date or "")[:10]
+        if not selected_date:
+            row = _read_sql(
+                "SELECT MAX(trade_date) AS trade_date "
+                "FROM sm_intraday_alert_observation",
+                {},
+            )
+            selected_date = (
+                str(row[0].get("trade_date"))[:10]
+                if row and row[0].get("trade_date")
+                else date.today().isoformat()
+            )
+        observations = _read_sql(
+            """
+            SELECT observation_id, trade_date, source_snapshot_at, observed_at,
+                   session_minute, source_provider, expected_count, observed_count,
+                   coverage, median_return_pct, equal_weight_return_pct,
+                   positive_breadth_pct, total_amount, amount_delta,
+                   sector_json, benchmark_json, key_stock_json, quality_status
+            FROM sm_intraday_alert_observation
+            WHERE trade_date=:trade_date
+            ORDER BY observed_at DESC LIMIT 20
+            """,
+            {"trade_date": selected_date},
+        )
+        states = _read_sql(
+            """
+            SELECT event_key, event_type, subject_code, subject_name, direction,
+                   state, severity, hit_count, miss_count, first_seen_at,
+                   last_seen_at, last_sent_state, last_sent_at, evidence_json
+            FROM st_intraday_alert_state
+            WHERE trade_date=:trade_date
+            ORDER BY last_seen_at DESC LIMIT :row_limit
+            """,
+            {"trade_date": selected_date, "row_limit": limit},
+        )
+        outbox = _read_sql(
+            """
+            SELECT outbox_id, event_key, transition_name, state, mode, status,
+                   content_markdown, attempts, created_at, sent_at, error_message
+            FROM st_intraday_alert_outbox
+            WHERE trade_date=:trade_date
+            ORDER BY created_at DESC LIMIT :row_limit
+            """,
+            {"trade_date": selected_date, "row_limit": limit},
+        )
+        for row in observations:
+            for field in ("sector_json", "benchmark_json", "key_stock_json"):
+                try:
+                    row[field] = json.loads(row.get(field) or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    row[field] = {}
+        for row in states:
+            try:
+                row["evidence_json"] = json.loads(row.get("evidence_json") or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                row["evidence_json"] = {}
+        return {
+            "date": selected_date,
+            "latest": observations[0] if observations else None,
+            "observations": observations,
+            "states": states,
+            "outbox": outbox,
+            "read_only": True,
+        }
+    except Exception as exc:
+        return {
+            "date": trade_date,
+            "latest": None,
+            "observations": [],
+            "states": [],
+            "outbox": [],
+            "read_only": True,
+            "error": str(exc),
+        }
+
+
 @router.post("/hot-data/news-flash/refresh")
 def refresh_news_flash():
     """Queue the fixed realtime news task; the API process never crawls."""

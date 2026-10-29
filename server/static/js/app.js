@@ -5646,6 +5646,101 @@
             .finally(function () { window._strategyGovernanceRunning = false; var currentButton = el('scGovernanceRunBtn'); if (currentButton) { currentButton.disabled = false; currentButton.textContent = '执行最新数据日治理'; } });
     };
 
+    function loadIntradayAlertPage(d, c) {
+        if (window._intradayAlertTimer) {
+            clearInterval(window._intradayAlertTimer);
+            window._intradayAlertTimer = null;
+        }
+        c.innerHTML = '<div class="loading">正在读取盘中播报...</div>';
+
+        function pct(value) {
+            var number = Number(value);
+            return Number.isFinite(number) ? (number > 0 ? '+' : '') + number.toFixed(2) + '%' : '未获取';
+        }
+
+        function render(payload) {
+            if (payload.error) {
+                c.innerHTML = '<div class="loading">盘中播报读取失败：' + escHtml(payload.error) + '</div>';
+                return;
+            }
+            var latest = payload.latest;
+            if (!latest) {
+                c.innerHTML = '<div class="loading">当前没有盘中播报快照</div>';
+                return;
+            }
+            var sectors = ((latest.sector_json || {}).items || []).slice().sort(function(a, b) {
+                return Number(b.equal_weight_return_pct || 0) - Number(a.equal_weight_return_pct || 0);
+            });
+            var benchmarks = ((latest.benchmark_json || {}).items || []).slice(0, 10);
+            var states = payload.states || [];
+            var outbox = payload.outbox || [];
+            var h = '<style>' +
+                '.ia-head{display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:12px}' +
+                '.ia-title{font-size:18px;font-weight:700;color:#0f172a}.ia-time{font-size:12px;color:#64748b}' +
+                '.ia-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:14px}' +
+                '.ia-card{background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:12px}.ia-card b{display:block;font-size:20px;color:#0f172a;margin-top:5px}' +
+                '.ia-panel{background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:14px;margin-bottom:12px}.ia-panel h3{margin:0 0 10px;font-size:15px}' +
+                '.ia-table{width:100%;border-collapse:collapse;font-size:12px}.ia-table th,.ia-table td{border-bottom:1px solid #edf2f7;padding:7px 6px;text-align:left}' +
+                '.ia-up{color:#dc2626}.ia-down{color:#059669}.ia-muted{color:#94a3b8}.ia-event{padding:8px 10px;border-left:3px solid #2563eb;background:#f8fafc;margin-bottom:7px}' +
+                '@media(max-width:900px){.ia-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}</style>' +
+                '<div class="ia-head"><div><div class="ia-title">盘中事件播报</div><div class="ia-time">数据 ' + escHtml(latest.source_snapshot_at || '-') + ' · 观察时间 ' + escHtml(latest.observed_at || '-') + '</div></div>' +
+                '<button class="sc-btn" onclick="window._intradayAlertRefresh()">立即刷新</button></div>' +
+                '<div class="ia-grid">' +
+                '<div class="ia-card">上涨覆盖率<b>' + pct(latest.positive_breadth_pct) + '</b></div>' +
+                '<div class="ia-card">个股中位数<b>' + pct(latest.median_return_pct) + '</b></div>' +
+                '<div class="ia-card">成交额<b>' + fmtMoney(latest.total_amount) + '</b></div>' +
+                '<div class="ia-card">QMT覆盖<b>' + (Number(latest.coverage) * 100).toFixed(2) + '%</b></div></div>' +
+                '<section class="ia-panel"><h3>指数与ETF</h3><div style="overflow:auto"><table class="ia-table"><thead><tr><th>品种</th><th>涨跌幅</th><th>成交额</th><th>来源</th><th>时间</th></tr></thead><tbody>';
+            if (!benchmarks.length) h += '<tr><td colspan="5" class="ia-muted">基准行情未获取</td></tr>';
+            benchmarks.forEach(function(row) {
+                var cls = Number(row.change_pct) >= 0 ? 'ia-up' : 'ia-down';
+                h += '<tr><td>' + escHtml(row.instrument_name || row.instrument_code || '-') + '</td><td class="' + cls + '">' + pct(row.change_pct) + '</td><td>' + fmtMoney(row.amount) + '</td><td>' + escHtml(row.source_provider || '-') + '</td><td>' + escHtml(row.source_time || '-') + '</td></tr>';
+            });
+            h += '</tbody></table></div></section><section class="ia-panel"><h3>板块强弱</h3><div style="overflow:auto"><table class="ia-table"><thead><tr><th>板块</th><th>涨跌幅</th><th>上涨占比</th><th>领涨股</th></tr></thead><tbody>';
+            sectors.slice(0, 8).concat(sectors.slice(-3)).forEach(function(row, index) {
+                if (index > 11) return;
+                var leader = (row.leaders || [])[0] || {};
+                var cls = Number(row.equal_weight_return_pct) >= 0 ? 'ia-up' : 'ia-down';
+                h += '<tr><td>' + escHtml(row.name || row.industry_name || '-') + '</td><td class="' + cls + '">' + pct(row.equal_weight_return_pct) + '</td><td>' + pct(row.positive_breadth_pct) + '</td><td>' + escHtml(leader.short_name || '-') + ' ' + escHtml(leader.stock_code || '') + '</td></tr>';
+            });
+            h += '</tbody></table></div></section><section class="ia-panel"><h3>当前事件状态</h3>';
+            if (!states.length) h += '<div class="ia-muted">暂无候选事件</div>';
+            states.forEach(function(row) {
+                var evidence = row.evidence_json || {};
+                var facts = evidence.facts || [];
+                var label = ({market_reversal:'市场转折',sector_spread:'板块扩散',sector_ebb:'板块走弱',key_stock:'个股异动',style_seesaw:'风格切换',broad_index_support:'宽基托底'})[row.event_type] || row.event_type;
+                h += '<div class="ia-event"><b>' + escHtml(label) + ' · ' + escHtml(row.subject_name || row.subject_code || '-') + '</b><span class="ia-muted">　' + escHtml(row.state || '') + ' · 最近 ' + escHtml(row.last_seen_at || '-') + '</span><div>' + escHtml(facts.join('；') || '证据未获取') + '</div></div>';
+            });
+            h += '</section><section class="ia-panel"><h3>已形成播报</h3>';
+            if (!outbox.length) h += '<div class="ia-muted">今天还没有达到播报条件的事件，或尚未完成投递。</div>';
+            outbox.forEach(function(row) {
+                h += '<div class="ia-event"><b>' + escHtml(row.transition_name || '-') + '</b><span class="ia-muted">　' + escHtml(row.status || '') + ' · ' + escHtml(row.created_at || '') + '</span><pre style="white-space:pre-wrap;margin:6px 0 0;font-family:inherit">' + escHtml(row.content_markdown || '') + '</pre></div>';
+            });
+            h += '</section>';
+            c.innerHTML = h;
+        }
+
+        var loading = false;
+        function refresh() {
+            if (loading || activeTabId() !== 'intraday-alert') return;
+            loading = true;
+            apiGet('/hot-data/intraday-alert-feed?trade_date=' + encodeURIComponent(d) + '&limit=30')
+                .then(render)
+                .catch(function(err) { c.innerHTML = '<div class="loading">盘中播报读取失败：' + escHtml(err.message) + '</div>'; })
+                .finally(function() { loading = false; });
+        }
+        window._intradayAlertRefresh = refresh;
+        refresh();
+        window._intradayAlertTimer = setInterval(function() {
+            if (activeTabId() !== 'intraday-alert') {
+                clearInterval(window._intradayAlertTimer);
+                window._intradayAlertTimer = null;
+                return;
+            }
+            refresh();
+        }, 30000);
+    }
+
     function loadMarketRadarPage(d, c) {
         if (window._marketRadarTimer) {
             clearInterval(window._marketRadarTimer);
@@ -6497,6 +6592,9 @@
         },
         'market-radar': function (d, c) {
             loadMarketRadarPage(d, c);
+        },
+        'intraday-alert': function (d, c) {
+            loadIntradayAlertPage(d, c);
         },
         /* ── 强势股（3天/5天切换） ── */
         strong: function (d, c) {
@@ -7782,6 +7880,7 @@
         {group:'市场分析', items:[
             {id:'command',icon:'🧭',label:'智能决策'},
             {id:'intraday-battle',icon:'⚡',label:'盘中作战'},
+            {id:'intraday-alert',icon:'🔔',label:'盘中播报'},
             {id:'monitor',icon:'📺',label:'市场监控中心'},
             {id:'sector-movement',icon:'🌊',label:'板块异动'},
             {id:'market-radar',icon:'📡',label:'异动雷达'},
@@ -7947,6 +8046,7 @@
         PAGE_TITLES['strategy-center'] = '🏆 策略研究与竞技';
         PAGE_TITLES['sentiment'] = '🧠 市场趋势与风格';
         PAGE_TITLES['intraday-battle'] = '⚡ 盘中作战';
+        PAGE_TITLES['intraday-alert'] = '🔔 盘中播报';
         PAGE_TITLES['strategy-backtest'] = '📊 策略回测';
         PAGE_TITLES['research-radar'] = '🧭 研报趋势雷达';
         PAGE_TITLES['market-radar'] = '📡 异动雷达';
