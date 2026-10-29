@@ -2056,6 +2056,12 @@ def _windows_release_activation_ready(
             )
             if not qmt_ready:
                 return False, "qmt_release_bootstrap_unavailable"
+    except RuntimeError:
+        # A Windows edge can publish directly from the local DAT cache while
+        # the peer component manifest or live QMT IPC receipt is unavailable.
+        # The dispatch gate below restricts this result to the frozen DAT-only
+        # task set; API-bound QMT work remains blocked.
+        return False, "qmt_release_bootstrap_unavailable"
     except Exception as exc:
         return False, f"release_activation_check_failed:{type(exc).__name__}"
     return True, "ready"

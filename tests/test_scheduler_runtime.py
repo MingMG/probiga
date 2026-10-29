@@ -8192,6 +8192,48 @@ def test_qmt_business_dispatch_preflight_requires_exact_release_activation() -> 
         release_ready.assert_not_called()
 
 
+def test_qmt_runtime_preflight_failure_falls_back_to_dat_only() -> None:
+    build_sha = "c" * 40
+    engine = MagicMock()
+    with patch(
+        "server.api.scheduler_runtime._scheduler_executor_role",
+        return_value=scheduler_runtime.SCHEDULER_OWNER_WINDOWS_QMT,
+    ), patch(
+        "server.api.scheduler_runtime._scheduler_build_commit_sha",
+        return_value=build_sha,
+    ), patch(
+        "server.api.scheduler_runtime.check_qmt_edge_release_activation",
+        return_value=(True, {"status": "READY", "reason_code": ""}),
+    ), patch(
+        "server.api.scheduler_runtime._windows_release_activation_ready",
+        return_value=(False, "qmt_release_bootstrap_unavailable"),
+    ):
+        assert scheduler_runtime._qmt_windows_dispatch_preflight(
+            engine,
+            mode="standalone",
+        ) == (
+            True,
+            scheduler_runtime.QMT_DATADIR_DIRECT_DISPATCH_REASON,
+        )
+
+
+def test_windows_peer_runtime_failure_allows_dat_only_dispatch() -> None:
+    with patch(
+        "server.api.scheduler_runtime.get_scheduler_runtime_config",
+        return_value={"poll_seconds": 60},
+    ), patch(
+        "server.api.scheduler_runtime._verified_linux_activation_build",
+        side_effect=RuntimeError("peer component manifest mismatch"),
+    ):
+        ready, reason = scheduler_runtime._windows_release_activation_ready(
+            MagicMock(),
+            build_sha="c" * 40,
+        )
+
+    assert not ready
+    assert reason == "qmt_release_bootstrap_unavailable"
+
+
 def test_qmt_datadir_direct_dispatch_is_limited_to_frozen_cache_importers() -> None:
     reason = scheduler_runtime.QMT_DATADIR_DIRECT_DISPATCH_REASON
     for task_type in scheduler_runtime.QMT_DATADIR_DIRECT_TASK_TYPES:
