@@ -344,6 +344,27 @@ def list_tasks():
     return {"data": rows, "total": len(rows), "runtime": _runtime_payload()}
 
 
+@router.post("/scheduler/managed-contracts/reconcile")
+def reconcile_managed_contracts():
+    """Install and exactly read back the managed Linux scheduler contracts."""
+
+    from tools import ensure_quality_gate
+
+    engine = get_engine()
+    actions = ensure_quality_gate.run(engine)
+    disabled = ensure_quality_gate.quarantine_legacy_canonical_market_writers(
+        engine
+    )
+    validation = ensure_quality_gate.validate_managed_task_contracts(engine)
+    ensure_quality_gate.validate_required_task_contracts(engine)
+    return {
+        "status": "PASS",
+        "actions": actions,
+        "validation": validation,
+        "legacy_stock_kline_disabled": disabled,
+    }
+
+
 @router.get("/scheduler/daily-delivery")
 def daily_delivery_status(
     trade_date: str = "",

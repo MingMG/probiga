@@ -4789,6 +4789,32 @@ class SchedulerRuntimeTest(unittest.TestCase):
         self.assertTrue(payload["runtime"]["api_restart_safe"])
         self.assertIn("重启 API 服务不会中断", payload["runtime"]["status_text"])
 
+    def test_managed_contract_reconcile_is_exactly_validated(self):
+        engine = object()
+        with patch(
+            "server.api.routers.scheduler.get_engine",
+            return_value=engine,
+        ), patch(
+            "tools.ensure_quality_gate.run",
+            return_value={"每日数据闭环自动补采": "inserted"},
+        ) as run, patch(
+            "tools.ensure_quality_gate.quarantine_legacy_canonical_market_writers",
+            return_value=0,
+        ) as quarantine, patch(
+            "tools.ensure_quality_gate.validate_managed_task_contracts",
+            return_value={"daily_data_closeout_repair": "validated"},
+        ) as validate_managed, patch(
+            "tools.ensure_quality_gate.validate_required_task_contracts",
+            return_value={},
+        ) as validate_required:
+            result = scheduler_router.reconcile_managed_contracts()
+
+        self.assertEqual(result["status"], "PASS")
+        run.assert_called_once_with(engine)
+        quarantine.assert_called_once_with(engine)
+        validate_managed.assert_called_once_with(engine)
+        validate_required.assert_called_once_with(engine)
+
     def test_scheduler_tasks_payload_warns_when_embedded_scheduler_runs(self):
         with patch("server.api.routers.scheduler._read_sql", return_value=[]), patch(
             "server.api.routers.scheduler.scheduler_runtime_info",
