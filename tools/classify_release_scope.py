@@ -192,6 +192,7 @@ _CROSS_END_CONTRACT_CODE_FILES = frozenset({
     "server/common/qmt_daily_market_truth.py",
     "server/common/qmt_datadir_result.py",
     "server/common/qmt_edge_release_recovery.py",
+    "server/common/scheduler_args.py",
     "tools/prepare_strategy_governance_deferred_schema.py",
     "tools/prepare_strategy_governance_qmt_history.py",
     "tools/prepare_strategy_governance_schema.py",
