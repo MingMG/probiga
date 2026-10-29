@@ -35,6 +35,8 @@ def test_fed_rss_becomes_structured_news_with_statement_summary(monkeypatch):
     assert len(items) == 1
     item = items[0]
     assert item["source"] == "federal_reserve"
+    assert item["source_id"].startswith("fed:")
+    assert len(item["source_id"]) <= 64
     assert item["title"] == "美联储FOMC公布利率决议"
     assert item["publish_time"] == datetime(2026, 10, 29, 2, 0)
     assert "3.75—4 percent" in item["content"]

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import html
+import hashlib
 import re
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
@@ -79,7 +80,7 @@ def fetch_official_macro_news(
             title = "美联储FOMC公布利率决议"
         items.append({
             "source": "federal_reserve",
-            "source_id": link,
+            "source_id": "fed:" + hashlib.sha256(link.encode("utf-8")).hexdigest()[:40],
             "title": title,
             "content": content,
             "publish_time": published,
