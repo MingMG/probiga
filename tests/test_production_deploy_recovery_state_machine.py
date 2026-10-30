@@ -3078,7 +3078,7 @@ activation_snapshot_remove_new_runtime_preserved_no_receipt() {{
 systemctl() {{ printf 'systemctl:%s\n' "$*" >> "$TRACE"; }}
 sync() {{ return 0; }}
 {recovery}
-controlled_activation_snapshot_only_recovery
+controlled_activation_snapshot_only_recovery "$GUARDED_SHA"
 recovery_status=$?
 printf '%s\n' "$recovery_status" > "$TEST_ROOT/status"
 exit 0
@@ -5482,4 +5482,189 @@ controlled_guard_assert_unit_fenced probiga-scheduler disabled \
     assert reported == [
         "database_writer_guard_boundary_failed="
         "unit_active:probiga-scheduler:active"
+    ]
+
+
+def _rollback_guard_harness(
+    tmp_path: Path,
+    *,
+    certify_rc: int,
+    source: str,
+) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
+    """Run the real rollback guard-release helper against the real engine."""
+
+    bash = _bash()
+    assert bash is not None
+    bodies = _shell_function_bodies(source)
+    helper = _function(
+        "rollback_release_database_writer_guard",
+        bodies["rollback_release_database_writer_guard"],
+    )
+    certify_log = tmp_path / "certify.log"
+    failures = tmp_path / "failures.log"
+    harness = f"""
+set -u
+DEPLOY_ARTIFACT_MODE=static-wheel-lock-v2
+EXPECTED_SHA={'b' * 40}
+DATABASE_GUARD_MIGRATION_UNVERIFIED=1
+DATABASE_WRITER_GUARD_PERSISTED=1
+CERTIFY_RC={certify_rc}
+CERTIFY_LOG={certify_log.as_posix()!r}
+FAILURES={failures.as_posix()!r}
+database_writer_guard_inventory() {{
+  printf '%s %s %s %s\n' loaded,inactive,disabled loaded,inactive,disabled \
+    loaded,inactive,static loaded,inactive,disabled
+}}
+controlled_guard_certify_database_boundary() {{
+  printf '%s\n' "$*" > "$CERTIFY_LOG"
+  return "$CERTIFY_RC"
+}}
+prepared_v2_rollback_release_database_guard() {{ return 99; }}
+rollback_failure() {{ printf '%s\n' "$1" >> "$FAILURES"; }}
+{helper}
+rollback_release_database_writer_guard
+printf 'rc=%s\n' "$?"
+"""
+    harness_path = tmp_path / "rollback-guard-harness.sh"
+    harness_path.write_text(harness, encoding="utf-8", newline="\n")
+    completed = subprocess.run(
+        [bash, str(harness_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=15,
+    )
+    return completed, certify_log, failures
+
+
+def test_rollback_releases_the_writer_fence_after_certification(
+    tmp_path: Path,
+) -> None:
+    """Reproduce the 2026-10-30 cutover outage: the site never came back.
+
+    Production runs ``static-wheel-lock-v2``.  When the cutover had already
+    committed the database boundary the rollback released the fence only for
+    ``ci-resolved-freeze-v1``, so every writer stayed stopped and production
+    needed a manual ``--recover-database-guard``.  Certifying the boundary with
+    the release that performed the cutover must now hand the runtime back.
+    """
+
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    completed, certify_log, failures = _rollback_guard_harness(
+        tmp_path, certify_rc=0, source=source
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert completed.stdout.strip() == "rc=0"
+    assert certify_log.read_text(encoding="utf-8").strip() == (
+        f"{'b' * 40} loaded,inactive,disabled loaded,inactive,disabled "
+        "loaded,inactive,static loaded,inactive,disabled"
+    )
+    assert not failures.exists()
+
+    bodies = _shell_function_bodies(source)
+    rollback = bodies["rollback"]
+    assert "rollback_release_database_writer_guard || true" in rollback
+    assert (
+        '[ "$DATABASE_GUARD_MIGRATION_UNVERIFIED" -eq 1 ]; then\n'
+        "      rollback_release_database_writer_guard || true"
+    ) in rollback
+    # The fence-release gate must not be restricted to the retired artifact mode.
+    assert (
+        '[ "$DATABASE_GUARD_MIGRATION_UNVERIFIED" -eq 1 ] && \\n'
+        '      [ "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 ]; then'
+    ) not in rollback
+
+
+def test_rollback_keeps_the_writer_fence_when_certification_fails(
+    tmp_path: Path,
+) -> None:
+    """A failed certification must leave today's fail-closed behaviour intact."""
+
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    completed, _certify_log, failures = _rollback_guard_harness(
+        tmp_path, certify_rc=1, source=source
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert completed.stdout.strip() == "rc=1"
+    assert failures.read_text(encoding="utf-8").splitlines() == [
+        "certify the database boundary before releasing the writer fence"
+    ]
+    # The helper must not clear either flag on its own failure path.
+    helper_body = _shell_function_bodies(source)[
+        "rollback_release_database_writer_guard"
+    ]
+    assert helper_body.count("DATABASE_GUARD_MIGRATION_UNVERIFIED=0") == 1
+    assert helper_body.index("DATABASE_GUARD_MIGRATION_UNVERIFIED=0") > (
+        helper_body.index("\n  esac")
+    )
+
+
+def test_recovery_authorization_is_a_parameter_not_an_environment_variable(
+    tmp_path: Path,
+) -> None:
+    """A normal deploy may not carry ``PROBIGA_RECOVERY_GUARD_SHA`` (engine :1189).
+
+    The broker keeps authorising recovery by passing the validated SHA in, so
+    the recovery functions must take it as an argument instead of reading the
+    rejected environment variable.
+    """
+
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the executable recovery authorization test")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    bodies = _shell_function_bodies(source)
+    recovery = _function(
+        "controlled_database_guard_recovery",
+        bodies["controlled_database_guard_recovery"],
+    )
+    guard = tmp_path / "database-migration-unverified"
+    guarded_sha = "c" * 40
+    harness = f"""
+set -u
+DATABASE_WRITER_GUARD_FILE={guard.as_posix()!r}
+DATABASE_WRITER_RESTORE_FILE={(tmp_path / "database-writer-restore-pending").as_posix()!r}
+GUARD_SHA={guarded_sha}
+CERTIFIED=0
+controlled_guard_assert_storage() {{ return 0; }}
+controlled_guard_assert_marker() {{ return 0; }}
+controlled_guard_certify_database_boundary() {{
+  CERTIFIED=$((CERTIFIED + 1))
+  printf '%s\n' "$@" > {tmp_path.as_posix()!r}/certify.args
+  return 0
+}}
+controlled_guard_write_restore_file() {{ return 0; }}
+controlled_guard_cleanup() {{ return 0; }}
+controlled_guard_restore_and_finalize() {{ return 0; }}
+{recovery}
+printf '%s\n' probiga.database-writer-guard.v2 "release=$GUARD_SHA" \
+  main_unit=loaded,inactive,disabled scheduler_unit=loaded,inactive,disabled \
+  ai_service_unit=loaded,inactive,static ai_timer_unit=loaded,inactive,disabled \
+  > "$DATABASE_WRITER_GUARD_FILE"
+if controlled_database_guard_recovery {'d' * 40} 2>/dev/null; then exit 60; fi
+test "$CERTIFIED" -eq 0 || exit 61
+controlled_database_guard_recovery "$GUARD_SHA" 2>/dev/null || exit 62
+test "$CERTIFIED" -eq 1 || exit 63
+"""
+    harness_path = tmp_path / "recovery-authorization-harness.sh"
+    harness_path.write_text(harness, encoding="utf-8", newline="\n")
+    completed = subprocess.run(
+        [bash, str(harness_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=15,
+        env={k: v for k, v in os.environ.items() if not k.startswith("PROBIGA_")},
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert (tmp_path / "certify.args").read_text(encoding="utf-8").split() == [
+        guarded_sha,
+        "loaded,inactive,disabled",
+        "loaded,inactive,disabled",
+        "loaded,inactive,static",
+        "loaded,inactive,disabled",
     ]

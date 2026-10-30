@@ -105,6 +105,7 @@ def test_every_guard_recovery_code_root_uses_sealed_manifest_policy() -> None:
     bodies = _shell_function_bodies(deploy)
     runtime_verifier = bodies["controlled_guard_verify_restored_runtime"]
     database_guard = bodies["controlled_database_guard_recovery"]
+    certifier = bodies["controlled_guard_certify_database_boundary"]
     explicit_failure = bodies["explicit_v2_recovery_failure"]
 
     assert (
@@ -118,9 +119,16 @@ def test_every_guard_recovery_code_root_uses_sealed_manifest_policy() -> None:
     assert (
         'controlled_guard_assert_recovery_code_tree_clean '
         '"$code_root" "$guarded_sha"'
-        in _normalized_shell(database_guard)
+        in _normalized_shell(certifier)
     )
+    assert "status --porcelain=v1 --untracked-files=all" not in certifier
     assert "status --porcelain=v1 --untracked-files=all" not in database_guard
+    # The broker recovery and the in-deploy rollback must share one certifier;
+    # the recovery path may not carry its own copy of the code-root policy.
+    assert (
+        "controlled_guard_certify_database_boundary "
+        '"$guarded_sha"'
+    ) in _normalized_shell(database_guard)
     assert "v2 recovery failed step=%s" in explicit_failure
     explicit_dispatch = deploy[deploy.index(
         'if [ "$DEPLOY_OPERATION" = recover-database-guard ]; then',
@@ -3466,33 +3474,47 @@ def test_ci_normal_rollback_releases_guard_only_after_exact_certification() -> N
     )
     assert 'test "$old_runtime_sha" = "$PREVIOUS_RELEASE_REVISION"' in release
 
-    rollback_gate = rollback.index(
-        '[ "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 ]'
-    )
-    release_call = rollback.index(
-        "prepared_v2_rollback_release_database_guard", rollback_gate
-    )
-    guard_clear = rollback.index(
-        "DATABASE_WRITER_GUARD_PERSISTED=0", release_call
-    )
-    migration_clear = rollback.index(
+    helper = bodies["rollback_release_database_writer_guard"]
+    release_call = helper.index("prepared_v2_rollback_release_database_guard")
+    guard_clear = helper.index("DATABASE_WRITER_GUARD_PERSISTED=0", release_call)
+    migration_clear = helper.index(
         "DATABASE_GUARD_MIGRATION_UNVERIFIED=0", guard_clear
     )
-    first_main_start = rollback.index(
-        'sudo systemctl start "$MAIN_SERVICE"', migration_clear
-    )
-    assert rollback_gate < release_call < guard_clear < migration_clear
-    assert migration_clear < first_main_start
+    assert release_call < guard_clear < migration_clear
     assert (
         '"certify and release the v2 database guard for previous runtime"'
-        in rollback[release_call:guard_clear]
+        in helper[release_call:guard_clear]
     )
+    # Both artifact modes own a certifier, and both flags clear only after the
+    # selected certifier succeeds.
+    for mode_and_certifier in (
+        "ci-resolved-freeze-v1)",
+        "static-wheel-lock-v2)",
+        "controlled_guard_certify_database_boundary",
+    ):
+        assert mode_and_certifier in helper
+
+    rollback_gate = rollback.index("rollback_release_database_writer_guard")
+    first_main_start = rollback.index(
+        'sudo systemctl start "$MAIN_SERVICE"', rollback_gate
+    )
+    assert rollback_gate < first_main_start
     for gate in (
         '[ "$restoration_ready" -eq 1 ]',
         '[ "$EXTERNAL_WRITER_BLOCKED" -eq 0 ]',
         '[ "$DATABASE_GUARD_MIGRATION_UNVERIFIED" -eq 1 ]',
     ):
-        assert gate in rollback[rollback_gate - 300:release_call]
+        assert gate in rollback[rollback_gate - 400:rollback_gate]
+    # The fail-closed branch still keys off the flag, so a certifier that did
+    # not clear it keeps every writer disabled and stopped.
+    disable_after_block = rollback.index(
+        '{ [ "$EXTERNAL_WRITER_BLOCKED" -eq 1 ] || '
+        '[ "$DATABASE_GUARD_MIGRATION_UNVERIFIED" -eq 1 ]; }; then'
+    )
+    assert 'sudo systemctl disable "$MAIN_SERVICE"' in rollback[
+        disable_after_block:first_main_start
+    ]
+    assert rollback_gate < disable_after_block < first_main_start
 
     finalize_call = rollback.index(
         "controlled_guard_restore_and_finalize", first_main_start
@@ -3691,6 +3713,9 @@ def test_controlled_database_guard_recovery_is_explicit_and_fail_closed() -> Non
     recovery = _normalized_shell(
         function_bodies["controlled_database_guard_recovery"]
     )
+    certifier = _normalized_shell(
+        function_bodies["controlled_guard_certify_database_boundary"]
+    )
     cleanup = _normalized_shell(function_bodies["controlled_guard_cleanup"])
     cleanup_restore = _normalized_shell(
         function_bodies["controlled_guard_restore_after_cleanup_failure"]
@@ -3775,89 +3800,94 @@ def test_controlled_database_guard_recovery_is_explicit_and_fail_closed() -> Non
     )
     assert explicit_mode < recovery_dispatch < normal_release_inputs
     assert recovery_dispatch < normal_release_inputs < stale_guard_rejection
-    assert 'test "$guarded_sha" = "$PROBIGA_RECOVERY_GUARD_SHA"' in recovery
+    # The broker authorises recovery by passing the validated SHA in; a normal
+    # deploy may not carry PROBIGA_RECOVERY_GUARD_SHA at all (engine :1189).
+    assert 'test "$guarded_sha" = "$authorized_sha" || return 1' in recovery
     assert (
-        'test "$guarded_sha" = "$PROBIGA_RECOVERY_GUARD_SHA"'
+        'test "$guarded_sha" = "$authorized_sha" || return 1'
         in restore_only_recovery
     )
 
-    repair_dropins = recovery.index("controlled_guard_install_dropins")
-    repair_reload = recovery.index("systemctl daemon-reload", repair_dropins)
-    initial_writer_fence = recovery.index(
+    repair_dropins = certifier.index("controlled_guard_install_dropins")
+    repair_reload = certifier.index("systemctl daemon-reload", repair_dropins)
+    initial_writer_fence = certifier.index(
         "controlled_guard_force_all_writers_fenced", repair_reload
     )
-    initial_boundary = recovery.index(
+    initial_boundary = certifier.index(
         "controlled_guard_assert_boundary", initial_writer_fence
     )
     assert repair_dropins < repair_reload < initial_writer_fence < initial_boundary
     assert "release=*" in recovery
-    assert '"$CODE_RELEASE_ROOT/$guarded_sha"' in recovery
-    assert '"$RELEASE_VENV_ROOT/$guarded_sha"' in recovery
-    assert 'git -C "$code_root" rev-parse HEAD' in recovery
-    venv_owner = recovery.index(
+    assert '"$CODE_RELEASE_ROOT/$guarded_sha"' in certifier
+    assert '"$RELEASE_VENV_ROOT/$guarded_sha"' in certifier
+    assert 'git -C "$code_root" rev-parse HEAD' in certifier
+    venv_owner = certifier.index(
         'test "$(stat -c \'%U\' "$release_venv_target")" = root'
     )
-    venv_seal = recovery.index(
+    venv_seal = certifier.index(
         'controlled_guard_assert_immutable_venv_tree "$release_venv_target"'
     )
-    venv_runtime_write_check = recovery.index(
+    venv_runtime_write_check = certifier.index(
         'sudo -u "$service_user" test ! -w "$release_venv_target"'
     )
     assert venv_owner < venv_seal < venv_runtime_write_check
-    assert 'find -P "$release_venv_target"' not in recovery
-    assert "--phase" not in recovery
-    initial_recover_run = recovery.index(
+    assert 'find -P "$release_venv_target"' not in certifier
+    assert "--phase" not in certifier
+    initial_recover_run = certifier.index(
         'controlled_guard_run_schema_tool "$code_root" '
         '"$release_venv" recover "$guarded_sha"'
     )
-    initial_recover_check = recovery.index(
+    initial_recover_check = certifier.index(
         "controlled_guard_validate_recover_json", initial_recover_run
     )
-    post_initial_recover_boundary = recovery.index(
+    post_initial_recover_boundary = certifier.index(
         "controlled_guard_assert_boundary", initial_recover_check
     )
-    writer_fence_run = recovery.index(
+    writer_fence_run = certifier.index(
         "controlled_guard_run_writer_fence", post_initial_recover_boundary
     )
-    writer_fence_check = recovery.index(
+    writer_fence_check = certifier.index(
         "controlled_guard_validate_writer_fence_json", writer_fence_run
     )
-    post_writer_fence_boundary = recovery.index(
+    post_writer_fence_boundary = certifier.index(
         "controlled_guard_assert_boundary", writer_fence_check
     )
-    resume_run = recovery.index(
+    resume_run = certifier.index(
         'controlled_guard_run_schema_tool "$code_root" '
         '"$release_venv" resume "$guarded_sha"',
         post_writer_fence_boundary,
     )
-    resume_check = recovery.index(
+    resume_check = certifier.index(
         "controlled_guard_validate_resume_json", resume_run
     )
-    post_resume_boundary = recovery.index(
+    post_resume_boundary = certifier.index(
         "controlled_guard_assert_boundary", resume_check
     )
-    final_recover_run = recovery.index(
+    final_recover_run = certifier.index(
         'controlled_guard_run_schema_tool "$code_root" '
         '"$release_venv" recover "$guarded_sha"',
         post_resume_boundary,
     )
-    final_recover_check = recovery.index(
+    final_recover_check = certifier.index(
         "controlled_guard_validate_recover_json", final_recover_run
     )
-    post_final_recover_boundary = recovery.index(
+    post_final_recover_boundary = certifier.index(
         "controlled_guard_assert_boundary", final_recover_check
     )
-    preflight_run = recovery.index(
+    preflight_run = certifier.index(
         'controlled_guard_run_schema_tool "$code_root" '
         '"$release_venv" preflight "$guarded_sha"',
         post_final_recover_boundary,
     )
-    preflight_check = recovery.index("controlled_guard_validate_preflight_json")
-    final_boundary = recovery.index(
+    preflight_check = certifier.index("controlled_guard_validate_preflight_json")
+    final_boundary = certifier.index(
         "controlled_guard_assert_boundary", preflight_check
     )
+    recovery_certify = recovery.index(
+        "controlled_guard_certify_database_boundary"
+    )
     restore_file_write = recovery.index(
-        "controlled_guard_write_restore_file", final_boundary
+        "controlled_guard_write_restore_file", recovery_certify
     )
     cleanup_call = recovery.index("controlled_guard_cleanup", restore_file_write)
     restore_finalize_call = recovery.index(
@@ -3880,11 +3910,11 @@ def test_controlled_database_guard_recovery_is_explicit_and_fail_closed() -> Non
         < preflight_run
         < preflight_check
         < final_boundary
-        < restore_file_write
-        < cleanup_call
-        < restore_finalize_call
     )
+    assert recovery_certify < restore_file_write < cleanup_call
+    assert cleanup_call < restore_finalize_call
     assert 'rm -f -- "$DATABASE_WRITER_GUARD_FILE"' not in recovery
+    assert 'rm -f -- "$DATABASE_WRITER_GUARD_FILE"' not in certifier
 
     for unit in (
         "probiga disabled",

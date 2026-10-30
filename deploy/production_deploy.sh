@@ -8701,27 +8701,166 @@ ok = (
 raise SystemExit(0 if ok else 2)
 '
 }
-controlled_database_guard_recovery() {
+# A cutover commits the database boundary before it restarts any writer, so a
+# rollback may only release that fence once the boundary is certified against
+# the release tree that performed it.  The operator recovery below proves the
+# same sequence; keeping the mechanics here stops an in-deploy rollback and a
+# broker recovery from drifting apart.  Every step must abort on its own
+# because the rollback caller runs with errexit disabled.
+controlled_guard_certify_database_boundary() {
   local adata_sha
   local adata_source
   local adata_tree_sha
+  local ai_service_record="$4"
+  local ai_timer_record="$5"
+  local code_root
+  local final_recover_output
+  local guarded_sha="$1"
+  local initial_recover_output
+  local main_record="$2"
+  local preflight_output
+  local release_venv
+  local release_venv_target
+  local resume_output
+  local scheduler_record="$3"
+  local service_user
+  local writer_fence_output
+  service_user="$(systemctl show -p User --value probiga)" || return 1
+  test -n "$service_user" || return 1
+  test "$service_user" != root || return 1
+  controlled_guard_install_dropins || \
+    controlled_guard_fail certify_guard_dropins || return 1
+  systemctl daemon-reload || \
+    controlled_guard_fail certify_daemon_reload || return 1
+  controlled_guard_force_all_writers_fenced "$main_record" \
+    "$scheduler_record" "$ai_service_record" "$ai_timer_record" || \
+    controlled_guard_fail certify_writer_fence || return 1
+  controlled_guard_assert_boundary "$guarded_sha" "$main_record" \
+    "$scheduler_record" "$ai_service_record" "$ai_timer_record" || \
+    controlled_guard_fail certify_boundary_before_schema || return 1
+  code_root="$CODE_RELEASE_ROOT/$guarded_sha"
+  release_venv="$RELEASE_VENV_ROOT/$guarded_sha"
+  test -d "$code_root" || return 1
+  test ! -L "$code_root" || return 1
+  test "$(readlink -f "$code_root")" = "$code_root" || return 1
+  test "$(stat -c '%U' "$code_root")" = root || \
+    controlled_guard_fail certify_code_root_owner || return 1
+  test -z "$(find -P "$code_root" -xdev \
+    \( ! -user root -o -perm /022 \) -print -quit)" || \
+    controlled_guard_fail certify_code_root_permissions || return 1
+  test "$(git -C "$code_root" rev-parse HEAD)" = "$guarded_sha" || \
+    controlled_guard_fail certify_code_root_revision || return 1
+  controlled_guard_assert_recovery_code_tree_clean \
+    "$code_root" "$guarded_sha" || \
+    controlled_guard_fail certify_code_tree_clean || return 1
+  sudo -u "$service_user" test ! -w "$code_root" || return 1
+  test -L "$release_venv" || return 1
+  release_venv_target="$(readlink -f "$release_venv")" || return 1
+  case "$release_venv_target" in
+    "$RELEASE_VENV_ROOT"/build-*) ;;
+    *) controlled_guard_fail certify_release_venv_path || return 1 ;;
+  esac
+  test "$(dirname "$release_venv_target")" = "$RELEASE_VENV_ROOT" || return 1
+  test "$(cat "$release_venv/.probiga.gitsha")" = "$guarded_sha" || \
+    controlled_guard_fail certify_release_venv_revision || return 1
+  test -x "$release_venv/bin/python" || return 1
+  test "$(stat -c '%U' "$release_venv_target")" = root || \
+    controlled_guard_fail certify_release_venv_owner || return 1
+  controlled_guard_assert_immutable_venv_tree "$release_venv_target" || \
+    controlled_guard_fail certify_release_venv_immutable || return 1
+  sudo -u "$service_user" test ! -w "$release_venv_target" || return 1
+  adata_sha="$(cat "$release_venv/.adata.gitsha")" || return 1
+  adata_tree_sha="$(cat "$release_venv/.adata.tree.sha256")" || return 1
+  [[ "$adata_sha" =~ ^[0-9a-f]{40}$ ]] || \
+    controlled_guard_fail certify_adata_revision || return 1
+  [[ "$adata_tree_sha" =~ ^[0-9a-f]{64}$ ]] || \
+    controlled_guard_fail certify_adata_tree || return 1
+  adata_source="$ADATA_RUNTIME_ROOT/$adata_sha-$adata_tree_sha"
+  test -d "$adata_source" || return 1
+  test ! -L "$adata_source" || return 1
+  test "$(readlink -f "$adata_source")" = "$adata_source" || return 1
+  test "$(stat -c '%U' "$adata_source")" = root || \
+    controlled_guard_fail certify_adata_owner || return 1
+  test "$(cat "$adata_source/.probiga-adata.gitsha")" = "$adata_sha" || \
+    controlled_guard_fail certify_adata_revision_mismatch || return 1
+  test "$(cat "$adata_source/.probiga-adata.tree.sha256")" = \
+    "$adata_tree_sha" || \
+    controlled_guard_fail certify_adata_tree_mismatch || return 1
+  test -z "$(find -P "$adata_source" -xdev \
+    \( ! -user root -o -perm /022 \) -print -quit)" || \
+    controlled_guard_fail certify_adata_permissions || return 1
+  sudo -u "$service_user" test ! -w "$adata_source" || return 1
+  controlled_guard_assert_file \
+    "$code_root/tools/prepare_strategy_governance_schema.py" 444 || return 1
+  controlled_guard_assert_file \
+    "$code_root/tools/add_trading_v3_tasks.py" 444 || return 1
+  initial_recover_output="$(controlled_guard_run_schema_tool \
+    "$code_root" "$release_venv" recover "$guarded_sha")" || \
+    controlled_guard_fail certify_schema_recover_initial || return 1
+  printf '%s\n' "$initial_recover_output"
+  printf '%s' "$initial_recover_output" \
+    | controlled_guard_validate_recover_json \
+      "$release_venv/bin/python" || \
+    controlled_guard_fail certify_schema_recover_initial_invalid || return 1
+  controlled_guard_assert_boundary "$guarded_sha" "$main_record" \
+    "$scheduler_record" "$ai_service_record" "$ai_timer_record" || \
+    controlled_guard_fail certify_boundary_after_recover_initial || return 1
+  writer_fence_output="$(controlled_guard_run_writer_fence \
+    "$code_root" "$release_venv" "$adata_source" "$guarded_sha" \
+    "$adata_sha" "$adata_tree_sha" "$service_user")" || \
+    controlled_guard_fail certify_writer_fence_tool || return 1
+  printf '%s\n' "$writer_fence_output"
+  printf '%s' "$writer_fence_output" \
+    | controlled_guard_validate_writer_fence_json \
+      "$release_venv/bin/python" || \
+    controlled_guard_fail certify_writer_fence_invalid || return 1
+  controlled_guard_assert_boundary "$guarded_sha" "$main_record" \
+    "$scheduler_record" "$ai_service_record" "$ai_timer_record" || \
+    controlled_guard_fail certify_boundary_after_writer_fence || return 1
+  resume_output="$(controlled_guard_run_schema_tool \
+    "$code_root" "$release_venv" resume "$guarded_sha")" || \
+    controlled_guard_fail certify_schema_resume || return 1
+  printf '%s\n' "$resume_output"
+  printf '%s' "$resume_output" \
+    | controlled_guard_validate_resume_json \
+      "$release_venv/bin/python" || \
+    controlled_guard_fail certify_schema_resume_invalid || return 1
+  controlled_guard_assert_boundary "$guarded_sha" "$main_record" \
+    "$scheduler_record" "$ai_service_record" "$ai_timer_record" || \
+    controlled_guard_fail certify_boundary_after_resume || return 1
+  final_recover_output="$(controlled_guard_run_schema_tool \
+    "$code_root" "$release_venv" recover "$guarded_sha")" || \
+    controlled_guard_fail certify_schema_recover_final || return 1
+  printf '%s\n' "$final_recover_output"
+  printf '%s' "$final_recover_output" \
+    | controlled_guard_validate_recover_json \
+      "$release_venv/bin/python" || \
+    controlled_guard_fail certify_schema_recover_final_invalid || return 1
+  controlled_guard_assert_boundary "$guarded_sha" "$main_record" \
+    "$scheduler_record" "$ai_service_record" "$ai_timer_record" || \
+    controlled_guard_fail certify_boundary_after_recover_final || return 1
+  preflight_output="$(controlled_guard_run_schema_tool \
+    "$code_root" "$release_venv" preflight "$guarded_sha")" || \
+    controlled_guard_fail certify_schema_preflight || return 1
+  printf '%s\n' "$preflight_output"
+  printf '%s' "$preflight_output" \
+    | controlled_guard_validate_preflight_json \
+      "$release_venv/bin/python" || \
+    controlled_guard_fail certify_schema_preflight_invalid || return 1
+  controlled_guard_assert_boundary "$guarded_sha" "$main_record" \
+    "$scheduler_record" "$ai_service_record" "$ai_timer_record" || \
+    controlled_guard_fail certify_boundary_final || return 1
+}
+controlled_database_guard_recovery() {
+  local authorized_sha="${1:-}"
   local ai_service_record
   local ai_service_load
   local ai_timer_record
   local ai_timer_load
-  local code_root
-  local resume_output
   local guarded_sha
   local main_record
-  local preflight_output
-  local initial_recover_output
-  local final_recover_output
-  local release_venv
-  local release_venv_target
   local scheduler_record
   local scheduler_load
-  local service_user
-  local writer_fence_output
   local -a guard_lines=()
   controlled_guard_assert_storage
   mapfile -t guard_lines < "$DATABASE_WRITER_GUARD_FILE"
@@ -8732,7 +8871,7 @@ controlled_database_guard_recovery() {
     *) return 1 ;;
   esac
   [[ "$guarded_sha" =~ ^[0-9a-f]{40}$ ]]
-  test "$guarded_sha" = "$PROBIGA_RECOVERY_GUARD_SHA"
+  test "$guarded_sha" = "$authorized_sha" || return 1
   case "${guard_lines[2]}" in
     main_unit=*) main_record="${guard_lines[2]#main_unit=}" ;;
     *) return 1 ;;
@@ -8764,95 +8903,9 @@ controlled_database_guard_recovery() {
     controlled_guard_assert_restore_file "$guarded_sha" "$main_record" \
       "$scheduler_record" "$ai_service_record" "$ai_timer_record"
   fi
-  service_user="$(systemctl show -p User --value probiga)"
-  test -n "$service_user"
-  test "$service_user" != root
-  controlled_guard_install_dropins
-  systemctl daemon-reload
-  controlled_guard_force_all_writers_fenced "$main_record" \
-    "$scheduler_record" "$ai_service_record" "$ai_timer_record"
-  controlled_guard_assert_boundary "$guarded_sha" "$main_record" \
-    "$scheduler_record" "$ai_service_record" "$ai_timer_record"
-  code_root="$CODE_RELEASE_ROOT/$guarded_sha"
-  release_venv="$RELEASE_VENV_ROOT/$guarded_sha"
-  test -d "$code_root"
-  test ! -L "$code_root"
-  test "$(readlink -f "$code_root")" = "$code_root"
-  test "$(stat -c '%U' "$code_root")" = root
-  test -z "$(find -P "$code_root" -xdev \
-    \( ! -user root -o -perm /022 \) -print -quit)"
-  test "$(git -C "$code_root" rev-parse HEAD)" = \
-    "$guarded_sha"
-  controlled_guard_assert_recovery_code_tree_clean \
-    "$code_root" "$guarded_sha"
-  sudo -u "$service_user" test ! -w "$code_root"
-  test -L "$release_venv"
-  release_venv_target="$(readlink -f "$release_venv")"
-  case "$release_venv_target" in
-    "$RELEASE_VENV_ROOT"/build-*) ;;
-    *) return 1 ;;
-  esac
-  test "$(dirname "$release_venv_target")" = "$RELEASE_VENV_ROOT"
-  test "$(cat "$release_venv/.probiga.gitsha")" = "$guarded_sha"
-  test -x "$release_venv/bin/python"
-  test "$(stat -c '%U' "$release_venv_target")" = root
-  controlled_guard_assert_immutable_venv_tree "$release_venv_target" || return 1
-  sudo -u "$service_user" test ! -w "$release_venv_target"
-  adata_sha="$(cat "$release_venv/.adata.gitsha")"
-  adata_tree_sha="$(cat "$release_venv/.adata.tree.sha256")"
-  [[ "$adata_sha" =~ ^[0-9a-f]{40}$ ]]
-  [[ "$adata_tree_sha" =~ ^[0-9a-f]{64}$ ]]
-  adata_source="$ADATA_RUNTIME_ROOT/$adata_sha-$adata_tree_sha"
-  test -d "$adata_source"
-  test ! -L "$adata_source"
-  test "$(readlink -f "$adata_source")" = "$adata_source"
-  test "$(stat -c '%U' "$adata_source")" = root
-  test "$(cat "$adata_source/.probiga-adata.gitsha")" = "$adata_sha"
-  test "$(cat "$adata_source/.probiga-adata.tree.sha256")" = \
-    "$adata_tree_sha"
-  test -z "$(find -P "$adata_source" -xdev \
-    \( ! -user root -o -perm /022 \) -print -quit)"
-  sudo -u "$service_user" test ! -w "$adata_source"
-  controlled_guard_assert_file \
-    "$code_root/tools/prepare_strategy_governance_schema.py" 444
-  controlled_guard_assert_file \
-    "$code_root/tools/add_trading_v3_tasks.py" 444
-  initial_recover_output="$(controlled_guard_run_schema_tool \
-    "$code_root" "$release_venv" recover "$guarded_sha")"
-  printf '%s\n' "$initial_recover_output"
-  printf '%s' "$initial_recover_output" \
-    | controlled_guard_validate_recover_json "$release_venv/bin/python"
-  controlled_guard_assert_boundary "$guarded_sha" "$main_record" \
-    "$scheduler_record" "$ai_service_record" "$ai_timer_record"
-  writer_fence_output="$(controlled_guard_run_writer_fence \
-    "$code_root" "$release_venv" "$adata_source" "$guarded_sha" \
-    "$adata_sha" "$adata_tree_sha" "$service_user")"
-  printf '%s\n' "$writer_fence_output"
-  printf '%s' "$writer_fence_output" \
-    | controlled_guard_validate_writer_fence_json "$release_venv/bin/python"
-  controlled_guard_assert_boundary "$guarded_sha" "$main_record" \
-    "$scheduler_record" "$ai_service_record" "$ai_timer_record"
-  resume_output="$(controlled_guard_run_schema_tool \
-    "$code_root" "$release_venv" resume "$guarded_sha")"
-  printf '%s\n' "$resume_output"
-  printf '%s' "$resume_output" \
-    | controlled_guard_validate_resume_json "$release_venv/bin/python"
-  controlled_guard_assert_boundary "$guarded_sha" "$main_record" \
-    "$scheduler_record" "$ai_service_record" "$ai_timer_record"
-  final_recover_output="$(controlled_guard_run_schema_tool \
-    "$code_root" "$release_venv" recover "$guarded_sha")"
-  printf '%s\n' "$final_recover_output"
-  printf '%s' "$final_recover_output" \
-    | controlled_guard_validate_recover_json "$release_venv/bin/python"
-  controlled_guard_assert_boundary "$guarded_sha" "$main_record" \
-    "$scheduler_record" "$ai_service_record" "$ai_timer_record"
-  preflight_output="$(controlled_guard_run_schema_tool \
-    "$code_root" "$release_venv" preflight "$guarded_sha")"
-  printf '%s\n' "$preflight_output"
-  printf '%s' "$preflight_output" \
-    | controlled_guard_validate_preflight_json "$release_venv/bin/python"
-  controlled_guard_assert_boundary "$guarded_sha" "$main_record" \
-    "$scheduler_record" "$ai_service_record" "$ai_timer_record"
+  controlled_guard_certify_database_boundary "$guarded_sha" \
+    "$main_record" "$scheduler_record" "$ai_service_record" \
+    "$ai_timer_record" || return 1
   echo "controlled database guard recovery validated for $guarded_sha" >&2
   controlled_guard_write_restore_file "$guarded_sha" "$main_record" \
     "$scheduler_record" "$ai_service_record" "$ai_timer_record"
@@ -8862,6 +8915,7 @@ controlled_database_guard_recovery() {
     "$scheduler_record" "$ai_service_record" "$ai_timer_record"
 }
 controlled_database_writer_restore_recovery() {
+  local authorized_sha="${1:-}"
   local ai_service_load
   local ai_service_record
   local ai_timer_load
@@ -8881,7 +8935,7 @@ controlled_database_writer_restore_recovery() {
     *) return 1 ;;
   esac
   [[ "$guarded_sha" =~ ^[0-9a-f]{40}$ ]]
-  test "$guarded_sha" = "$PROBIGA_RECOVERY_GUARD_SHA"
+  test "$guarded_sha" = "$authorized_sha" || return 1
   case "${restore_lines[2]}" in
     main_unit=*) main_record="${restore_lines[2]#main_unit=}" ;;
     *) return 1 ;;
@@ -8923,6 +8977,7 @@ controlled_database_writer_restore_recovery() {
     "$scheduler_record" "$ai_service_record" "$ai_timer_record"
 }
 controlled_activation_snapshot_only_recovery() {
+  local authorized_sha="${1:-}"
   local ai_service_record
   local ai_timer_record
   local guarded_sha
@@ -8935,7 +8990,7 @@ controlled_activation_snapshot_only_recovery() {
   local scheduler_record
   local -a state_lines=()
   guarded_sha="$(activation_snapshot_recorded_release)" || return 1
-  test "$guarded_sha" = "$PROBIGA_RECOVERY_GUARD_SHA" || return 1
+  test "$guarded_sha" = "$authorized_sha" || return 1
   old_runtime_sha="$(activation_snapshot_old_release "$guarded_sha")" || \
     return 1
   phase="$(activation_snapshot_phase)" || return 1
@@ -9088,13 +9143,14 @@ if [ "$DEPLOY_OPERATION" = recover-database-guard ]; then
         new-runtime-preserved-no-receipt ] || \
       [ "$(<"$ACTIVATION_UNIT_SNAPSHOT_PHASE")" = new-runtime-verified ] || \
       [ "$(<"$ACTIVATION_UNIT_SNAPSHOT_PHASE")" = finalized ]; }; then
-    controlled_activation_snapshot_only_recovery
+    controlled_activation_snapshot_only_recovery \
+      "$PROBIGA_RECOVERY_GUARD_SHA"
   elif [ -e "$DATABASE_WRITER_GUARD_FILE" ] || \
     [ -L "$DATABASE_WRITER_GUARD_FILE" ]; then
-    controlled_database_guard_recovery
+    controlled_database_guard_recovery "$PROBIGA_RECOVERY_GUARD_SHA"
   elif [ -e "$DATABASE_WRITER_RESTORE_FILE" ] || \
     [ -L "$DATABASE_WRITER_RESTORE_FILE" ]; then
-    controlled_database_writer_restore_recovery
+    controlled_database_writer_restore_recovery "$PROBIGA_RECOVERY_GUARD_SHA"
   else
     echo "controlled recovery found no persistent guard or restore state" >&2
     exit 2
@@ -15208,6 +15264,46 @@ deploy_deferred_database_release() {
   echo "Deployed $EXPECTED_SHA with deferred trigger boundary; governance remains locked"
   exit 0
 }
+# A cutover commits the database boundary before it restarts any writer, so a
+# rollback may release that fence only once the boundary is certified against
+# the release that performed the cutover.  Each artifact mode owns a certifier.
+# Any other outcome leaves both flags set, so the caller keeps every writer
+# stopped with the fence in place.
+rollback_release_database_writer_guard() {
+  local guard_ai_service_record=""
+  local guard_ai_timer_record=""
+  local guard_main_record=""
+  local guard_scheduler_record=""
+  case "$DEPLOY_ARTIFACT_MODE" in
+    ci-resolved-freeze-v1)
+      if ! prepared_v2_rollback_release_database_guard; then
+        rollback_failure \
+          "certify and release the v2 database guard for previous runtime"
+        return 1
+      fi
+      ;;
+    static-wheel-lock-v2)
+      if ! read -r guard_main_record guard_scheduler_record \
+        guard_ai_service_record guard_ai_timer_record \
+        < <(database_writer_guard_inventory) || \
+        ! controlled_guard_certify_database_boundary \
+          "$EXPECTED_SHA" "$guard_main_record" \
+          "$guard_scheduler_record" "$guard_ai_service_record" \
+          "$guard_ai_timer_record"; then
+        rollback_failure \
+          "certify the database boundary before releasing the writer fence"
+        return 1
+      fi
+      ;;
+    *)
+      rollback_failure "select the rollback database guard certifier"
+      return 1
+      ;;
+  esac
+  DATABASE_WRITER_GUARD_PERSISTED=0
+  DATABASE_GUARD_MIGRATION_UNVERIFIED=0
+  return 0
+}
 rollback() {
   local failed_status="${1:-$?}"
   local failed_line="${2:-0}"
@@ -15494,15 +15590,8 @@ rollback() {
     fi
     if [ "$restoration_ready" -eq 1 ] && \
       [ "$EXTERNAL_WRITER_BLOCKED" -eq 0 ] && \
-      [ "$DATABASE_GUARD_MIGRATION_UNVERIFIED" -eq 1 ] && \
-      [ "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 ]; then
-      if ! prepared_v2_rollback_release_database_guard; then
-        rollback_failure \
-          "certify and release the v2 database guard for previous runtime"
-      else
-        DATABASE_WRITER_GUARD_PERSISTED=0
-        DATABASE_GUARD_MIGRATION_UNVERIFIED=0
-      fi
+      [ "$DATABASE_GUARD_MIGRATION_UNVERIFIED" -eq 1 ]; then
+      rollback_release_database_writer_guard || true
     fi
     if [ "$restoration_ready" -eq 1 ] && \
       { [ "$EXTERNAL_WRITER_BLOCKED" -eq 1 ] || \
