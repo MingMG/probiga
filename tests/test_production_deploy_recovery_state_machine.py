@@ -5353,3 +5353,133 @@ test "$(wc -l < "$CALL_LOG")" -eq 4 || exit 36
         f"{contract_sha}|{guarded_sha}|{guarded_sha}|-P {entrypoint.as_posix()} --phase recover",
         f"{contract_sha}|{guarded_sha}|{guarded_sha}|-P {entrypoint.as_posix()} --phase preflight",
     ]
+
+
+def test_guard_removal_proves_the_boundary_before_deleting_the_fence(
+    tmp_path: Path,
+) -> None:
+    """Reproduce the 2026-10-30 cutover outage at line 16251.
+
+    Cutover stops and disables every writer, then deletes the database-writer
+    guard.  When the retried boundary assertion ran only after the deletion it
+    rebuilt the fence over an already stopped host and production stayed down.
+    The assertion must therefore fail while the guard marker still exists and
+    must not need a restore pass at all.
+    """
+
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the executable guard removal test")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    bodies = _shell_function_bodies(source)
+    removal = _function(
+        "remove_database_writer_guard_after_recovery",
+        bodies["remove_database_writer_guard_after_recovery"],
+    )
+    guard = tmp_path / "database-migration-unverified"
+    restored = tmp_path / "restored"
+    harness = f"""
+set -u
+EXPECTED_SHA={'a' * 40}
+DATABASE_WRITER_GUARD_FILE={guard.as_posix()!r}
+DATABASE_WRITER_GUARD_DIR={tmp_path.as_posix()!r}
+DATABASE_WRITER_GUARD_DROPINS=(
+  {tmp_path.as_posix()!r}/main.conf
+  {tmp_path.as_posix()!r}/scheduler.conf
+  {tmp_path.as_posix()!r}/ai-service.conf
+  {tmp_path.as_posix()!r}/ai-timer.conf
+)
+RESTORED={restored.as_posix()!r}
+BOUNDARY_RC=1
+CUTOVER_STEP=unset
+sudo() {{ "$@"; }}
+sync() {{ return 0; }}
+database_writer_guard_inventory() {{
+  printf '%s %s %s %s\n' loaded,active,enabled loaded,active,enabled \
+    loaded,inactive,static loaded,inactive,disabled
+}}
+controlled_guard_assert_marker() {{ return 0; }}
+controlled_guard_sync_activation_journal() {{ return 0; }}
+assert_database_writer_guard_dropin_file() {{ return 0; }}
+assert_database_writer_guard_dropins_loaded() {{ return 0; }}
+controlled_guard_assert_restore_file() {{ return 0; }}
+controlled_guard_assert_dropin_boundary() {{ return "$BOUNDARY_RC"; }}
+restore_database_writer_guard_after_cleanup_failure() {{
+  printf 'restored\n' > "$RESTORED"
+  return 0
+}}
+{removal}
+printf 'guard\n' > "$DATABASE_WRITER_GUARD_FILE"
+if remove_database_writer_guard_after_recovery; then exit 40; fi
+test -e "$DATABASE_WRITER_GUARD_FILE" || exit 41
+test ! -e "$RESTORED" || exit 42
+test "$CUTOVER_STEP" = verify_database_writer_boundary_before_guard_removal || \
+  exit 43
+BOUNDARY_RC=0
+remove_database_writer_guard_after_recovery || exit 44
+test ! -e "$DATABASE_WRITER_GUARD_FILE" || exit 45
+"""
+    harness_path = tmp_path / "guard-removal-order-harness.sh"
+    harness_path.write_text(harness, encoding="utf-8", newline="\n")
+    completed = subprocess.run(
+        [bash, str(harness_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=15,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_guard_boundary_assertions_name_the_rejected_condition(
+    tmp_path: Path,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the executable guard boundary test")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    bodies = _shell_function_bodies(source)
+    shell_functions = "".join(
+        _function(name, bodies[name])
+        for name in ("controlled_guard_fail", "controlled_guard_assert_unit_fenced")
+    )
+    stderr_path = tmp_path / "stderr"
+    harness = f"""
+set -u
+ACTIVE_STATE=active
+systemctl() {{
+  case "$*" in
+    *'LoadState --value probiga-scheduler'*) printf 'loaded\n' ;;
+    *'ActiveState --value probiga-scheduler'*) printf '%s\n' "$ACTIVE_STATE" ;;
+    *'UnitFileState --value probiga-scheduler'*) printf 'disabled\n' ;;
+    *'MainPID --value probiga-scheduler'*) printf '0\n' ;;
+    *'ExecMainPID --value probiga-scheduler'*) printf '0\n' ;;
+    *) printf '\n' ;;
+  esac
+}}
+{shell_functions}
+if controlled_guard_assert_unit_fenced probiga-scheduler disabled \
+    2> {stderr_path.as_posix()!r}; then exit 50; fi
+ACTIVE_STATE=inactive
+controlled_guard_assert_unit_fenced probiga-scheduler disabled \
+    2>> {stderr_path.as_posix()!r} || exit 51
+"""
+    harness_path = tmp_path / "guard-boundary-naming-harness.sh"
+    harness_path.write_text(harness, encoding="utf-8", newline="\n")
+    completed = subprocess.run(
+        [bash, str(harness_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=15,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    reported = stderr_path.read_text(encoding="utf-8").splitlines()
+    assert reported == [
+        "database_writer_guard_boundary_failed="
+        "unit_active:probiga-scheduler:active"
+    ]

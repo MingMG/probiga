@@ -2399,6 +2399,15 @@ activation_snapshot_restore_old_set() {
   activation_snapshot_set_phase "$expected_release" old-set-restored || return 1
   return 0
 }
+# The guard-boundary predicates below must name the exact condition they
+# rejected.  Cutover stops and disables every writer before it removes the
+# database-writer fence, so a silent `return 1` there leaves the host unable to
+# start and unable to say why.  Each tag is a fixed reason code plus the unit or
+# drop-in path, which is enough to re-run the predicate by hand.
+controlled_guard_fail() {
+  printf 'database_writer_guard_boundary_failed=%s\n' "$1" >&2
+  return 1
+}
 controlled_guard_assert_file() {
   local expected_mode="$2"
   local path="$1"
@@ -2431,9 +2440,13 @@ controlled_guard_assert_state_record() {
   local unit_file_state
   local unit_kind="$1"
   IFS=, read -r load_state active_state unit_file_state extra <<< "$record" || \
+    controlled_guard_fail "guard_state_record_unparsable:$unit_kind" || \
     return 1
-  test -z "$extra" || return 1
-  test "$record" = "$load_state,$active_state,$unit_file_state" || return 1
+  test -z "$extra" || controlled_guard_fail \
+    "guard_state_record_extra_field:$unit_kind:$record" || return 1
+  test "$record" = "$load_state,$active_state,$unit_file_state" || \
+    controlled_guard_fail "guard_state_record_malformed:$unit_kind:$record" || \
+    return 1
   case "$unit_kind:$load_state:$active_state:$unit_file_state" in
     main:loaded:active:enabled|main:loaded:active:disabled|\
     main:loaded:inactive:enabled|main:loaded:inactive:disabled|\
@@ -2447,7 +2460,10 @@ controlled_guard_assert_state_record() {
     ai-timer:loaded:active:enabled|ai-timer:loaded:active:disabled|\
     ai-timer:loaded:inactive:enabled|ai-timer:loaded:inactive:disabled|\
     ai-timer:not-found:not-found:not-found) ;;
-    *) return 1 ;;
+    *)
+      controlled_guard_fail "guard_state_record_rejected:$unit_kind:$record"
+      return 1
+      ;;
   esac
   return 0
 }
@@ -2462,16 +2478,35 @@ controlled_guard_assert_marker() {
   controlled_guard_assert_state_record scheduler "$scheduler_record" || return 1
   controlled_guard_assert_state_record ai-service "$ai_service_record" || return 1
   controlled_guard_assert_state_record ai-timer "$ai_timer_record" || return 1
-  test "${ai_service_record%%,*}" = "${ai_timer_record%%,*}" || return 1
-  controlled_guard_assert_storage || return 1
-  mapfile -t guard_lines < "$DATABASE_WRITER_GUARD_FILE" || return 1
-  test "${#guard_lines[@]}" -eq 6 || return 1
-  test "${guard_lines[0]}" = probiga.database-writer-guard.v2 || return 1
-  test "${guard_lines[1]}" = "release=$guarded_sha" || return 1
-  test "${guard_lines[2]}" = "main_unit=$main_record" || return 1
-  test "${guard_lines[3]}" = "scheduler_unit=$scheduler_record" || return 1
-  test "${guard_lines[4]}" = "ai_service_unit=$ai_service_record" || return 1
-  test "${guard_lines[5]}" = "ai_timer_unit=$ai_timer_record" || return 1
+  test "${ai_service_record%%,*}" = "${ai_timer_record%%,*}" || \
+    controlled_guard_fail "guard_marker_ai_load_mismatch:$ai_service_record" || \
+    return 1
+  controlled_guard_assert_storage || \
+    controlled_guard_fail "guard_marker_storage" || return 1
+  mapfile -t guard_lines < "$DATABASE_WRITER_GUARD_FILE" || \
+    controlled_guard_fail "guard_marker_unreadable" || return 1
+  test "${#guard_lines[@]}" -eq 6 || controlled_guard_fail \
+    "guard_marker_line_count:${#guard_lines[@]}" || return 1
+  test "${guard_lines[0]}" = probiga.database-writer-guard.v2 || \
+    controlled_guard_fail "guard_marker_schema:${guard_lines[0]}" || return 1
+  test "${guard_lines[1]}" = "release=$guarded_sha" || \
+    controlled_guard_fail \
+    "guard_marker_release:${guard_lines[1]}:expected=$guarded_sha" || return 1
+  test "${guard_lines[2]}" = "main_unit=$main_record" || \
+    controlled_guard_fail \
+    "guard_marker_main_unit:${guard_lines[2]}:expected=$main_record" || return 1
+  test "${guard_lines[3]}" = "scheduler_unit=$scheduler_record" || \
+    controlled_guard_fail \
+    "guard_marker_scheduler_unit:${guard_lines[3]}:expected=$scheduler_record" \
+    || return 1
+  test "${guard_lines[4]}" = "ai_service_unit=$ai_service_record" || \
+    controlled_guard_fail \
+    "guard_marker_ai_service_unit:${guard_lines[4]}:expected=$ai_service_record" \
+    || return 1
+  test "${guard_lines[5]}" = "ai_timer_unit=$ai_timer_record" || \
+    controlled_guard_fail \
+    "guard_marker_ai_timer_unit:${guard_lines[5]}:expected=$ai_timer_record" \
+    || return 1
   return 0
 }
 controlled_guard_assert_restore_file() {
@@ -2537,27 +2572,41 @@ controlled_guard_assert_dropin() {
   local parent
   local path="$1"
   parent="$(dirname "$path")" || return 1
-  test -d "$parent" || return 1
-  test ! -L "$parent" || return 1
-  test "$(readlink -f "$parent")" = "$parent" || return 1
-  test "$(stat -c '%U:%G' "$parent")" = root:root || return 1
-  test "$(stat -c '%a' "$parent")" = 755 || return 1
-  controlled_guard_assert_file "$path" 644 || return 1
-  test "$(wc -l < "$path")" -eq 2 || return 1
-  grep -Fx '[Unit]' "$path" >/dev/null || return 1
+  test -d "$parent" || \
+    controlled_guard_fail "dropin_parent_missing:$path" || return 1
+  test ! -L "$parent" || \
+    controlled_guard_fail "dropin_parent_symlink:$path" || return 1
+  test "$(readlink -f "$parent")" = "$parent" || \
+    controlled_guard_fail "dropin_parent_unresolved:$path" || return 1
+  test "$(stat -c '%U:%G' "$parent")" = root:root || \
+    controlled_guard_fail "dropin_parent_owner:$path" || return 1
+  test "$(stat -c '%a' "$parent")" = 755 || \
+    controlled_guard_fail "dropin_parent_mode:$path" || return 1
+  controlled_guard_assert_file "$path" 644 || \
+    controlled_guard_fail "dropin_file_identity:$path" || return 1
+  test "$(wc -l < "$path")" -eq 2 || \
+    controlled_guard_fail "dropin_line_count:$path" || return 1
+  grep -Fx '[Unit]' "$path" >/dev/null || \
+    controlled_guard_fail "dropin_section:$path" || return 1
   grep -Fx "ConditionPathExists=!$DATABASE_WRITER_GUARD_FILE" \
-    "$path" >/dev/null || return 1
+    "$path" >/dev/null || \
+    controlled_guard_fail "dropin_condition:$path" || return 1
   return 0
 }
 controlled_guard_assert_unit_dropin_loaded() {
   local dropin="$2"
   local dropin_paths
   local unit="$1"
-  test "$(systemctl show -p LoadState --value "$unit")" = loaded || return 1
-  dropin_paths="$(systemctl show -p DropInPaths --value "$unit")" || return 1
+  test "$(systemctl show -p LoadState --value "$unit")" = loaded || \
+    controlled_guard_fail "unit_load:$unit" || return 1
+  dropin_paths="$(systemctl show -p DropInPaths --value "$unit")" || \
+    controlled_guard_fail "unit_dropin_inventory:$unit" || return 1
   case " $dropin_paths " in
     *" $dropin "*) ;;
-    *) return 1 ;;
+    *)
+      controlled_guard_fail "unit_dropin_missing:$unit:$dropin"
+      return 1
+      ;;
   esac
   return 0
 }
@@ -2568,17 +2617,29 @@ controlled_guard_assert_unit_fenced() {
   local main_pid
   local unit="$1"
   local unit_file_state
-  test "$(systemctl show -p LoadState --value "$unit")" = loaded || return 1
-  active_state="$(systemctl show -p ActiveState --value "$unit")" || return 1
-  unit_file_state="$(systemctl show -p UnitFileState --value "$unit")" || return 1
-  test "$active_state" = inactive || return 1
-  main_pid="$(systemctl show -p MainPID --value "$unit")" || return 1
-  exec_main_pid="$(systemctl show -p ExecMainPID --value "$unit")" || return 1
-  test "${main_pid:-0}" = 0 || return 1
-  test "${exec_main_pid:-0}" = 0 || return 1
+  test "$(systemctl show -p LoadState --value "$unit")" = loaded || \
+    controlled_guard_fail "unit_load:$unit" || return 1
+  active_state="$(systemctl show -p ActiveState --value "$unit")" || \
+    controlled_guard_fail "unit_active_state:$unit" || return 1
+  unit_file_state="$(systemctl show -p UnitFileState --value "$unit")" || \
+    controlled_guard_fail "unit_file_state:$unit" || return 1
+  test "$active_state" = inactive || \
+    controlled_guard_fail "unit_active:$unit:$active_state" || return 1
+  main_pid="$(systemctl show -p MainPID --value "$unit")" || \
+    controlled_guard_fail "unit_main_pid:$unit" || return 1
+  exec_main_pid="$(systemctl show -p ExecMainPID --value "$unit")" || \
+    controlled_guard_fail "unit_exec_main_pid:$unit" || return 1
+  test "${main_pid:-0}" = 0 || \
+    controlled_guard_fail "unit_main_pid_alive:$unit:$main_pid" || return 1
+  test "${exec_main_pid:-0}" = 0 || controlled_guard_fail \
+    "unit_exec_main_pid_alive:$unit:$exec_main_pid" || return 1
   case ":$allowed_unit_file_states:" in
     *":$unit_file_state:"*) ;;
-    *) return 1 ;;
+    *)
+      controlled_guard_fail \
+        "unit_file_state_not_fenced:$unit:$unit_file_state"
+      return 1
+      ;;
   esac
   return 0
 }
@@ -2589,24 +2650,40 @@ controlled_guard_normalize_unit_fenced() {
   local main_pid
   local unit="$1"
   local unit_file_state
-  test "$(systemctl show -p LoadState --value "$unit")" = loaded || return 1
-  unit_file_state="$(systemctl show -p UnitFileState --value "$unit")" || return 1
+  test "$(systemctl show -p LoadState --value "$unit")" = loaded || \
+    controlled_guard_fail "unit_load:$unit" || return 1
+  unit_file_state="$(systemctl show -p UnitFileState --value "$unit")" || \
+    controlled_guard_fail "unit_file_state:$unit" || return 1
   case ":$allowed_unit_file_states:" in
     *":$unit_file_state:"*) ;;
-    *) return 1 ;;
+    *)
+      controlled_guard_fail \
+        "unit_file_state_not_fenced:$unit:$unit_file_state"
+      return 1
+      ;;
   esac
-  active_state="$(systemctl show -p ActiveState --value "$unit")" || return 1
+  active_state="$(systemctl show -p ActiveState --value "$unit")" || \
+    controlled_guard_fail "unit_active_state:$unit" || return 1
   case "$active_state" in
     inactive) ;;
     failed)
-      main_pid="$(systemctl show -p MainPID --value "$unit")" || return 1
-      exec_main_pid="$(systemctl show -p ExecMainPID --value "$unit")" || return 1
-      test "${main_pid:-0}" = 0 || return 1
-      test "${exec_main_pid:-0}" = 0 || return 1
-      systemctl stop "$unit" || return 1
-      systemctl reset-failed "$unit" || return 1
+      main_pid="$(systemctl show -p MainPID --value "$unit")" || \
+        controlled_guard_fail "unit_main_pid:$unit" || return 1
+      exec_main_pid="$(systemctl show -p ExecMainPID --value "$unit")" || \
+        controlled_guard_fail "unit_exec_main_pid:$unit" || return 1
+      test "${main_pid:-0}" = 0 || \
+        controlled_guard_fail "unit_main_pid_alive:$unit:$main_pid" || return 1
+      test "${exec_main_pid:-0}" = 0 || controlled_guard_fail \
+        "unit_exec_main_pid_alive:$unit:$exec_main_pid" || return 1
+      systemctl stop "$unit" || \
+        controlled_guard_fail "unit_stop_failed:$unit" || return 1
+      systemctl reset-failed "$unit" || \
+        controlled_guard_fail "unit_reset_failed_failed:$unit" || return 1
       ;;
-    *) return 1 ;;
+    *)
+      controlled_guard_fail "unit_active:$unit:$active_state"
+      return 1
+      ;;
   esac
   controlled_guard_assert_unit_fenced "$unit" "$allowed_unit_file_states" || \
     return 1
@@ -2623,9 +2700,12 @@ controlled_guard_assert_unit_inventory_fenced() {
       ;;
     not-found)
       test "$(systemctl show -p LoadState --value "$unit")" = not-found || \
-        return 1
+        controlled_guard_fail "unit_expected_absent:$unit" || return 1
       ;;
-    *) return 1 ;;
+    *)
+      controlled_guard_fail "unit_inventory_record:$unit:$expected_load"
+      return 1
+      ;;
   esac
   return 0
 }
@@ -2650,7 +2730,10 @@ controlled_guard_assert_all_writers_fenced() {
       not-found) ;;
       loaded) controlled_guard_normalize_unit_fenced \
         "$trigger_unit" disabled || return 1 ;;
-      *) return 1 ;;
+      *)
+        controlled_guard_fail "trigger_unit_load:$trigger_unit"
+        return 1
+        ;;
     esac
   done
   return 0
@@ -10711,14 +10794,20 @@ restore_database_writer_guard_after_cleanup_failure() {
   test "$failed" -eq 0
 }
 remove_database_writer_guard_after_recovery() {
+  local ai_service_load
   local ai_service_record
+  local ai_timer_load
   local ai_timer_record
   local dropin
   local main_record
+  local scheduler_load
   local scheduler_record
   CUTOVER_STEP=remove_database_writer_guard_inventory
   read -r main_record scheduler_record ai_service_record ai_timer_record \
     < <(database_writer_guard_inventory) || return 1
+  scheduler_load="${scheduler_record%%,*}"
+  ai_service_load="${ai_service_record%%,*}"
+  ai_timer_load="${ai_timer_record%%,*}"
   CUTOVER_STEP=verify_database_writer_guard_marker_before_removal
   controlled_guard_assert_marker "$EXPECTED_SHA" "$main_record" \
     "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
@@ -10730,6 +10819,13 @@ remove_database_writer_guard_after_recovery() {
     assert_database_writer_guard_dropin_file "$dropin" || return 1
   done
   assert_database_writer_guard_dropins_loaded || return 1
+  # Prove the whole fence boundary while the guard marker still exists.  Every
+  # writer is already stopped and disabled by this point, so removing the marker
+  # before the assertion leaves no recoverable state if the assertion fails:
+  # the fence is rebuilt over an already-stopped host and nothing restarts it.
+  CUTOVER_STEP=verify_database_writer_boundary_before_guard_removal
+  controlled_guard_assert_dropin_boundary "$scheduler_load" \
+    "$ai_service_load" "$ai_timer_load" || return 1
   CUTOVER_STEP=remove_database_writer_guard_marker
   if ! sudo rm -f -- "$DATABASE_WRITER_GUARD_FILE" || \
     ! sudo sync -f "$DATABASE_WRITER_GUARD_DIR"; then
@@ -10756,9 +10852,8 @@ remove_database_writer_guard_after_recovery() {
     return 1
   fi
   CUTOVER_STEP=verify_database_writer_boundary_after_guard_removal
-  if ! controlled_guard_assert_dropin_boundary \
-    "${scheduler_record%%,*}" "${ai_service_record%%,*}" \
-    "${ai_timer_record%%,*}"; then
+  if ! controlled_guard_assert_dropin_boundary "$scheduler_load" \
+    "$ai_service_load" "$ai_timer_load"; then
     restore_database_writer_guard_after_cleanup_failure || true
     return 1
   fi

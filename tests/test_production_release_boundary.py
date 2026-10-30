@@ -5960,6 +5960,10 @@ def test_database_guard_removal_records_precise_failure_steps() -> None:
         "verify_database_writer_guard_marker_before_removal",
         "sync_database_writer_restore_journal_before_removal",
         "verify_database_writer_guard_dropins_before_removal",
+        # Proving the boundary while the guard marker still exists is what keeps a
+        # rejection recoverable: every writer is already stopped by this point, so
+        # deleting the fence first rebuilds it over a down host with no way back.
+        "verify_database_writer_boundary_before_guard_removal",
         "remove_database_writer_guard_marker",
         "verify_database_writer_restore_journal_after_removal",
         "verify_database_writer_guard_dropins_after_removal",
@@ -5967,7 +5971,8 @@ def test_database_guard_removal_records_precise_failure_steps() -> None:
     )
 
     positions = [cleanup.index(f"CUTOVER_STEP={step}") for step in steps]
-    assert positions == sorted(positions)
+    assert positions == sorted(set(positions))
+    assert all(cleanup.count(f"CUTOVER_STEP={step}") == 1 for step in steps)
     assert all(re.fullmatch(r"[a-z0-9][a-z0-9_]*", step) for step in steps)
 
 
