@@ -17,7 +17,10 @@ from server.common.scheduler_runtime_schema import (
     migrate_scheduler_runtime_heartbeat,
     preflight_scheduler_runtime_heartbeat_schema,
 )
-from tools.qmt_host_ownership_contract import WINDOWS_QMT_EDGE_TASKS_BY_TYPE
+from tools.qmt_host_ownership_contract import (
+    QMT_DATADIR_DIRECT_TASK_TYPES,
+    WINDOWS_QMT_EDGE_TASKS_BY_TYPE,
+)
 
 
 BUILD_SHA = "a" * 40
@@ -362,6 +365,29 @@ def test_qmt_windows_edge_fails_closed_without_execution_proof(
     assert detail["status"] == "UNAVAILABLE"
     assert detail["strategy_eligible"] is False
     assert expected_error in detail["errors"]
+
+
+def test_datadir_direct_history_cannot_satisfy_edge_health():
+    # Authorization to run the frozen DAT-cache importers is not execution
+    # proof.  Health only ever asks about the API-bound proof tasks, so a host
+    # that ran nothing else stays ineligible for strategy execution even after
+    # the dispatch gate was widened for a peer outage.
+    assert not (
+        set(QMT_DATADIR_DIRECT_TASK_TYPES) & set(EDGE_PROOF_TASK_TYPES)
+    )
+    datadir_history = [
+        {**_edge_history_rows()[0], "id": 300 + index, "task_type": task_type}
+        for index, task_type in enumerate(QMT_DATADIR_DIRECT_TASK_TYPES)
+    ]
+    passed, detail = check_qmt_windows_edge_executor(
+        _EdgeConnection(history=datadir_history),
+        expected_build_sha=BUILD_SHA,
+    )
+
+    assert passed is False
+    assert detail["strategy_eligible"] is False
+    for task_type in EDGE_PROOF_TASK_TYPES:
+        assert f"last_success_missing:{task_type}" in detail["errors"]
 
 
 def test_qmt_windows_edge_rejects_zero_or_malformed_release_identity():

@@ -8217,7 +8217,10 @@ def test_qmt_runtime_preflight_failure_falls_back_to_dat_only() -> None:
         )
 
 
-def test_windows_peer_runtime_failure_allows_dat_only_dispatch() -> None:
+def test_windows_peer_runtime_failure_is_reported_as_a_check_failure() -> None:
+    # Regression: this exact state used to be reported as a missing QMT
+    # bootstrap, so a peer-side RuntimeError looked like a QMT problem and hid
+    # which endpoint was actually inconsistent.
     with patch(
         "server.api.scheduler_runtime.get_scheduler_runtime_config",
         return_value={"poll_seconds": 60},
@@ -8231,7 +8234,128 @@ def test_windows_peer_runtime_failure_allows_dat_only_dispatch() -> None:
         )
 
     assert not ready
+    assert reason == "release_activation_check_failed:RuntimeError"
+    assert reason != "qmt_release_bootstrap_unavailable"
+    assert scheduler_runtime._qmt_datadir_direct_authorized(reason)
+
+
+@pytest.mark.parametrize("reason", [
+    "qmt_release_bootstrap_unavailable",
+    "linux_active_lease_unavailable",
+    "linux_activation_receipt_not_unique",
+    "linux_activation_receipt_mismatch",
+    "release_activation_check_failed:RuntimeError",
+])
+def test_windows_peer_activation_reasons_allow_datadir_direct_dispatch(reason) -> None:
+    build_sha = "c" * 40
+    engine = MagicMock()
+    with patch(
+        "server.api.scheduler_runtime._scheduler_executor_role",
+        return_value=scheduler_runtime.SCHEDULER_OWNER_WINDOWS_QMT,
+    ), patch(
+        "server.api.scheduler_runtime._scheduler_build_commit_sha",
+        return_value=build_sha,
+    ), patch(
+        "server.api.scheduler_runtime.check_qmt_edge_release_activation",
+        return_value=(True, {"status": "READY", "reason_code": ""}),
+    ), patch(
+        "server.api.scheduler_runtime._windows_release_activation_ready",
+        return_value=(False, reason),
+    ):
+        assert scheduler_runtime._qmt_windows_dispatch_preflight(
+            engine, mode="standalone"
+        ) == (True, scheduler_runtime.QMT_DATADIR_DIRECT_DISPATCH_REASON)
+
+
+@pytest.mark.parametrize("reason", [
+    "executor_role_unclassified",
+    "build_identity_unavailable",
+    "release_activation_check_failed",
+])
+def test_unknown_peer_reasons_do_not_authorize_datadir_direct(reason) -> None:
+    assert not scheduler_runtime._qmt_datadir_direct_authorized(reason)
+
+
+def test_loop_grant_still_blocks_dat_only_dispatch() -> None:
+    # The QMT edge grant is the first and unconditional gate: a peer problem
+    # must never be able to bypass it, not even for the frozen DAT importers.
+    build_sha = "c" * 40
+    engine = MagicMock()
+    with patch(
+        "server.api.scheduler_runtime._scheduler_executor_role",
+        return_value=scheduler_runtime.SCHEDULER_OWNER_WINDOWS_QMT,
+    ), patch(
+        "server.api.scheduler_runtime._scheduler_build_commit_sha",
+        return_value=build_sha,
+    ), patch(
+        "server.api.scheduler_runtime.check_qmt_edge_release_activation",
+        return_value=(False, {
+            "status": "PENDING",
+            "reason_code": "QMT_EDGE_RELEASE_ACTIVATION_PENDING",
+        }),
+    ), patch(
+        "server.api.scheduler_runtime._windows_release_activation_ready",
+    ) as release_ready:
+        assert scheduler_runtime._qmt_windows_dispatch_preflight(
+            engine, mode="standalone"
+        ) == (False, "QMT_EDGE_RELEASE_ACTIVATION_PENDING")
+        release_ready.assert_not_called()
+
+
+def test_qmt_receipt_failure_keeps_bootstrap_reason_and_logs_detail(
+    caplog, monkeypatch,
+) -> None:
+    monkeypatch.setattr(scheduler_runtime, "_qmt_receipt_detail_state", None)
+    build_sha = "c" * 40
+    engine = MagicMock()
+    connection = engine.connect.return_value.__enter__.return_value
+    with caplog.at_level("WARNING"), patch(
+        "server.api.scheduler_runtime.get_scheduler_runtime_config",
+        return_value={"poll_seconds": 60},
+    ), patch(
+        "server.api.scheduler_runtime._verified_linux_activation_build",
+        return_value=(build_sha, "ready"),
+    ), patch(
+        "server.api.scheduler_runtime.check_qmt_windows_edge_release_receipt",
+        return_value=(False, {
+            "status": "PENDING",
+            "reason_code": "QMT_EDGE_RELEASE_BOOTSTRAP_PENDING",
+        }),
+    ) as receipt:
+        ready, reason = scheduler_runtime._windows_release_activation_ready(
+            engine, build_sha=build_sha,
+        )
+        receipt.assert_called_once_with(
+            connection,
+            expected_build_sha=build_sha,
+            expected_poll_seconds=60,
+        )
+
+    assert not ready
     assert reason == "qmt_release_bootstrap_unavailable"
+    assert "QMT_EDGE_RELEASE_BOOTSTRAP_PENDING" in caplog.text
+
+
+def test_qmt_dispatch_gate_logs_once_per_state_change(caplog, monkeypatch) -> None:
+    monkeypatch.setattr(scheduler_runtime, "_qmt_dispatch_gate_state", None)
+    with caplog.at_level("INFO"):
+        scheduler_runtime._log_qmt_dispatch_gate(True, "not_applicable")
+        scheduler_runtime._log_qmt_dispatch_gate(True, "not_applicable")
+        blocked = "release_activation_check_failed:OperationalError"
+        scheduler_runtime._log_qmt_dispatch_gate(False, blocked)
+        scheduler_runtime._log_qmt_dispatch_gate(False, blocked)
+        scheduler_runtime._log_qmt_dispatch_gate(
+            True, scheduler_runtime.QMT_DATADIR_DIRECT_DISPATCH_REASON,
+        )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert len(messages) == 3
+    assert messages[0].startswith("QMT dispatch gate: not_applicable")
+    assert messages[1].startswith("QMT dispatch gate blocked by a failed check")
+    assert "frozen DAT-cache importers" in messages[2]
+    assert [record.levelname for record in caplog.records] == [
+        "INFO", "ERROR", "WARNING",
+    ]
 
 
 def test_qmt_datadir_direct_dispatch_is_limited_to_frozen_cache_importers() -> None:

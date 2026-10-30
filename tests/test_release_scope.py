@@ -77,7 +77,7 @@ def repo(tmp_path):
 def test_application_and_deployment_changes_are_linux(repo, path):
     repo.write(path, "changed\n")
     result = repo.classify(repo.commit())
-    assert result["schema"] == "probiga.release-scope.v3"
+    assert result["schema"] == "probiga.release-scope.v4"
     assert result["scope"] == "LINUX"
     assert result["reason_codes"] == ["code_only_delta"]
     assert result["base_contract_sha256"] == result["contract_sha256"]
@@ -122,32 +122,156 @@ def test_sql_file_ddl_is_coordinated(repo):
     assert repo.classify(repo.commit())["scope"] == "COORDINATED"
 
 
+CONTRACT_MODULE = "server/common/scheduler_args.py"
+
+
+def test_contract_docstring_and_comment_change_is_linux(repo):
+    repo.write(CONTRACT_MODULE, '"""Revision."""\nREVISION = 1\n')
+    first = repo.commit()
+    repo.write(CONTRACT_MODULE, '"""Revision, clarified."""\nREVISION = 1  # same\n')
+    result = repo.classify(repo.commit(), base=first)
+    assert result["scope"] == "LINUX"
+    assert result["base_contract_sha256"] == result["contract_sha256"]
+
+
+def test_contract_function_body_change_is_linux(repo):
+    repo.write(CONTRACT_MODULE, "REVISION = 1\n\n\ndef helper(value):\n    return value\n")
+    first = repo.commit()
+    repo.write(
+        CONTRACT_MODULE,
+        "REVISION = 1\n\n\ndef helper(value):\n    # traced\n    return value + 1\n",
+    )
+    result = repo.classify(repo.commit(), base=first)
+    assert result["scope"] == "LINUX"
+    assert result["base_contract_sha256"] == result["contract_sha256"]
+
+
 @pytest.mark.parametrize("path", [
     "server/api/scheduler_runtime.py",
-    "server/common/limit_up_event_schema.py",
-    "server/common/qmt_edge_release_recovery.py",
-    "server/common/scheduler_args.py",
-    "server/common/scheduler_runtime_health.py",
-    "server/common/scheduler_script_policy.py",
-    "server/common/scheduler_task_retirement.py",
-    "server/common/scheduler_tasks.py",
-    "server/common/scheduler_validation.py",
-    "tools/prepare_strategy_governance_schema.py",
-    "tools/prepare_strategy_governance_deferred_schema.py",
-    "tools/prepare_strategy_governance_qmt_history.py",
-    "tools/reload_big_qmt_strategy.ps1",
-    "tools/resume_qmt_prior_edge.ps1",
-    "tools/apply_public_market_profile.py",
-    "tools/run_big_qmt_bridge.py",
-    "tools/run_qmt_windows_edge_release_bootstrap.py",
-    "tools/start_local_live_services.ps1",
+    "server/common/qmt_edge_release_receipt.py",
+    "tools/qmt_host_ownership_contract.py",
     "tools/update_qmt_windows_edge.ps1",
 ])
-def test_cross_end_contract_changes_are_coordinated(repo, path):
-    repo.write(path, "SCHEMA_CONTRACT_REVISION = 1\n")
-    result = repo.classify(repo.commit())
+def test_contract_declaration_change_is_coordinated(repo, path):
+    repo.write(path, "CONTRACT_REVISION = 1\n")
+    first = repo.commit()
+    repo.write(path, "CONTRACT_REVISION = 2\n")
+    result = repo.classify(repo.commit(), base=first)
     assert result["scope"] == "COORDINATED"
     assert result["reason_codes"] == ["schema_contract_changed"]
+
+
+def test_contract_binding_addition_and_removal_are_coordinated(repo):
+    repo.write(CONTRACT_MODULE, "ALPHA = 1\n")
+    first = repo.commit()
+    repo.write(CONTRACT_MODULE, "ALPHA = 1\nBETA = 2\n")
+    second = repo.commit()
+    assert repo.classify(second, base=first)["scope"] == "COORDINATED"
+    repo.write(CONTRACT_MODULE, "ALPHA = 1\n")
+    third = repo.commit()
+    assert repo.classify(third, base=second)["scope"] == "COORDINATED"
+
+
+def test_contract_same_value_with_different_spelling_is_linux(repo):
+    repo.write(CONTRACT_MODULE, "TASK_TYPES = frozenset({'a', 'b'})\n")
+    first = repo.commit()
+    repo.write(CONTRACT_MODULE, "TASK_TYPES = frozenset({'b', 'a'})\n")
+    result = repo.classify(repo.commit(), base=first)
+    assert result["scope"] == "LINUX"
+    assert result["base_contract_sha256"] == result["contract_sha256"]
+
+
+def test_contract_mapping_order_change_is_coordinated(repo):
+    repo.write(CONTRACT_MODULE, "READY = {'a': 1, 'b': 2}\n")
+    first = repo.commit()
+    repo.write(CONTRACT_MODULE, "READY = {'b': 2, 'a': 1}\n")
+    assert repo.classify(repo.commit(), base=first)["scope"] == "COORDINATED"
+
+
+def test_contract_module_level_mapping_mutation_is_coordinated(repo):
+    repo.write(CONTRACT_MODULE, "DEPENDENCIES = {}\nDEPENDENCIES['a'] = ('x',)\n")
+    first = repo.commit()
+    repo.write(CONTRACT_MODULE, "DEPENDENCIES = {}\nDEPENDENCIES['a'] = ('y',)\n")
+    result = repo.classify(repo.commit(), base=first)
+    assert result["scope"] == "COORDINATED"
+
+
+def test_contract_multi_target_binding_rename_is_coordinated(repo):
+    repo.write(CONTRACT_MODULE, "ALPHA = BETA = 1\n")
+    first = repo.commit()
+    repo.write(CONTRACT_MODULE, "GAMMA = DELTA = 1\n")
+    assert repo.classify(repo.commit(), base=first)["scope"] == "COORDINATED"
+
+
+def test_contract_export_list_is_not_part_of_the_contract(repo):
+    repo.write(CONTRACT_MODULE, "REVISION = 1\n__all__ = ['REVISION']\n")
+    first = repo.commit()
+    repo.write(CONTRACT_MODULE, "REVISION = 1\n__all__ = ['REVISION', 'helper']\n")
+    result = repo.classify(repo.commit(), base=first)
+    assert result["scope"] == "LINUX"
+
+
+def test_deleted_contract_file_is_coordinated(repo):
+    repo.write(CONTRACT_MODULE, "REVISION = 1\n")
+    first = repo.commit()
+    (repo.root / CONTRACT_MODULE).unlink()
+    result = repo.classify(repo.commit(), base=first)
+    assert result["scope"] == "COORDINATED"
+
+
+def test_unparsable_target_contract_file_aborts(repo):
+    repo.write(CONTRACT_MODULE, "def broken(:\n")
+    with pytest.raises(policy.ScopeError, match="^contract_parse_failed$"):
+        repo.classify(repo.commit())
+
+
+def test_empty_target_contract_file_aborts(repo):
+    repo.write(CONTRACT_MODULE, "import os\n\n\ndef helper():\n    return 1\n")
+    with pytest.raises(policy.ScopeError, match="^contract_extraction_empty$"):
+        repo.classify(repo.commit())
+
+
+def test_duplicate_target_contract_binding_aborts(repo):
+    repo.write(CONTRACT_MODULE, "REVISION = 1\nREVISION = 2\n")
+    with pytest.raises(policy.ScopeError, match="^contract_symbol_duplicate$"):
+        repo.classify(repo.commit())
+
+
+def test_unsupported_target_contract_value_aborts(repo):
+    repo.write(CONTRACT_MODULE, "PHASE = 1j\n")
+    with pytest.raises(policy.ScopeError, match="^contract_value_unsupported$"):
+        repo.classify(repo.commit())
+
+
+def test_unparsable_base_contract_file_stays_lenient(repo):
+    # The base tree cannot be repaired by this release; a broken base must still
+    # classify (as a contract change) instead of aborting the deploy.
+    repo.write(CONTRACT_MODULE, "def broken(:\n")
+    broken = repo.commit()
+    repo.write(CONTRACT_MODULE, "REVISION = 1\n")
+    result = repo.classify(repo.commit(), base=broken)
+    assert result["scope"] == "COORDINATED"
+
+
+def test_same_sha_recompute_is_lenient_and_stable(repo):
+    repo.write(CONTRACT_MODULE, "def broken(:\n")
+    broken = repo.commit()
+    first = repo.classify(broken, base=broken)
+    second = repo.classify(broken, base=broken)
+    assert first == second
+    assert first["scope"] == "LINUX"
+    assert first["base_contract_sha256"] == first["contract_sha256"]
+
+
+def test_every_policy_python_file_declares_bindings():
+    root = TOOL.parents[1]
+    assert policy._CONTRACT_PYTHON_FILES
+    assert policy._CONTRACT_WHOLE_FILE_FILES
+    for path in policy._CONTRACT_PYTHON_FILES:
+        record = policy._contract_file_record(
+            path, (root / path).read_bytes(), strict=True,
+        )
+        assert record["bindings"], path
 
 
 def test_symlinks_and_gitlinks_fail_even_under_docs(repo):

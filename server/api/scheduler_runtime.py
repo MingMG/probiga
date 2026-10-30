@@ -159,6 +159,19 @@ RELEASE_CATCHUP_BLOCKED_RETRY_INTERVAL_MINUTES = max(
 _QMT_MEMBERSHIP_TASK_TYPE = "qmt_membership_snapshot"
 _QMT_MEMBERSHIP_PROVIDER = "gj_big_qmt_inner"
 QMT_DATADIR_DIRECT_DISPATCH_REASON = "qmt_datadir_direct_only"
+# A Windows edge may publish from the local QMT DAT cache while the peer Linux
+# activation is missing, mid-restart or momentarily unreadable.  Those importers
+# read files on this host and never consume the peer's activation receipt, so a
+# peer inconsistency must not stop them.  The QMT edge release grant remains the
+# first and unconditional gate; only its downstream peer check is widened here.
+QMT_DATADIR_DIRECT_RELEASE_REASONS = frozenset({
+    "qmt_release_bootstrap_unavailable",
+    "linux_active_lease_unavailable",
+    "linux_activation_receipt_not_unique",
+    "linux_activation_receipt_mismatch",
+})
+QMT_RELEASE_ACTIVATION_CHECK_FAILED_PREFIX = "release_activation_check_failed:"
+_QMT_EDGE_ACTIVATION_CHECK_FAILED_PREFIX = "qmt_release_activation_check_failed:"
 RELEASE_CATCHUP_AUTHORITATIVE_DATE_TASK_TYPES = (
     RELEASE_CATCHUP_CLOSED_TARGET_TASK_TYPES
 )
@@ -2031,13 +2044,51 @@ def _verified_linux_activation_build(
     return linux_build_sha, "ready"
 
 
+def _qmt_receipt_detail_fields(detail: object) -> str:
+    """Render fixed receipt reason codes, never paths, arguments or secrets."""
+
+    if not isinstance(detail, dict):
+        return "unknown"
+    fields = []
+    for key in ("status", "reason_code"):
+        value = detail.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            fields.append(f"{key}={text[:80]}")
+    return " ".join(fields)[:240] or "unknown"
+
+
+_qmt_receipt_detail_state: str | None = None
+
+
+def _log_qmt_receipt_detail(detail: object) -> None:
+    """Log a changed QMT bootstrap receipt state once, never once per poll."""
+
+    global _qmt_receipt_detail_state
+    fields = _qmt_receipt_detail_fields(detail)
+    if _qmt_receipt_detail_state == fields:
+        return
+    _qmt_receipt_detail_state = fields
+    logger.warning("QMT release bootstrap receipt is not ready: %s", fields)
+
+
 def _windows_release_activation_ready(
     engine,
     *,
     build_sha: str,
 ) -> tuple[bool, str]:
-    """Require current Linux activation and QMT bootstrap on Windows."""
+    """Require current Linux activation and QMT bootstrap on Windows.
 
+    The returned reason is the truthful gate state; ``_qmt_datadir_direct_authorized``
+    decides whether that state still permits the frozen DAT-only importers.  A
+    failed check is reported with its exception type instead of being disguised
+    as a missing QMT bootstrap, which is what made a peer mismatch look like a
+    QMT problem in production.
+    """
+
+    global _qmt_receipt_detail_state
     try:
         expected_poll_seconds = int(
             get_scheduler_runtime_config()["poll_seconds"]
@@ -2049,22 +2100,29 @@ def _windows_release_activation_ready(
             )
             if linux_build_sha is None:
                 return False, reason
-            qmt_ready, _qmt_detail = check_qmt_windows_edge_release_receipt(
+            qmt_ready, qmt_detail = check_qmt_windows_edge_release_receipt(
                 connection,
                 expected_build_sha=build_sha,
                 expected_poll_seconds=expected_poll_seconds,
             )
             if not qmt_ready:
+                _log_qmt_receipt_detail(qmt_detail)
                 return False, "qmt_release_bootstrap_unavailable"
-    except RuntimeError:
-        # A Windows edge can publish directly from the local DAT cache while
-        # the peer component manifest or live QMT IPC receipt is unavailable.
-        # The dispatch gate below restricts this result to the frozen DAT-only
-        # task set; API-bound QMT work remains blocked.
-        return False, "qmt_release_bootstrap_unavailable"
     except Exception as exc:
-        return False, f"release_activation_check_failed:{type(exc).__name__}"
+        return False, (
+            f"{QMT_RELEASE_ACTIVATION_CHECK_FAILED_PREFIX}{type(exc).__name__}"
+        )
+    _qmt_receipt_detail_state = None
     return True, "ready"
+
+
+def _qmt_datadir_direct_authorized(reason: str) -> bool:
+    """Decide whether a peer-check state still permits local DAT importers."""
+
+    return (
+        reason in QMT_DATADIR_DIRECT_RELEASE_REASONS
+        or reason.startswith(QMT_RELEASE_ACTIVATION_CHECK_FAILED_PREFIX)
+    )
 
 
 def _release_activation_started_at_matches(
@@ -2212,7 +2270,7 @@ def _qmt_windows_dispatch_preflight(
     )
     if release_ready:
         return True, release_reason
-    if release_reason == "qmt_release_bootstrap_unavailable":
+    if _qmt_datadir_direct_authorized(release_reason):
         return True, QMT_DATADIR_DIRECT_DISPATCH_REASON
     return False, release_reason
 
@@ -2227,6 +2285,38 @@ def _qmt_windows_task_dispatch_allowed(
     if authorization_reason != QMT_DATADIR_DIRECT_DISPATCH_REASON:
         return True
     return str(task_type or "").strip() in QMT_DATADIR_DIRECT_TASK_TYPES
+
+
+_qmt_dispatch_gate_state: tuple[bool, str] | None = None
+
+
+def _log_qmt_dispatch_gate(granted: bool, reason: str) -> None:
+    """Log exactly one line per dispatch-gate state change.
+
+    The gate is re-evaluated on every poll, and the previous unconditional
+    warning both buried the transition in identical lines and kept claiming a
+    block after a DAT-only authorization had already unblocked the importers.
+    """
+
+    global _qmt_dispatch_gate_state
+    if _qmt_dispatch_gate_state == (granted, reason):
+        return
+    _qmt_dispatch_gate_state = (granted, reason)
+    if granted and reason == QMT_DATADIR_DIRECT_DISPATCH_REASON:
+        logger.warning(
+            "QMT dispatch gate: only the frozen DAT-cache importers are "
+            "authorized; API-bound QMT tasks stay paused until the release "
+            "receipt matches"
+        )
+    elif granted:
+        logger.info("QMT dispatch gate: %s", reason)
+    elif (
+        reason.startswith(QMT_RELEASE_ACTIVATION_CHECK_FAILED_PREFIX)
+        or reason.startswith(_QMT_EDGE_ACTIVATION_CHECK_FAILED_PREFIX)
+    ):
+        logger.error("QMT dispatch gate blocked by a failed check: %s", reason)
+    else:
+        logger.warning("QMT dispatch gate blocked: %s", reason)
 
 
 def _notice_history_continuation_started_at(row: dict, *, now: datetime) -> datetime | None:
@@ -10272,12 +10362,7 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
             qmt_dispatch_authorized, qmt_dispatch_reason = (
                 _qmt_windows_dispatch_preflight(engine, mode=mode)
             )
-            if not qmt_dispatch_authorized:
-                logger.warning(
-                    "QMT dispatch preflight is not ready; business tasks remain "
-                    "paused: %s",
-                    qmt_dispatch_reason,
-                )
+            _log_qmt_dispatch_gate(qmt_dispatch_authorized, qmt_dispatch_reason)
             time_str = now.strftime("%H:%M")
             max_pending_tasks = max(1, int(get_scheduler_runtime_config()["max_concurrent_tasks"]))
 

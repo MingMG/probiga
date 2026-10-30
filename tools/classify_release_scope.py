@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
 """Classify a complete, trusted Git release delta without importing project code.
 
-Explicit schema files, the strategy-schema preparation tools and the protected
-QMT release controller path are cross-end. Application, UI, deployment,
-dependency and unrelated tool changes remain normal Linux code releases; the
-Windows/QMT updater tracks its own strategy source independently. Schema
-transitions live under ``server/db``, in ``.sql`` files, in the guarded
+Schema transitions live under ``server/db``, in ``.sql`` files, in the guarded
 strategy-schema preparation tools, or in the QMT release controller path.
+Application, UI, deployment, dependency and unrelated tool changes remain normal
+Linux code releases; the Windows/QMT updater tracks its own strategy source
+independently.
+
+The cross-end contract for the policy files below is the set of their
+module-level bindings, not their whole bytes.  A change to a declaration
+(threshold, task table, receipt schema, protocol constant) therefore selects the
+coordinated release, while an ordinary change to a function body, a docstring or
+a comment stays a single-end Linux release.  PowerShell controllers have no
+trusted stdlib parser, so they stay whole-file: that is a deliberate, documented
+boundary rather than an oversight.
+
 Run this installed trusted tool, never the copy from an untrusted target commit.
 """
 
@@ -16,6 +24,7 @@ import argparse
 import ast
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -24,7 +33,8 @@ import sys
 from dataclasses import dataclass
 
 
-SCHEMA = "probiga.release-scope.v3"
+SCHEMA = "probiga.release-scope.v4"
+_CONTRACT_POLICY_VERSION = 1
 _SHA = re.compile(r"[0-9a-fA-F]{40}\Z")
 _REGULAR_MODES = frozenset({"100644", "100755"})
 
@@ -187,11 +197,18 @@ _DDL_SQL = re.compile(
     re.IGNORECASE,
 )
 _DDL_CODE_ROOTS = ("server/db/", "db/")
-_CROSS_END_CONTRACT_CODE_FILES = frozenset({
+
+# Python contract files contribute their module-level bindings only.  Listing the
+# files (instead of every contract symbol) keeps the policy reviewable while the
+# extraction rule stays mechanical: a symbol that is added, removed or revalued
+# anywhere in these files changes the digest, and no hand-maintained symbol list
+# can silently downgrade a release to LINUX by omission.
+_CONTRACT_PYTHON_FILES = (
     "server/api/scheduler_runtime.py",
     "server/common/limit_up_event_schema.py",
     "server/common/qmt_daily_market_truth.py",
     "server/common/qmt_datadir_result.py",
+    "server/common/qmt_edge_release_receipt.py",
     "server/common/qmt_edge_release_recovery.py",
     "server/common/scheduler_args.py",
     "server/common/scheduler_runtime_health.py",
@@ -199,21 +216,34 @@ _CROSS_END_CONTRACT_CODE_FILES = frozenset({
     "server/common/scheduler_task_retirement.py",
     "server/common/scheduler_tasks.py",
     "server/common/scheduler_validation.py",
-    "tools/prepare_strategy_governance_deferred_schema.py",
-    "tools/prepare_strategy_governance_qmt_history.py",
-    "tools/prepare_strategy_governance_schema.py",
-    "tools/reload_big_qmt_strategy.ps1",
-    "tools/resume_qmt_prior_edge.ps1",
     "tools/apply_public_market_profile.py",
     "tools/import_qmt_datadir_daily.py",
     "tools/import_qmt_datadir_history.py",
     "tools/import_qmt_datadir_index.py",
+    "tools/prepare_strategy_governance_deferred_schema.py",
+    "tools/prepare_strategy_governance_qmt_history.py",
+    "tools/prepare_strategy_governance_schema.py",
     "tools/qmt_host_ownership_contract.py",
     "tools/run_big_qmt_bridge.py",
     "tools/run_qmt_windows_edge_release_bootstrap.py",
+)
+
+# PowerShell controllers stay whole-file.  There is no standard-library parser
+# with stable output for PowerShell, so a binding-level rule cannot be applied
+# here without inventing one; hashing the bytes is the honest boundary.
+_CONTRACT_WHOLE_FILE_FILES = (
+    "tools/reload_big_qmt_strategy.ps1",
+    "tools/resume_qmt_prior_edge.ps1",
     "tools/start_local_live_services.ps1",
     "tools/update_qmt_windows_edge.ps1",
-})
+)
+
+# The export list is packaging, not a runtime contract with the other endpoint.
+_CONTRACT_EXCLUDED_NAMES = frozenset({"__all__"})
+
+_CONTAINER_LITERAL_CALLS = {
+    "frozenset": frozenset, "list": list, "set": set, "tuple": tuple,
+}
 
 
 def _ddl_strings(path: str, blob: bytes) -> list[str]:
@@ -233,29 +263,174 @@ def _ddl_strings(path: str, blob: bytes) -> list[str]:
     return strings
 
 
-def _contract(git: Git, tree: dict[str, Entry]) -> str:
-    paths = [
+def _contract_policy() -> dict[str, object]:
+    # Bind the policy itself into the digest so that adding, dropping or
+    # retyping a policy path is itself a visible contract transition.
+    if (set(_CONTRACT_PYTHON_FILES) & set(_CONTRACT_WHOLE_FILE_FILES)
+            or any(not path.endswith(".py") for path in _CONTRACT_PYTHON_FILES)
+            or any(not path.endswith(".ps1") for path in _CONTRACT_WHOLE_FILE_FILES)):
+        raise ScopeError("contract_policy_invalid")
+    return {
+        "version": _CONTRACT_POLICY_VERSION,
+        "python": list(_CONTRACT_PYTHON_FILES),
+        "whole_file": list(_CONTRACT_WHOLE_FILE_FILES),
+        "excluded": sorted(_CONTRACT_EXCLUDED_NAMES),
+    }
+
+
+def _canonical_json(value: object) -> str:
+    return json.dumps(value, ensure_ascii=True, separators=(",", ":"),
+                      allow_nan=False)
+
+
+def _canonical_value(value: object) -> object:
+    # Only a normalised, type-preserving projection may enter the digest: two
+    # spellings of the same value must hash alike, and two different values must
+    # never hash alike.
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ScopeError("contract_value_unsupported")
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        return {"bytes": bytes(value).hex()}
+    if isinstance(value, (list, tuple)):
+        return [_canonical_value(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        return sorted((_canonical_value(item) for item in value),
+                      key=_canonical_json)
+    if isinstance(value, dict):
+        # Order-preserving: reordering a mapping literal is a real behavioural
+        # delta in iteration order, so ``sort_keys`` would hide it.
+        return [[_canonical_value(key), _canonical_value(item)]
+                for key, item in value.items()]
+    raise ScopeError("contract_value_unsupported")
+
+
+def _literal_value(node: ast.AST) -> tuple[bool, object]:
+    try:
+        return True, ast.literal_eval(node)
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+        pass
+    # ``frozenset({...})`` is a container call, not a bare literal, yet it is
+    # still declared content.  Evaluate exactly one positional literal argument.
+    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id in _CONTAINER_LITERAL_CALLS
+            and len(node.args) == 1 and not node.keywords):
+        found, inner = _literal_value(node.args[0])
+        if found and isinstance(inner, (list, tuple, set, frozenset, dict)):
+            try:
+                return True, _CONTAINER_LITERAL_CALLS[node.func.id](inner)
+            except TypeError:
+                # Unhashable elements: fall back to the expression text rather
+                # than letting a TypeError escape as an unclassified crash.
+                return False, None
+    return False, None
+
+
+def _digest(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _source_record(text: str, *, name: str | None = None) -> dict[str, object]:
+    # A computed declaration is still declared content: hash the normalised
+    # expression so that reformatting is free and any real edit is not.
+    return {"name": name, "mode": "source", "sha256": _digest(text)}
+
+
+def _binding_record(name: str, value: ast.AST) -> dict[str, object]:
+    found, literal = _literal_value(value)
+    if found:
+        return {"name": name, "mode": "value",
+                "sha256": _digest(_canonical_json(_canonical_value(literal)))}
+    return _source_record(ast.unparse(value), name=name)
+
+
+def _module_bindings(module: ast.Module) -> list[dict[str, object]]:
+    bindings: list[dict[str, object]] = []
+    names: set[str] = set()
+    for statement in module.body:
+        if isinstance(statement, ast.AnnAssign):
+            if statement.value is None:
+                continue
+            targets = [statement.target]
+        elif isinstance(statement, ast.Assign):
+            targets = statement.targets
+        else:
+            continue
+        name = (
+            targets[0].id
+            if len(targets) == 1 and isinstance(targets[0], ast.Name) else None
+        )
+        if name is None:
+            # Multi-target, attribute or subscript assignment: the whole
+            # statement is the declaration, targets included.
+            bindings.append(_source_record(ast.unparse(statement)))
+            continue
+        if name in _CONTRACT_EXCLUDED_NAMES:
+            continue
+        if name in names:
+            raise ScopeError("contract_symbol_duplicate")
+        names.add(name)
+        bindings.append(_binding_record(name, statement.value))
+    return bindings
+
+
+def _contract_file_record(path: str, blob: bytes, *,
+                          strict: bool) -> dict[str, object]:
+    if path in _CONTRACT_WHOLE_FILE_FILES:
+        return {"path": path, "kind": "whole_file",
+                "sha256": hashlib.sha256(blob).hexdigest()}
+    try:
+        bindings = _module_bindings(ast.parse(blob))
+    except ScopeError:
+        # ScopeError is a ValueError: this clause must precede the parse-error
+        # clause or a precise contract code would be reported as a parse fault.
+        if strict:
+            raise
+        return {"path": path, "kind": "python_bindings", "state": "unparsable"}
+    except (SyntaxError, ValueError):
+        if strict:
+            raise ScopeError("contract_parse_failed") from None
+        return {"path": path, "kind": "python_bindings", "state": "unparsable"}
+    if not bindings:
+        if strict:
+            raise ScopeError("contract_extraction_empty")
+        return {"path": path, "kind": "python_bindings", "state": "empty"}
+    return {"path": path, "kind": "python_bindings", "bindings": bindings}
+
+
+def _contract(git: Git, tree: dict[str, Entry], *, strict: bool) -> str:
+    policy_paths = _CONTRACT_PYTHON_FILES + _CONTRACT_WHOLE_FILE_FILES
+    ddl_paths = [
         path for path in sorted(tree)
-        if path in _CROSS_END_CONTRACT_CODE_FILES
-        or path.endswith(".sql")
+        if path.endswith(".sql")
         or (path.endswith(".py") and path.startswith(_DDL_CODE_ROOTS))
     ]
-    records = []
-    for path, blob in zip(paths, git.blobs([tree[path].oid for path in paths])):
-        if path in _CROSS_END_CONTRACT_CODE_FILES:
-            records.append({
-                "path": path,
-                "sha256": hashlib.sha256(blob).hexdigest(),
-            })
-            continue
-        strings = _ddl_strings(path, blob)
+    wanted = ddl_paths + [path for path in policy_paths if path in tree]
+    blobs = dict(zip(wanted, git.blobs([tree[path].oid for path in wanted])))
+    records: list[object] = []
+    for path in ddl_paths:
+        strings = _ddl_strings(path, blobs[path])
         if strings:
             records.append([path, strings])
+    for path in policy_paths:
+        # A policy file absent from one side is a marker, not an error: a
+        # legitimate deletion must classify as a contract change, and the base
+        # tree predates any file this release introduces.
+        records.append(
+            _contract_file_record(path, blobs[path], strict=strict)
+            if path in blobs else {"path": path, "kind": "absent"}
+        )
     # The schema and policy version are bound into the digest.  Only executable
-    # DDL string constants participate, so ordinary code edits stay fast while a
-    # real schema transition still selects the coordinated database cutover.
-    canonical = json.dumps({"schema": SCHEMA, "files": records},
-                           ensure_ascii=True, separators=(",", ":")).encode("ascii")
+    # DDL string constants and declared bindings participate, so ordinary code
+    # edits stay fast while a real schema or contract transition still selects
+    # the coordinated database cutover.
+    canonical = json.dumps(
+        {"schema": SCHEMA, "policy": _contract_policy(), "files": records},
+        ensure_ascii=True, separators=(",", ":"), allow_nan=False,
+    ).encode("ascii")
     return hashlib.sha256(canonical).hexdigest()
 
 
@@ -278,8 +453,13 @@ def classify_release_scope(*, base_sha: str, target_sha: str,
     # deliberately unnecessary: every rename includes a forbidden deletion.
     changed = sorted(path for path in base.keys() | target.keys()
                      if base.get(path) != target.get(path))
-    base_contract = _contract(git, base)
-    target_contract = _contract(git, target)
+    # The target tree is the release being authorised, so an unreadable or
+    # unextractable contract file aborts instead of silently classifying as
+    # LINUX.  The base tree is history that no release can repair, and a same-SHA
+    # recomputation (the deploy drift check) must not depend on parsability.
+    paired = base_sha != target_sha
+    base_contract = _contract(git, base, strict=False)
+    target_contract = _contract(git, target, strict=paired)
     reasons: set[str] = set()
     if base_contract != target_contract:
         reasons.add("schema_contract_changed")
