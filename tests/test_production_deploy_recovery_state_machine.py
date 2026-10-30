@@ -5489,8 +5489,9 @@ def _rollback_guard_harness(
     tmp_path: Path,
     *,
     certify_rc: int,
+    cleanup_rc: int = 0,
     source: str,
-) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
+) -> tuple[subprocess.CompletedProcess[str], Path, Path, Path]:
     """Run the real rollback guard-release helper against the real engine."""
 
     bash = _bash()
@@ -5501,6 +5502,7 @@ def _rollback_guard_harness(
         bodies["rollback_release_database_writer_guard"],
     )
     certify_log = tmp_path / "certify.log"
+    cleanup_log = tmp_path / "cleanup.log"
     failures = tmp_path / "failures.log"
     harness = f"""
 set -u
@@ -5509,7 +5511,9 @@ EXPECTED_SHA={'b' * 40}
 DATABASE_GUARD_MIGRATION_UNVERIFIED=1
 DATABASE_WRITER_GUARD_PERSISTED=1
 CERTIFY_RC={certify_rc}
+CLEANUP_RC={cleanup_rc}
 CERTIFY_LOG={certify_log.as_posix()!r}
+CLEANUP_LOG={cleanup_log.as_posix()!r}
 FAILURES={failures.as_posix()!r}
 database_writer_guard_inventory() {{
   printf '%s %s %s %s\n' loaded,inactive,disabled loaded,inactive,disabled \
@@ -5518,6 +5522,10 @@ database_writer_guard_inventory() {{
 controlled_guard_certify_database_boundary() {{
   printf '%s\n' "$*" > "$CERTIFY_LOG"
   return "$CERTIFY_RC"
+}}
+controlled_guard_cleanup() {{
+  printf '%s\n' "$*" > "$CLEANUP_LOG"
+  return "$CLEANUP_RC"
 }}
 prepared_v2_rollback_release_database_guard() {{ return 99; }}
 rollback_failure() {{ printf '%s\n' "$1" >> "$FAILURES"; }}
@@ -5536,7 +5544,7 @@ printf 'rc=%s\n' "$?"
         errors="replace",
         timeout=15,
     )
-    return completed, certify_log, failures
+    return completed, certify_log, cleanup_log, failures
 
 
 def test_rollback_releases_the_writer_fence_after_certification(
@@ -5552,15 +5560,19 @@ def test_rollback_releases_the_writer_fence_after_certification(
     """
 
     source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
-    completed, certify_log, failures = _rollback_guard_harness(
+    completed, certify_log, cleanup_log, failures = _rollback_guard_harness(
         tmp_path, certify_rc=0, source=source
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert completed.stdout.strip() == "rc=0"
-    assert certify_log.read_text(encoding="utf-8").strip() == (
+    expected_args = (
         f"{'b' * 40} loaded,inactive,disabled loaded,inactive,disabled "
         "loaded,inactive,static loaded,inactive,disabled"
     )
+    assert certify_log.read_text(encoding="utf-8").strip() == expected_args
+    # Releasing the fence also drops the guard marker; leaving it behind would
+    # make the next deploy demand a manual controlled recovery.
+    assert cleanup_log.read_text(encoding="utf-8").strip() == expected_args
     assert not failures.exists()
 
     bodies = _shell_function_bodies(source)
@@ -5583,14 +5595,16 @@ def test_rollback_keeps_the_writer_fence_when_certification_fails(
     """A failed certification must leave today's fail-closed behaviour intact."""
 
     source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
-    completed, _certify_log, failures = _rollback_guard_harness(
+    completed, _certify_log, cleanup_log, failures = _rollback_guard_harness(
         tmp_path, certify_rc=1, source=source
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert completed.stdout.strip() == "rc=1"
     assert failures.read_text(encoding="utf-8").splitlines() == [
-        "certify the database boundary before releasing the writer fence"
+        "certify the database boundary and remove the writer guard"
     ]
+    # The marker stays while the boundary is uncertified.
+    assert not cleanup_log.exists()
     # The helper must not clear either flag on its own failure path.
     helper_body = _shell_function_bodies(source)[
         "rollback_release_database_writer_guard"
@@ -5599,6 +5613,28 @@ def test_rollback_keeps_the_writer_fence_when_certification_fails(
     assert helper_body.index("DATABASE_GUARD_MIGRATION_UNVERIFIED=0") > (
         helper_body.index("\n  esac")
     )
+
+
+def test_rollback_keeps_the_writer_fence_when_the_guard_cannot_be_removed(
+    tmp_path: Path,
+) -> None:
+    """A certified boundary with a stuck marker still fails closed.
+
+    ``controlled_guard_cleanup`` itself rebuilds the fence when it cannot drop
+    the marker, so the rollback must not clear the flags on top of that.
+    """
+
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    completed, certify_log, cleanup_log, failures = _rollback_guard_harness(
+        tmp_path, certify_rc=0, cleanup_rc=1, source=source
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert completed.stdout.strip() == "rc=1"
+    assert certify_log.exists()
+    assert cleanup_log.exists()
+    assert failures.read_text(encoding="utf-8").splitlines() == [
+        "certify the database boundary and remove the writer guard"
+    ]
 
 
 def test_recovery_authorization_is_a_parameter_not_an_environment_variable(

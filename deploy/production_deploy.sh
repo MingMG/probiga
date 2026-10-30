@@ -15289,9 +15289,12 @@ rollback_release_database_writer_guard() {
         ! controlled_guard_certify_database_boundary \
           "$EXPECTED_SHA" "$guard_main_record" \
           "$guard_scheduler_record" "$guard_ai_service_record" \
+          "$guard_ai_timer_record" || \
+        ! controlled_guard_cleanup "$EXPECTED_SHA" "$guard_main_record" \
+          "$guard_scheduler_record" "$guard_ai_service_record" \
           "$guard_ai_timer_record"; then
         rollback_failure \
-          "certify the database boundary before releasing the writer fence"
+          "certify the database boundary and remove the writer guard"
         return 1
       fi
       ;;

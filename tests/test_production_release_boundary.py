@@ -3493,6 +3493,11 @@ def test_ci_normal_rollback_releases_guard_only_after_exact_certification() -> N
         "controlled_guard_certify_database_boundary",
     ):
         assert mode_and_certifier in helper
+    # Releasing the fence must also drop the guard marker; leaving it behind
+    # makes the next deploy demand a manual controlled recovery.
+    certifier_call = helper.index("controlled_guard_certify_database_boundary")
+    marker_removal = helper.index("controlled_guard_cleanup", certifier_call)
+    assert marker_removal < guard_clear
 
     rollback_gate = rollback.index("rollback_release_database_writer_guard")
     first_main_start = rollback.index(
