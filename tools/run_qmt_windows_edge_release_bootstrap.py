@@ -58,6 +58,9 @@ from server.common.qmt_edge_release_receipt import (
     validate_qmt_edge_release_receipt,
 )
 from server.common.qmt_history_coverage import validate_coverage_schema
+from server.common.qmt_stock_catalog import (
+    CATALOG_RETIREMENT_RECONCILIATION_SCHEMA,
+)
 from server.common.scheduler_runtime_health import (
     DEFAULT_SCHEDULER_POLL_SECONDS,
     QMT_WINDOWS_EDGE_ROLE,
@@ -76,6 +79,9 @@ BIGQMT_STRATEGY_SOURCE = (
 )
 INDEX_WEIGHT_PUBLICATION_RECEIPT_SCHEMA = (
     "probiga.qmt-index-weight-publication-receipt.v1"
+)
+RETIREMENT_RECONCILIATION_SCHEMA = (
+    CATALOG_RETIREMENT_RECONCILIATION_SCHEMA
 )
 
 
@@ -377,16 +383,31 @@ def _validated_reference_capture(
 
     if catalog_only:
         proof = capture.get("reference_capture")
+        retirement = capture.get("retirement_reconciliation")
         if (capture.get("status") != "success" or not isinstance(proof, dict)
                 or proof.get("schema") != "probiga.qmt-reference-capture.v1"
                 or re.fullmatch(r"[0-9a-f]{64}", str(proof.get("sha256") or "")) is None
                 or type(proof.get("partition_count")) is not int or proof["partition_count"] <= 0
                 or proof.get("collector_build_sha") != batch_values[0][8:48]):
             incomplete()
+        if retirement is not None and (
+            not isinstance(retirement, dict)
+            or retirement.get("schema")
+            != RETIREMENT_RECONCILIATION_SCHEMA
+            or retirement.get("source") != "baostock.query_stock_basic"
+            or type(retirement.get("row_count")) is not int
+            or retirement["row_count"] <= 0
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(retirement.get("retirement_batch_id") or ""),
+            ) is None
+        ):
+            incomplete()
         return catalog, calendar, catalog_insert, calendar_insert, {
             "capture_status": "success", "workload": "STOCK_CATALOG_NATIVE_CALENDAR",
             "batch_id": batch_values[0], "catalog_manifest_hash": catalog_manifest_hash,
             "calendar_manifest_hash": calendar_manifest_hash, "source_capture": proof,
+            "retirement_reconciliation": retirement,
         }
 
     # A full index publication remains strictly validated. It cannot borrow
