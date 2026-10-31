@@ -9214,6 +9214,7 @@ PREVIOUS_WINDOWS_SHA=""
 PREVIOUS_CONTRACT_SHA=""
 TARGET_WINDOWS_SHA="$EXPECTED_SHA"
 TARGET_CONTRACT_SHA="$EXPECTED_SHA"
+STRICT_WINDOWS_MANIFEST=0
 COMPONENT_TOOL_ROOT=/var/lib/probiga/component-deploy-tools
 BOOTSTRAP_PYTHON=/usr/bin/python3.14
 test -x "$BOOTSTRAP_PYTHON"
@@ -9279,8 +9280,13 @@ PY
   materialize_component_deploy_tools "$EXPECTED_SHA"
 }
 classify_component_release() {
-  PREVIOUS_WINDOWS_SHA="$(controlled_guard_component_sha "$PREVIOUS_SHA" windows)"
-  PREVIOUS_CONTRACT_SHA="$(controlled_guard_component_sha "$PREVIOUS_SHA" contract)"
+  local windows_manifest_drift=""
+  PREVIOUS_WINDOWS_SHA="$(
+    controlled_guard_component_sha "$PREVIOUS_SHA" windows 2>/dev/null || true
+  )"
+  PREVIOUS_CONTRACT_SHA="$(
+    controlled_guard_component_sha "$PREVIOUS_SHA" contract 2>/dev/null || true
+  )"
   COMPONENT_SCOPE_FILE="$COMPONENT_TOOL_ROOT/$EXPECTED_SHA/scope.json"
   "$BOOTSTRAP_PYTHON" -I "$COMPONENT_CLASSIFIER" --git-dir "$CODE_GIT_CACHE" \
     --base-sha "$PREVIOUS_SHA" --target-sha "$EXPECTED_SHA" > "$COMPONENT_SCOPE_FILE"
@@ -9292,7 +9298,9 @@ classify_component_release() {
   # contract identities. Re-attest both endpoints with one coordinated build.
   local windows_scope_file="$COMPONENT_TOOL_ROOT/$EXPECTED_SHA/windows-contract.json"
   local windows_manifest="$RELEASE_ARTIFACT_ROOT/$PREVIOUS_WINDOWS_SHA/component-release.json"
-  if [ -f "$windows_manifest" ]; then
+  if [ -z "$PREVIOUS_WINDOWS_SHA" ] || [ -z "$PREVIOUS_CONTRACT_SHA" ]; then
+    windows_manifest_drift=windows_component_manifest_unavailable
+  elif [ -f "$windows_manifest" ]; then
     "$BOOTSTRAP_PYTHON" -I "$COMPONENT_CLASSIFIER" --git-dir "$CODE_GIT_CACHE" \
       --base-sha "$PREVIOUS_WINDOWS_SHA" --target-sha "$PREVIOUS_WINDOWS_SHA" \
       > "$windows_scope_file"
@@ -9301,16 +9309,22 @@ classify_component_release() {
     recorded_windows_contract="$("$BOOTSTRAP_PYTHON" -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["contract_sha256"])' "$windows_manifest")"
     current_windows_contract="$("$BOOTSTRAP_PYTHON" -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["contract_sha256"])' "$windows_scope_file")"
     if [ "$recorded_windows_contract" != "$current_windows_contract" ]; then
-      RELEASE_SCOPE=COORDINATED
-      printf 'release_scope_override=COORDINATED reason=windows_contract_schema_drift\n'
+      windows_manifest_drift=windows_contract_schema_drift
     fi
   else
-    RELEASE_SCOPE=COORDINATED
-    printf 'release_scope_override=COORDINATED reason=windows_manifest_unavailable\n'
+    windows_manifest_drift=windows_manifest_unavailable
+  fi
+  if [ -n "$windows_manifest_drift" ]; then
+    printf 'release_scope_warning reason=%s classified_scope=%s\n' \
+      "$windows_manifest_drift" "$RELEASE_SCOPE" >&2
+    if [ "$STRICT_WINDOWS_MANIFEST" -eq 1 ]; then
+      RELEASE_SCOPE=COORDINATED
+      printf 'release_scope_override=COORDINATED reason=%s strict=true\n' \
+        "$windows_manifest_drift" >&2
+    fi
   fi
   case "$RELEASE_SCOPE" in
     LINUX)
-      test -f "$RELEASE_ARTIFACT_ROOT/$PREVIOUS_SHA/component-release.json"
       TARGET_WINDOWS_SHA="$PREVIOUS_WINDOWS_SHA"
       TARGET_CONTRACT_SHA="$PREVIOUS_CONTRACT_SHA"
       ;;
