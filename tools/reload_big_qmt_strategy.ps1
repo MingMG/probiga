@@ -61,8 +61,8 @@ $IpcReloadAuthorizationPath = Join-Path `
 $TrustedReloadStateOwnerSids = @()
 $SupportedQmtClientVersion = "2.1.19.0"
 $StrategyEditorRunXOffset = 348
-$StrategyEditorStopXOffset = 508
-$StrategyEditorToolbarYOffset = 116
+$StrategyEditorStopXOffsets = @(474, 487, 500, 508)
+$StrategyEditorToolbarYOffset = 115
 
 $QmtClient = $null
 $QmtMainHandle = [IntPtr]::Zero
@@ -1946,7 +1946,8 @@ function Invoke-ExactScreenPointClick(
 function Invoke-ExactStrategyEditorControl(
     [IntPtr]$Editor,
     [ValidateSet("run", "stop")]
-    [string]$Action
+    [string]$Action,
+    [int]$StopCandidateIndex = 0
 ) {
     if (
         ![ProBigAQmtReleaseWindow]::IsWindow($Editor) -or
@@ -1979,7 +1980,13 @@ function Invoke-ExactStrategyEditorControl(
         $StrategyEditorRunXOffset
     }
     else {
-        $StrategyEditorStopXOffset
+        if (
+            $StopCandidateIndex -lt 0 -or
+            $StopCandidateIndex -ge $StrategyEditorStopXOffsets.Count
+        ) {
+            throw "QMT strategy-editor stop candidate is invalid"
+        }
+        $StrategyEditorStopXOffsets[$StopCandidateIndex]
     }
     Invoke-ExactScreenPointClick `
         $Editor `
@@ -2074,9 +2081,16 @@ function Stop-ExactStrategy([IntPtr]$Editor) {
     if (!(Test-RunningHeartbeat $Before)) {
         throw "target QMT strategy heartbeat is not running before stop"
     }
-    for ($Attempt = 0; $Attempt -lt 2; $Attempt += 1) {
+    for (
+        $Attempt = 0;
+        $Attempt -lt $StrategyEditorStopXOffsets.Count;
+        $Attempt += 1
+    ) {
         Show-QmtMainWindow
-        Invoke-ExactStrategyEditorControl $Editor "stop"
+        Invoke-ExactStrategyEditorControl `
+            $Editor `
+            "stop" `
+            -StopCandidateIndex $Attempt
         $Stopped = Wait-ForHeartbeat {
             param($Heartbeat)
             return (

@@ -1093,7 +1093,7 @@ def test_release_reload_never_targets_an_ambiguous_or_other_model() -> None:
     assert "target QMT strategy editor is not unique" in source
     assert "GetWindowThreadProcessId" in source
     assert "QMT click target identity changed" in source
-    assert 'Invoke-ExactStrategyEditorControl $Editor "stop"' in source
+    assert '-StopCandidateIndex $Attempt' in source
     assert 'Invoke-ExactStrategyEditorControl $Editor "run"' in source
     assert "Stop-Process" not in source
     assert "Start-Process" not in source
@@ -1108,10 +1108,11 @@ def test_release_reload_uses_the_verified_strategy_editor_run_stop_control() -> 
     assert "$Editor" in control
     assert "$EditorTitle" in control
     assert "$StrategyEditorRunXOffset = 348" in source
-    assert "$StrategyEditorStopXOffset = 508" in source
-    assert "$StrategyEditorToolbarYOffset = 116" in source
+    assert "$StrategyEditorStopXOffsets = @(474, 487, 500, 508)" in source
+    assert "$StrategyEditorToolbarYOffset = 115" in source
     assert "$StrategyEditorRunXOffset" in control
-    assert "$StrategyEditorStopXOffset" in control
+    assert "$StrategyEditorStopXOffsets" in control
+    assert "$StopCandidateIndex" in control
     assert "$StrategyEditorToolbarYOffset" in control
     assert "GetDpiForWindow($Editor)" in control
     assert "QMT_EDITOR_DPI_UNSUPPORTED" in control
@@ -1130,12 +1131,12 @@ def test_qmt_editor_stop_point_matches_the_observed_toolbar() -> None:
     # (464, 99) point landed outside the control, so the loaded model kept
     # running and the reloader failed closed.
     old_stop_offset = (464, 99)
-    stop_offset = (508, 116)
+    stop_offsets = ((474, 115), (487, 115), (500, 115), (508, 115))
 
     assert not (500 <= old_stop_offset[0] <= 566)
     assert not (104 <= old_stop_offset[1] <= 126)
-    assert 500 <= stop_offset[0] <= 566
-    assert 104 <= stop_offset[1] <= 126
+    assert all(466 <= x <= 514 for x, _ in stop_offsets)
+    assert all(104 <= y <= 126 for _, y in stop_offsets)
 
 
 def test_release_reload_pins_the_qmt_version_for_exact_editor_geometry() -> None:
