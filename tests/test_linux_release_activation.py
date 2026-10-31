@@ -152,11 +152,35 @@ def test_success_preserves_windows_contract_and_ai_states(fixture):
     assert fs.snapshot(activation.LINK)["target"].endswith(NEW)
     receipt = json.loads(fs.read(ctl.receipt(NEW)))
     assert receipt["component_release"]["windows_build_sha"] == WINDOWS
+    assert receipt["mode"] == "fast"
+    assert receipt["scope"] == "LINUX"
+    assert receipt["execution_scope"] == "LINUX"
+    assert receipt["flags"] == []
+    assert receipt["sha"] == NEW
+    assert receipt["signed_manifest"] == "component-release.json"
+    assert receipt["lite_manifest"] == "component-release-lite.json"
+    assert receipt["ledger"] == "async-pending"
     assert services.units[activation.AI_UNITS[0]] == {"active": "inactive", "enabled": "static"}
     assert services.units[activation.AI_UNITS[1]] == {"active": "active", "enabled": "enabled"}
     assert services.calls.count("stop") == 1
     assert services.calls.count("verify_new") == 1
     assert ctl.recover() == "NO_TRANSACTION"
+
+
+def test_forced_fast_receipt_preserves_classified_coordinated_scope(fixture):
+    fs, services, sources = fixture
+    ctl = activation.Activation(
+        fs,
+        services,
+        classified_scope="COORDINATED",
+        receipt_flags=("fast-forced-over-coordinated",),
+    )
+    assert ctl.activate(NEW, OLD, sources) == "DEPLOYED"
+    receipt = json.loads(fs.read(ctl.receipt(NEW)))
+    assert receipt["scope"] == "COORDINATED"
+    assert receipt["execution_scope"] == "LINUX"
+    assert receipt["flags"] == ["fast-forced-over-coordinated"]
+    assert receipt["ledger"] == "async-pending"
 
 
 @pytest.mark.parametrize("step", ["stop", "reload_static", "start_new", "verify_new"])

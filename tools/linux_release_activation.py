@@ -376,13 +376,33 @@ class Activation:
         *,
         health_retries=5,
         health_interval=2,
+        release_mode="fast",
+        classified_scope="LINUX",
+        receipt_flags=(),
+        ledger_status="async-pending",
     ):
         self.fs = fs or Filesystem()
         self.services = services or Services()
         if not 1 <= health_retries <= 60 or not 1 <= health_interval <= 60:
             raise ActivationError("invalid_health_timing")
+        if release_mode not in {"fast", "full"}:
+            raise ActivationError("invalid_release_mode")
+        if classified_scope not in {"LINUX", "COORDINATED"}:
+            raise ActivationError("invalid_classified_scope")
+        if ledger_status not in {"synced", "async-pending"}:
+            raise ActivationError("invalid_ledger_status")
+        flags = tuple(receipt_flags)
+        if any(
+            flag != "fast-forced-over-coordinated"
+            for flag in flags
+        ):
+            raise ActivationError("invalid_receipt_flag")
         self.health_retries = health_retries
         self.health_interval = health_interval
+        self.release_mode = release_mode
+        self.classified_scope = classified_scope
+        self.receipt_flags = flags
+        self.ledger_status = ledger_status
 
     def save(self, value, phase):
         value["phase"] = phase
@@ -512,8 +532,25 @@ class Activation:
                     raise ActivationError("prepared_unit_identity_differs")
             new_files[name] = {"kind": "file", "mode": 0o644, "data": base64.b64encode(data).decode()}
         new_files[LINK] = {"kind": "link", "target": f"/opt/ProBigA-releases/{target_sha}"}
-        receipt = {"schema": SCHEMA, "status": "DEPLOYED", "previous_sha": previous_sha,
-                   "component_release": target}
+        receipt = {
+            "schema": SCHEMA,
+            "schema_version": "probiga.deploy-receipt.v4",
+            "status": "DEPLOYED",
+            "mode": self.release_mode,
+            "scope": self.classified_scope,
+            "execution_scope": target["scope"],
+            "flags": list(self.receipt_flags),
+            "sha": target_sha,
+            "previous_sha": previous_sha,
+            "signed_manifest": "component-release.json",
+            "lite_manifest": (
+                "component-release-lite.json"
+                if self.release_mode == "fast"
+                else None
+            ),
+            "ledger": self.ledger_status,
+            "component_release": target,
+        }
         new_files[self.receipt(target_sha)] = {"kind": "file", "mode": 0o600,
                                             "data": base64.b64encode(encoded(receipt)).decode()}
         units = self.services.states()
@@ -559,6 +596,27 @@ def main(argv=None):
     parser.add_argument("--ai-source")
     parser.add_argument("--health-retries", type=int, default=5)
     parser.add_argument("--health-interval", type=int, default=2)
+    parser.add_argument(
+        "--release-mode",
+        choices=("fast", "full"),
+        default="fast",
+    )
+    parser.add_argument(
+        "--classified-scope",
+        choices=("LINUX", "COORDINATED"),
+        default="LINUX",
+    )
+    parser.add_argument(
+        "--receipt-flag",
+        action="append",
+        default=[],
+        choices=("fast-forced-over-coordinated",),
+    )
+    parser.add_argument(
+        "--ledger-status",
+        choices=("synced", "async-pending"),
+        default="async-pending",
+    )
     args = parser.parse_args(argv)
     if not sys.platform.startswith("linux") or os.geteuid() != 0:
         parser.exit(2, "linux activation: root Linux execution required\n")
@@ -570,6 +628,10 @@ def main(argv=None):
         activation = Activation(
             health_retries=args.health_retries,
             health_interval=args.health_interval,
+            release_mode=args.release_mode,
+            classified_scope=args.classified_scope,
+            receipt_flags=args.receipt_flag,
+            ledger_status=args.ledger_status,
         )
         if args.operation == "recover":
             status = activation.recover()

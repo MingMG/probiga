@@ -129,6 +129,8 @@ HEARTBEAT_RETRIES="${HEARTBEAT_RETRIES:-10}"
 HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-2}"
 HEALTH_RETRIES="${HEALTH_RETRIES:-5}"
 HEALTH_INTERVAL="${HEALTH_INTERVAL:-2}"
+declare -a RECEIPT_FLAGS=()
+COMPONENT_LEDGER_STATUS=not-started
 DEPLOY_ARTIFACT_MODE=""
 prepare_qmt_announcement_checkpoint_root() {
   local parent_root=/var/lib/probiga
@@ -1248,13 +1250,13 @@ elif [ -n "${PROBIGA_RECOVERY_GUARD_SHA:-}" ] || \
 fi
 RELEASE_LOG_PREFIX="[MODE=$RELEASE_MODE]"
 log_release() {
-  printf '%s %s\n' "$RELEASE_LOG_PREFIX" "$*"
+  printf '%s\n' "$*"
 }
 log_release_warning() {
-  printf '%s WARNING: %s\n' "$RELEASE_LOG_PREFIX" "$*" >&2
+  printf 'WARNING: %s\n' "$*" >&2
 }
 log_release_error() {
-  printf '%s ERROR: %s\n' "$RELEASE_LOG_PREFIX" "$*" >&2
+  printf 'ERROR: %s\n' "$*" >&2
 }
 for timing_name in HEARTBEAT_RETRIES HEARTBEAT_INTERVAL \
   HEALTH_RETRIES HEALTH_INTERVAL; do
@@ -1270,6 +1272,10 @@ for timing_name in HEARTBEAT_RETRIES HEARTBEAT_INTERVAL \
     exit 2
   }
 done
+if [ "$DEPLOY_OPERATION" = deploy ]; then
+  exec > >(/usr/bin/sed -u "s/^/$RELEASE_LOG_PREFIX /") \
+    2> >(/usr/bin/sed -u "s/^/$RELEASE_LOG_PREFIX /" >&2)
+fi
 preflight_linux_execution_permissions || exit 2
 cd "$REPOSITORY_ROOT"
 test ! -L "$DEPLOY_LOCK_ROOT"
@@ -9418,10 +9424,12 @@ start_fast_component_ledger_publication() {
       --manifest "$RELEASE_ARTIFACT_ROOT/$EXPECTED_SHA/component-release.json" \
       --mode publish --pending-marker "$marker"; then
     write_ledger_pending_marker "$marker" schedule_failed 1
+    COMPONENT_LEDGER_STATUS=schedule-failed
     log_release_error \
       "failed to schedule component ledger publication; retry with --full"
     return 2
   fi
+  COMPONENT_LEDGER_STATUS=async-pending
   log_release \
     "component ledger publication scheduled async unit=$unit delay=${LEDGER_PENDING_DELAY_SECONDS}s"
 }
@@ -9459,6 +9467,43 @@ PY
       --health-interval "$HEALTH_INTERVAL"
   fi
   materialize_component_deploy_tools "$EXPECTED_SHA"
+}
+resolve_release_execution_scope() {
+  local classified_scope="$1"
+  case "$classified_scope" in LINUX|COORDINATED) ;; *) return 2 ;; esac
+  RELEASE_CLASSIFIED_SCOPE="$classified_scope"
+  RELEASE_EXECUTION_SCOPE="$classified_scope"
+  RELEASE_SCOPE="$classified_scope"
+  RECEIPT_FLAGS=()
+  if [ "$RELEASE_MODE" = full ]; then
+    # A full request deliberately executes the coordinated database, task,
+    # quality, and cross-end transaction even when the path classifier returned
+    # LINUX. This is the recovery route for a missed DDL classification.
+    RELEASE_SCOPE=COORDINATED
+    RELEASE_EXECUTION_SCOPE=COORDINATED
+  elif [ "$classified_scope" = COORDINATED ]; then
+    if [ "$I_KNOW_DDL_CHANGED" -ne 1 ]; then
+      log_release_error \
+        "COORDINATED scope requires --full, or --fast --i-know-ddl-changed"
+      return 2
+    fi
+    RELEASE_SCOPE=LINUX
+    RELEASE_EXECUTION_SCOPE=LINUX
+    RECEIPT_FLAGS=("fast-forced-over-coordinated")
+    log_release_warning \
+      "fast forced over classified COORDINATED scope; database migration is skipped"
+  else
+    RELEASE_SCOPE=LINUX
+    RELEASE_EXECUTION_SCOPE=LINUX
+  fi
+  if [ "$RELEASE_EXECUTION_SCOPE" = LINUX ] && \
+    { [ -z "$PREVIOUS_WINDOWS_SHA" ] || \
+      [ -z "$PREVIOUS_CONTRACT_SHA" ] || \
+      [ ! -f "$RELEASE_ARTIFACT_ROOT/$PREVIOUS_SHA/component-release.json" ]; }; then
+    log_release_error \
+      "component parent manifest is unavailable; retry with --full"
+    return 2
+  fi
 }
 classify_component_release() {
   local windows_manifest_drift=""
@@ -9514,38 +9559,7 @@ classify_component_release() {
   esac
   printf 'release_scope=%s previous_linux=%s previous_windows=%s previous_contract=%s target_linux=%s\n' \
     "$RELEASE_SCOPE" "$PREVIOUS_SHA" "$PREVIOUS_WINDOWS_SHA" "$PREVIOUS_CONTRACT_SHA" "$EXPECTED_SHA"
-  RELEASE_CLASSIFIED_SCOPE="$RELEASE_SCOPE"
-  RELEASE_EXECUTION_SCOPE="$RELEASE_SCOPE"
-  RECEIPT_FLAGS=()
-  if [ "$RELEASE_MODE" = full ]; then
-    # A full request deliberately executes the coordinated database, task,
-    # quality, and cross-end transaction even when the path classifier returned
-    # LINUX. This is the recovery route for a missed DDL classification.
-    RELEASE_SCOPE=COORDINATED
-    RELEASE_EXECUTION_SCOPE=COORDINATED
-  elif [ "$RELEASE_CLASSIFIED_SCOPE" = COORDINATED ]; then
-    if [ "$I_KNOW_DDL_CHANGED" -ne 1 ]; then
-      log_release_error \
-        "COORDINATED scope requires --full, or --fast --i-know-ddl-changed"
-      return 2
-    fi
-    RELEASE_SCOPE=LINUX
-    RELEASE_EXECUTION_SCOPE=LINUX
-    RECEIPT_FLAGS=("fast-forced-over-coordinated")
-    log_release_warning \
-      "fast forced over classified COORDINATED scope; database migration is skipped"
-  else
-    RELEASE_SCOPE=LINUX
-    RELEASE_EXECUTION_SCOPE=LINUX
-  fi
-  if [ "$RELEASE_EXECUTION_SCOPE" = LINUX ] && \
-    { [ -z "$PREVIOUS_WINDOWS_SHA" ] || \
-      [ -z "$PREVIOUS_CONTRACT_SHA" ] || \
-      [ ! -f "$RELEASE_ARTIFACT_ROOT/$PREVIOUS_SHA/component-release.json" ]; }; then
-    log_release_error \
-      "component parent manifest is unavailable; retry with --full"
-    return 2
-  fi
+  resolve_release_execution_scope "$RELEASE_SCOPE"
   log_release \
     "classification complete classified_scope=$RELEASE_CLASSIFIED_SCOPE execution_scope=$RELEASE_EXECUTION_SCOPE"
 }
@@ -9599,6 +9613,7 @@ PY
       "$CODE_VALIDATION_ROOT/tools/publish_component_release.py" \
       --manifest "$RELEASE_ARTIFACT_ROOT/$EXPECTED_SHA/component-release.json" \
       --mode sign
+    COMPONENT_LEDGER_STATUS=signed-pending-schedule
   else
     for publication_mode in "${publication_modes[@]}"; do
       /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
@@ -9612,6 +9627,7 @@ PY
         --manifest "$RELEASE_ARTIFACT_ROOT/$EXPECTED_SHA/component-release.json" \
         --mode "$publication_mode"
     done
+    COMPONENT_LEDGER_STATUS=synced
   fi
 }
 linux_release_failure() {
@@ -9686,6 +9702,8 @@ check_fast_release_schema() {
 activate_linux_release() {
   local prepared_dir="$COMPONENT_TOOL_ROOT/$EXPECTED_SHA/prepared"
   local -a ai_arguments=()
+  local -a receipt_arguments=()
+  local receipt_flag
   install -d -o root -g root -m 0700 "$prepared_dir"
   install -o root -g root -m 0600 "$PREPARED_MAIN_DROPIN" "$prepared_dir/main.conf"
   install -o root -g root -m 0600 "$PREPARED_SCHEDULER_DROPIN" "$prepared_dir/scheduler.service"
@@ -9694,10 +9712,17 @@ activate_linux_release() {
     install -o root -g root -m 0600 "$PREPARED_AI_WORKER_DROPIN" "$prepared_dir/ai.conf"
     ai_arguments=(--ai-source "$prepared_dir/ai.conf")
   fi
+  for receipt_flag in "${RECEIPT_FLAGS[@]}"; do
+    receipt_arguments+=(--receipt-flag "$receipt_flag")
+  done
   "$BOOTSTRAP_PYTHON" -I "$COMPONENT_CONTROLLER" activate \
     --target-sha "$EXPECTED_SHA" --previous-sha "$PREVIOUS_SHA" \
     --health-retries "$HEALTH_RETRIES" \
     --health-interval "$HEALTH_INTERVAL" \
+    --release-mode "$RELEASE_MODE" \
+    --classified-scope "$RELEASE_CLASSIFIED_SCOPE" \
+    --ledger-status async-pending \
+    "${receipt_arguments[@]}" \
     --main-source "$prepared_dir/main.conf" \
     --scheduler-source "$prepared_dir/scheduler.service" \
     --resources-source "$prepared_dir/resources.conf" "${ai_arguments[@]}"
@@ -9721,9 +9746,22 @@ render_receipt_file() {
   local active_sha="$2"
   local output_file="$3"
   local ended_at
+  local receipt_scope="${RELEASE_CLASSIFIED_SCOPE:-UNCLASSIFIED}"
+  local execution_scope="${RELEASE_EXECUTION_SCOPE:-UNCLASSIFIED}"
+  local flags_json='[]'
+  local lite_manifest_json='null'
   ended_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  printf '{"schema_version":"probiga.deploy-receipt.v4","status":"%s","expected_sha":"%s","previous_sha":"%s","active_sha":"%s","expected_input_lock_sha256":"%s","previous_input_lock_sha256":"%s","active_input_lock_sha256":"%s","expected_resolved_freeze_sha256":"%s","previous_resolved_freeze_sha256":"%s","active_resolved_freeze_sha256":"%s","expected_wheel_manifest_sha256":"%s","expected_adata_sha":"%s","expected_adata_tree_sha256":"%s","previous_adata_sha":"%s","previous_adata_tree_sha256":"%s","active_adata_sha":"%s","active_adata_tree_sha256":"%s","started_at":"%s","ended_at":"%s"}\n' \
-    "$status" "$EXPECTED_SHA" "$PREVIOUS_SHA" "$active_sha" \
+  if [ "${#RECEIPT_FLAGS[@]}" -gt 0 ]; then
+    flags_json='["fast-forced-over-coordinated"]'
+  fi
+  if [ "$RELEASE_MODE" = fast ]; then
+    lite_manifest_json='"component-release-lite.json"'
+  fi
+  printf '{"schema_version":"probiga.deploy-receipt.v4","status":"%s","mode":"%s","scope":"%s","execution_scope":"%s","flags":%s,"sha":"%s","signed_manifest":"component-release.json","lite_manifest":%s,"ledger":"%s","expected_sha":"%s","previous_sha":"%s","active_sha":"%s","expected_input_lock_sha256":"%s","previous_input_lock_sha256":"%s","active_input_lock_sha256":"%s","expected_resolved_freeze_sha256":"%s","previous_resolved_freeze_sha256":"%s","active_resolved_freeze_sha256":"%s","expected_wheel_manifest_sha256":"%s","expected_adata_sha":"%s","expected_adata_tree_sha256":"%s","previous_adata_sha":"%s","previous_adata_tree_sha256":"%s","active_adata_sha":"%s","active_adata_tree_sha256":"%s","started_at":"%s","ended_at":"%s"}\n' \
+    "$status" "$RELEASE_MODE" "$receipt_scope" "$execution_scope" \
+    "$flags_json" "$EXPECTED_SHA" "$lite_manifest_json" \
+    "$COMPONENT_LEDGER_STATUS" \
+    "$EXPECTED_SHA" "$PREVIOUS_SHA" "$active_sha" \
     "$EXPECTED_INPUT_LOCK_SHA256" \
     "${PREVIOUS_INPUT_LOCK_SHA256:-}" \
     "${ACTIVE_INPUT_LOCK_SHA256:-}" \
