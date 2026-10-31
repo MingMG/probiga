@@ -188,6 +188,51 @@ def test_health_rejects_component_file_database_disagreement(monkeypatch):
     assert health._component_release_readiness() == {"ready": False, "error_code": "component_release_identity_failed"}
 
 
+def test_health_accepts_lite_proof_only_while_ledger_row_is_absent(monkeypatch):
+    expected = manifest()
+    proof_loader = MagicMock()
+    monkeypatch.setattr(health, "load_runtime_component_release", lambda: expected)
+    monkeypatch.setattr(health, "get_engine", MagicMock())
+    monkeypatch.setattr(
+        health,
+        "load_component_attestation",
+        MagicMock(side_effect=RuntimeError("row missing")),
+    )
+    monkeypatch.setattr(
+        health,
+        "component_release_row_state",
+        MagicMock(return_value="absent"),
+    )
+    monkeypatch.setattr(health, "load_runtime_component_release_lite", proof_loader)
+
+    assert health._component_release_readiness() == {"ready": True, **expected}
+    proof_loader.assert_called_once_with(expected)
+
+
+def test_health_never_falls_back_when_ledger_row_is_present(monkeypatch):
+    expected = manifest()
+    proof_loader = MagicMock()
+    monkeypatch.setattr(health, "load_runtime_component_release", lambda: expected)
+    monkeypatch.setattr(health, "get_engine", MagicMock())
+    monkeypatch.setattr(
+        health,
+        "load_component_attestation",
+        MagicMock(side_effect=RuntimeError("invalid signature")),
+    )
+    monkeypatch.setattr(
+        health,
+        "component_release_row_state",
+        MagicMock(return_value="present"),
+    )
+    monkeypatch.setattr(health, "load_runtime_component_release_lite", proof_loader)
+
+    assert health._component_release_readiness() == {
+        "ready": False,
+        "error_code": "component_release_identity_failed",
+    }
+    proof_loader.assert_not_called()
+
+
 def checkpoint(producer=LINUX, anchor=WINDOWS, stage="analysis_fast"):
     replay = '{"status":"COMPLETED"}'
     digest = hashlib.sha256(replay.encode()).hexdigest()

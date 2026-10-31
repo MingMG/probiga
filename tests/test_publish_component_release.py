@@ -395,6 +395,70 @@ def test_public_entry_uses_fixed_credential_boundary_and_closes_engines(monkeypa
     assert boundary.runtime_engine.disposed and boundary.migrator_engine.disposed
 
 
+def test_sign_mode_writes_only_the_local_signed_lite_manifest(monkeypatch):
+    _boundary()
+    observed = []
+    monkeypatch.setattr(publisher, "_safe_manifest", lambda path: _manifest())
+    monkeypatch.setattr(
+        publisher,
+        "write_component_release_lite",
+        lambda path, key: observed.append((path, key)) or Path("/fixed/component-release-lite.json"),
+    )
+    monkeypatch.setattr(
+        publisher.boundary_policy,
+        "_open_boundary",
+        lambda **_: pytest.fail("sign mode opened a database boundary"),
+    )
+
+    assert publisher.publish_component_release(
+        "/fixed/component-release.json",
+        mode="sign",
+    ) == {
+        "status": "signed",
+        "linux_build_sha": LINUX,
+        "lite_manifest": "component-release-lite.json",
+    }
+    assert observed[0][0] == "/fixed/component-release.json"
+
+
+def test_pending_marker_records_only_sanitized_failure_and_is_removed_on_success(
+    monkeypatch, tmp_path, capsys,
+):
+    _boundary()
+    monkeypatch.setattr(publisher, "_PENDING_ROOT", tmp_path)
+    marker = tmp_path / f"component-release-{LINUX}.json"
+    monkeypatch.setattr(publisher, "_safe_manifest", lambda path: _manifest())
+    monkeypatch.setattr(
+        publisher,
+        "publish_component_release",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            publisher.ComponentPublicationError("COMPONENT_LINEAGE_INVALID")
+        ),
+    )
+
+    assert publisher.main([
+        "--manifest", "/fixed/component-release.json", "--mode", "publish",
+        "--pending-marker", str(marker),
+    ]) == 1
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert payload["status"] == "failed"
+    assert payload["category"] == "COMPONENT_LINEAGE_INVALID"
+    assert payload["linux_build_sha"] == LINUX
+    assert "secret" not in marker.read_text(encoding="utf-8").lower()
+    capsys.readouterr()
+
+    monkeypatch.setattr(
+        publisher,
+        "publish_component_release",
+        lambda *args, **kwargs: {"status": "created", "linux_build_sha": LINUX},
+    )
+    assert publisher.main([
+        "--manifest", "/fixed/component-release.json", "--mode", "publish",
+        "--pending-marker", str(marker),
+    ]) == 0
+    assert not marker.exists()
+
+
 def test_public_errors_are_fixed_categories_without_database_secret_text(monkeypatch, capsys):
     boundary, db = _boundary()
     db.create_error = "mysql://user:secret@private-server SQL CREATE TABLE"

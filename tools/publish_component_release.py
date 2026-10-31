@@ -7,10 +7,12 @@ coordinated operation; publish and verify never execute DDL or change grants.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
 import os
 import stat
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +27,9 @@ from server.common.component_release import (  # noqa: E402
     validate_component_release,
 )
 from server.common.component_release_attestation import load_component_attestation  # noqa: E402
+from server.common.component_release_proof import (  # noqa: E402
+    write_component_release_lite,
+)
 from server.common.component_release_ledger import (  # noqa: E402
     TABLE_NAME, build_component_ledger_metadata, load_component_ledger_public_key,
     load_signing_key, sign_component_manifest, signing_public_key,
@@ -33,6 +38,7 @@ from tools import prepare_strategy_governance_schema as boundary_policy  # noqa:
 
 PUBLICATION_LOCK_NAME = "probiga:component-release:publish"
 _RUNTIME_CONFIG_PATH = Path("/opt/ProBigA/.env")
+_PENDING_ROOT = Path("/var/lib/probiga/deploy-guards/ledger-pending")
 PUBLICATION_DIAGNOSTIC_SCHEMA = "probiga.component-release-publication-diagnostic.v1"
 _FAILURE_CATEGORIES = frozenset({
     "MYSQL_LOCK_TIMEOUT", "MYSQL_DEADLOCK", "MYSQL_PERMISSION_DENIED",
@@ -129,6 +135,68 @@ def _safe_manifest(manifest_path: str) -> dict[str, str]:
             os.environ.pop("PROBIGA_COMPONENT_RELEASE_PATH", None)
         else:
             os.environ["PROBIGA_COMPONENT_RELEASE_PATH"] = previous
+
+
+def _pending_marker_path(value: str) -> Path:
+    path = Path(value)
+    if (
+        not path.is_absolute()
+        or path.parent != _PENDING_ROOT
+        or path.suffix != ".json"
+        or not path.name.startswith("component-release-")
+    ):
+        raise ComponentPublicationError("INVALID_PENDING_MARKER")
+    return path
+
+
+def _write_pending_status(
+    path: Path,
+    *,
+    manifest: dict[str, str] | None,
+    status: str,
+    category: str | None = None,
+) -> None:
+    if path.parent != _PENDING_ROOT:
+        raise ComponentPublicationError("INVALID_PENDING_MARKER")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    payload = {
+        "schema": "probiga.component-release-ledger-pending.v1",
+        "status": status,
+        "linux_build_sha": (
+            manifest["linux_build_sha"] if manifest is not None else ""
+        ),
+        "recorded_at": datetime.now(timezone.utc).isoformat().replace(
+            "+00:00", "Z"
+        ),
+    }
+    if category is not None:
+        payload["category"] = category
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        dir=path.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _remove_pending_status(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise ComponentPublicationError(
+            "PENDING_MARKER_REMOVE_FAILED"
+        ) from exc
 
 
 def _require_runtime_metadata_authority(connection: Any) -> None:
@@ -288,8 +356,17 @@ def _sanitized_failure_category(exc: BaseException) -> str:
 
 
 def publish_component_release(manifest_path: str, *, mode: str) -> dict[str, str]:
-    if mode not in {"initialize", "publish", "verify"}:
+    if mode not in {"initialize", "publish", "verify", "sign"}:
         raise ComponentPublicationError("INVALID_ARGUMENT")
+    if mode == "sign":
+        manifest = _safe_manifest(manifest_path)
+        key = load_signing_key(create=False)
+        path = write_component_release_lite(manifest_path, key)
+        return {
+            "status": "signed",
+            "linux_build_sha": manifest["linux_build_sha"],
+            "lite_manifest": path.name,
+        }
     boundary = None
     try:
         _load_protected_runtime_env()
@@ -320,13 +397,39 @@ def publish_component_release(manifest_path: str, *, mode: str) -> dict[str, str
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", required=True)
-    parser.add_argument("--mode", choices=("initialize", "publish", "verify"), required=True)
+    parser.add_argument(
+        "--mode",
+        choices=("initialize", "publish", "verify", "sign"),
+        required=True,
+    )
+    parser.add_argument("--pending-marker")
     args = parser.parse_args(argv)
+    pending_marker = None
+    manifest = None
     try:
+        if args.pending_marker:
+            pending_marker = _pending_marker_path(args.pending_marker)
+            manifest = _safe_manifest(args.manifest)
         result = publish_component_release(args.manifest, mode=args.mode)
     except ComponentPublicationError as exc:
+        if pending_marker is not None:
+            try:
+                _write_pending_status(
+                    pending_marker,
+                    manifest=manifest,
+                    status="failed",
+                    category=exc.category,
+                )
+            except Exception:
+                pass
         print(json.dumps({"status": "error", "category": exc.category}, sort_keys=True))
         _report_failure_diagnostic(exc)
+        return 1
+    try:
+        if pending_marker is not None:
+            _remove_pending_status(pending_marker)
+    except ComponentPublicationError as exc:
+        print(json.dumps({"status": "error", "category": exc.category}, sort_keys=True))
         return 1
     print(json.dumps(result, sort_keys=True))
     return 0

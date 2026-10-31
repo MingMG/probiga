@@ -61,6 +61,10 @@ from server.common.release_manifest import (
 )
 from server.common.component_release import load_runtime_component_release
 from server.common.component_release_attestation import load_component_attestation
+from server.common.component_release_ledger import component_release_row_state
+from server.common.component_release_proof import (
+    load_runtime_component_release_lite,
+)
 from server.engine.strategy_funding_checkpoint import (
     FUNDING_CHECKPOINT_AUDIT_MAX_BYTES,
     FUNDING_CHECKPOINT_BATCH_MAX_BYTES,
@@ -1173,13 +1177,31 @@ def _scheduler_script_policy_readiness() -> dict[str, str | bool]:
 
 
 def _component_release_readiness() -> dict[str, object]:
-    """Prove the file and privileged database attest the same component set."""
+    """Prove the runtime manifest and a trusted publication authority agree.
+
+    Fast releases publish a root-owned Ed25519 lite proof immediately and the
+    permanent MySQL ledger shortly afterwards. The proof is accepted only while
+    the ledger row is provably absent; malformed ledger metadata or a present
+    but invalid row never falls back to the local path.
+    """
     try:
         manifest = load_runtime_component_release()
         with get_engine().connect() as connection:
-            attestation = load_component_attestation(connection, manifest["linux_build_sha"])
-        if manifest != attestation:
-            raise RuntimeError("component identity authorities differ")
+            try:
+                attestation = load_component_attestation(
+                    connection,
+                    manifest["linux_build_sha"],
+                )
+            except Exception:
+                if component_release_row_state(
+                    connection,
+                    manifest["linux_build_sha"],
+                ) != "absent":
+                    raise
+                load_runtime_component_release_lite(manifest)
+            else:
+                if manifest != attestation:
+                    raise RuntimeError("component identity authorities differ")
         return {"ready": True, **manifest}
     except Exception as exc:
         _log_public_health_probe_failure("component_release_readiness", exc)

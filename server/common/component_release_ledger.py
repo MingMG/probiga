@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import stat
 import tempfile
 from pathlib import Path
@@ -153,7 +154,6 @@ def load_component_ledger_public_key(connection: Any) -> str:
 
 
 def load_component_release_row(connection: Any, linux_build_sha: str) -> dict[str, str]:
-    import re
     if not isinstance(linux_build_sha, str) or re.fullmatch("[0-9a-f]{40}", linux_build_sha) is None or linux_build_sha == "0" * 40:
         raise ComponentLedgerError("component release build is invalid")
     public_key = load_component_ledger_public_key(connection)
@@ -164,6 +164,32 @@ def load_component_release_row(connection: Any, linux_build_sha: str) -> dict[st
     if len(rows) != 1 or set(rows[0]) != {"linux_build_sha", "manifest_json", "signature"} or rows[0].get("linux_build_sha") != linux_build_sha:
         raise ComponentLedgerError("component release row unavailable or ambiguous")
     return verify_signed_component_manifest(rows[0]["manifest_json"], rows[0]["signature"], public_key, linux_build_sha)
+
+
+def component_release_row_state(
+    connection: Any,
+    linux_build_sha: str,
+) -> str:
+    """Return ``present`` or ``absent`` after validating ledger metadata.
+
+    A malformed table is never treated as an absent row. Callers may use the
+    absent state to accept a separately signed local fast-release proof while
+    the permanent ledger publication is pending.
+    """
+    if (
+        not isinstance(linux_build_sha, str)
+        or re.fullmatch("[0-9a-f]{40}", linux_build_sha) is None
+        or linux_build_sha == "0" * 40
+    ):
+        raise ComponentLedgerError("component release build is invalid")
+    load_component_ledger_public_key(connection)
+    count = connection.execute(text(
+        "SELECT COUNT(*) FROM probiga.st_component_release_manifest "
+        "WHERE linux_build_sha=:linux_build_sha"
+    ), {"linux_build_sha": linux_build_sha}).scalar_one()
+    if count not in (0, 1):
+        raise ComponentLedgerError("component release row count differs")
+    return "present" if count == 1 else "absent"
 
 
 def load_signing_key(*, create: bool = False) -> Ed25519PrivateKey:
