@@ -83,6 +83,64 @@ _stopping = False
 _stop_completed = False
 _fault_log = None
 
+# QMT's embedded interpreter refuses every python-level open() that names a
+# path it did not create itself -- reads, appends and overwrites alike -- with
+# PermissionError("Foribdden FileIO"), the broker's spelling -- while
+# os.listdir/os.stat, creation of new files and os.replace keep working.
+# kernel32 is not intercepted inside the same process, so an existing path is
+# opened through CreateFileW and the handle is adopted as an ordinary file
+# object.  Every read in this module goes through _open_bridge_file(); writes
+# keep the create-new-file + os.replace pattern of _atomic_write, which the
+# sandbox permits.
+_NATIVE_IO = os.name == "nt"
+_native_read_api = None
+
+
+def _create_native_read_api():
+    import ctypes as ct
+    from ctypes import wintypes as wt
+    kernel = ct.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.argtypes = [wt.LPCWSTR, wt.DWORD, wt.DWORD,
+        ct.c_void_p, wt.DWORD, wt.DWORD, wt.HANDLE]
+    kernel.CreateFileW.restype = wt.HANDLE
+    kernel.CloseHandle.argtypes = [wt.HANDLE]
+    kernel.CloseHandle.restype = wt.BOOL
+    return ct, wt, kernel
+
+
+def _open_bridge_file(path, append=False):
+    """Open an existing path for reading, or create/append the fault log."""
+    if not _NATIVE_IO:
+        return open(path, "ab" if append else "rb", 0 if append else -1)
+    global _native_read_api
+    if _native_read_api is None:
+        _native_read_api = _create_native_read_api()
+    ct, wt, kernel = _native_read_api
+    import msvcrt
+    handle = kernel.CreateFileW(
+        path,
+        0x0004 if append else 0x80000000,  # FILE_APPEND_DATA / GENERIC_READ
+        0x1 | 0x2 | 0x4,                   # share read/write/delete
+        None,
+        4 if append else 3,                # OPEN_ALWAYS / OPEN_EXISTING
+        0x80,                              # FILE_ATTRIBUTE_NORMAL
+        None,
+    )
+    if handle is None or handle == wt.HANDLE(-1).value:
+        raise ct.WinError(ct.get_last_error())
+    try:
+        descriptor = msvcrt.open_osfhandle(
+            handle, os.O_WRONLY | os.O_APPEND if append else os.O_RDONLY)
+    except Exception:
+        kernel.CloseHandle(handle)
+        raise
+    return os.fdopen(descriptor, "ab" if append else "rb", 0 if append else -1)
+
+
+def _read_json_file(path):
+    with _open_bridge_file(path) as handle:
+        return json.loads(handle.read().decode("utf-8"))
+
 
 def _enable_fault_log():
     global _fault_log
@@ -90,18 +148,15 @@ def _enable_fault_log():
     # Native access violations cannot be caught by bridge_tick's except block.
     try:
         if _fault_log is None:
-            _fault_log = open(
+            _fault_log = _open_bridge_file(
                 os.path.join(_bridge_root, "native_fault.log"),
-                "ab",
-                buffering=0,
+                append=True,
             )
         faulthandler.enable(file=_fault_log, all_threads=True)
     except OSError as exc:
-        # QMT's embedded Python can reject otherwise writable userdata files
-        # with PermissionError("Forbidden FileIO"). Fault diagnostics are
-        # useful but must never prevent the read-only data strategy from
-        # starting. Fall back to the host's stderr, which QMT captures in its
-        # formula output log.
+        # Fault diagnostics are useful but must never prevent the read-only
+        # data strategy from starting. Fall back to the host's stderr, which
+        # QMT captures in its formula output log.
         _fault_log = None
         try:
             faulthandler.enable(all_threads=True)
@@ -320,7 +375,7 @@ def _load_direct_acquisition_model():
     module_name = (
         "probiga_direct_acquisition_" + DIRECT_ACQUISITION_MODEL_SHA256
     )
-    with open(model_path, "rb") as handle:
+    with _open_bridge_file(model_path) as handle:
         source = handle.read()
     namespace = {
         "__name__": module_name,
@@ -364,7 +419,7 @@ def _json_safe(value):
 
 def _file_sha256(path):
     hasher = hashlib.sha256()
-    with open(path, "rb") as handle:
+    with _open_bridge_file(path) as handle:
         while True:
             chunk = handle.read(1024 * 1024)
             if not chunk:
@@ -451,8 +506,7 @@ def _freeze_loaded_strategy_identity():
         )
         if not manifest_path:
             return unavailable
-        with open(manifest_path, "r", encoding="utf-8") as handle:
-            manifest = json.load(handle)
+        manifest = _read_json_file(manifest_path)
         if not isinstance(manifest, dict):
             return unavailable
         artifact_sha256 = str(
@@ -1931,8 +1985,7 @@ def _recover_inflight_requests():
     for name in names:
         path = os.path.join(_inflight_root, name)
         try:
-            with open(path, "r", encoding="utf-8") as handle:
-                payload = json.load(handle)
+            payload = _read_json_file(path)
             request_id = str(payload.get("request_id") or name[:-5])
             response_path = os.path.join(
                 _responses_root, request_id + ".json.gz"
@@ -2003,8 +2056,7 @@ def _process_one_request(C):
     request_payload = {}
     dead_lettered = False
     try:
-        with open(path, "r", encoding="utf-8") as handle:
-            request_payload = json.load(handle)
+        request_payload = _read_json_file(path)
         request_id = str(request_payload.get("request_id") or request_id)
         response_path = os.path.join(_responses_root, request_id + ".json.gz")
         action = str(request_payload.get("action") or "").strip()

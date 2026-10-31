@@ -24,7 +24,9 @@ def test_fault_log_permission_error_does_not_abort_strategy(
 
     monkeypatch.setattr(producer, "_fault_log", None)
     monkeypatch.setattr(producer, "_bridge_root", str(tmp_path))
-    monkeypatch.setattr("builtins.open", denied)
+    # Every bridge file access goes through this one adapter; the sandbox
+    # rejects path-based open() in the terminal, so that is the seam to deny.
+    monkeypatch.setattr(producer, "_open_bridge_file", denied)
     monkeypatch.setattr(
         producer.faulthandler,
         "enable",
