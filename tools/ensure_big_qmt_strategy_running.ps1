@@ -693,6 +693,8 @@ function Get-QmtStrategyPaneLayout {
         throw "QMT model-research strategy pane is not visibly identifiable"
     }
     return [pscustomobject]@{
+        ReturnX = [int]($paneLeft + 24)
+        ReturnY = [int]($work.Top + 39)
         SearchX = [int]($paneLeft + 70)
         SearchY = [int]($work.Top + 67)
         EditX = [int]($paneLeft + 322)
@@ -941,15 +943,15 @@ try {
         # filter to the exact bridge strategy, then click that row's edit
         # action. The pane boundary is detected from the visible chart/pane
         # relationship so both single-screen and spanning layouts are safe.
-        # Closing an editor may leave QMT on its model backtest/trading
-        # subpage.  The same location is a harmless market-index tab on the
-        # home page, so this safely normalizes both states before navigation.
-        # QMT 2.1.19: 0.056/0.039 is the account badge and opens About QMT.
-        # The read-only return-home link is centered at this work-area point.
-        Invoke-WindowClick $mainHandle 0.107 0.077 -UseMonitorWorkArea
-        Start-Sleep -Milliseconds 800
-        Invoke-WindowClick $mainHandle 0.470 0.015
-        Start-Sleep -Milliseconds 1000
+        # Closing an editor leaves QMT on its model backtest subpage. The
+        # read-only return-home link belongs to the visible model-research
+        # pane, not to a fixed fraction of the market client width.
+        $layout = Get-QmtStrategyPaneLayout $mainHandle
+        Invoke-WindowPointClick `
+            $mainHandle `
+            $layout.ReturnX `
+            $layout.ReturnY
+        Start-Sleep -Milliseconds 1200
         $layout = Get-QmtStrategyPaneLayout $mainHandle
         Invoke-WindowPointClick `
             $mainHandle `

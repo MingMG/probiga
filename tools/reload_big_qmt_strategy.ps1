@@ -2005,6 +2005,8 @@ function Get-QmtStrategyPaneLayout {
         )
     }
     return [pscustomobject]@{
+        ReturnX = [int]($PaneLeft + 24)
+        ReturnY = [int]($Work.Top + 39)
         SearchX = [int]($PaneLeft + 70)
         SearchY = [int]($Work.Top + 67)
         EditX = [int]($PaneLeft + 322)
@@ -2022,20 +2024,18 @@ function Open-ExactStrategyEditor {
     Add-Type -AssemblyName System.Windows.Forms
     Show-QmtMainWindow
     # QMT 2.1.19 leaves the client on a model backtest page after an editor
-    # closes.  This exact location is the read-only "return to home" link.
-    # The old 0.056/0.039 point lands on the account badge in 2.1.19 and opens
-    # the modal "About QMT", which prevents unattended release recovery.
-    Invoke-ExactWindowClick `
+    # closes. The read-only "return to home" link belongs to the detected
+    # model-research pane; a window-width ratio can land in the market chart
+    # and leave the following search on the backtest page.
+    $Layout = Get-QmtStrategyPaneLayout
+    Invoke-ExactScreenPointClick `
         $QmtMainHandle `
         $QmtMainTitle `
-        0.107 `
-        0.077 `
-        -UseMonitorWorkArea
+        $Layout.ReturnX `
+        $Layout.ReturnY
     Start-Sleep -Milliseconds 1200
-    # The model-research header tracks the full QMT wrapper, while the search
-    # pane is anchored to the owning monitor. This normalizes spanning layouts.
-    Invoke-ExactWindowClick $QmtMainHandle $QmtMainTitle 0.470 0.015
-    Start-Sleep -Milliseconds 1000
+    # Returning home changes an embedded backtest pane into the strategy-list
+    # pane, so search and row controls must be rebound after that transition.
     $Layout = Get-QmtStrategyPaneLayout
     Invoke-ExactScreenPointClick `
         $QmtMainHandle `

@@ -1162,6 +1162,7 @@ def test_release_reload_verifies_foreground_before_every_pointer_click() -> None
 
 def test_release_reload_locates_the_visible_strategy_pane_and_fails_closed() -> None:
     source = _source()
+    open_editor = _powershell_function(source, "Open-ExactStrategyEditor")
 
     assert "FindStrategyPaneLeft" in source
     assert "CreateDIBSection" in source
@@ -1169,14 +1170,45 @@ def test_release_reload_locates_the_visible_strategy_pane_and_fails_closed() -> 
     assert "Get-QmtStrategyPaneLayout" in source
     assert "$FullWidthList" in source
     assert "$EmbeddedList" in source
+    assert "ReturnX = [int]($PaneLeft + 24)" in source
+    assert "ReturnY = [int]($Work.Top + 39)" in source
     assert "$PaneLeft + 70" in source
     assert "$PaneLeft + 322" in source
     assert "the visible QMT model-research strategy pane is not unique" in source
     assert "Invoke-ExactScreenPointClick" in source
     assert "QMT point-click target identity changed" in source
     assert "QMT point click escapes the exact target window" in source
+    assert "$Layout.ReturnX" in open_editor
+    assert "$Layout.ReturnY" in open_editor
+    assert "0.107" not in open_editor
+    assert "0.470" not in open_editor
     assert "SearchX = 0.325" not in source
     assert "EditX = 0.458" not in source
+
+
+def test_release_reload_returns_home_inside_the_model_research_pane() -> None:
+    # Production failure: on a 1920-pixel window the old 0.107 ratio landed
+    # at x=205 in the market chart while the model-research pane began at
+    # x=994. The editor was therefore never opened.
+    observed_window_width = 1920
+    observed_pane_left = 994
+    old_click_x = int(observed_window_width * 0.107)
+    return_click_x = observed_pane_left + 24
+
+    assert old_click_x < observed_pane_left
+    assert observed_pane_left < return_click_x < observed_window_width
+
+    source = _source()
+    for path in (
+        ROOT / "tools" / "reload_big_qmt_strategy.ps1",
+        ROOT / "tools" / "ensure_big_qmt_strategy_running.ps1",
+    ):
+        implementation = path.read_text(encoding="utf-8")
+        assert "ReturnX = [int]($PaneLeft + 24)" in implementation or (
+            "ReturnX = [int]($paneLeft + 24)" in implementation
+        )
+        assert "0.107 0.077" not in implementation
+        assert "0.470 0.015" not in implementation
 
 
 def test_atomic_install_finishes_before_the_old_model_is_stopped() -> None:

@@ -220,14 +220,17 @@ def test_big_qmt_strategy_recovery_uses_end_to_end_persistent_backoff():
         "Add-Type -AssemblyName System.Windows.Forms"
     )
     assert "QMT 2.1.19" in source
-    assert "0.107 0.077" in source
-    assert "0.056/0.039 is the account badge" in source
-    assert "0.470 0.015" in source
+    assert "$layout.ReturnX" in source
+    assert "$layout.ReturnY" in source
+    assert "0.107 0.077" not in source
+    assert "0.470 0.015" not in source
     assert "FindStrategyPaneLeft" in source
     assert "CreateDIBSection" in source
     assert "BitBlt" in source
     assert "$fullWidthList" in source
     assert "$embeddedList" in source
+    assert "ReturnX = [int]($paneLeft + 24)" in source
+    assert "ReturnY = [int]($work.Top + 39)" in source
     assert "$paneLeft + 70" in source
     assert "$paneLeft + 322" in source
     assert "SearchX = 0.325" not in source
