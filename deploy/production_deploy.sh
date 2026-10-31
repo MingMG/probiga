@@ -1172,15 +1172,60 @@ case "${PROBIGA_DEPLOY_PROTOCOL_VERSION:-}" in
     ;;
 esac
 DEPLOY_OPERATION=deploy
+RELEASE_MODE=fast
+I_KNOW_DDL_CHANGED=0
+RELEASE_MODE_EXPLICIT=0
 if [ "$#" -eq 1 ] && [ "$1" = --recover-database-guard ]; then
   if [ "$DEPLOY_ARTIFACT_MODE" != static-wheel-lock-v2 ]; then
     echo "v2 production deploy broker cannot authorize recovery" >&2
     exit 2
   fi
   DEPLOY_OPERATION=recover-database-guard
-elif [ "$#" -ne 0 ]; then
-  echo "production deploy engine rejected unsupported arguments" >&2
-  exit 2
+elif [ "$#" -gt 0 ]; then
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --mode)
+        test "$#" -ge 2 || {
+          echo "--mode requires fast or full" >&2
+          exit 2
+        }
+        test "$RELEASE_MODE_EXPLICIT" -eq 0 || {
+          echo "release mode may be selected only once" >&2
+          exit 2
+        }
+        case "$2" in
+          fast|full) RELEASE_MODE="$2" ;;
+          *) echo "--mode requires fast or full" >&2; exit 2 ;;
+        esac
+        RELEASE_MODE_EXPLICIT=1
+        shift 2
+        ;;
+      --i-know-ddl-changed)
+        test "$#" -ge 2 || {
+          echo "--i-know-ddl-changed requires 0 or 1" >&2
+          exit 2
+        }
+        case "$2" in
+          0|1) I_KNOW_DDL_CHANGED="$2" ;;
+          *) echo "--i-know-ddl-changed requires 0 or 1" >&2; exit 2 ;;
+        esac
+        shift 2
+        ;;
+      --strict-windows-manifest)
+        STRICT_WINDOWS_MANIFEST=1
+        shift
+        ;;
+      *)
+        echo "production deploy engine rejected unsupported arguments" >&2
+        exit 2
+        ;;
+    esac
+  done
+  if [ "$I_KNOW_DDL_CHANGED" -eq 1 ] && \
+    { [ "$RELEASE_MODE" != fast ] || [ "$RELEASE_MODE_EXPLICIT" -ne 1 ]; }; then
+    echo "--i-know-ddl-changed requires an explicit --fast" >&2
+    exit 2
+  fi
 fi
 if [ "$DEPLOY_OPERATION" = recover-database-guard ]; then
   : "${PROBIGA_RECOVERY_GUARD_SHA:?broker-validated recovery SHA is required}"
@@ -1192,6 +1237,16 @@ elif [ -n "${PROBIGA_RECOVERY_GUARD_SHA:-}" ] || \
   echo "production deploy engine rejected recovery state during normal deploy" >&2
   exit 2
 fi
+RELEASE_LOG_PREFIX="[MODE=$RELEASE_MODE]"
+log_release() {
+  printf '%s %s\n' "$RELEASE_LOG_PREFIX" "$*"
+}
+log_release_warning() {
+  printf '%s WARNING: %s\n' "$RELEASE_LOG_PREFIX" "$*" >&2
+}
+log_release_error() {
+  printf '%s ERROR: %s\n' "$RELEASE_LOG_PREFIX" "$*" >&2
+}
 preflight_linux_execution_permissions || exit 2
 cd "$REPOSITORY_ROOT"
 test ! -L "$DEPLOY_LOCK_ROOT"
@@ -9215,7 +9270,7 @@ PREVIOUS_WINDOWS_SHA=""
 PREVIOUS_CONTRACT_SHA=""
 TARGET_WINDOWS_SHA="$EXPECTED_SHA"
 TARGET_CONTRACT_SHA="$EXPECTED_SHA"
-STRICT_WINDOWS_MANIFEST=0
+STRICT_WINDOWS_MANIFEST="${STRICT_WINDOWS_MANIFEST:-0}"
 COMPONENT_TOOL_ROOT=/var/lib/probiga/component-deploy-tools
 BOOTSTRAP_PYTHON=/usr/bin/python3.14
 test -x "$BOOTSTRAP_PYTHON"
@@ -9334,6 +9389,40 @@ classify_component_release() {
   esac
   printf 'release_scope=%s previous_linux=%s previous_windows=%s previous_contract=%s target_linux=%s\n' \
     "$RELEASE_SCOPE" "$PREVIOUS_SHA" "$PREVIOUS_WINDOWS_SHA" "$PREVIOUS_CONTRACT_SHA" "$EXPECTED_SHA"
+  RELEASE_CLASSIFIED_SCOPE="$RELEASE_SCOPE"
+  RELEASE_EXECUTION_SCOPE="$RELEASE_SCOPE"
+  RECEIPT_FLAGS=()
+  if [ "$RELEASE_MODE" = full ]; then
+    # A full request deliberately executes the coordinated database, task,
+    # quality, and cross-end transaction even when the path classifier returned
+    # LINUX. This is the recovery route for a missed DDL classification.
+    RELEASE_SCOPE=COORDINATED
+    RELEASE_EXECUTION_SCOPE=COORDINATED
+  elif [ "$RELEASE_CLASSIFIED_SCOPE" = COORDINATED ]; then
+    if [ "$I_KNOW_DDL_CHANGED" -ne 1 ]; then
+      log_release_error \
+        "COORDINATED scope requires --full, or --fast --i-know-ddl-changed"
+      return 2
+    fi
+    RELEASE_SCOPE=LINUX
+    RELEASE_EXECUTION_SCOPE=LINUX
+    RECEIPT_FLAGS=("fast-forced-over-coordinated")
+    log_release_warning \
+      "fast forced over classified COORDINATED scope; database migration is skipped"
+  else
+    RELEASE_SCOPE=LINUX
+    RELEASE_EXECUTION_SCOPE=LINUX
+  fi
+  if [ "$RELEASE_EXECUTION_SCOPE" = LINUX ] && \
+    { [ -z "$PREVIOUS_WINDOWS_SHA" ] || \
+      [ -z "$PREVIOUS_CONTRACT_SHA" ] || \
+      [ ! -f "$RELEASE_ARTIFACT_ROOT/$PREVIOUS_SHA/component-release.json" ]; }; then
+    log_release_error \
+      "component parent manifest is unavailable; retry with --full"
+    return 2
+  fi
+  log_release \
+    "classification complete classified_scope=$RELEASE_CLASSIFIED_SCOPE execution_scope=$RELEASE_EXECUTION_SCOPE"
 }
 prepare_component_release_manifest() {
   local publication_mode
@@ -9388,8 +9477,13 @@ PY
 }
 linux_release_failure() {
   local failed_status="$1"
+  local failed_command="${BASH_COMMAND:0:300}"
   trap '' TERM INT HUP
   trap - ERR
+  log_release_error \
+    "fast mode failed at: $failed_command (status=$failed_status)"
+  log_release_error \
+    "If this is a schema-related error, retry with: $EXPECTED_SHA --full"
   # Only the Linux controller can restore its transaction; the coordinated
   # rollback function creates QMT/SQL recovery effects and is never used here.
   "$BOOTSTRAP_PYTHON" -I "$COMPONENT_CONTROLLER" recover || true
@@ -15856,7 +15950,7 @@ rollback() {
   exit "$failed_status"
 }
 classify_component_release
-if [ "$RELEASE_SCOPE" = LINUX ]; then
+if [ "$RELEASE_EXECUTION_SCOPE" = LINUX ]; then
   trap 'linux_release_failure "$?"' ERR
   trap 'linux_release_failure 143' TERM
   trap 'linux_release_failure 130' INT
@@ -15873,15 +15967,17 @@ CUTOVER_STEP=prebuild_release_space
 prebuild_reclaim_release_space
 CUTOVER_STEP=prepare_release
 prepare_release
-if [ "$RELEASE_SCOPE" = LINUX ]; then
+if [ "$RELEASE_EXECUTION_SCOPE" = LINUX ]; then
   CUTOVER_STEP=ensure_inherited_qmt_windows_edge_activation
   ensure_qmt_windows_edge_activation 1
   CUTOVER_STEP=activate_linux_components
   activate_linux_release
+  log_release "Linux activation complete sha=$EXPECTED_SHA"
   # This branch ends before schema preflight, writer fencing, task mutations,
   # Windows requests, grants and the coordinated rollback state machine.
   exit 0
 fi
+log_release "coordinated preparation and database gates starting"
 # Every remaining release changes the reviewed runtime contract. Linux-only
 # changes exited above using the complete current-to-target classification.
 # PREPARE DATABASE: every production mode runs the same full read-only schema

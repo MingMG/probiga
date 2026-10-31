@@ -260,7 +260,7 @@ def test_linux_dispatch_exits_before_coordinated_mutations():
     script = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
     start = script.index("CUTOVER_STEP=prepare_release\nprepare_release")
     dispatch = script[start:script.index("# PREPARE DATABASE:", start)]
-    assert 'if [ "$RELEASE_SCOPE" = LINUX ]' in dispatch
+    assert 'if [ "$RELEASE_EXECUTION_SCOPE" = LINUX ]' in dispatch
     assert "activate_linux_release\n" in dispatch and "exit 0" in dispatch
     assert "--activation-grant" not in dispatch
     controller = (ROOT / "tools/linux_release_activation.py").read_text(encoding="utf-8")
