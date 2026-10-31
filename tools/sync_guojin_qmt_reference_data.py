@@ -9,7 +9,7 @@ import re
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import pandas as pd
 from sqlalchemy import inspect, text
@@ -83,6 +83,9 @@ INDEX_WEIGHT_PUBLICATION_RECEIPT_SCHEMA = (
 )
 HISTORICAL_INSTRUMENT_ARCHIVE_SCHEMA = (
     "probiga.qmt-historical-instrument-archive.v1"
+)
+BAOSTOCK_RETIREMENT_RECONCILIATION_SCHEMA = (
+    "probiga.baostock-retirement-reconciliation.v1"
 )
 REFERENCE_SCHEMA_CONTRACT_KEY = "qmt_reference_truth_v2"
 _REFERENCE_SEAL_TABLE_DDL = ("""
@@ -1457,6 +1460,142 @@ def _resolve_catalog_list_date(
     raise RuntimeError("QMT instrument list_date changed across batches")
 
 
+def _query_baostock_stock_basic() -> list[dict[str, str]]:
+    """Read the complete independent stock master once for retirement facts."""
+
+    vendor_root = ROOT / "third_party"
+    if str(vendor_root) not in sys.path:
+        sys.path.insert(0, str(vendor_root))
+    import baostock as bs
+
+    login = bs.login()
+    if str(login.error_code) != "0":
+        raise RuntimeError("Baostock stock master login failed")
+    try:
+        result = bs.query_stock_basic()
+        if str(result.error_code) != "0":
+            raise RuntimeError("Baostock stock master query failed")
+        rows: list[dict[str, str]] = []
+        while result.next():
+            rows.append({
+                str(key): str(value or "")
+                for key, value in zip(result.fields, result.get_row_data())
+            })
+        return rows
+    finally:
+        bs.logout()
+
+
+def _baostock_qmt_code(value: Any) -> str:
+    code = str(value or "").strip().lower()
+    match = re.fullmatch(r"(sh|sz|bj)\.([0-9]{6})", code)
+    if match is None:
+        return ""
+    return f"{match.group(2)}.{match.group(1).upper()}"
+
+
+def _reconcile_removed_catalog_members(
+    catalog_by_qmt: dict[str, dict[str, Any]],
+    *,
+    current_qmt_codes: set[str],
+    captured_day: str,
+    stock_basic_lookup: Callable[[], Iterable[Mapping[str, Any]]] | None = None,
+) -> dict[str, Any] | None:
+    """Attach independently verified exchange retirement dates."""
+
+    unresolved = sorted(
+        code for code, member in catalog_by_qmt.items()
+        if code not in current_qmt_codes
+        and (
+            member.get("expire_date") in (None, "")
+            or captured_day <= str(member.get("expire_date"))[:10]
+        )
+    )
+    if not unresolved:
+        return None
+
+    lookup = stock_basic_lookup or _query_baostock_stock_basic
+    by_qmt_code: dict[str, dict[str, str]] = {}
+    for raw in lookup():
+        if not isinstance(raw, Mapping):
+            raise RuntimeError("Baostock stock master row is invalid")
+        qmt_code = _baostock_qmt_code(raw.get("code"))
+        if qmt_code not in unresolved:
+            continue
+        if qmt_code in by_qmt_code:
+            raise RuntimeError(
+                f"Baostock stock master has duplicate identity: {qmt_code}"
+            )
+        by_qmt_code[qmt_code] = {
+            key: str(raw.get(key) or "")
+            for key in ("code", "ipoDate", "outDate", "type", "status")
+        }
+
+    evidence_rows: list[dict[str, str]] = []
+    for qmt_code in unresolved:
+        member = catalog_by_qmt[qmt_code]
+        proof = by_qmt_code.get(qmt_code)
+        if proof is None:
+            raise RuntimeError(
+                f"Baostock stock master is missing retirement fact: {qmt_code}"
+            )
+        if proof["type"] != "1" or proof["status"] != "0":
+            raise RuntimeError(
+                f"Baostock stock master does not prove retirement: {qmt_code}"
+            )
+        list_date = str(member.get("list_date") or "")[:10]
+        if proof["ipoDate"] != list_date:
+            raise RuntimeError(
+                f"Baostock listing identity differs: {qmt_code}"
+            )
+        out_date = proof["outDate"]
+        try:
+            normalized_out = date.fromisoformat(out_date).isoformat()
+            normalized_capture = date.fromisoformat(captured_day).isoformat()
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Baostock retirement date is invalid: {qmt_code}"
+            ) from exc
+        if (
+            normalized_out != out_date
+            or normalized_capture != captured_day
+            or normalized_out >= normalized_capture
+        ):
+            raise RuntimeError(
+                f"Baostock retirement date does not predate capture: {qmt_code}"
+            )
+        evidence_rows.append({
+            "qmt_code": qmt_code,
+            "baostock_code": proof["code"],
+            "ipo_date": proof["ipoDate"],
+            "out_date": normalized_out,
+            "type": proof["type"],
+            "status": proof["status"],
+            "prior_instrument_batch_id": str(
+                member.get("instrument_batch_id") or ""
+            ),
+        })
+
+    retirement_batch_id = canonical_digest({
+        "schema": BAOSTOCK_RETIREMENT_RECONCILIATION_SCHEMA,
+        "source": "baostock.query_stock_basic",
+        "captured_day": captured_day,
+        "rows": evidence_rows,
+    })
+    for row in evidence_rows:
+        member = catalog_by_qmt[row["qmt_code"]]
+        member["expire_date"] = row["out_date"]
+        member["instrument_batch_id"] = retirement_batch_id
+    return {
+        "schema": BAOSTOCK_RETIREMENT_RECONCILIATION_SCHEMA,
+        "source": "baostock.query_stock_basic",
+        "captured_day": captured_day,
+        "row_count": len(evidence_rows),
+        "retirement_batch_id": retirement_batch_id,
+        "rows": evidence_rows,
+    }
+
+
 def _business_stock_info_rows(details: pd.DataFrame) -> pd.DataFrame:
     if details.empty:
         return pd.DataFrame(columns=["stock_code", "short_name", "exchange", "list_date", "qmt_code"])
@@ -2252,6 +2391,11 @@ def _capture_reference_data(
             "instrument_batch_id": instrument_source_batch_id,
             "instrument_type": "STOCK",
         }
+    retirement_reconciliation = _reconcile_removed_catalog_members(
+        catalog_by_qmt,
+        current_qmt_codes=set(native_stock_qmt_codes),
+        captured_day=captured_day,
+    )
     unresolved_removed = sorted(
         code for code, member in catalog_by_qmt.items()
         if code not in set(native_stock_qmt_codes)
@@ -2397,6 +2541,7 @@ def _capture_reference_data(
         "calendar_source_id": calendar_source_id,
         "catalog_manifest": catalog_manifest,
         "catalog_members": catalog_members,
+        "retirement_reconciliation": retirement_reconciliation,
     }
 
 
@@ -2502,6 +2647,9 @@ def _publish_reference_snapshot(engine, snapshot, normalized_release_sha, *, dry
             "status": "dry_run",
             "batch_id": batch_id,
             "refresh": refresh_result,
+            "retirement_reconciliation": snapshot.get(
+                "retirement_reconciliation"
+            ),
             "rows": {
                 "qmt_sector_list": int(len(sector_df)),
                 "qmt_sector_member": int(len(sector_members)),
@@ -2533,6 +2681,9 @@ def _publish_reference_snapshot(engine, snapshot, normalized_release_sha, *, dry
         "refresh": refresh_result,
         "batch_id": batch_id,
         "release_build_sha": normalized_release_sha or None,
+        "retirement_reconciliation": snapshot.get(
+            "retirement_reconciliation"
+        ),
         "stock_catalog": catalog_manifest,
         "trade_calendar": calendar_manifest,
         "trade_calendar_capture": calendar_capture_evidence,
