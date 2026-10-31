@@ -61,8 +61,8 @@ $IpcReloadAuthorizationPath = Join-Path `
 $TrustedReloadStateOwnerSids = @()
 $SupportedQmtClientVersion = "2.1.19.0"
 $StrategyEditorRunXOffset = 348
-$StrategyEditorStopXOffset = 464
-$StrategyEditorToolbarYOffset = 99
+$StrategyEditorStopXOffset = 508
+$StrategyEditorToolbarYOffset = 116
 
 $QmtClient = $null
 $QmtMainHandle = [IntPtr]::Zero
@@ -1969,11 +1969,12 @@ function Invoke-ExactStrategyEditorControl(
     if (![ProBigAQmtReleaseWindow]::GetWindowRect($Editor, [ref]$Rect)) {
         throw "QMT strategy-editor control bounds are unavailable"
     }
-    # QMT 2.1.19 exposes Run and Stop only on the exact editor toolbar. These
-    # controls are anchored after the fixed model-navigation pane, so resizing
-    # the editor does not preserve a window-width ratio. Bind the 96-DPI point
-    # to the exact editor's top-left corner and prove the resulting state with
-    # the in-process heartbeat in the caller.
+    # QMT 2.1.19 exposes Run and Stop only on the exact editor toolbar. In the
+    # production 1024x768 editor the toolbar row is centered at y=116 and the
+    # Stop icon is centered at x=508. These controls are anchored after the
+    # fixed model-navigation pane, so resizing the editor does not preserve a
+    # window-width ratio. Bind the 96-DPI point to the exact editor's top-left
+    # corner and prove the resulting state with the in-process heartbeat.
     $XOffset = if ($Action -ceq "run") {
         $StrategyEditorRunXOffset
     }

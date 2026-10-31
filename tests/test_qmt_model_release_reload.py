@@ -1108,8 +1108,8 @@ def test_release_reload_uses_the_verified_strategy_editor_run_stop_control() -> 
     assert "$Editor" in control
     assert "$EditorTitle" in control
     assert "$StrategyEditorRunXOffset = 348" in source
-    assert "$StrategyEditorStopXOffset = 464" in source
-    assert "$StrategyEditorToolbarYOffset = 99" in source
+    assert "$StrategyEditorStopXOffset = 508" in source
+    assert "$StrategyEditorToolbarYOffset = 116" in source
     assert "$StrategyEditorRunXOffset" in control
     assert "$StrategyEditorStopXOffset" in control
     assert "$StrategyEditorToolbarYOffset" in control
@@ -1122,6 +1122,20 @@ def test_release_reload_uses_the_verified_strategy_editor_run_stop_control() -> 
     assert "Invoke-ExactWindowClick" not in control
     assert "\n        0.811 `" not in control
     assert "\n        0.091 `" not in control
+
+
+def test_qmt_editor_stop_point_matches_the_observed_toolbar() -> None:
+    # Production failure at 15:18 on 2026-10-31: the editor toolbar occupied
+    # y=104..126 and the Stop button occupied x=500..566. The previous
+    # (464, 99) point landed outside the control, so the loaded model kept
+    # running and the reloader failed closed.
+    old_stop_offset = (464, 99)
+    stop_offset = (508, 116)
+
+    assert not (500 <= old_stop_offset[0] <= 566)
+    assert not (104 <= old_stop_offset[1] <= 126)
+    assert 500 <= stop_offset[0] <= 566
+    assert 104 <= stop_offset[1] <= 126
 
 
 def test_release_reload_pins_the_qmt_version_for_exact_editor_geometry() -> None:
