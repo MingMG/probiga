@@ -124,6 +124,7 @@ readonly RELEASE_DATA_VALIDATION_BLOCKING=0
 # the prior trusted controller and its protected, unchanged-schema recovery.
 readonly QMT_EDGE_RECOVERY_COMPATIBILITY_INSTALL=0
 readonly DEPENDENCY_DOWNLOAD_TIMEOUT=30m
+readonly FAST_SCHEMA_GUARD_TIMEOUT=20s
 DEPLOY_ARTIFACT_MODE=""
 prepare_qmt_announcement_checkpoint_root() {
   local parent_root=/var/lib/probiga
@@ -9489,6 +9490,59 @@ linux_release_failure() {
   "$BOOTSTRAP_PYTHON" -I "$COMPONENT_CONTROLLER" recover || true
   exit "$failed_status"
 }
+check_fast_release_schema() {
+  local guard_output
+  local guard_status
+  CUTOVER_STEP=fast_release_schema_guard
+  guard_status=0
+  if guard_output="$(
+    cd "$PREPARED_CODE_ROOT" &&
+      /usr/bin/timeout --signal=TERM --kill-after=2s \
+        "$FAST_SCHEMA_GUARD_TIMEOUT" /usr/bin/env -i \
+        PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+        GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
+        "PYTHONPATH=$ADATA_SOURCE:$PREPARED_CODE_ROOT" \
+        "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P \
+        "$PREPARED_CODE_ROOT/tools/check_schema_expected.py" --json
+  )"; then
+    printf '%s' "$guard_output" | "$BOOTSTRAP_PYTHON" -I -c \
+      'import json,sys; p=json.load(sys.stdin); ok=isinstance(p,dict) and p.get("schema")=="probiga.release-schema-guard.v1" and p.get("status")=="READY" and p.get("read_only") is True and p.get("mismatch_count")==0 and type(p.get("check_count")) is int and p["check_count"]>0; raise SystemExit(0 if ok else 2)' \
+      || {
+        printf '%s\n' "$guard_output" >&2
+        log_release_error \
+          "schema guard returned an invalid success contract; retry with --full"
+        return 2
+      }
+    log_release "schema guard passed against the current database"
+    return 0
+  else
+    guard_status=$?
+  fi
+  printf '%s\n' "$guard_output" >&2
+  case "$guard_status" in
+    2)
+      log_release_error \
+        "schema mismatch: code expects tables or columns not present in the database"
+      log_release_error "retry with --full to run the coordinated schema path"
+      return 2
+      ;;
+    3)
+      log_release_warning \
+        "schema guard skipped because the database boundary is unavailable"
+      return 0
+      ;;
+    124|137)
+      log_release_error \
+        "schema guard exceeded $FAST_SCHEMA_GUARD_TIMEOUT; retry with --full"
+      return 2
+      ;;
+    *)
+      log_release_error \
+        "schema guard failed with exit=$guard_status; retry with --full"
+      return "$guard_status"
+      ;;
+  esac
+}
 activate_linux_release() {
   local prepared_dir="$COMPONENT_TOOL_ROOT/$EXPECTED_SHA/prepared"
   local -a ai_arguments=()
@@ -15968,6 +16022,8 @@ prebuild_reclaim_release_space
 CUTOVER_STEP=prepare_release
 prepare_release
 if [ "$RELEASE_EXECUTION_SCOPE" = LINUX ]; then
+  CUTOVER_STEP=fast_release_schema_guard
+  check_fast_release_schema
   CUTOVER_STEP=ensure_inherited_qmt_windows_edge_activation
   ensure_qmt_windows_edge_activation 1
   CUTOVER_STEP=activate_linux_components
