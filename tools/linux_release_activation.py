@@ -285,7 +285,15 @@ class Services:
             if (not original and unit in UNITS) or states[unit]["active"] in {"active", "activating"}:
                 self.run("start", unit)
 
-    def verify(self, manifest, states, *, original=False, deadline_seconds=180):
+    def verify(
+        self,
+        manifest,
+        states,
+        *,
+        original=False,
+        health_retries=5,
+        health_interval=2,
+    ):
         sha = manifest["linux_build_sha"]
         current = self.states()
         scheduler_pid = None
@@ -338,7 +346,9 @@ class Services:
         if original and states[UNITS[0]]["active"] != "active":
             self.verify_static(manifest)
             return
-        attempts = max(1, deadline_seconds // 2)
+        if not 1 <= health_retries <= 60 or not 1 <= health_interval <= 60:
+            raise ActivationError("invalid_health_timing")
+        attempts = health_retries
         for attempt in range(attempts):
             try:
                 health = self.health()
@@ -354,14 +364,25 @@ class Services:
             except (OSError, ValueError, ActivationError):
                 if attempt + 1 >= attempts:
                     raise ActivationError("runtime_health_failed") from None
-                time.sleep(2)
+                time.sleep(health_interval)
         self.verify_static(manifest)
 
 
 class Activation:
-    def __init__(self, fs=None, services=None):
+    def __init__(
+        self,
+        fs=None,
+        services=None,
+        *,
+        health_retries=5,
+        health_interval=2,
+    ):
         self.fs = fs or Filesystem()
         self.services = services or Services()
+        if not 1 <= health_retries <= 60 or not 1 <= health_interval <= 60:
+            raise ActivationError("invalid_health_timing")
+        self.health_retries = health_retries
+        self.health_interval = health_interval
 
     def save(self, value, phase):
         value["phase"] = phase
@@ -429,7 +450,9 @@ class Activation:
         self.services.reload_static()
         self.services.start(value["units"], original=True)
         self.services.verify(self.fs.manifest(value["previous_sha"]), value["units"],
-                             original=True, deadline_seconds=120)
+                             original=True,
+                             health_retries=self.health_retries,
+                             health_interval=self.health_interval)
         for name, item in value["old_files"].items():
             if self.fs.snapshot(name) != item:
                 raise ActivationError("rollback_file_differs")
@@ -456,7 +479,12 @@ class Activation:
         target = self.fs.manifest(target_sha)
         previous = self.fs.manifest(previous_sha)
         if target_sha == previous_sha:
-            self.services.verify(target, self.services.states())
+            self.services.verify(
+                target,
+                self.services.states(),
+                health_retries=self.health_retries,
+                health_interval=self.health_interval,
+            )
             return "ALREADY_ACTIVE"
         if (target["scope"] != "LINUX" or target["parent_linux_build_sha"] != previous_sha
                 or any(target[key] != previous[key] for key in
@@ -503,7 +531,12 @@ class Activation:
             self.services.reload_static()
             self.services.start(units, original=False)
             self.save(value, "VERIFYING")
-            self.services.verify(target, units)
+            self.services.verify(
+                target,
+                units,
+                health_retries=self.health_retries,
+                health_interval=self.health_interval,
+            )
             self.fs.restore(self.receipt(target_sha), new_files[self.receipt(target_sha)])
             self.save(value, "COMMITTED")
         except Exception:
@@ -524,6 +557,8 @@ def main(argv=None):
     parser.add_argument("--scheduler-source")
     parser.add_argument("--resources-source")
     parser.add_argument("--ai-source")
+    parser.add_argument("--health-retries", type=int, default=5)
+    parser.add_argument("--health-interval", type=int, default=2)
     args = parser.parse_args(argv)
     if not sys.platform.startswith("linux") or os.geteuid() != 0:
         parser.exit(2, "linux activation: root Linux execution required\n")
@@ -532,7 +567,10 @@ def main(argv=None):
     for number in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(number, interrupted)
     try:
-        activation = Activation()
+        activation = Activation(
+            health_retries=args.health_retries,
+            health_interval=args.health_interval,
+        )
         if args.operation == "recover":
             status = activation.recover()
         else:

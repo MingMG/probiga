@@ -1122,7 +1122,7 @@ if [ "$BROKER_OPERATION" = deploy ]; then
     fail "trusted release requirements are too large"
   mapfile -t RELEASE_MANIFEST_LINES < "$RELEASE_MANIFEST_FILE" || \
     fail "trusted production release manifest is unreadable"
-  test "${#RELEASE_MANIFEST_LINES[@]}" -eq 10 || \
+  test "${#RELEASE_MANIFEST_LINES[@]}" -eq 14 || \
     fail "trusted production release manifest has unexpected fields"
   test "${RELEASE_MANIFEST_LINES[0]}" = \
     PROBIGA_PRODUCTION_RELEASE_MANIFEST_VERSION=2 || \
@@ -1166,6 +1166,38 @@ if [ "$BROKER_OPERATION" = deploy ]; then
       EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256="${RELEASE_MANIFEST_LINES[9]#ADAPTER_REGISTRY_SEAL_SHA256=}" ;;
     *) fail "trusted adapter registry seal is missing" ;;
   esac
+  case "${RELEASE_MANIFEST_LINES[10]}" in
+    HEARTBEAT_RETRIES=*) \
+      RELEASE_HEARTBEAT_RETRIES="${RELEASE_MANIFEST_LINES[10]#HEARTBEAT_RETRIES=}" ;;
+    *) fail "trusted heartbeat retry count is missing" ;;
+  esac
+  case "${RELEASE_MANIFEST_LINES[11]}" in
+    HEARTBEAT_INTERVAL=*) \
+      RELEASE_HEARTBEAT_INTERVAL="${RELEASE_MANIFEST_LINES[11]#HEARTBEAT_INTERVAL=}" ;;
+    *) fail "trusted heartbeat interval is missing" ;;
+  esac
+  case "${RELEASE_MANIFEST_LINES[12]}" in
+    HEALTH_RETRIES=*) \
+      RELEASE_HEALTH_RETRIES="${RELEASE_MANIFEST_LINES[12]#HEALTH_RETRIES=}" ;;
+    *) fail "trusted health retry count is missing" ;;
+  esac
+  case "${RELEASE_MANIFEST_LINES[13]}" in
+    HEALTH_INTERVAL=*) \
+      RELEASE_HEALTH_INTERVAL="${RELEASE_MANIFEST_LINES[13]#HEALTH_INTERVAL=}" ;;
+    *) fail "trusted health interval is missing" ;;
+  esac
+  [[ "$RELEASE_HEARTBEAT_RETRIES" =~ ^[1-9][0-9]?$ ]] && \
+    [ "$RELEASE_HEARTBEAT_RETRIES" -le 60 ] || \
+    fail "trusted heartbeat retry count is invalid"
+  [[ "$RELEASE_HEARTBEAT_INTERVAL" =~ ^[1-9][0-9]?$ ]] && \
+    [ "$RELEASE_HEARTBEAT_INTERVAL" -le 60 ] || \
+    fail "trusted heartbeat interval is invalid"
+  [[ "$RELEASE_HEALTH_RETRIES" =~ ^[1-9][0-9]?$ ]] && \
+    [ "$RELEASE_HEALTH_RETRIES" -le 60 ] || \
+    fail "trusted health retry count is invalid"
+  [[ "$RELEASE_HEALTH_INTERVAL" =~ ^[1-9][0-9]?$ ]] && \
+    [ "$RELEASE_HEALTH_INTERVAL" -le 60 ] || \
+    fail "trusted health interval is invalid"
   [[ "$EXPECTED_ADATA_SHA" =~ ^[0-9a-f]{40}$ ]] || \
     fail "trusted production release adata identity is invalid"
   [[ "$EXPECTED_ADATA_TREE_SHA256" =~ ^[0-9a-f]{64}$ ]] || \
@@ -1236,6 +1268,10 @@ if [ "$BROKER_OPERATION" = deploy ]; then
     EXPECTED_ADATA_TREE_SHA256="$EXPECTED_ADATA_TREE_SHA256" \
     EXPECTED_RELEASE_TREE_SHA256="$EXPECTED_RELEASE_TREE_SHA256" \
     EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256="$EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256" \
+    HEARTBEAT_RETRIES="$RELEASE_HEARTBEAT_RETRIES" \
+    HEARTBEAT_INTERVAL="$RELEASE_HEARTBEAT_INTERVAL" \
+    HEALTH_RETRIES="$RELEASE_HEALTH_RETRIES" \
+    HEALTH_INTERVAL="$RELEASE_HEALTH_INTERVAL" \
     /usr/bin/bash --noprofile --norc "$BOOTSTRAP_FILE" \
       "${ENGINE_RELEASE_ARGS[@]}"
 else

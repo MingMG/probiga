@@ -365,7 +365,18 @@ def test_broker_binds_release_tree_registry_seal_and_snapshot_identity() -> None
         encoding="utf-8"
     )
     normalized = _normalized_shell(broker)
-    assert 'test "${#RELEASE_MANIFEST_LINES[@]}" -eq 10' in broker
+    assert 'test "${#RELEASE_MANIFEST_LINES[@]}" -eq 14' in broker
+    release = (ROOT / "deploy" / "production_release.env").read_text(
+        encoding="utf-8"
+    )
+    for name in (
+        "HEARTBEAT_RETRIES",
+        "HEARTBEAT_INTERVAL",
+        "HEALTH_RETRIES",
+        "HEALTH_INTERVAL",
+    ):
+        assert f"{name}=" in release
+        assert f"{name}=\"$RELEASE_{name}\"" in broker
     assert "ADAPTER_REGISTRY_SEAL_SHA256=*" in broker
     assert "${EXPECTED_SHA}^{tree}" in broker
     assert '{"kind":"git-tree","tree":"%s"}' in broker
@@ -376,9 +387,6 @@ def test_broker_binds_release_tree_registry_seal_and_snapshot_identity() -> None
     )
     assert "ACTIVATION_RELEASE_IDENTITY_SHA" in broker
     assert "activation release identity digest differs" in broker
-    release = (ROOT / "deploy" / "production_release.env").read_text(
-        encoding="utf-8"
-    )
     declared = next(
         line.split("=", 1)[1]
         for line in release.splitlines()

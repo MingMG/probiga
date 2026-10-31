@@ -125,6 +125,10 @@ readonly RELEASE_DATA_VALIDATION_BLOCKING=0
 readonly QMT_EDGE_RECOVERY_COMPATIBILITY_INSTALL=0
 readonly DEPENDENCY_DOWNLOAD_TIMEOUT=30m
 readonly FAST_SCHEMA_GUARD_TIMEOUT=20s
+HEARTBEAT_RETRIES="${HEARTBEAT_RETRIES:-10}"
+HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-2}"
+HEALTH_RETRIES="${HEALTH_RETRIES:-5}"
+HEALTH_INTERVAL="${HEALTH_INTERVAL:-2}"
 DEPLOY_ARTIFACT_MODE=""
 prepare_qmt_announcement_checkpoint_root() {
   local parent_root=/var/lib/probiga
@@ -1252,6 +1256,20 @@ log_release_warning() {
 log_release_error() {
   printf '%s ERROR: %s\n' "$RELEASE_LOG_PREFIX" "$*" >&2
 }
+for timing_name in HEARTBEAT_RETRIES HEARTBEAT_INTERVAL \
+  HEALTH_RETRIES HEALTH_INTERVAL; do
+  timing_value="${!timing_name}"
+  [[ "$timing_value" =~ ^[1-9][0-9]?$ ]] || {
+    printf '%s ERROR: invalid release timing %s\n' \
+      "$RELEASE_LOG_PREFIX" "$timing_name" >&2
+    exit 2
+  }
+  test "$timing_value" -le 60 || {
+    printf '%s ERROR: release timing %s exceeds 60\n' \
+      "$RELEASE_LOG_PREFIX" "$timing_name" >&2
+    exit 2
+  }
+done
 preflight_linux_execution_permissions || exit 2
 cd "$REPOSITORY_ROOT"
 test ! -L "$DEPLOY_LOCK_ROOT"
@@ -9436,7 +9454,9 @@ PY
     # A transaction is interpreted by its own reviewed, sealed controller,
     # even when the next requested main revision changes deployment internals.
     materialize_component_deploy_tools "$owner_sha"
-    "$BOOTSTRAP_PYTHON" -I "$COMPONENT_CONTROLLER" recover
+    "$BOOTSTRAP_PYTHON" -I "$COMPONENT_CONTROLLER" recover \
+      --health-retries "$HEALTH_RETRIES" \
+      --health-interval "$HEALTH_INTERVAL"
   fi
   materialize_component_deploy_tools "$EXPECTED_SHA"
 }
@@ -9605,7 +9625,9 @@ linux_release_failure() {
     "If this is a schema-related error, retry with: $EXPECTED_SHA --full"
   # Only the Linux controller can restore its transaction; the coordinated
   # rollback function creates QMT/SQL recovery effects and is never used here.
-  "$BOOTSTRAP_PYTHON" -I "$COMPONENT_CONTROLLER" recover || true
+  "$BOOTSTRAP_PYTHON" -I "$COMPONENT_CONTROLLER" recover \
+    --health-retries "$HEALTH_RETRIES" \
+    --health-interval "$HEALTH_INTERVAL" || true
   exit "$failed_status"
 }
 check_fast_release_schema() {
@@ -9674,6 +9696,8 @@ activate_linux_release() {
   fi
   "$BOOTSTRAP_PYTHON" -I "$COMPONENT_CONTROLLER" activate \
     --target-sha "$EXPECTED_SHA" --previous-sha "$PREVIOUS_SHA" \
+    --health-retries "$HEALTH_RETRIES" \
+    --health-interval "$HEALTH_INTERVAL" \
     --main-source "$prepared_dir/main.conf" \
     --scheduler-source "$prepared_dir/scheduler.service" \
     --resources-source "$prepared_dir/resources.conf" "${ai_arguments[@]}"
@@ -16847,7 +16871,7 @@ test "${SCHEDULER_CMDLINE[2]}" = \
   "$PREPARED_CODE_ROOT/tools/run_scheduler_daemon.py"
 CUTOVER_STEP=wait_for_first_scheduler_heartbeat
 SCHEDULER_HEARTBEAT_READY=0
-for _heartbeat_attempt in $(seq 1 30); do
+for _heartbeat_attempt in $(seq 1 "$HEARTBEAT_RETRIES"); do
   if run_prepared_python_tool \
       "$PREPARED_CODE_ROOT/tools/check_scheduler_runtime_heartbeat.py" \
       --expected-build-sha "$EXPECTED_SHA" \
@@ -16855,16 +16879,16 @@ for _heartbeat_attempt in $(seq 1 30); do
     SCHEDULER_HEARTBEAT_READY=1
     break
   fi
-  if [ "$_heartbeat_attempt" -lt 30 ]; then
-    sleep 2
+  if [ "$_heartbeat_attempt" -lt "$HEARTBEAT_RETRIES" ]; then
+    sleep "$HEARTBEAT_INTERVAL"
   fi
 done
 test "$SCHEDULER_HEARTBEAT_READY" -eq 1
 CUTOVER_STEP=record_strategy_governance_scheduler_heartbeat
 CUTOVER_STEP=verify_health
 HEALTH_RESPONSE="$(mktemp)"
-if ! curl --fail-with-body --silent --show-error --retry 15 \
-  --retry-all-errors --retry-delay 2 --retry-connrefused \
+if ! curl --fail-with-body --silent --show-error --retry "$HEALTH_RETRIES" \
+  --retry-all-errors --retry-delay "$HEALTH_INTERVAL" --retry-connrefused \
   --output "$HEALTH_RESPONSE" http://127.0.0.1/api/health; then
   cat "$HEALTH_RESPONSE" >&2
   rm -f "$HEALTH_RESPONSE"
@@ -16937,8 +16961,8 @@ CUTOVER_STEP=verify_post_prune_release_identity
 release_identity_check 1 "$PREPARED_CODE_ROOT"
 CUTOVER_STEP=verify_post_prune_health
 HEALTH_RESPONSE="$(mktemp)"
-if ! curl --fail-with-body --silent --show-error --retry 15 \
-  --retry-all-errors --retry-delay 2 --retry-connrefused \
+if ! curl --fail-with-body --silent --show-error --retry "$HEALTH_RETRIES" \
+  --retry-all-errors --retry-delay "$HEALTH_INTERVAL" --retry-connrefused \
   --output "$HEALTH_RESPONSE" http://127.0.0.1/api/health; then
   cat "$HEALTH_RESPONSE" >&2
   rm -f "$HEALTH_RESPONSE"
@@ -16948,8 +16972,8 @@ fi
 cat "$HEALTH_RESPONSE"
 rm -f "$HEALTH_RESPONSE"
 HEALTH_RESPONSE=""
-curl --fail-with-body --silent --show-error --retry 15 \
-  --retry-all-errors --retry-delay 2 --retry-connrefused \
+curl --fail-with-body --silent --show-error --retry "$HEALTH_RETRIES" \
+  --retry-all-errors --retry-delay "$HEALTH_INTERVAL" --retry-connrefused \
   http://127.0.0.1/api/health/runtime >/dev/null
 if [ "$RELEASE_DATA_VALIDATION_BLOCKING" -eq 1 ]; then
   CUTOVER_STEP=verify_strategy_governance_api_and_page_smoke

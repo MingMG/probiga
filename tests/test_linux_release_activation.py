@@ -68,6 +68,7 @@ class FakeServices:
         self.units[activation.AI_UNITS[0]] = {"active": "inactive", "enabled": "static"}
         self.units[activation.AI_UNITS[1]] = {"active": "active", "enabled": "enabled"}
         self.calls = []
+        self.health_timing = []
         self.failure = None
         self.crash = None
 
@@ -98,8 +99,17 @@ class FakeServices:
             for unit in activation.UNITS:
                 self.units[unit]["active"] = "active"
 
-    def verify(self, manifest, states, *, original=False, deadline_seconds=180):
+    def verify(
+        self,
+        manifest,
+        states,
+        *,
+        original=False,
+        health_retries=5,
+        health_interval=2,
+    ):
         self.action("verify_old" if original else "verify_new")
+        self.health_timing.append((health_retries, health_interval))
         self.calls.append("verified:" + manifest["linux_build_sha"])
 
 
@@ -269,6 +279,21 @@ def test_linux_dispatch_exits_before_coordinated_mutations():
     assert 'PROBIGA_PREVIOUS_GIT_SHA="$PREVIOUS_CONTRACT_SHA"' in script
     main_path = script[script.index("# PREPARE: all network"):]
     assert "--request-recoverable-quiescence" not in main_path
+
+
+def test_linux_activation_uses_configured_bounded_health_timing(fixture):
+    fs, services, sources = fixture
+    result = activation.Activation(
+        fs,
+        services,
+        health_retries=3,
+        health_interval=1,
+    ).activate(NEW, OLD, sources)
+
+    assert result == "DEPLOYED"
+    assert (3, 1) in services.health_timing
+    with pytest.raises(activation.ActivationError, match="invalid_health_timing"):
+        activation.Activation(fs, services, health_retries=0)
 
 
 class ObservedServices(activation.Services):
