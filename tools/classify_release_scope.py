@@ -34,7 +34,7 @@ from dataclasses import dataclass
 
 
 SCHEMA = "probiga.release-scope.v4"
-_CONTRACT_POLICY_VERSION = 1
+_CONTRACT_POLICY_VERSION = 2
 _SHA = re.compile(r"[0-9a-fA-F]{40}\Z")
 _REGULAR_MODES = frozenset({"100644", "100755"})
 
@@ -228,10 +228,17 @@ _CONTRACT_PYTHON_FILES = (
     "tools/run_qmt_windows_edge_release_bootstrap.py",
 )
 
-# PowerShell controllers stay whole-file.  There is no standard-library parser
-# with stable output for PowerShell, so a binding-level rule cannot be applied
-# here without inventing one; hashing the bytes is the honest boundary.
+# Whole-file contract entries are files whose bytes, not whose bindings, are
+# what the other endpoint agrees on.  PowerShell controllers belong here because
+# there is no standard-library parser with stable output, so a binding-level
+# rule cannot be applied without inventing one.  The QMT strategy source belongs
+# here because the Linux API compares it byte for byte: qmt_strategy_bridge_proof
+# hashes the source from the server's own checkout and requires the Windows
+# bridge to report that exact SHA-256 and Git blob.  A release that changed this
+# file without moving Windows would therefore leave the two endpoints unable to
+# agree, so it must classify as COORDINATED instead of a Linux-only delta.
 _CONTRACT_WHOLE_FILE_FILES = (
+    "integrations/bigqmt/qmt_strategy/probiga_big_qmt_bridge.py",
     "tools/reload_big_qmt_strategy.ps1",
     "tools/resume_qmt_prior_edge.ps1",
     "tools/start_local_live_services.ps1",
@@ -268,7 +275,8 @@ def _contract_policy() -> dict[str, object]:
     # retyping a policy path is itself a visible contract transition.
     if (set(_CONTRACT_PYTHON_FILES) & set(_CONTRACT_WHOLE_FILE_FILES)
             or any(not path.endswith(".py") for path in _CONTRACT_PYTHON_FILES)
-            or any(not path.endswith(".ps1") for path in _CONTRACT_WHOLE_FILE_FILES)):
+            or any(not path.endswith((".py", ".ps1"))
+                   for path in _CONTRACT_WHOLE_FILE_FILES)):
         raise ScopeError("contract_policy_invalid")
     return {
         "version": _CONTRACT_POLICY_VERSION,

@@ -72,7 +72,6 @@ def repo(tmp_path):
     "tools/classify_release_scope.py",
     "requirements.txt",
     ".env.example",
-    "integrations/bigqmt/qmt_strategy/probiga_big_qmt_bridge.py",
 ])
 def test_application_and_deployment_changes_are_linux(repo, path):
     repo.write(path, "changed\n")
@@ -81,6 +80,20 @@ def test_application_and_deployment_changes_are_linux(repo, path):
     assert result["scope"] == "LINUX"
     assert result["reason_codes"] == ["code_only_delta"]
     assert result["base_contract_sha256"] == result["contract_sha256"]
+
+
+def test_qmt_strategy_source_change_is_coordinated(repo):
+    # The Linux API hashes this source from its own checkout and requires the
+    # Windows bridge to report the same SHA-256 and Git blob, so a Linux-only
+    # release of a change here can never converge both endpoints.
+    path = "integrations/bigqmt/qmt_strategy/probiga_big_qmt_bridge.py"
+    repo.write(path, "BRIDGE = 1\n")
+    base = repo.commit()
+    repo.write(path, "BRIDGE = 1\n\n\ndef read():\n    return 2\n")
+    result = repo.classify(repo.commit(), base=base)
+    assert result["scope"] == "COORDINATED"
+    assert result["reason_codes"] == ["schema_contract_changed"]
+    assert result["base_contract_sha256"] != result["contract_sha256"]
 
 
 def test_deleting_account_auth_code_is_linux(repo):
