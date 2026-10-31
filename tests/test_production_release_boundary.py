@@ -2013,7 +2013,9 @@ def test_prebuild_space_reclamation_is_guarded_and_precedes_build() -> None:
         _shell_function_bodies(deploy_script)["prebuild_reclaim_release_space"]
     )
 
-    assert "PREBUILD_MIN_AVAILABLE_BYTES=0" in deploy_script
+    assert "PREBUILD_MIN_AVAILABLE_BYTES=524288000" in deploy_script
+    assert "PREBUILD_WARN_AVAILABLE_BYTES=2147483648" in deploy_script
+    assert "disk full on $space_path; free space and retry" in deploy_script
     assert 'CUTOVER_STEP=prebuild_release_space' in normalized
     reclaim = normalized.index("prebuild_reclaim_release_space\n")
     prepare = normalized.index("CUTOVER_STEP=prepare_release", reclaim)
@@ -2114,6 +2116,7 @@ DATABASE_WRITER_GUARD_FILE="$TEST_ROOT/guard"
 DATABASE_WRITER_RESTORE_FILE="$TEST_ROOT/restore"
 ACTIVATION_UNIT_SNAPSHOT_DIR="$TEST_ROOT/activation"
 PREBUILD_MIN_AVAILABLE_BYTES=0
+PREBUILD_WARN_AVAILABLE_BYTES=0
 BUILD_USER=probiga-build
 PREVIOUS_RELEASE_REVISION=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 EXPECTED_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
@@ -2131,7 +2134,10 @@ sudo() {{
   "$@"
 }}
 test() {{
-  if [ "${{1:-}}" = -d ] && [ "${{2:-}}" = /var/tmp ]; then return 0; fi
+  if [ "${{1:-}}" = -d ] && \
+    {{ [ "${{2:-}}" = /var/tmp ] || [ "${{2:-}}" = /opt ]; }}; then
+    return 0
+  fi
   builtin test "$@"
 }}
 df() {{ printf 'Filesystem 1-blocks Used Available Capacity Mounted on\nmock 1 0 3000000000 0%% /\n'; }}

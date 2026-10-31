@@ -10218,7 +10218,8 @@ quarantine_unsafe_untracked_release_files() {
 }
 RELEASE_VENV_RETENTION=2
 CODE_RELEASE_RETENTION=2
-PREBUILD_MIN_AVAILABLE_BYTES=0
+PREBUILD_MIN_AVAILABLE_BYTES=524288000
+PREBUILD_WARN_AVAILABLE_BYTES=2147483648
 
 path_is_runtime_referenced() {
   local candidate="$1"
@@ -10493,6 +10494,7 @@ prebuild_reclaim_release_space() {
   for space_path in \
     /tmp \
     /var/tmp \
+    /opt \
     "$RELEASE_VENV_ROOT" \
     "$RELEASE_ARTIFACT_ROOT" \
     "$CODE_RELEASE_ROOT"; do
@@ -10501,10 +10503,12 @@ prebuild_reclaim_release_space() {
       awk 'NR == 2 {print $4}')" || return 2
     [[ "$available_bytes" =~ ^[0-9]+$ ]] || return 2
     if [ "$available_bytes" -lt "$PREBUILD_MIN_AVAILABLE_BYTES" ]; then
-      echo "insufficient prebuild disk space: path=$space_path available=$available_bytes required=$PREBUILD_MIN_AVAILABLE_BYTES" >&2
+      echo "disk full on $space_path; free space and retry (available=$available_bytes required=$PREBUILD_MIN_AVAILABLE_BYTES)" >&2
       return 2
+    elif [ "$available_bytes" -lt "$PREBUILD_WARN_AVAILABLE_BYTES" ]; then
+      echo "WARNING: low prebuild disk space: path=$space_path available=$available_bytes warning=$PREBUILD_WARN_AVAILABLE_BYTES" >&2
     fi
-    echo "Prebuild disk space verified: path=$space_path available=$available_bytes required=$PREBUILD_MIN_AVAILABLE_BYTES" >&2
+    echo "Prebuild disk space verified: path=$space_path available=$available_bytes required=$PREBUILD_MIN_AVAILABLE_BYTES warning=$PREBUILD_WARN_AVAILABLE_BYTES" >&2
   done
   build_temp_probe="$(sudo -u "$BUILD_USER" \
     mktemp -d /tmp/.probiga-prebuild.XXXXXX)" || return 2
