@@ -815,7 +815,7 @@ def test_stock_trade_date_column_is_independently_replayed(monkeypatch):
     try:
         with target.begin() as connection:
             connection.execute(text("UPDATE sm_stock_minute SET trade_date='2026-09-10'"))
-        with pytest.raises(ValueError, match="persisted identity"):
+        with pytest.raises(ValueError, match="persisted business values differ"):
             c.replay_result(result, primary, started_at=datetime(2026, 9, 11, 9, 32), now=datetime(2026, 9, 11, 9, 33))
     finally:
         primary.dispose()

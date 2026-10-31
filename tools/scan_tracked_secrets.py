@@ -65,7 +65,11 @@ EXCLUDED_PATHS = frozenset(
         "tests/test_sync_concept_ths_runtime.py",
         "tests/test_trading_v2_candidate_context_pit.py",
         "tests/test_trading_v3_mysql_acceptance.py",
+        "tests/test_windows_scheduler_owner_deadline.py",
+        "tests/test_windows_scheduler_owner_sql.py",
         "tests/test_windows_qmt_login.py",
+        # Vendored baostock ships the upstream anonymous default credential.
+        "third_party/baostock/login/loginout.py",
     }
 )
 

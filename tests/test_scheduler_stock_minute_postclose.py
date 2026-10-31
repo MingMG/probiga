@@ -88,7 +88,7 @@ def test_prior_session_success_does_not_consume_today_postclose_run(calendar_eng
     )
     args = runtime._build_task_args(row, row["script_path"], "2026-09-21")
     assert "--latest-session" not in args
-    assert args[-4:] == ["--start-date", "2026-09-21", "--end-date", "2026-09-21"]
+    assert args[-4:] == ["--start", "2026-09-21", "--end", "2026-09-21"]
     # The source publisher's verified success still consumes this exact day.
     row.update(last_triggered_at=now, last_run_at=now,
                last_run_output=json.dumps({"trade_date": "2026-09-21"}))

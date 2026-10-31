@@ -15,6 +15,7 @@ def test_concept_scheduler_args_bind_the_authoritative_closed_session():
         "script_args": "--dataset current --json",
         "date_param": "",
         "_trigger_source": "scheduled",
+        "_scheduler_target_trade_date": "2026-10-26",
     }
     assert build_scheduler_task_args(
         row,

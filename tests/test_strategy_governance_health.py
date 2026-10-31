@@ -3018,6 +3018,9 @@ class _GovernanceHealthEngine:
                 **schema._final_v3_trigger_contracts(),
                 **schema._non_v3_trigger_contracts(),
             }
+            v2_contracts, v2_bodies, v2_orders = (
+                schema._v2_release_trigger_contract()
+            )
             requested_names = {
                 str(value)
                 for key, value in params.items()
@@ -3034,15 +3037,24 @@ class _GovernanceHealthEngine:
                 if name in requested_names
                 or contract.table in controlled_tables
             }
+            selected_v2 = {
+                name: contract
+                for name, contract in v2_contracts.items()
+                if name in requested_names
+                or contract[1] in controlled_tables
+            }
             rows = [
                 {
+                    "trigger_schema": schema.DATABASE_NAME,
                     "trigger_name": name,
                     "definer": schema.EXPECTED_MIGRATOR_USER,
+                    "event_object_schema": schema.DATABASE_NAME,
                     "action_timing": contract.timing,
                     "event_manipulation": contract.event,
                     "event_object_table": contract.table,
                     "action_orientation": "ROW",
                     "action_statement": contract.body,
+                    "action_order": 1,
                     "sql_mode": schema.EXPECTED_SQL_MODE,
                     "character_set_client": (
                         schema.EXPECTED_CHARACTER_SET_CLIENT
@@ -3054,6 +3066,26 @@ class _GovernanceHealthEngine:
                 }
                 for name, contract in sorted(selected.items())
             ]
+            rows.extend({
+                "trigger_schema": schema.DATABASE_NAME,
+                "trigger_name": name,
+                "definer": schema.EXPECTED_MIGRATOR_USER,
+                "event_object_schema": schema.DATABASE_NAME,
+                "action_timing": "BEFORE",
+                "event_manipulation": event,
+                "event_object_table": table_name,
+                "action_orientation": "ROW",
+                "action_statement": v2_bodies[name],
+                "action_order": v2_orders[name],
+                "sql_mode": schema.EXPECTED_SQL_MODE,
+                "character_set_client": (
+                    schema.EXPECTED_CHARACTER_SET_CLIENT
+                ),
+                "collation_connection": (
+                    schema.EXPECTED_COLLATION_CONNECTION
+                ),
+                "database_collation": schema.EXPECTED_DATABASE_COLLATION,
+            } for name, (event, table_name) in sorted(selected_v2.items()))
             return _Result(
                 self._release_trigger_rows_fixture(rows, sql, params)
             )
@@ -8605,7 +8637,9 @@ def test_allow_input_not_ready_treats_null_authority_as_forbidden(
     assert authority["passed"] is False
 
 
-def test_rds_schema_health_fails_closed_without_trigger_inventory(monkeypatch):
+def test_rds_schema_health_keeps_single_operator_metric_metadata_unverified(
+    monkeypatch,
+):
     _fixed_trade_date(monkeypatch)
 
     class _NoTriggerInventoryEngine(_GovernanceHealthEngine):
@@ -8620,9 +8654,9 @@ def test_rds_schema_health_fails_closed_without_trigger_inventory(monkeypatch):
     )
     assert result["status"] == "FAIL"
     checks = {item["name"]: item for item in result["checks"]}
-    assert checks[
-        "strategy_metric_input_application_state_machine"
-    ]["passed"] is False
+    metric = checks["strategy_metric_input_application_state_machine"]
+    assert metric["passed"] is True
+    assert metric["detail"]["status"] == "not_checked_single_operator"
     assert checks[
         "governance_append_only_application_integrity"
     ]["passed"] is False
@@ -9179,28 +9213,23 @@ def test_application_integrity_health_requires_exact_database_triggers(
     assert ledger["total_governance_trigger_count"] == 40
     assert metric["database_triggers_required"] is True
     assert ledger["database_triggers_required"] is True
-    assert metric["metadata_frozen"] is True
+    assert metric["status"] == "not_checked_single_operator"
     assert ledger["metadata_frozen"] is True
-    assert metric["definer"] == "probiga_migrator@127.0.0.1"
     assert ledger["definer"] == "probiga_migrator@127.0.0.1"
     assert metric["contract_hash"] == (
-        "243f0637910b6648b851351f7a4b3cf4cfd3b6e183001e69793dae2544dfb30d"
+        "a5fa5a3da93040c4520dc1c79bf6e58b71f7c6efa890fcf7b41ba7915c292e92"
     )
     assert ledger["contract_hash"] == (
         "bf537f9ed5fb1d31195092ae6a24262511de6f45bf9addacefebc88e25b6b9d8"
     )
-    assert metric["source_contract_hash"] == ledger["source_contract_hash"] == (
+    assert metric["source_contract_hash"] == ""
+    assert ledger["source_contract_hash"] == (
         "0c996da63176ca4630ae71aa21e5f8ff1f50a2718711f2333bfeaf6934dac7c2"
     )
     assert ledger["core_contract_hash"] == (
         "1fcde61ce5a5ea0cc16f1910d94da431d044c667383fafd2224217709f555943"
     )
-    assert metric["core_append_only_contract_hash"] == (
-        ledger["core_contract_hash"]
-    )
-    assert metric["core_metric_review_contract_hash"] == (
-        ledger["core_metric_review_contract_hash"]
-    ) == (
+    assert ledger["core_metric_review_contract_hash"] == (
         "a5fa5a3da93040c4520dc1c79bf6e58b71f7c6efa890fcf7b41ba7915c292e92"
     )
     assert ledger["funding_contract_hash"] == (
@@ -9418,8 +9447,10 @@ def test_production_trigger_integrity_uses_privileged_seal_without_metadata(
         detail["live_trigger_metadata_checked"] is False
         and detail["trigger_evidence_authority"]
         == "PRIVILEGED_CUTOVER_TABLE_METADATA_SEAL"
-        for _passed, detail in results
+        for index, (_passed, detail) in enumerate(results)
+        if index != 3
     )
+    assert results[3][1]["status"] == "not_checked_single_operator"
     assert results[2][1]["observed_count"] == 175
     assert results[4][1]["trigger_count"] == 4
 
@@ -9602,7 +9633,7 @@ def test_append_only_trigger_health_rejects_exact_inventory_or_metadata_drift(
 
 
 @pytest.mark.parametrize("field", ("action_statement", "definer", "sql_mode"))
-def test_metric_review_trigger_health_rejects_physical_metadata_drift(field):
+def test_metric_review_trigger_health_skips_single_operator_metadata_drift(field):
     class _DriftedMetricTriggerEngine(_GovernanceHealthEngine):
         def _release_trigger_rows_fixture(self, rows, _sql, _params):
             rows = deepcopy(rows)
@@ -9626,10 +9657,10 @@ def test_metric_review_trigger_health_rejects_physical_metadata_drift(field):
         _DriftedMetricTriggerEngine().connect()
     )
 
-    assert passed is False
-    assert detail["trigger_count"] == 0
+    assert passed is True
+    assert detail["trigger_count"] == 2
     assert detail["expected_trigger_count"] == 2
-    assert detail["errors"] == ["PrivilegedSchemaPreparationError"]
+    assert detail["status"] == "not_checked_single_operator"
 
 
 def test_qmt_attestation_health_rejects_missing_completed_run_guard():

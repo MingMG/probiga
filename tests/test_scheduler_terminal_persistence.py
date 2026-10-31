@@ -28,7 +28,8 @@ def case(tmp_path, monkeypatch):
         monkeypatch.setattr(runtime, name, {})
     monkeypatch.setattr(runtime, "_terminal_worker_exited", set())
     monkeypatch.setattr(runtime, "_last_terminal_retry", 0.0)
-    engine = create_engine("sqlite+pysqlite:///:memory:")
+    database = tmp_path / "scheduler-terminal.sqlite3"
+    engine = create_engine(f"sqlite+pysqlite:///{database}")
     event.listen(engine, "connect", lambda db, _: db.create_function("NOW", 0, lambda: now.isoformat(" ")))
     daily.privileged_migrate_daily_delivery_schema(engine)
     with engine.begin() as conn:

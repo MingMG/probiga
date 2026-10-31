@@ -451,7 +451,9 @@ def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: s
         args.remove("--latest-session")
         args.extend(["--trade-date", today])
         return args
-    if release_catchup and task_type in RELEASE_EXPLICIT_TRADE_DATE_TARGET_TASK_TYPES:
+    if (
+        release_catchup or scheduler_target_bound
+    ) and task_type in RELEASE_EXPLICIT_TRADE_DATE_TARGET_TASK_TYPES:
         if not _is_iso_date_arg(today):
             raise ValueError("provider target date is invalid")
         explicit_dates = _option_values(args, "--trade-date")

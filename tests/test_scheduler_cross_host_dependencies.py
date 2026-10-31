@@ -220,6 +220,11 @@ def test_blocked_peer_dependency_does_not_abort_owned_gap_dispatch(windows_depen
         monkeypatch.setattr(scheduler, name, MagicMock())
     monkeypatch.setattr(scheduler, "_release_catchup_disabled_for_deferred_database", lambda: True)
     monkeypatch.setattr(scheduler, "_qmt_windows_loop_activation_ready", lambda *a, **kw: (True, "ready"))
+    monkeypatch.setattr(
+        scheduler,
+        "_windows_scheduler_lease",
+        SimpleNamespace(authorized=lambda: True),
+    )
     monkeypatch.setattr(scheduler, "_qmt_windows_dispatch_preflight", lambda *a, **kw: (True, "ready"))
     monkeypatch.setattr(scheduler, "_standalone_heartbeat_allows_dispatch", lambda *a: (True, {}))
     monkeypatch.setattr(scheduler, "_wait_for_scheduler_poll", lambda *a: True)

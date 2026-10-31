@@ -285,7 +285,7 @@ def test_preliminary_receipt_binds_order_scores_and_input_roots() -> None:
 
     assert validate_preliminary_upper_subject_receipt(receipt) == receipt
     assert receipt["ordered_stock_codes"] == _codes()
-    assert receipt["input_proof"]["turnover_full_market_count"] == 5205
+    assert int(receipt["input_proof"]["turnover_full_market_count"]) == 5205
     tampered = json.loads(json.dumps(receipt))
     tampered["ranked_candidates"][0]["ranking_score"] = "99"
     with pytest.raises(ValueError, match="hash/content differs"):
