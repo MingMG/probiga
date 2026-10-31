@@ -16293,10 +16293,11 @@ fi
 CUTOVER_STEP=verify_cross_host_writer_quiescence_before_api_stop
 WRITER_QUIESCENCE_OUTPUT="$(run_prepared_python_tool \
   "$PREPARED_CODE_ROOT/tools/trading_v3_layer4_maintenance.py" \
-  wait-writers --timeout-seconds 600 --poll-seconds 5)"
+  wait-writers --timeout-seconds 30 --poll-seconds 5 \
+    --fast-exit-if-zero)"
 printf '%s\n' "$WRITER_QUIESCENCE_OUTPUT"
 printf '%s' "$WRITER_QUIESCENCE_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
-  'import json,sys; p=json.load(sys.stdin); ok=isinstance(p,dict) and p.get("status")=="ok" and p.get("ready") is True and p.get("live_writer_count")==0 and p.get("live_writers")==[]; raise SystemExit(0 if ok else 2)'
+  'import json,sys; p=json.load(sys.stdin); ok=isinstance(p,dict) and p.get("status")=="ok" and p.get("ready") is True and p.get("live_writer_count")==0 and p.get("live_writers")==[] and p.get("zero_confirmations")==2; raise SystemExit(0 if ok else 2)'
 CUTOVER_STEP=migrate_probiga_job_log_legacy_modes_after_writer_quiescence
 migrate_legacy_flow_progress apply
 migrate_probiga_job_log_legacy_modes

@@ -330,15 +330,23 @@ def wait_for_writer_quiescence(
     *,
     timeout_seconds: float,
     poll_seconds: float,
+    fast_exit_if_zero: bool = False,
 ) -> dict[str, Any]:
     if not 0 <= timeout_seconds <= 600:
         raise ValueError("timeout_seconds must be between 0 and 600")
     if not 0.1 <= poll_seconds <= 60:
         raise ValueError("poll_seconds must be between 0.1 and 60")
+    if type(fast_exit_if_zero) is not bool:
+        raise ValueError("fast_exit_if_zero must be bool")
+    if fast_exit_if_zero and timeout_seconds < 2:
+        raise ValueError(
+            "fast_exit_if_zero requires timeout_seconds of at least 2"
+        )
     deadline = time.monotonic() + timeout_seconds
     expected_identity: dict[str, Any] | None = None
     blocked_reason: str | None = None
     connection_error: DBAPIError | None = None
+    first_zero_at: float | None = None
     while True:
         if blocked_reason is not None and time.monotonic() >= deadline:
             raise MaintenanceBlocked(blocked_reason) from connection_error
@@ -363,9 +371,30 @@ def wait_for_writer_quiescence(
             engine.dispose()
             connection_error = exc
             blocked_reason = "LAYER4_WRITER_QUIESCENCE_DATABASE_UNAVAILABLE"
+            first_zero_at = None
         else:
             connection_error = None
             if not live:
+                if fast_exit_if_zero:
+                    now = time.monotonic()
+                    if first_zero_at is None:
+                        first_zero_at = now
+                        if now + 2 > deadline:
+                            raise MaintenanceBlocked(
+                                "LAYER4_WRITER_QUIESCENCE_TIMEOUT"
+                            )
+                        time.sleep(2)
+                        continue
+                    if now - first_zero_at >= 2:
+                        return {
+                            "status": "ok",
+                            "ready": True,
+                            "live_writer_count": 0,
+                            "live_writers": [],
+                            "zero_confirmations": 2,
+                        }
+                    time.sleep(2 - (now - first_zero_at))
+                    continue
                 if timeout_seconds > 0 and time.monotonic() > deadline:
                     raise MaintenanceBlocked("LAYER4_WRITER_QUIESCENCE_TIMEOUT")
                 return {
@@ -374,6 +403,7 @@ def wait_for_writer_quiescence(
                     "live_writer_count": 0,
                     "live_writers": [],
                 }
+            first_zero_at = None
             blocked_reason = (
                 "LAYER4_FRESH_SCHEDULER_WRITERS_REMAIN:"
                 + ",".join(str(row.get("instance_id") or "") for row in live)
@@ -566,6 +596,7 @@ def _parser() -> argparse.ArgumentParser:
     writers = subparsers.add_parser("wait-writers")
     writers.add_argument("--timeout-seconds", type=float, default=150.0)
     writers.add_argument("--poll-seconds", type=float, default=5.0)
+    writers.add_argument("--fast-exit-if-zero", action="store_true")
 
     topology = subparsers.add_parser("assert-exclusive-writer")
     topology.add_argument("--expected-instance-id", required=True)
@@ -601,6 +632,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 engine,
                 timeout_seconds=args.timeout_seconds,
                 poll_seconds=args.poll_seconds,
+                fast_exit_if_zero=bool(args.fast_exit_if_zero),
             )
         elif args.command == "assert-exclusive-writer":
             payload = collect_exclusive_writer_topology(

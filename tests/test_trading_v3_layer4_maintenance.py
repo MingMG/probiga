@@ -238,6 +238,98 @@ def test_writer_quiescence_zero_timeout_permits_one_immediate_observation(
     )["ready"] is True
 
 
+def test_writer_quiescence_fast_exit_requires_two_separated_zero_observations(
+    monkeypatch,
+) -> None:
+    clock = _QuiescenceClock(monkeypatch)
+    observations: list[float] = []
+    monkeypatch.setattr(
+        maintenance_cli,
+        "_connection_identity",
+        lambda _: {"server_uuid": "same"},
+    )
+
+    def no_writers(_engine):
+        observations.append(clock.now)
+        return ()
+
+    monkeypatch.setattr(
+        maintenance_cli,
+        "read_fresh_scheduler_writers_on_connection",
+        no_writers,
+    )
+    result = maintenance_cli.wait_for_writer_quiescence(
+        _Engine(),
+        timeout_seconds=30,
+        poll_seconds=5,
+        fast_exit_if_zero=True,
+    )
+
+    assert observations == [0, 2]
+    assert clock.sleeps == [2]
+    assert result == {
+        "status": "ok",
+        "ready": True,
+        "live_writer_count": 0,
+        "live_writers": [],
+        "zero_confirmations": 2,
+    }
+
+
+def test_writer_quiescence_live_registration_resets_zero_confirmation(
+    monkeypatch,
+) -> None:
+    clock = _QuiescenceClock(monkeypatch)
+    observations = iter([
+        (),
+        ({"instance_id": "windows-registering"},),
+        (),
+        (),
+    ])
+    monkeypatch.setattr(
+        maintenance_cli,
+        "_connection_identity",
+        lambda _: {"server_uuid": "same"},
+    )
+    monkeypatch.setattr(
+        maintenance_cli,
+        "read_fresh_scheduler_writers_on_connection",
+        lambda _: next(observations),
+    )
+
+    result = maintenance_cli.wait_for_writer_quiescence(
+        _Engine(),
+        timeout_seconds=30,
+        poll_seconds=1,
+        fast_exit_if_zero=True,
+    )
+
+    assert result["zero_confirmations"] == 2
+    assert clock.sleeps == [2, 1, 2]
+
+
+def test_writer_quiescence_fast_exit_requires_a_confirmation_window() -> None:
+    with pytest.raises(ValueError, match="at least 2"):
+        maintenance_cli.wait_for_writer_quiescence(
+            _Engine(),
+            timeout_seconds=1.9,
+            poll_seconds=1,
+            fast_exit_if_zero=True,
+        )
+
+
+def test_wait_writers_cli_exposes_two_zero_confirmation_mode() -> None:
+    args = maintenance_cli._parser().parse_args([
+        "wait-writers",
+        "--timeout-seconds", "30",
+        "--poll-seconds", "5",
+        "--fast-exit-if-zero",
+    ])
+    assert args.timeout_seconds == 30
+    assert args.poll_seconds == 5
+    assert args.fast_exit_if_zero is True
+
+
 def test_exclusive_writer_topology_accepts_only_expected_linux_scheduler(
     monkeypatch,
 ) -> None:
