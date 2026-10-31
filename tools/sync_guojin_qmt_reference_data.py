@@ -44,6 +44,7 @@ from server.common.mysql_metadata_compat import (
     normalize_mysql_referential_rule,
 )
 from server.common.qmt_stock_catalog import (
+    CATALOG_RETIREMENT_RECONCILIATION_SCHEMA,
     NATIVE_A_SHARE_SECTORS,
     build_catalog_discovery,
     build_catalog_manifest,
@@ -83,9 +84,6 @@ INDEX_WEIGHT_PUBLICATION_RECEIPT_SCHEMA = (
 )
 HISTORICAL_INSTRUMENT_ARCHIVE_SCHEMA = (
     "probiga.qmt-historical-instrument-archive.v1"
-)
-BAOSTOCK_RETIREMENT_RECONCILIATION_SCHEMA = (
-    "probiga.baostock-retirement-reconciliation.v1"
 )
 REFERENCE_SCHEMA_CONTRACT_KEY = "qmt_reference_truth_v2"
 _REFERENCE_SEAL_TABLE_DDL = ("""
@@ -1577,7 +1575,7 @@ def _reconcile_removed_catalog_members(
         })
 
     retirement_batch_id = canonical_digest({
-        "schema": BAOSTOCK_RETIREMENT_RECONCILIATION_SCHEMA,
+        "schema": CATALOG_RETIREMENT_RECONCILIATION_SCHEMA,
         "source": "baostock.query_stock_basic",
         "captured_day": captured_day,
         "rows": evidence_rows,
@@ -1587,7 +1585,7 @@ def _reconcile_removed_catalog_members(
         member["expire_date"] = row["out_date"]
         member["instrument_batch_id"] = retirement_batch_id
     return {
-        "schema": BAOSTOCK_RETIREMENT_RECONCILIATION_SCHEMA,
+        "schema": CATALOG_RETIREMENT_RECONCILIATION_SCHEMA,
         "source": "baostock.query_stock_basic",
         "captured_day": captured_day,
         "row_count": len(evidence_rows),

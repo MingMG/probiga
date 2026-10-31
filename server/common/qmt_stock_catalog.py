@@ -24,6 +24,9 @@ from server.common.qmt_attestation_contract import canonical_digest
 CATALOG_MANIFEST_SCHEMA = "probiga.qmt-stock-catalog.v1"
 CATALOG_MEMBER_SET_SCHEMA = "probiga.qmt-stock-catalog-members.v1"
 CATALOG_DISCOVERY_SCHEMA = "probiga.qmt-stock-catalog-discovery.v1"
+CATALOG_RETIREMENT_RECONCILIATION_SCHEMA = (
+    "probiga.baostock-retirement-reconciliation.v1"
+)
 CATALOG_STATUS_COMPLETE = "COMPLETE"
 NATIVE_A_SHARE_SECTORS = ("上证A股", "深证A股", "京市A股", "沪深A股")
 

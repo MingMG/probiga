@@ -58,6 +58,9 @@ from server.common.qmt_edge_release_receipt import (
     validate_qmt_edge_release_receipt,
 )
 from server.common.qmt_history_coverage import validate_coverage_schema
+from server.common.qmt_stock_catalog import (
+    CATALOG_RETIREMENT_RECONCILIATION_SCHEMA,
+)
 from server.common.scheduler_runtime_health import (
     DEFAULT_SCHEDULER_POLL_SECONDS,
     QMT_WINDOWS_EDGE_ROLE,
@@ -76,6 +79,9 @@ BIGQMT_STRATEGY_SOURCE = (
 )
 INDEX_WEIGHT_PUBLICATION_RECEIPT_SCHEMA = (
     "probiga.qmt-index-weight-publication-receipt.v1"
+)
+RETIREMENT_RECONCILIATION_SCHEMA = (
+    CATALOG_RETIREMENT_RECONCILIATION_SCHEMA
 )
 
 
@@ -387,7 +393,7 @@ def _validated_reference_capture(
         if retirement is not None and (
             not isinstance(retirement, dict)
             or retirement.get("schema")
-            != "probiga.baostock-retirement-reconciliation.v1"
+            != RETIREMENT_RECONCILIATION_SCHEMA
             or retirement.get("source") != "baostock.query_stock_basic"
             or type(retirement.get("row_count")) is not int
             or retirement["row_count"] <= 0
