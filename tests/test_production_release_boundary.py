@@ -865,10 +865,12 @@ def test_root_broker_has_exact_normal_and_recovery_argv_contracts() -> None:
         "parse_broker_invocation"
     ])
 
-    assert 'case "$#" in' in parser
-    assert "1)" in parser
-    assert "2)" in parser
-    assert 'test "$1" = --recover-database-guard' in parser
+    assert 'if [ "$#" -eq 1 ] && [ "$1" = --capabilities ]' in parser
+    assert 'elif [ "$#" -eq 2 ] && [ "$1" = --recover-database-guard ]' in parser
+    assert 'while [ "$#" -gt 0 ]' in parser
+    assert '--fast)' in parser and '--full)' in parser
+    assert '--i-know-ddl-changed' in parser
+    assert '--strict-windows-manifest' in parser
     assert "BROKER_OPERATION=deploy" in parser
     assert "BROKER_OPERATION=recover-database-guard" in parser
     assert "expected one trusted-main SHA or an exact guard recovery request" in parser
@@ -1006,13 +1008,12 @@ def test_root_broker_exposes_only_exact_deploy_recovery_and_verifier_calls() -> 
     )
     parse = _normalized_shell(_shell_function_bodies(broker)["parse_broker_invocation"])
 
-    assert "case \"$#\" in" in parse
-    assert 'if [ "$1" = --capabilities ]' in parse
-    assert 'elif [ "$1" = --verify-trading-v3 ]' in parse
+    assert 'if [ "$#" -eq 1 ] && [ "$1" = --capabilities ]' in parse
+    assert 'elif [ "$#" -eq 1 ] && [ "$1" = --verify-trading-v3 ]' in parse
     assert "BROKER_OPERATION=verify-trading-v3" in parse
     assert "BROKER_OPERATION=deploy" in parse
     assert 'EXPECTED_SHA="$1"' in parse
-    assert 'test "$1" = --recover-database-guard' in parse
+    assert 'elif [ "$#" -eq 2 ] && [ "$1" = --recover-database-guard ]' in parse
     assert 'EXPECTED_RECOVERY_GUARD_SHA="$2"' in parse
     assert '[[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]' in parse
     assert '[[ "$EXPECTED_RECOVERY_GUARD_SHA" =~ ^[0-9a-f]{40}$ ]]' in parse

@@ -1,12 +1,21 @@
 # Linux 与 Windows/QMT 组件发布
 
-生产入口继续使用安装在服务器上的 v4 root broker。发布前先合并到 `main`，再向 broker 传入完整的 40 位合并提交 SHA：
+生产入口继续使用安装在服务器上的 v4 root broker。发布前先合并到 `main`，再向 broker 传入完整的 40 位合并提交 SHA。默认是快速路径：
 
 ```bash
 sudo -n /usr/local/sbin/probiga-production-deploy "$MERGED_MAIN_SHA"
+
+# 显式执行数据库/任务/质量门/跨端协调事务
+sudo -n /usr/local/sbin/probiga-production-deploy "$MERGED_MAIN_SHA" --full
+
+# 仅用于分类器误报 COORDINATED、只读 schema 守卫仍能证明 DB 合同未缺项
+sudo -n /usr/local/sbin/probiga-production-deploy "$MERGED_MAIN_SHA" \
+  --fast --i-know-ddl-changed
 ```
 
-发布范围由受信 Git 镜像中的完整“当前 Linux 版本 → 目标版本”差异决定，没有绕过参数或范围开关。检查依赖锁、不可变源码、adata、执行适配器密封与质量门的 `prepare_release` 流程保持共用。
+发布范围由受信 Git 镜像中的完整“当前 Linux 版本 → 目标版本”差异决定。`fast/full` 只改变执行路径，不改变同一条 SHA 的组件 scope。`--fast --i-know-ddl-changed` 不能绕过只读 schema 守卫；默认 fast 遇到分类为 `COORDINATED` 的范围会在任何服务切换前退出。`--full` 始终执行协调事务，这既是真 DDL 的正常入口，也是快速路径失败后修复代码/schema 不一致的入口。
+
+本版参数协议要求 root broker 与目标引擎同时支持 `probiga-release-mode-v1`。普通发布只替换目标引擎；高级参数和新增发布清单字段首次上线时，必须先从已合并的 `main` 用 `deploy/install_production_deploy_broker.sh` 完成 root 维护安装，再调用 broker。旧 broker 不支持参数透传，不能用它声称 `--full` 已生效。
 
 ## 三种版本身份
 
@@ -32,7 +41,13 @@ sudo -n /usr/local/sbin/probiga-production-deploy "$MERGED_MAIN_SHA"
 
 ## Linux 单端切换
 
-单端分支在 `prepare_release` 完成后进入独立控制器，随后直接结束，不进入数据库业务 schema 迁移、任务变更、Windows request/hold/grant 或协调回滚流程。
+快速分支共用依赖锁、不可变源码、adata、venv、组件身份和回执准备。`prepare_release` 完成后先运行只读 schema 守卫，再由独立控制器切换 Linux；它不进入数据库业务 schema 迁移、任务变更、Windows request/hold/grant 或协调回滚流程。
+
+`tools/check_schema_expected.py` 调用当前代码的运行时 schema validators，不执行 DDL、迁移、seed 或 recovery planner。任何一个 validator 要求的表/列/索引合同不满足时，发布在激活前失败并提示使用 `--full`。数据库边界不可达时日志明确标记跳过；激活后的健康检查仍会失败并回滚。
+
+快速路径立即生成独立签名的 `component-release-lite.json`，其中包含 `schema_version: lite-1`、原组件清单、Ed25519 签名和公钥。`component-release.json` 保持不可变自封格式，不在副本上改字段。MySQL 账本在 60 秒后由 transient systemd unit 异步补写；发布启动时若发现 `deploy-guards/ledger-pending/` 中仍有状态文件，会明确告警。
+
+API 健康检查优先验证 MySQL 账本签名。只有账本表中的该 SHA 行可证明为“不存在”时，才接受根目录保护的 lite 证明；账本存在但内容、元数据或签名错误时绝不回退到本地证明。
 
 `tools/linux_release_activation.py` 将以下内容保存到 root 持久事务文件 `/var/lib/probiga/linux-activation/transaction.json`：
 
@@ -59,3 +74,13 @@ AI worker 是单次任务：原来处于运行中的任务，重启后可以正�
 `tests/test_release_scope.py` 使用真实 Git 历史验证累计差异、AST 边界、环境隔离和危险树拒绝。`tests/test_linux_release_activation.py` 注入停止、安装、Nginx、启动、健康、回执及事务提交故障，验证独立恢复和同 SHA 重试。既有协调恢复状态机测试继续覆盖 Windows 与数据库路径。
 
 QMT 未登录或行情数据尚未齐备仍由数据就绪检查单独报告，不改变实际组件版本，也不自动把已验证的代码发布报告成数据就绪。
+
+## 健康等待、磁盘与回执
+
+`production_release.env` 的 `HEARTBEAT_RETRIES`、`HEARTBEAT_INTERVAL`、`HEALTH_RETRIES`、`HEALTH_INTERVAL` 同时供引擎和 Linux 激活控制器使用，每项限制为 1–60。默认值分别为 `10 / 2 / 5 / 2`，即心跳最多 20 秒、API health 最多 10 秒。
+
+`/tmp`、`/var/tmp`、`/opt`、venv 根、artifact 根和代码发布根都必须至少保留 500 MiB；低于 2 GiB 时告警，低于 500 MiB 时直接输出 `disk full on <path>; free space and retry`。
+
+成功和失败回执都记录 `mode`、原始 `scope`、`execution_scope`、`flags`、目标 `sha`、`signed_manifest`、`lite_manifest` 和真实 `ledger` 状态。快速协调覆盖会保留 `fast-forced-over-coordinated`。引擎 stdout/stderr 每行带 `[MODE=fast]` 或 `[MODE=full]`；快速失败日志直接给出 `--full` 重试提示。
+
+验收顺序是：确定性单元/合同测试；真实 Git 分类测试；schema guard 与 writer 两次零确认测试；在合并后的 `main` 上安装 root broker；最后分别验证快速、快速失败兜底和完整协调发布。只有目标 SHA 在 Linux 实际运行、health/identity 通过且回执与账本状态一致，部署才可标记为 `COMPLETE`。

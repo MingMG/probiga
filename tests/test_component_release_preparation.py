@@ -44,7 +44,7 @@ def test_isolated_manifest_preparation_does_not_modify_release_source(tmp_path):
     artifacts = tmp_path / "artifacts"
     result = subprocess.run(
         [sys.executable, *flags.group(1).split(), "-", str(code), target,
-         prior, str(report), str(artifacts)],
+             prior, str(report), str(artifacts), "COORDINATED"],
         input=program, text=True, capture_output=True, timeout=30,
     )
     assert result.returncode == 0, result.stderr

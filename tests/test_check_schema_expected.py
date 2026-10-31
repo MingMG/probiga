@@ -83,7 +83,8 @@ def test_fast_dispatch_runs_schema_guard_before_linux_activation():
     )
     guard_function = script.index("check_fast_release_schema() {")
     dispatch = script.index(
-        'if [ "$RELEASE_EXECUTION_SCOPE" = LINUX ]; then'
+        'if [ "$RELEASE_EXECUTION_SCOPE" = LINUX ]; then',
+        script.index("CUTOVER_STEP=prepare_release"),
     )
     guard = script.index("check_fast_release_schema", dispatch)
     activation = script.index("activate_linux_release", guard)

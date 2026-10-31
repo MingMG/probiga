@@ -107,7 +107,7 @@ def test_fast_dispatch_signs_locally_and_schedules_ledger_after_schema_guard():
         / "production_deploy.sh"
     ).read_text(encoding="utf-8")
     manifest_branch = script.index(
-        'if [ "$RELEASE_EXECUTION_SCOPE" = LINUX ]; then\n'
+        'if [ "$RELEASE_MODE" = fast ]; then\n'
         "    /usr/bin/env -i"
     )
     assert "--mode sign" in script[manifest_branch:manifest_branch + 1200]

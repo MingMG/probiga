@@ -9478,8 +9478,8 @@ resolve_release_execution_scope() {
   if [ "$RELEASE_MODE" = full ]; then
     # A full request deliberately executes the coordinated database, task,
     # quality, and cross-end transaction even when the path classifier returned
-    # LINUX. This is the recovery route for a missed DDL classification.
-    RELEASE_SCOPE=COORDINATED
+    # LINUX. The component scope remains classifier-owned so a same-SHA retry
+    # never changes its immutable manifest identity.
     RELEASE_EXECUTION_SCOPE=COORDINATED
   elif [ "$classified_scope" = COORDINATED ]; then
     if [ "$I_KNOW_DDL_CHANGED" -ne 1 ]; then
@@ -9566,8 +9566,10 @@ classify_component_release() {
 prepare_component_release_manifest() {
   local publication_mode
   local -a publication_modes=()
-  if [ "$RELEASE_EXECUTION_SCOPE" = COORDINATED ]; then
+  if [ "$RELEASE_SCOPE" = COORDINATED ]; then
     publication_modes=(initialize publish)
+  else
+    publication_modes=(publish)
   fi
   "$BOOTSTRAP_PYTHON" -I -B - "$CODE_VALIDATION_ROOT" "$EXPECTED_SHA" "$PREVIOUS_SHA" \
     "$COMPONENT_SCOPE_FILE" "$RELEASE_ARTIFACT_ROOT" "$RELEASE_SCOPE" <<'PY'
@@ -9602,7 +9604,7 @@ else:
         parent_linux_build_sha=previous, contract_sha256=report['contract_sha256'], scope=scope))
     _trusted_read(path)
 PY
-  if [ "$RELEASE_EXECUTION_SCOPE" = LINUX ]; then
+  if [ "$RELEASE_MODE" = fast ]; then
     /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
       PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
       PROBIGA_DEPLOYMENT_MODE=production PROBIGA_BUILD_COMMIT_SHA="$EXPECTED_SHA" \
@@ -13757,7 +13759,7 @@ prepare_release() {
       'from server.engine.strategy_execution_adapters import bootstrap_strategy_execution_adapter_registry; p=bootstrap_strategy_execution_adapter_registry(); assert p["registry_sealed"] is True'
   )
   assert_service_cannot_write_release_paths "$CODE_VALIDATION_ROOT"
-  if [ "$RELEASE_SCOPE" = COORDINATED ]; then
+  if [ "$RELEASE_EXECUTION_SCOPE" = COORDINATED ]; then
     (
       cd "$CODE_VALIDATION_ROOT"
       GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
