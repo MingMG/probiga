@@ -44,6 +44,7 @@ readonly BROKER_LOCK_FILE="$BROKER_LOCK_ROOT/production-broker.lock"
 readonly DEPLOY_PROTOCOL_VERSION=probiga-production-deploy-v4
 readonly RECOVERY_PROTOCOL_VERSION=probiga-database-guard-recovery-v2
 readonly CAPABILITY_SCHEMA=probiga.production-deploy.capabilities.v1
+readonly RELEASE_MODE_ENGINE_CAPABILITY=probiga-release-mode-v1
 readonly TRUSTED_ARTIFACT_PROTOCOL=probiga-trusted-artifacts-v2
 readonly BROKER_COMPILED_LOCK_STATUS=READY
 readonly TRUSTED_REMOTE=git@github.com:MingMG/probiga.git
@@ -260,30 +261,63 @@ assert_commit_attributes_safe() {
 parse_broker_invocation() {
   BROKER_OPERATION=""
   EXPECTED_SHA=""
+  BROKER_DEPLOY_MODE=fast
+  BROKER_I_KNOW_DDL_CHANGED=0
+  BROKER_STRICT_WINDOWS_MANIFEST=0
   EXPECTED_INPUT_LOCK_SHA256=""
   EXPECTED_ADATA_SHA=""
   EXPECTED_ADATA_TREE_SHA256=""
   EXPECTED_RECOVERY_GUARD_SHA=""
   EXPECTED_RECOVERY_TOOL_SHA=""
-  case "$#" in
-    1)
-      if [ "$1" = --capabilities ]; then
-        BROKER_OPERATION=capabilities
-      elif [ "$1" = --verify-trading-v3 ]; then
-        BROKER_OPERATION=verify-trading-v3
-      else
-        BROKER_OPERATION=deploy
-        EXPECTED_SHA="$1"
-      fi
-      ;;
-    2)
-      test "$1" = --recover-database-guard || \
-        fail "unsupported two-argument operation"
-      BROKER_OPERATION=recover-database-guard
-      EXPECTED_RECOVERY_GUARD_SHA="$2"
-      ;;
-    *) fail "expected one trusted-main SHA or an exact guard recovery request" ;;
-  esac
+  local explicit_mode=""
+  local argument
+  if [ "$#" -eq 1 ] && [ "$1" = --capabilities ]; then
+    BROKER_OPERATION=capabilities
+  elif [ "$#" -eq 1 ] && [ "$1" = --verify-trading-v3 ]; then
+    BROKER_OPERATION=verify-trading-v3
+  elif [ "$#" -eq 2 ] && [ "$1" = --recover-database-guard ]; then
+    BROKER_OPERATION=recover-database-guard
+    EXPECTED_RECOVERY_GUARD_SHA="$2"
+  elif [ "$#" -ge 1 ] && [[ "$1" =~ ^[0-9a-f]{40}$ ]]; then
+    BROKER_OPERATION=deploy
+    EXPECTED_SHA="$1"
+    shift
+    while [ "$#" -gt 0 ]; do
+      argument="$1"
+      shift
+      case "$argument" in
+        --fast)
+          test -z "$explicit_mode" || \
+            fail "release mode may be selected only once"
+          explicit_mode=fast
+          BROKER_DEPLOY_MODE=fast
+          ;;
+        --full)
+          test -z "$explicit_mode" || \
+            fail "release mode may be selected only once"
+          explicit_mode=full
+          BROKER_DEPLOY_MODE=full
+          ;;
+        --i-know-ddl-changed)
+          test "$BROKER_I_KNOW_DDL_CHANGED" -eq 0 || \
+            fail "--i-know-ddl-changed may be supplied only once"
+          BROKER_I_KNOW_DDL_CHANGED=1
+          ;;
+        --strict-windows-manifest)
+          test "$BROKER_STRICT_WINDOWS_MANIFEST" -eq 0 || \
+            fail "--strict-windows-manifest may be supplied only once"
+          BROKER_STRICT_WINDOWS_MANIFEST=1
+          ;;
+        *) fail "unsupported deploy argument" ;;
+      esac
+    done
+    if [ "$BROKER_I_KNOW_DDL_CHANGED" -eq 1 ] && \
+      [ "$explicit_mode" != fast ]; then
+      fail "--i-know-ddl-changed requires an explicit --fast"
+    fi
+  else
+    fail "expected one trusted-main SHA or an exact guard recovery request"
+  fi
   if [ "$BROKER_OPERATION" = capabilities ]; then
     return 0
   elif [ "$BROKER_OPERATION" = verify-trading-v3 ]; then
@@ -305,6 +339,8 @@ if [ "$BROKER_OPERATION" = capabilities ]; then
     "deploy_protocol=$DEPLOY_PROTOCOL_VERSION" \
     "recovery_protocol=$RECOVERY_PROTOCOL_VERSION" \
     "artifact_protocol=$TRUSTED_ARTIFACT_PROTOCOL" \
+    "release_mode_engine=$RELEASE_MODE_ENGINE_CAPABILITY" \
+    'release_modes=fast,full' \
     'snapshot_only_recovery=true' \
     'input_and_freeze_digests=true' \
     'governance_task_snapshot=true' \
@@ -1061,6 +1097,10 @@ else
 fi
 chmod 0700 "$BOOTSTRAP_FILE"
 chown root:root "$BOOTSTRAP_FILE"
+grep -Fx \
+  "readonly DEPLOY_ENGINE_RELEASE_MODE_CAPABILITY=$RELEASE_MODE_ENGINE_CAPABILITY" \
+  "$BOOTSTRAP_FILE" >/dev/null || \
+  fail "engine does not support --mode; upgrade broker and engine together"
 test "$(sha256sum "$BOOTSTRAP_FILE" | cut -d' ' -f1)" = \
   "$("${GIT[@]}" show \
     "$([ "$BROKER_OPERATION" = deploy ] && printf '%s' "$EXPECTED_SHA" || \
@@ -1171,6 +1211,13 @@ if [ "$BROKER_OPERATION" = deploy ]; then
   TRUSTED_WHEEL_MANIFEST_B64="$(base64 -w0 "$WHEEL_MANIFEST_FILE")"
   test -n "$TRUSTED_WHEEL_MANIFEST_B64" || \
     fail "root-derived wheel manifest payload is empty"
+  ENGINE_RELEASE_ARGS=(
+    --mode "$BROKER_DEPLOY_MODE"
+    --i-know-ddl-changed "$BROKER_I_KNOW_DDL_CHANGED"
+  )
+  if [ "$BROKER_STRICT_WINDOWS_MANIFEST" -eq 1 ]; then
+    ENGINE_RELEASE_ARGS+=(--strict-windows-manifest)
+  fi
   rm -f -- "$RELEASE_MANIFEST_FILE" "$WHEEL_MANIFEST_FILE"
   RELEASE_MANIFEST_FILE=""
   WHEEL_MANIFEST_FILE=""
@@ -1189,7 +1236,8 @@ if [ "$BROKER_OPERATION" = deploy ]; then
     EXPECTED_ADATA_TREE_SHA256="$EXPECTED_ADATA_TREE_SHA256" \
     EXPECTED_RELEASE_TREE_SHA256="$EXPECTED_RELEASE_TREE_SHA256" \
     EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256="$EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256" \
-    /usr/bin/bash --noprofile --norc "$BOOTSTRAP_FILE"
+    /usr/bin/bash --noprofile --norc "$BOOTSTRAP_FILE" \
+      "${ENGINE_RELEASE_ARGS[@]}"
 else
   /usr/bin/env -i \
     PATH=/usr/sbin:/usr/bin:/sbin:/bin \

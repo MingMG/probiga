@@ -106,6 +106,7 @@ DEPLOY_LOCK_FILE="$DEPLOY_LOCK_ROOT/production-deploy.lock"
 REQUIRED_DEPLOY_PROTOCOL_V4=probiga-production-deploy-v4
 RETIRED_DEPLOY_PROTOCOL_V2=probiga-production-deploy-v2
 REQUIRED_RECOVERY_PROTOCOL=probiga-database-guard-recovery-v2
+readonly DEPLOY_ENGINE_RELEASE_MODE_CAPABILITY=probiga-release-mode-v1
 readonly QMT_EDGE_DEPLOY_BLOCKING=0
 # Market-history attestation is a data-readiness concern, not a code-release
 # prerequisite.  Keep the legacy exact-window gate available for controlled

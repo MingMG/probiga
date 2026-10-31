@@ -89,11 +89,14 @@ def test_root_broker_uses_the_v4_single_sha_deploy_contract() -> None:
     )
     parse = _normalized_shell(_shell_function_body(broker, "parse_broker_invocation"))
 
-    assert "case \"$#\" in" in parse
+    assert 'BROKER_DEPLOY_MODE=fast' in parse
+    assert 'while [ "$#" -gt 0 ]' in parse
     assert "BROKER_OPERATION=deploy" in parse
     assert 'EXPECTED_SHA="$1"' in parse
     assert '[[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]' in parse
     assert 'BROKER_OPERATION=verify-trading-v3' in parse
+    assert '--i-know-ddl-changed requires an explicit --fast' in parse
+    assert '--strict-windows-manifest' in parse
     assert "$3" not in parse
     assert 'REMOTE_SHA="$(clean_git_ssh ls-remote' in broker
     assert 'test "$REMOTE_SHA" = "$EXPECTED_SHA"' in broker
