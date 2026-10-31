@@ -128,6 +128,128 @@ def test_qmt_catalog_allows_epoch_placeholder_to_become_listing_fact_once():
         )
 
 
+def test_removed_qmt_members_use_independent_baostock_retirement_facts():
+    retired = {
+        "000016.SZ": ("1992-03-27", "2026-10-23"),
+        "301139.SZ": ("2022-07-08", "2026-10-28"),
+        "601059.SH": ("2023-02-01", "2026-10-19"),
+        "601198.SH": ("2015-02-26", "2026-10-19"),
+    }
+    catalog = {
+        qmt_code: {
+            "qmt_code": qmt_code,
+            "stock_code": qmt_code[:6],
+            "list_date": list_date,
+            "expire_date": None,
+            "instrument_batch_id": "qmt-detail-batch",
+            "instrument_type": "STOCK",
+        }
+        for qmt_code, (list_date, _out_date) in retired.items()
+    }
+    calls = 0
+
+    def stock_basic_lookup():
+        nonlocal calls
+        calls += 1
+        return [
+            {
+                "code": f"{qmt_code[-2:].lower()}.{qmt_code[:6]}",
+                "ipoDate": list_date,
+                "outDate": out_date,
+                "type": "1",
+                "status": "0",
+            }
+            for qmt_code, (list_date, out_date) in retired.items()
+        ]
+
+    evidence = reference_sync._reconcile_removed_catalog_members(
+        catalog,
+        current_qmt_codes={"000001.SZ"},
+        captured_day="2026-10-31",
+        stock_basic_lookup=stock_basic_lookup,
+    )
+
+    assert calls == 1
+    assert evidence is not None
+    assert evidence["row_count"] == len(retired)
+    assert {
+        row["qmt_code"]: row["out_date"] for row in evidence["rows"]
+    } == {
+        qmt_code: out_date
+        for qmt_code, (_list_date, out_date) in retired.items()
+    }
+    assert all(
+        member["expire_date"] == retired[qmt_code][1]
+        and member["instrument_batch_id"]
+        == evidence["retirement_batch_id"]
+        for qmt_code, member in catalog.items()
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("status", "1", "does not prove retirement"),
+        ("type", "2", "does not prove retirement"),
+        ("ipoDate", "1992-03-28", "listing identity differs"),
+        ("outDate", "2026-10-31", "does not predate capture"),
+    ),
+)
+def test_removed_qmt_member_requires_exact_baostock_retirement_identity(
+    field,
+    value,
+    message,
+):
+    catalog = {
+        "000016.SZ": {
+            "qmt_code": "000016.SZ",
+            "stock_code": "000016",
+            "list_date": "1992-03-27",
+            "expire_date": None,
+            "instrument_batch_id": "qmt-detail-batch",
+            "instrument_type": "STOCK",
+        }
+    }
+    proof = {
+        "code": "sz.000016",
+        "ipoDate": "1992-03-27",
+        "outDate": "2026-10-23",
+        "type": "1",
+        "status": "0",
+        field: value,
+    }
+
+    with pytest.raises(RuntimeError, match=message):
+        reference_sync._reconcile_removed_catalog_members(
+            catalog,
+            current_qmt_codes={"000001.SZ"},
+            captured_day="2026-10-31",
+            stock_basic_lookup=lambda: [proof],
+        )
+
+
+def test_current_qmt_member_does_not_trigger_baostock_lookup():
+    catalog = {
+        "000001.SZ": {
+            "qmt_code": "000001.SZ",
+            "stock_code": "000001",
+            "list_date": "1991-04-03",
+            "expire_date": None,
+            "instrument_batch_id": "qmt-detail-batch",
+            "instrument_type": "STOCK",
+        }
+    }
+
+    assert reference_sync._reconcile_removed_catalog_members(
+        catalog,
+        current_qmt_codes={"000001.SZ"},
+        captured_day="2026-10-31",
+        stock_basic_lookup=lambda: pytest.fail(
+            "current QMT members must not require an external lookup"
+        ),
+    ) is None
+
+
 def _discovery(members):
     sector_by_exchange = {
         "SH": "上证A股",
