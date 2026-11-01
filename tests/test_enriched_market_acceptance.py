@@ -43,6 +43,8 @@ def test_preparation_preserves_raw_source_and_observed_cutoffs_without_publishin
     assert receipt["source_receipts"]["facts"]["raw_sha256"] == permanent._sha(facts.read_bytes())
     assert receipt["model_calls"] == 0 and receipt["report_database_write_invoked"] is False
     assert receipt["wecom_delivery_invoked"] is False
+    assert receipt["provider_stage_budget"] == 8
+    assert receipt["accepted_provider_stage_counts"] == [6, 8]
     assert (path.parent / "enrichment_manifest.json").read_bytes() == (evidence / "enrichment_manifest.json").read_bytes()
 
 

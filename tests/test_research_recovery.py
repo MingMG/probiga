@@ -50,7 +50,8 @@ def recovery(tmp_path, monkeypatch):
         "raw_response": raw, "raw_sha256": core._body_hash(raw), "provider_receipt": {
             "transport": "live_http", "raw_sha256": core._body_hash(raw), "messages_sha256": core._hash(messages),
             "source": "deepseek_api", "endpoint": "https://api.deepseek.com/v1/chat/completions",
-            "provider_response_id": "offline-unit", "model": "unit"}}
+            "provider_response_id": "offline-unit", "model": core.DEEPSEEK_RESEARCH_POLICY["model"],
+            "request_policy": deepcopy(core.DEEPSEEK_RESEARCH_POLICY)}}
     prior = {"status": "FAILED", "request_id": request_id, "messages_sha256": core._hash(messages),
              "error_type": "ResearchBridgeError", "error": "ResearchBridgeError"}
     checkpoint = {"run_id": str(uuid4()), "generation_started_at": NOW.isoformat(),
@@ -59,7 +60,7 @@ def recovery(tmp_path, monkeypatch):
     receipt = {"schema_version": cli.RUN_SCHEMA, "run_id": source.name, "status": "FAILED", "stage": "review:codex_draft",
         "bundle_sha256": bundle["bundle_sha256"], "rules_sha256": rules_hash, "publish": False, "api_base": None,
         "report_started_at": {"review": NOW.isoformat()}, "deadline_at": (NOW + timedelta(seconds=1320)).isoformat(),
-        "total_units": 12, "completed_units": 1, "report_database_write_invoked": False, "wecom_delivery_invoked": False}
+        "total_units": len(core.STAGES) * 2, "completed_units": 1, "report_database_write_invoked": False, "wecom_delivery_invoked": False}
     for name, value in (("bundle.json", bundle), ("review_checkpoint.json", checkpoint), ("run_receipt.json", receipt)):
         cli._atomic(source / name, value)
     cli._atomic(source / "stages/review/codex_draft_input.json", {"messages": messages, "response_schema": schema})
@@ -252,3 +253,18 @@ def test_codex_final_recovery_rebuilds_the_editor_request_from_both_drafts_and_p
 def test_retired_final_audit_is_not_a_recoverable_execution_path():
     with pytest.raises(RuntimeError, match="unsupported_recovery_stage"):
         cli._recovery_request(core, {}, "rules", {"stages": {}}, "codex_final_review")
+
+
+def test_second_editor_round_is_not_an_operator_recovery_path():
+    assert "codex_final_2" not in cli.RECOVERY_STAGES
+    with pytest.raises(RuntimeError, match="unsupported_recovery_stage"):
+        cli._recovery_request(core, {}, "rules", {"stages": {}}, "codex_final_2")
+
+
+def test_rejected_final_cannot_allocate_a_transport_recovery(recovery):
+    checkpoint = cli._read_json(recovery["source"] / "review_checkpoint.json")
+    checkpoint["stages"]["deepseek_final_review"] = {"status": "COMPLETE", "raw_response": '{"verdict":"REJECT","findings":[]}'}
+    cli._atomic(recovery["source"] / "review_checkpoint.json", checkpoint)
+    with pytest.raises(RuntimeError, match="rejected_final_cannot_be_reopened"):
+        cli.inspect_recovery(recovery["engine"], recovery["source"], **recovery["kwargs"])
+    assert not (recovery["source"] / "recovery_claim.json").exists()

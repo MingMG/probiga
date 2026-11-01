@@ -140,7 +140,8 @@ def test_frozen_input_hash_is_checked_and_checkpoint_does_not_reread(monkeypatch
         research._freeze_research_evidence(None, altered)
 
 
-def test_replay_uses_explicit_new_frozen_context_without_any_source_read(monkeypatch):
+@pytest.mark.parametrize("count", [6, 8])
+def test_replay_uses_explicit_new_frozen_context_without_any_source_read(monkeypatch, count):
     frozen = research.freeze_inputs(observation(), [], events(), mode="replay")
     frozen["context"] = enhanced(frozen["context"])
     frozen["input_sha256"] = research._hash({"digest": frozen["digest"], "context": frozen["context"]})
@@ -150,12 +151,14 @@ def test_replay_uses_explicit_new_frozen_context_without_any_source_read(monkeyp
 
     def generate(digest, **kwargs):
         assert kwargs["context"] == frozen["context"]
-        return final_result()
+        return final_result(count)
 
     result = research.run_intraday_research_replay(None, observation_id="a" * 64, generator=generate,
         checkpoint={"generation_started_at": NOW.replace(tzinfo=research.TZ).isoformat()}, frozen_inputs=frozen)
     assert result["input_snapshot"] == frozen
     assert result["outbox_write_invoked"] is False
+    assert result["completed_units"] == result["total_units"] == count
+    assert result["stage_budget"] == 8
 
 
 def test_fresh_observation_replay_enriches_once_and_emits_snapshot_for_resumption(db, monkeypatch):

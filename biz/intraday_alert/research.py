@@ -24,10 +24,26 @@ TZ = ZoneInfo("Asia/Shanghai")
 MAX_AGE_SECONDS = 180
 TOTAL_DEADLINE_SECONDS = 180
 LEASE_SECONDS = 60
+MAX_RESEARCH_STAGES = 8
 
 
 class IntradayResearchError(RuntimeError):
     pass
+
+
+def _verified_research_units(research: dict) -> int:
+    """Measure only the verified actual path, never its maximum stage budget."""
+    proof = research.get("verification") or {}
+    stages = research.get("generation_attempts") or []
+    count = proof.get("stage_count")
+    if (type(count) is not int or count not in {6, MAX_RESEARCH_STAGES}
+            or len(stages) != count or any(stage.get("status") != "COMPLETE" for stage in stages)
+            or len({stage.get("stage") for stage in stages}) != count
+            or proof.get("stage_budget") != MAX_RESEARCH_STAGES
+            or proof.get("final_round") != (1 if count == 6 else 2)
+            or proof.get("early_pass") is not (count == 6)):
+        raise IntradayResearchError("INTRADAY_RESEARCH_BLOCKED stage=validation reason=stage_completion_proof_mismatch")
+    return count
 
 
 def _json(value):
@@ -268,7 +284,8 @@ def process_research_batch(engine, *, outbox_id: str, generator=None, now_fn: Ca
         generation = int(old_analysis.get("generation", 0)) + 1
         state["analysis"] = {"owner": owner, "generation": generation, "deadline_at": _stamp(deadline),
                              "lease_expires_at": _stamp(min(deadline, now + timedelta(seconds=LEASE_SECONDS))),
-                             "started_at": _stamp(now), "completed_units": 0, "total_units": 6}
+                             "started_at": _stamp(now), "completed_units": 0, "total_units": MAX_RESEARCH_STAGES,
+                             "stage_budget": MAX_RESEARCH_STAGES}
         connection.execute(text(f"UPDATE {OUTBOX_TABLE} SET status='ANALYZING',evidence_json=:evidence,claimed_at=:now,updated_at=:now WHERE outbox_id=:id"), {"id": outbox_id, "evidence": _json(state), "now": now})
 
     def progress(event):
@@ -277,12 +294,26 @@ def process_research_batch(engine, *, outbox_id: str, generator=None, now_fn: Ca
             _prepare(connection)
             row = _load_locked(connection, engine, outbox_id)
             snapshot = _owned(row, owner, generation, current)
+            analysis = snapshot["analysis"]
+            total = event.get("total", event.get("total_units", analysis["total_units"]))
+            completed = event.get("completed", event.get("completed_units", analysis["completed_units"]))
+            actual = event.get("actual_total", analysis.get("declared_actual_total"))
+            if (type(total) is not int or total not in {6, MAX_RESEARCH_STAGES}
+                    or type(completed) is not int or not analysis["completed_units"] <= completed <= total
+                    or (actual is not None and (type(actual) is not int or actual not in {6, MAX_RESEARCH_STAGES}
+                        or completed != actual or event.get("early_pass") is not (actual == 6)))):
+                raise IntradayResearchError("INTRADAY_RESEARCH_BLOCKED stage=progress reason=stage_count_out_of_bounds")
             checkpoint = event.get("checkpoint")
             if checkpoint is not None:
+                if (event.get("completed", event.get("completed_units")) is not None
+                        and sum(item.get("status") == "COMPLETE" for item in (checkpoint.get("stages") or {}).values()) != completed):
+                    raise IntradayResearchError("INTRADAY_RESEARCH_BLOCKED stage=progress reason=checkpoint_count_mismatch")
                 snapshot["checkpoint"] = checkpoint
-            snapshot["analysis"].update(lease_expires_at=_stamp(min(deadline, current + timedelta(seconds=LEASE_SECONDS))),
-                                        completed_units=event.get("completed", event.get("completed_units", 0)),
+            analysis.update(lease_expires_at=_stamp(min(deadline, current + timedelta(seconds=LEASE_SECONDS))),
+                                        completed_units=completed, total_units=total,
                                         current_unit=event.get("stage"), last_progress_at=_stamp(current))
+            if actual is not None:
+                analysis["declared_actual_total"] = actual
             connection.execute(text(f"UPDATE {OUTBOX_TABLE} SET evidence_json=:evidence,updated_at=:now WHERE outbox_id=:id AND status='ANALYZING'"), {"id": outbox_id, "evidence": _json(snapshot), "now": current})
 
     try:
@@ -314,18 +345,23 @@ def process_research_batch(engine, *, outbox_id: str, generator=None, now_fn: Ca
             engine=engine, now=now.replace(tzinfo=TZ), checkpoint=state.get("checkpoint"), progress=progress)
         from biz.review.market_decision import verify_automatic_research
         verify_automatic_research(research)
+        actual_units = _verified_research_units(research)
         finished = _time(now_fn())
         with engine.begin() as connection:
             _prepare(connection)
             row = _load_locked(connection, engine, outbox_id)
             snapshot = _owned(row, owner, generation, finished)
+            if (snapshot["analysis"].get("declared_actual_total", actual_units) != actual_units
+                    or snapshot["analysis"]["completed_units"] > actual_units):
+                raise IntradayResearchError("INTRADAY_RESEARCH_BLOCKED stage=validation reason=stage_count_mismatch")
             if research.get("status") != "COMPLETE" or not isinstance(research.get("content"), str) or not research["content"]:
                 raise IntradayResearchError("INTRADAY_RESEARCH_BLOCKED stage=validation reason=incomplete_research")
             content = research["content"]
             if len(content.encode("utf-8")) > 60_000:
                 raise IntradayResearchError("INTRADAY_RESEARCH_BLOCKED stage=publication reason=content_budget")
             snapshot["research"] = research
-            snapshot["analysis"].update(completed_units=6, completed_at=_stamp(finished))
+            snapshot["analysis"].update(completed_units=actual_units, total_units=actual_units,
+                                        stage_budget=MAX_RESEARCH_STAGES, completed_at=_stamp(finished))
             status = "SHADOW" if row["mode"] == "shadow" else "PENDING"
             connection.execute(text(f"UPDATE {OUTBOX_TABLE} SET status=:status,evidence_json=:evidence,content_markdown=:content,content_sha256=:hash,next_retry_at=:retry,claimed_at=NULL,updated_at=:now WHERE outbox_id=:id"),
                 {"id": outbox_id, "status": status, "evidence": _json(snapshot), "content": content,
@@ -406,6 +442,9 @@ def run_intraday_research_replay(engine, *, observation_id: str, generator=None,
         checkpoint=checkpoint, progress=progress)
     from biz.review.market_decision import verify_automatic_research
     verify_automatic_research(research)
+    actual_units = _verified_research_units(research)
     return {"status": research.get("status"), "mode": "replay", "asof_at": frozen["context"]["cutoff_at"],
             "observation_id": observation_id, "input_sha256": frozen["input_sha256"],
-            "research": research, "input_snapshot": frozen, "outbox_write_invoked": False, "delivery_invoked": False}
+            "research": research, "input_snapshot": frozen, "completed_units": actual_units,
+            "total_units": actual_units, "stage_budget": MAX_RESEARCH_STAGES,
+            "outbox_write_invoked": False, "delivery_invoked": False}

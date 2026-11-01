@@ -80,13 +80,15 @@ def verifier(monkeypatch):
     def verify(result):
         assert result["status"] == "COMPLETE"
         assert result["verification"]["status"] == "PASS"
-        assert len(result["generation_attempts"]) == 6
+        assert len(result["generation_attempts"]) == result["verification"]["stage_count"] in {6, 8}
     monkeypatch.setattr(market_decision, "verify_automatic_research", verify)
 
 
-def final_result():
-    return {"status": "COMPLETE", "content": "已由共享研究流程生成的盘中播报", "verification": {"status": "PASS"},
-            "generation_attempts": [{"stage": str(i), "raw_response": '{"reply":"raw"}'} for i in range(6)]}
+def final_result(count=6):
+    return {"status": "COMPLETE", "content": "已由共享研究流程生成的盘中播报", "verification": {
+                "status": "PASS", "stage_count": count, "stage_budget": 8,
+                "final_round": 1 if count == 6 else 2, "early_pass": count == 6},
+            "generation_attempts": [{"stage": str(i), "status": "COMPLETE", "raw_response": '{"reply":"raw"}'} for i in range(count)]}
 
 
 def test_freeze_excludes_future_history_and_old_fixed_analysis_without_daily_facts():
@@ -139,9 +141,106 @@ def test_model_runs_without_database_transaction_and_success_persists_six_stage_
     assert saved["content_markdown"] == result["research"]["content"]
     assert saved["content_sha256"] == hashlib.sha256(saved["content_markdown"].encode()).hexdigest()
     assert state["analysis"]["completed_units"] == 6
+    assert state["analysis"]["total_units"] == 6
+    assert state["analysis"]["stage_budget"] == 8
     assert len(state["checkpoint"]["stages"]) == 6
     again = research.process_research_batch(db[0], outbox_id=identity, generator=generate, now_fn=lambda: clock[0])
     assert again["status"] == "SHADOW" and calls == [1]
+
+
+@pytest.mark.parametrize("count", [6, 8])
+def test_max_budget_progress_completes_only_the_verified_actual_six_or_eight_stages(db, verifier, count):
+    identity, clock = queue(db), [NOW]
+
+    def generate(_digest, **kwargs):
+        checkpoint = {"stages": {}}
+        for index in range(count):
+            clock[0] += timedelta(seconds=5)
+            checkpoint["stages"][str(index)] = {"status": "COMPLETE", "raw_response": '{"verdict":"REJECT"}' if index == 5 and count == 8 else '{"reply":"raw"}'}
+            kwargs["progress"]({"stage": str(index), "status": "COMPLETE", "completed": index + 1, "total": 8, "checkpoint": deepcopy(checkpoint)})
+            snapshot = load(db, identity)[1]
+            assert snapshot["analysis"]["completed_units"] == index + 1
+            assert snapshot["analysis"]["total_units"] == 8
+            if index == 1:
+                kwargs["progress"]({"stage": "bridge_heartbeat", "status": "RUNNING"})
+                assert load(db, identity)[1]["analysis"]["completed_units"] == 2
+        kwargs["progress"]({"stage": "acceptance", "status": "COMPLETE", "completed": count,
+                            "total": 8, "actual_total": count, "early_pass": count == 6, "checkpoint": checkpoint})
+        return final_result(count)
+
+    result = research.process_research_batch(db[0], outbox_id=identity, generator=generate, now_fn=lambda: clock[0])
+    assert result["status"] == "SHADOW"
+    saved, state = load(db, identity)
+    assert state["analysis"]["completed_units"] == state["analysis"]["total_units"] == count
+    assert state["analysis"]["stage_budget"] == 8
+    assert len(state["checkpoint"]["stages"]) == count
+    if count == 8:
+        assert state["checkpoint"]["stages"]["5"]["raw_response"] == '{"verdict":"REJECT"}'
+
+
+def test_second_reject_preserves_all_eight_raw_stages_and_never_publishes_or_restarts(db):
+    identity = queue(db, mode="live")
+
+    def reject(_digest, **kwargs):
+        checkpoint = {"stages": {str(index): {"status": "COMPLETE", "raw_response": '{"verdict":"REJECT"}'} for index in range(8)}}
+        kwargs["progress"]({"stage": "deepseek_final_review_2", "status": "COMPLETE", "completed": 8, "total": 8, "checkpoint": checkpoint})
+        raise RuntimeError("second final audit REJECT")
+
+    with pytest.raises(RuntimeError, match="second final audit REJECT"):
+        research.process_research_batch(db[0], outbox_id=identity, generator=reject, now_fn=lambda: NOW)
+    saved, state = load(db, identity)
+    assert saved["status"] == "BLOCKED" and saved["content_markdown"] == ""
+    assert state["analysis"]["completed_units"] == 8
+    assert len(state["checkpoint"]["stages"]) == 8
+    assert research.process_research_batch(db[0], outbox_id=identity,
+        generator=lambda *args, **kwargs: pytest.fail("terminal audit was retried"), now_fn=lambda: NOW)["status"] == "BLOCKED"
+
+
+def test_second_audit_cannot_extend_original_source_deadline_or_publish_first_rejected_draft(db):
+    identity, clock = queue(db, mode="live"), [NOW]
+
+    def too_late(_digest, **kwargs):
+        checkpoint = {"stages": {}}
+        for index in range(8):
+            clock[0] += timedelta(seconds=15 if index < 6 else 40 if index == 6 else 31)
+            checkpoint["stages"][str(index)] = {"status": "COMPLETE", "raw_response": "original raw"}
+            kwargs["progress"]({"stage": str(index), "status": "COMPLETE", "completed": index + 1, "total": 8, "checkpoint": deepcopy(checkpoint)})
+        pytest.fail("the expired eighth stage must never return a report")
+
+    with pytest.raises(research.IntradayResearchError, match="owner_or_deadline_lost"):
+        research.process_research_batch(db[0], outbox_id=identity, generator=too_late, now_fn=lambda: clock[0])
+    saved, state = load(db, identity)
+    assert saved["status"] == "EXPIRED" and saved["content_markdown"] == "" and state["research"] is None
+    assert state["analysis"]["completed_units"] == 7
+    assert len(state["checkpoint"]["stages"]) == 7
+    assert research._time(state["analysis"]["deadline_at"]) == NOW + timedelta(seconds=160)
+
+
+@pytest.mark.parametrize("event", [
+    {"completed": 9, "total": 8}, {"completed": 1, "total": 9}, {"completed": True, "total": 8},
+    {"completed": 6, "total": 8, "actual_total": 8, "early_pass": False},
+])
+def test_out_of_bound_dynamic_counts_are_blocked_without_publication(db, event):
+    identity = queue(db)
+
+    def invalid(_digest, **kwargs):
+        kwargs["progress"]({"stage": "invalid", "status": "COMPLETE", **event})
+        pytest.fail("invalid progress was accepted")
+
+    with pytest.raises(research.IntradayResearchError, match="stage_count_out_of_bounds"):
+        research.process_research_batch(db[0], outbox_id=identity, generator=invalid, now_fn=lambda: NOW)
+    assert load(db, identity)[0]["content_markdown"] == ""
+
+
+def test_claimed_stage_count_must_match_actual_verified_attempts(db, monkeypatch):
+    from biz.review import market_decision
+    monkeypatch.setattr(market_decision, "verify_automatic_research", lambda _result: None)
+    identity = queue(db)
+    mismatch = final_result(8)
+    mismatch["verification"]["stage_count"] = 6
+    with pytest.raises(research.IntradayResearchError, match="stage_completion_proof_mismatch"):
+        research.process_research_batch(db[0], outbox_id=identity, generator=lambda *args, **kwargs: mismatch, now_fn=lambda: NOW)
+    assert load(db, identity)[0]["content_markdown"] == ""
 
 
 def test_analyzing_owner_is_never_reclaimed_even_after_lease_expiry(db, verifier):

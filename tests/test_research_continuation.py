@@ -69,7 +69,9 @@ def add_peer_reviews(value):
             provider = value["completed_codex"](payload, raw)
         else:
             provider = {"source": "deepseek_api", "transport": "live_http", "endpoint": "https://api.deepseek.com/v1/chat/completions",
-                "provider_response_id": "unit", "model": "unit", "raw_sha256": core._body_hash(raw), "messages_sha256": core._hash(messages)}
+                "provider_response_id": "unit", "model": core.DEEPSEEK_RESEARCH_POLICY["model"],
+                "request_policy": deepcopy(core.DEEPSEEK_RESEARCH_POLICY),
+                "raw_sha256": core._body_hash(raw), "messages_sha256": core._hash(messages)}
         value["save"](stage, payload, raw, provider)
     cli._atomic(value["source"] / "review_checkpoint.json", value["checkpoint"])
 
@@ -96,7 +98,7 @@ def test_expired_complete_boundary_creates_one_new_operation_without_rewriting_s
         cli.prepare_continuation(boundary["engine"], source, output_dir=tmp_path / "another")
 
 
-@pytest.mark.parametrize("mutation", ["provider_failed", "provider_running", "not_expired", "raw_changed", "unstarted_request", "semantic_final", "already_continued", "active_job"])
+@pytest.mark.parametrize("mutation", ["provider_failed", "provider_running", "not_expired", "raw_changed", "unstarted_request", "semantic_final", "second_revision", "already_continued", "active_job"])
 def test_invalid_continuation_never_claims_source(boundary, tmp_path, mutation):
     source = boundary["source"]
     checkpoint = cli._read_json(source / "review_checkpoint.json")
@@ -110,6 +112,8 @@ def test_invalid_continuation_never_claims_source(boundary, tmp_path, mutation):
         cli._atomic(source / "stages/review/deepseek_review_input.json", {"unknown": "attempt"})
     elif mutation == "semantic_final":
         checkpoint["stages"]["deepseek_final_review"] = {"status": "COMPLETE", "raw_response": '{"verdict":"REJECT"}'}
+    elif mutation == "second_revision":
+        checkpoint["stages"]["codex_final_2"] = {"status": "COMPLETE", "raw_response": '{"draft":{}}'}
     elif mutation == "already_continued":
         checkpoint["continuation"] = {"continuation_count": 1}
     else:

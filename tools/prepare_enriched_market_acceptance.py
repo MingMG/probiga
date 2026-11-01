@@ -19,7 +19,8 @@ if str(ROOT) not in sys.path:
 
 from tools import preview_market_decision as permanent
 
-EXPECTED_STAGES = ("deepseek_draft", "codex_draft", "deepseek_review", "codex_review", "codex_final", "deepseek_final_review")
+EXPECTED_STAGES = ("deepseek_draft", "codex_draft", "deepseek_review", "codex_review", "codex_final", "deepseek_final_review",
+                   "codex_final_2", "deepseek_final_review_2")
 DEFAULT_EVIDENCE = ROOT / "artifacts/deepseek_auto_reports_20261101/evidence_enrichment"
 DEFAULT_FACTS = ROOT / "artifacts/report_correction_20261101/digest.json"
 
@@ -33,7 +34,7 @@ def audit_inputs(facts_path: Path, evidence_dir: Path, *, next_trade_date: str) 
         if time.monotonic() >= stop:
             raise RuntimeError("FAILED stage=enriched_preparation: total_deadline_exceeded")
     if tuple(core.STAGES) != EXPECTED_STAGES:
-        raise RuntimeError("FAILED stage=workflow: expected Codex final and DeepSeek final audit")
+        raise RuntimeError("FAILED stage=workflow: expected bounded Codex revision and DeepSeek audit")
     paths = {"facts": facts_path.resolve(), "review_context": evidence_dir.resolve() / "context_review_enriched.json",
              "briefing_context": evidence_dir.resolve() / "context_briefing_enriched.json"}
     raw, data = {}, {}
@@ -96,7 +97,8 @@ def audit_inputs(facts_path: Path, evidence_dir: Path, *, next_trade_date: str) 
     summary = {"status": "PREPARED", "prepared_at": datetime.now(timezone.utc).isoformat(),
         "review_date": bundle["review_date"], "next_trade_date": next_trade_date, "bundle_sha256": bundle["bundle_sha256"],
         "rules_sha256": core.rules_identity(), "workflow": getattr(core, "WORKFLOW_VERSION", "UNKNOWN"),
-        "stages": list(core.STAGES), "data_cutoff_at": bundle["data_cutoff_at"], "source_receipts": bundle["source_receipts"],
+        "stages": list(core.STAGES), "provider_stage_budget": len(core.STAGES), "accepted_provider_stage_counts": [6, 8],
+        "data_cutoff_at": bundle["data_cutoff_at"], "source_receipts": bundle["source_receipts"],
         "enrichment_manifest_sha256": permanent._sha(manifest_path.read_bytes()), "original_source_snapshots": source_receipts,
         "observed_cutoffs": cutoffs, "review_packet": {"bytes": packet_bytes, "byte_limit": MAX_PACKET_BYTES,
             "remaining_bytes": MAX_PACKET_BYTES - packet_bytes, "fact_count": len(packet["facts"]), "metrics": metrics},

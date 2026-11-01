@@ -38,6 +38,21 @@ RECOVERY_SCHEMA = "probiga.research-recovery.v1"
 RECOVERY_STAGES = ("codex_draft", "codex_review", "codex_final")
 
 
+def _assert_no_rejected_final(checkpoint: dict) -> None:
+    """A terminal rejected operation cannot acquire another revision budget."""
+    stages = checkpoint.get("stages", {})
+    if any(name in stages for name in ("codex_final_2", "deepseek_final_review_2")):
+        raise RuntimeError("BLOCKED stage=resume: revision_round_cannot_be_reopened")
+    item = stages.get("deepseek_final_review", {})
+    if item.get("status") == "COMPLETE":
+        try:
+            review = json.loads(item["raw_response"])
+        except (KeyError, ValueError, TypeError):
+            raise RuntimeError("BLOCKED stage=resume: unknown_final_audit_outcome")
+        if review.get("verdict") != "PASS" or any(f.get("severity") == "blocker" for f in review.get("findings", [])):
+            raise RuntimeError("BLOCKED stage=resume: rejected_final_cannot_be_reopened")
+
+
 def _default(value):
     if isinstance(value, (datetime, date)):
         return value.isoformat()
@@ -318,6 +333,7 @@ def inspect_recovery(engine, source_dir: Path, *, stage: str, worker_state_root:
                 candidates.append((kind, value))
     require(len(candidates) == 1, "exact_failed_stage_checkpoint_required")
     kind, checkpoint = candidates[0]
+    _assert_no_rejected_final(checkpoint)
     require(not checkpoint.get("recovery"), "recovery_limit_reached")
     require(checkpoint.get("rules_sha256") == rules_hash, "checkpoint_rules_changed")
     require(set(checkpoint["stages"]).issubset(core.STAGES), "unknown_stage")
@@ -605,7 +621,7 @@ def prepare_continuation(engine, source_dir: Path, *, output_dir: Path) -> Path:
 
 
 def execute_run(engine, bundle: dict, directory: Path, *, publish=False, api_base=None, resume=False) -> dict:
-    from biz.review.market_decision import DEADLINE_SECONDS, rules_identity, source_digest_identity, verify_automatic_research
+    from biz.review.market_decision import DEADLINE_SECONDS, STAGES, rules_identity, source_digest_identity, verify_automatic_research
     from biz.review.research_flow import attach_review, generate_briefing, publication_snapshot, persist_report_pair, verify_report_pair, load_digest
     validate_bundle(bundle)
     bundle = _source_ordered_contexts(bundle)
@@ -617,6 +633,12 @@ def execute_run(engine, bundle: dict, directory: Path, *, publish=False, api_bas
                 or receipt.get("publish") != publish or receipt.get("api_base") != api_base):
             raise RuntimeError("FAILED stage=resume: frozen input, rules or publication scope changed")
         UUID(receipt["run_id"])
+        if receipt.get("status") == "FAILED":
+            for kind in ("review", "briefing"):
+                path = directory / (kind + "_checkpoint.json")
+                completed_artifact = directory / ("digest.json" if kind == "review" else "briefing.json")
+                if path.exists() and not completed_artifact.exists():
+                    _assert_no_rejected_final(_read_json(path))
     else:
         if receipt_path.exists():
             raise RuntimeError("FAILED stage=run_identity: existing run requires explicit resume")
@@ -625,13 +647,36 @@ def execute_run(engine, bundle: dict, directory: Path, *, publish=False, api_bas
         now = datetime.now(timezone.utc)
         receipt = {"schema_version": RUN_SCHEMA, "run_id": directory.name, "bundle_sha256": bundle["bundle_sha256"],
                    "rules_sha256": rule_hash, "status": "RUNNING", "stage": "freeze", "started_at": now.isoformat(),
-                   "deadline_at": (now + timedelta(seconds=RUN_SECONDS)).isoformat(), "total_units": 14 if publish else 12,
+                   "deadline_at": (now + timedelta(seconds=RUN_SECONDS)).isoformat(),
+                   "total_units": len(STAGES) * 2 + (2 if publish else 0),
                    "completed_units": 0, "report_started_at": {}, "publish": publish, "api_base": api_base,
                    "publication_guard": publication_snapshot(engine, bundle["review_date"]) if publish else None,
                    "report_database_write_invoked": False, "wecom_delivery_invoked": False}
         UUID(receipt["run_id"])
         _atomic(receipt_path, receipt)
+    receipt.setdefault("provider_units", {kind: {"completed": 0, "total": len(STAGES)} for kind in ("review", "briefing")})
+    receipt.setdefault("publication_completed_units", 0)
     lock = RLock()
+    def update_units():
+        receipt["completed_units"] = sum(value["completed"] for value in receipt["provider_units"].values()) + receipt["publication_completed_units"]
+        receipt["total_units"] = sum(value["total"] for value in receipt["provider_units"].values()) + (2 if publish else 0)
+    def completed_report(kind, research):
+        verify_automatic_research(research)
+        attempts = research.get("generation_attempts") or []
+        count = len(attempts)
+        first_round = STAGES.index("deepseek_final_review") + 1
+        if (count not in (first_round, len(STAGES)) or [item.get("stage") for item in attempts] != list(STAGES[:count])
+                or research.get("verification", {}).get("status") != "PASS"):
+            raise RuntimeError("FAILED stage=acceptance: incomplete_automatic_provider_stages")
+        for item in attempts:
+            raw = item["raw_response"].encode("utf-8")
+            path = directory / "stages" / kind / (item["stage"] + "_response.json")
+            if item.get("status") != "COMPLETE" or _sha(raw) != item.get("raw_sha256") or (path.exists() and path.read_bytes() != raw):
+                raise RuntimeError("FAILED stage=acceptance: saved_provider_raw_changed")
+            _atomic(path, raw, raw=True)
+        receipt["provider_units"][kind] = {"completed": count, "total": count}
+        update_units()
+        _atomic(receipt_path, receipt)
     def gate(seconds=0):
         if (datetime.now(timezone.utc) + timedelta(seconds=seconds)) >= _aware(receipt["deadline_at"]):
             raise RuntimeError("FAILED stage=" + receipt.get("stage", "run") + ": total_run_deadline")
@@ -656,8 +701,12 @@ def execute_run(engine, bundle: dict, directory: Path, *, publish=False, api_bas
                 receipt.update(status="RUNNING", stage=kind + ":" + stage,
                                last_progress_at=event.get("last_progress_at", datetime.now(timezone.utc).isoformat()))
                 completed = event.get("completed")
-                if isinstance(completed, int):
-                    receipt["completed_units"] = (6 if kind == "briefing" else 0) + completed
+                if kind in receipt["provider_units"] and isinstance(completed, int):
+                    total = event.get("actual_total", event.get("total", len(STAGES)))
+                    if not isinstance(total, int) or not 0 <= completed <= total <= len(STAGES):
+                        raise RuntimeError("FAILED stage=checkpoint: invalid provider progress count")
+                    receipt["provider_units"][kind] = {"completed": completed, "total": total}
+                    update_units()
                 _atomic(receipt_path, receipt)
                 print(f"RUNNING run_id={receipt['run_id']} stage={receipt['stage']} completed={receipt['completed_units']} total={receipt['total_units']}", flush=True)
         return record
@@ -686,6 +735,7 @@ def execute_run(engine, bundle: dict, directory: Path, *, publish=False, api_bas
                           checkpoint=checkpoint("review"), progress=progress("review"))
             _atomic(digest_path, digest)
             _atomic(directory / "review.md", digest["compact_review"].encode("utf-8"), raw=True)
+        completed_report("review", digest["factor_validation_json"]["market_decision"])
         kind = "briefing"
         briefing_path = directory / "briefing.json"
         if briefing_path.exists():
@@ -699,7 +749,8 @@ def execute_run(engine, bundle: dict, directory: Path, *, publish=False, api_bas
             verify_report_pair(digest, briefing)
             _atomic(briefing_path, briefing)
             _atomic(directory / "briefing.md", briefing["content"].encode("utf-8"), raw=True)
-        receipt.update(completed_units=12, stage="generation_complete", status="GENERATED")
+        completed_report("briefing", briefing)
+        receipt.update(stage="generation_complete", status="GENERATED")
         _atomic(receipt_path, receipt)
         if publish:
             if not api_base:
@@ -718,12 +769,14 @@ def execute_run(engine, bundle: dict, directory: Path, *, publish=False, api_bas
                 publication = persist_report_pair(engine, digest, briefing, expected=receipt["publication_guard"],
                     backup=lambda value: _atomic(directory / "publication_before.json", value), progress=progress("publication"))
                 _atomic(publication_path, publication)
-            receipt.update(completed_units=13, stage="production_api")
+            receipt.update(publication_completed_units=1, stage="production_api")
+            update_units()
             _atomic(receipt_path, receipt)
             payload, accepted = verify_production_api(api_base, digest, briefing)
             _atomic(directory / "production_api.json", payload)
             _atomic(directory / "acceptance_receipt.json", accepted)
-            receipt["completed_units"] = 14
+            receipt["publication_completed_units"] = 2
+            update_units()
         receipt.update(status="COMPLETE", stage="acceptance", completed_at=datetime.now(timezone.utc).isoformat())
         _atomic(receipt_path, receipt)
         print(f"COMPLETE run_id={receipt['run_id']} directory={directory} published={str(publish).lower()} wecom=false", flush=True)

@@ -73,11 +73,14 @@ def automatic_boundary(monkeypatch):
     monkeypatch.setattr(core, "verify_automatic_research", verify)
 
 
-def report(digest, kind, now=None):
+def report(digest, kind, now=None, *, stage_count=6):
     value = {"schema_version": core.SCHEMA_VERSION, "status": "COMPLETE", "report_kind": kind,
         "review_date": DAY, "next_trade_date": NEXT, "generated_at": (now or datetime.now(timezone.utc)).isoformat(),
         "rules_sha256": core.rules_identity(), "source_digest_sha256": core.source_digest_identity(digest),
-        "content": "自动复盘" if kind == "review" else "自动早报"}
+        "content": "自动复盘" if kind == "review" else "自动早报",
+        "generation_attempts": [{"stage": stage, "status": "COMPLETE", "raw_response": "raw:" + kind + ":" + stage,
+            "raw_sha256": acceptance._sha(("raw:" + kind + ":" + stage).encode())} for stage in core.STAGES[:stage_count]],
+        "verification": {"status": "PASS", "stage_count": stage_count}}
     value["research_sha256"] = flow.artifact_hash(value)
     return value
 
@@ -108,16 +111,22 @@ def test_api_requires_exact_date_no_fallback_and_both_untouched_reports(automati
             acceptance.verify_api_payload(changed, digest, morning)
 
 
-def test_uuid_run_resumes_completed_artifacts_without_rereading_or_regenerating(tmp_path, monkeypatch, automatic_boundary):
+@pytest.mark.parametrize("stage_counts", [(6, 6), (6, 8), (8, 6), (8, 8)])
+@pytest.mark.parametrize("publish", [False, True])
+def test_uuid_run_resumes_completed_artifacts_without_rereading_or_regenerating(tmp_path, monkeypatch, automatic_boundary, stage_counts, publish):
     frozen, calls = bundle(), []
     def review(engine, digest, **kwargs):
         calls.append(kwargs)
-        digest["factor_validation_json"]["market_decision"] = report(digest, "review", kwargs["now"])
+        kwargs["progress"]({"stage": core.STAGES[stage_counts[0] - 1], "completed": stage_counts[0], "total": len(core.STAGES)})
+        digest["factor_validation_json"]["market_decision"] = report(digest, "review", kwargs["now"], stage_count=stage_counts[0])
         digest["compact_review"] = "自动复盘"
     def morning(engine, target, **kwargs):
         calls.append(kwargs)
         digest = kwargs["digest"]
-        value = report(digest, "briefing", kwargs["now"])
+        saved = acceptance._read_json(directory / "run_receipt.json")
+        assert saved["provider_units"]["review"] == {"completed": stage_counts[0], "total": stage_counts[0]}
+        kwargs["progress"]({"stage": core.STAGES[stage_counts[1] - 1], "completed": stage_counts[1], "total": len(core.STAGES)})
+        value = report(digest, "briefing", kwargs["now"], stage_count=stage_counts[1])
         value.pop("research_sha256")
         parent = digest["factor_validation_json"]["market_decision"]
         value.update(parent_research=parent, parent_research_sha256=parent["research_sha256"])
@@ -126,11 +135,43 @@ def test_uuid_run_resumes_completed_artifacts_without_rereading_or_regenerating(
     monkeypatch.setattr(flow, "attach_review", review)
     monkeypatch.setattr(flow, "generate_briefing", morning)
     monkeypatch.setattr(flow, "collect_context", lambda *_a, **_k: pytest.fail("context reread"))
+    monkeypatch.setattr(flow, "publication_snapshot", lambda *_a: {"source_digest_sha256": "frozen"})
+    durable = {}
+    def persist(_engine, digest, briefing, **_kwargs):
+        durable.update(deepcopy(digest))
+        durable["factor_validation_json"]["early_briefing"] = deepcopy(briefing)
+        return {"status": "DATABASE_COMPLETE", "wecom_delivery_invoked": False}
+    monkeypatch.setattr(flow, "persist_report_pair", persist)
+    monkeypatch.setattr(flow, "load_digest", lambda *_a: durable)
+    monkeypatch.setattr(acceptance, "verify_production_api", lambda *_a: ({"date": DAY}, {"status": "COMPLETE"}))
     directory = tmp_path / str(uuid4())
-    assert acceptance.execute_run(None, frozen, directory)["completed_units"] == 12
-    assert acceptance.execute_run(None, frozen, directory, resume=True)["status"] == "COMPLETE"
+    options = {"publish": publish, "api_base": "http://example.invalid" if publish else None}
+    receipt = acceptance.execute_run(None, frozen, directory, **options)
+    assert receipt["completed_units"] == receipt["total_units"] == sum(stage_counts) + (2 if publish else 0)
+    for kind, count in zip(("review", "briefing"), stage_counts):
+        for stage in core.STAGES[:count]:
+            assert (directory / "stages" / kind / (stage + "_response.json")).read_text() == "raw:" + kind + ":" + stage
+    assert acceptance.execute_run(None, frozen, directory, resume=True, **options)["status"] == "COMPLETE"
     assert len(calls) == 2 and calls[0]["previous_research"] is None
     assert all("completion" not in call for call in calls)
+
+
+def test_failed_rejected_final_resume_starts_no_new_model_operation(tmp_path, monkeypatch):
+    frozen = bundle()
+    directory = tmp_path / str(uuid4())
+    saved = {"stages": {"deepseek_final_review": {"status": "COMPLETE", "raw_response": '{"verdict":"REJECT","findings":[]}'}}}
+    def fail(*_a, **_kwargs):
+        error = core.ResearchError("final_reviewer_rejected_draft")
+        error.checkpoint = saved
+        raise error
+    monkeypatch.setattr(flow, "attach_review", fail)
+    with pytest.raises(core.ResearchError):
+        acceptance.execute_run(None, frozen, directory)
+    monkeypatch.setattr(flow, "attach_review", lambda *_a, **_k: pytest.fail("reopened a rejected operation"))
+    with pytest.raises(RuntimeError, match="rejected_final_cannot_be_reopened"):
+        acceptance.execute_run(None, frozen, directory, resume=True)
+    assert not (directory / "recovery_claim.json").exists()
+    assert acceptance._read_json(directory / "run_receipt.json")["status"] == "FAILED"
 
 
 def test_failed_stage_checkpoint_is_preserved_and_not_given_a_new_identity(tmp_path, monkeypatch):
