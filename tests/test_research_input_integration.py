@@ -140,7 +140,7 @@ def test_frozen_input_hash_is_checked_and_checkpoint_does_not_reread(monkeypatch
         research._freeze_research_evidence(None, altered)
 
 
-@pytest.mark.parametrize("count", [6, 8])
+@pytest.mark.parametrize("count", [7])
 def test_replay_uses_explicit_new_frozen_context_without_any_source_read(monkeypatch, count):
     frozen = research.freeze_inputs(observation(), [], events(), mode="replay")
     frozen["context"] = enhanced(frozen["context"])
@@ -158,7 +158,7 @@ def test_replay_uses_explicit_new_frozen_context_without_any_source_read(monkeyp
     assert result["input_snapshot"] == frozen
     assert result["outbox_write_invoked"] is False
     assert result["completed_units"] == result["total_units"] == count
-    assert result["stage_budget"] == 8
+    assert result["stage_budget"] == 7
 
 
 def test_fresh_observation_replay_enriches_once_and_emits_snapshot_for_resumption(db, monkeypatch):

@@ -247,7 +247,7 @@ def test_codex_final_recovery_rebuilds_the_editor_request_from_both_drafts_and_p
     assert parser.call_args_list[1].args == ("CX peer review", core._body_hash("original DS draft"), packet)
     assert editor.call_args.args == (packet, "unchanged rules", {"deepseek": "original DS draft", "codex": "original CX draft"},
                                     {"deepseek_review": parsed["DS peer review"], "codex_review": parsed["CX peer review"]})
-    assert cli.RECOVERY_STAGES == ("codex_draft", "codex_review", "codex_final")
+    assert cli.RECOVERY_STAGES == ("codex_draft", "codex_review", "codex_final", "codex_arbitration")
 
 
 def test_retired_final_audit_is_not_a_recoverable_execution_path():
@@ -259,12 +259,3 @@ def test_second_editor_round_is_not_an_operator_recovery_path():
     assert "codex_final_2" not in cli.RECOVERY_STAGES
     with pytest.raises(RuntimeError, match="unsupported_recovery_stage"):
         cli._recovery_request(core, {}, "rules", {"stages": {}}, "codex_final_2")
-
-
-def test_rejected_final_cannot_allocate_a_transport_recovery(recovery):
-    checkpoint = cli._read_json(recovery["source"] / "review_checkpoint.json")
-    checkpoint["stages"]["deepseek_final_review"] = {"status": "COMPLETE", "raw_response": '{"verdict":"REJECT","findings":[]}'}
-    cli._atomic(recovery["source"] / "review_checkpoint.json", checkpoint)
-    with pytest.raises(RuntimeError, match="rejected_final_cannot_be_reopened"):
-        cli.inspect_recovery(recovery["engine"], recovery["source"], **recovery["kwargs"])
-    assert not (recovery["source"] / "recovery_claim.json").exists()

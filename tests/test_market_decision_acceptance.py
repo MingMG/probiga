@@ -73,8 +73,8 @@ def automatic_boundary(monkeypatch):
     monkeypatch.setattr(core, "verify_automatic_research", verify)
 
 
-def report(digest, kind, now=None, *, stage_count=6):
-    names = core.expected_research_stages({6: "none", 7: "deterministic_contract", 8: "blind_audit"}[stage_count])
+def report(digest, kind, now=None, *, stage_count=7):
+    names = core.STAGES
     value = {"schema_version": core.SCHEMA_VERSION, "status": "COMPLETE", "report_kind": kind,
         "review_date": DAY, "next_trade_date": NEXT, "generated_at": (now or datetime.now(timezone.utc)).isoformat(),
         "rules_sha256": core.rules_identity(), "source_digest_sha256": core.source_digest_identity(digest),
@@ -112,7 +112,7 @@ def test_api_requires_exact_date_no_fallback_and_both_untouched_reports(automati
             acceptance.verify_api_payload(changed, digest, morning)
 
 
-@pytest.mark.parametrize("stage_counts", [(6, 6), (6, 7), (6, 8), (7, 6), (7, 7), (7, 8), (8, 6), (8, 7), (8, 8)])
+@pytest.mark.parametrize("stage_counts", [(7, 7)])
 @pytest.mark.parametrize("publish", [False, True])
 def test_uuid_run_resumes_completed_artifacts_without_rereading_or_regenerating(tmp_path, monkeypatch, automatic_boundary, stage_counts, publish):
     frozen, calls = bundle(), []
@@ -150,32 +150,15 @@ def test_uuid_run_resumes_completed_artifacts_without_rereading_or_regenerating(
     receipt = acceptance.execute_run(None, frozen, directory, **options)
     assert receipt["completed_units"] == receipt["total_units"] == sum(stage_counts) + (2 if publish else 0)
     for kind, count in zip(("review", "briefing"), stage_counts):
-        names = core.expected_research_stages({6: "none", 7: "deterministic_contract", 8: "blind_audit"}[count])
+        names = core.STAGES
         for stage in names:
             assert (directory / "stages" / kind / (stage + "_response.json")).read_text() == "raw:" + kind + ":" + stage
-        if count == 7:
-            assert not (directory / "stages" / kind / "deepseek_final_review_response.json").exists()
+        assert (directory / "stages" / kind / "deepseek_final_review_response.json").exists()
     assert acceptance.execute_run(None, frozen, directory, resume=True, **options)["status"] == "COMPLETE"
     assert len(calls) == 2 and calls[0]["previous_research"] is None
     assert all("completion" not in call for call in calls)
 
 
-def test_failed_rejected_final_resume_starts_no_new_model_operation(tmp_path, monkeypatch):
-    frozen = bundle()
-    directory = tmp_path / str(uuid4())
-    saved = {"stages": {"deepseek_final_review": {"status": "COMPLETE", "raw_response": '{"verdict":"REJECT","findings":[]}'}}}
-    def fail(*_a, **_kwargs):
-        error = core.ResearchError("final_reviewer_rejected_draft")
-        error.checkpoint = saved
-        raise error
-    monkeypatch.setattr(flow, "attach_review", fail)
-    with pytest.raises(core.ResearchError):
-        acceptance.execute_run(None, frozen, directory)
-    monkeypatch.setattr(flow, "attach_review", lambda *_a, **_k: pytest.fail("reopened a rejected operation"))
-    with pytest.raises(RuntimeError, match="rejected_final_cannot_be_reopened"):
-        acceptance.execute_run(None, frozen, directory, resume=True)
-    assert not (directory / "recovery_claim.json").exists()
-    assert acceptance._read_json(directory / "run_receipt.json")["status"] == "FAILED"
 
 
 def test_failed_stage_checkpoint_is_preserved_and_not_given_a_new_identity(tmp_path, monkeypatch):

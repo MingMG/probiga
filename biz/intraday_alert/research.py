@@ -24,7 +24,7 @@ TZ = ZoneInfo("Asia/Shanghai")
 MAX_AGE_SECONDS = 180
 TOTAL_DEADLINE_SECONDS = 180
 LEASE_SECONDS = 60
-MAX_RESEARCH_STAGES = 8
+MAX_RESEARCH_STAGES = 7
 
 
 class IntradayResearchError(RuntimeError):
@@ -38,9 +38,9 @@ def _verified_research_units(research: dict) -> int:
     stages = research.get("generation_attempts") or []
     count = proof.get("stage_count")
     names = [stage.get("stage") for stage in stages]
-    if (type(count) is not int or not 0 < count <= MAX_RESEARCH_STAGES
+    if (type(count) is not int or count != MAX_RESEARCH_STAGES
             or len(stages) != count or any(stage.get("status") != "COMPLETE" for stage in stages)
-            or names != [name for name in STAGES if name in names]
+            or names != list(STAGES)
             or proof.get("stage_budget") != MAX_RESEARCH_STAGES
             or proof.get("status") != "PASS"):
         raise IntradayResearchError("INTRADAY_RESEARCH_BLOCKED stage=validation reason=stage_completion_proof_mismatch")
