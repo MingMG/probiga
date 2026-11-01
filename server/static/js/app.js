@@ -6956,12 +6956,12 @@
                     var gateColor = publishStatus === 'ready' ? (qualityStatus === 'warn' ? '#f59e0b' : '#22c55e') : '#ef4444';
                     var cutoff = quantData.data_cutoff_at ? String(quantData.data_cutoff_at).replace('T', ' ').replace(/\.\d+$/, '') : '-';
                     var html = '<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px">';
-                    html += '<span style="font-size:16px;font-weight:700;color:#e0e0e0">盘后复盘与次日计划 | ' + escHtml(reviewDate) + '</span>';
+                    html += '<span style="font-size:16px;font-weight:700;color:inherit">盘后复盘与次日计划 | ' + escHtml(reviewDate) + '</span>';
                     html += '<div><button onclick="exportReview(\'' + escAttr(reviewDate) + '\')" style="padding:6px 14px;border:none;border-radius:6px;background:#1a73e8;color:#fff;cursor:pointer;font-size:12px">导出 Markdown</button></div></div>';
                     if (quantRes.fallback) {
                         html += '<div style="margin-bottom:12px;padding:9px 12px;border:1px solid #854d0e;background:#422006;color:#fde68a;border-radius:6px;font-size:12px">请求日 ' + escHtml(quantRes.requested_date || d) + ' 暂无量化复盘，当前显示最近可发布日 ' + escHtml(reviewDate) + '。</div>';
                     }
-                    html += '<details class="review-evidence" style="margin-bottom:20px;border:1px solid #334155;border-radius:8px;padding:10px 14px;color:#94a3b8;font-size:13px"><summary style="cursor:pointer">数据与研究范围 · 行情覆盖 ' + escHtml(coverageText) + '</summary><div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:12px;font-size:12px">';
+                    html += '<details class="review-evidence" style="margin-bottom:20px;border:1px solid #334155;border-radius:8px;padding:10px 14px;color:inherit;font-size:13px"><summary style="cursor:pointer">数据与研究范围 · 行情覆盖 ' + escHtml(coverageText) + '</summary><div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:12px;font-size:12px">';
                     html += '<span style="padding:5px 9px;border-radius:12px;background:#172554;color:#bfdbfe">数据截止：' + escHtml(cutoff) + '</span>';
                     html += '<span style="padding:5px 9px;border-radius:12px;background:#172554;color:#bfdbfe">目标覆盖：' + escHtml(coverageText) + '</span>';
                     html += '<span style="padding:5px 9px;border-radius:12px;background:#111827;color:' + gateColor + ';border:1px solid ' + gateColor + '">数据校验：' + escHtml(gateLabel) + '</span>';
@@ -6990,7 +6990,7 @@
                                 /^\d{4}-\d{2}-\d{2}$/.test(String(morning.next_trade_date || '')) &&
                                 morning.next_trade_date > String(reviewDate).slice(0, 10) &&
                                 typeof morning.content === 'string' && morning.content.trim()) {
-                            html += '<details class="review-early-briefing" open style="margin-top:16px;background:#111827;border:1px solid #334155;border-radius:8px;padding:16px 20px">';
+                            html += '<details class="review-early-briefing" open style="margin-top:16px;background:#111827;color:#cbd5e1;border:1px solid #334155;border-radius:8px;padding:16px 20px">';
                             html += '<summary style="cursor:pointer;font-size:15px;font-weight:700;color:#93c5fd">下一交易日早报参考 | ' + escHtml(morning.next_trade_date) + '</summary>';
                             html += '<div style="margin:12px 0;font-size:12px;color:#94a3b8">承接复盘：' + escHtml(morning.review_date) + ' · 生成时间：' + escHtml(String(morning.generated_at || '未记录').replace('T', ' ').replace(/\.\d+(?=[+-]|$)/, '')) + '</div>';
                             html += '<div style="font-size:14px;line-height:1.75;overflow-wrap:anywhere">' + _renderProReview(morning.content) + '</div></details>';
