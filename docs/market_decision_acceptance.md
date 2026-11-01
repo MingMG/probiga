@@ -28,6 +28,8 @@ python -B tools/preview_market_decision.py --resume E:\report-runs\UUID --output
 
 已明确终止的 Codex 网络故障可以用 `--recover-from`、`--recover-stage`、`--prior-worker-registration`、`--prior-worker-revision`、`--worker-state-root` 创建一次独立恢复操作。入口先核对数据库失败回执、本地子进程终态及PID消失、原worker注册和已合并版本、全部输入身份与未变化的发布行，再原子领取唯一恢复机会。成功阶段的原始回复保持原样，只为失败阶段分配新UUID；旧失败证据和截止时间完整保留。第二次恢复、未知进程结果和内容终检拒稿均不能使用此入口。新建、恢复和重读都从已核验原始字节重建context，避免JSON保存的键序影响请求身份。
 
+若操作已因到期终止，而全部已启动模型阶段恰好停在两稿或互审完成的边界，显式 `--resume` 会先校验输入、原始回复、数据库完成回执和发布行，再领取唯一一次新的有界续跑操作。它有新UUID及新截止时间，保留旧时限和全部成功回复，只执行尚未开始的阶段。存在RUNNING/FAILED模型阶段、已有续跑、未知结果或已写报告时均拒绝；原网络恢复次数不会重置。
+
 ## 发布和真实回读
 
 需要发布时，新运行显式指定：

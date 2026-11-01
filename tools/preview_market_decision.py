@@ -486,6 +486,122 @@ def prepare_recovery(engine, source_dir: Path, *, output_dir: Path, stage: str, 
     return directory
 
 
+def prepare_continuation(engine, source_dir: Path, *, output_dir: Path) -> Path:
+    """An operator resumes one expired, fully completed phase boundary once."""
+    from biz.review import market_decision as core
+    from biz.review.research_flow import publication_snapshot
+    from server.ai_bridge import research
+    from sqlalchemy import text
+    import time
+    proof_deadline = time.monotonic() + 120
+    source_dir = source_dir.resolve()
+    def require(value, reason):
+        if time.monotonic() >= proof_deadline:
+            raise RuntimeError("BLOCKED stage=continuation: proof_deadline_exceeded")
+        if not value:
+            raise RuntimeError("BLOCKED stage=continuation: " + reason)
+    require(not any((source_dir / name).exists() for name in ("continuation_claim.json", "recovery_claim.json")), "source_operation_already_claimed")
+    original = _read_json(source_dir / "run_receipt.json")
+    require(original.get("status") == "FAILED" and original.get("run_id") == source_dir.name, "source_not_terminal_failed")
+    require(not original.get("continuation") and original.get("report_database_write_invoked") is False
+            and original.get("wecom_delivery_invoked") is False, "continuation_limit_or_publication_boundary")
+    require("deadline" in str(original.get("error", "")).lower(), "source_failure_is_not_expired_boundary")
+    bundle = _read_json(source_dir / "bundle.json")
+    validate_bundle(bundle)
+    bundle = _source_ordered_contexts(bundle)
+    rules, rules_hash = core._load_rules()
+    require(original.get("bundle_sha256") == bundle["bundle_sha256"] and original.get("rules_sha256") == rules_hash, "bundle_or_rules_changed")
+    now = datetime.now(timezone.utc)
+    eligible = []
+    for kind in ("review", "briefing"):
+        path = source_dir / (kind + "_checkpoint.json")
+        if path.exists():
+            saved = _read_json(path)
+            names = set(saved.get("stages", {}))
+            if names in (set(core.STAGES[:2]), set(core.STAGES[:4])):
+                eligible.append((kind, saved))
+    require(len(eligible) == 1, "exact_two_or_four_stage_boundary_required")
+    kind, checkpoint = eligible[0]
+    require(not checkpoint.get("continuation") and all(item.get("status") == "COMPLETE" for item in checkpoint["stages"].values()), "noncomplete_or_already_continued_stage")
+    require(_aware(checkpoint["deadline_at"]) <= now and checkpoint.get("rules_sha256") == rules_hash, "report_not_expired_or_rules_changed")
+    require(_aware(checkpoint["generation_started_at"]) == _aware(original["report_started_at"][kind]), "generation_clock_changed")
+    for name in set(core.STAGES) - set(checkpoint["stages"]):
+        require(not any((source_dir / "stages" / kind / (name + "_" + suffix + ".json")).exists()
+                        for suffix in ("input", "response")), "unrecorded_provider_outcome")
+    digest = _read_json(source_dir / "digest.json") if kind == "briefing" else deepcopy(bundle["facts"])
+    previous = digest["factor_validation_json"]["market_decision"] if kind == "briefing" else bundle.get("previous_research")
+    if kind == "briefing":
+        core.verify_automatic_research(previous)
+    packet = core.build_packet(digest, report_kind=kind, next_trade_date=bundle["next_trade_date"], context=bundle[kind + "_context"],
+        previous_research=previous, now=core._now(_aware(checkpoint["generation_started_at"])), source_digest_sha256=core.source_digest_identity(digest))
+    require(core._hash(packet) == checkpoint.get("input_sha256"), "packet_changed")
+    bounded = research.get_research_engine(engine)
+    with bounded.connect() as connection:
+        active = connection.execute(text("SELECT /*+ MAX_EXECUTION_TIME(15000) */ request_uid FROM st_ai_bridge_job WHERE channel='research' AND status IN ('queued','processing') LIMIT 1")).first()
+    require(active is None, "another_research_job_is_active")
+    for stage, item in checkpoint["stages"].items():
+        if stage.endswith("_draft"):
+            messages, schema = core._draft_request(packet, rules)
+        else:
+            other = "codex_draft" if stage == "deepseek_review" else "deepseek_draft"
+            messages, schema = core._peer_request(packet, rules, checkpoint["stages"][other]["raw_response"])
+        retained = _read_json(source_dir / "stages" / kind / (stage + "_input.json"))
+        raw = (source_dir / "stages" / kind / (stage + "_response.json")).read_bytes()
+        receipt = item.get("provider_receipt") or {}
+        require(retained == {"messages": messages, "response_schema": schema} and core._hash(messages) == item.get("messages_sha256")
+                and raw.decode("utf-8") == item.get("raw_response") and _sha(raw) == item.get("raw_sha256")
+                and receipt.get("raw_sha256") == item.get("raw_sha256") and receipt.get("messages_sha256") == item.get("messages_sha256"), "saved_messages_schema_raw_or_receipt_changed")
+        if stage.startswith("codex"):
+            row = research._load(bounded, item["request_id"])
+            require(row is not None and row["status"] == "completed", "canonical_codex_stage_not_complete")
+            result = research._result(row)
+            require(result.get("raw_response") == item["raw_response"] and receipt.get("transport") == "live_codex_bridge"
+                    and receipt.get("process_exit_code") == 0 and receipt.get("ephemeral") is True
+                    and all(receipt.get(key) == value for key, value in result.get("provider_receipt", {}).items()), "codex_completion_receipt_changed")
+        else:
+            require(receipt.get("source") == "deepseek_api" and receipt.get("transport") == "live_http"
+                    and receipt.get("endpoint") == "https://api.deepseek.com/v1/chat/completions"
+                    and receipt.get("provider_response_id") and receipt.get("model"), "deepseek_identity_missing")
+        if stage.endswith("_review"):
+            core._parse_review(item["raw_response"], schema["properties"]["reviewed_sha256"]["const"], packet)
+    if original.get("publish"):
+        guard = publication_snapshot(engine, bundle["review_date"])
+        require(all(guard.get(key) == original["publication_guard"].get(key) for key in ("row_sha256", "source_digest_sha256")), "publication_source_changed")
+    operation_id = str(uuid4())
+    directory = output_dir.resolve() / operation_id
+    continuation = {"schema": "probiga.research-continuation.v1", "continuation_of": original["run_id"], "continuation_count": 1,
+        "prior_deadline_at": checkpoint["deadline_at"], "prior_run_deadline_at": original["deadline_at"],
+        "old_receipt_sha256": _sha((source_dir / "run_receipt.json").read_bytes()),
+        "old_checkpoint_sha256": _sha((source_dir / (kind + "_checkpoint.json")).read_bytes()),
+        "created_at": now.isoformat(), "completed_stages": list(checkpoint["stages"])}
+    claim = {**continuation, "operation_id": operation_id, "operation_directory": str(directory)}
+    with (source_dir / "continuation_claim.json").open("xb") as handle:
+        handle.write(_bytes(claim)); handle.flush(); os.fsync(handle.fileno())
+    directory.mkdir(parents=True, exist_ok=False)
+    names = ["bundle.json", "digest.json", "review.md", "review_checkpoint.json", "briefing_checkpoint.json"]
+    for report_kind in ("review", "briefing"):
+        for stage in core.STAGES:
+            names.extend(f"stages/{report_kind}/{stage}_{suffix}.json" for suffix in ("input", "response"))
+    for name in names:
+        path = source_dir / name
+        if path.is_file():
+            _atomic(directory / name, path.read_bytes(), raw=True)
+    _atomic(directory / "continuation/source_run_receipt.json", original)
+    _atomic(directory / "continuation/source_checkpoint.json", checkpoint)
+    _atomic(directory / "continuation/manifest.json", continuation)
+    checkpoint["continuation"] = continuation
+    checkpoint["deadline_at"] = (now + timedelta(seconds=600)).isoformat()
+    _atomic(directory / (kind + "_checkpoint.json"), checkpoint)
+    receipt = deepcopy(original)
+    for key in ("error", "error_type", "failed_at", "completed_at"):
+        receipt.pop(key, None)
+    receipt.update(run_id=operation_id, status="RUNNING", stage="continuation_prepared", continuation=continuation,
+        started_at=now.isoformat(), deadline_at=(now + timedelta(seconds=RUN_SECONDS)).isoformat())
+    _atomic(directory / "run_receipt.json", receipt)
+    print(f"RUNNING continuation_of={original['run_id']} run_id={operation_id} directory={directory}", flush=True)
+    return directory
+
+
 def execute_run(engine, bundle: dict, directory: Path, *, publish=False, api_base=None, resume=False) -> dict:
     from biz.review.market_decision import DEADLINE_SECONDS, rules_identity, source_digest_identity, verify_automatic_research
     from biz.review.research_flow import attach_review, generate_briefing, publication_snapshot, persist_report_pair, verify_report_pair, load_digest
@@ -656,6 +772,20 @@ def main(argv=None) -> int:
             bundle = _read_json(directory / "bundle.json")
         elif args.resume:
             directory = args.resume.resolve()
+            prior = _read_json(directory / "run_receipt.json")
+            expired_boundary = False
+            from biz.review.market_decision import STAGES
+            for kind in ("review", "briefing"):
+                path = directory / (kind + "_checkpoint.json")
+                if path.exists():
+                    state = _read_json(path)
+                    if (set(state.get("stages", {})) in (set(STAGES[:2]), set(STAGES[:4]))
+                            and _aware(state["deadline_at"]) <= datetime.now(timezone.utc)):
+                        expired_boundary = True
+            if prior.get("status") == "FAILED" and expired_boundary:
+                if prior.get("publish") != args.publish or prior.get("api_base") != (args.api_base.rstrip("/") or None):
+                    raise RuntimeError("BLOCKED stage=continuation: original_publication_scope_required")
+                directory = prepare_continuation(engine, directory, output_dir=args.output_dir.resolve())
             bundle = _read_json(directory / "bundle.json")
         else:
             if args.bundle:

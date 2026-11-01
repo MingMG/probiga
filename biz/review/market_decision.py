@@ -324,6 +324,7 @@ def generate_research(digest,*,report_kind,next_trade_date,context=None,previous
             "verification":{"status":"PASS","workflow":"dual_model","input_sha256":packet_hash,"final_raw_sha256":_body_hash(final_raw),
                 "final_draft_sha256":_hash(final["draft"]),"raw_semantics_unchanged":True,"peer_reviews":reviews,"final_review":final_review}}
         if state.get("recovery"): result["recovery"]=deepcopy(state["recovery"])
+        if state.get("continuation"): result["continuation"]=deepcopy(state["continuation"])
         result["content"]=render_research(result);verify_automatic_research(result);emit("acceptance","COMPLETE");return result
     except BaseException as exc:
         if isinstance(exc,ResearchError): exc.checkpoint=state;raise
