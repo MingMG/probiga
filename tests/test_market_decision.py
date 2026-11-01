@@ -402,7 +402,7 @@ def test_codex_authors_native_final_schema_and_deepseek_only_independently_audit
     assert final["receipt"]["schema_sha256"] == decision._body_hash(json.dumps(final["schema"], ensure_ascii=False, sort_keys=True, separators=(",", ":")))
     assert audit["receipt"]["source"] == "deepseek_api"
     assert audit["receipt"]["endpoint"] == "https://api.deepseek.com/v1/chat/completions"
-    assert audit["schema"] == decision._review_schema(decision._hash(result["draft"]), final=True)
+    assert audit["schema"] == decision._review_schema(decision._hash(result["draft"]), result["input_packet"]["facts"], final=True)
     assert json.loads(audit["messages"][1]["content"])["material"] == {
         "input": result["input_packet"], "final_draft": json.loads(final["raw"])["draft"]}
     assert len(result["model_output"]["dispositions"]) == 23
@@ -479,6 +479,25 @@ def test_final_audit_is_invariant_to_superseded_findings_and_editor_resolution_c
                                                   final=different_target, reviews=stale)
     assert changed_target != clean
     assert changed_target[1]["properties"]["reviewed_sha256"]["const"] == decision._hash(different_target["draft"])
+
+
+def test_review_schema_exposes_the_immutable_fact_catalog_in_stable_order():
+    first = decision._review_schema("target", {"F2": {}, "F1": {}}, final=True)
+    reordered = decision._review_schema("target", {"F1": {}, "F2": {}}, final=True)
+    assert first == reordered
+    items = first["properties"]["findings"]["items"]["properties"]["fact_ids"]["items"]
+    assert items["enum"] == ["F1", "F2"]
+
+
+def test_review_condition_unit_is_a_target_not_existing_market_evidence():
+    packet = {"facts": {"F1": {}}}
+    review = {"schema_version": "probiga.research-review.v3", "reviewed_sha256": "target", "findings": [{
+        "id": "R1", "severity": "warning", "category": "structure", "target": "scenario C2",
+        "fact_ids": ["C2"], "explanation": "此处定位条件单元，不把未来条件当作已有事实。"}]}
+    with pytest.raises(decision.ResearchError, match="schema_enum"):
+        decision._parse_review(json.dumps(review), "target", packet)
+    review["findings"][0]["fact_ids"] = []
+    assert decision._parse_review(json.dumps(review), "target", packet) == review
 
 
 def test_first_blind_rejection_runs_one_revision_with_all_findings_then_a_current_draft_only_audit(monkeypatch):

@@ -30,8 +30,8 @@ MAX_OUTPUT_CHARS = 60_000
 WORKFLOW_VERSION = "independent-drafts.cross-review.codex-final.blind-deepseek-audit.local-contract.max2.v3"
 STAGES = ("deepseek_draft", "codex_draft", "deepseek_review", "codex_review", "codex_final", "deepseek_final_review", "codex_final_2", "deepseek_final_review_2")
 LOCAL_REVIEW_VERSION = "probiga.research-local-contract-review.v1"
-DEEPSEEK_RESEARCH_POLICY = {"model": "deepseek-v4-pro", "thinking": {"type": "enabled"},
-                            "reasoning_effort": "low", "max_tokens": 16000}
+DEEPSEEK_RESEARCH_POLICY = {"model": "deepseek-v4-pro", "thinking": {"type": "disabled"},
+                            "reasoning_effort": "none", "max_tokens": 16000}
 DEEPSEEK_INTRADAY_POLICY = {"model": "deepseek-flash", "thinking": {"type": "enabled"},
                             "reasoning_effort": "low", "max_tokens": 16000}
 
@@ -142,7 +142,15 @@ def _call_deepseek(messages, *, timeout_seconds, stage):
         if response.status_code!=200: _fail(stage,"http_"+str(response.status_code))
         if len(response.content)>MAX_OUTPUT_CHARS*6: _fail(stage,"response_byte_budget")
         body=response.json(); choice=body["choices"][0]
-        if choice.get("finish_reason")!="stop": _fail(stage,"response_incomplete")
+        if choice.get("finish_reason")!="stop":
+            error=ResearchError("RESEARCH_BLOCKED stage="+stage+" reason=response_incomplete")
+            error.provider_failure_receipt={"source":"deepseek_api","endpoint":endpoint,
+                "provider_response_id":body.get("id"),"model":body.get("model"),"request_policy":policy,
+                "finish_reason":choice.get("finish_reason"),"usage":body.get("usage"),"started_at":started,
+                "completed_at":datetime.now(timezone.utc).isoformat(),"messages_sha256":_hash(messages),"transport":"live_http"}
+            partial=(choice.get("message") or {}).get("content")
+            if isinstance(partial,str): error.partial_raw_response=partial
+            raise error
         raw=choice["message"]["content"]
         if not isinstance(raw,str) or not raw.strip() or len(raw)>MAX_OUTPUT_CHARS: _fail(stage,"response_size")
         return ProviderReply(raw,{"source":"deepseek_api","endpoint":endpoint,"provider_response_id":body.get("id"),
@@ -174,11 +182,11 @@ def _call_codex(engine,messages,schema,*,timeout_seconds,stage,request_id,rules_
 def _object(props): return {"type":"object","properties":props,"required":list(props),"additionalProperties":False}
 
 
-def _review_schema(target_hash,*,final=False):
+def _review_schema(target_hash,fact_ids,*,final=False):
     string={"type":"string","minLength":1,"maxLength":1600}
     finding=_object({"id":{"type":"string","minLength":1,"maxLength":32},"severity":{"type":"string","enum":["blocker","warning"]},
         "category":{"type":"string","enum":["unsupported_fact","scope_error","entity_mismatch","causal_overreach","missed_evidence","time_leakage","contradiction","structure"]},
-        "target":string,"fact_ids":{"type":"array","items":{"type":"string"},"maxItems":12},"explanation":string})
+        "target":string,"fact_ids":{"type":"array","items":{"type":"string",**({"enum":sorted(fact_ids)} if fact_ids else {})},"maxItems":12 if fact_ids else 0},"explanation":string})
     props={"schema_version":{"type":"string","const":"probiga.research-review.v3"},"reviewed_sha256":{"type":"string","const":target_hash},
         "findings":{"type":"array","items":finding,"maxItems":12}}
     if final: props["verdict"]={"type":"string","enum":["PASS","REJECT"]}
@@ -188,7 +196,7 @@ def _review_schema(target_hash,*,final=False):
 def _parse_review(raw,target_hash,packet,*,final=False,require_pass=True):
     from biz.review.research_contract import _check_schema
     try:
-        value=json.loads(raw);_check_schema(value,_review_schema(target_hash,final=final))
+        value=json.loads(raw);_check_schema(value,_review_schema(target_hash,packet["facts"],final=final))
     except (ValueError,TypeError) as exc: _fail("peer_review",str(exc)[:400])
     ids=[x["id"] for x in value["findings"]]
     if len(ids)!=len(set(ids)): _fail("peer_review","duplicate_finding_id")
@@ -274,7 +282,7 @@ def _draft_request(packet,rules):
 
 
 def _peer_request(packet,rules,raw):
-    schema=_review_schema(_body_hash(raw))
+    schema=_review_schema(_body_hash(raw),packet["facts"])
     return _messages("审查另一模型草稿的事实、范围、关联、时序、因果、竞争解释和遗漏。只列具体问题，不改稿；无问题则findings为空。两模型一致不是事实证据。",{"input":packet,"target_draft":raw,"deterministic_errors":_diagnostic(raw,packet)},schema,rules),schema
 
 
@@ -297,7 +305,7 @@ def _revision_request(packet,rules,final_raw,reviews):
 
 
 def _audit_request(packet,rules,final):
-    schema=_review_schema(_hash(final["draft"]),final=True)
+    schema=_review_schema(_hash(final["draft"]),packet["facts"],final=True)
     # A blind audit sees the current target, not superseded draft diagnostics or
     # the editor's resolution claims. Dispositions remain durably verified by
     # _validate_final; this reviewer must independently recheck the actual text.
@@ -398,6 +406,11 @@ def generate_research(digest,*,report_kind,next_trade_date,context=None,previous
             with lock:
                 if state["stages"][stage]["status"]!="COMPLETE":
                     state["stages"][stage].update(status="FAILED",error_type=type(exc).__name__,error=str(exc)[:1200] if isinstance(exc,(ResearchError,ContractError)) else type(exc).__name__)
+                    if getattr(exc,"provider_failure_receipt",None) is not None:
+                        state["stages"][stage]["provider_failure_receipt"]=deepcopy(exc.provider_failure_receipt)
+                    if isinstance(getattr(exc,"partial_raw_response",None),str):
+                        state["stages"][stage].update(partial_raw_response=exc.partial_raw_response,
+                            partial_raw_sha256=_body_hash(exc.partial_raw_response))
             emit(stage,"FAILED");raise
     try:
         initial,initial_schema=build_stage_request("deepseek_draft",packet,rules)
