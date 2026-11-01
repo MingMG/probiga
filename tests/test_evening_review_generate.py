@@ -1,5 +1,6 @@
 """The evening CLI delivers the same verified report shown on the website."""
 import sys
+from copy import deepcopy
 from unittest.mock import Mock, patch
 
 import pytest
@@ -10,26 +11,26 @@ from biz.review import quant_digest
 from biz.review.market_decision import rules_identity, source_digest_identity
 from biz.review.research_flow import artifact_hash
 from integrations.wecom.delivery import WeComDeliveryError
+from test_market_decision import completed_research
 
 REVIEW_DATE = "2026-10-30"
-CONTENT = "# A股盘后复盘｜2026-10-30\n\n[INFERRED] 等待，下一交易日先核验强势股反馈。"
+def _automatic_fixture():
+    # Exercise the real producer/verifier; only the two provider boundaries are mocked.
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        research, _, _, data, _ = completed_research(monkeypatch)
+    research["research_sha256"] = artifact_hash(research)
+    data["factor_validation_json"]["market_decision"] = research
+    data["compact_review"] = research["content"]
+    return data
+
+
+_CANONICAL = _automatic_fixture()
+CONTENT = _CANONICAL["compact_review"]
 
 
 def _ready_digest(content=CONTENT):
-    digest = {
-        "review_date": REVIEW_DATE, "publish_status": quant_digest.PUBLISH_READY,
-        "compact_review": content,
-        "quality_json": {"target_date": REVIEW_DATE,
-                         "source_dates": {"target_bars": REVIEW_DATE}, "errors": []},
-        "factor_validation_json": {},
-    }
-    research = {
-        "status": "COMPLETE", "report_kind": "review", "review_date": REVIEW_DATE,
-        "rules_sha256": rules_identity(), "source_digest_sha256": source_digest_identity(digest),
-        "content": content,
-    }
-    research["research_sha256"] = artifact_hash(research)
-    digest["factor_validation_json"]["market_decision"] = research
+    digest = deepcopy(_CANONICAL)
+    digest["compact_review"] = content
     return digest
 
 
@@ -187,6 +188,22 @@ def test_published_report_rejects_outdated_or_inconsistent_research(mutation):
     else:
         digest["compact_review"] = "another report"
     with pytest.raises(RuntimeError, match="review_publication"):
+        generate.published_report(digest, REVIEW_DATE)
+
+
+@pytest.mark.parametrize("mutation", ["manual_source", "edited_body"])
+def test_recomputed_publication_hash_does_not_authorize_manual_research(mutation):
+    from biz.review.market_decision import ResearchError
+    digest = _ready_digest()
+    research = digest["factor_validation_json"]["market_decision"]
+    if mutation == "manual_source":
+        research["generation_attempts"][0]["provider_receipt"]["source"] = "manual"
+    else:
+        research["draft"]["units"][0]["statement"].append({"text": "人工追加观点。"})
+        research["content"] = generate.published_report(_ready_digest(), REVIEW_DATE) + "人工追加观点。"
+        digest["compact_review"] = research["content"]
+    research["research_sha256"] = artifact_hash({key: value for key, value in research.items() if key != "research_sha256"})
+    with pytest.raises(ResearchError, match="automatic_provenance"):
         generate.published_report(digest, REVIEW_DATE)
 
 

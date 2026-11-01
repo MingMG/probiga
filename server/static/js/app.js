@@ -5740,6 +5740,7 @@
                 '.ia-panel{background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:14px;margin-bottom:12px}.ia-panel h3{margin:0 0 10px;font-size:15px}' +
                 '.ia-table{width:100%;border-collapse:collapse;font-size:12px}.ia-table th,.ia-table td{border-bottom:1px solid #edf2f7;padding:7px 6px;text-align:left}' +
                 '.ia-up{color:#dc2626}.ia-down{color:#059669}.ia-muted{color:#94a3b8}.ia-event{padding:8px 10px;border-left:3px solid #2563eb;background:#f8fafc;margin-bottom:7px}' +
+                '.ia-research{background:#111827;color:#cbd5e1;border-radius:8px;padding:4px 18px 16px;margin-top:10px}.ia-research h1{font-size:20px!important}' +
                 '@media(max-width:900px){.ia-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}</style>' +
                 '<div class="ia-head"><div><div class="ia-title">盘中事件播报</div><div class="ia-time">数据 ' + escHtml(latest.source_snapshot_at || '-') + ' · 观察时间 ' + escHtml(latest.observed_at || '-') + '</div></div>' +
                 '<button class="sc-btn" onclick="window._intradayAlertRefresh()">立即刷新</button></div>' +
@@ -5769,10 +5770,16 @@
                 var label = ({market_reversal:'市场转折',sector_spread:'板块扩散',sector_ebb:'板块走弱',key_stock:'个股异动',style_seesaw:'风格切换',broad_index_support:'宽基托底'})[row.event_type] || row.event_type;
                 h += '<div class="ia-event"><b>' + escHtml(label) + ' · ' + escHtml(row.subject_name || row.subject_code || '-') + '</b><span class="ia-muted">　' + escHtml(row.state || '') + ' · 最近 ' + escHtml(row.last_seen_at || '-') + '</span><div>' + escHtml(facts.join('；') || '证据未获取') + '</div></div>';
             });
-            h += '</section><section class="ia-panel"><h3>已形成播报</h3>';
+            h += '</section><section class="ia-panel"><h3>研究播报</h3>';
             if (!outbox.length) h += '<div class="ia-muted">今天还没有达到播报条件的事件，或尚未完成投递。</div>';
             outbox.forEach(function(row) {
-                h += '<div class="ia-event"><b>' + escHtml(row.transition_name || '-') + '</b><span class="ia-muted">　' + escHtml(row.status || '') + ' · ' + escHtml(row.created_at || '') + '</span><pre style="white-space:pre-wrap;margin:6px 0 0;font-family:inherit">' + escHtml(row.content_markdown || '') + '</pre></div>';
+                var state = row.research_status || row.status;
+                var status = ({RESEARCH_PENDING:'等待研究',ANALYZING:'研究中',BLOCKED:'研究未通过',EXPIRED:'已过时',SHADOW:'观察稿',PENDING:'已形成',SENDING:'投递中',SENT:'已投递',FAILED:'投递失败',LEGACY_UNVERIFIED:'历史规则记录，未经过双模型校验'})[state] || state || '';
+                var progress = row.research_progress || {};
+                var progressText = row.status === 'ANALYZING' && progress.total_units ? ' ' + Number(progress.completed_units || 0) + '/' + Number(progress.total_units) : '';
+                h += '<div class="ia-event"><b>' + escHtml(row.transition_name || '-') + '</b><span class="ia-muted">　' + escHtml(status + progressText) + ' · ' + escHtml(row.created_at || '') + '</span>';
+                if (row.content_markdown) h += '<div class="ia-research">' + _renderProReview(row.content_markdown) + '</div>';
+                h += '</div>';
             });
             h += '</section>';
             c.innerHTML = h;

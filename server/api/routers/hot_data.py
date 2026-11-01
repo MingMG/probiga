@@ -2846,13 +2846,30 @@ def intraday_alert_feed(
         outbox = _read_sql(
             """
             SELECT outbox_id, event_key, transition_name, state, mode, status,
-                   content_markdown, attempts, created_at, sent_at, error_message
+                   content_markdown, attempts, created_at, sent_at, error_message, evidence_json
             FROM st_intraday_alert_outbox
             WHERE trade_date=:trade_date
             ORDER BY created_at DESC LIMIT :row_limit
             """,
             {"trade_date": selected_date, "row_limit": limit},
         )
+        for row in outbox:
+            try:
+                audit = json.loads(row.pop("evidence_json", None) or "{}")
+            except (TypeError, ValueError):
+                audit = {}
+            if audit.get("schema_version") == "probiga.intraday-research.v1":
+                row["research_status"] = row["status"]
+                row["research_progress"] = {key: (audit.get("analysis") or {}).get(key)
+                    for key in ("completed_units", "total_units", "current_unit", "last_progress_at")}
+                row["formed"] = ((audit.get("research") or {}).get("status") == "COMPLETE"
+                                  and row["status"] in {"SHADOW", "PENDING", "SENDING", "SENT", "FAILED"})
+                if not row["formed"]:
+                    row["content_markdown"] = ""
+            else:
+                # Preserve historical ledger metadata without presenting old
+                # fixed prose as a newly verified dual-model research artifact.
+                row.update(formed=False, research_status="LEGACY_UNVERIFIED", content_markdown="")
         for row in observations:
             for field in ("sector_json", "benchmark_json", "key_stock_json"):
                 try:

@@ -5,7 +5,7 @@ import secrets
 from typing import Literal
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from server.ai_bridge.service import (
     claim_job,
@@ -14,6 +14,10 @@ from server.ai_bridge.service import (
     get_job,
     list_jobs,
     update_progress,
+)
+from server.ai_bridge.research import (
+    ResearchBridgeError, claim_research, progress_research,
+    complete_research, research_state, get_research_engine,
 )
 from server.api.routers._engine import get_engine
 from server.common.config import get_ai_bridge_config
@@ -158,3 +162,77 @@ def worker_complete(
     if not updated:
         raise HTTPException(status_code=409, detail="Job lease is no longer owned by this worker")
     return {"status": "ok"}
+
+
+class ResearchWorkerClaim(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    worker_id: str = Field(min_length=1, max_length=120)
+
+
+class ResearchWorkerProgress(ResearchWorkerClaim):
+    claim_generation: int = Field(ge=1)
+
+
+class ResearchWorkerComplete(ResearchWorkerProgress):
+    status: Literal["completed", "failed"]
+    raw_response: str | None = Field(default=None, max_length=60000)
+    provider_receipt: dict | None = None
+    error_message: str | None = Field(default=None, max_length=1000)
+
+
+def _research_error(exc):
+    if isinstance(exc, ValueError):
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/worker/research/claim")
+def research_worker_claim(payload: ResearchWorkerClaim,
+                          x_probiga_ai_bridge_token: str | None = Header(default=None)):
+    config = _require_worker_token(x_probiga_ai_bridge_token)
+    job = claim_research(get_research_engine(get_engine()), worker_id=payload.worker_id,
+                         lease_seconds=int(config["lease_seconds"]))
+    return {"status": "ok", "job": job}
+
+
+@router.post("/worker/research/{request_id}/progress")
+def research_worker_progress(request_id: str, payload: ResearchWorkerProgress,
+                             x_probiga_ai_bridge_token: str | None = Header(default=None)):
+    config = _require_worker_token(x_probiga_ai_bridge_token)
+    try:
+        job = progress_research(get_research_engine(get_engine()), request_id=request_id, worker_id=payload.worker_id,
+                                claim_generation=payload.claim_generation,
+                                lease_seconds=int(config["lease_seconds"]))
+    except (ValueError, ResearchBridgeError) as exc:
+        _research_error(exc)
+    if job is None:
+        raise HTTPException(status_code=409, detail="Research owner, generation or active lease differs")
+    return {"status": "ok", "job": job}
+
+
+@router.post("/worker/research/{request_id}/complete")
+def research_worker_complete(request_id: str, payload: ResearchWorkerComplete,
+                             x_probiga_ai_bridge_token: str | None = Header(default=None)):
+    _require_worker_token(x_probiga_ai_bridge_token)
+    try:
+        result = complete_research(get_research_engine(get_engine()), request_id=request_id, **payload.model_dump())
+    except (ValueError, ResearchBridgeError) as exc:
+        _research_error(exc)
+    if result is None:
+        raise HTTPException(status_code=409, detail="Research completion lost its owner, generation or lease")
+    return {"status": "ok", "result": result}
+
+
+@router.get("/worker/research/{request_id}")
+def research_worker_state(request_id: str, worker_id: str = Query(min_length=1, max_length=120),
+                          claim_generation: int = Query(ge=1),
+                          x_probiga_ai_bridge_token: str | None = Header(default=None)):
+    _require_worker_token(x_probiga_ai_bridge_token)
+    try:
+        result = research_state(get_research_engine(get_engine()), request_id=request_id, worker_id=worker_id,
+                                claim_generation=claim_generation)
+    except (ValueError, ResearchBridgeError) as exc:
+        _research_error(exc)
+    if result is None:
+        raise HTTPException(status_code=409, detail="Research readback owner or generation differs")
+    return {"status": "ok", "result": result}

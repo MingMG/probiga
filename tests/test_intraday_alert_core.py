@@ -177,7 +177,10 @@ class _Connection:
             if self.claimed:
                 return _Result(None)
             self.claimed = True
-            return _Result({"outbox_id": "outbox-a", "content_markdown": "消息", "attempts": 0})
+            return _Result({"outbox_id": "outbox-a", "content_markdown": "消息", "attempts": 0,
+                "evidence_json": json.dumps({"schema_version": "probiga.intraday-research.v1",
+                    "research": {"status": "COMPLETE", "content": "消息"}, "raw_observation": {"source_snapshot_at": NOW.isoformat()}}),
+                "content_sha256": __import__("hashlib").sha256("消息".encode()).hexdigest()})
         return _Result()
 
 
@@ -325,23 +328,8 @@ def test_snapshot_publication_race_is_retried_within_bound(monkeypatch):
     assert calls == [NOW, NOW, NOW]
 
 
-def test_render_adapter_passes_complete_observation(monkeypatch):
-    import biz.intraday_alert.core as core
-    import biz.intraday_alert.render as renderer
-
-    captured = {}
-
-    def fake_render(event, observation):
-        captured.update(observation)
-        return "ok"
-
-    monkeypatch.setattr(renderer, "render_event", fake_render)
-    content = core._render_emission(_event(), {"coverage": 0.99, "source_provider": "qmt"})
-    assert content == "ok"
-    assert captured == {"coverage": 0.99, "source_provider": "qmt"}
-
-
-def test_live_failure_is_durable_and_nonzero():
+def test_live_failure_is_durable_and_nonzero(monkeypatch):
+    monkeypatch.setattr("biz.review.market_decision.verify_automatic_research", lambda report: None)
     engine = _Engine()
 
     def fail_delivery(*args, **kwargs):
@@ -361,3 +349,14 @@ def test_live_failure_is_durable_and_nonzero():
     ]
     assert failed_updates
     assert failed_updates[0]["next_retry_at"] > NOW
+
+
+def test_live_drain_revalidates_untouched_provider_provenance_before_resolving_webhook():
+    engine = _Engine()
+    called = []
+    with pytest.raises(DeliveryDispatchError):
+        drain_outbox(engine, mode="live", now=NOW,
+                     delivery_fn=lambda *a, **k: called.append("delivery"),
+                     webhook_getter=lambda *a, **k: called.append("webhook"))
+    assert called == []
+    assert any("SET status='BLOCKED'" in sql for sql, _ in engine.connection.statements)

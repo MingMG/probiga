@@ -86,6 +86,7 @@ def get_job(engine: Engine, *, owner_user_id: int, request_uid: str) -> dict[str
                 and_(
                     ai_bridge_job.c.request_uid == request_uid,
                     ai_bridge_job.c.owner_user_id == int(owner_user_id),
+                    ai_bridge_job.c.channel.in_(("stock", "general")),
                 )
             )
         ).mappings().first()
@@ -100,7 +101,8 @@ def list_jobs(
     limit: int = 20,
 ) -> list[dict[str, Any]]:
     ensure_ai_bridge_schema(engine)
-    conditions = [ai_bridge_job.c.owner_user_id == int(owner_user_id)]
+    conditions = [ai_bridge_job.c.owner_user_id == int(owner_user_id),
+                  ai_bridge_job.c.channel.in_(("stock", "general"))]
     if channel:
         if channel not in CHANNELS:
             raise ValueError("unsupported channel")
@@ -126,7 +128,8 @@ def claim_job(engine: Engine, *, worker_id: str, lease_seconds: int) -> dict[str
     )
     statement = (
         select(ai_bridge_job)
-        .where(or_(ai_bridge_job.c.status == "queued", expired))
+        .where(and_(ai_bridge_job.c.channel.in_(("stock", "general")),
+                    or_(ai_bridge_job.c.status == "queued", expired)))
         .order_by(ai_bridge_job.c.id.asc())
         .limit(1)
     )
@@ -180,6 +183,7 @@ def update_progress(
             .where(
                 and_(
                     ai_bridge_job.c.request_uid == request_uid,
+                    ai_bridge_job.c.channel.in_(("stock", "general")),
                     ai_bridge_job.c.status == "processing",
                     ai_bridge_job.c.worker_id == worker_id,
                 )
@@ -214,6 +218,7 @@ def complete_job(
             .where(
                 and_(
                     ai_bridge_job.c.request_uid == request_uid,
+                    ai_bridge_job.c.channel.in_(("stock", "general")),
                     ai_bridge_job.c.status == "processing",
                     ai_bridge_job.c.worker_id == worker_id,
                 )

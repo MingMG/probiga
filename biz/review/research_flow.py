@@ -8,6 +8,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time as monotonic_time
+from contextlib import nullcontext
+from copy import deepcopy
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any
@@ -15,10 +18,17 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
 
-from server.common.batch_db import read_records
+from server.common.batch_db import routed_read_engine
 
 TZ = ZoneInfo("Asia/Shanghai")
 JSON_FIELDS = ("quality_json", "market_structure_json", "industry_rotation_json", "factor_validation_json")
+_UNSET = object()
+
+
+def read_records(statement, engine, *, params=None):
+    """Single bounded query, with no batch-helper retry or shared transaction."""
+    with routed_read_engine(statement, engine).connect() as connection:
+        return [dict(row) for row in connection.execute(statement, params or {}).mappings().all()]
 
 
 def artifact_hash(value: dict) -> str:
@@ -192,12 +202,9 @@ def reported_turnover(rows: list[dict]) -> dict:
     return {"status": "UNKNOWN", "reason": "no_exact_session_sh_sz_turnover_bulletin"}
 
 
-def attach_review(engine, digest: dict, *, now=None, completion=None, context=None) -> dict:
-    from biz.review.market_decision import generate_research
-
-    target = str(digest["review_date"])[:10]
-    assert_digest(digest, target)
-    context = context if context is not None else collect_context(engine, target, now=now)
+def prepare_research_facts(digest: dict, context: dict) -> dict:
+    """Freeze monetary quarantine before either model sees the fact packet."""
+    digest = deepcopy(digest)
     amount_quality = (context.get("theme_evidence") or {}).get("amount_quality")
     if amount_quality is not None:
         from biz.review.amount_integrity import apply_amount_integrity
@@ -214,19 +221,40 @@ def attach_review(engine, digest: dict, *, now=None, completion=None, context=No
         verified = apply_amount_integrity(
             digest, target_quality=receipt("target", "amount_quality"),
             previous_quality=receipt("previous", "previous_amount_quality"))
-        digest.clear()
-        digest.update(verified)
+        digest = verified
+    return digest
+
+
+def automatic_previous_research(engine, digest: dict) -> dict | None:
+    from biz.review.market_decision import verify_automatic_research
     previous_date = (digest["quality_json"].get("source_dates") or {}).get("previous_bars")
     previous = load_digest(engine, str(previous_date)[:10], required=False) if previous_date else None
-    prior_factors = (previous or {}).get("factor_validation_json") or {}
-    previous_research = next((item for item in
-                             (prior_factors.get("early_briefing"), prior_factors.get("market_decision"))
-                             if isinstance(item, dict) and item.get("status") == "COMPLETE"
-                             and item.get("next_trade_date") == target), None)
+    factors = (previous or {}).get("factor_validation_json") or {}
+    for candidate in (factors.get("early_briefing"), factors.get("market_decision")):
+        if isinstance(candidate, dict) and candidate.get("next_trade_date") == digest["review_date"]:
+            try:
+                verify_automatic_research(candidate)
+            except RuntimeError:
+                continue
+            return candidate
+    return None
+
+
+def attach_review(engine, digest: dict, *, now=None, context=None, next_trade_date=None,
+                  previous_research=_UNSET, checkpoint=None, progress=None) -> dict:
+    from biz.review.market_decision import generate_research
+    target = str(digest["review_date"])[:10]
+    assert_digest(digest, target)
+    context = context if context is not None else collect_context(engine, target, now=now)
+    verified = prepare_research_facts(digest, context)
+    digest.clear()
+    digest.update(verified)
+    if previous_research is _UNSET:
+        previous_research = automatic_previous_research(engine, digest)
     research = generate_research(
-        digest, report_kind="review", next_trade_date=next_session(engine, target),
-        previous_research=previous_research, now=now, completion=completion,
-        context=context,
+        digest, report_kind="review", next_trade_date=next_trade_date or next_session(engine, target),
+        previous_research=previous_research, now=now, context=context, engine=engine,
+        checkpoint=checkpoint, progress=progress,
     )
     research["research_sha256"] = artifact_hash(research)
     digest["factor_validation_json"]["market_decision"] = research
@@ -259,19 +287,21 @@ def persist_briefing(engine, digest: dict, research: dict) -> None:
 
 
 def generate_briefing(engine, review_date: str, *, persist: bool = True,
-                      now=None, completion=None, digest=None, context=None) -> dict:
-    from biz.review.market_decision import generate_research
+                      now=None, digest=None, context=None, next_trade_date=None,
+                      checkpoint=None, progress=None) -> dict:
+    from biz.review.market_decision import generate_research, verify_automatic_research
 
     digest = digest if digest is not None else load_digest(engine, review_date)
     assert_digest(digest, review_date)
     parent = digest["factor_validation_json"].get("market_decision") or {}
-    target = next_session(engine, review_date)
+    target = next_trade_date or next_session(engine, review_date)
     if (parent.get("status") != "COMPLETE" or parent.get("review_date") != review_date
             or parent.get("next_trade_date") != target or not parent.get("research_sha256")):
         raise RuntimeError("DATA_BLOCKED stage=previous_review: verified research is missing or stale")
+    verify_automatic_research(parent)
     research = generate_research(
         digest, report_kind="briefing", next_trade_date=target,
-        previous_research=parent, now=now, completion=completion,
+        previous_research=parent, now=now, engine=engine, checkpoint=checkpoint, progress=progress,
         context=context if context is not None else collect_context(engine, review_date, now=now, overnight=True),
     )
     research["parent_research_sha256"] = parent["research_sha256"]
@@ -285,3 +315,134 @@ def generate_briefing(engine, review_date: str, *, persist: bool = True,
             raise RuntimeError("FAILED stage=briefing_readback: canonical report differs from generation")
         return stored
     return research
+
+
+def publication_snapshot(engine, review_date: str) -> dict:
+    """Optimistic publication guard, captured before expensive model work."""
+    from biz.review.market_decision import source_digest_identity
+    row = load_digest(engine, review_date, required=False)
+    return {"review_date": review_date, "row_sha256": artifact_hash(row) if row else None,
+            "source_digest_sha256": source_digest_identity(row) if row else None,
+            "captured_at": datetime.now(TZ).isoformat()}
+
+
+class _PublicationTransaction:
+    """Bind existing publishers to the one transaction owning the report pair."""
+    def __init__(self, connection):
+        self.connection = connection
+        self.dialect = connection.dialect
+    def begin(self):
+        return nullcontext(self.connection)
+    def connect(self):
+        return nullcontext(self.connection)
+
+
+def verify_report_pair(digest: dict, briefing: dict) -> None:
+    from biz.review.market_decision import source_digest_identity, rules_identity, verify_automatic_research
+    target = str(digest["review_date"])[:10]
+    assert_digest(digest, target)
+    parent = (digest.get("factor_validation_json") or {}).get("market_decision") or {}
+    for report, kind in ((parent, "review"), (briefing, "briefing")):
+        verify_automatic_research(report)
+        if (report.get("report_kind") != kind or report.get("review_date") != target
+                or report.get("source_digest_sha256") != source_digest_identity(digest)
+                or report.get("rules_sha256") != rules_identity()
+                or report.get("research_sha256") != artifact_hash({key: value for key, value in report.items() if key != "research_sha256"})):
+            raise RuntimeError("FAILED stage=pair_validation: report identity differs from frozen facts")
+    if (digest.get("compact_review") != parent.get("content")
+            or briefing.get("next_trade_date") != parent.get("next_trade_date")
+            or briefing.get("parent_research_sha256") != parent.get("research_sha256")
+            or briefing.get("parent_research") != parent):
+        raise RuntimeError("FAILED stage=pair_validation: report lineage or content differs")
+
+
+def persist_report_pair(engine, digest: dict, briefing: dict, *, expected: dict,
+                        backup, progress=None) -> dict:
+    """Publish two untouched automatic reports atomically, with no delivery.
+
+    A row snapshot, source identity and scheduler locks prevent a long model
+    run from silently replacing a newer publication. Neither fact timestamps
+    nor market cutoffs are changed to bypass the digest publisher's guards.
+    """
+    from biz.review.market_decision import source_digest_identity
+    from biz.review.quant_digest import persist_quant_digest
+    verify_report_pair(digest, briefing)
+    target = digest["review_date"]
+    if expected.get("review_date") != target or not callable(backup):
+        raise RuntimeError("FAILED stage=publication_input: missing exact snapshot or backup sink")
+    deadline = monotonic_time.monotonic() + 60
+    body_hashes = {"review": hashlib.sha256(digest["compact_review"].encode("utf-8")).hexdigest(),
+                   "briefing": hashlib.sha256(briefing["content"].encode("utf-8")).hexdigest()}
+    publication_id = artifact_hash({"expected": expected, "review": digest["factor_validation_json"]["market_decision"]["research_sha256"],
+                                    "briefing": briefing["research_sha256"]})
+    def tick(stage):
+        if monotonic_time.monotonic() >= deadline:
+            raise RuntimeError("FAILED stage=" + stage + ": publication_deadline_exceeded")
+        if progress:
+            progress({"stage": stage, "status": "RUNNING", "publication_id": publication_id,
+                      "last_progress_at": datetime.now(TZ).isoformat()})
+    def select_row(connection, lock=False):
+        suffix = " FOR UPDATE" if lock and engine.dialect.name == "mysql" else ""
+        raw = connection.execute(text("SELECT /*+ MAX_EXECUTION_TIME(15000) */ * FROM st_quant_review_digest "
+                                      "WHERE review_date=:d AND adjust_type=0" + suffix), {"d": target}).mappings().one_or_none()
+        return decode_digest(dict(raw)) if raw else None
+    def delivery_count(connection):
+        return connection.execute(text("SELECT /*+ MAX_EXECUTION_TIME(15000) */ COUNT(*) FROM sys_wecom_delivery_receipt "
+                                        "WHERE content_sha256 IN (:review,:briefing)"), body_hashes).scalar_one()
+    document = deepcopy(digest)
+    document["factor_validation_json"]["early_briefing"] = briefing
+    tick("publication_lock")
+    with engine.begin() as connection:
+        if engine.dialect.name == "mysql":
+            connection.execute(text("SET SESSION innodb_lock_wait_timeout=5"))
+        suffix = " FOR UPDATE" if engine.dialect.name == "mysql" else ""
+        connection.execute(text("SELECT /*+ MAX_EXECUTION_TIME(15000) */ id FROM st_scheduled_tasks WHERE task_type IN "
+                                "('daily_review','early_briefing','evening_review','quant_review_digest') ORDER BY id" + suffix)).all()
+        active = connection.execute(text("SELECT /*+ MAX_EXECUTION_TIME(15000) */ run_uid FROM st_scheduled_task_history "
+                                          "WHERE task_type IN ('daily_review','early_briefing','evening_review','quant_review_digest') "
+                                          "AND run_at>=:d AND LOWER(status) IN ('running','queued','pending') LIMIT 1"), {"d": target}).first()
+        jobs = connection.execute(text("SELECT /*+ MAX_EXECUTION_TIME(15000) */ job_id FROM st_job_run_v4 "
+                                        "WHERE LOWER(status) IN ('running','queued','pending') AND "
+                                        "(job_type LIKE '%review%' OR job_type LIKE '%brief%') LIMIT 1")).first()
+        if active or jobs:
+            raise RuntimeError("BLOCKED stage=publication_owner: another report producer is active")
+        before = select_row(connection, lock=True)
+        if ((artifact_hash(before) if before else None) != expected.get("row_sha256")
+                or (source_digest_identity(before) if before else None) != expected.get("source_digest_sha256")):
+            raise RuntimeError("BLOCKED stage=publication_source: durable source or publication changed")
+        backup({"publication_id": publication_id, "review_date": target, "row": before,
+                "expected": expected, "captured_at": datetime.now(TZ).isoformat()})
+        before_deliveries = delivery_count(connection)
+        if before_deliveries:
+            raise RuntimeError("BLOCKED stage=no_wecom: this content already has delivery receipts")
+        tick("publication_write")
+        scope = _PublicationTransaction(connection)
+        persist_quant_digest(scope, document)
+        # The digest publisher deliberately preserves a previously stored
+        # morning report. Replace that snapshot under the same row lock and
+        # lineage guard before this transaction can commit either report.
+        persist_briefing(scope, document, briefing)
+        saved = select_row(connection)
+        saved_briefing = saved["factor_validation_json"].get("early_briefing") or {}
+        verify_report_pair(saved, saved_briefing)
+        if (saved["compact_review"] != digest["compact_review"] or saved_briefing != briefing
+                or saved["factor_validation_json"]["market_decision"] != digest["factor_validation_json"]["market_decision"]):
+            raise RuntimeError("FAILED stage=publication_write_readback: generated artifacts differ")
+        if delivery_count(connection) != before_deliveries:
+            raise RuntimeError("FAILED stage=no_wecom: delivery receipt appeared")
+        tick("publication_commit")
+    tick("publication_independent_readback")
+    with engine.connect() as connection:
+        saved = select_row(connection)
+        saved_briefing = saved["factor_validation_json"].get("early_briefing") or {}
+        verify_report_pair(saved, saved_briefing)
+        if (saved["compact_review"] != digest["compact_review"] or saved_briefing != briefing
+                or delivery_count(connection) != 0):
+            raise RuntimeError("FAILED stage=publication_independent_readback: content or notification mismatch")
+    tick("publication_database_complete")
+    return {"status": "DATABASE_COMPLETE", "publication_id": publication_id, "review_date": target,
+            "briefing_date": briefing["next_trade_date"], "review_sha256": digest["factor_validation_json"]["market_decision"]["research_sha256"],
+            "briefing_sha256": briefing["research_sha256"], "review_body_sha256": body_hashes["review"],
+            "briefing_body_sha256": body_hashes["briefing"], "wecom_delivery_invoked": False,
+            "matched_wecom_receipts_before": 0, "matched_wecom_receipts_after": 0,
+            "next_gate": "production_api", "completed_at": datetime.now(TZ).isoformat()}

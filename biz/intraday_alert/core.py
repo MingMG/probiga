@@ -844,8 +844,9 @@ def _load_history(connection: Connection, trade_date: date, limit: int = 30) -> 
     rows = connection.execute(
         text(
             f"""
-            SELECT observed_at, session_minute, market_json, sector_json,
-                   key_stock_json, style_json, benchmark_json
+            SELECT observation_id, trade_date, source_snapshot_at, observed_at, session_minute,
+                   source_provider, source_receipt_id, expected_count, observed_count, coverage,
+                   quality_status, market_json, sector_json, key_stock_json, style_json, benchmark_json
             FROM {OBSERVATION_TABLE}
             WHERE trade_date = :trade_date
             ORDER BY observed_at DESC
@@ -856,6 +857,10 @@ def _load_history(connection: Connection, trade_date: date, limit: int = 30) -> 
     ).mappings().all()
     history = [
         {
+            "observation_id": row["observation_id"], "trade_date": str(row["trade_date"]),
+            "source_snapshot_at": row["source_snapshot_at"], "source_provider": row["source_provider"],
+            "expected_count": row["expected_count"], "observed_count": row["observed_count"],
+            "coverage": row["coverage"], "quality": {"status": row["quality_status"], "receipt_id": row["source_receipt_id"]},
             "observed_at": row["observed_at"],
             "session_minute": int(row["session_minute"]),
             "market": _json_object(row["market_json"]),
@@ -1037,71 +1042,6 @@ def _upsert_state(connection: Connection, trade_date: date, state: Mapping[str, 
     )
 
 
-def _render_emission(emission: Mapping[str, Any], observation: Mapping[str, Any]) -> str:
-    from .render import render_event
-
-    return str(render_event(dict(emission), dict(observation)))
-
-
-def _insert_outbox(
-    connection: Connection,
-    *,
-    trade_date: date,
-    emission: Mapping[str, Any],
-    mode: str,
-    content: str,
-    now: datetime,
-) -> None:
-    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
-    outbox_id = hashlib.sha256(
-        _json(
-            {
-                "trade_date": trade_date,
-                "event_key": emission["event_key"],
-                "cycle": emission.get("cycle"),
-                "transition": emission["transition_name"],
-                "evidence_hash": emission["evidence_hash"],
-                "mode": mode,
-            }
-        ).encode("utf-8")
-    ).hexdigest()
-    connection.execute(
-        text(
-            f"""
-            INSERT IGNORE INTO {OUTBOX_TABLE} (
-                outbox_id, trade_date, event_key, cycle, transition_name,
-                state, mode, status, evidence_hash, evidence_json,
-                content_sha256, content_markdown, attempts, next_retry_at,
-                claimed_at, delivery_id, error_message, created_at, sent_at,
-                updated_at
-            ) VALUES (
-                :outbox_id, :trade_date, :event_key, :cycle, :transition_name,
-                :state, :mode, :status, :evidence_hash, :evidence_json,
-                :content_sha256, :content_markdown, 0, :next_retry_at,
-                NULL, NULL, NULL, :created_at, NULL, :updated_at
-            )
-            """
-        ),
-        {
-            "outbox_id": outbox_id,
-            "trade_date": trade_date,
-            "event_key": emission["event_key"],
-            "cycle": int(emission.get("cycle") or 1),
-            "transition_name": emission["transition_name"],
-            "state": emission.get("state") or emission["transition_name"],
-            "mode": mode,
-            "status": "SHADOW" if mode == "shadow" else "PENDING",
-            "evidence_hash": emission["evidence_hash"],
-            "evidence_json": _json(emission.get("evidence") or {}),
-            "content_sha256": content_hash,
-            "content_markdown": content,
-            "next_retry_at": now if mode == "live" else None,
-            "created_at": now,
-            "updated_at": now,
-        },
-    )
-
-
 def _backoff_minutes(attempts: int) -> int:
     return (1, 2, 5, 10, 20, 30)[min(max(0, attempts - 1), 5)]
 
@@ -1139,9 +1079,11 @@ def drain_outbox(
             row = connection.execute(
                 text(
                     f"""
-                    SELECT outbox_id, content_markdown, attempts
+                    SELECT outbox_id, content_markdown, attempts, evidence_json, content_sha256
                     FROM {OUTBOX_TABLE}
                     WHERE mode='live' AND status IN ('PENDING','FAILED')
+                      AND JSON_UNQUOTE(JSON_EXTRACT(evidence_json,'$.schema_version'))='probiga.intraday-research.v1'
+                      AND JSON_UNQUOTE(JSON_EXTRACT(evidence_json,'$.research.status'))='COMPLETE'
                       AND (next_retry_at IS NULL OR next_retry_at <= :now)
                     ORDER BY created_at
                     LIMIT 1
@@ -1155,6 +1097,15 @@ def drain_outbox(
             outbox_id = str(row["outbox_id"])
             attempts = int(row["attempts"] or 0) + 1
             content = str(row["content_markdown"])
+            audit = _json_object(row.get("evidence_json"))
+            source_at = _as_naive_cn((audit.get("raw_observation") or {}).get("source_snapshot_at"))
+            age = (now - source_at).total_seconds() if source_at else None
+            if (audit.get("schema_version") != "probiga.intraday-research.v1"
+                    or (audit.get("research") or {}).get("status") != "COMPLETE"
+                    or hashlib.sha256(content.encode("utf-8")).hexdigest() != row.get("content_sha256")
+                    or age is None or not 0 <= age <= 180):
+                connection.execute(text(f"UPDATE {OUTBOX_TABLE} SET status='EXPIRED',error_message='research validation or source freshness unavailable',updated_at=:now WHERE outbox_id=:outbox_id"), {"now": now, "outbox_id": outbox_id})
+                continue
             connection.execute(
                 text(
                     f"""
@@ -1166,6 +1117,16 @@ def drain_outbox(
                 ),
                 {"attempts": attempts, "now": now, "outbox_id": outbox_id},
             )
+        try:
+            from biz.review.market_decision import verify_automatic_research
+            verify_automatic_research(audit["research"])
+            if content != audit["research"].get("content"):
+                raise ValueError("published body differs from verified research")
+        except Exception:
+            with engine.begin() as connection:
+                connection.execute(text(f"UPDATE {OUTBOX_TABLE} SET status='BLOCKED',claimed_at=NULL,error_message='automatic research provenance rejected',updated_at=:now WHERE outbox_id=:outbox_id"), {"now": now, "outbox_id": outbox_id})
+            failures.append(outbox_id)
+            break
         try:
             webhook = webhook_getter("intraday", required=True)
             result = delivery_fn(
@@ -1217,7 +1178,7 @@ def drain_outbox(
             )
         delivered += 1
     if failures:
-        raise DeliveryDispatchError("盘中播报发送失败，已写入 outbox 并安排退避重试")
+        raise DeliveryDispatchError("盘中研究验收或发送失败，详情已持久化到 outbox")
     return delivered
 
 
@@ -1317,6 +1278,7 @@ def run_intraday_scan(
     mode: str = "shadow",
     now: datetime | None = None,
     benchmark_fetcher: Callable[..., list[dict[str, Any]]] = fetch_benchmark_quotes,
+    research_generator: Callable | None = None,
 ) -> dict[str, Any]:
     """Run one source-batch-idempotent scan and optionally drain live outbox."""
 
@@ -1332,6 +1294,8 @@ def run_intraday_scan(
         return {"status": "skipped", "reason": "non_trading_day", "mode": normalized_mode}
 
     ensure_intraday_alert_tables(main_engine)
+    from .research import expire_research_batches
+    expired_batches = expire_research_batches(main_engine, now=observed_at, limit=10)
     snapshot = _load_validated_snapshot_with_retry(
         current_engine,
         now=observed_at,
@@ -1346,7 +1310,10 @@ def run_intraday_scan(
         benchmark_quotes = []
         warnings.append("benchmark_source_unavailable")
 
+    from .research import queue_research_batch, process_research_batch, research_batch_id
+
     emissions_count = 0
+    research_batch = None
     duplicate = False
     with mysql_named_lock(main_engine, LOCK_NAME, timeout_seconds=0) as connection:
         try:
@@ -1359,6 +1326,10 @@ def run_intraday_scan(
             ).first()
             if existing:
                 duplicate = True
+                found_batch = connection.execute(text(
+                    f"SELECT outbox_id FROM {OUTBOX_TABLE} WHERE outbox_id=:id LIMIT 1"),
+                    {"id": research_batch_id(observation_id, normalized_mode)}).first()
+                research_batch = str(found_batch[0]) if found_batch else None
                 connection.commit()
             else:
                 previous = _load_previous_observation(connection, observed_at.date())
@@ -1380,6 +1351,9 @@ def run_intraday_scan(
                     (previous or {}).get("sectors"),
                 )
                 current = {
+                    "observation_id": observation_id,
+                    "trade_date": observed_at.date().isoformat(),
+                    "source_receipt": dict(snapshot.receipt),
                     "observed_at": observed_at,
                     "source_snapshot_at": _as_naive_cn(snapshot.receipt.get("source_generated_at")),
                     "session_minute": minute_number,
@@ -1422,8 +1396,9 @@ def run_intraday_scan(
                 emitted_today = int(
                     connection.execute(
                         text(
-                            f"SELECT COUNT(*) FROM {OUTBOX_TABLE} "
-                            "WHERE trade_date=:trade_date AND mode=:mode"
+                            f"SELECT COALESCE(SUM(CASE WHEN JSON_UNQUOTE(JSON_EXTRACT(evidence_json,'$.schema_version'))='probiga.intraday-research.v1' "
+                            "THEN JSON_LENGTH(JSON_EXTRACT(evidence_json,'$.emissions')) ELSE 1 END),0) "
+                            f"FROM {OUTBOX_TABLE} WHERE trade_date=:trade_date AND mode=:mode"
                         ),
                         {"trade_date": observed_at.date(), "mode": normalized_mode},
                     ).scalar()
@@ -1437,15 +1412,10 @@ def run_intraday_scan(
                 )
                 for state in states:
                     _upsert_state(connection, observed_at.date(), state)
-                for emission in emissions:
-                    content = _render_emission(emission, current)
-                    _insert_outbox(
-                        connection,
-                        trade_date=observed_at.date(),
-                        emission=emission,
-                        mode=normalized_mode,
-                        content=content,
-                        now=observed_at,
+                if emissions:
+                    research_batch = queue_research_batch(
+                        connection, observation=current, history=history,
+                        emissions=emissions, mode=normalized_mode, now=observed_at,
                     )
                 emissions_count = len(emissions)
                 connection.commit()
@@ -1453,13 +1423,20 @@ def run_intraday_scan(
             connection.rollback()
             raise
 
-    delivered = drain_outbox(main_engine, mode=normalized_mode, now=observed_at)
+    # Both the transaction and named lock have ended before any provider call.
+    research_result = process_research_batch(
+        main_engine, outbox_id=research_batch, generator=research_generator, now_fn=china_now,
+    ) if research_batch else None
+    delivered = drain_outbox(main_engine, mode=normalized_mode, now=china_now())
     return {
         "status": "duplicate" if duplicate else "ok",
         "mode": normalized_mode,
         "observation_id": observation_id,
         "source_receipt_id": str(snapshot.receipt.get("receipt_id") or ""),
         "emissions": emissions_count,
+        "expired_research_batches": expired_batches,
+        "research_batch_id": research_batch,
+        "research_status": (research_result or {}).get("status"),
         "delivered": delivered,
         "warnings": warnings,
     }

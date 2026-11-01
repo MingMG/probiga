@@ -118,6 +118,8 @@ def published_report(digest: dict, target: str) -> str:
             or research.get("research_sha256") != expected_hash
             or not content or research.get("content") != content):
         raise RuntimeError("DATA_BLOCKED stage=review_publication: canonical research is missing, stale or inconsistent")
+    from biz.review.market_decision import verify_automatic_research
+    verify_automatic_research(research)
     return content
 
 

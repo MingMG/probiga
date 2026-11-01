@@ -158,6 +158,7 @@ def test_failed_database_update_rolls_back_the_whole_briefing_write(db):
 
 
 def test_preview_briefing_uses_exact_parent_next_open_session_and_never_writes(db, monkeypatch):
+    monkeypatch.setattr(market_decision, "verify_automatic_research", Mock())
     digest = _with_parent()
     _insert(db, digest)
     before = _stored(db)
@@ -247,6 +248,7 @@ def test_morning_artifact_does_not_change_the_frozen_fact_identity():
 
 
 def test_postclose_audits_the_matching_morning_hypothesis_before_previous_evening(db, monkeypatch):
+    monkeypatch.setattr(market_decision, "verify_automatic_research", Mock())
     prior = _with_parent()
     prior["review_date"] = "2026-08-27"
     prior["factor_validation_json"]["market_decision"]["next_trade_date"] = REVIEW
@@ -264,6 +266,7 @@ def test_postclose_audits_the_matching_morning_hypothesis_before_previous_evenin
 
 
 def test_briefing_publication_returns_the_canonical_database_readback(db, monkeypatch):
+    monkeypatch.setattr(market_decision, "verify_automatic_research", Mock())
     digest = _with_parent()
     _insert(db, digest)
     monkeypatch.setattr(market_decision, "generate_research", Mock(return_value={
@@ -277,6 +280,7 @@ def test_briefing_publication_returns_the_canonical_database_readback(db, monkey
 
 
 def test_briefing_readback_mismatch_stops_publication(db, monkeypatch):
+    monkeypatch.setattr(market_decision, "verify_automatic_research", Mock())
     digest = _with_parent()
     _insert(db, digest)
     monkeypatch.setattr(market_decision, "generate_research", Mock(return_value={
@@ -371,3 +375,27 @@ def test_review_sample_preserves_full_verified_amount_unless_it_contradicts(db, 
     assert digest["market_structure_json"]["total_amount"] == expected_amount
     assert digest["market_structure_json"]["previous_total_amount"] == 90_000_000
     assert complete.call_args.args[0] is digest
+
+
+def test_editorial_parent_cannot_enter_the_automatic_briefing_flow(db, monkeypatch):
+    digest = _with_parent()
+    generate = Mock(side_effect=AssertionError("editorial parent reached model"))
+    monkeypatch.setattr(market_decision, "generate_research", generate)
+    with pytest.raises(market_decision.ResearchError, match="nonautomatic_artifact"):
+        research_flow.generate_briefing(db, REVIEW, persist=False, digest=digest, context={})
+    generate.assert_not_called()
+
+
+def test_explicit_frozen_none_parent_and_calendar_never_reread_sources(monkeypatch):
+    generate = Mock(return_value={"content": "automatic report"})
+    monkeypatch.setattr(market_decision, "generate_research", generate)
+    monkeypatch.setattr(research_flow, "load_digest", Mock(side_effect=AssertionError("prior reread")))
+    monkeypatch.setattr(research_flow, "next_session", Mock(side_effect=AssertionError("calendar reread")))
+    snapshot = {"run_id": "frozen", "stages": {}}
+    progress = Mock()
+    research_flow.attach_review(None, _digest(), context={}, previous_research=None,
+                                next_trade_date=NEXT, checkpoint=snapshot, progress=progress)
+    kwargs = generate.call_args.kwargs
+    assert kwargs["previous_research"] is None and kwargs["next_trade_date"] == NEXT
+    assert kwargs["checkpoint"] is snapshot and kwargs["progress"] is progress
+    assert "completion" not in kwargs
