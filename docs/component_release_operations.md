@@ -15,7 +15,57 @@ sudo -n /usr/local/sbin/probiga-production-deploy "$MERGED_MAIN_SHA" \
 
 发布范围由受信 Git 镜像中的完整“当前 Linux 版本 → 目标版本”差异决定。`fast/full` 只改变执行路径，不改变同一条 SHA 的组件 scope。`--fast --i-know-ddl-changed` 不能绕过只读 schema 守卫；默认 fast 遇到分类为 `COORDINATED` 的范围会在任何服务切换前退出。`--full` 始终执行协调事务，这既是真 DDL 的正常入口，也是快速路径失败后修复代码/schema 不一致的入口。
 
-本版参数协议要求 root broker 与目标引擎同时支持 `probiga-release-mode-v1`。普通发布只替换目标引擎；高级参数和新增发布清单字段首次上线时，必须先从已合并的 `main` 用 `deploy/install_production_deploy_broker.sh` 完成 root 维护安装，再调用 broker。旧 broker 不支持参数透传，不能用它声称 `--full` 已生效。
+## Broker 与 engine 协议变更顺序
+
+这是 v2.0 第五节必须满足的前置约束，不是可选部署建议。本版参数协议要求 root broker 与目标引擎同时支持 `probiga-release-mode-v1`。普通发布只替换目标引擎；任何改变 broker/engine 参数、环境字段或能力协商的发布，必须按以下顺序执行：
+
+1. 合并代码到 `main`，记录精确的目标 SHA。
+2. 由授权 root 维护人员从该 SHA 暂存并安装新 broker。
+3. 用安装后的 broker 验证 `--capabilities` 包含新协议标记。
+4. 再用新 broker 发布该 SHA 的 engine。
+
+反向顺序会在旧 broker 的清单校验或能力协商阶段安全失败，通常不会进入 engine、不会重启服务、不会留下 journal；但这仍会阻塞发布，不能当作有效上线。部署账户没有 root broker 安装权限，不能通过普通 `sudo probiga-production-deploy` 绕过。
+
+安装脚本固定为：
+
+```text
+install_production_deploy_broker.sh ROOT_OWNED_SOURCE EXPECTED_SHA256
+```
+
+它没有 `--help`、`--sha` 或 `--source` 参数。`ROOT_OWNED_SOURCE` 必须是 `/root/*` 或 `/var/lib/probiga/broker-maintenance/*` 下的非符号链接根文件。root shell 中的完整顺序如下，`TARGET_SHA` 必须替换为本次已合并的 40 位 SHA：
+
+```bash
+TARGET_SHA=0123456789abcdef0123456789abcdef01234567
+SOURCE="/var/lib/probiga/broker-maintenance/production_deploy_root.$TARGET_SHA.sh"
+INSTALLER="/root/install_production_deploy_broker.$TARGET_SHA.sh"
+
+install -d -o root -g root -m 0700 /var/lib/probiga/broker-maintenance
+git --git-dir=/var/lib/probiga/release-sources/probiga.git \
+  show "$TARGET_SHA:deploy/production_deploy_root.sh" > "$SOURCE"
+git --git-dir=/var/lib/probiga/release-sources/probiga.git \
+  show "$TARGET_SHA:deploy/install_production_deploy_broker.sh" > "$INSTALLER"
+chown root:root "$SOURCE" "$INSTALLER"
+chmod 0600 "$SOURCE" "$INSTALLER"
+
+BROKER_SHA256="$(sha256sum "$SOURCE" | cut -d' ' -f1)"
+printf 'broker source sha256: %s\n' "$BROKER_SHA256"
+bash "$INSTALLER" "$SOURCE" "$BROKER_SHA256"
+```
+
+安装器会执行 Bash 语法检查、SHA-256 核对、原子替换和完整 capabilities 自检。随后以部署账户验证：
+
+```bash
+sudo -n /usr/local/sbin/probiga-production-deploy --capabilities
+```
+
+必须看到以下两行，大小写和连字符必须完全一致：
+
+```text
+release_mode_engine=probiga-release-mode-v1
+release_modes=fast,full
+```
+
+看不到这两行时停止，不要发布 engine。
 
 ## 三种版本身份
 
