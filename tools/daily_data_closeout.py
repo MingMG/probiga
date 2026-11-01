@@ -19,10 +19,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from integrations.wecom.delivery import deliver_markdown
 from server.api.data_monitor import BY_KEY, Observer
 from server.common.batch_db import create_batch_engine
-from server.common.config import get_wecom_webhook
 from server.common.kline_data import get_kline_engine
 from server.common.minute_data import get_minute_engine
 from tools.data_quality_check import expected_completed_trade_date
@@ -362,6 +360,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--no-notify", action="store_true")
     args = parser.parse_args(argv)
+    if args.mode == "verify":
+        from tools.daily_data_acceptance import main as acceptance_main
+
+        acceptance_arguments = ["--json"] if args.json else []
+        if args.no_notify:
+            acceptance_arguments.append("--no-notify")
+        return acceptance_main(acceptance_arguments)
 
     now = _now()
     engine = create_batch_engine()
@@ -389,19 +394,12 @@ def main(argv: list[str] | None = None) -> int:
     report["repair_attempts"] = attempts
     report["mode"] = args.mode
     message = render_message(report, mode=args.mode, attempts=attempts)
-    if not args.no_notify:
-        result = deliver_markdown(
-            get_wecom_webhook("briefing", required=False),
-            message,
-            engine=engine,
-            delivery_kind=f"daily_data_closeout_{args.mode}",
-            webhook_kind="briefing",
-            title=f"## A股数据闭环｜{target}",
-            idempotency_key=f"daily-data-closeout:{args.mode}:{target}",
-        )
-        report["wecom_delivery_id"] = result.delivery_id
-        report["wecom_delivered_count"] = result.delivered_count
-        report["wecom_segment_count"] = result.segment_count
+    # Repair is an internal bounded-retry stage.  The authoritative acceptance
+    # run at 23:20 sends the only daily alert, after repairs had a chance to
+    # converge; successful repair runs stay silent.
+    report["notification"] = {
+        "status": "DEFERRED_TO_FINAL_ACCEPTANCE",
+    }
     report["message"] = message
 
     if args.json:

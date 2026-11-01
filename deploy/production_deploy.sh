@@ -99,6 +99,7 @@ QMT_ANNOUNCEMENT_CHECKPOINT_ROOT=/var/lib/probiga/qmt-announcement-checkpoints
 QMT_FULL_MARKET_HISTORY_STATE_ROOT=/var/lib/probiga/qmt-full-market-history
 QMT_LOCAL_GAP_REPAIR_STATE_ROOT=/var/lib/probiga/qmt-local-gap-repair
 PROBIGA_JOB_LOG_ROOT=/var/lib/probiga/jobs
+DATA_ACCEPTANCE_ROOT=/var/lib/probiga/data-acceptance
 RELEASE_DATA_READINESS_STATUS_ROOT=/var/lib/probiga/release-data-readiness
 LEGACY_RELEASE_VENV_ROOT=/opt/ProBigA/.release_venvs
 DEPLOY_LOCK_ROOT=/run/probiga
@@ -885,6 +886,30 @@ finally:
 PY
   validate_scheduler_terminal_job_log_tree || return 2
   validate_exposure_risk_job_checkpoint_tree live || return 2
+  return 0
+}
+prepare_data_acceptance_root() {
+  local parent_root=/var/lib/probiga
+  if [ -e "$parent_root" ] || [ -L "$parent_root" ]; then
+    test -d "$parent_root" || return 2
+    test ! -L "$parent_root" || return 2
+  fi
+  install -d -o root -g root -m 0755 "$parent_root" || return 2
+  if [ -e "$DATA_ACCEPTANCE_ROOT" ] || [ -L "$DATA_ACCEPTANCE_ROOT" ]; then
+    test -d "$DATA_ACCEPTANCE_ROOT" || return 2
+    test ! -L "$DATA_ACCEPTANCE_ROOT" || return 2
+  else
+    install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0700 \
+      "$DATA_ACCEPTANCE_ROOT" || return 2
+  fi
+  test "$(readlink -f -- "$DATA_ACCEPTANCE_ROOT")" = \
+    "$DATA_ACCEPTANCE_ROOT" || return 2
+  test "$(stat -c '%U:%G' -- "$DATA_ACCEPTANCE_ROOT")" = \
+    "$SERVICE_USER:$SERVICE_USER" || return 2
+  test "$(stat -c '%a' -- "$DATA_ACCEPTANCE_ROOT")" = 700 || return 2
+  sudo -u "$SERVICE_USER" test -r "$DATA_ACCEPTANCE_ROOT" || return 2
+  sudo -u "$SERVICE_USER" test -w "$DATA_ACCEPTANCE_ROOT" || return 2
+  sudo -u "$SERVICE_USER" test -x "$DATA_ACCEPTANCE_ROOT" || return 2
   return 0
 }
 migrate_probiga_job_log_legacy_modes() {
@@ -9983,6 +10008,7 @@ prepare_qmt_full_market_history_state_root
 prepare_qmt_local_gap_repair_state_root
 migrate_legacy_flow_progress inspect
 prepare_probiga_job_log_root
+prepare_data_acceptance_root
 materialize_controlled_governance_contract_tool "$EXPECTED_SHA"
 if [ "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 ] && \
   [ -d "$ACTIVATION_UNIT_SNAPSHOT_DIR" ] && \
