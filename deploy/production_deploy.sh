@@ -16352,20 +16352,47 @@ prepared_qmt_announcement_snapshot verify \
 # QMT strategy releases are independent of Linux code/schema releases.  The
 # Windows updater tracks the strategy source on its own and is never fenced by
 # this broker.
+LOCAL_SCHEDULER_INSTANCE_ID=""
+LOCAL_SCHEDULER_PID=""
+if [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ]; then
+  CUTOVER_STEP=capture_linux_scheduler_identity_before_stop
+  LOCAL_SCHEDULER_PID="$(systemctl show probiga-scheduler \
+    --property=MainPID --value)"
+  [[ "$LOCAL_SCHEDULER_PID" =~ ^[1-9][0-9]*$ ]]
+  LOCAL_SCHEDULER_HEARTBEAT_OUTPUT="$(run_prepared_python_tool \
+    "$PREPARED_CODE_ROOT/tools/check_scheduler_runtime_heartbeat.py" \
+    --expected-build-sha "$PREVIOUS_SHA" \
+    --expected-scheduler-pid "$LOCAL_SCHEDULER_PID")"
+  printf '%s\n' "$LOCAL_SCHEDULER_HEARTBEAT_OUTPUT"
+  LOCAL_SCHEDULER_INSTANCE_ID="$(
+    printf '%s' "$LOCAL_SCHEDULER_HEARTBEAT_OUTPUT" | \
+      "$BOOTSTRAP_PYTHON" -I -c \
+        'import json,sys; p=json.load(sys.stdin); d=p.get("detail"); c=d.get("current") if isinstance(d,dict) else None; ok=p.get("status")=="PASS" and isinstance(c,dict) and c.get("pid")==int(sys.argv[1]) and isinstance(c.get("instance_id"),str) and c["instance_id"] and not any(ch.isspace() for ch in c["instance_id"]); print(c["instance_id"]) if ok else sys.exit(2)' \
+        "$LOCAL_SCHEDULER_PID"
+  )"
+fi
 CUTOVER_STEP=stop_linux_scheduler_before_writer_quiescence
 if [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ]; then
   sudo systemctl stop probiga-scheduler
   ! systemctl is-active --quiet probiga-scheduler
+  test ! -d "/proc/$LOCAL_SCHEDULER_PID"
   PRE_CUTOVER_SCHEDULER_STOPPED=1
 fi
 CUTOVER_STEP=verify_cross_host_writer_quiescence_before_api_stop
+WRITER_EXCLUSION_ARGS=()
+if [ -n "$LOCAL_SCHEDULER_INSTANCE_ID" ]; then
+  WRITER_EXCLUSION_ARGS=(
+    --exclude-instance-id "$LOCAL_SCHEDULER_INSTANCE_ID"
+  )
+fi
 WRITER_QUIESCENCE_OUTPUT="$(run_prepared_python_tool \
   "$PREPARED_CODE_ROOT/tools/trading_v3_layer4_maintenance.py" \
   wait-writers --timeout-seconds 30 --poll-seconds 5 \
-    --fast-exit-if-zero)"
+    --fast-exit-if-zero "${WRITER_EXCLUSION_ARGS[@]}")"
 printf '%s\n' "$WRITER_QUIESCENCE_OUTPUT"
 printf '%s' "$WRITER_QUIESCENCE_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
-  'import json,sys; p=json.load(sys.stdin); ok=isinstance(p,dict) and p.get("status")=="ok" and p.get("ready") is True and p.get("live_writer_count")==0 and p.get("live_writers")==[] and p.get("zero_confirmations")==2; raise SystemExit(0 if ok else 2)'
+  'import json,sys; p=json.load(sys.stdin); expected=[sys.argv[1]] if sys.argv[1] else []; ok=isinstance(p,dict) and p.get("status")=="ok" and p.get("ready") is True and p.get("live_writer_count")==0 and p.get("live_writers")==[] and p.get("zero_confirmations")==2 and p.get("excluded_instance_ids")==expected; raise SystemExit(0 if ok else 2)' \
+  "$LOCAL_SCHEDULER_INSTANCE_ID"
 CUTOVER_STEP=migrate_probiga_job_log_legacy_modes_after_writer_quiescence
 migrate_legacy_flow_progress apply
 migrate_probiga_job_log_legacy_modes

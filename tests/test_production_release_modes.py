@@ -209,3 +209,28 @@ def test_engine_log_stream_is_mode_prefixed_and_broker_checks_engine_capability(
     assert '/usr/bin/sed -u "s/^/$RELEASE_LOG_PREFIX /"' in script
     assert "readonly DEPLOY_ENGINE_RELEASE_MODE_CAPABILITY=probiga-release-mode-v1" in script
     assert "engine does not support --mode; upgrade broker and engine together" in broker
+
+
+def test_full_release_excludes_only_the_pid_verified_stopped_local_scheduler():
+    script = (ROOT / "deploy" / "production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    capture = script.index(
+        "CUTOVER_STEP=capture_linux_scheduler_identity_before_stop"
+    )
+    stop = script.index(
+        "CUTOVER_STEP=stop_linux_scheduler_before_writer_quiescence",
+        capture,
+    )
+    quiescence = script.index(
+        "CUTOVER_STEP=verify_cross_host_writer_quiescence_before_api_stop",
+        stop,
+    )
+    assert capture < stop < quiescence
+    between = script[capture:quiescence]
+    assert '--expected-build-sha "$PREVIOUS_SHA"' in between
+    assert '--expected-scheduler-pid "$LOCAL_SCHEDULER_PID"' in between
+    assert 'test ! -d "/proc/$LOCAL_SCHEDULER_PID"' in between
+    assert '--exclude-instance-id "$LOCAL_SCHEDULER_INSTANCE_ID"' in (
+        script[quiescence:quiescence + 2000]
+    )

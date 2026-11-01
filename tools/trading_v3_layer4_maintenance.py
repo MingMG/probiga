@@ -331,6 +331,7 @@ def wait_for_writer_quiescence(
     timeout_seconds: float,
     poll_seconds: float,
     fast_exit_if_zero: bool = False,
+    excluded_instance_ids: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     if not 0 <= timeout_seconds <= 600:
         raise ValueError("timeout_seconds must be between 0 and 600")
@@ -342,6 +343,14 @@ def wait_for_writer_quiescence(
         raise ValueError(
             "fast_exit_if_zero requires timeout_seconds of at least 2"
         )
+    if not isinstance(excluded_instance_ids, frozenset) or any(
+        not isinstance(instance_id, str)
+        or not instance_id
+        or len(instance_id) > 255
+        or any(character.isspace() for character in instance_id)
+        for instance_id in excluded_instance_ids
+    ):
+        raise ValueError("excluded_instance_ids must be exact non-empty tokens")
     deadline = time.monotonic() + timeout_seconds
     expected_identity: dict[str, Any] | None = None
     blocked_reason: str | None = None
@@ -361,6 +370,11 @@ def wait_for_writer_quiescence(
                 elif identity != expected_identity:
                     raise MaintenanceBlocked("LAYER4_DATABASE_IDENTITY_CHANGED")
                 live = read_fresh_scheduler_writers_on_connection(connection)
+                live = tuple(
+                    row for row in live
+                    if str(row.get("instance_id") or "")
+                    not in excluded_instance_ids
+                )
         except DBAPIError as exc:
             args = getattr(exc.orig, "args", ())
             errno = args[0] if args else None
@@ -392,6 +406,9 @@ def wait_for_writer_quiescence(
                             "live_writer_count": 0,
                             "live_writers": [],
                             "zero_confirmations": 2,
+                            "excluded_instance_ids": sorted(
+                                excluded_instance_ids
+                            ),
                         }
                     time.sleep(2 - (now - first_zero_at))
                     continue
@@ -402,6 +419,9 @@ def wait_for_writer_quiescence(
                     "ready": True,
                     "live_writer_count": 0,
                     "live_writers": [],
+                    "excluded_instance_ids": sorted(
+                        excluded_instance_ids
+                    ),
                 }
             first_zero_at = None
             blocked_reason = (
@@ -597,6 +617,12 @@ def _parser() -> argparse.ArgumentParser:
     writers.add_argument("--timeout-seconds", type=float, default=150.0)
     writers.add_argument("--poll-seconds", type=float, default=5.0)
     writers.add_argument("--fast-exit-if-zero", action="store_true")
+    writers.add_argument(
+        "--exclude-instance-id",
+        action="append",
+        default=[],
+        dest="excluded_instance_ids",
+    )
 
     topology = subparsers.add_parser("assert-exclusive-writer")
     topology.add_argument("--expected-instance-id", required=True)
@@ -633,6 +659,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 timeout_seconds=args.timeout_seconds,
                 poll_seconds=args.poll_seconds,
                 fast_exit_if_zero=bool(args.fast_exit_if_zero),
+                excluded_instance_ids=frozenset(args.excluded_instance_ids),
             )
         elif args.command == "assert-exclusive-writer":
             payload = collect_exclusive_writer_topology(

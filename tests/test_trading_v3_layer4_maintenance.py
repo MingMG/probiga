@@ -95,7 +95,7 @@ def test_writer_quiescence_reconnects_and_rechecks_identity_before_inventory(
 
     assert result == {
         "status": "ok", "ready": True, "live_writer_count": 0,
-        "live_writers": [],
+        "live_writers": [], "excluded_instance_ids": [],
     }
     before_failure = ["identity"] if failed_stage == "identity" else ["identity", "writers"]
     assert events == before_failure + ["dispose", "identity", "writers"]
@@ -273,6 +273,7 @@ def test_writer_quiescence_fast_exit_requires_two_separated_zero_observations(
         "live_writer_count": 0,
         "live_writers": [],
         "zero_confirmations": 2,
+        "excluded_instance_ids": [],
     }
 
 
@@ -318,16 +319,54 @@ def test_writer_quiescence_fast_exit_requires_a_confirmation_window() -> None:
         )
 
 
+def test_writer_quiescence_excludes_only_the_confirmed_stopped_local_scheduler(
+    monkeypatch,
+) -> None:
+    clock = _QuiescenceClock(monkeypatch)
+    observations = iter([
+        (
+            {"instance_id": "linux-host-4057304"},
+            {"instance_id": "windows-edge-42"},
+        ),
+        ({"instance_id": "linux-host-4057304"},),
+        ({"instance_id": "linux-host-4057304"},),
+    ])
+    monkeypatch.setattr(
+        maintenance_cli,
+        "_connection_identity",
+        lambda _: {"server_uuid": "same"},
+    )
+    monkeypatch.setattr(
+        maintenance_cli,
+        "read_fresh_scheduler_writers_on_connection",
+        lambda _: next(observations),
+    )
+
+    result = maintenance_cli.wait_for_writer_quiescence(
+        _Engine(),
+        timeout_seconds=30,
+        poll_seconds=1,
+        fast_exit_if_zero=True,
+        excluded_instance_ids=frozenset({"linux-host-4057304"}),
+    )
+
+    assert result["excluded_instance_ids"] == ["linux-host-4057304"]
+    assert result["zero_confirmations"] == 2
+    assert clock.sleeps == [1, 2]
+
+
 def test_wait_writers_cli_exposes_two_zero_confirmation_mode() -> None:
     args = maintenance_cli._parser().parse_args([
         "wait-writers",
         "--timeout-seconds", "30",
         "--poll-seconds", "5",
         "--fast-exit-if-zero",
+        "--exclude-instance-id", "linux-host-4057304",
     ])
     assert args.timeout_seconds == 30
     assert args.poll_seconds == 5
     assert args.fast_exit_if_zero is True
+    assert args.excluded_instance_ids == ["linux-host-4057304"]
 
 
 def test_exclusive_writer_topology_accepts_only_expected_linux_scheduler(
