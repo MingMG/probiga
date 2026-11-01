@@ -90,3 +90,13 @@ def test_fast_dispatch_runs_schema_guard_before_linux_activation():
     activation = script.index("activate_linux_release", guard)
     assert guard < activation
     assert "retry with --full" in script[guard_function:dispatch]
+
+
+def test_schema_guard_boundary_includes_trigger_metadata_authority():
+    source = TOOL.read_text(encoding="utf-8")
+    function = source[
+        source.index("def _open_read_only_boundary()"):
+        source.index("def _parser()")
+    ]
+    assert "include_migrator=True" in function
+    assert "boundary.migrator_engine" in source

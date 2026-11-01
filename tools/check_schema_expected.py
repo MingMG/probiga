@@ -78,13 +78,13 @@ def collect_schema_guard(
     }
 
 
-def _open_read_only_engine() -> Any:
+def _open_read_only_boundary() -> Any:
     from tools import prepare_strategy_governance_schema as boundary_policy
 
     return boundary_policy._open_boundary(
-        include_migrator=False,
+        include_migrator=True,
         expected_trust=0,
-    ).runtime_engine
+    )
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -104,9 +104,15 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    engine = None
+    boundary = None
     try:
-        engine = _open_read_only_engine()
+        boundary = _open_read_only_boundary()
+        # Runtime has SELECT but no TRIGGER privilege, so MySQL hides trigger
+        # metadata from information_schema. The read-only migrator connection
+        # is required to validate the append-only trigger contracts.
+        engine = boundary.migrator_engine
+        if engine is None:
+            raise SchemaGuardError("required_schema_inventory_unavailable")
         result = collect_schema_guard(engine)
     except SchemaGuardError as exc:
         print(json.dumps({
@@ -128,11 +134,20 @@ def main(argv: list[str] | None = None) -> int:
         }, sort_keys=True))
         return EXIT_UNAVAILABLE
     finally:
-        if engine is not None:
-            try:
-                engine.dispose()
-            except Exception:
-                pass
+        if boundary is not None:
+            engines = {
+                id(candidate): candidate
+                for candidate in (
+                    boundary.runtime_engine,
+                    boundary.migrator_engine,
+                )
+                if candidate is not None
+            }
+            for engine in engines.values():
+                try:
+                    engine.dispose()
+                except Exception:
+                    pass
 
     print(json.dumps(result, sort_keys=True))
     return 0 if result["status"] == "READY" else EXIT_MISMATCH
