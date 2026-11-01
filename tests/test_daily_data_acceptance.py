@@ -5,6 +5,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -191,3 +192,84 @@ def test_deploy_provisions_service_writable_acceptance_receipt_root():
     assert 'test "$(stat -c \'%a\' -- "$DATA_ACCEPTANCE_ROOT")" = 700' in body
     assert 'sudo -u "$SERVICE_USER" test -w "$DATA_ACCEPTANCE_ROOT"' in body
     assert "\nprepare_data_acceptance_root\n" in script
+
+
+def _run_main_with_report(monkeypatch, status):
+    engine = SimpleNamespace(dispose=lambda: None)
+    delivered = []
+    failed = status == acceptance.FAIL
+    report = {
+        "schema": acceptance.ACCEPTANCE_SCHEMA,
+        "status": status,
+        "acceptance_status": (
+            "DATA_ACCEPTANCE_FAILED"
+            if failed
+            else "DATA_ACCEPTANCE_OK"
+        ),
+        "target_date": "2026-10-30",
+        "observed_at": "2026-10-30T23:20:00",
+        "failed_count": 1 if failed else 0,
+        "checks": [
+            acceptance.AcceptanceCheck(
+                "membership",
+                "membership",
+                acceptance.FAIL if failed else acceptance.PASS,
+                "stale" if failed else "ready",
+                "rerun task 65" if failed else "",
+                {},
+            ).as_dict(),
+        ],
+    }
+    monkeypatch.setattr(
+        "server.common.batch_db.create_batch_engine",
+        lambda: engine,
+    )
+    monkeypatch.setattr(
+        acceptance,
+        "collect_acceptance",
+        lambda *args, **kwargs: report,
+    )
+    monkeypatch.setattr(
+        acceptance,
+        "persist_report",
+        lambda report, **kwargs: Path("/tmp/2026-10-30.json"),
+    )
+    monkeypatch.setattr(
+        "server.common.config.get_wecom_webhook",
+        lambda kind, required=False: "https://example.invalid/hook",
+    )
+
+    def deliver(*args, **kwargs):
+        delivered.append((args, kwargs))
+        return SimpleNamespace(
+            delivery_id="delivery-id",
+            delivered_count=1,
+            segment_count=1,
+        )
+
+    monkeypatch.setattr(
+        "integrations.wecom.delivery.deliver_markdown",
+        deliver,
+    )
+    code = acceptance.main(
+        ["--target-date", "2026-10-30", "--json"]
+    )
+    return code, delivered
+
+
+def test_failed_acceptance_sends_one_actionable_alert(monkeypatch):
+    code, delivered = _run_main_with_report(monkeypatch, acceptance.FAIL)
+
+    assert code == 2
+    assert len(delivered) == 1
+    args, kwargs = delivered[0]
+    assert "membership" in args[1]
+    assert "rerun task 65" in args[1]
+    assert kwargs["delivery_kind"] == "daily_data_acceptance"
+
+
+def test_successful_acceptance_stays_silent(monkeypatch):
+    code, delivered = _run_main_with_report(monkeypatch, acceptance.PASS)
+
+    assert code == 0
+    assert delivered == []
