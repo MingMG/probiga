@@ -26,6 +26,8 @@ python -B tools/preview_market_decision.py --resume E:\report-runs\UUID --output
 
 恢复使用原始生成时间、完整事实包及同一规则版本。仅成功的阶段可复用；已经开始或失败的阶段不会重新发起模型请求。终态原因留在 receipt 和 checkpoint 中。输入、规则或发布范围发生变化时拒绝恢复。全流程上限1320秒；每份研究自身上限600秒，开始下一份研究前必须仍有完整阶段预算。
 
+已明确终止的 Codex 网络故障可以用 `--recover-from`、`--recover-stage`、`--prior-worker-registration`、`--prior-worker-revision`、`--worker-state-root` 创建一次独立恢复操作。入口先核对数据库失败回执、本地子进程终态及PID消失、原worker注册和已合并版本、全部输入身份与未变化的发布行，再原子领取唯一恢复机会。成功阶段的原始回复保持原样，只为失败阶段分配新UUID；旧失败证据和截止时间完整保留。第二次恢复、未知进程结果和内容终检拒稿均不能使用此入口。新建、恢复和重读都从已核验原始字节重建context，避免JSON保存的键序影响请求身份。
+
 ## 发布和真实回读
 
 需要发布时，新运行显式指定：
@@ -45,6 +47,8 @@ python -B tools/preview_market_decision.py --bundle E:\report-inputs\bundle.json
 Windows consumer 使用 `tools/run_codex_web_bridge.py --research-only`，只领取 `research` 队列，使用独立临时会话；不领取股票问答或通用问答，不恢复固定聊天，不使用 DeepSeek 网页兜底。领取代次和 worker 身份绑定租约，等待 CLI 期间每10秒续租。原始输入/输出、CLI session、实际返回的模型信息和内容身份进入回执；未返回的字段明确为 `UNKNOWN`。
 
 研究进程使用专用 `probiga_openai_https` provider，以单次 CLI `-c` 指向官方 `https://chatgpt.com/backend-api/codex`，保持已有 ChatGPT 登录；`requires_openai_auth=true`、`supports_websockets=false`，HTTP和流重连的重试预算均为零，不更改模型选择或用户配置。当前本机 CLI 不允许覆盖保留的 `openai` provider，所以使用单独名称，而不是已经移除的 WebSocket feature flags。字段依据[官方 Codex provider 源码](https://github.com/openai/codex/blob/main/codex-rs/model-provider-info/src/lib.rs)，HTTPS/SSE选择依据[OpenAI Docs](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations)。CLI进程仍受任务自身总截止约束。
+
+Windows 子进程明确读取当前用户已启用的静态系统HTTPS代理，只接受无凭据的本机loopback地址。PAC、自动发现和不受信任的地址会终止该次调用；不修改系统代理，也不继承当前Codex聊天进程的临时代理或API重定向。实际路由及其身份写入进程和模型回执。父进程连接ProBigA服务器的API仍保持直连配置。
 
 长期归属由 `tools/register_ai_research_worker.ps1` 注册独立隐藏的 `ProBigA AI Research Worker` 任务，并由 `tools/run_ai_research_worker.ps1` 前台托管进程。目标 checkout 必须 tracked clean 且 HEAD 精确等于已经 fetch 的 `origin/main`，可以使用 detached 专用生产目录。状态目录在代码树外，任务绑定 worker 自身内容 hash。注册不会启动任务，也不调整 QMT 调度、启动项或进程。
 

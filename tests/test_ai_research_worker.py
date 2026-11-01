@@ -133,7 +133,7 @@ def test_untyped_changed_or_expired_claims_never_reach_a_model(mutation, tmp_pat
 def offline_cli(tmp_path, monkeypatch):
     """A real local subprocess exercises stdin, output, deadlines and killing."""
     script = tmp_path / "offline_codex.py"
-    script.write_text('''import json,sys,time
+    script.write_text('''import json,sys,time,os
 from pathlib import Path
 args=sys.argv[1:]
 prompt=json.loads(sys.stdin.buffer.read().decode("utf-8"))
@@ -142,6 +142,7 @@ schema=json.loads(Path(args[args.index("--output-schema")+1]).read_bytes())
 assert schema["type"]=="object"
 raw='{"verdict":"通过"}\\r\\n'.encode("utf-8")
 Path(args[args.index("-o")+1]).write_bytes(raw)
+Path(args[args.index("-o")+1]).with_name("child-network.json").write_text(json.dumps({key:value for key,value in os.environ.items() if key.lower() in {"http_proxy","https_proxy","all_proxy","no_proxy"}}),encoding="utf-8")
 sys.stdout.buffer.write((json.dumps({"type":"thread.started","thread_id":"isolated-session"})+"\\n").encode())
 ''', encoding="utf-8")
     original = subprocess.Popen
@@ -273,3 +274,129 @@ def test_unconfirmed_child_termination_is_never_published_as_terminal_failure(tm
     receipt = json.loads((tmp_path / "research-1" / "receipt.json").read_text(encoding="utf-8"))
     assert receipt["status"] == "BLOCKED"
     assert receipt["stage"] == "termination_unconfirmed"
+
+
+@pytest.fixture
+def system_proxy_registry(monkeypatch):
+    """Model the observed HKCU WinINET boundary; no machine registry mutations."""
+    class Registry:
+        HKEY_CURRENT_USER = object()
+        KEY_READ = 0x20019
+        REG_DWORD, REG_SZ, REG_EXPAND_SZ = 4, 1, 2
+        def __init__(self, values):
+            self.values = values
+            self.opens = []
+        def OpenKey(self, hive, path, reserved, access):
+            assert hive is self.HKEY_CURRENT_USER
+            assert path == r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+            assert reserved == 0 and access == self.KEY_READ
+            self.opens.append((path, access))
+            return self
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return False
+        def QueryValueEx(self, _key, name):
+            if name not in self.values:
+                raise FileNotFoundError(name)
+            kind = self.REG_DWORD if name in {"ProxyEnable", "AutoDetect"} else self.REG_SZ
+            return self.values[name], kind
+    def install(values):
+        registry = Registry(values)
+        monkeypatch.setitem(sys.modules, "winreg", registry)
+        return registry
+    return install
+
+
+def test_enabled_hkcu_proxy_reaches_the_actual_child_without_inheriting_temporary_process_routes(
+        offline_cli, tmp_path, monkeypatch, system_proxy_registry):
+    registry = system_proxy_registry({"ProxyEnable": 1, "ProxyServer": "http://127.0.0.1:6064"})
+    monkeypatch.setenv("HTTPS_PROXY", "http://untrusted-process.example:8080")
+    monkeypatch.setenv("HTTP_PROXY", "http://untrusted-process.example:8080")
+    monkeypatch.setenv("ALL_PROXY", "http://another-process.example:9090")
+    monkeypatch.setenv("NO_PROXY", "*")
+    before = {key: value for key, value in bridge.os.environ.items() if key.lower() in bridge._PROXY_ENV_NAMES}
+    directory = tmp_path / "explicit-system-proxy"
+    directory.mkdir()
+    result = bridge.CodexResearchProvider(5, executable=Path("codex.exe")).ask(job()["payload"], directory, threading.Event())
+    child = json.loads((directory / "child-network.json").read_text(encoding="utf-8"))
+    assert {key.upper(): value for key, value in child.items()} == {"HTTPS_PROXY": "http://127.0.0.1:6064"}
+    assert {key: value for key, value in bridge.os.environ.items() if key.lower() in bridge._PROXY_ENV_NAMES} == before
+    route = result["provider_receipt"]["network_route"]
+    assert route["source"] == "windows_hkcu_internet_settings"
+    assert route["mode"] == "system_https_loopback_proxy"
+    assert route["route"] == "http://127.0.0.1:6064"
+    assert route["route_sha256"] == hashlib.sha256(b"http://127.0.0.1:6064").hexdigest()
+    assert route["process_proxy_inherited"] is False and route["pac_used"] is False
+    process = json.loads((directory / "process" / "receipt.json").read_text(encoding="utf-8"))
+    assert process["network_route"] == route
+    assert registry.opens and len(offline_cli) == 1
+    assert result["provider_receipt"]["base_url"] == "https://chatgpt.com/backend-api/codex"
+    assert result["provider_receipt"]["request_max_retries"] == 0
+
+
+def test_disabled_system_proxy_clears_process_proxy_and_bypass_variables(monkeypatch, system_proxy_registry):
+    system_proxy_registry({"ProxyEnable": 0, "ProxyServer": "http://old-untrusted.example:8080"})
+    for key in ("HTTPS_PROXY", "http_proxy", "ALL_PROXY", "no_proxy"):
+        monkeypatch.setenv(key, "http://process.example:8080")
+    environment, route = bridge.CodexResearchProvider.environment_with_route()
+    assert not any(key.lower() in bridge._PROXY_ENV_NAMES for key in environment)
+    assert route["mode"] == "system_proxy_disabled_direct" and route["route"] == "DIRECT"
+
+
+@pytest.mark.parametrize("server,expected", [
+    ("127.0.0.1:6064", "http://127.0.0.1:6064"),
+    ("http=127.0.0.1:6064;https=127.0.0.1:7070", "http://127.0.0.1:7070"),
+    ("https=http://[::1]:6064", "http://[::1]:6064"),
+])
+def test_trusted_system_https_proxy_selection(server, expected, system_proxy_registry):
+    system_proxy_registry({"ProxyEnable": 1, "ProxyServer": server})
+    assert bridge.CodexResearchProvider.environment()["HTTPS_PROXY"] == expected
+
+
+@pytest.mark.parametrize("values", [
+    {"ProxyEnable": 1, "ProxyServer": "http://192.0.2.2:6064"},
+    {"ProxyEnable": 1, "ProxyServer": "http://proxy.example:6064"},
+    {"ProxyEnable": 1, "ProxyServer": "http://secret-user:secret-pass@127.0.0.1:6064"},
+    {"ProxyEnable": 1, "ProxyServer": "socks5://127.0.0.1:6064"},
+    {"ProxyEnable": 1, "ProxyServer": "http://127.0.0.1:6064/path"},
+    {"ProxyEnable": 1, "ProxyServer": "http://127.0.0.1:6064?token=secret"},
+    {"ProxyEnable": 1, "ProxyServer": ""},
+    {"ProxyEnable": 1, "ProxyServer": "https=127.0.0.1:6064;https=127.0.0.1:7070"},
+    {"ProxyEnable": 1, "ProxyServer": "http=127.0.0.1:6064"},
+    {"ProxyEnable": 1, "ProxyServer": "http://127.0.0.1:0"},
+    {"ProxyEnable": 1, "ProxyServer": "http://127.0.0.1:6064", "AutoConfigURL": "http://127.0.0.1/proxy.pac"},
+    {"ProxyEnable": 1, "ProxyServer": "http://127.0.0.1:6064", "AutoDetect": 1},
+    {"ProxyEnable": "1", "ProxyServer": "http://127.0.0.1:6064"},
+])
+def test_pac_untrusted_or_ambiguous_system_routes_stop_before_any_child(
+        values, offline_cli, tmp_path, system_proxy_registry):
+    system_proxy_registry(values)
+    directory = tmp_path / "blocked-route"
+    directory.mkdir()
+    with pytest.raises(bridge.ProviderUnavailable, match="stage=network_route") as error:
+        bridge.CodexResearchProvider(5, executable=Path("codex.exe")).ask(job()["payload"], directory, threading.Event())
+    assert "secret" not in str(error.value)
+    assert offline_cli == []
+
+
+def test_unreadable_system_proxy_is_a_named_terminal_error_not_direct_fallback(monkeypatch, system_proxy_registry):
+    registry = system_proxy_registry({"ProxyEnable": 1, "ProxyServer": "http://127.0.0.1:6064"})
+    monkeypatch.setattr(registry, "OpenKey", lambda *a: (_ for _ in ()).throw(PermissionError("registry denied")))
+    with pytest.raises(bridge.ProviderUnavailable, match="system_proxy_registry_unavailable"):
+        bridge.CodexResearchProvider.environment()
+
+
+def test_reused_provider_never_reports_the_previous_route_after_new_system_policy_failure(
+        offline_cli, tmp_path, system_proxy_registry):
+    registry = system_proxy_registry({"ProxyEnable": 1, "ProxyServer": "http://127.0.0.1:6064"})
+    provider = bridge.CodexResearchProvider(5, executable=Path("codex.exe"))
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir(); second.mkdir()
+    provider.ask(job()["payload"], first, threading.Event())
+    assert provider.network_route["route"] == "http://127.0.0.1:6064"
+    registry.values["AutoConfigURL"] = "http://127.0.0.1/proxy.pac"
+    with pytest.raises(bridge.ProviderUnavailable, match="stage=network_route"):
+        provider.ask(job()["payload"], second, threading.Event())
+    assert provider.network_route == {"source": "UNAVAILABLE", "mode": "route_not_resolved"}
+    assert len(offline_cli) == 1

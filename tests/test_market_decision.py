@@ -4,6 +4,7 @@ from datetime import timedelta
 import json
 from threading import Lock
 from unittest.mock import Mock
+from uuid import uuid4
 
 import pytest
 
@@ -196,6 +197,77 @@ def test_changed_packet_cannot_reuse_a_checkpoint(monkeypatch):
     with pytest.raises(decision.ResearchError, match="checkpoint_identity_mismatch"):
         decision.generate_research(data, report_kind="review", next_trade_date="2026-11-02",
                                    context=context, engine=object(), checkpoint=progress[-1]["checkpoint"])
+    no_call.assert_not_called()
+
+
+def _terminal_recovery_checkpoint(monkeypatch, failed_stage="codex_draft"):
+    providers = Providers(failed_stage=failed_stage).install(monkeypatch)
+    data, context = material()
+    with pytest.raises(decision.ResearchError) as caught:
+        decision.generate_research(data, report_kind="review", next_trade_date="2026-11-02",
+                                   context=context, now=NOW, engine=object())
+    checkpoint = deepcopy(caught.value.checkpoint)
+    prior = checkpoint["stages"].pop(failed_stage)
+    assert prior["status"] == "FAILED"
+    replacement = str(uuid4())
+    checkpoint["recovery"] = {
+        "schema": "probiga.research-recovery.v1", "recovery_count": 1,
+        "failed_stage": failed_stage, "prior_attempt": prior,
+        "request_ids": {failed_stage: replacement},
+        # The permanent CLI proves these external terminal boundaries before
+        # passing the checkpoint. This unit test exercises only core routing.
+        "proof": {"database_status": "failed", "local_terminal": "failed", "pid_absent": True},
+    }
+    return checkpoint, replacement, data, context
+
+
+def test_terminal_codex_recovery_uses_new_request_uuid_and_reuses_completed_deepseek_bytes(monkeypatch):
+    checkpoint, replacement, data, context = _terminal_recovery_checkpoint(monkeypatch)
+    successful_ds = deepcopy(checkpoint["stages"]["deepseek_draft"])
+    original_checkpoint = deepcopy(checkpoint)
+    assert successful_ds["status"] == "COMPLETE"
+    assert checkpoint["recovery"]["prior_attempt"]["request_id"] != replacement
+    providers = Providers().install(monkeypatch)
+    result = decision.generate_research(data, report_kind="review", next_trade_date="2026-11-02",
+                                       context=context, engine=object(), checkpoint=checkpoint)
+    assert set(providers.calls) == set(decision.STAGES) - {"deepseek_draft"}
+    stages = {stage["stage"]: stage for stage in result["generation_attempts"]}
+    assert stages["deepseek_draft"] == {"stage": "deepseek_draft", **successful_ds}
+    assert stages["codex_draft"]["request_id"] == replacement
+    assert stages["codex_draft"]["provider_receipt"]["request_id"] == replacement
+    assert result["recovery"] == original_checkpoint["recovery"]
+    assert checkpoint == original_checkpoint
+    decision.verify_automatic_research(result)
+
+
+@pytest.mark.parametrize("mutation,reason", [
+    (lambda recovery: recovery.update(recovery_count=2), "invalid_terminal_recovery"),
+    (lambda recovery: recovery.update(schema="other-recovery"), "invalid_terminal_recovery"),
+    (lambda recovery: recovery["prior_attempt"].update(status="RUNNING"), "invalid_terminal_recovery"),
+    (lambda recovery: recovery["request_ids"].update(codex_draft="not-a-uuid"), "invalid_attempt_uuid"),
+    (lambda recovery: recovery["request_ids"].update(codex_draft=recovery["request_ids"]["codex_draft"].upper()), "invalid_attempt_uuid"),
+    (lambda recovery: recovery["request_ids"].update(codex_draft=recovery["prior_attempt"]["request_id"]), "invalid_terminal_recovery"),
+])
+def test_terminal_recovery_rejects_second_attempt_nonterminal_prior_or_invalid_uuid(monkeypatch, mutation, reason):
+    checkpoint, _, data, context = _terminal_recovery_checkpoint(monkeypatch)
+    mutation(checkpoint["recovery"])
+    no_call = Mock(side_effect=AssertionError("invalid recovery must not call any provider"))
+    monkeypatch.setattr(decision, "_call_deepseek", no_call)
+    monkeypatch.setattr(decision, "_call_codex", no_call)
+    with pytest.raises(decision.ResearchError, match=reason):
+        decision.generate_research(data, report_kind="review", next_trade_date="2026-11-02",
+                                   context=context, engine=object(), checkpoint=checkpoint)
+    no_call.assert_not_called()
+
+
+def test_terminal_request_uuid_override_is_not_a_deepseek_retry_channel(monkeypatch):
+    checkpoint, _, data, context = _terminal_recovery_checkpoint(monkeypatch, failed_stage="deepseek_draft")
+    no_call = Mock(side_effect=AssertionError("DeepSeek override must never issue a retry"))
+    monkeypatch.setattr(decision, "_call_deepseek", no_call)
+    monkeypatch.setattr(decision, "_call_codex", no_call)
+    with pytest.raises(decision.ResearchError, match="invalid_terminal_recovery"):
+        decision.generate_research(data, report_kind="review", next_trade_date="2026-11-02",
+                                   context=context, engine=object(), checkpoint=checkpoint)
     no_call.assert_not_called()
 
 

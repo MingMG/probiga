@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import ipaddress
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -25,7 +26,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.error import URLError
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
 from uuid import uuid4
 
@@ -805,6 +806,99 @@ class ResearchLease:
             self.thread.join(timeout=16)
 
 
+_WINDOWS_INTERNET_SETTINGS = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+_PROXY_ENV_NAMES = frozenset({"http_proxy", "https_proxy", "all_proxy", "no_proxy"})
+
+
+def _proxy_error(reason: str):
+    # Never include raw registry strings: malformed URLs can contain secrets.
+    raise ProviderUnavailable("RESEARCH_FAILED stage=network_route reason=" + reason)
+
+
+def _current_user_proxy_settings() -> dict[str, Any]:
+    """Read HKCU only; no WinHTTP mutation, PAC execution or process-proxy reuse."""
+    try:
+        import winreg
+    except ImportError:
+        return {"platform": "non_windows", "ProxyEnable": 0, "ProxyServer": "", "AutoConfigURL": "", "AutoDetect": 0}
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _WINDOWS_INTERNET_SETTINGS, 0, winreg.KEY_READ) as key:
+            def read(name, default, kinds):
+                try:
+                    value, kind = winreg.QueryValueEx(key, name)
+                except FileNotFoundError:
+                    return default
+                if kind not in kinds:
+                    _proxy_error("invalid_system_proxy_value_type")
+                return value
+            return {"platform": "windows", "ProxyEnable": read("ProxyEnable", 0, {winreg.REG_DWORD}),
+                    "ProxyServer": read("ProxyServer", "", {winreg.REG_SZ, winreg.REG_EXPAND_SZ}),
+                    "AutoConfigURL": read("AutoConfigURL", "", {winreg.REG_SZ, winreg.REG_EXPAND_SZ}),
+                    "AutoDetect": read("AutoDetect", 0, {winreg.REG_DWORD})}
+    except OSError as exc:
+        raise ProviderUnavailable("RESEARCH_FAILED stage=network_route reason=system_proxy_registry_unavailable") from exc
+
+
+def _system_https_proxy(settings: dict[str, Any]) -> str | None:
+    enabled, detect = settings.get("ProxyEnable"), settings.get("AutoDetect")
+    if type(enabled) is not int or enabled not in (0, 1) or type(detect) is not int or detect not in (0, 1):
+        _proxy_error("invalid_system_proxy_flags")
+    if not isinstance(settings.get("AutoConfigURL"), str) or not isinstance(settings.get("ProxyServer"), str):
+        _proxy_error("invalid_system_proxy_value")
+    if settings["AutoConfigURL"].strip() or detect:
+        _proxy_error("system_proxy_auto_configuration_unsupported")
+    if not enabled:
+        return None
+    configured = settings["ProxyServer"].strip()
+    if not configured:
+        _proxy_error("enabled_system_proxy_missing_server")
+    # WinINET accepts either a single server or a protocol-specific map.
+    if "=" in configured or ";" in configured:
+        servers = {}
+        for entry in configured.split(";"):
+            if not entry or entry.count("=") != 1:
+                _proxy_error("invalid_system_proxy_protocol_map")
+            protocol, value = (part.strip() for part in entry.split("=", 1))
+            protocol = protocol.lower()
+            if protocol not in {"http", "https"} or protocol in servers or not value:
+                _proxy_error("invalid_system_proxy_protocol_map")
+            servers[protocol] = value
+        if "https" not in servers:
+            _proxy_error("system_https_proxy_missing")
+        configured = servers["https"]
+    if any(char.isspace() or ord(char) < 32 for char in configured):
+        _proxy_error("invalid_system_proxy_url")
+    try:
+        parsed = urlsplit(configured if "://" in configured else "http://" + configured)
+        if (parsed.scheme not in {"http", "https"} or parsed.username is not None or parsed.password is not None
+                or parsed.path not in {"", "/"} or parsed.query or parsed.fragment or not parsed.hostname):
+            _proxy_error("untrusted_system_https_proxy")
+        address = ipaddress.ip_address(parsed.hostname)
+        port = parsed.port
+        if not address.is_loopback or port is None or not 1 <= port <= 65535:
+            _proxy_error("system_https_proxy_not_loopback")
+    except ValueError as exc:
+        raise ProviderUnavailable("RESEARCH_FAILED stage=network_route reason=invalid_or_nonliteral_loopback_proxy") from None
+    host = "[" + str(address) + "]" if address.version == 6 else str(address)
+    return f"{parsed.scheme}://{host}:{port}"
+
+
+def _research_child_environment() -> tuple[dict[str, str], dict[str, Any]]:
+    environment = {key: value for key, value in os.environ.items()
+                   if key.lower() not in _PROXY_ENV_NAMES
+                   and key.upper() not in {"OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_API_KEY"}}
+    settings = _current_user_proxy_settings()
+    proxy = _system_https_proxy(settings)
+    if proxy:
+        environment["HTTPS_PROXY"] = proxy
+    route = proxy or "DIRECT"
+    receipt = {"source": "windows_hkcu_internet_settings" if settings.get("platform") == "windows" else "non_windows_no_system_proxy",
+               "mode": "system_https_loopback_proxy" if proxy else "system_proxy_disabled_direct",
+               "route": route, "route_sha256": hashlib.sha256(route.encode("utf-8")).hexdigest(),
+               "process_proxy_inherited": False, "pac_used": False}
+    return environment, receipt
+
+
 class CodexResearchProvider:
     """A single tool-disabled ephemeral process, never an existing chat."""
 
@@ -814,10 +908,11 @@ class CodexResearchProvider:
 
     @staticmethod
     def environment() -> dict[str, str]:
-        environment = dict(os.environ)
-        for key in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_API_KEY"):
-            environment.pop(key, None)
-        return environment
+        return _research_child_environment()[0]
+
+    @staticmethod
+    def environment_with_route() -> tuple[dict[str, str], dict[str, Any]]:
+        return _research_child_environment()
 
     def version(self) -> str:
         try:
@@ -830,6 +925,9 @@ class CodexResearchProvider:
 
     def ask(self, payload: dict[str, Any], directory: Path, lease_lost: threading.Event) -> dict[str, Any]:
         directory = directory.resolve()
+        self.network_route = {"source": "UNAVAILABLE", "mode": "route_not_resolved"}
+        child_environment, network_route = self.environment_with_route()
+        self.network_route = network_route
         cli_version = self.version()
         deadline = min(_research_deadline(payload), time.monotonic() + self.timeout_seconds)
         schema_path, answer_path = directory / "schema.json", directory / "answer.json"
@@ -850,12 +948,12 @@ class CodexResearchProvider:
                          "input_sha256": payload["input_sha256"], "started_at": started,
                          "deadline_at": payload["deadline_at"], "executable": str(self.executable),
                          "command_sha256": _sha256(_research_json(command)), "parent_pid": os.getpid(),
-                         "worker_source_sha256": WORKER_SOURCE_SHA256,
+                         "worker_source_sha256": WORKER_SOURCE_SHA256, "network_route": network_route,
                          "observed_output_bytes": 0, "last_output_at": None, "progress_state": "NO_OUTPUT_YET"}
         with events_path.open("wb") as events, errors_path.open("wb") as errors:
             try:
                 process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=events, stderr=errors,
-                                           cwd=directory / "session", env=self.environment(),
+                                           cwd=directory / "session", env=child_environment,
                                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
                 process_state["pid"] = process.pid
                 _research_checkpoint(directory / "process", process_state)
@@ -936,6 +1034,7 @@ class CodexResearchProvider:
             "model": model, "session_id": session_id, "turn_id": turn_id, "ephemeral": True,
             "provider_id": RESEARCH_CODEX_PROVIDER, "base_url": RESEARCH_CODEX_BASE_URL,
             "network_transport": "https_sse", "websocket_enabled": False,
+            "network_route": network_route,
             "request_max_retries": 0, "stream_max_retries": 0,
             "started_at": started, "completed_at": _utc_iso(), "process_id": process.pid,
             "process_exit_code": process.returncode, "cli_version": cli_version,
@@ -995,7 +1094,8 @@ def process_research_job(api, provider, *, job: dict[str, Any], worker_id: str, 
             completion = {"worker_id": worker_id, "claim_generation": generation, "status": "failed",
                           "error_message": str(exc)[:1000], "provider_receipt": {
                               "source": SOURCE_CODEX, "request_id": request_id, "input_sha256": payload["input_sha256"],
-                              "rules_sha256": payload["rules_sha256"], "completed_at": _utc_iso()}}
+                              "rules_sha256": payload["rules_sha256"], "completed_at": _utc_iso(),
+                              "network_route": getattr(provider, "network_route", {"source": "UNAVAILABLE"})}}
         checkpoint.update(status="MODEL_COMPLETE", stage="completion", completion=completion, updated_at=_utc_iso())
         _research_checkpoint(directory, checkpoint)
         result = _confirm_research_completion(api, request_id, completion)

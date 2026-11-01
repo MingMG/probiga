@@ -275,7 +275,18 @@ def generate_research(digest,*,report_kind,next_trade_date,context=None,previous
         if saved and saved.get("status") in {"RUNNING","FAILED"}: _fail("resume","prior_attempt_not_reusable_"+stage)
         budget=min(90 if report_kind=="intraday" else 150,deadline-time.monotonic())
         if budget<5: _fail(stage,"total_deadline_exceeded")
-        with lock: state["stages"][stage]={"status":"RUNNING","messages_sha256":message_hash,"request_id":str(uuid5(namespace,stage)),"started_at":datetime.now(timezone.utc).isoformat()}
+        recovery=state.get("recovery") or {}
+        request_id=(recovery.get("request_ids") or {}).get(stage) or str(uuid5(namespace,stage))
+        if (recovery.get("request_ids") or {}).get(stage):
+            try:
+                if str(UUID(request_id))!=request_id: raise ValueError("noncanonical UUID")
+            except (ValueError,TypeError): _fail("recovery","invalid_attempt_uuid")
+            if (not stage.startswith("codex") or recovery.get("schema")!="probiga.research-recovery.v1"
+                    or recovery.get("recovery_count")!=1 or recovery.get("failed_stage")!=stage
+                    or (recovery.get("prior_attempt") or {}).get("status")!="FAILED"
+                    or (recovery.get("prior_attempt") or {}).get("request_id")==request_id):
+                _fail("recovery","invalid_terminal_recovery")
+        with lock: state["stages"][stage]={"status":"RUNNING","messages_sha256":message_hash,"request_id":request_id,"started_at":datetime.now(timezone.utc).isoformat()}
         emit(stage,"RUNNING",messages=messages,response_schema=schema)
         try:
             if stage.startswith("deepseek"): reply=_call_deepseek(messages,timeout_seconds=budget,stage=stage)
@@ -310,6 +321,7 @@ def generate_research(digest,*,report_kind,next_trade_date,context=None,previous
             "generation_attempts":[dict(stage=stage,**state["stages"][stage]) for stage in STAGES],
             "verification":{"status":"PASS","workflow":"dual_model","input_sha256":packet_hash,"final_raw_sha256":_body_hash(final_raw),
                 "final_draft_sha256":_hash(final["draft"]),"raw_semantics_unchanged":True,"peer_reviews":reviews,"final_review":final_review}}
+        if state.get("recovery"): result["recovery"]=deepcopy(state["recovery"])
         result["content"]=render_research(result);verify_automatic_research(result);emit("acceptance","COMPLETE");return result
     except BaseException as exc:
         if isinstance(exc,ResearchError): exc.checkpoint=state;raise
