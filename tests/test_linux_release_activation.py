@@ -433,3 +433,19 @@ def test_nginx_verification_includes_new_page_assets_and_rejects_cached_old_byte
     values["js/trading-day.js"] = b"cached-old-page"
     with pytest.raises(activation.ActivationError, match="static_release_bytes_differ"):
         services.verify_static(manifest(NEW, OLD))
+
+
+def test_release_health_waits_out_previous_scheduler_heartbeat_lease():
+    values = {}
+    for line in (
+        ROOT / "deploy" / "production_release.env"
+    ).read_text(encoding="utf-8").splitlines():
+        if line.startswith("HEALTH_"):
+            key, value = line.split("=", 1)
+            values[key] = int(value)
+    polling_window_seconds = 60
+    previous_scheduler_lease_seconds = polling_window_seconds * 2
+    assert (
+        values["HEALTH_RETRIES"] * values["HEALTH_INTERVAL"]
+        > previous_scheduler_lease_seconds + polling_window_seconds
+    )
