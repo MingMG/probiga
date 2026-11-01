@@ -33,15 +33,16 @@ class IntradayResearchError(RuntimeError):
 
 def _verified_research_units(research: dict) -> int:
     """Measure only the verified actual path, never its maximum stage budget."""
+    from biz.review.market_decision import STAGES
     proof = research.get("verification") or {}
     stages = research.get("generation_attempts") or []
     count = proof.get("stage_count")
-    if (type(count) is not int or count not in {6, MAX_RESEARCH_STAGES}
+    names = [stage.get("stage") for stage in stages]
+    if (type(count) is not int or not 0 < count <= MAX_RESEARCH_STAGES
             or len(stages) != count or any(stage.get("status") != "COMPLETE" for stage in stages)
-            or len({stage.get("stage") for stage in stages}) != count
+            or names != [name for name in STAGES if name in names]
             or proof.get("stage_budget") != MAX_RESEARCH_STAGES
-            or proof.get("final_round") != (1 if count == 6 else 2)
-            or proof.get("early_pass") is not (count == 6)):
+            or proof.get("status") != "PASS"):
         raise IntradayResearchError("INTRADAY_RESEARCH_BLOCKED stage=validation reason=stage_completion_proof_mismatch")
     return count
 
@@ -298,10 +299,10 @@ def process_research_batch(engine, *, outbox_id: str, generator=None, now_fn: Ca
             total = event.get("total", event.get("total_units", analysis["total_units"]))
             completed = event.get("completed", event.get("completed_units", analysis["completed_units"]))
             actual = event.get("actual_total", analysis.get("declared_actual_total"))
-            if (type(total) is not int or total not in {6, MAX_RESEARCH_STAGES}
+            if (type(total) is not int or not 0 < total <= MAX_RESEARCH_STAGES
                     or type(completed) is not int or not analysis["completed_units"] <= completed <= total
-                    or (actual is not None and (type(actual) is not int or actual not in {6, MAX_RESEARCH_STAGES}
-                        or completed != actual or event.get("early_pass") is not (actual == 6)))):
+                    or (actual is not None and (type(actual) is not int or not 0 < actual <= MAX_RESEARCH_STAGES
+                        or completed != actual))):
                 raise IntradayResearchError("INTRADAY_RESEARCH_BLOCKED stage=progress reason=stage_count_out_of_bounds")
             checkpoint = event.get("checkpoint")
             if checkpoint is not None:

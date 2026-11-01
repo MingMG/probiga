@@ -97,7 +97,7 @@ def audit_inputs(facts_path: Path, evidence_dir: Path, *, next_trade_date: str) 
     summary = {"status": "PREPARED", "prepared_at": datetime.now(timezone.utc).isoformat(),
         "review_date": bundle["review_date"], "next_trade_date": next_trade_date, "bundle_sha256": bundle["bundle_sha256"],
         "rules_sha256": core.rules_identity(), "workflow": getattr(core, "WORKFLOW_VERSION", "UNKNOWN"),
-        "stages": list(core.STAGES), "provider_stage_budget": len(core.STAGES), "accepted_provider_stage_counts": [6, 8],
+        "stages": list(core.STAGES), "provider_stage_budget": len(core.STAGES), "accepted_provider_stage_counts": [6, 7, 8],
         "data_cutoff_at": bundle["data_cutoff_at"], "source_receipts": bundle["source_receipts"],
         "enrichment_manifest_sha256": permanent._sha(manifest_path.read_bytes()), "original_source_snapshots": source_receipts,
         "observed_cutoffs": cutoffs, "review_packet": {"bytes": packet_bytes, "byte_limit": MAX_PACKET_BYTES,

@@ -27,8 +27,9 @@ RULES_DIR = Path(__file__).with_name("market_decision_rules")
 DEADLINE_SECONDS = 600
 INTRADAY_DEADLINE_SECONDS = 180
 MAX_OUTPUT_CHARS = 60_000
-WORKFLOW_VERSION = "independent-drafts.cross-review.codex-final.blind-deepseek-audit.max2.v3"
+WORKFLOW_VERSION = "independent-drafts.cross-review.codex-final.blind-deepseek-audit.local-contract.max2.v3"
 STAGES = ("deepseek_draft", "codex_draft", "deepseek_review", "codex_review", "codex_final", "deepseek_final_review", "codex_final_2", "deepseek_final_review_2")
+LOCAL_REVIEW_VERSION = "probiga.research-local-contract-review.v1"
 DEEPSEEK_RESEARCH_POLICY = {"model": "deepseek-v4-pro", "thinking": {"type": "enabled"},
                             "reasoning_effort": "low", "max_tokens": 16000}
 DEEPSEEK_INTRADAY_POLICY = {"model": "deepseek-flash", "thinking": {"type": "enabled"},
@@ -47,6 +48,17 @@ class ResearchError(RuntimeError):
 
 def _fail(stage, reason):
     raise ResearchError(f"RESEARCH_BLOCKED stage={stage} reason={reason}")
+
+
+def expected_research_stages(revision_trigger):
+    """The three complete provider layouts; a local rejection is not an audit."""
+    if revision_trigger == "none":
+        return STAGES[:6]
+    if revision_trigger == "blind_audit":
+        return STAGES
+    if revision_trigger == "deterministic_contract":
+        return STAGES[:5] + STAGES[6:]
+    _fail("automatic_provenance", "unknown_revision_trigger")
 
 
 def _json(value: Any) -> str:
@@ -190,7 +202,7 @@ def _parse_review(raw,target_hash,packet,*,final=False,require_pass=True):
 
 
 def _final_schema(review_names=("deepseek_review", "codex_review")):
-    allowed = ("deepseek_review", "codex_review", "deepseek_final_review")
+    allowed = ("deepseek_review", "codex_review", "deepseek_final_review", "deterministic_contract")
     names = [name for name in allowed if name in review_names]
     if not names or len(names) != len(review_names): _fail("input", "invalid_disposition_reviews")
     return _object({"schema_version":{"type":"string","const":"probiga.research-final.v3"},"draft":draft_json_schema(),
@@ -213,6 +225,31 @@ def _validate_final(raw,packet,reviews):
         if any(x not in packet["facts"] for x in item["fact_ids"]) or any(x not in units for x in item["unit_ids"]): _fail("final_contract","unknown_disposition_reference")
         if item["resolution"]=="disputed_with_evidence" and not item["fact_ids"]: _fail("final_contract","dispute_without_evidence")
     return result
+
+
+def _inspect_first_final(raw, packet, reviews):
+    """Return the untouched valid final, or a reproducible local rejection.
+
+    This finding is program evidence about the original raw target.  It never
+    impersonates a provider response and never changes the rejected content.
+    """
+    try:
+        return _validate_final(raw, packet, reviews), None
+    except ResearchError as exc:
+        original, visited = exc, set()
+        while (cause := original.__cause__ or original.__context__) is not None and id(cause) not in visited:
+            visited.add(id(original))
+            original = cause
+            if not isinstance(original, ResearchError):
+                break
+        error = {"type": type(original).__name__, "message": str(original)}
+        path = re.search(r"\bpath=([^\s]+)", error["message"])
+        review = {"schema_version": LOCAL_REVIEW_VERSION, "reviewed_sha256": _body_hash(raw),
+                  "verifier": "validate_final", "verdict": "REJECT", "error": error,
+                  "findings": [{"id": "LOCAL_CONTRACT", "severity": "blocker", "category": "deterministic_contract",
+                      "target": path.group(1) if path else "native_final", "fact_ids": [],
+                      "explanation": "原始定稿未通过本地合同校验：" + error["message"]}]}
+        return None, review
 
 
 def _diagnostic(raw,packet):
@@ -250,10 +287,9 @@ def _final_request(packet,rules,drafts,reviews):
     return _messages(instruction,material,schema,rules),schema
 
 
-def _revision_request(packet,rules,final,reviews):
+def _revision_request(packet,rules,final_raw,reviews):
     schema=_final_schema(tuple(reviews))
-    material={"input":packet,"prior_final":final,"peer_reviews":reviews,
-        "deterministic_errors":_diagnostic(_json(final["draft"]),packet)}
+    material={"input":packet,"prior_final_raw":final_raw,"peer_reviews":reviews}
     instruction="这是最后一次正式定稿。逐条核验前轮终审与双方互审发现，完整处置全部finding。真实无据断言必须修复；误报可依据事实反驳，也可自动澄清引发误读的措辞并保留真实证据。不要因审查意见错误而删除有效事实，不机械迎合，也不固守歧义原句。不加入输入之外的证据，不程序修稿；返回完整draft及全部finding处置，随后将接受仅看当前稿的独立盲审。"
     if packet["task"]["kind"]=="intraday":
         instruction+="保持盘中短稿，只解释当时变化与剩余时段条件。"
@@ -268,7 +304,8 @@ def _audit_request(packet,rules,final):
     return _messages("最终独立盲审：只核对本次final_draft与事实合同，不接收旧稿、旧诊断或主编自称的修复结果。六个研究问题应有实质回答，条件应可验证。只列最终稿当前仍存在的具体问题；已修复事项和无问题事项不进入findings，maxItems是上限而不是数量目标。blocker须定位最终原句、违反的合同和证据缺口。矛盾必须是同一对象、时点和命题的互斥判断，不同研究命题置信度不同不构成矛盾。候选分类按合同定义，不把候选推断误读为资金动机已经证实。存在真正阻断问题就REJECT；没有阻断问题才PASS，不为流程结束而通过，不改写最终稿。",{"input":packet,"final_draft":final["draft"]},schema,rules),schema
 
 
-def build_stage_request(stage, packet, rules, *, drafts=None, reviews=None, final=None, final_review=None):
+def build_stage_request(stage, packet, rules, *, drafts=None, reviews=None, final=None, final_review=None,
+                        final_raw=None, revision_trigger=None):
     """Canonical request/schema for exactly one stage of the final workflow."""
     if stage not in STAGES:
         _fail("input", "unknown_provider_stage")
@@ -283,12 +320,14 @@ def build_stage_request(stage, packet, rules, *, drafts=None, reviews=None, fina
             if not isinstance(drafts,dict) or not isinstance(reviews,dict):
                 raise TypeError("drafts and reviews required")
             return _final_request(packet, rules, drafts, reviews)
+        if stage == "codex_final_2":
+            if (not isinstance(reviews,dict) or not isinstance(final_review,dict) or not isinstance(final_raw,str)
+                    or revision_trigger not in {"blind_audit", "deterministic_contract"}):
+                raise TypeError("peer and first final reviews required")
+            name = "deterministic_contract" if revision_trigger == "deterministic_contract" else "deepseek_final_review"
+            return _revision_request(packet, rules, final_raw, {**reviews,name:final_review})
         if not isinstance(final,dict):
             raise TypeError("final required")
-        if stage == "codex_final_2":
-            if not isinstance(reviews,dict) or not isinstance(final_review,dict):
-                raise TypeError("peer and first final reviews required")
-            return _revision_request(packet, rules, final, {**reviews,"deepseek_final_review":final_review})
         return _audit_request(packet, rules, final)
     except (KeyError, TypeError):
         _fail("input", "stage_prerequisites_missing_" + stage)
@@ -373,31 +412,45 @@ def generate_research(digest,*,report_kind,next_trade_date,context=None,previous
             reviews={"deepseek_review":ds.result(),"codex_review":cx.result()}
         state["final_round"]=1
         messages,schema=build_stage_request("codex_final",packet,rules,drafts=drafts,reviews=reviews)
-        final_raw=call("codex_final",messages,schema);final=_validate_final(final_raw,packet,reviews)
-        messages,schema=build_stage_request("deepseek_final_review",packet,rules,final=final)
-        first_review=_parse_review(call("deepseek_final_review",messages,schema),_hash(final["draft"]),packet,final=True,require_pass=False)
+        first_raw=call("codex_final",messages,schema)
+        final,local_review=_inspect_first_final(first_raw,packet,reviews)
+        if local_review is not None:
+            first_review=local_review
+            revision_trigger="deterministic_contract"
+            state["local_contract_review"]=local_review
+            state["revision_trigger"]=revision_trigger
+            emit("final_contract","REJECT",deterministic_review=local_review)
+        else:
+            messages,schema=build_stage_request("deepseek_final_review",packet,rules,final=final)
+            first_review=_parse_review(call("deepseek_final_review",messages,schema),_hash(final["draft"]),packet,final=True,require_pass=False)
+            revision_trigger="blind_audit" if first_review["verdict"]!="PASS" or any(x["severity"]=="blocker" for x in first_review["findings"]) else "none"
+        state["revision_trigger"]=revision_trigger
         round_reviews=[first_review]
-        needs_revision=first_review["verdict"]!="PASS" or any(x["severity"]=="blocker" for x in first_review["findings"])
+        needs_revision=revision_trigger!="none"
         if needs_revision:
             state["final_round"]=2
-            messages,schema=build_stage_request("codex_final_2",packet,rules,final=final,reviews=reviews,final_review=first_review)
+            messages,schema=build_stage_request("codex_final_2",packet,rules,final_raw=first_raw,
+                reviews=reviews,final_review=first_review,revision_trigger=revision_trigger)
             final_raw=call("codex_final_2",messages,schema)
-            final=_validate_final(final_raw,packet,{**reviews,"deepseek_final_review":first_review})
+            review_name="deterministic_contract" if revision_trigger=="deterministic_contract" else "deepseek_final_review"
+            final=_validate_final(final_raw,packet,{**reviews,review_name:first_review})
             messages,schema=build_stage_request("deepseek_final_review_2",packet,rules,final=final)
             final_review=_parse_review(call("deepseek_final_review_2",messages,schema),_hash(final["draft"]),packet,final=True)
             round_reviews.append(final_review)
         else:
             if any(name in state["stages"] for name in STAGES[6:]): _fail("resume","unnecessary_second_round")
-            final_review=first_review
+            final_review=first_review;final_raw=first_raw
         if time.monotonic()>deadline: _fail("completion","total_deadline_exceeded")
-        executed=STAGES[:6] if len(round_reviews)==1 else STAGES
+        executed=expected_research_stages(revision_trigger)
+        if any(stage not in executed for stage in state["stages"]): _fail("resume","unexpected_provider_stages")
         result={"schema_version":SCHEMA_VERSION,"status":"COMPLETE","report_kind":report_kind,"review_date":str(digest["review_date"])[:10],"next_trade_date":next_trade_date,
             "generated_at":current.isoformat(),"data_cutoff_at":packet["task"].get("data_cutoff_at"),"context_cutoff_at":packet["task"].get("context_cutoff_at"),
             "rules_sha256":rule_hash,"source_digest_sha256":source_digest_identity(digest),"input_packet":packet,"model_output":final,"draft":final["draft"],
             "generation_attempts":[dict(stage=stage,**state["stages"][stage]) for stage in executed],
             "verification":{"status":"PASS","workflow":WORKFLOW_VERSION,"input_sha256":packet_hash,"final_raw_sha256":_body_hash(final_raw),
                 "final_draft_sha256":_hash(final["draft"]),"raw_semantics_unchanged":True,"peer_reviews":reviews,"final_review":final_review,
-                "round_reviews":round_reviews,"final_round":len(round_reviews),"stage_count":len(executed),"stage_budget":len(STAGES),"early_pass":len(round_reviews)==1}}
+                "round_reviews":round_reviews,"final_round":len(round_reviews),"stage_count":len(executed),"stage_budget":len(STAGES),
+                "early_pass":len(round_reviews)==1,"revision_trigger":revision_trigger}}
         if state.get("recovery"): result["recovery"]=deepcopy(state["recovery"])
         if state.get("continuation"): result["continuation"]=deepcopy(state["continuation"])
         result["content"]=render_research(result);verify_automatic_research(result);emit("acceptance","COMPLETE",actual_total=len(executed),early_pass=len(round_reviews)==1);return result
@@ -413,7 +466,10 @@ def verify_automatic_research(research):
     """Rebuild from untouched provider raw responses, not a body hash alone."""
     if research.get("schema_version")!=SCHEMA_VERSION or research.get("status")!="COMPLETE" or research.get("editorial_review"): _fail("automatic_provenance","nonautomatic_artifact")
     stages=research.get("generation_attempts") or []
-    if [x.get("stage") for x in stages] not in (list(STAGES[:6]),list(STAGES)) or any(x.get("status")!="COMPLETE" for x in stages): _fail("automatic_provenance","incomplete_provider_stages")
+    if ([x.get("stage") for x in stages] not in tuple(list(expected_research_stages(trigger))
+            for trigger in ("none", "blind_audit", "deterministic_contract"))
+            or any(x.get("status")!="COMPLETE" for x in stages)):
+        _fail("automatic_provenance","incomplete_provider_stages")
     by_stage={x["stage"]:x for x in stages}
     for stage,item in by_stage.items():
         raw=item.get("raw_response");receipt=item.get("provider_receipt") or {}
@@ -440,14 +496,22 @@ def verify_automatic_research(research):
     if _hash(packet)!=proof.get("input_sha256"): _fail("automatic_provenance","input_packet_changed")
     reviews={"deepseek_review":_parse_review(by_stage["deepseek_review"]["raw_response"],_body_hash(by_stage["codex_draft"]["raw_response"]),packet),
         "codex_review":_parse_review(by_stage["codex_review"]["raw_response"],_body_hash(by_stage["deepseek_draft"]["raw_response"]),packet)}
-    first_final=_validate_final(by_stage["codex_final"]["raw_response"],packet,reviews)
-    first_review=_parse_review(by_stage["deepseek_final_review"]["raw_response"],_hash(first_final["draft"]),packet,final=True,require_pass=False)
-    needs_revision=first_review["verdict"]!="PASS" or any(x["severity"]=="blocker" for x in first_review["findings"])
-    if needs_revision != (len(stages)==8): _fail("automatic_provenance","final_round_layout_mismatch")
+    first_raw=by_stage["codex_final"]["raw_response"]
+    first_final,local_review=_inspect_first_final(first_raw,packet,reviews)
+    if local_review is not None:
+        first_review=local_review;revision_trigger="deterministic_contract"
+    else:
+        if "deepseek_final_review" not in by_stage: _fail("automatic_provenance","final_round_layout_mismatch")
+        first_review=_parse_review(by_stage["deepseek_final_review"]["raw_response"],_hash(first_final["draft"]),packet,final=True,require_pass=False)
+        revision_trigger="blind_audit" if first_review["verdict"]!="PASS" or any(x["severity"]=="blocker" for x in first_review["findings"]) else "none"
+    needs_revision=revision_trigger!="none"
+    if [item["stage"] for item in stages]!=list(expected_research_stages(revision_trigger)):
+        _fail("automatic_provenance","final_round_layout_mismatch")
     round_reviews=[first_review]
     if needs_revision:
         final_stage="codex_final_2"
-        final=_validate_final(by_stage[final_stage]["raw_response"],packet,{**reviews,"deepseek_final_review":first_review})
+        review_name="deterministic_contract" if revision_trigger=="deterministic_contract" else "deepseek_final_review"
+        final=_validate_final(by_stage[final_stage]["raw_response"],packet,{**reviews,review_name:first_review})
         review=_parse_review(by_stage["deepseek_final_review_2"]["raw_response"],_hash(final["draft"]),packet,final=True)
         round_reviews.append(review)
     else:
@@ -456,15 +520,19 @@ def verify_automatic_research(research):
     if final!=research.get("model_output") or final["draft"]!=research.get("draft"): _fail("automatic_provenance","model_semantics_edited")
     if proof.get("final_review")!=review or proof.get("peer_reviews")!=reviews or proof.get("round_reviews")!=round_reviews: _fail("automatic_provenance","review_result_edited")
     if (proof.get("final_round")!=len(round_reviews) or proof.get("stage_count")!=len(stages)
-            or proof.get("stage_budget")!=len(STAGES) or proof.get("early_pass")!=(len(round_reviews)==1)):
+            or proof.get("stage_budget")!=len(STAGES) or proof.get("early_pass")!=(len(round_reviews)==1)
+            or proof.get("revision_trigger")!=revision_trigger):
         _fail("automatic_provenance","stage_accounting_changed")
     if proof.get("final_raw_sha256")!=by_stage[final_stage]["raw_sha256"] or proof.get("final_draft_sha256")!=_hash(final["draft"]): _fail("automatic_provenance","final_identity_mismatch")
     rules,rule_hash=_load_rules()
     if research.get("rules_sha256")!=rule_hash: _fail("automatic_provenance","rules_changed")
     drafts={"deepseek":by_stage["deepseek_draft"]["raw_response"],"codex":by_stage["codex_draft"]["raw_response"]}
-    requests={stage:build_stage_request(stage,packet,rules,drafts=drafts,reviews=reviews,final=first_final) for stage in STAGES[:6]}
+    requests={stage:build_stage_request(stage,packet,rules,drafts=drafts,reviews=reviews) for stage in STAGES[:5]}
+    if local_review is None:
+        requests["deepseek_final_review"]=build_stage_request("deepseek_final_review",packet,rules,final=first_final)
     if needs_revision:
-        requests["codex_final_2"]=build_stage_request("codex_final_2",packet,rules,final=first_final,reviews=reviews,final_review=first_review)
+        requests["codex_final_2"]=build_stage_request("codex_final_2",packet,rules,final_raw=first_raw,
+            reviews=reviews,final_review=first_review,revision_trigger=revision_trigger)
         requests["deepseek_final_review_2"]=build_stage_request("deepseek_final_review_2",packet,rules,final=final)
     from server.ai_bridge.research import research_input_sha256
     for stage,(messages,schema) in requests.items():

@@ -664,9 +664,10 @@ def execute_run(engine, bundle: dict, directory: Path, *, publish=False, api_bas
         verify_automatic_research(research)
         attempts = research.get("generation_attempts") or []
         count = len(attempts)
-        first_round = STAGES.index("deepseek_final_review") + 1
-        if (count not in (first_round, len(STAGES)) or [item.get("stage") for item in attempts] != list(STAGES[:count])
-                or research.get("verification", {}).get("status") != "PASS"):
+        names = [item.get("stage") for item in attempts]
+        proof = research.get("verification", {})
+        if (not 0 < count <= len(STAGES) or names != [name for name in STAGES if name in names]
+                or proof.get("stage_count") != count or proof.get("status") != "PASS"):
             raise RuntimeError("FAILED stage=acceptance: incomplete_automatic_provider_stages")
         for item in attempts:
             raw = item["raw_response"].encode("utf-8")

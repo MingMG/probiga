@@ -74,12 +74,13 @@ def automatic_boundary(monkeypatch):
 
 
 def report(digest, kind, now=None, *, stage_count=6):
+    names = core.expected_research_stages({6: "none", 7: "deterministic_contract", 8: "blind_audit"}[stage_count])
     value = {"schema_version": core.SCHEMA_VERSION, "status": "COMPLETE", "report_kind": kind,
         "review_date": DAY, "next_trade_date": NEXT, "generated_at": (now or datetime.now(timezone.utc)).isoformat(),
         "rules_sha256": core.rules_identity(), "source_digest_sha256": core.source_digest_identity(digest),
         "content": "自动复盘" if kind == "review" else "自动早报",
         "generation_attempts": [{"stage": stage, "status": "COMPLETE", "raw_response": "raw:" + kind + ":" + stage,
-            "raw_sha256": acceptance._sha(("raw:" + kind + ":" + stage).encode())} for stage in core.STAGES[:stage_count]],
+            "raw_sha256": acceptance._sha(("raw:" + kind + ":" + stage).encode())} for stage in names],
         "verification": {"status": "PASS", "stage_count": stage_count}}
     value["research_sha256"] = flow.artifact_hash(value)
     return value
@@ -111,13 +112,13 @@ def test_api_requires_exact_date_no_fallback_and_both_untouched_reports(automati
             acceptance.verify_api_payload(changed, digest, morning)
 
 
-@pytest.mark.parametrize("stage_counts", [(6, 6), (6, 8), (8, 6), (8, 8)])
+@pytest.mark.parametrize("stage_counts", [(6, 6), (6, 7), (6, 8), (7, 6), (7, 7), (7, 8), (8, 6), (8, 7), (8, 8)])
 @pytest.mark.parametrize("publish", [False, True])
 def test_uuid_run_resumes_completed_artifacts_without_rereading_or_regenerating(tmp_path, monkeypatch, automatic_boundary, stage_counts, publish):
     frozen, calls = bundle(), []
     def review(engine, digest, **kwargs):
         calls.append(kwargs)
-        kwargs["progress"]({"stage": core.STAGES[stage_counts[0] - 1], "completed": stage_counts[0], "total": len(core.STAGES)})
+        kwargs["progress"]({"stage": "deepseek_final_review" if stage_counts[0] == 6 else "deepseek_final_review_2", "completed": stage_counts[0], "total": len(core.STAGES)})
         digest["factor_validation_json"]["market_decision"] = report(digest, "review", kwargs["now"], stage_count=stage_counts[0])
         digest["compact_review"] = "自动复盘"
     def morning(engine, target, **kwargs):
@@ -125,7 +126,7 @@ def test_uuid_run_resumes_completed_artifacts_without_rereading_or_regenerating(
         digest = kwargs["digest"]
         saved = acceptance._read_json(directory / "run_receipt.json")
         assert saved["provider_units"]["review"] == {"completed": stage_counts[0], "total": stage_counts[0]}
-        kwargs["progress"]({"stage": core.STAGES[stage_counts[1] - 1], "completed": stage_counts[1], "total": len(core.STAGES)})
+        kwargs["progress"]({"stage": "deepseek_final_review" if stage_counts[1] == 6 else "deepseek_final_review_2", "completed": stage_counts[1], "total": len(core.STAGES)})
         value = report(digest, "briefing", kwargs["now"], stage_count=stage_counts[1])
         value.pop("research_sha256")
         parent = digest["factor_validation_json"]["market_decision"]
@@ -149,8 +150,11 @@ def test_uuid_run_resumes_completed_artifacts_without_rereading_or_regenerating(
     receipt = acceptance.execute_run(None, frozen, directory, **options)
     assert receipt["completed_units"] == receipt["total_units"] == sum(stage_counts) + (2 if publish else 0)
     for kind, count in zip(("review", "briefing"), stage_counts):
-        for stage in core.STAGES[:count]:
+        names = core.expected_research_stages({6: "none", 7: "deterministic_contract", 8: "blind_audit"}[count])
+        for stage in names:
             assert (directory / "stages" / kind / (stage + "_response.json")).read_text() == "raw:" + kind + ":" + stage
+        if count == 7:
+            assert not (directory / "stages" / kind / "deepseek_final_review_response.json").exists()
     assert acceptance.execute_run(None, frozen, directory, resume=True, **options)["status"] == "COMPLETE"
     assert len(calls) == 2 and calls[0]["previous_research"] is None
     assert all("completion" not in call for call in calls)

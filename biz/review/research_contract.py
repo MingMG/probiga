@@ -596,6 +596,18 @@ def validate_draft(raw: str, packet: dict) -> dict:
     def evidence(unit):
         return [facts[fid] for fid in unit.get("evidence_ids", [])]
 
+    def condition_time_order(trigger_units, abandon_units, path):
+        # This contract has no historical latch or re-activation semantics.
+        # Every abandonment observation must be available at or after every
+        # possible triggering observation, including all/any compound units.
+        trigger = max((WINDOWS.index(item["window"]), unit["id"], item["window"])
+                      for unit in trigger_units for item in unit["conditions"])
+        abandon = min((WINDOWS.index(item["window"]), unit["id"], item["window"])
+                      for unit in abandon_units for item in unit["conditions"])
+        if abandon[0] < trigger[0]:
+            _fail("abandon_window_precedes_trigger",
+                  f"{path}.abandon_units:{abandon[1]}.{abandon[2]}<trigger_units:{trigger[1]}.{trigger[2]}")
+
     def own_stock_quantity(selected, eid, capital=False):
         allowed = {"market_cap", "total_market_cap", "circulating_market_cap", "float_market_cap"}
         if not capital:
@@ -688,7 +700,7 @@ def validate_draft(raw: str, packet: dict) -> dict:
     if available_themes and not report["directions"]:
         _fail("available_directions_not_analysed")
     selected_entities = []
-    for direction in report["directions"]:
+    for direction_index, direction in enumerate(report["directions"]):
         eid = direction["entity_id"]
         if eid not in available_themes or eid in selected_entities:
             _fail("unknown_or_duplicate_direction")
@@ -701,7 +713,7 @@ def validate_draft(raw: str, packet: dict) -> dict:
         if linked and not direction["watches"]:
             _fail("linked_stock_observation_required")
         used = set()
-        for watch in direction["watches"]:
+        for watch_index, watch in enumerate(direction["watches"]):
             stock_id = watch["entity_id"]
             if stock_id not in linked or stock_id in used:
                 _fail("unlinked_or_duplicate_stock")
@@ -714,14 +726,17 @@ def validate_draft(raw: str, packet: dict) -> dict:
                 _fail("capacity_requires_own_quantity")
             if identity in {"leader", "anchor", "follower"} and not any(card.get("entity_id") == stock_id and card["metric"] in {"leadership", "lead_lag", "sector_response"} for unit in selected for card in evidence(unit)):
                 _fail("confirmed_identity_requires_relationship")
-            refs(watch["trigger_units"], "watch.trigger", kinds={"future_condition"})
-            refs(watch["abandon_units"], "watch.abandon", kinds={"future_condition"})
+            triggers = refs(watch["trigger_units"], "watch.trigger", kinds={"future_condition"})
+            abandons = refs(watch["abandon_units"], "watch.abandon", kinds={"future_condition"})
+            condition_time_order(triggers, abandons,
+                                 f"report.directions[{direction_index}].watches[{watch_index}]")
     refs(report["event_units"], "report.events", kinds={"market_inference", "data_limitation", "baseline_restatement"})
-    for scenario in report["scenarios"]:
+    for scenario_index, scenario in enumerate(report["scenarios"]):
         if any(char.isdigit() for char in scenario["name"]):
             _fail("scenario_name_number_requires_reference")
-        refs(scenario["trigger_units"], "scenario.trigger", kinds={"future_condition"})
-        refs(scenario["abandon_units"], "scenario.abandon", kinds={"future_condition"})
+        triggers = refs(scenario["trigger_units"], "scenario.trigger", kinds={"future_condition"})
+        abandons = refs(scenario["abandon_units"], "scenario.abandon", kinds={"future_condition"})
+        condition_time_order(triggers, abandons, f"report.scenarios[{scenario_index}]")
         refs(scenario["action_units"], "scenario.action")
     for window, ids in report["checks"].items():
         if not ids and packet["task"]["kind"] != "intraday":

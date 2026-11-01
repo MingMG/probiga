@@ -1,4 +1,4 @@
-"""Automatic research proves six or eight bounded provider stages and untouched output."""
+"""Automatic research proves six, seven or eight bounded provider stages."""
 from copy import deepcopy
 from datetime import timedelta
 import json
@@ -16,7 +16,8 @@ from test_research_contract import NOW, answer, material
 
 class Providers:
     """Unit-test provider boundary only; no completion/editorial bypass hook."""
-    def __init__(self, *, failed_stage=None, final_reject=False, findings=False, invalid_initial=False, oversized_final=False, many_findings=False, first_reject=False):
+    def __init__(self, *, failed_stage=None, final_reject=False, findings=False, invalid_initial=False, oversized_final=False, many_findings=False, first_reject=False,
+                 invalid_final=False, repeat_invalid_final=False, invalid_json_final=False):
         self.calls = {}
         self.lock = Lock()
         self.failed_stage = failed_stage
@@ -26,6 +27,9 @@ class Providers:
         self.invalid_initial = invalid_initial
         self.oversized_final = oversized_final
         self.many_findings = many_findings
+        self.invalid_final = invalid_final
+        self.repeat_invalid_final = repeat_invalid_final
+        self.invalid_json_final = invalid_json_final
 
     def install(self, monkeypatch):
         monkeypatch.setattr(decision, "_call_deepseek", self.deepseek)
@@ -90,8 +94,12 @@ class Providers:
                     unit = deepcopy(final_draft["units"][0])
                     unit["id"] = "Oversize" + str(len(final_draft["units"]))
                     final_draft["units"].append(unit)
+            if self.invalid_final and (stage == "codex_final" or self.repeat_invalid_final):
+                final_draft["report"]["scenarios"][0].update(trigger_units=["Cmid"], abandon_units=["Cearly"])
             value = {"schema_version": "probiga.research-final.v3", "draft": final_draft, "dispositions": dispositions}
         raw = json.dumps(value, ensure_ascii=False)
+        if self.invalid_json_final and stage == "codex_final":
+            raw = '{"schema_version":"probiga.research-final.v3","draft":'
         receipt = {"messages_sha256": decision._hash(messages), "raw_sha256": decision._body_hash(raw),
                    "started_at": NOW.isoformat(), "completed_at": NOW.isoformat(),
                    "provider_response_id": "provider-" + stage, "model": "unit-provider"}
@@ -481,7 +489,7 @@ def test_first_blind_rejection_runs_one_revision_with_all_findings_then_a_curren
     material2 = json.loads(revision["messages"][1]["content"])["material"]
     first = json.loads(providers.calls["codex_final"]["raw"])
     audit1 = json.loads(providers.calls["deepseek_final_review"]["raw"])
-    assert material2["prior_final"] == first
+    assert material2["prior_final_raw"] == providers.calls["codex_final"]["raw"]
     assert material2["peer_reviews"]["deepseek_final_review"] == audit1
     assert "drafts" not in material2 and "target_draft" not in material2
     assert revision["schema"]["properties"]["dispositions"]["maxItems"] == 36
@@ -573,9 +581,125 @@ def test_second_round_stage_requests_rebuild_exactly_from_preserved_raw_and_revi
     first = json.loads(providers.calls["codex_final"]["raw"])
     first_audit = json.loads(providers.calls["deepseek_final_review"]["raw"])
     revision = decision.build_stage_request("codex_final_2", packet, rules,
-        final=first, final_review=first_audit, reviews=result["verification"]["peer_reviews"])
+        final_raw=providers.calls["codex_final"]["raw"], final_review=first_audit,
+        reviews=result["verification"]["peer_reviews"], revision_trigger="blind_audit")
     audit = decision.build_stage_request("deepseek_final_review_2", packet, rules, final=result["model_output"])
     for stage, request in (("codex_final_2", revision), ("deepseek_final_review_2", audit)):
         assert request == (providers.calls[stage]["messages"], providers.calls[stage]["schema"])
     with pytest.raises(decision.ResearchError, match="stage_prerequisites_missing_codex_final_2"):
         decision.build_stage_request("codex_final_2", packet, rules, final=first, reviews={})
+
+
+def test_real_midday_trigger_early_abandon_error_automatically_repairs_in_seven_true_provider_stages(monkeypatch):
+    result, providers, progress, *_ = completed_research(monkeypatch, invalid_final=True, many_findings=True)
+    expected = decision.expected_research_stages("deterministic_contract")
+    assert expected == decision.STAGES[:5] + decision.STAGES[6:]
+    assert tuple(stage["stage"] for stage in result["generation_attempts"]) == expected
+    assert set(providers.calls) == set(expected)
+    assert "deepseek_final_review" not in providers.calls
+    first_raw = providers.calls["codex_final"]["raw"]
+    first = json.loads(first_raw)
+    assert first["draft"]["report"]["scenarios"][0]["trigger_units"] == ["Cmid"]
+    assert first["draft"]["report"]["scenarios"][0]["abandon_units"] == ["Cearly"]
+    with pytest.raises(ValueError, match="abandon_window_precedes_trigger"):
+        decision.validate_draft(json.dumps(first["draft"]), result["input_packet"])
+    local = result["verification"]["round_reviews"][0]
+    assert local["schema_version"] == decision.LOCAL_REVIEW_VERSION
+    assert local["reviewed_sha256"] == decision._body_hash(first_raw)
+    assert local["error"]["type"] == "ContractError"
+    assert "abandon_window_precedes_trigger" in local["error"]["message"]
+    assert "report.scenarios[0]" in local["findings"][0]["target"]
+    material2 = json.loads(providers.calls["codex_final_2"]["messages"][1]["content"])["material"]
+    assert material2["prior_final_raw"] == first_raw
+    assert material2["peer_reviews"]["deterministic_contract"] == local
+    assert "deepseek_final_review" not in material2["peer_reviews"]
+    assert len(result["model_output"]["dispositions"]) == 24
+    assert result["draft"] == json.loads(providers.calls["codex_final_2"]["raw"])["draft"]
+    blind = json.loads(providers.calls["deepseek_final_review_2"]["messages"][1]["content"])["material"]
+    assert blind == {"input": result["input_packet"], "final_draft": result["draft"]}
+    assert result["verification"]["revision_trigger"] == "deterministic_contract"
+    assert result["verification"]["stage_count"] == progress[-1]["actual_total"] == 7
+    assert result["verification"]["final_round"] == 2 and result["verification"]["early_pass"] is False
+    assert progress[-1]["checkpoint"]["local_contract_review"] == local
+    assert progress[-1]["checkpoint"]["stages"]["codex_final"]["raw_response"] == first_raw
+    decision.verify_automatic_research(result)
+
+
+def test_malformed_native_first_final_preserves_exact_raw_and_gets_only_one_automatic_revision(monkeypatch):
+    result, providers, *_ = completed_research(monkeypatch, invalid_json_final=True)
+    raw = providers.calls["codex_final"]["raw"]
+    assert raw == '{"schema_version":"probiga.research-final.v3","draft":'
+    local = result["verification"]["round_reviews"][0]
+    assert local["error"]["type"] == "JSONDecodeError"
+    assert local["reviewed_sha256"] == decision._body_hash(raw)
+    assert len(providers.calls) == 7 and "deepseek_final_review" not in providers.calls
+    decision.verify_automatic_research(result)
+
+
+@pytest.mark.parametrize("options,reason", [
+    ({"invalid_final": True, "repeat_invalid_final": True}, "final_contract"),
+    ({"invalid_final": True, "final_reject": True}, "final_reviewer_rejected_draft"),
+])
+def test_second_local_or_blind_failure_is_terminal_without_third_round_or_invalid_draft_audit(monkeypatch, options, reason):
+    providers = Providers(**options).install(monkeypatch)
+    data, context = material()
+    with pytest.raises(decision.ResearchError, match=reason) as caught:
+        decision.generate_research(data, report_kind="review", next_trade_date="2026-11-02", context=context, now=NOW, engine=object())
+    assert "deepseek_final_review" not in providers.calls
+    assert caught.value.checkpoint["final_round"] == 2
+    assert caught.value.checkpoint["stages"]["codex_final_2"]["status"] == "COMPLETE"
+    if options.get("repeat_invalid_final"):
+        assert "deepseek_final_review_2" not in providers.calls
+        assert len(providers.calls) == 6
+    else:
+        assert len(providers.calls) == 7
+
+
+@pytest.mark.parametrize("mutation,reason", [
+    (lambda r: r["verification"]["round_reviews"][0]["error"].update(message="manual finding"), "review_result_edited"),
+    (lambda r: r["verification"]["round_reviews"][0]["findings"][0].update(explanation="manual finding"), "review_result_edited"),
+    (lambda r: r["verification"].update(revision_trigger="blind_audit"), "stage_accounting_changed"),
+    (lambda r: r["generation_attempts"].pop(), "incomplete_provider_stages"),
+])
+def test_local_rejection_evidence_and_seven_stage_layout_are_recomputed_not_trusted(monkeypatch, mutation, reason):
+    result, *_ = completed_research(monkeypatch, invalid_final=True)
+    mutation(result)
+    with pytest.raises(decision.ResearchError, match=reason):
+        decision.verify_automatic_research(result)
+
+
+def test_complete_seven_stage_resume_reuses_all_provider_raw_and_recomputes_local_review(monkeypatch):
+    result, providers, progress, data, context = completed_research(monkeypatch, invalid_final=True)
+    checkpoint = deepcopy(progress[-1]["checkpoint"])
+    no_call = Mock(side_effect=AssertionError("immutable provider stages cannot be repeated"))
+    monkeypatch.setattr(decision, "_call_deepseek", no_call)
+    monkeypatch.setattr(decision, "_call_codex", no_call)
+    resumed = decision.generate_research(data, report_kind="review", next_trade_date="2026-11-02",
+        context=context, engine=object(), checkpoint=checkpoint)
+    assert resumed == result
+    no_call.assert_not_called()
+    packet, rules = result["input_packet"], decision._load_rules()[0]
+    first, local = decision._inspect_first_final(providers.calls["codex_final"]["raw"], packet, result["verification"]["peer_reviews"])
+    assert first is None
+    request = decision.build_stage_request("codex_final_2", packet, rules, final_raw=providers.calls["codex_final"]["raw"],
+        final_review=local, reviews=result["verification"]["peer_reviews"], revision_trigger="deterministic_contract")
+    assert request == (providers.calls["codex_final_2"]["messages"], providers.calls["codex_final_2"]["schema"])
+
+
+def test_local_rejection_does_not_refresh_original_deadline_for_automatic_revision(monkeypatch):
+    providers = Providers(invalid_final=True).install(monkeypatch)
+    data, context = material()
+    clock, events = [100.0], []
+    monkeypatch.setattr(decision.time, "monotonic", lambda: clock[0])
+
+    def record(event):
+        events.append(event)
+        if event["stage"] == "final_contract":
+            clock[0] += 601
+
+    with pytest.raises(decision.ResearchError, match="codex_final_2 reason=total_deadline_exceeded") as error:
+        decision.generate_research(data, report_kind="review", next_trade_date="2026-11-02",
+            context=context, now=NOW, engine=object(), progress=record)
+    assert set(providers.calls) == set(decision.STAGES[:5])
+    assert error.value.checkpoint["deadline_at"] == events[0]["checkpoint"]["deadline_at"]
+    assert error.value.checkpoint["local_contract_review"]["error"]["type"] == "ContractError"

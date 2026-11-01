@@ -80,15 +80,17 @@ def verifier(monkeypatch):
     def verify(result):
         assert result["status"] == "COMPLETE"
         assert result["verification"]["status"] == "PASS"
-        assert len(result["generation_attempts"]) == result["verification"]["stage_count"] in {6, 8}
+        assert len(result["generation_attempts"]) == result["verification"]["stage_count"] in {6, 7, 8}
     monkeypatch.setattr(market_decision, "verify_automatic_research", verify)
 
 
 def final_result(count=6):
+    from biz.review.market_decision import expected_research_stages
+    trigger = {6: "none", 7: "deterministic_contract", 8: "blind_audit"}[count]
     return {"status": "COMPLETE", "content": "已由共享研究流程生成的盘中播报", "verification": {
                 "status": "PASS", "stage_count": count, "stage_budget": 8,
-                "final_round": 1 if count == 6 else 2, "early_pass": count == 6},
-            "generation_attempts": [{"stage": str(i), "status": "COMPLETE", "raw_response": '{"reply":"raw"}'} for i in range(count)]}
+                "final_round": 1 if count == 6 else 2, "early_pass": count == 6, "revision_trigger": trigger},
+            "generation_attempts": [{"stage": name, "status": "COMPLETE", "raw_response": '{"reply":"raw"}'} for name in expected_research_stages(trigger)]}
 
 
 def test_freeze_excludes_future_history_and_old_fixed_analysis_without_daily_facts():
@@ -148,16 +150,19 @@ def test_model_runs_without_database_transaction_and_success_persists_six_stage_
     assert again["status"] == "SHADOW" and calls == [1]
 
 
-@pytest.mark.parametrize("count", [6, 8])
-def test_max_budget_progress_completes_only_the_verified_actual_six_or_eight_stages(db, verifier, count):
+@pytest.mark.parametrize("count", [6, 7, 8])
+def test_max_budget_progress_completes_only_the_verified_actual_provider_calls(db, verifier, count):
     identity, clock = queue(db), [NOW]
 
     def generate(_digest, **kwargs):
         checkpoint = {"stages": {}}
-        for index in range(count):
+        for index, item in enumerate(final_result(count)["generation_attempts"]):
             clock[0] += timedelta(seconds=5)
-            checkpoint["stages"][str(index)] = {"status": "COMPLETE", "raw_response": '{"verdict":"REJECT"}' if index == 5 and count == 8 else '{"reply":"raw"}'}
-            kwargs["progress"]({"stage": str(index), "status": "COMPLETE", "completed": index + 1, "total": 8, "checkpoint": deepcopy(checkpoint)})
+            name = item["stage"]
+            checkpoint["stages"][name] = {"status": "COMPLETE", "raw_response": '{"verdict":"REJECT"}' if name == "deepseek_final_review" and count == 8 else '{"reply":"raw"}'}
+            if name == "codex_final" and count == 7:
+                checkpoint["local_findings"] = {"reason": "abandon_window_precedes_trigger", "path": "report.scenarios[1]"}
+            kwargs["progress"]({"stage": name, "status": "COMPLETE", "completed": index + 1, "total": 8, "checkpoint": deepcopy(checkpoint)})
             snapshot = load(db, identity)[1]
             assert snapshot["analysis"]["completed_units"] == index + 1
             assert snapshot["analysis"]["total_units"] == 8
@@ -175,7 +180,10 @@ def test_max_budget_progress_completes_only_the_verified_actual_six_or_eight_sta
     assert state["analysis"]["stage_budget"] == 8
     assert len(state["checkpoint"]["stages"]) == count
     if count == 8:
-        assert state["checkpoint"]["stages"]["5"]["raw_response"] == '{"verdict":"REJECT"}'
+        assert state["checkpoint"]["stages"]["deepseek_final_review"]["raw_response"] == '{"verdict":"REJECT"}'
+    if count == 7:
+        assert "deepseek_final_review" not in state["checkpoint"]["stages"]
+        assert state["checkpoint"]["local_findings"]["reason"] == "abandon_window_precedes_trigger"
 
 
 def test_second_reject_preserves_all_eight_raw_stages_and_never_publishes_or_restarts(db):
@@ -241,6 +249,67 @@ def test_claimed_stage_count_must_match_actual_verified_attempts(db, monkeypatch
     with pytest.raises(research.IntradayResearchError, match="stage_completion_proof_mismatch"):
         research.process_research_batch(db[0], outbox_id=identity, generator=lambda *args, **kwargs: mismatch, now_fn=lambda: NOW)
     assert load(db, identity)[0]["content_markdown"] == ""
+
+
+def test_real_core_repairs_reversed_scenario_windows_in_seven_calls_before_outbox(db, monkeypatch):
+    from biz.review import market_decision as core
+    from biz.review.research_contract import DRAFT_VERSION, ROLES
+    from test_market_decision import Providers
+    from test_research_contract import condition, inferred
+
+    def draft(packet):
+        market = next(fid for fid, fact in packet["facts"].items() if fact["metric"] == "market_prices")
+        audit = next(fid for fid, fact in packet["facts"].items() if fact["metric"] == "audit_windows")
+        observable = next(oid for oid, item in packet["observables"].items() if item["metric"] == "up_share")
+        units = [inferred(uid, topic, market, "以当时广度验证后续修复，尚未确认持续性。")
+                 for uid, topic in [("Uenv", "environment"), ("Usent", "sentiment"), ("Umain", "mainline"),
+                                    ("Urisk", "risk"), ("Ustock", "identity"), ("Uaction", "action")]]
+        units += [{"id": "Uaudit", "kind": "data_limitation", "topic": "audit", "evidence_ids": [audit],
+                   "effect": "missing_window", "statement": [{"fact_id": audit, "field": "summary"}]},
+                  condition("Cmid", "midday", observable), condition("Cclose", "close", observable),
+                  condition("Ccounter", "close", observable, topic="counter_evidence")]
+        role_units = ["Uenv", "Usent", "Umain", "Urisk", "Ustock", "Urisk", "Ccounter", "Uaudit"]
+        return {"schema_version": DRAFT_VERSION, "units": units,
+                "roles": [{"role": role, "unit_ids": [uid]} for role, uid in zip(ROLES, role_units)],
+                "report": {"conclusion_units": ["Uenv", "Usent"], "permission": {"action": "OBSERVE", "basis_units": ["Urisk"]},
+                    "market_reading_units": ["Umain"], "directions": [], "event_units": [],
+                    "scenarios": [{"name": "修复观察", "trigger_units": ["Cmid"], "action_units": ["Uaction"], "abandon_units": ["Cclose"]}],
+                    "checks": {"open": [], "first_30m": [], "midday": ["Cmid"], "close": ["Cclose"]},
+                    "counter_evidence_units": ["Ccounter"], "limitation_units": [], "continuity": [], "audit_units": ["Uaudit"]}}
+
+    class ReversedFirstFinal(Providers):
+        def reply(self, *args, **kwargs):
+            reply = super().reply(*args, **kwargs)
+            if kwargs["stage"] != "codex_final":
+                return reply
+            value = json.loads(reply.raw_response)
+            value["draft"]["report"]["scenarios"][0].update(trigger_units=["Cclose"], abandon_units=["Cmid"])
+            raw = core._json(value)
+            receipt = {**reply.provider_receipt, "raw_sha256": core._body_hash(raw)}
+            self.calls["codex_final"].update(raw=raw, receipt=deepcopy(receipt))
+            return core.ProviderReply(raw, receipt)
+
+    providers = ReversedFirstFinal().install(monkeypatch)
+    providers.draft_factory = draft
+    source = observation()
+    source["sectors"], source["key_stocks"] = [], []
+    with db[0].begin() as connection:
+        identity = research.queue_research_batch(connection, observation=source, history=[], emissions=events(), mode="shadow", now=NOW)
+    result = research.process_research_batch(db[0], outbox_id=identity, now_fn=lambda: NOW)
+    accepted = result["research"]
+    assert result["status"] == "SHADOW"
+    core.verify_automatic_research(accepted)
+    assert list(providers.calls).count("codex_final") == 1
+    assert set(providers.calls) == set(core.expected_research_stages("deterministic_contract"))
+    assert "deepseek_final_review" not in providers.calls
+    assert accepted["verification"]["stage_count"] == 7
+    assert accepted["verification"]["revision_trigger"] == "deterministic_contract"
+    assert "abandon_window_precedes_trigger" in accepted["verification"]["round_reviews"][0]["error"]["message"]
+    row, state = load(db, identity)
+    assert state["analysis"]["completed_units"] == state["analysis"]["total_units"] == 7
+    assert state["checkpoint"]["stages"]["codex_final"]["raw_response"] == providers.calls["codex_final"]["raw"]
+    assert state["research"]["verification"]["final_review"]["verdict"] == "PASS"
+    assert row["content_markdown"] == accepted["content"]
 
 
 def test_analyzing_owner_is_never_reclaimed_even_after_lease_expiry(db, verifier):
