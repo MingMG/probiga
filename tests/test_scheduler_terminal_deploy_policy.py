@@ -10,6 +10,7 @@ import builtins
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -152,14 +153,63 @@ def _snapshot(model):
 def test_prepare_migrate_and_final_find_use_the_one_closed_validator():
     prepare = _body("prepare_probiga_job_log_root")
     migrate = _body("migrate_probiga_job_log_legacy_modes")
+    assert prepare.count(
+        "validate_scheduler_terminal_job_log_tree_live || return 2"
+    ) == 2
+    assert prepare.index(
+        "validate_scheduler_terminal_job_log_tree_live || return 2"
+    ) < prepare.index("<<'PY'")
+    assert prepare.rindex(
+        "validate_scheduler_terminal_job_log_tree_live || return 2"
+    ) > prepare.index("\nPY")
     for body in (prepare, migrate):
-        assert body.count("validate_scheduler_terminal_job_log_tree || return 2") == 2
-        assert body.index("validate_scheduler_terminal_job_log_tree || return 2") < body.index("<<'PY'")
-        assert body.rindex("validate_scheduler_terminal_job_log_tree || return 2") > body.index("\nPY")
         assert 'name == "scheduler-terminal"' in body
+    assert migrate.count(
+        "validate_scheduler_terminal_job_log_tree || return 2"
+    ) == 2
+    assert migrate.index(
+        "validate_scheduler_terminal_job_log_tree || return 2"
+    ) < migrate.index("<<'PY'")
+    assert migrate.rindex(
+        "validate_scheduler_terminal_job_log_tree || return 2"
+    ) > migrate.index("\nPY")
     assert "-name acquisition-shards -o -name scheduler-terminal" in migrate
     validator = _script("validate_scheduler_terminal_job_log_tree")
     assert not any(operation in validator for operation in ("os.write(", "os.unlink(", "os.chmod(", "os.fchmod(", "json.loads("))
+
+
+def test_live_journal_validator_retries_a_transient_namespace_change():
+    bash = shutil.which("bash")
+    if bash is None and os.name == "nt":
+        candidate = Path(r"C:\Program Files\Git\bin\bash.exe")
+        bash = str(candidate) if candidate.is_file() else None
+    if bash is None:
+        pytest.skip("bash is required for shell retry contract")
+    body = _body("validate_scheduler_terminal_job_log_tree_live")
+    harness = f"""
+set -u
+sleep() {{ :; }}
+attempts=0
+validate_scheduler_terminal_job_log_tree() {{
+  attempts=$((attempts + 1))
+  [ "$attempts" -ge 3 ]
+}}
+validate_scheduler_terminal_job_log_tree_live() {{
+{body}
+}}
+validate_scheduler_terminal_job_log_tree_live
+printf 'attempts=%s\\n' "$attempts"
+"""
+    completed = subprocess.run(
+        [bash, "-c", harness],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=10,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "attempts=3"
 
 
 @pytest.mark.parametrize("layout", ["absent", "empty_root", "empty_run", "all_records"])

@@ -464,6 +464,20 @@ finally:
     os.close(directory)
 PY
 }
+validate_scheduler_terminal_job_log_tree_live() {
+  local attempt=1
+  local status=0
+  while [ "$attempt" -le 5 ]; do
+    if validate_scheduler_terminal_job_log_tree; then
+      return 0
+    else
+      status=$?
+    fi
+    attempt=$((attempt + 1))
+    [ "$attempt" -gt 5 ] || sleep 1
+  done
+  return "$status"
+}
 validate_exposure_risk_job_checkpoint_tree() {
   # One fixed business namespace, inspected without following links or
   # interpreting partial checkpoint bytes. Quiescent calls follow the broker's
@@ -723,7 +737,7 @@ prepare_probiga_job_log_root() {
   test "$(stat -c '%a' -- "$PROBIGA_JOB_LOG_ROOT")" = 700 || return 2
   service_uid="$(id -u -- "$SERVICE_USER")" || return 2
   service_gid="$(id -g -- "$SERVICE_USER")" || return 2
-  validate_scheduler_terminal_job_log_tree || return 2
+  validate_scheduler_terminal_job_log_tree_live || return 2
   validate_exposure_risk_job_checkpoint_tree live || return 2
   # The old writers may still be running here. This pass is deliberately
   # read-only: the two exact legacy basenames may be 0600 or 0644, while every
@@ -884,7 +898,7 @@ try:
 finally:
     os.close(directory_fd)
 PY
-  validate_scheduler_terminal_job_log_tree || return 2
+  validate_scheduler_terminal_job_log_tree_live || return 2
   validate_exposure_risk_job_checkpoint_tree live || return 2
   return 0
 }
