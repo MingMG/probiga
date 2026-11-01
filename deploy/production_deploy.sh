@@ -16220,8 +16220,14 @@ if [ "$RELEASE_EXECUTION_SCOPE" = LINUX ]; then
   CUTOVER_STEP=fast_release_schema_guard
   check_fast_release_schema
   start_fast_component_ledger_publication
-  CUTOVER_STEP=ensure_inherited_qmt_windows_edge_activation
-  ensure_qmt_windows_edge_activation 1
+  if [ "$RELEASE_SCOPE" = COORDINATED ]; then
+    CUTOVER_STEP=ensure_inherited_qmt_windows_edge_activation
+    ensure_qmt_windows_edge_activation 1
+  else
+    CUTOVER_STEP=preserve_qmt_windows_edge_activation
+    log_release \
+      "QMT Windows edge build preserved for Linux-scope fast release"
+  fi
   CUTOVER_STEP=activate_linux_components
   activate_linux_release
   log_release "Linux activation complete sha=$EXPECTED_SHA"

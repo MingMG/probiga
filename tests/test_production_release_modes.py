@@ -282,3 +282,22 @@ def test_linux_scope_full_preserves_existing_windows_activation():
         "QMT Windows edge activation grant skipped for Linux-scope release"
     )
     assert grant < skip
+
+
+def test_linux_scope_fast_preserves_existing_windows_activation():
+    script = (ROOT / "deploy" / "production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    fast_branch = script.index(
+        'if [ "$RELEASE_EXECUTION_SCOPE" = LINUX ]; then'
+    )
+    activation = script.index(
+        "CUTOVER_STEP=activate_linux_components", fast_branch
+    )
+    branch = script[fast_branch:activation]
+    assert 'if [ "$RELEASE_SCOPE" = COORDINATED ]; then' in branch
+    assert "ensure_qmt_windows_edge_activation 1" in branch
+    assert (
+        "QMT Windows edge build preserved for Linux-scope fast release"
+        in branch
+    )
