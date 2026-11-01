@@ -239,3 +239,31 @@ def test_full_release_excludes_only_the_pid_verified_stopped_local_scheduler():
     assert "${WRITER_FENCE_EXCLUSION_ARGS[@]}" in (
         script[writer_fence:writer_fence + 2500]
     )
+
+
+def test_linux_scope_full_preserves_existing_windows_activation():
+    script = (ROOT / "deploy" / "production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    activation = script.index(
+        'if [ "$RELEASE_SCOPE" = COORDINATED ]; then\n'
+        "  CUTOVER_STEP=repair_qmt_windows_edge_activation"
+    )
+    preserved = script.index(
+        "QMT Windows edge build preserved for Linux-scope full release",
+        activation,
+    )
+    assert "ensure_qmt_windows_edge_activation" in (
+        script[activation:preserved]
+    )
+    finalize = script.index("finalize_preserved_no_receipt_request() {")
+    finalize_body = script[
+        finalize:script.index("install_prepared_dropins() {", finalize)
+    ]
+    grant = finalize_body.index(
+        '"${RELEASE_SCOPE:-COORDINATED}" = COORDINATED'
+    )
+    skip = finalize_body.index(
+        "QMT Windows edge activation grant skipped for Linux-scope release"
+    )
+    assert grant < skip

@@ -9566,7 +9566,7 @@ classify_component_release() {
 prepare_component_release_manifest() {
   local publication_mode
   local -a publication_modes=()
-  if [ "$RELEASE_SCOPE" = COORDINATED ]; then
+  if [ "${RELEASE_SCOPE:-COORDINATED}" = COORDINATED ]; then
     publication_modes=(initialize publish)
   else
     publication_modes=(publish)
@@ -14111,15 +14111,20 @@ finalize_preserved_no_receipt_request() {
     "$V2_FORWARD_PRESERVED_AI_TIMER_RECORD" || return 1
   CUTOVER_STEP=write_verified_activation_receipt
   publish_deployed_receipt_pending "$EXPECTED_SHA" || return 1
-  CUTOVER_STEP=grant_qmt_windows_edge_activation
-  qmt_activation_output="$(controlled_guard_run_qmt_activation_tool \
-    "$PREPARED_CODE_ROOT" "$RELEASE_VENV_ROOT/$EXPECTED_SHA" \
-    "$EXPECTED_SHA" --activation-grant-latest)" || return 1
-  printf '%s\n' "$qmt_activation_output"
-  printf '%s' "$qmt_activation_output" | \
-    controlled_guard_validate_qmt_activation_json \
-      "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" "$EXPECTED_SHA" \
-      activation-grant-latest || return 1
+  if [ "${RELEASE_SCOPE:-COORDINATED}" = COORDINATED ]; then
+    CUTOVER_STEP=grant_qmt_windows_edge_activation
+    qmt_activation_output="$(controlled_guard_run_qmt_activation_tool \
+      "$PREPARED_CODE_ROOT" "$RELEASE_VENV_ROOT/$EXPECTED_SHA" \
+      "$EXPECTED_SHA" --activation-grant-latest)" || return 1
+    printf '%s\n' "$qmt_activation_output"
+    printf '%s' "$qmt_activation_output" | \
+      controlled_guard_validate_qmt_activation_json \
+        "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" "$EXPECTED_SHA" \
+        activation-grant-latest || return 1
+  else
+    CUTOVER_STEP=preserve_qmt_windows_edge_activation
+    echo "QMT Windows edge activation grant skipped for Linux-scope release" >&2
+  fi
   DEPLOY_SUCCEEDED=1
   trap '' TERM INT HUP
   CUTOVER_STEP=remove_finalized_activation_journal
@@ -16532,15 +16537,17 @@ CUTOVER_STEP=verify_qmt_local_history_provenance_schema_after_cutover
 run_prepared_python_tool \
   "$PREPARED_CODE_ROOT/tools/migrate_qmt_local_history_provenance.py" \
   --check-via-primary
-# A coordinated build must have an exact target hold, protected lineage and
-# post-cutover grant even when its Windows wait is deferred. The repair is
-# idempotent, fences the predecessor immediately, and never starts QMT.
-CUTOVER_STEP=repair_qmt_windows_edge_activation
-ensure_qmt_windows_edge_activation
-# A deferred release still leaves a terminal grant for the background Windows
-# updater. A blocking release additionally proves the exact new heartbeat and
-# native bootstrap receipt before Linux service activation continues.
-if [ "$QMT_EDGE_DEPLOY_BLOCKING" -eq 1 ]; then
+# A coordinated component transition owns the Windows hold/grant protocol.
+# A full retry whose classified component scope remains LINUX keeps the existing
+# Windows build; its scheduler is quiesced only for the database cutover and
+# must not be rewritten to the Linux-only target identity.
+if [ "$RELEASE_SCOPE" = COORDINATED ]; then
+  CUTOVER_STEP=repair_qmt_windows_edge_activation
+  ensure_qmt_windows_edge_activation
+  # A deferred release still leaves a terminal grant for the background Windows
+  # updater. A blocking release additionally proves the exact new heartbeat and
+  # native bootstrap receipt before Linux service activation continues.
+  if [ "$QMT_EDGE_DEPLOY_BLOCKING" -eq 1 ]; then
 CUTOVER_STEP=wait_for_qmt_windows_edge_identity
 QMT_EDGE_WAIT_DEADLINE=$((SECONDS + 900))
 QMT_EDGE_IDENTITY_OUTPUT=""
@@ -16579,6 +16586,10 @@ printf '%s' "$QMT_EDGE_BOOTSTRAP_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
 else
   CUTOVER_STEP=defer_qmt_windows_edge_release_bootstrap
   echo "QMT Windows edge bootstrap wait skipped; exact activation remains scheduler-owned" >&2
+  fi
+else
+  CUTOVER_STEP=preserve_qmt_windows_edge_activation
+  echo "QMT Windows edge build preserved for Linux-scope full release" >&2
 fi
 CUTOVER_STEP=read_strategy_governance_qmt_history_readiness_after_schema
 if [ "$QMT_HISTORY_DEPLOY_BLOCKING" -eq 1 ]; then
