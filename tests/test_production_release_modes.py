@@ -234,3 +234,8 @@ def test_full_release_excludes_only_the_pid_verified_stopped_local_scheduler():
     assert '--exclude-instance-id "$LOCAL_SCHEDULER_INSTANCE_ID"' in (
         script[quiescence:quiescence + 2000]
     )
+    writer_fence = script.index("CUTOVER_STEP=writer_fence_before_api_stop")
+    assert "WRITER_FENCE_EXCLUSION_ARGS" in script[writer_fence:writer_fence + 2000]
+    assert "${WRITER_FENCE_EXCLUSION_ARGS[@]}" in (
+        script[writer_fence:writer_fence + 2500]
+    )

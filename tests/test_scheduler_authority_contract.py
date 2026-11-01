@@ -327,6 +327,7 @@ def test_writer_quiescence_block_keeps_fence_and_skips_task_upserts(
 ) -> None:
     engine = _Engine()
     observed: list[dict] = []
+    drain_kwargs: dict = {}
     live_writer = {
         "instance_id": "external-7",
         "mode": "standalone",
@@ -344,7 +345,9 @@ def test_writer_quiescence_block_keeps_fence_and_skips_task_upserts(
     monkeypatch.setattr(
         task_deployment,
         "wait_for_scheduler_writer_quiescence",
-        lambda _engine, **_kwargs: (live_writer,),
+        lambda _engine, **kwargs: (
+            drain_kwargs.update(kwargs) or (live_writer,)
+        ),
     )
     monkeypatch.setattr(
         task_deployment,
@@ -355,6 +358,7 @@ def test_writer_quiescence_block_keeps_fence_and_skips_task_upserts(
     assert task_deployment.main([
         "--writer-fence",
         "--require-no-live-scheduler-writers",
+        "--exclude-instance-id", "linux-host-4085693",
         "--writer-drain-timeout-seconds",
         "0",
     ]) == task_deployment.WRITER_QUIESCENCE_BLOCK_EXIT_CODE
@@ -366,8 +370,32 @@ def test_writer_quiescence_block_keeps_fence_and_skips_task_upserts(
         "SCHEDULER_LIVE_WRITERS_REMAIN"
     ]
     assert payload["writer_quiescence"]["live_writers"] == [live_writer]
+    assert drain_kwargs["excluded_instance_ids"] == frozenset(
+        {"linux-host-4085693"}
+    )
     assert observed == []
     assert engine.disposed is True
+
+
+def test_writer_drain_excludes_only_confirmed_local_scheduler(monkeypatch):
+    local = {"instance_id": "linux-host-4085693"}
+    external = {"instance_id": "windows-edge-25144"}
+    observations = iter(((local, external), (local,)))
+    sleeps: list[float] = []
+    monkeypatch.setattr(
+        task_deployment,
+        "read_fresh_scheduler_writers",
+        lambda _engine: next(observations),
+    )
+    assert task_deployment.wait_for_scheduler_writer_quiescence(
+        object(),
+        timeout_seconds=5,
+        poll_seconds=1,
+        excluded_instance_ids=frozenset({local["instance_id"]}),
+        monotonic=lambda: len(sleeps),
+        sleep=sleeps.append,
+    ) == ()
+    assert sleeps == [1]
 
 
 def test_explicit_layer4_activation_fails_before_any_write_when_schema_blocks(

@@ -16421,6 +16421,12 @@ assert_database_writer_guard_dropins_loaded
 # online until this final atomic database fence succeeds.
 CUTOVER_STEP=writer_fence_before_api_stop
 WRITER_FENCE_STATUS=0
+WRITER_FENCE_EXCLUSION_ARGS=()
+if [ -n "$LOCAL_SCHEDULER_INSTANCE_ID" ]; then
+  WRITER_FENCE_EXCLUSION_ARGS=(
+    --exclude-instance-id "$LOCAL_SCHEDULER_INSTANCE_ID"
+  )
+fi
 (
   cd "$PREPARED_CODE_ROOT"
   sudo -u "$SERVICE_USER" /usr/bin/env -i \
@@ -16441,7 +16447,8 @@ WRITER_FENCE_STATUS=0
     tools/add_trading_v3_tasks.py --fence-only \
       --require-no-live-scheduler-writers \
       --writer-drain-timeout-seconds 0 \
-      --writer-drain-poll-seconds 5
+      --writer-drain-poll-seconds 5 \
+      "${WRITER_FENCE_EXCLUSION_ARGS[@]}"
 ) || WRITER_FENCE_STATUS=$?
 if [ "$WRITER_FENCE_STATUS" -ne 0 ]; then
   if [ "$WRITER_FENCE_STATUS" -eq 3 ]; then

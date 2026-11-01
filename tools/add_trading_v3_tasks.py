@@ -193,6 +193,7 @@ def wait_for_scheduler_writer_quiescence(
     *,
     timeout_seconds: float,
     poll_seconds: float,
+    excluded_instance_ids: frozenset[str] = frozenset(),
     monotonic=time.monotonic,
     sleep=time.sleep,
 ) -> tuple[dict, ...]:
@@ -202,9 +203,21 @@ def wait_for_scheduler_writer_quiescence(
         raise ValueError("timeout_seconds must be non-negative")
     if poll_seconds <= 0:
         raise ValueError("poll_seconds must be positive")
+    if not isinstance(excluded_instance_ids, frozenset) or any(
+        not isinstance(instance_id, str)
+        or not instance_id
+        or len(instance_id) > 255
+        or any(character.isspace() for character in instance_id)
+        for instance_id in excluded_instance_ids
+    ):
+        raise ValueError("excluded_instance_ids must be exact non-empty tokens")
     deadline = monotonic() + timeout_seconds
     while True:
-        live_writers = tuple(read_fresh_scheduler_writers(engine))
+        live_writers = tuple(
+            writer for writer in read_fresh_scheduler_writers(engine)
+            if str(writer.get("instance_id") or "")
+            not in excluded_instance_ids
+        )
         if not live_writers:
             return ()
         remaining = deadline - monotonic()
@@ -272,6 +285,12 @@ def _parser() -> argparse.ArgumentParser:
         default=5.0,
         help="shared heartbeat polling interval while draining writers",
     )
+    parser.add_argument(
+        "--exclude-instance-id",
+        action="append",
+        default=[],
+        dest="excluded_instance_ids",
+    )
     return parser
 
 
@@ -318,6 +337,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     engine,
                     timeout_seconds=args.writer_drain_timeout_seconds,
                     poll_seconds=args.writer_drain_poll_seconds,
+                    excluded_instance_ids=frozenset(
+                        args.excluded_instance_ids
+                    ),
                 )
             except Exception as exc:
                 writer_quiescence = {

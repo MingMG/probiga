@@ -705,13 +705,21 @@ def test_fence_only_drains_writers_without_upsert_or_schema_changes(
         "150",
         "--writer-drain-poll-seconds",
         "2",
+        "--exclude-instance-id",
+        "linux-host-4085693",
     ]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert calls == [
         "disable",
         (
             "drain",
-            {"timeout_seconds": 150.0, "poll_seconds": 2.0},
+            {
+                "timeout_seconds": 150.0,
+                "poll_seconds": 2.0,
+                "excluded_instance_ids": frozenset(
+                    {"linux-host-4085693"}
+                ),
+            },
         ),
     ]
     assert payload["status"] == "ok"
