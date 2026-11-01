@@ -329,15 +329,22 @@ PY
 validate_scheduler_terminal_job_log_tree() {
   # Recovery originals may be empty or partially written.  This is a read-only
   # namespace/physical-metadata check, never a business-outcome validator.
+  local validation_phase="${1:-strict}"
+  case "$validation_phase" in
+    strict|live) ;;
+    *) return 2 ;;
+  esac
   /usr/bin/python3.14 -I - "$PROBIGA_JOB_LOG_ROOT" \
-    "$(id -u -- "$SERVICE_USER")" "$(id -g -- "$SERVICE_USER")" <<'PY' || return 2
+    "$(id -u -- "$SERVICE_USER")" "$(id -g -- "$SERVICE_USER")" \
+    "$validation_phase" <<'PY' || return 2
 import os
 import re
 import stat
 import sys
 
-root, uid_text, gid_text = sys.argv[1:]
+root, uid_text, gid_text, validation_phase = sys.argv[1:]
 uid, gid = int(uid_text), int(gid_text)
+live = validation_phase == "live"
 record_name = re.compile(r"(?:OBSERVED|REJECTED|FAILED_FINALIZATION|COMMITTED|PREPARED\.[0-9a-f]{64})")
 
 def require(metadata, *, directory):
@@ -402,10 +409,23 @@ def require_upper_limit_history(parent_fd, name):
         os.close(descriptor)
 
 def inspect(parent, name, *, runs):
-    before = os.lstat(name, dir_fd=parent)
+    try:
+        before = os.lstat(name, dir_fd=parent)
+    except FileNotFoundError:
+        if live:
+            return
+        raise
     require(before, directory=True)
-    descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                         dir_fd=parent)
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=parent,
+        )
+    except FileNotFoundError:
+        if live:
+            return
+        raise
     try:
         opened = os.fstat(descriptor)
         require(opened, directory=True)
@@ -420,24 +440,51 @@ def inspect(parent, name, *, runs):
                 continue
             if record_name.fullmatch(child) is None:
                 raise SystemExit("unknown scheduler terminal record")
-            observed = os.lstat(child, dir_fd=descriptor)
+            try:
+                observed = os.lstat(child, dir_fd=descriptor)
+            except FileNotFoundError:
+                if live:
+                    continue
+                raise
             require(observed, directory=False)
-            record = os.open(child, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
-                             dir_fd=descriptor)
+            try:
+                record = os.open(
+                    child,
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                    dir_fd=descriptor,
+                )
+            except FileNotFoundError:
+                if live:
+                    continue
+                raise
             try:
                 held = os.fstat(record)
                 require(held, directory=False)
-                current = os.lstat(child, dir_fd=descriptor)
+                try:
+                    current = os.lstat(child, dir_fd=descriptor)
+                except FileNotFoundError:
+                    if live:
+                        continue
+                    raise
                 require(current, directory=False)
                 if identity(observed) != identity(held) or identity(held) != identity(current):
+                    if live:
+                        continue
                     raise SystemExit("scheduler terminal journal record changed")
             finally:
                 os.close(record)
-        if set(os.listdir(descriptor)) != names:
+        if not live and set(os.listdir(descriptor)) != names:
             raise SystemExit("scheduler terminal journal namespace changed")
-        current = os.lstat(name, dir_fd=parent)
+        try:
+            current = os.lstat(name, dir_fd=parent)
+        except FileNotFoundError:
+            if live:
+                return
+            raise
         require(current, directory=True)
         if identity(os.fstat(descriptor)) != identity(current) or identity(current) != identity(before):
+            if live:
+                return
             raise SystemExit("scheduler terminal journal directory changed")
     finally:
         os.close(descriptor)
@@ -465,18 +512,7 @@ finally:
 PY
 }
 validate_scheduler_terminal_job_log_tree_live() {
-  local attempt=1
-  local status=0
-  while [ "$attempt" -le 5 ]; do
-    if validate_scheduler_terminal_job_log_tree; then
-      return 0
-    else
-      status=$?
-    fi
-    attempt=$((attempt + 1))
-    [ "$attempt" -gt 5 ] || sleep 1
-  done
-  return "$status"
+  validate_scheduler_terminal_job_log_tree live
 }
 validate_exposure_risk_job_checkpoint_tree() {
   # One fixed business namespace, inspected without following links or

@@ -10,7 +10,6 @@ import builtins
 import os
 from pathlib import Path, PurePosixPath
 import re
-import shutil
 import stat
 import subprocess
 import sys
@@ -134,13 +133,23 @@ class _PosixModel:
         del self.nodes[path]
 
 
-def _run(model, name="validate_scheduler_terminal_job_log_tree"):
+def _run(
+    model,
+    name="validate_scheduler_terminal_job_log_tree",
+    arguments=None,
+):
+    if arguments is None:
+        arguments = (
+            ("strict",)
+            if name == "validate_scheduler_terminal_job_log_tree"
+            else ()
+        )
     real_import = builtins.__import__
     def import_model(module, *args, **kwargs):
         if module == "os":
             return model
         if module == "sys":
-            return SimpleNamespace(argv=["-", "/jobs", "41", "42"])
+            return SimpleNamespace(argv=["-", "/jobs", "41", "42", *arguments])
         return real_import(module, *args, **kwargs)
     namespace = {"__builtins__": dict(vars(builtins), __import__=import_model)}
     exec(compile(_script(name), name, "exec"), namespace)
@@ -178,38 +187,10 @@ def test_prepare_migrate_and_final_find_use_the_one_closed_validator():
     assert not any(operation in validator for operation in ("os.write(", "os.unlink(", "os.chmod(", "os.fchmod(", "json.loads("))
 
 
-def test_live_journal_validator_retries_a_transient_namespace_change():
-    bash = shutil.which("bash")
-    if bash is None and os.name == "nt":
-        candidate = Path(r"C:\Program Files\Git\bin\bash.exe")
-        bash = str(candidate) if candidate.is_file() else None
-    if bash is None:
-        pytest.skip("bash is required for shell retry contract")
+def test_live_journal_validator_uses_live_phase():
     body = _body("validate_scheduler_terminal_job_log_tree_live")
-    harness = f"""
-set -u
-sleep() {{ :; }}
-attempts=0
-validate_scheduler_terminal_job_log_tree() {{
-  attempts=$((attempts + 1))
-  [ "$attempts" -ge 3 ]
-}}
-validate_scheduler_terminal_job_log_tree_live() {{
-{body}
-}}
-validate_scheduler_terminal_job_log_tree_live
-printf 'attempts=%s\\n' "$attempts"
-"""
-    completed = subprocess.run(
-        [bash, "-c", harness],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=10,
-    )
-    assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.strip() == "attempts=3"
+    assert "validate_scheduler_terminal_job_log_tree live" in body
+    assert "while " not in body
 
 
 @pytest.mark.parametrize("layout", ["absent", "empty_root", "empty_run", "all_records"])
@@ -317,6 +298,14 @@ def test_new_unknown_entry_during_inventory_is_not_ignored():
     with pytest.raises(SystemExit, match="namespace changed"):
         _run(model)
     assert model.nodes["/jobs/scheduler-terminal/" + UID + "/UNKNOWN"]["raw"] == b"unknown retained"
+    assert not model.handles
+
+
+def test_live_scan_accepts_active_journal_snapshot():
+    model = _PosixModel().journal()
+    original = _snapshot(model)
+    _run(model, arguments=("live",))
+    assert _snapshot(model) == original
     assert not model.handles
 
 
