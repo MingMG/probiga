@@ -14,6 +14,8 @@
 
 schema_version固定probiga.research-draft.v3。units数组保存研究单元；每项id唯一、topic取schema枚举、statement是typed spans。roles恰好八项，每项只有role和unit_ids，分别为总策略负责人、情绪周期分析师、相对强度分析师、博弈与资金分析师、主线交易员、风险经理、反方审查员、复盘审计员。角色引用共享研究单元，不重复八篇全文，须各自覆盖职责。
 
+角色引用的必需topic依次为：总策略负责人environment；情绪周期分析师sentiment；相对强度分析师mainline；博弈与资金分析师mainline或risk；主线交易员identity或mainline；风险经理risk；反方审查员counter_evidence；复盘审计员audit。每个角色至少引用一个相应topic单元；其他相关单元可以共享。units总数不得超过四十八，复用内部引用，不能靠扩充同义单元处理互审问题。
+
 report包括conclusion_units、permission、market_reading_units、directions、event_units、scenarios、checks、counter_evidence_units、limitation_units、continuity、audit_units。逐字段以JSON Schema为准，不创造body、content、status或替代字段。
 
 ## 文字与数字
@@ -41,9 +43,9 @@ future_condition含logic与conditions；每个condition用observable_id、window
 
 ## 条件与行动
 
-window为open/first_30m/midday/close。improves/weakens只用same_session_open；turns_positive/turns_negative只用于有正负号指标且reference.kind=zero；holds_above/breaks_below只用同一标的已给价格fact字段。无fact时reference.fact_id和field都写空字符串。不得造固定比例、家数、收益阈值，不拿前半小时的累计家数或成交额比较前日全天。
+window为open/first_30m/midday/close。improves/weakens只用same_session_open；turns_positive/turns_negative只用于previous_strength_return_pct或relative_strength且reference.kind=zero；holds_above/breaks_below只用同一标的已给价格fact字段（price/open/close/high/low/pre_close/ma5/ma10/ma20/ma60）。MA是冻结的已闭市基准，不能声称次日均线已经形成。无fact时reference.fact_id和field都写空字符串。不得造固定比例、家数、收益阈值，不拿前半小时的累计家数或成交额比较前日全天。
 
-盘后/早报checks四窗必须有对应future_condition。盘中只用intraday_observation及intraday_events；不能偷用当天收盘日线、收盘后标签或当时未见新闻。已过去时间窗checks可空，条件只针对剩余时段，不能冒充已触发。盘中price表示快照现价，不是收盘。
+盘后/早报checks四窗必须有对应future_condition。盘中实时判断只用intraday_observation及intraday_events；可参考technical_indicators中前一已闭市交易日的日线基准，不能偷用当天收盘日线、收盘后标签或当时未见新闻。已过去时间窗checks可空，条件只针对剩余时段，不能冒充已触发。盘中price表示快照现价，不是收盘。
 
 permission.action为WAIT/OBSERVE/CONDITIONAL，程序映射中文。没有账户和风险预算，不给空仓、清仓、满仓等账户命令。研究权限不等于市场必然涨跌。
 
@@ -57,6 +59,18 @@ watch必有assessment_units、trigger_units、abandon_units。unconfirmed/front_
 
 counter_evidence_units须含可观察future_condition。次日修复只能削弱继续风险释放推断，不改变已发生普跌事实。修复写下跌扩散收缩或上涨扩散改善，不笼统说广度收缩。
 
+## 基本面、消息政策与量价技术
+
+将基本面、消息面、政策面、均线、MACD、KDJ、量价证据与情绪及方向反馈交叉判断；不同证据发生冲突时说明冲突，不能机械投票或因一个指标金叉就升级交易权限。按本次evidence_coverage与具体事实卡选择可用证据，不要求每篇堆齐所有指标；若相应维度缺失，明确其对方向或个股判断的影响。
+
+fundamental_metrics只来自已认证、在截止时点已披露并已知的PIT报告，注明报告期，不把单期EPS冒充TTM，不由股价/EPS拼市盈率。没有有效财务卡就不能给盈利质量、估值便宜或业绩催化结论；基本面属于未验证维度，不因表中有记录就宣称已结合。
+
+新闻和政策卡为source_statement。先区分正式文件、媒体报道、公司公告与转述，说明已知事件与方向的证据关系；没有事件就明确样本缺口，不能拿新闻发布时间证明市场此前未预期，也不能把任意公司新闻称为政策利好。
+
+technical_indicators为已闭市未复权日线，参数和可用范围见technical_methods；引用数值用fact字段，均线名称可写中文“五日均线”。MACD/DIF/DEA和KDJ只解释对应日线趋势、动量与过热风险，不代替方向持续性、身份证据或盘中确认。前收不连续、历史不足、日历缺口对应指标不能使用；缺失不是零，不能猜测为除权。
+
+成交额、成交量和资金净流入是不同量。volume_ratio5/20仅在单位与量价认证通过时可用，为当日日量相对此前完整日均量，不等于盘中同时间量比；没有有效量比不能判断个股放量突破。独立沪深报道成交额仅适用报道范围，不能修复全A金额缺口。
+
 ## 基线与审计
 
 continuity引用baseline_fact_id。inherited不带new_fact_ids，仅继承；strengthened/weakened/invalidated必须有父基线context_cutoff_at之后的真实新增事实；unassessable说明对应限制。同日行情被再次输入不构成验证，样本内未见新闻不能扩大成整个市场无消息。
@@ -65,4 +79,4 @@ audit_units只表达已提供过程证据与边界。没有逐窗触发/执行�
 
 ## 自动审查
 
-同一packet独立生成、双方互审、一次最终修订、独立终检与程序门禁。保留分歧、证据定位和问题处置；不自动改未知、不程序改稿、不人工补正文。最终不合格明确失败并停止。
+同一packet由DeepSeek和ChatGPT/Codex独立生成、双方互审，ChatGPT/Codex在原生Schema约束下作一次正式定稿，DeepSeek独立终审，最后经过本地事实和结构门禁。定稿逐一处置双方发现的问题，可用证据反驳误报，不因审查员提出就删除真实证据。保留分歧、证据定位和问题处置；不自动改未知、不程序改稿、不人工补正文。最终不合格明确失败并停止，无替代发布路径。

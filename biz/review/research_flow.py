@@ -172,7 +172,9 @@ def collect_context(engine, review_date: str, *, now: datetime | None = None,
                                           "rows": list(latest.values())}
         except Exception as exc:
             context["external_market"] = {"status": "UNKNOWN", "reason": type(exc).__name__}
-    return context
+    from biz.review.research_inputs import enrich_context
+    return enrich_context(engine, {"review_date": review_date}, context,
+                          report_kind="briefing" if overnight else "review", now=current)
 
 
 def reported_turnover(rows: list[dict]) -> dict:
@@ -243,6 +245,8 @@ def automatic_previous_research(engine, digest: dict) -> dict | None:
 def attach_review(engine, digest: dict, *, now=None, context=None, next_trade_date=None,
                   previous_research=_UNSET, checkpoint=None, progress=None) -> dict:
     from biz.review.market_decision import generate_research
+    if checkpoint and context is None:
+        raise RuntimeError("BLOCKED stage=research_input_resume: frozen context is required")
     target = str(digest["review_date"])[:10]
     assert_digest(digest, target)
     context = context if context is not None else collect_context(engine, target, now=now)
@@ -290,6 +294,9 @@ def generate_briefing(engine, review_date: str, *, persist: bool = True,
                       now=None, digest=None, context=None, next_trade_date=None,
                       checkpoint=None, progress=None) -> dict:
     from biz.review.market_decision import generate_research, verify_automatic_research
+
+    if checkpoint and context is None:
+        raise RuntimeError("BLOCKED stage=research_input_resume: frozen context is required")
 
     digest = digest if digest is not None else load_digest(engine, review_date)
     assert_digest(digest, review_date)

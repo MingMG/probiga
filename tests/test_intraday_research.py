@@ -11,6 +11,13 @@ from biz.intraday_alert import research
 NOW = datetime(2026, 10, 30, 10, 0, 30)
 
 
+@pytest.fixture(autouse=True)
+def public_evidence_boundary(monkeypatch):
+    from biz.review import research_inputs
+    monkeypatch.setattr(research_inputs, "enrich_context", lambda engine, digest, context, **kwargs:
+                        {**context, "technical_facts": {"status": "UNKNOWN"}, "fundamental_facts": {"status": "UNKNOWN"}})
+
+
 def observation(at=NOW, identifier="a" * 64):
     return {"observation_id": identifier, "trade_date": at.date().isoformat(), "observed_at": at,
             "source_snapshot_at": at - timedelta(seconds=20), "coverage": 0.99,

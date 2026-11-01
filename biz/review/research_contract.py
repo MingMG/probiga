@@ -15,7 +15,9 @@ from zoneinfo import ZoneInfo
 
 INPUT_VERSION = "probiga.research-input.v3"
 DRAFT_VERSION = "probiga.research-draft.v3"
-MAX_PACKET_BYTES = 35 * 1024
+# Includes bounded technical/PIT evidence and the eight-unit parent baseline.
+# Provider/bridge envelopes enforce their separate transport byte limits.
+MAX_PACKET_BYTES = 48 * 1024
 MAX_DRAFT_CHARS = 50_000
 TZ = ZoneInfo("Asia/Shanghai")
 ROLES = ("总策略负责人", "情绪周期分析师", "相对强度分析师", "博弈与资金分析师", "主线交易员", "风险经理", "反方审查员", "复盘审计员")
@@ -143,13 +145,19 @@ def _time_text(value):
 
 
 def _unit(field):
+    if field in {"basic_eps", "net_asset_ps", "oper_cf_ps"}:
+        return "price"
+    if field in {"total_rev", "net_profit_attr_sh", "non_gaap_net_profit"}:
+        return "CNY"
+    if field in {"total_rev_yoy_gr", "net_profit_yoy_gr", "non_gaap_net_profit_yoy_gr", "roe_wtd", "roa_wtd", "gross_margin", "net_margin", "asset_liab_ratio", "cash_flow_ratio"}:
+        return "percent"
     if field.endswith("_pct"):
         return "percent"
     if field.endswith(("_share", "_coverage")) or field == "coverage":
         return "ratio"
     if field.endswith(("_amount", "market_cap")) or field == "amount":
         return "CNY"
-    if field in {"price", "open", "close", "high", "low", "pre_close"}:
+    if field in {"price", "open", "close", "high", "low", "pre_close", "ma5", "ma10", "ma20", "ma60"}:
         return "price"
     return "number"
 
@@ -172,6 +180,10 @@ def _format(field, value):
         return f"{value / 100_000_000:,.2f}亿元"
     if unit == "price":
         return f"{value:.2f}"
+    if field.startswith(("macd_", "kdj_", "previous_macd_", "previous_kdj_")):
+        return f"{value:.6g}"
+    if field.startswith("volume_ratio"):
+        return f"{value:.2f}倍"
     return str(int(value)) if value == int(value) else str(value)
 
 
@@ -367,6 +379,107 @@ def build_packet(digest: dict, *, report_kind: str, next_trade_date: str, contex
             if _number(heat.get(key)) is not None:
                 values["heat_" + key] = heat[key]
         card("market_measurement", "stock_prices", values, eid, "已校验个股行情", scope="attention_candidate_sample")
+    # Optional evidence is projected only from a frozen, independently gated
+    # source snapshot. A status receipt is never substituted for a measurement.
+    linked = {(item["kind"], item.get("code")): eid for eid, item in packet["entities"].items()}
+    technical = context.get("technical_facts") or {}
+    baseline_day = str(technical.get("baseline_trade_date") or "")[:10]
+    valid_baseline = bool(baseline_day and (baseline_day < review_date if intraday else baseline_day == review_date))
+    technical_counts = {"ma_stock_count": 0, "macd_stock_count": 0, "kdj_stock_count": 0, "volume_stock_count": 0}
+    missing_technical = []
+    for group, kind, key in (("stocks", "stock", "stock_code"), ("indices", "index", "index_code")):
+        for row in technical.get(group, []):
+            eid = linked.get((kind, str(row.get(key) or "")))
+            if not eid:
+                continue
+            values = {}
+            verified = (valid_baseline and str(row.get("trade_date"))[:10] == baseline_day
+                        and row.get("status") == "OBSERVED" and row.get("price_revision_matches_frozen") is not False
+                        and (row.get("coverage") or {}).get("price_status") == "OBSERVED"
+                        and (row.get("coverage") or {}).get("calendar_verified") is True
+                        and bool(row.get("source_snapshot_sha256")))
+            if verified:
+                for period in ("5", "10", "20", "60"):
+                    ma = (row.get("ma") or {}).get(period) or {}
+                    if ma.get("status") == "OBSERVED" and _number(ma.get("last")) is not None:
+                        values["ma" + period] = _number(ma["last"])
+                        deviation = _number(ma.get("last_deviation_pct"))
+                        if deviation is not None:
+                            values["ma" + period + "_deviation_pct"] = deviation
+                for name, fields in (("macd", ("dif", "dea", "hist")), ("kdj", ("k", "d", "j"))):
+                    indicator = row.get(name) or {}
+                    if indicator.get("status") != "OBSERVED":
+                        continue
+                    for phase, prefix in (("last", ""), ("previous", "previous_")):
+                        for field, value in measurements(indicator.get(phase) or {}, fields).items():
+                            values[prefix + name + "_" + field] = value
+                volume = row.get("volume") or {}
+                receipt = volume.get("verification") or {}
+                if (volume.get("status") == "OBSERVED" and receipt.get("status") == "VERIFIED"
+                        and receipt.get("amount_price_status") == "VERIFIED" and volume.get("unit")):
+                    for period in ("5", "20"):
+                        if _number(volume.get("ratio" + period)) is not None:
+                            values["volume_ratio" + period] = _number(volume["ratio" + period])
+            if values:
+                card("market_measurement", "technical_indicators", values, eid, row.get("source"),
+                     scope="closed_daily_technical_baseline", trade_date=baseline_day, window="closed_daily_baseline",
+                     source_snapshot_sha256=row["source_snapshot_sha256"], acquired_at=technical.get("acquired_at"))
+                if kind == "stock":
+                    for name, fields in (("ma", ("ma5", "ma10", "ma20", "ma60")), ("macd", ("macd_dif",)),
+                                        ("kdj", ("kdj_k",)), ("volume", ("volume_ratio5", "volume_ratio20"))):
+                        technical_counts[name + "_stock_count"] += int(any(field in values for field in fields))
+            absent = [name for name, fields in (("MA", ("ma5", "ma10", "ma20", "ma60")),
+                      ("MACD", ("macd_dif",)), ("KDJ", ("kdj_k",)), ("日成交量比", ("volume_ratio5", "volume_ratio20")))
+                      if not any(field in values for field in fields)]
+            if absent:
+                missing_technical.append(packet["entities"][eid]["name"] + "：" + "、".join(absent))
+    technical_summary = ("已闭市日线技术证据仅覆盖已核验样本；前收与相邻收盘不一致、历史不足或缺日时相应指标不可用，不能推断原因或填零。"
+                         "成交量单位和量价校验未经认证时，不提供量比；报道成交额不能替代个股量比。")
+    if missing_technical:
+        technical_summary += " 当前缺口：" + "；".join(missing_technical)
+    elif not technical:
+        technical_summary = "未提供经过连续性、复权口径和日历核验的技术及成交量快照，不能声称使用均线、MACD、KDJ或量比。"
+    limitation("technical_coverage", technical_summary, "partial" if any(technical_counts.values()) else "unavailable")
+    packet["technical_methods"] = {"baseline_trade_date": baseline_day or None, "price_basis": "unadjusted_closed_daily_bars",
+        "ma": "MA5/10/20/60，收盘价算术均值；偏离为收盘相对该均线百分比",
+        "macd": "EMA(12,26,9), adjust=False, 首收盘初始化；柱=2*(DIF-DEA)，至少120连续日，前值需121日",
+        "kdj": "KDJ(9,3,3)，K和D初始50，平区RSV=50；至少120连续日，前值需121日",
+        "volume": "当日日成交量/此前5或20完整日均量，排除当日；不等于盘中同时间量比",
+        "availability": "历史日线为本次取得版本，不证明当时盘中已知或技术信号已经触发"}
+    fundamental = context.get("fundamental_facts") or {}
+    finance_cutoff = _stamp(context.get("cutoff_at"))
+    finance_count = 0
+    finance_fields = ("basic_eps", "net_asset_ps", "total_rev", "net_profit_attr_sh", "total_rev_yoy_gr", "net_profit_yoy_gr",
+                      "roe_wtd", "roa_wtd", "gross_margin", "net_margin", "asset_liab_ratio", "curr_ratio", "quick_ratio",
+                      "oper_cf_ps", "non_gaap_net_profit", "non_gaap_net_profit_yoy_gr", "cash_flow_ratio")
+    for row in fundamental.get("stocks", []):
+        eid = linked.get(("stock", str(row.get("stock_code") or "")))
+        latest = row.get("latest") or {}
+        known, published = _stamp(latest.get("finance_known_at")), _stamp(latest.get("finance_published_at"))
+        publication_date_only = latest.get("finance_publication_time_verified") is not True
+        # Date-only disclosures can be used at their certified known_at, without
+        # inventing a publication hour or shifting them back to the morning.
+        publication_ok = bool(published and finance_cutoff and (published.date() <= finance_cutoff.date() if publication_date_only else published <= finance_cutoff))
+        if (not eid or row.get("status") != "OBSERVED" or not latest.get("finance_pit_verified")
+                or not fundamental.get("manifest_hash") or not known or not finance_cutoff or known > finance_cutoff
+                or not publication_ok or str(latest.get("finance_report_date") or "9999")[:10] > finance_cutoff.date().isoformat()):
+            continue
+        values = measurements(latest.get("metrics") or {}, finance_fields)
+        if not values:
+            continue
+        values["report_date"] = str(latest["finance_report_date"])[:10]
+        values["known_at"] = known.isoformat()
+        card("market_measurement", "fundamental_metrics", values, eid, "已认证PIT财务修订",
+             scope="certified_public_financial_report", window="financial_report", trade_date=values["report_date"],
+             published_at=str(latest.get("finance_published_at")), publication_precision=latest.get("finance_publication_precision"),
+             revision_id=latest.get("finance_revision_id"), content_hash=latest.get("finance_content_hash"),
+             manifest_hash=fundamental["manifest_hash"], acquired_at=fundamental.get("acquired_at"))
+        finance_count += 1
+    finance_expected = sum(item["kind"] == "stock" for item in packet["entities"].values())
+    limitation("fundamental_coverage", "财务仅使用截止时点已披露且已知、通过PIT完整性认证的报告字段；未认证部分不能判断盈利质量、估值或财务催化。"
+               "财务原表或修订记录存在不等于认证完成，不得用单期每股收益冒充TTM或拼估值。",
+               "complete" if finance_count == finance_expected and finance_count else "partial" if finance_count else "unavailable")
+    packet["evidence_coverage"] = {**technical_counts, "fundamental_stock_count": finance_count, "stock_count": finance_expected}
     if intraday:
         histories = observation.get("history") or []
         for row in histories[-3:]:
@@ -418,6 +531,11 @@ def build_packet(digest: dict, *, report_kind: str, next_trade_date: str, contex
     if not intraday:
         terms = [item["name"] for item in packet["entities"].values() if item["kind"] in {"theme", "stock"}]
         events = sorted(events, key=lambda row: -sum(term in str(row.get("title", "")) + str(row.get("content", "")) for term in terms) if isinstance(row, dict) else 0)
+        # A related-stock headline must not crowd every policy observation out
+        # of the bounded sample. The quotation remains a source statement;
+        # a media report is never upgraded to an official policy document.
+        policies = [row for row in events if isinstance(row, dict) and any(term in str(row.get("title", "")) for term in ("国务院", "商务部", "财政部", "央行", "证监会", "工信部", "发改委", "政策", "关税"))]
+        events = policies[:2] + [row for row in events if row not in policies[:2]]
     seen, event_ids = set(), []
     for row in events:
         if not isinstance(row, dict):
@@ -519,7 +637,7 @@ def validate_draft(raw: str, packet: dict) -> dict:
                 if reference["kind"] == "fact":
                     card = facts.get(reference["fact_id"], {})
                     if (card.get("kind") != "market_measurement" or card.get("entity_id") != observable["entity_id"]
-                            or reference["field"] not in {"price", "open", "close", "high", "low", "pre_close"}
+                            or reference["field"] not in {"price", "open", "close", "high", "low", "pre_close", "ma5", "ma10", "ma20", "ma60"}
                             or reference["field"] not in card.get("values", {})):
                         _fail("threshold_entity_or_unit_mismatch", path)
                     condition_refs.add(reference["fact_id"])

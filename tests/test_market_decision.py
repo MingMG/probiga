@@ -16,13 +16,15 @@ from test_research_contract import NOW, answer, material
 
 class Providers:
     """Unit-test provider boundary only; no completion/editorial bypass hook."""
-    def __init__(self, *, failed_stage=None, final_reject=False, findings=False, invalid_initial=False):
+    def __init__(self, *, failed_stage=None, final_reject=False, findings=False, invalid_initial=False, oversized_final=False, many_findings=False):
         self.calls = {}
         self.lock = Lock()
         self.failed_stage = failed_stage
         self.final_reject = final_reject
         self.findings = findings
         self.invalid_initial = invalid_initial
+        self.oversized_final = oversized_final
+        self.many_findings = many_findings
 
     def install(self, monkeypatch):
         monkeypatch.setattr(decision, "_call_deepseek", self.deepseek)
@@ -53,17 +55,22 @@ class Providers:
             value["units"][0]["statement"].append({"text": "来自独立甲方研究。" if stage.startswith("deepseek") else "来自独立乙方研究。"})
             if self.invalid_initial:
                 value["units"][0]["statement"] = [{"text": "上涨率99.9%。"}]
-        elif stage in {"deepseek_review", "codex_review", "codex_final_review"}:
+        elif stage in {"deepseek_review", "codex_review", "deepseek_final_review"}:
             value = {"schema_version": "probiga.research-review.v3",
                      "reviewed_sha256": schema["properties"]["reviewed_sha256"]["const"], "findings": []}
             if self.findings and stage in {"deepseek_review", "codex_review"}:
                 value["findings"] = [{"id": "R1", "severity": "warning", "category": "missed_evidence",
                                      "target": "/units/Uenv", "fact_ids": [next(iter(packet["facts"]))],
                                      "explanation": "请把有效广度证据与环境判断联系得更明确。"}]
-            if stage == "codex_final_review":
+            if self.many_findings and stage in {"deepseek_review", "codex_review"}:
+                value["findings"] = [{"id": "R" + str(index), "severity": "warning", "category": "missed_evidence",
+                    "target": "units.Uenv", "fact_ids": [next(iter(packet["facts"]))],
+                    "explanation": "请保留并逐条处置此审查意见。"}
+                    for index in range(12 if stage == "deepseek_review" else 11)]
+            if stage == "deepseek_final_review":
                 value["verdict"] = "REJECT" if self.final_reject else "PASS"
         else:
-            assert stage == "deepseek_final"
+            assert stage == "codex_final"
             final_draft = getattr(self, "draft_factory", answer)(packet)
             final_draft["units"][0]["statement"].append({"text": "最终研究明确保留竞争解释。"})
             dispositions = []
@@ -72,6 +79,11 @@ class Providers:
                     dispositions.append({"review": name, "finding_id": finding["id"], "resolution": "corrected",
                                          "unit_ids": ["Uenv"], "fact_ids": finding["fact_ids"],
                                          "reason": "最终环境段依据实际广度说明行动边界。"})
+            if self.oversized_final:
+                while len(final_draft["units"]) < 52:
+                    unit = deepcopy(final_draft["units"][0])
+                    unit["id"] = "Oversize" + str(len(final_draft["units"]))
+                    final_draft["units"].append(unit)
             value = {"schema_version": "probiga.research-final.v3", "draft": final_draft, "dispositions": dispositions}
         raw = json.dumps(value, ensure_ascii=False)
         receipt = {"messages_sha256": decision._hash(messages), "raw_sha256": decision._body_hash(raw),
@@ -112,7 +124,7 @@ def test_six_provider_calls_are_independent_then_cross_reviewed_and_final_semant
         material = json.loads(call["messages"][1]["content"])["material"]
         assert material["target_draft"] == opposite
         assert call["schema"]["properties"]["reviewed_sha256"]["const"] == decision._body_hash(opposite)
-    final = json.loads(providers.calls["deepseek_final"]["raw"])
+    final = json.loads(providers.calls["codex_final"]["raw"])
     assert result["model_output"] == final
     assert result["draft"] == final["draft"]
     assert len(final["dispositions"]) == 2
@@ -134,11 +146,11 @@ def test_peer_review_preserves_declared_descriptive_locator_without_undeclared_p
 
 def test_invalid_initial_numeric_claims_are_diagnosed_and_only_provider_revision_can_fix_them(monkeypatch):
     result, providers, *_ = completed_research(monkeypatch, invalid_initial=True)
-    final_material = json.loads(providers.calls["deepseek_final"]["messages"][1]["content"])["material"]
+    final_material = json.loads(providers.calls["codex_final"]["messages"][1]["content"])["material"]
     assert all("free_text_number_requires_reference" in errors[0] for errors in final_material["deterministic_errors"].values())
     assert "99.9" in providers.calls["deepseek_draft"]["raw"]
     assert "99.9" not in result["content"]
-    assert result["draft"] == json.loads(providers.calls["deepseek_final"]["raw"])["draft"]
+    assert result["draft"] == json.loads(providers.calls["codex_final"]["raw"])["draft"]
 
 
 @pytest.mark.parametrize("stage", decision.STAGES)
@@ -152,17 +164,17 @@ def test_each_external_stage_failure_is_terminal_without_fallback_or_duplicate_a
     assert caught.value.checkpoint["stages"][stage]["status"] == "FAILED"
     assert len(providers.calls) <= 6
     if stage.endswith("_draft"):
-        assert not set(providers.calls).intersection({"deepseek_review", "codex_review", "deepseek_final", "codex_final_review"})
+        assert not set(providers.calls).intersection({"deepseek_review", "codex_review", "codex_final", "deepseek_final_review"})
     if stage in {"deepseek_review", "codex_review"}:
-        assert "deepseek_final" not in providers.calls
-    if stage == "deepseek_final":
-        assert "codex_final_review" not in providers.calls
+        assert "codex_final" not in providers.calls
+    if stage == "codex_final":
+        assert "deepseek_final_review" not in providers.calls
 
 
 def test_final_independent_rejection_never_publishes_a_generated_body(monkeypatch):
     providers = Providers(final_reject=True).install(monkeypatch)
     data, context = material()
-    with pytest.raises(decision.ResearchError, match="codex_rejected_final_draft"):
+    with pytest.raises(decision.ResearchError, match="final_reviewer_rejected_draft"):
         decision.generate_research(data, report_kind="review", next_trade_date="2026-11-02",
                                    context=context, now=NOW, engine=object())
     assert set(providers.calls) == set(decision.STAGES)
@@ -187,11 +199,11 @@ def test_complete_checkpoint_resume_reuses_every_stage_and_stable_generation_clo
 def test_unconfirmed_or_failed_provider_attempt_is_not_reissued(monkeypatch, state):
     _, _, progress, data, context = completed_research(monkeypatch)
     checkpoint = progress[-1]["checkpoint"]
-    checkpoint["stages"]["deepseek_final"]["status"] = state
+    checkpoint["stages"]["codex_final"]["status"] = state
     no_call = Mock(side_effect=AssertionError("must not duplicate an unconfirmed prior request"))
     monkeypatch.setattr(decision, "_call_deepseek", no_call)
     monkeypatch.setattr(decision, "_call_codex", no_call)
-    with pytest.raises(decision.ResearchError, match="prior_attempt_not_reusable_deepseek_final"):
+    with pytest.raises(decision.ResearchError, match="prior_attempt_not_reusable_codex_final"):
         decision.generate_research(data, report_kind="review", next_trade_date="2026-11-02",
                                    context=context, engine=object(), checkpoint=checkpoint)
     no_call.assert_not_called()
@@ -360,3 +372,64 @@ def test_fact_identity_ignores_only_persisted_reports_and_execution_ledger():
     assert decision.source_digest_identity(data) == before
     data["market_structure_json"]["sample_count"] -= 1
     assert decision.source_digest_identity(data) != before
+
+
+def test_codex_authors_native_final_schema_and_deepseek_only_independently_audits_it(monkeypatch):
+    result, providers, _, _, _ = completed_research(monkeypatch, many_findings=True)
+    assert decision.STAGES == ("deepseek_draft", "codex_draft", "deepseek_review", "codex_review", "codex_final", "deepseek_final_review")
+    final = providers.calls["codex_final"]
+    audit = providers.calls["deepseek_final_review"]
+    assert final["schema"] == decision._final_schema()
+    assert final["schema"]["properties"]["draft"]["properties"]["units"]["maxItems"] == 48
+    assert final["receipt"]["source"] == "codex_gpt"
+    assert final["receipt"]["ephemeral"] is True
+    assert final["receipt"]["schema_sha256"] == decision._body_hash(json.dumps(final["schema"], ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    assert audit["receipt"]["source"] == "deepseek_api"
+    assert audit["receipt"]["endpoint"] == "https://api.deepseek.com/v1/chat/completions"
+    assert audit["schema"] == decision._review_schema(decision._hash(result["draft"]), final=True)
+    assert json.loads(audit["messages"][1]["content"])["material"]["final_output"] == json.loads(final["raw"])
+    assert len(result["model_output"]["dispositions"]) == 23
+    assert result["verification"]["final_raw_sha256"] == final["receipt"]["raw_sha256"]
+    assert result["verification"]["workflow"] == decision.WORKFLOW_VERSION
+    assert "codex-final.deepseek-audit" in decision.WORKFLOW_VERSION
+    assert "deepseek_final" not in providers.calls and "codex_final_review" not in providers.calls
+
+
+def test_native_final_with_observed_52_units_is_blocked_without_deleting_units_or_auditing_it(monkeypatch):
+    providers = Providers(oversized_final=True, many_findings=True).install(monkeypatch)
+    data, context = material()
+    with pytest.raises(decision.ResearchError, match="final_contract") as error:
+        decision.generate_research(data, report_kind="review", next_trade_date="2026-11-02", context=context, now=NOW, engine=object())
+    raw = providers.calls["codex_final"]["raw"]
+    assert len(json.loads(raw)["draft"]["units"]) == 52
+    assert len(json.loads(raw)["dispositions"]) == 23
+    assert error.value.checkpoint["stages"]["codex_final"]["raw_response"] == raw
+    assert "deepseek_final_review" not in providers.calls
+    assert decision._final_schema()["properties"]["draft"]["properties"]["units"]["maxItems"] == 48
+
+
+def test_canonical_stage_builder_reconstructs_exact_requests_and_rejects_superseded_stages(monkeypatch):
+    result, providers, *_ = completed_research(monkeypatch)
+    packet, rules = result["input_packet"], decision._load_rules()[0]
+    drafts = {"deepseek": providers.calls["deepseek_draft"]["raw"], "codex": providers.calls["codex_draft"]["raw"]}
+    final = json.loads(providers.calls["codex_final"]["raw"])
+    for stage in decision.STAGES:
+        messages, schema = decision.build_stage_request(stage, packet, rules, drafts=drafts,
+            reviews=result["verification"]["peer_reviews"], final=final)
+        assert messages == providers.calls[stage]["messages"]
+        assert schema == providers.calls[stage]["schema"]
+    for old in ("deepseek_final", "codex_final_review"):
+        with pytest.raises(decision.ResearchError, match="unknown_provider_stage"):
+            decision.build_stage_request(old, packet, rules, drafts=drafts)
+
+
+def test_workflow_version_and_final_provider_identity_cannot_be_relabelled(monkeypatch):
+    result, *_ = completed_research(monkeypatch)
+    wrong = deepcopy(result)
+    wrong["verification"]["workflow"] = "dual_model"
+    with pytest.raises(decision.ResearchError, match="workflow_changed"):
+        decision.verify_automatic_research(wrong)
+    wrong = deepcopy(result)
+    next(item for item in wrong["generation_attempts"] if item["stage"] == "codex_final")["provider_receipt"]["source"] = "deepseek_api"
+    with pytest.raises(decision.ResearchError, match="codex_identity_missing_codex_final"):
+        decision.verify_automatic_research(wrong)

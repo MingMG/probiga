@@ -226,3 +226,29 @@ def test_default_resume_still_refuses_the_failed_stage_without_a_recovery_claim(
         core.generate_research(frozen["facts"], report_kind="review", next_trade_date="2026-11-02",
             context=frozen["review_context"], previous_research=None, now=NOW, engine=object(), checkpoint=checkpoint)
     assert providers.calls == {}
+
+
+def test_codex_final_recovery_rebuilds_the_editor_request_from_both_drafts_and_peer_reviews(monkeypatch):
+    from unittest.mock import Mock
+    packet = {"facts": {"F1": {}}}
+    state = {"stages": {"deepseek_draft": {"raw_response": "original DS draft"},
+                        "codex_draft": {"raw_response": "original CX draft"},
+                        "deepseek_review": {"raw_response": "DS peer review"},
+                        "codex_review": {"raw_response": "CX peer review"}}}
+    parsed = {"DS peer review": {"findings": [{"id": "DS"}]}, "CX peer review": {"findings": [{"id": "CX"}]}}
+    parser = Mock(side_effect=lambda raw, target, facts: parsed[raw])
+    editor = Mock(return_value=([{"role": "user", "content": "canonical editor request"}], {"type": "object"}))
+    monkeypatch.setattr(core, "_parse_review", parser)
+    monkeypatch.setattr(core, "_final_request", editor)
+    result = cli._recovery_request(core, packet, "unchanged rules", state, "codex_final")
+    assert result == editor.return_value
+    assert parser.call_args_list[0].args == ("DS peer review", core._body_hash("original CX draft"), packet)
+    assert parser.call_args_list[1].args == ("CX peer review", core._body_hash("original DS draft"), packet)
+    assert editor.call_args.args == (packet, "unchanged rules", {"deepseek": "original DS draft", "codex": "original CX draft"},
+                                    {"deepseek_review": parsed["DS peer review"], "codex_review": parsed["CX peer review"]})
+    assert cli.RECOVERY_STAGES == ("codex_draft", "codex_review", "codex_final")
+
+
+def test_retired_final_audit_is_not_a_recoverable_execution_path():
+    with pytest.raises(RuntimeError, match="unsupported_recovery_stage"):
+        cli._recovery_request(core, {}, "rules", {"stages": {}}, "codex_final_review")

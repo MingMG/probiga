@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
 from decimal import Decimal
 from datetime import datetime, timedelta
 from typing import Any, Callable, Mapping
@@ -156,6 +157,28 @@ def research_batch_id(observation_id: str, mode: str) -> str:
     return _hash({"observation_id": observation_id, "mode": mode, "schema": SCHEMA})
 
 
+def _freeze_research_evidence(engine, frozen: dict, *, now=None, progress=None) -> dict:
+    """Read auxiliary evidence once, before the first model input is durable.
+
+    An explicit frozen context or a model checkpoint is immutable.  In
+    particular, recovery must not query today's tables to recreate past input.
+    """
+    expected = _hash({"digest": frozen["digest"], "context": frozen["context"]})
+    if frozen.get("input_sha256") != expected:
+        raise IntradayResearchError("INTRADAY_RESEARCH_BLOCKED stage=input_freeze reason=input_hash_mismatch")
+    context = frozen["context"]
+    if (all(key in context for key in ("technical_facts", "fundamental_facts"))
+            or frozen.get("checkpoint") or frozen.get("research")):
+        return frozen
+    from biz.review.research_inputs import enrich_context
+    result = deepcopy(frozen)
+    result["context"] = enrich_context(engine, result["digest"], context,
+        report_kind="intraday", now=now, progress=progress)
+    result["input_sha256"] = _hash({"digest": result["digest"], "context": result["context"]})
+    result["evidence_enrichment"] = {"status": "COMPLETE", "frozen_at": _stamp(now or _now())}
+    return result
+
+
 def queue_research_batch(connection, *, observation: dict, history: list, emissions: list, mode: str, now: datetime) -> str:
     frozen = freeze_inputs(observation, history, emissions, mode=mode)
     identity = research_batch_id(observation["observation_id"], mode)
@@ -263,6 +286,26 @@ def process_research_batch(engine, *, outbox_id: str, generator=None, now_fn: Ca
             connection.execute(text(f"UPDATE {OUTBOX_TABLE} SET evidence_json=:evidence,updated_at=:now WHERE outbox_id=:id AND status='ANALYZING'"), {"id": outbox_id, "evidence": _json(snapshot), "now": current})
 
     try:
+        # The scan transaction/named lock and claim transaction have ended.
+        # Renew the fenced owner while bounded evidence queries make progress;
+        # their budget never extends the source's original freshness deadline.
+        progress({"stage": "research_input_freeze", "status": "RUNNING"})
+        enriched = _freeze_research_evidence(engine, state, now=now.replace(tzinfo=TZ), progress=progress)
+        if enriched is not state:
+            current = _time(now_fn())
+            with engine.begin() as connection:
+                _prepare(connection)
+                row = _load_locked(connection, engine, outbox_id)
+                snapshot = _owned(row, owner, generation, current)
+                if snapshot.get("checkpoint") or snapshot["input_sha256"] != state["input_sha256"]:
+                    raise IntradayResearchError("INTRADAY_RESEARCH_BLOCKED stage=input_freeze reason=frozen_input_changed")
+                snapshot.update(context=enriched["context"], input_sha256=enriched["input_sha256"],
+                                evidence_enrichment=enriched["evidence_enrichment"])
+                snapshot["analysis"].update(lease_expires_at=_stamp(min(deadline, current + timedelta(seconds=LEASE_SECONDS))),
+                                            current_unit="research_input_frozen", last_progress_at=_stamp(current))
+                connection.execute(text(f"UPDATE {OUTBOX_TABLE} SET evidence_json=:evidence,evidence_hash=:hash,updated_at=:now WHERE outbox_id=:id AND status='ANALYZING'"),
+                    {"id": outbox_id, "evidence": _json(snapshot), "hash": snapshot["input_sha256"], "now": current})
+                state = snapshot
         if generator is None:
             from biz.review.market_decision import generate_research
             generator = generate_research
@@ -330,7 +373,8 @@ def load_replay_inputs(engine, *, observation_id: str) -> dict:
     for row in boxes:
         evidence = _object(row["evidence_json"])
         if evidence.get("schema_version") == SCHEMA:
-            replay = {**evidence, "mode": "replay", "context": {**evidence["context"], "mode": "replay", "asof_mode": "retained_snapshot"}}
+            replay = {**evidence, "mode": "replay", "retained_research_input": True,
+                      "context": {**evidence["context"], "mode": "replay", "asof_mode": "retained_snapshot"}}
             replay["input_sha256"] = _hash({"digest": replay["digest"], "context": replay["context"]})
             return replay
         emissions.append({"event_key": row["event_key"], "transition_name": row["transition_name"],
@@ -338,8 +382,21 @@ def load_replay_inputs(engine, *, observation_id: str) -> dict:
     return freeze_inputs(observation, [_decode_retained(row) for row in reversed(rows)], emissions, mode="replay")
 
 
-def run_intraday_research_replay(engine, *, observation_id: str, generator=None, checkpoint=None, progress=None) -> dict:
-    frozen = load_replay_inputs(engine, observation_id=observation_id)
+def run_intraday_research_replay(engine, *, observation_id: str, generator=None, checkpoint=None, progress=None,
+                                 frozen_inputs: dict | None = None) -> dict:
+    if frozen_inputs is not None:
+        frozen = deepcopy(frozen_inputs)
+        if (frozen.get("observation_id") != observation_id or frozen.get("mode") != "replay"
+                or frozen.get("input_sha256") != _hash({"digest": frozen.get("digest"), "context": frozen.get("context")})):
+            raise IntradayResearchError("INTRADAY_RESEARCH_BLOCKED stage=replay reason=frozen_input_identity_mismatch")
+    else:
+        frozen = load_replay_inputs(engine, observation_id=observation_id)
+        if checkpoint and not frozen.get("retained_research_input"):
+            raise IntradayResearchError("INTRADAY_RESEARCH_BLOCKED stage=replay reason=checkpoint_requires_frozen_inputs")
+        if not checkpoint and not frozen.get("retained_research_input"):
+            frozen = _freeze_research_evidence(engine, frozen, progress=progress)
+    if progress:
+        progress({"stage": "research_input_frozen", "status": "COMPLETE", "input_snapshot": frozen})
     if generator is None:
         from biz.review.market_decision import generate_research
         generator = generate_research
@@ -351,4 +408,4 @@ def run_intraday_research_replay(engine, *, observation_id: str, generator=None,
     verify_automatic_research(research)
     return {"status": research.get("status"), "mode": "replay", "asof_at": frozen["context"]["cutoff_at"],
             "observation_id": observation_id, "input_sha256": frozen["input_sha256"],
-            "research": research, "outbox_write_invoked": False, "delivery_invoked": False}
+            "research": research, "input_snapshot": frozen, "outbox_write_invoked": False, "delivery_invoked": False}

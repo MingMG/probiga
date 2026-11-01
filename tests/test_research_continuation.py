@@ -109,7 +109,7 @@ def test_invalid_continuation_never_claims_source(boundary, tmp_path, mutation):
     elif mutation == "unstarted_request":
         cli._atomic(source / "stages/review/deepseek_review_input.json", {"unknown": "attempt"})
     elif mutation == "semantic_final":
-        checkpoint["stages"]["codex_final_review"] = {"status": "COMPLETE", "raw_response": '{"verdict":"REJECT"}'}
+        checkpoint["stages"]["deepseek_final_review"] = {"status": "COMPLETE", "raw_response": '{"verdict":"REJECT"}'}
     elif mutation == "already_continued":
         checkpoint["continuation"] = {"continuation_count": 1}
     else:
@@ -131,7 +131,7 @@ def test_four_stage_continuation_only_calls_unstarted_final_stages(boundary, tmp
     providers = Providers().install(monkeypatch)
     result = core.generate_research(frozen["facts"], report_kind="review", next_trade_date="2026-11-02",
         context=frozen["review_context"], previous_research=None, now=NOW, engine=object(), checkpoint=checkpoint)
-    assert set(providers.calls) == {"deepseek_final", "codex_final_review"}
+    assert set(providers.calls) == {"codex_final", "deepseek_final_review"}
     assert result["status"] == "COMPLETE"
     assert result["continuation"]["continuation_count"] == 1
     assert result["recovery"]["recovery_count"] == 1

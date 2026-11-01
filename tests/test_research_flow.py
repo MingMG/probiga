@@ -18,6 +18,13 @@ REVIEW = "2026-08-28"
 NEXT = "2026-08-31"
 
 
+@pytest.fixture(autouse=True)
+def public_evidence_boundary(monkeypatch):
+    from biz.review import research_inputs
+    monkeypatch.setattr(research_inputs, "enrich_context", lambda engine, digest, context, **kwargs:
+                        {**context, "technical_facts": {"status": "UNKNOWN"}, "fundamental_facts": {"status": "UNKNOWN"}})
+
+
 def _digest():
     return {
         "review_date": REVIEW, "adjust_type": 0, "publish_status": "ready",

@@ -35,7 +35,7 @@ FACT_FIELDS = ("review_date", "adjust_type", "generated_at", "data_cutoff_at", "
                "quality_json", "market_structure_json", "industry_rotation_json", "factor_validation_json")
 ARTIFACT_KEYS = {"research", "market_decision", "early_briefing", "selection_review", "editorial_review"}
 RECOVERY_SCHEMA = "probiga.research-recovery.v1"
-RECOVERY_STAGES = ("codex_draft", "codex_review", "codex_final_review")
+RECOVERY_STAGES = ("codex_draft", "codex_review", "codex_final")
 
 
 def _default(value):
@@ -272,12 +272,14 @@ def _recovery_request(core, packet: dict, rules: str, checkpoint: dict, stage: s
         return core._draft_request(packet, rules)
     if stage == "codex_review":
         return core._peer_request(packet, rules, stages["deepseek_draft"]["raw_response"])
+    if stage != "codex_final":
+        raise RuntimeError("BLOCKED stage=recovery: unsupported_recovery_stage")
     reviews = {"deepseek_review": core._parse_review(stages["deepseek_review"]["raw_response"],
                     core._body_hash(stages["codex_draft"]["raw_response"]), packet),
                "codex_review": core._parse_review(stages["codex_review"]["raw_response"],
                     core._body_hash(stages["deepseek_draft"]["raw_response"]), packet)}
-    final = core._validate_final(stages["deepseek_final"]["raw_response"], packet, reviews)
-    return core._audit_request(packet, rules, final, reviews)
+    drafts = {"deepseek": stages["deepseek_draft"]["raw_response"], "codex": stages["codex_draft"]["raw_response"]}
+    return core._final_request(packet, rules, drafts, reviews)
 
 
 def inspect_recovery(engine, source_dir: Path, *, stage: str, worker_state_root: Path,
