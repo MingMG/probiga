@@ -35,22 +35,8 @@ FACT_FIELDS = ("review_date", "adjust_type", "generated_at", "data_cutoff_at", "
                "quality_json", "market_structure_json", "industry_rotation_json", "factor_validation_json")
 ARTIFACT_KEYS = {"research", "market_decision", "early_briefing", "selection_review", "editorial_review"}
 RECOVERY_SCHEMA = "probiga.research-recovery.v1"
-RECOVERY_STAGES = ("codex_draft", "codex_review", "codex_final")
+RECOVERY_STAGES = ("codex_draft", "codex_review", "codex_final", "codex_arbitration")
 
-
-def _assert_no_rejected_final(checkpoint: dict) -> None:
-    """A terminal rejected operation cannot acquire another revision budget."""
-    stages = checkpoint.get("stages", {})
-    if any(name in stages for name in ("codex_final_2", "deepseek_final_review_2")):
-        raise RuntimeError("BLOCKED stage=resume: revision_round_cannot_be_reopened")
-    item = stages.get("deepseek_final_review", {})
-    if item.get("status") == "COMPLETE":
-        try:
-            review = json.loads(item["raw_response"])
-        except (KeyError, ValueError, TypeError):
-            raise RuntimeError("BLOCKED stage=resume: unknown_final_audit_outcome")
-        if review.get("verdict") != "PASS" or any(f.get("severity") == "blocker" for f in review.get("findings", [])):
-            raise RuntimeError("BLOCKED stage=resume: rejected_final_cannot_be_reopened")
 
 
 def _default(value):
@@ -287,13 +273,19 @@ def _recovery_request(core, packet: dict, rules: str, checkpoint: dict, stage: s
         return core._draft_request(packet, rules)
     if stage == "codex_review":
         return core._peer_request(packet, rules, stages["deepseek_draft"]["raw_response"])
-    if stage != "codex_final":
+    if stage not in {"codex_final", "codex_arbitration"}:
         raise RuntimeError("BLOCKED stage=recovery: unsupported_recovery_stage")
     reviews = {"deepseek_review": core._parse_review(stages["deepseek_review"]["raw_response"],
                     core._body_hash(stages["codex_draft"]["raw_response"]), packet),
                "codex_review": core._parse_review(stages["codex_review"]["raw_response"],
                     core._body_hash(stages["deepseek_draft"]["raw_response"]), packet)}
     drafts = {"deepseek": stages["deepseek_draft"]["raw_response"], "codex": stages["codex_draft"]["raw_response"]}
+    if stage == "codex_arbitration":
+        raw=stages["codex_final"]["raw_response"]
+        _,local=core._inspect_first_final(raw,packet,reviews)
+        reviews["deepseek_final_review"]=core._parse_review(stages["deepseek_final_review"]["raw_response"],core._body_hash(raw),packet,final=True,require_pass=False)
+        if local: reviews["deterministic_contract"]=local
+        return core.build_stage_request(stage,packet,rules,reviews=reviews,final_raw=raw)
     return core._final_request(packet, rules, drafts, reviews)
 
 
@@ -333,7 +325,6 @@ def inspect_recovery(engine, source_dir: Path, *, stage: str, worker_state_root:
                 candidates.append((kind, value))
     require(len(candidates) == 1, "exact_failed_stage_checkpoint_required")
     kind, checkpoint = candidates[0]
-    _assert_no_rejected_final(checkpoint)
     require(not checkpoint.get("recovery"), "recovery_limit_reached")
     require(checkpoint.get("rules_sha256") == rules_hash, "checkpoint_rules_changed")
     require(set(checkpoint["stages"]).issubset(core.STAGES), "unknown_stage")
@@ -633,12 +624,6 @@ def execute_run(engine, bundle: dict, directory: Path, *, publish=False, api_bas
                 or receipt.get("publish") != publish or receipt.get("api_base") != api_base):
             raise RuntimeError("FAILED stage=resume: frozen input, rules or publication scope changed")
         UUID(receipt["run_id"])
-        if receipt.get("status") == "FAILED":
-            for kind in ("review", "briefing"):
-                path = directory / (kind + "_checkpoint.json")
-                completed_artifact = directory / ("digest.json" if kind == "review" else "briefing.json")
-                if path.exists() and not completed_artifact.exists():
-                    _assert_no_rejected_final(_read_json(path))
     else:
         if receipt_path.exists():
             raise RuntimeError("FAILED stage=run_identity: existing run requires explicit resume")
@@ -664,9 +649,10 @@ def execute_run(engine, bundle: dict, directory: Path, *, publish=False, api_bas
         verify_automatic_research(research)
         attempts = research.get("generation_attempts") or []
         count = len(attempts)
-        first_round = STAGES.index("deepseek_final_review") + 1
-        if (count not in (first_round, len(STAGES)) or [item.get("stage") for item in attempts] != list(STAGES[:count])
-                or research.get("verification", {}).get("status") != "PASS"):
+        names = [item.get("stage") for item in attempts]
+        proof = research.get("verification", {})
+        if (not 0 < count <= len(STAGES) or names != [name for name in STAGES if name in names]
+                or proof.get("stage_count") != count or proof.get("status") != "PASS"):
             raise RuntimeError("FAILED stage=acceptance: incomplete_automatic_provider_stages")
         for item in attempts:
             raw = item["raw_response"].encode("utf-8")
