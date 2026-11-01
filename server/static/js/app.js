@@ -5789,7 +5789,7 @@
         function refresh() {
             if (loading || activeTabId() !== 'intraday-alert') return;
             loading = true;
-            apiGet('/hot-data/intraday-alert-feed?trade_date=' + encodeURIComponent(d) + '&limit=30')
+            apiGet('/intraday-alert-feed?trade_date=' + encodeURIComponent(d) + '&limit=30')
                 .then(render)
                 .catch(function(err) { c.innerHTML = '<div class="loading">盘中播报读取失败：' + escHtml(err.message) + '</div>'; })
                 .finally(function() { loading = false; });

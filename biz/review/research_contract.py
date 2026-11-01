@@ -651,9 +651,14 @@ def render_draft(draft: dict, packet: dict, metadata: dict) -> str:
         target += " " + (_stamp(task.get("as_of_at")) or _stamp(task["generated_at"])).strftime("%H:%M")
         if task.get("mode") in {"replay", "shadow"}:
             target += "（" + {"replay": "回放", "shadow": "影子观察"}[task["mode"]] + "）"
-    lines = [f"# {title}｜{target}", "", f"> 行情日：{task['review_date']}；下一交易日：{task['next_trade_date']}",
-             f"> 行情同步：{_time_text(task.get('data_cutoff_at'))}；新闻截止：{_time_text(task.get('context_cutoff_at'))}",
-             f"> 研究生成：{_time_text(task.get('generated_at'))}（北京时间）", ""]
+    lines = [f"# {title}｜{target}", ""]
+    if kind == "intraday":
+        lines += [f"> 行情源时点：{_time_text(task.get('source_snapshot_at') or task.get('data_cutoff_at'))}；观察时点：{_time_text(task.get('as_of_at') or task.get('context_cutoff_at'))}",
+                  "> 验证范围：当日剩余交易时段"]
+    else:
+        lines += [f"> 行情日：{task['review_date']}；下一交易日：{task['next_trade_date']}",
+                  f"> 行情同步：{_time_text(task.get('data_cutoff_at'))}；新闻截止：{_time_text(task.get('context_cutoff_at'))}"]
+    lines += [f"> 研究生成：{_time_text(task.get('generated_at'))}（北京时间）", ""]
     if kind == "review" and str(task.get("generated_at", ""))[:10] > task["review_date"]:
         lines += ["> 补记：本篇在行情日之后整理，晚入库收盘事实不能冒充当日事前判断。", ""]
 

@@ -231,8 +231,10 @@ def test_intraday_replay_is_explicit_and_source_time_is_not_observation_time():
                      data_cutoff_at="2026-10-30T13:51:33+08:00")
     content = render_draft(draft, p, {})
     assert "A股盘中播报｜2026-10-30 13:52（回放）" in content
-    assert "行情同步：10月30日 13:51" in content
-    assert "新闻截止：10月30日 13:52" in content
+    assert "行情源时点：10月30日 13:51" in content
+    assert "观察时点：10月30日 13:52" in content
+    assert "验证范围：当日剩余交易时段" in content
+    assert "下一交易日" not in content
 
 
 def test_real_provider_alphabetical_check_keys_render_in_trading_time_order():

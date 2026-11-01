@@ -123,6 +123,15 @@ def test_six_provider_calls_are_independent_then_cross_reviewed_and_final_semant
     decision.verify_automatic_research(result)
 
 
+@pytest.mark.parametrize("target", ["units.U8", "report.checks.open；units.U29", "roles.博弈与资金分析师 unit_ids=[M3,R1]"])
+def test_peer_review_preserves_declared_descriptive_locator_without_undeclared_pointer_rule(monkeypatch, target):
+    result, *_ = completed_research(monkeypatch)
+    value = {"schema_version": "probiga.research-review.v3", "reviewed_sha256": "0" * 64,
+             "findings": [{"id": "R1", "severity": "blocker", "category": "structure", "target": target,
+                           "fact_ids": [], "explanation": "定位草稿中需要模型修订的单元。"}]}
+    assert decision._parse_review(json.dumps(value, ensure_ascii=False), "0" * 64, result["input_packet"]) == value
+
+
 def test_invalid_initial_numeric_claims_are_diagnosed_and_only_provider_revision_can_fix_them(monkeypatch):
     result, providers, *_ = completed_research(monkeypatch, invalid_initial=True)
     final_material = json.loads(providers.calls["deepseek_final"]["messages"][1]["content"])["material"]

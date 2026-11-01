@@ -165,7 +165,9 @@ def _parse_review(raw,target_hash,packet,*,final=False):
     if len(ids)!=len(set(ids)): _fail("peer_review","duplicate_finding_id")
     for item in value["findings"]:
         if any(ref not in packet["facts"] for ref in item["fact_ids"]): _fail("peer_review","unknown_finding_evidence")
-        if not item["target"].startswith("/"): _fail("peer_review","invalid_finding_target")
+        # The declared schema defines a descriptive draft locator, not JSON
+        # Pointer syntax. Preserve the model's unit/path label unchanged; the
+        # reviewed raw hash and finding/disposition IDs bind its actual scope.
     if final and (value["verdict"]!="PASS" or any(x["severity"]=="blocker" for x in value["findings"])): _fail("final_peer_review","codex_rejected_final_draft")
     return value
 
