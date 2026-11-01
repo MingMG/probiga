@@ -124,7 +124,9 @@ readonly RELEASE_DATA_VALIDATION_BLOCKING=0
 # the prior trusted controller and its protected, unchanged-schema recovery.
 readonly QMT_EDGE_RECOVERY_COMPATIBILITY_INSTALL=0
 readonly DEPENDENCY_DOWNLOAD_TIMEOUT=30m
-readonly FAST_SCHEMA_GUARD_TIMEOUT=20s
+# The read-only guard checks all 39 runtime contracts. Production measured
+# 1m53s for a complete scan, so a 20s deadline rejected healthy databases.
+readonly FAST_SCHEMA_GUARD_TIMEOUT=180s
 HEARTBEAT_RETRIES="${HEARTBEAT_RETRIES:-10}"
 HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-2}"
 HEALTH_RETRIES="${HEALTH_RETRIES:-5}"

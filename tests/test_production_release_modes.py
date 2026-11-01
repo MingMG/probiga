@@ -211,6 +211,21 @@ def test_engine_log_stream_is_mode_prefixed_and_broker_checks_engine_capability(
     assert "engine does not support --mode; upgrade broker and engine together" in broker
 
 
+def test_fast_schema_guard_timeout_covers_measured_production_scan():
+    script = (ROOT / "deploy" / "production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    match = re.search(
+        r"^readonly FAST_SCHEMA_GUARD_TIMEOUT=(\d+)s$",
+        script,
+        flags=re.MULTILINE,
+    )
+    assert match is not None
+    timeout_seconds = int(match.group(1))
+    measured_production_seconds = 113
+    assert timeout_seconds >= measured_production_seconds * 3 // 2
+
+
 def test_full_release_excludes_only_the_pid_verified_stopped_local_scheduler():
     script = (ROOT / "deploy" / "production_deploy.sh").read_text(
         encoding="utf-8"
