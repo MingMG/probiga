@@ -1,7 +1,11 @@
 import json
 from datetime import date
 from pathlib import Path
+import shutil
+import subprocess
 from unittest.mock import patch
+
+import pytest
 
 from server.api.routers import hot_data
 
@@ -149,7 +153,65 @@ def test_review_page_contract_requests_quant_and_exports_markdown():
     ).read_text(encoding="utf-8")
 
     assert "apiGet('/daily-review/quant?review_date=' + d)" in source
-    assert "量化三段式为默认视图" in source
+    assert "统一研究报告为默认视图" in source
     assert "质量门禁未通过" in source
     assert "fetch('/api/hot-data/daily-review/export?review_date='" in source
     assert "text/markdown;charset=utf-8" in source
+
+
+def test_review_page_renders_bound_early_briefing_without_replacing_review(tmp_path):
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node.js unavailable")
+    source = (Path(__file__).resolve().parents[1] / "server/static/js/app.js").read_text(encoding="utf-8")
+    renderer = source[source.index("    function _renderProReview(text) {"):source.index("    function portfolioCapitalInflowAlerts(")]
+    escaping = source[source.index("    function escAttr(v) {"):source.index("    function safeText(v)")]
+    start = source.index("        review: function (d, c) {")
+    review = source[start:source.index("        portfolio: function", start)].rstrip().rstrip(",")
+    runner = tmp_path / "research-reports.cjs"
+    runner.write_text(r"""
+const assert = require('node:assert/strict');
+const vm = require('node:vm');
+let row;
+const context = {
+  syncDateFromResponse() {},
+  jsonF(value, fallback) { if (typeof value === 'object') return value; try { return JSON.parse(value); } catch (_) { return fallback; } },
+  apiGet(url) { return Promise.resolve(url.includes('/quant?') ? {date:'2026-10-30',data:[row]} : {data:[]}); }
+};
+vm.runInNewContext(ESCAPING + RENDERER + '\nvar pages = {' + REVIEW + '};', context);
+const morning = {status:'COMPLETE',report_kind:'briefing',review_date:'2026-10-30',next_trade_date:'2026-11-02',generated_at:'2026-11-02T08:30:00+08:00',content:'# 次日早报\n\n| 时间窗 | 验证 |\n|---|---|\n| 开盘 | <script>alert(1)</script> 或 A\\|B |'};
+async function render(patch, asJsonString = true) {
+  const early = Object.assign({}, morning, patch);
+  const factors = {early_briefing:early};
+  row = {review_date:'2026-10-30',publish_status:'ready',compact_review:'# 前日复盘\n\n原始收盘判断',quality_json:'{}',factor_validation_json:asJsonString ? JSON.stringify(factors) : factors};
+  const container = {innerHTML:''};
+  context.pages.review('2026-10-30', container);
+  await new Promise(resolve => setImmediate(resolve));
+  return container.innerHTML;
+}
+(async () => {
+  for (const asJsonString of [true, false]) {
+    const html = await render({}, asJsonString);
+    assert.match(html, /原始收盘判断/);
+    assert.match(html, /<details class="review-early-briefing"/);
+    assert.match(html, /下一交易日早报参考 \| 2026-11-02/);
+    assert.match(html, /<h1[^>]*>次日早报<\/h1>/);
+    assert.match(html, /<table class="data-table">/);
+    assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt; 或 A\|B/);
+    assert.doesNotMatch(html, /<script>/);
+    assert.equal(row.compact_review, '# 前日复盘\n\n原始收盘判断');
+  }
+  for (const patch of [{review_date:'2026-10-29'},{next_trade_date:'2026-10-30'},{next_trade_date:'bad'},{report_kind:'review'},{status:'BLOCKED'},{content:''}]) {
+    const html = await render(patch);
+    assert.doesNotMatch(html, /review-early-briefing/);
+    assert.match(html, /原始收盘判断/);
+  }
+  row.publish_status = 'blocked';
+  const container = {innerHTML:''};
+  context.pages.review('2026-10-30', container);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.doesNotMatch(container.innerHTML, /review-early-briefing/);
+})().catch(error => { console.error(error); process.exit(1); });
+""".replace("ESCAPING", json.dumps(escaping)).replace("RENDERER", json.dumps(renderer)).replace("REVIEW", json.dumps(review)), encoding="utf-8")
+    result = subprocess.run([node, str(runner)], capture_output=True, text=True, encoding="utf-8", timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr

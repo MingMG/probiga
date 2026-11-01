@@ -169,6 +169,93 @@ def test_ready_digest_has_structured_three_sections_and_only_calculated_numbers(
     assert "统计显著性" in result["compact_review"]
 
 
+def test_decision_facts_measure_extremes_without_calling_them_price_limits():
+    bars = _bars(TARGET)
+    bars["close"] = bars["pre_close"]
+    for position, return_pct in enumerate((7.0, 10.0, -7.0)):
+        bars.loc[position, "close"] = bars.loc[position, "pre_close"] * (1 + return_pct / 100)
+
+    result = _ready_result(target_bars=bars)
+    facts = result["market_structure_json"]["decision_facts"]
+
+    assert facts["trade_date"] == TARGET
+    assert facts["breadth"]["up_count"] == 2
+    assert facts["breadth"]["down_count"] == 1
+    assert facts["breadth"]["flat_count"] == 122
+    assert facts["extremes"]["up_count"] == 2
+    assert facts["extremes"]["down_count"] == 1
+    assert "不是涨停/跌停" in facts["extremes"]["definition"]
+    assert facts["indices"]["evidence_type"] == "UNKNOWN"
+    assert facts["data_cutoff_at"].startswith(TARGET)
+
+
+def test_previous_strength_uses_frozen_previous_percentile_and_measures_loss_feedback():
+    bars = _bars(TARGET)
+    bars["close"] = bars["pre_close"]
+    bars.loc[bars.index >= 112, "close"] = bars.loc[bars.index >= 112, "pre_close"] * 0.98
+
+    facts = _ready_result(target_bars=bars)["market_structure_json"]["decision_facts"]
+    feedback = facts["previous_strength"]
+
+    assert feedback["evidence_type"] == "OBSERVED"
+    assert feedback["selection_date"] == PREVIOUS
+    assert feedback["feedback_date"] == TARGET
+    assert feedback["selected_count"] == 13
+    assert feedback["matched_count"] == 13
+    assert feedback["mean_return_pct"] == -2.0
+    assert feedback["median_return_pct"] == -2.0
+    assert feedback["positive_share"] == 0
+    assert "不是昨日涨停股" in feedback["definition"]
+
+
+def test_good_market_coverage_cannot_mask_missing_previous_strong_stocks():
+    # Missing one of 125 stocks passes the market gate (99.2%), but missing one
+    # of the 13 frozen strong stocks fails that cohort's independent coverage.
+    bars = _bars(TARGET).iloc[:-1].copy()
+    result = _ready_result(target_bars=bars)
+    feedback = result["market_structure_json"]["decision_facts"]["previous_strength"]
+
+    assert result["publish_status"] == PUBLISH_READY
+    assert feedback["evidence_type"] == "UNKNOWN"
+    assert feedback["selected_count"] == 13
+    assert feedback["matched_count"] == 12
+    assert feedback["mean_return_pct"] is None
+    assert feedback["median_return_pct"] is None
+
+
+def test_unverified_industry_cannot_supply_stock_identity_candidates():
+    result = _ready_result(industry_quality_status="UNVERIFIED")
+    roles = result["market_structure_json"]["decision_facts"]["stock_roles"]
+
+    assert result["publish_status"] == PUBLISH_READY
+    assert roles["evidence_type"] == "UNKNOWN"
+    assert roles["candidates"] == []
+
+
+def test_stock_roles_are_statistical_candidates_with_price_and_amount_evidence():
+    facts = _ready_result()["market_structure_json"]["decision_facts"]
+    candidates = facts["stock_roles"]["candidates"]
+
+    assert len(candidates) == 6
+    assert {item["identity"] for item in candidates} == {"相对强度前排候选", "成交额容量核心候选"}
+    for item in candidates:
+        assert item["evidence_type"] == "INFERRED"
+        assert item["name"] == item["stock_code"]  # No invented company names.
+        assert item["evidence"]["evidence_type"] == "OBSERVED"
+        assert item["evidence"]["trade_date"] == TARGET
+        assert item["evidence"]["amount"] > 0
+        assert item["evidence"]["industry_sample_count"] == 25
+        assert item["invalidation"]
+        assert "定价权" in item["unknown"]
+
+
+def test_missing_high_low_is_unknown_and_does_not_invent_close_location():
+    facts = _ready_result(target_bars=_bars(TARGET).drop(columns=["high", "low"]))[
+        "market_structure_json"
+    ]["decision_facts"]
+    assert facts["close_position"]["evidence_type"] == "UNKNOWN"
+
+
 @pytest.mark.parametrize(
     ("field", "replacement", "gate_name"),
     [
@@ -325,6 +412,10 @@ def test_factor_builder_uses_only_history_through_frozen_date():
     assert len(factors) == 5
     assert set(factors["exposure_date"]) == {PREVIOUS}
     assert set(factors["max_source_date"]) == {PREVIOUS}
+    pd.testing.assert_frame_equal(
+        factors,
+        build_frozen_factor_exposures(history.sample(frac=1, random_state=7), PREVIOUS),
+    )
     leaked = pd.concat(
         [
             history,
@@ -354,7 +445,7 @@ def test_db_loader_sql_always_binds_one_adjustment_version_and_target_date():
         calls.append((sql, params))
         if "FROM si_trade_calendar" in sql:
             return pd.DataFrame({"trade_date": [PREVIOUS]})
-        if "FROM sm_stock_kline" in sql and "BETWEEN DATE_SUB" in sql:
+        if "FROM sm_stock_kline" in sql and "IN (__[POSTCOMPILE_history_dates])" in sql:
             return pd.DataFrame()
         if "FROM sm_stock_kline" in sql:
             return _bars(str(params["d"]), count=1)
@@ -375,8 +466,19 @@ def test_db_loader_sql_always_binds_one_adjustment_version_and_target_date():
     assert kline_calls
     assert all("adjust_type = :adjust_type" in sql for sql, _ in kline_calls)
     assert all(params and params["adjust_type"] == 0 for _, params in kline_calls)
-    assert any(params["d"] == TARGET for _, params in kline_calls)
-    assert any(params["d"] == PREVIOUS for _, params in kline_calls)
+    assert any(params.get("d") == TARGET for _, params in kline_calls)
+    assert any(params.get("d") == PREVIOUS for _, params in kline_calls)
+    history_calls = [(sql, params) for sql, params in kline_calls if "history_dates" in params]
+    assert len(history_calls) == 1
+    history_sql, history_params = history_calls[0]
+    assert history_params["history_dates"] == [PREVIOUS]
+    assert "MAX_EXECUTION_TIME(45000)" in history_sql
+    assert "ORDER BY" not in history_sql
+    calendar_sql, calendar_params = next(
+        (sql, params) for sql, params in calls if params and "history_sessions" in params
+    )
+    assert calendar_params == {"d": PREVIOUS, "history_sessions": 61}
+    assert "trade_status = 1" in calendar_sql
     industry_calls = [
         (sql, params) for sql, params in calls
         if "FROM qmt_industry_member_snapshot" in sql
@@ -387,6 +489,54 @@ def test_db_loader_sql_always_binds_one_adjustment_version_and_target_date():
     assert loaded["industry_snapshot_date"] == TARGET
     assert loaded["previous_industry_snapshot_date"] == PREVIOUS
     assert loaded["expected_previous_date"] == PREVIOUS
+
+
+@pytest.mark.parametrize("calendar_count,history_sessions,missing_index", [(25, 20, 23), (3, 61, None)])
+def test_history_loader_batches_exact_calendar_sessions_without_filling_missing_days(
+    calendar_count, history_sessions, missing_index,
+):
+    from sqlalchemy import create_engine
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    sessions = [day.date().isoformat() for day in pd.bdate_range(end=PREVIOUS, periods=calendar_count)]
+    missing = sessions[missing_index] if missing_index is not None else None
+    calendar = pd.DataFrame({"trade_date": sessions + [TARGET, "2026-08-15"],
+                             "trade_status": [1] * (calendar_count + 1) + [0]})
+    bars = pd.concat([_bars(day, count=2) for day in sessions + [TARGET] if day != missing],
+                     ignore_index=True).assign(k_type=1)
+    # A second adjustment version on an otherwise selected date must not enter
+    # the frozen history, even though both versions share the date index.
+    bars = pd.concat([bars, _bars(PREVIOUS, count=2, adjust_type=1).assign(k_type=1)], ignore_index=True)
+    with engine.begin() as conn:
+        calendar.to_sql("si_trade_calendar", conn, index=False)
+        bars.to_sql("sm_stock_kline", conn, index=False)
+    history_calls = []
+
+    def reader(statement, _engine, params=None):
+        sql = str(statement)
+        if "FROM si_trade_calendar" in sql:
+            return pd.read_sql_query(statement, engine, params=params)
+        if "history_dates" in (params or {}):
+            history_calls.append(params)
+            return pd.read_sql_query(statement, engine, params=params)
+        if "FROM sm_stock_kline" in sql:
+            return _bars(params["d"], count=2)
+        return pd.DataFrame()
+
+    try:
+        loaded = load_quant_digest_inputs(
+            engine, TARGET, history_sessions=history_sessions, reader=reader,
+        )
+        expected = set(sessions[-history_sessions:]) - {missing}
+        history = loaded["history_bars"]
+        assert len(history_calls) == 1
+        assert set(history_calls[0]["history_dates"]) == set(sessions[-history_sessions:])
+        assert set(history["trade_date"]) == expected
+        assert len(history) == len(expected) * 2
+        assert set(history["adjust_type"]) == {0}
+        assert TARGET not in set(history["trade_date"])
+    finally:
+        engine.dispose()
 
 
 def test_calendar_t_minus_one_mismatch_blocks_instead_of_using_t_minus_two():
@@ -424,6 +574,8 @@ class _Connection:
 
     def execute(self, statement, params=None):
         self.calls.append((str(statement), params))
+        if "SELECT factor_validation_json" in str(statement):
+            return _Result("{}")
         return _Result(self.existing_status)
 
 

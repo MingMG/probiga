@@ -16,12 +16,13 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass
+from decimal import Decimal
 from datetime import date, datetime, time
 from typing import Any, Callable, Iterable, Mapping
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 
 from server.common.batch_db import create_batch_engine, read_frame
 from server.common.runtime_table_schema import (
@@ -147,6 +148,8 @@ def _json_value(value: Any) -> Any:
         return None
     if isinstance(value, (datetime, date, pd.Timestamp)):
         return value.isoformat()
+    if isinstance(value, Decimal):
+        return int(value) if value == value.to_integral_value() else float(value)
     if isinstance(value, Mapping):
         return {key: _json_value(member) for key, member in value.items()}
     if isinstance(value, (list, tuple)):
@@ -370,6 +373,172 @@ def calc_market_cross_section(
             (total_amount / previous_amount - 1.0) * 100.0 if previous_amount > 0 else None
         ),
     }
+
+
+def calc_decision_facts(
+    target_bars: pd.DataFrame,
+    previous_bars: pd.DataFrame,
+    *,
+    target: date,
+    previous: date | None,
+    expected_codes: set[str],
+    membership: pd.DataFrame | None,
+    min_coverage: float,
+    min_industry_members: int,
+) -> dict[str, Any]:
+    """Evidence for research; daily price ranks never establish a market leader.
+
+    Inputs are the digest's normalized bars and its validated point-in-time
+    membership. Missing data stays unknown instead of acquiring narrative names.
+    """
+
+    current = target_bars[target_bars["_valid_bar"]].copy()
+    prior = previous_bars[previous_bars["_valid_bar"]].copy()
+    denominator = len(expected_codes)
+    current_coverage = len(set(current["stock_code"]) & expected_codes) / max(denominator, 1)
+    prior_coverage = len(set(prior["stock_code"]) & expected_codes) / max(denominator, 1)
+    current_usable = bool(
+        denominator and current_coverage >= min_coverage
+        and not current["stock_code"].duplicated().any()
+        and set(current["stock_code"]).issubset(expected_codes)
+    )
+    prior_usable = bool(
+        denominator and previous and previous < target
+        and prior_coverage >= min_coverage
+        and not prior["stock_code"].duplicated().any()
+        and set(prior["stock_code"]).issubset(expected_codes)
+    )
+    unknown = {"evidence_type": "UNKNOWN", "reason": "有效行情覆盖不足或证券身份不唯一"}
+    facts: dict[str, Any] = {
+        "trade_date": target.isoformat(),
+        "previous_trade_date": previous.isoformat() if previous else None,
+        "source": "sm_stock_kline; k_type=1; 指定同一adjust_type; close/pre_close收益口径",
+        "data_cutoff_at": _max_cutoff(target_bars),
+        "coverage": {
+            "expected_count": denominator,
+            "current": _round(current_coverage),
+            "previous": _round(prior_coverage),
+            "minimum": min_coverage,
+        },
+        "breadth": dict(unknown),
+        "extremes": dict(unknown),
+        "previous_strength": dict(unknown),
+        "close_position": {
+            "evidence_type": "UNKNOWN", "reason": "未提供可校验的同日high/low"
+        },
+        "indices": {
+            "evidence_type": "UNKNOWN", "reason": "量化摘要未加载同日指数行情，不用股票加权收益冒充指数"
+        },
+        "stock_roles": {
+            "evidence_type": "UNKNOWN", "reason": "缺少可用的同日PIT行业快照或有效行情",
+            "candidates": [],
+        },
+        "unavailable": [
+            "涨跌停与连板高度需要证券当日涨跌停价格及历史状态，±7%极值不代表涨跌停",
+            "炸板率需要盘中触板和收盘状态，日收益排名不足以证明",
+            "龙头定价权、分歧承接及板块带动关系不能由两日收盘截面确认",
+            "成交额代表交易活跃度，不等于增量资金或净流入",
+        ],
+    }
+    if current_usable:
+        returns = current["_return_pct"]
+        facts["breadth"] = {
+            "evidence_type": "OBSERVED", "sample_count": len(current),
+            "up_count": int(returns.gt(0).sum()),
+            "down_count": int(returns.lt(0).sum()),
+            "flat_count": int(returns.eq(0).sum()),
+            "up_share": _round(returns.gt(0).mean()),
+        }
+        facts["extremes"] = {
+            "evidence_type": "OBSERVED", "threshold_pct": 7.0,
+            "definition": "日收益>=7%及<=-7%；包括阈值，不是涨停/跌停家数",
+            # Rounded at a precision far below any quoted price change to avoid
+            # losing exactly 7% to binary floating-point representation.
+            "up_count": int(returns.round(8).ge(7.0).sum()),
+            "down_count": int(returns.round(8).le(-7.0).sum()),
+        }
+        if {"high", "low"}.issubset(current.columns):
+            high = pd.to_numeric(current["high"], errors="coerce")
+            low = pd.to_numeric(current["low"], errors="coerce")
+            valid_range = (
+                low.gt(0) & high.gt(low) & current["close"].between(low, high)
+                & current["open"].between(low, high)
+            )
+            count = int(valid_range.sum())
+            coverage = count / max(len(current), 1)
+            facts["close_position"] = {
+                "evidence_type": "OBSERVED" if coverage >= min_coverage else "UNKNOWN",
+                "definition": "(close-low)/(high-low)，一字价high=low无法计算",
+                "valid_count": count, "coverage": _round(coverage),
+                "median": _round(
+                    ((current["close"] - low) / (high - low))[valid_range].median()
+                ) if coverage >= min_coverage else None,
+            }
+    if current_usable and prior_usable:
+        cutoff = float(prior["_return_pct"].quantile(0.90))
+        strong = prior.loc[prior["_return_pct"].ge(cutoff), ["stock_code", "_return_pct"]]
+        matched = strong.merge(
+            current[["stock_code", "_return_pct"]], on="stock_code", suffixes=("_previous", "")
+        )
+        coverage = len(matched) / max(len(strong), 1)
+        usable = bool(len(strong) and coverage >= min_coverage)
+        facts["previous_strength"] = {
+            "evidence_type": "OBSERVED" if usable else "UNKNOWN",
+            "definition": "上一交易日全有效股票日收益90%分位及以上，边界并列全部纳入；不是昨日涨停股",
+            "selection_date": previous.isoformat(),
+            "feedback_date": target.isoformat(),
+            "cutoff_return_pct": _round(cutoff),
+            "selected_count": len(strong), "matched_count": len(matched),
+            "matched_coverage": _round(coverage),
+            "mean_return_pct": _round(matched["_return_pct"].mean()) if usable else None,
+            "median_return_pct": _round(matched["_return_pct"].median()) if usable else None,
+            "positive_share": _round(matched["_return_pct"].gt(0).mean()) if usable else None,
+            "reason": None if usable else "昨日强势样本的当日匹配覆盖不足",
+        }
+    mapping = _frame(membership)
+    if current_usable and {"stock_code", "industry_name"}.issubset(mapping.columns) and not mapping.empty:
+        groups = current.merge(mapping[["stock_code", "industry_name"]], on="stock_code")
+        if not groups["stock_code"].duplicated().any():
+            prior_returns = prior[["stock_code", "_return_pct"]].rename(
+                columns={"_return_pct": "previous_return_pct"}
+            ) if prior_usable else pd.DataFrame(columns=["stock_code", "previous_return_pct"])
+            groups = groups.merge(prior_returns, on="stock_code", how="left")
+            ranked_groups = groups.groupby("industry_name")["_return_pct"].median().sort_values(ascending=False)
+            candidates = []
+            for industry_name in ranked_groups.head(3).index:
+                group = groups[groups["industry_name"].eq(industry_name)]
+                if len(group) < min_industry_members:
+                    continue
+                for identity, column in (("相对强度前排候选", "_return_pct"), ("成交额容量核心候选", "amount")):
+                    traded = group[group["amount"].gt(0)]
+                    if traded.empty:
+                        continue
+                    row = traded.sort_values([column, "stock_code"], ascending=[False, True]).iloc[0]
+                    name = row.get("short_name")
+                    candidates.append({
+                        "evidence_type": "INFERRED", "stock_code": str(row["stock_code"]),
+                        "name": str(name) if pd.notna(name) and name else str(row["stock_code"]),
+                        "industry_name": str(industry_name), "identity": identity,
+                        "rule": "同日行业内日收益排名第一；同值按代码排序" if column == "_return_pct" else "同日行业内成交额排名第一；同值按代码排序",
+                        "evidence": {
+                            "evidence_type": "OBSERVED", "trade_date": target.isoformat(),
+                            "return_pct": _round(row["_return_pct"]),
+                            "previous_return_pct": _round(row.get("previous_return_pct")),
+                            "amount": _round(row["amount"], 2), "industry_sample_count": len(group),
+                            "industry_median_return_pct": _round(group["_return_pct"].median()),
+                            "industry_up_share": _round(group["_return_pct"].gt(0).mean()),
+                            "industry_amount_share": _round(float(row["amount"]) / float(group["amount"].sum())),
+                        },
+                        "invalidation": "相对强度或成交额领先消失、行业上涨广度收缩；仅日线身份候选，等待盘中联动与分歧承接验证",
+                        "unknown": "定价权、龙头/跟风因果身份、边际买家及净资金流无法由此确认",
+                    })
+            facts["stock_roles"] = {
+                "evidence_type": "INFERRED" if candidates else "UNKNOWN",
+                "definition": "当日PIT申万一级行业；按行业收益中位数前三筛选；只给统计候选身份",
+                "candidates": candidates,
+                "reason": None if candidates else "行业有效样本或成交不足",
+            }
+    return facts
 
 
 def _normalise_industries(industries: pd.DataFrame | None) -> tuple[pd.DataFrame, list[str]]:
@@ -1272,6 +1441,21 @@ def generate_quant_digest_from_frames(
         )
 
     market = calc_market_cross_section(target_frame, previous_frame, shares=share_frame)
+    market["decision_facts"] = calc_decision_facts(
+        target_frame,
+        previous_frame,
+        target=target,
+        previous=previous_date if previous_date_ok else None,
+        expected_codes=expected,
+        membership=(
+            membership
+            if snapshot_usable and not ambiguous
+            and industry_coverage >= config.min_industry_coverage
+            else None
+        ),
+        min_coverage=config.min_market_coverage,
+        min_industry_members=config.min_industry_members,
+    )
     if market.get("market_cap_coverage") is not None and market["market_cap_coverage"] < 0.80:
         market["market_cap_weighted_return_pct"] = None
         quality.warn("市值权重覆盖不足80%，正文不展示市值加权收益")
@@ -1410,10 +1594,13 @@ def load_quant_digest_inputs(
     date_str: str,
     *,
     adjust_type: int = DEFAULT_ADJUST_TYPE,
+    history_sessions: int = 61,
     reader: Callable[[Any, Any, dict[str, Any] | None], pd.DataFrame] = _default_reader,
 ) -> dict[str, Any]:
     """Load only same-date unadjusted facts required by the pure generator."""
 
+    if not isinstance(history_sessions, int) or history_sessions < 20:
+        raise ValueError("history_sessions must be an integer of at least twenty")
     target = _parse_date(date_str, "date_str").isoformat()
     params = {"d": target, "adjust_type": adjust_type}
     target_bars = reader(
@@ -1461,19 +1648,42 @@ def load_quant_digest_inputs(
             engine,
             previous_params,
         )
-        history_bars = reader(
+        history_calendar = reader(
             text(
                 """
-                SELECT stock_code, trade_date, adjust_type, close, pre_close
-                FROM sm_stock_kline
-                WHERE trade_date BETWEEN DATE_SUB(:d, INTERVAL 120 DAY) AND :d
-                  AND k_type = 1 AND adjust_type = :adjust_type
-                ORDER BY trade_date, stock_code
+                SELECT trade_date
+                FROM si_trade_calendar
+                WHERE trade_status = 1 AND trade_date <= :d
+                ORDER BY trade_date DESC
+                LIMIT :history_sessions
                 """
             ),
             engine,
-            previous_params,
+            {"d": previous_date, "history_sessions": history_sessions},
         )
+        sessions = sorted({
+            _parse_date(value, "history trade_date").isoformat()
+            for value in history_calendar.get("trade_date", [])
+        }, reverse=True)
+        if any(session > previous_date for session in sessions):
+            raise ValueError("history calendar contains a date after the frozen date")
+        if sessions:
+            # Equality on each calendar date uses all columns of idx_date_ktype.
+            # The factor builder orders each stock's observations itself; SQL
+            # sorting would delay the first row without changing the factors.
+            history_bars = reader(
+                text(
+                    """
+                    SELECT /*+ MAX_EXECUTION_TIME(45000) */
+                           stock_code, trade_date, adjust_type, close, pre_close
+                    FROM sm_stock_kline
+                    WHERE trade_date IN :history_dates
+                      AND k_type = 1 AND adjust_type = :adjust_type
+                    """
+                ).bindparams(bindparam("history_dates", expanding=True)),
+                engine,
+                {"history_dates": sessions[:history_sessions], "adjust_type": adjust_type},
+            )
 
     universe = reader(
         text(
@@ -1794,6 +2004,17 @@ def persist_quant_digest(engine: Any, result: Mapping[str, Any]) -> None:
             # closes the no-existing-row race; this lock handles the common
             # existing-row case explicitly inside the same transaction.
             return
+        if existing_status == PUBLISH_READY and payload["publish_status"] == PUBLISH_READY:
+            stored = connection.execute(text(
+                "SELECT factor_validation_json FROM st_quant_review_digest "
+                "WHERE review_date=:review_date AND adjust_type=:adjust_type"
+            ), {"review_date": payload["review_date"], "adjust_type": payload["adjust_type"]}).scalar_one_or_none()
+            if stored:
+                previous_factors = json.loads(stored) if isinstance(stored, str) else stored
+                if previous_factors.get("early_briefing"):
+                    factors = json.loads(payload["factor_validation_json"])
+                    factors["early_briefing"] = previous_factors["early_briefing"]
+                    payload["factor_validation_json"] = _dump_json(factors)
         connection.execute(text(_DIGEST_UPSERT), payload)
 
 
@@ -1818,7 +2039,10 @@ def generate_quant_digest(
         min_factor_coverage=min_factor_coverage,
         min_factor_sample=min_factor_sample,
     )
-    inputs = load_quant_digest_inputs(engine, date_str, adjust_type=adjust_type)
+    inputs = load_quant_digest_inputs(
+        engine, date_str, adjust_type=adjust_type,
+        history_sessions=config.factor_history_sessions,
+    )
     result = generate_quant_digest_from_frames(
         date_str,
         **inputs,
@@ -1848,25 +2072,25 @@ def generate_quant_digest(
     })
     result["factor_validation_json"]["selection_review"] = selection
     if result.get("publish_status") == PUBLISH_READY:
-        from biz.review.six_step import build_six_step_review
-
-        result["compact_review"] = build_six_step_review(
-            engine,
-            date_str,
-            digest=result,
-            target_bars=inputs["target_bars"],
-            previous_bars=inputs["previous_bars"],
-            history_bars=inputs["history_bars"],
-        )
+        from biz.review.research_flow import attach_review
+        attach_review(engine, result, now=now)
     if persist:
         persist_quant_digest(engine, result)
+        if result.get("publish_status") == PUBLISH_READY:
+            from biz.review.research_flow import load_digest
+            stored = load_digest(engine, date_str)
+            actual = (stored["factor_validation_json"].get("market_decision") or {}).get("research_sha256")
+            expected = result["factor_validation_json"]["market_decision"]["research_sha256"]
+            if stored.get("compact_review") != result["compact_review"] or actual != expected:
+                raise RuntimeError("FAILED stage=review_readback: canonical report differs from generation")
+            return stored
     return result
 
 
 def main() -> int:
     import argparse
 
-    parser = argparse.ArgumentParser(description="生成三段式盘后量化复盘")
+    parser = argparse.ArgumentParser(description="生成统一盘后决策复盘")
     parser.add_argument("date", help="目标交易日，YYYY-MM-DD")
     parser.add_argument("--no-persist", action="store_true", help="仅预览，不写数据库")
     parser.add_argument("--adjust-type", type=int, default=DEFAULT_ADJUST_TYPE)
