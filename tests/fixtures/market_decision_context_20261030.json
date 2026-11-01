@@ -1,0 +1,3883 @@
+{
+  "description": "Frozen public close observations: 12 sectors, 16 stocks, five sessions; raw repeated receipts reproduce the production LLM evidence-budget failure. No account, position or credentials.",
+  "digest": {
+    "review_date": "2026-10-30",
+    "adjust_type": 0,
+    "generated_at": "2026-11-01T17:51:48.099588+08:00",
+    "data_cutoff_at": "2026-11-01T15:32:38+08:00",
+    "publish_status": "ready",
+    "quality_json": {
+      "status": "warn",
+      "target_date": "2026-10-30",
+      "adjust_type": 0,
+      "gates": [
+        {
+          "name": "weekday",
+          "status": "pass",
+          "actual": "Friday",
+          "expected": "Monday-Friday"
+        },
+        {
+          "name": "not_future",
+          "status": "pass",
+          "actual": "2026-10-30",
+          "expected": "不晚于2026-11-01"
+        },
+        {
+          "name": "post_close",
+          "status": "pass",
+          "actual": "2026-11-01T17:51:48.099588+08:00",
+          "expected": "目标日15:30后"
+        },
+        {
+          "name": "previous_trade_date",
+          "status": "pass",
+          "actual": [
+            "2026-10-29"
+          ],
+          "expected": "2026-10-29"
+        },
+        {
+          "name": "target_schema",
+          "status": "pass",
+          "actual": [],
+          "expected": "required K-line columns present"
+        },
+        {
+          "name": "target_date",
+          "status": "pass",
+          "actual": [
+            "2026-10-30"
+          ],
+          "expected": "2026-10-30"
+        },
+        {
+          "name": "target_adjust_type",
+          "status": "pass",
+          "actual": [
+            0
+          ],
+          "expected": [
+            0
+          ]
+        },
+        {
+          "name": "target_unique_stock",
+          "status": "pass",
+          "actual": 0,
+          "expected": 0
+        },
+        {
+          "name": "previous_schema",
+          "status": "pass",
+          "actual": [],
+          "expected": "required K-line columns present"
+        },
+        {
+          "name": "previous_date",
+          "status": "pass",
+          "actual": [
+            "2026-10-29"
+          ],
+          "expected": "2026-10-29"
+        },
+        {
+          "name": "previous_adjust_type",
+          "status": "pass",
+          "actual": [
+            0
+          ],
+          "expected": [
+            0
+          ]
+        },
+        {
+          "name": "previous_unique_stock",
+          "status": "pass",
+          "actual": 0,
+          "expected": 0
+        },
+        {
+          "name": "universe_present",
+          "status": "pass",
+          "actual": 5579,
+          "expected": "> 0"
+        },
+        {
+          "name": "universe_alignment",
+          "status": "pass",
+          "actual": 0,
+          "expected": 0
+        },
+        {
+          "name": "target_coverage",
+          "status": "pass",
+          "actual": 0.9986,
+          "expected": ">=98.00%"
+        },
+        {
+          "name": "previous_coverage",
+          "status": "pass",
+          "actual": 0.9978,
+          "expected": ">=98.00%"
+        },
+        {
+          "name": "positive_turnover",
+          "status": "pass",
+          "actual": {
+            "target": 1537409501084.0,
+            "previous": 1424004658497.0
+          },
+          "expected": "both > 0"
+        },
+        {
+          "name": "industry_snapshot_run_complete",
+          "status": "warn",
+          "actual": {
+            "row_count": 0,
+            "run": {}
+          },
+          "expected": "matching QMT_VALIDATED run metadata and relation count",
+          "message": "目标日行业快照缺少完整运行凭据或关系数不一致"
+        },
+        {
+          "name": "industry_snapshot_same_date",
+          "status": "warn",
+          "actual": null,
+          "expected": "2026-10-30",
+          "message": "目标日QMT申万一级行业快照缺失或日期不一致"
+        },
+        {
+          "name": "previous_industry_snapshot_run_complete",
+          "status": "warn",
+          "actual": {
+            "row_count": 0,
+            "run": {}
+          },
+          "expected": "matching QMT_VALIDATED run metadata and relation count",
+          "message": "上一交易日行业快照缺少完整运行凭据或关系数不一致"
+        },
+        {
+          "name": "industry_snapshot_source",
+          "status": "warn",
+          "actual": null,
+          "expected": "gj_big_qmt_inner",
+          "message": "行业快照不是指定QMT数据源"
+        },
+        {
+          "name": "industry_snapshot_quality",
+          "status": "warn",
+          "actual": null,
+          "expected": "QMT_VALIDATED",
+          "message": "行业快照未达到QMT_VALIDATED"
+        },
+        {
+          "name": "industry_snapshot_level",
+          "status": "pass",
+          "actual": [],
+          "expected": [
+            "申万一级"
+          ]
+        },
+        {
+          "name": "industry_membership_unique",
+          "status": "pass",
+          "actual": 0,
+          "expected": 0
+        },
+        {
+          "name": "previous_industry_snapshot_same_date",
+          "status": "warn",
+          "actual": null,
+          "expected": "2026-10-29",
+          "message": "上一交易日QMT申万一级行业快照缺失或日期不一致"
+        },
+        {
+          "name": "previous_industry_snapshot_source",
+          "status": "warn",
+          "actual": null,
+          "expected": "gj_big_qmt_inner",
+          "message": "上一交易日行业快照不是指定QMT数据源"
+        },
+        {
+          "name": "previous_industry_snapshot_quality",
+          "status": "warn",
+          "actual": null,
+          "expected": "QMT_VALIDATED",
+          "message": "上一交易日行业快照未达到QMT_VALIDATED"
+        },
+        {
+          "name": "previous_industry_snapshot_level",
+          "status": "pass",
+          "actual": [],
+          "expected": [
+            "申万一级"
+          ]
+        },
+        {
+          "name": "previous_industry_membership_unique",
+          "status": "pass",
+          "actual": 0,
+          "expected": 0
+        },
+        {
+          "name": "industry_coverage",
+          "status": "warn",
+          "actual": 0.0,
+          "expected": ">=80.00%",
+          "message": "申万一级行业映射覆盖率0.00%不足，行业段降级"
+        },
+        {
+          "name": "previous_industry_coverage",
+          "status": "warn",
+          "actual": 0.0,
+          "expected": ">=80.00%",
+          "message": "上一交易日申万一级行业映射覆盖率0.00%不足，不判断行业延续或轮动"
+        },
+        {
+          "name": "shares_as_of",
+          "status": "pass",
+          "actual": 0,
+          "expected": 0
+        }
+      ],
+      "coverage": {
+        "target": 0.9986,
+        "previous": 0.9978,
+        "industry": 0.0,
+        "industry_previous": 0.0,
+        "factor_min": 0.9943,
+        "expected_count": 5579,
+        "target_valid_count": 5571,
+        "previous_valid_count": 5567
+      },
+      "source_dates": {
+        "target_bars": "2026-10-30",
+        "previous_bars": "2026-10-29",
+        "industry_membership": {
+          "current": {
+            "snapshot_date": null,
+            "source": null,
+            "quality_status": null
+          },
+          "previous": {
+            "snapshot_date": null,
+            "source": null,
+            "quality_status": null
+          }
+        },
+        "factor_exposure": "2026-10-29"
+      },
+      "errors": [],
+      "warnings": [
+        "目标日行业快照缺少完整运行凭据或关系数不一致",
+        "目标日QMT申万一级行业快照缺失或日期不一致",
+        "上一交易日行业快照缺少完整运行凭据或关系数不一致",
+        "行业快照不是指定QMT数据源",
+        "行业快照未达到QMT_VALIDATED",
+        "上一交易日QMT申万一级行业快照缺失或日期不一致",
+        "上一交易日行业快照不是指定QMT数据源",
+        "上一交易日行业快照未达到QMT_VALIDATED",
+        "申万一级行业映射覆盖率0.00%不足，行业段降级",
+        "上一交易日申万一级行业映射覆盖率0.00%不足，不判断行业延续或轮动"
+      ]
+    },
+    "market_structure_json": {
+      "status": "available",
+      "sample_count": 5571,
+      "previous_sample_count": 5567,
+      "return_median_pct": -3.1293,
+      "up_coverage": 0.1603,
+      "price_weighted_return_pct": -3.7743,
+      "amount_weighted_return_pct": -3.0989,
+      "market_cap_weighted_return_pct": -1.7191,
+      "market_cap_coverage": 0.9935,
+      "open_gap_median_pct": -1.2987,
+      "intraday_return_median_pct": -1.6129,
+      "total_amount": 1537409501084.0,
+      "previous_total_amount": 1424004658497.0,
+      "amount_change_pct": 7.9638,
+      "decision_facts": {
+        "trade_date": "2026-10-30",
+        "previous_trade_date": "2026-10-29",
+        "source": "sm_stock_kline; k_type=1; 指定同一adjust_type; close/pre_close收益口径",
+        "data_cutoff_at": "2026-11-01T15:32:38+08:00",
+        "coverage": {
+          "expected_count": 5579,
+          "current": 0.9986,
+          "previous": 0.9978,
+          "minimum": 0.98
+        },
+        "breadth": {
+          "evidence_type": "OBSERVED",
+          "sample_count": 5571,
+          "up_count": 893,
+          "down_count": 4602,
+          "flat_count": 76,
+          "up_share": 0.1603
+        },
+        "extremes": {
+          "evidence_type": "OBSERVED",
+          "threshold_pct": 7.0,
+          "definition": "日收益>=7%及<=-7%；包括阈值，不是涨停/跌停家数",
+          "up_count": 75,
+          "down_count": 638
+        },
+        "previous_strength": {
+          "evidence_type": "OBSERVED",
+          "definition": "上一交易日全有效股票日收益90%分位及以上，边界并列全部纳入；不是昨日涨停股",
+          "selection_date": "2026-10-29",
+          "feedback_date": "2026-10-30",
+          "cutoff_return_pct": 0.7265,
+          "selected_count": 557,
+          "matched_count": 557,
+          "matched_coverage": 1.0,
+          "mean_return_pct": -1.3855,
+          "median_return_pct": -1.0582,
+          "positive_share": 0.3591,
+          "reason": null
+        },
+        "close_position": {
+          "evidence_type": "OBSERVED",
+          "definition": "(close-low)/(high-low)，一字价high=low无法计算",
+          "valid_count": 5564,
+          "coverage": 0.9987,
+          "median": 0.081
+        },
+        "indices": {
+          "evidence_type": "UNKNOWN",
+          "reason": "量化摘要未加载同日指数行情，不用股票加权收益冒充指数"
+        },
+        "stock_roles": {
+          "evidence_type": "UNKNOWN",
+          "reason": "缺少可用的同日PIT行业快照或有效行情",
+          "candidates": []
+        },
+        "unavailable": [
+          "涨跌停与连板高度需要证券当日涨跌停价格及历史状态，±7%极值不代表涨跌停",
+          "炸板率需要盘中触板和收盘状态，日收益排名不足以证明",
+          "龙头定价权、分歧承接及板块带动关系不能由两日收盘截面确认",
+          "成交额代表交易活跃度，不等于增量资金或净流入"
+        ]
+      }
+    },
+    "industry_rotation_json": {
+      "status": "unavailable",
+      "reason": "目标日QMT_VALIDATED申万一级行业快照不可用",
+      "industries": []
+    },
+    "factor_validation_json": {
+      "status": "available",
+      "frozen_as_of": "2026-10-29",
+      "method": "按T-1冻结暴露五等分，比较目标日Q5与Q1等权收益",
+      "factors": [
+        {
+          "factor_key": "trend_20d",
+          "label": "技术趋势",
+          "sample_count": 5557,
+          "coverage": 0.9975,
+          "q1_return_pct": -4.3819,
+          "q5_return_pct": -2.0816,
+          "spread_pct_points": 2.3003,
+          "rank_ic": 0.2641
+        },
+        {
+          "factor_key": "mean_deviation_20d",
+          "label": "均价偏离",
+          "sample_count": 5557,
+          "coverage": 0.9975,
+          "q1_return_pct": -4.2334,
+          "q5_return_pct": -2.1978,
+          "spread_pct_points": 2.0356,
+          "rank_ic": 0.2461
+        },
+        {
+          "factor_key": "volatility_structure_5_20d",
+          "label": "波动结构",
+          "sample_count": 5557,
+          "coverage": 0.9975,
+          "q1_return_pct": -2.6647,
+          "q5_return_pct": -4.1416,
+          "spread_pct_points": -1.4769,
+          "rank_ic": -0.1807
+        },
+        {
+          "factor_key": "elasticity_60d",
+          "label": "市场弹性",
+          "sample_count": 5539,
+          "coverage": 0.9943,
+          "q1_return_pct": -0.6357,
+          "q5_return_pct": -4.8906,
+          "spread_pct_points": -4.2549,
+          "rank_ic": -0.4756
+        }
+      ]
+    }
+  },
+  "context": {
+    "cutoff_at": "2026-10-30T23:59:59+08:00",
+    "source": "ProBigA",
+    "market_data_asof_at": "2026-11-01T19:02:23.541227+08:00",
+    "theme_evidence": {
+      "status": "OBSERVED",
+      "trade_date": "2026-10-30",
+      "asof": "2026-11-01T19:02:23.541227+08:00",
+      "history_dates": [
+        "2026-10-26",
+        "2026-10-27",
+        "2026-10-28",
+        "2026-10-29",
+        "2026-10-30"
+      ],
+      "sectors": [
+        {
+          "status": "OBSERVED",
+          "name": "创新药",
+          "concept_name": "创新药",
+          "concept_code": "886015",
+          "trade_date": "2026-10-30",
+          "plate_type": 1,
+          "source": "同花顺概念热度榜",
+          "rank_basis": "source_attention_rank",
+          "rank": 1,
+          "change_pct": -0.5615,
+          "hot_tag": "连续149天上榜",
+          "history": [
+            {
+              "trade_date": "2026-10-26",
+              "change_pct": 0.3002,
+              "rank": 5,
+              "received_at": "2026-10-26T23:23:18+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-27",
+              "change_pct": -3.5829,
+              "rank": 6,
+              "received_at": "2026-10-27T23:44:34+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-28",
+              "change_pct": 1.5837,
+              "rank": 6,
+              "received_at": "2026-10-28T23:04:45+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-29",
+              "change_pct": -1.8717,
+              "rank": 6,
+              "received_at": "2026-10-29T21:17:07+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-30",
+              "change_pct": -0.5615,
+              "rank": 1,
+              "received_at": "2026-10-30T17:15:26+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            }
+          ],
+          "history_observed_sessions": 5,
+          "history_expected_sessions": 5,
+          "history_complete_5d": true,
+          "cumulative_return_5d_pct": -4.141919,
+          "history_note": "榜单缺失日期未知，不补零；仅完整五个交易日复利。不同来源指数口径不混算。",
+          "identity_limit": "来源榜单与指数行情，不代表资金净流入、PIT成分覆盖或持续主线已成立",
+          "received_at": "2026-10-30T17:15:26+08:00",
+          "received_after_session_close": true,
+          "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+        },
+        {
+          "status": "OBSERVED",
+          "name": "商业航天",
+          "concept_name": "商业航天",
+          "concept_code": "886078",
+          "trade_date": "2026-10-30",
+          "plate_type": 1,
+          "source": "同花顺概念热度榜",
+          "rank_basis": "source_attention_rank",
+          "rank": 2,
+          "change_pct": -4.0024,
+          "hot_tag": "连续248天上榜",
+          "history": [
+            {
+              "trade_date": "2026-10-26",
+              "change_pct": -1.6217,
+              "rank": 13,
+              "received_at": "2026-10-26T23:23:18+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-27",
+              "change_pct": -3.652,
+              "rank": 10,
+              "received_at": "2026-10-27T23:44:34+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-28",
+              "change_pct": 2.7552,
+              "rank": 8,
+              "received_at": "2026-10-28T23:04:45+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-29",
+              "change_pct": -2.2078,
+              "rank": 1,
+              "received_at": "2026-10-29T21:17:07+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-30",
+              "change_pct": -4.0024,
+              "rank": 2,
+              "received_at": "2026-10-30T17:15:26+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            }
+          ],
+          "history_observed_sessions": 5,
+          "history_expected_sessions": 5,
+          "history_complete_5d": true,
+          "cumulative_return_5d_pct": -8.565432,
+          "history_note": "榜单缺失日期未知，不补零；仅完整五个交易日复利。不同来源指数口径不混算。",
+          "identity_limit": "来源榜单与指数行情，不代表资金净流入、PIT成分覆盖或持续主线已成立",
+          "received_at": "2026-10-30T17:15:26+08:00",
+          "received_after_session_close": true,
+          "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+        },
+        {
+          "status": "OBSERVED",
+          "name": "人形机器人",
+          "concept_name": "人形机器人",
+          "concept_code": "886069",
+          "trade_date": "2026-10-30",
+          "plate_type": 1,
+          "source": "同花顺概念热度榜",
+          "rank_basis": "source_attention_rank",
+          "rank": 3,
+          "change_pct": -4.197,
+          "hot_tag": "连续11天上榜",
+          "history": [
+            {
+              "trade_date": "2026-10-26",
+              "change_pct": -0.7874,
+              "rank": 1,
+              "received_at": "2026-10-26T23:23:18+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-27",
+              "change_pct": -2.7567,
+              "rank": 1,
+              "received_at": "2026-10-27T23:44:34+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-28",
+              "change_pct": 4.1347,
+              "rank": 1,
+              "received_at": "2026-10-28T23:04:45+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-29",
+              "change_pct": -4.0888,
+              "rank": 2,
+              "received_at": "2026-10-29T21:17:07+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-30",
+              "change_pct": -4.197,
+              "rank": 3,
+              "received_at": "2026-10-30T17:15:26+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            }
+          ],
+          "history_observed_sessions": 5,
+          "history_expected_sessions": 5,
+          "history_complete_5d": true,
+          "cumulative_return_5d_pct": -7.685393,
+          "history_note": "榜单缺失日期未知，不补零；仅完整五个交易日复利。不同来源指数口径不混算。",
+          "identity_limit": "来源榜单与指数行情，不代表资金净流入、PIT成分覆盖或持续主线已成立",
+          "received_at": "2026-10-30T17:15:26+08:00",
+          "received_after_session_close": true,
+          "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+        },
+        {
+          "status": "OBSERVED",
+          "name": "PCB概念",
+          "concept_name": "PCB概念",
+          "concept_code": "885959",
+          "trade_date": "2026-10-30",
+          "plate_type": 1,
+          "source": "同花顺概念热度榜",
+          "rank_basis": "source_attention_rank",
+          "rank": 4,
+          "change_pct": -3.919,
+          "hot_tag": "连续142天上榜",
+          "history": [
+            {
+              "trade_date": "2026-10-26",
+              "change_pct": -3.5262,
+              "rank": 10,
+              "received_at": "2026-10-26T23:23:18+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-27",
+              "change_pct": -3.9487,
+              "rank": 5,
+              "received_at": "2026-10-27T23:44:34+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-28",
+              "change_pct": 3.9308,
+              "rank": 7,
+              "received_at": "2026-10-28T23:04:45+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-29",
+              "change_pct": -5.3595,
+              "rank": 8,
+              "received_at": "2026-10-29T21:17:07+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-30",
+              "change_pct": -3.919,
+              "rank": 4,
+              "received_at": "2026-10-30T17:15:26+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            }
+          ],
+          "history_observed_sessions": 5,
+          "history_expected_sessions": 5,
+          "history_complete_5d": true,
+          "cumulative_return_5d_pct": -12.426755,
+          "history_note": "榜单缺失日期未知，不补零；仅完整五个交易日复利。不同来源指数口径不混算。",
+          "identity_limit": "来源榜单与指数行情，不代表资金净流入、PIT成分覆盖或持续主线已成立",
+          "received_at": "2026-10-30T17:15:26+08:00",
+          "received_after_session_close": true,
+          "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+        },
+        {
+          "status": "OBSERVED",
+          "name": "共封装光学(CPO)",
+          "concept_name": "共封装光学(CPO)",
+          "concept_code": "886033",
+          "trade_date": "2026-10-30",
+          "plate_type": 1,
+          "source": "同花顺概念热度榜",
+          "rank_basis": "source_attention_rank",
+          "rank": 5,
+          "change_pct": -4.9051,
+          "hot_tag": "连续319天上榜",
+          "history": [
+            {
+              "trade_date": "2026-10-26",
+              "change_pct": -3.8507,
+              "rank": 7,
+              "received_at": "2026-10-26T23:23:18+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-27",
+              "change_pct": -3.9456,
+              "rank": 4,
+              "received_at": "2026-10-27T23:44:34+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-28",
+              "change_pct": 4.0205,
+              "rank": 5,
+              "received_at": "2026-10-28T23:04:45+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-29",
+              "change_pct": -6.1574,
+              "rank": 3,
+              "received_at": "2026-10-29T21:17:07+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-30",
+              "change_pct": -4.9051,
+              "rank": 5,
+              "received_at": "2026-10-30T17:15:26+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            }
+          ],
+          "history_observed_sessions": 5,
+          "history_expected_sessions": 5,
+          "history_complete_5d": true,
+          "cumulative_return_5d_pct": -14.268665,
+          "history_note": "榜单缺失日期未知，不补零；仅完整五个交易日复利。不同来源指数口径不混算。",
+          "identity_limit": "来源榜单与指数行情，不代表资金净流入、PIT成分覆盖或持续主线已成立",
+          "received_at": "2026-10-30T17:15:26+08:00",
+          "received_after_session_close": true,
+          "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+        },
+        {
+          "status": "OBSERVED",
+          "name": "CRO概念",
+          "concept_name": "CRO概念",
+          "concept_code": "885927",
+          "trade_date": "2026-10-30",
+          "plate_type": 1,
+          "source": "同花顺概念热度榜",
+          "rank_basis": "source_attention_rank",
+          "rank": 6,
+          "change_pct": 0.7621,
+          "hot_tag": "10天9次上榜",
+          "history": [
+            {
+              "trade_date": "2026-10-28",
+              "change_pct": 3.5842,
+              "rank": 17,
+              "received_at": "2026-10-28T23:04:45+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-30",
+              "change_pct": 0.7621,
+              "rank": 6,
+              "received_at": "2026-10-30T17:15:26+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            }
+          ],
+          "history_observed_sessions": 2,
+          "history_expected_sessions": 5,
+          "history_complete_5d": false,
+          "cumulative_return_5d_pct": null,
+          "history_note": "榜单缺失日期未知，不补零；仅完整五个交易日复利。不同来源指数口径不混算。",
+          "identity_limit": "来源榜单与指数行情，不代表资金净流入、PIT成分覆盖或持续主线已成立",
+          "received_at": "2026-10-30T17:15:26+08:00",
+          "received_after_session_close": true,
+          "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+        },
+        {
+          "status": "OBSERVED",
+          "name": "白酒概念",
+          "concept_name": "白酒概念",
+          "concept_code": "885525",
+          "trade_date": "2026-10-30",
+          "plate_type": 1,
+          "source": "同花顺概念热度榜",
+          "rank_basis": "source_attention_rank",
+          "rank": 7,
+          "change_pct": 1.1707,
+          "hot_tag": "7天6次上榜",
+          "history": [
+            {
+              "trade_date": "2026-10-26",
+              "change_pct": 1.0144,
+              "rank": 15,
+              "received_at": "2026-10-26T23:23:18+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-29",
+              "change_pct": -1.4758,
+              "rank": 16,
+              "received_at": "2026-10-29T21:17:07+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-30",
+              "change_pct": 1.1707,
+              "rank": 7,
+              "received_at": "2026-10-30T17:15:26+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            }
+          ],
+          "history_observed_sessions": 3,
+          "history_expected_sessions": 5,
+          "history_complete_5d": false,
+          "cumulative_return_5d_pct": null,
+          "history_note": "榜单缺失日期未知，不补零；仅完整五个交易日复利。不同来源指数口径不混算。",
+          "identity_limit": "来源榜单与指数行情，不代表资金净流入、PIT成分覆盖或持续主线已成立",
+          "received_at": "2026-10-30T17:15:26+08:00",
+          "received_after_session_close": true,
+          "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+        },
+        {
+          "status": "OBSERVED",
+          "name": "机器人概念",
+          "concept_name": "机器人概念",
+          "concept_code": "885517",
+          "trade_date": "2026-10-30",
+          "plate_type": 1,
+          "source": "同花顺概念热度榜",
+          "rank_basis": "source_attention_rank",
+          "rank": 8,
+          "change_pct": -3.8617,
+          "hot_tag": "10天10次上榜",
+          "history": [
+            {
+              "trade_date": "2026-10-26",
+              "change_pct": -0.7087,
+              "rank": 2,
+              "received_at": "2026-10-26T23:23:18+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-27",
+              "change_pct": -2.948,
+              "rank": 2,
+              "received_at": "2026-10-27T23:44:34+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-28",
+              "change_pct": 3.1382,
+              "rank": 2,
+              "received_at": "2026-10-28T23:04:45+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-29",
+              "change_pct": -3.4606,
+              "rank": 4,
+              "received_at": "2026-10-29T21:17:07+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-30",
+              "change_pct": -3.8617,
+              "rank": 8,
+              "received_at": "2026-10-30T17:15:26+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            }
+          ],
+          "history_observed_sessions": 5,
+          "history_expected_sessions": 5,
+          "history_complete_5d": true,
+          "cumulative_return_5d_pct": -7.756395,
+          "history_note": "榜单缺失日期未知，不补零；仅完整五个交易日复利。不同来源指数口径不混算。",
+          "identity_limit": "来源榜单与指数行情，不代表资金净流入、PIT成分覆盖或持续主线已成立",
+          "received_at": "2026-10-30T17:15:26+08:00",
+          "received_after_session_close": true,
+          "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+        },
+        {
+          "status": "OBSERVED",
+          "name": "存储芯片",
+          "concept_name": "存储芯片",
+          "concept_code": "886042",
+          "trade_date": "2026-10-30",
+          "plate_type": 1,
+          "source": "同花顺概念热度榜",
+          "rank_basis": "source_attention_rank",
+          "rank": 9,
+          "change_pct": -5.0451,
+          "hot_tag": "连续272天上榜",
+          "history": [
+            {
+              "trade_date": "2026-10-26",
+              "change_pct": -3.6198,
+              "rank": 11,
+              "received_at": "2026-10-26T23:23:18+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-27",
+              "change_pct": -4.2028,
+              "rank": 3,
+              "received_at": "2026-10-27T23:44:34+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-28",
+              "change_pct": 3.9674,
+              "rank": 3,
+              "received_at": "2026-10-28T23:04:45+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-29",
+              "change_pct": -5.2777,
+              "rank": 5,
+              "received_at": "2026-10-29T21:17:07+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-30",
+              "change_pct": -5.0451,
+              "rank": 9,
+              "received_at": "2026-10-30T17:15:26+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            }
+          ],
+          "history_observed_sessions": 5,
+          "history_expected_sessions": 5,
+          "history_complete_5d": true,
+          "cumulative_return_5d_pct": -13.660916,
+          "history_note": "榜单缺失日期未知，不补零；仅完整五个交易日复利。不同来源指数口径不混算。",
+          "identity_limit": "来源榜单与指数行情，不代表资金净流入、PIT成分覆盖或持续主线已成立",
+          "received_at": "2026-10-30T17:15:26+08:00",
+          "received_after_session_close": true,
+          "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+        },
+        {
+          "status": "OBSERVED",
+          "name": "白酒",
+          "concept_name": "白酒",
+          "concept_code": "881273",
+          "trade_date": "2026-10-30",
+          "plate_type": 2,
+          "source": "同花顺行业热度榜",
+          "rank_basis": "source_attention_rank",
+          "rank": 1,
+          "change_pct": 5.2748,
+          "hot_tag": "连续566天上榜",
+          "history": [
+            {
+              "trade_date": "2026-10-26",
+              "change_pct": 2.5016,
+              "rank": 3,
+              "received_at": "2026-10-26T23:23:18+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-27",
+              "change_pct": -0.9547,
+              "rank": 8,
+              "received_at": "2026-10-27T23:44:34+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-28",
+              "change_pct": -2.3521,
+              "rank": 7,
+              "received_at": "2026-10-28T23:04:45+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-29",
+              "change_pct": 0.0378,
+              "rank": 4,
+              "received_at": "2026-10-29T21:17:07+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-30",
+              "change_pct": 5.2748,
+              "rank": 1,
+              "received_at": "2026-10-30T17:15:26+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            }
+          ],
+          "history_observed_sessions": 5,
+          "history_expected_sessions": 5,
+          "history_complete_5d": true,
+          "cumulative_return_5d_pct": 4.403722,
+          "history_note": "榜单缺失日期未知，不补零；仅完整五个交易日复利。不同来源指数口径不混算。",
+          "identity_limit": "来源榜单与指数行情，不代表资金净流入、PIT成分覆盖或持续主线已成立",
+          "received_at": "2026-10-30T17:15:26+08:00",
+          "received_after_session_close": true,
+          "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+        },
+        {
+          "status": "OBSERVED",
+          "name": "电子",
+          "concept_name": "电子",
+          "concept_code": "BK1201",
+          "trade_date": "2026-10-30",
+          "plate_type": 3,
+          "source": "东财一级行业行情榜",
+          "rank_basis": "source_quoted_turnover_rank",
+          "rank": 1,
+          "change_pct": -4.62,
+          "hot_tag": "东财一级行业成交额",
+          "history": [
+            {
+              "trade_date": "2026-10-27",
+              "change_pct": -3.96,
+              "rank": 1,
+              "received_at": "2026-10-28T14:21:58+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-28",
+              "change_pct": 3.86,
+              "rank": 1,
+              "received_at": "2026-10-30T09:36:54+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-29",
+              "change_pct": -5.34,
+              "rank": 1,
+              "received_at": "2026-10-30T06:19:46+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-30",
+              "change_pct": -4.62,
+              "rank": 1,
+              "received_at": "2026-11-01T10:50:54+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            }
+          ],
+          "history_observed_sessions": 4,
+          "history_expected_sessions": 5,
+          "history_complete_5d": false,
+          "cumulative_return_5d_pct": null,
+          "history_note": "榜单缺失日期未知，不补零；仅完整五个交易日复利。不同来源指数口径不混算。",
+          "identity_limit": "来源榜单与指数行情，不代表资金净流入、PIT成分覆盖或持续主线已成立",
+          "received_at": "2026-11-01T10:50:54+08:00",
+          "received_after_session_close": true,
+          "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+        },
+        {
+          "status": "OBSERVED",
+          "name": "半导体",
+          "concept_name": "半导体",
+          "concept_code": "BK1036",
+          "trade_date": "2026-10-30",
+          "plate_type": 4,
+          "source": "东财二级行业行情榜",
+          "rank_basis": "source_quoted_turnover_rank",
+          "rank": 1,
+          "change_pct": -5.45,
+          "hot_tag": "东财二级行业成交额",
+          "history": [
+            {
+              "trade_date": "2026-10-26",
+              "change_pct": -3.79,
+              "rank": 1,
+              "received_at": "2026-10-27T09:57:56+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-27",
+              "change_pct": -4.54,
+              "rank": 1,
+              "received_at": "2026-10-28T14:21:58+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-28",
+              "change_pct": 4.88,
+              "rank": 1,
+              "received_at": "2026-10-30T09:36:54+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-29",
+              "change_pct": -5.55,
+              "rank": 1,
+              "received_at": "2026-10-30T06:19:46+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-30",
+              "change_pct": -5.45,
+              "rank": 1,
+              "received_at": "2026-11-01T10:50:54+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            }
+          ],
+          "history_observed_sessions": 5,
+          "history_expected_sessions": 5,
+          "history_complete_5d": true,
+          "cumulative_return_5d_pct": -13.980321,
+          "history_note": "榜单缺失日期未知，不补零；仅完整五个交易日复利。不同来源指数口径不混算。",
+          "identity_limit": "来源榜单与指数行情，不代表资金净流入、PIT成分覆盖或持续主线已成立",
+          "received_at": "2026-11-01T10:50:54+08:00",
+          "received_after_session_close": true,
+          "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+        }
+      ],
+      "stocks": [
+        {
+          "status": "OBSERVED",
+          "stock_code": "600118",
+          "short_name": "中国卫星",
+          "trade_date": "2026-10-30",
+          "sector_names": [
+            "商业航天"
+          ],
+          "concept_tag": "6G概念;商业航天",
+          "tag_source": "同日同花顺个股标签；非PIT行业成员或完整概念成分表",
+          "pop_tag": "2天1板",
+          "heat_ranks": {
+            "fused": 9,
+            "ths": 13
+          },
+          "rank_basis": "source_attention_rank_not_price_strength_or_leadership",
+          "identity": "身份待确认",
+          "identity_limit": "热度及标签只构成观察候选，不能证明龙头、中军或容量身份",
+          "change_pct": 0.017889,
+          "ohlc": {
+            "status": "OBSERVED",
+            "open": 56.0,
+            "close": 55.91,
+            "pre_close": 55.9,
+            "high": 59.72,
+            "low": 54.9
+          },
+          "price_verification": {
+            "status": "OBSERVED",
+            "same_day_source_checks": {
+              "fused": {
+                "change_pct": 0.02,
+                "matches_unadjusted_close": true
+              },
+              "ths": {
+                "change_pct": 0.0179,
+                "matches_unadjusted_close": true
+              }
+            },
+            "source": "qmt_datadir",
+            "quality_status": "VERIFIED",
+            "previous_close_matches_pre_close": true,
+            "previous_close_note": "不一致可能涉及除权等原因，不擅自修正前收盘字段"
+          },
+          "amount_quality": {
+            "status": "UNKNOWN",
+            "trade_date": "2026-10-30",
+            "sample_count": 1,
+            "checked_count": 0,
+            "inconsistent_count": 1,
+            "missing_count": 0,
+            "suspended_count": 0,
+            "samples": [
+              {
+                "stock_code": "600118",
+                "reason": "implied_price_outside_daily_range",
+                "amount": 774950729.0,
+                "volume": 88600700.0,
+                "implied_price": 8.746553119783478,
+                "low": 54.9,
+                "high": 59.72,
+                "adjust_type": 0.0
+              }
+            ],
+            "units": {
+              "amount": "CNY",
+              "volume": "shares",
+              "price": "unadjusted_CNY"
+            },
+            "definition": "positive-volume amount/volume must lie in same-day unadjusted [low, high]",
+            "reason": "implied_price_outside_daily_range"
+          },
+          "amount": null,
+          "volume": 88600700.0,
+          "history": [
+            {
+              "trade_date": "2026-10-26",
+              "status": "OBSERVED",
+              "close": 50.71,
+              "change_pct": -1.4191290824261182,
+              "received_at": "2026-10-26T16:14:44+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-27",
+              "status": "OBSERVED",
+              "close": 48.87,
+              "change_pct": -3.628475645829232,
+              "received_at": "2026-10-28T16:19:55+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-28",
+              "status": "OBSERVED",
+              "close": 50.82,
+              "change_pct": 3.9901780233271955,
+              "received_at": "2026-10-28T20:07:56+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-29",
+              "status": "OBSERVED",
+              "close": 55.9,
+              "change_pct": 9.99606454151909,
+              "received_at": "2026-10-30T14:41:35+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-30",
+              "status": "OBSERVED",
+              "close": 55.91,
+              "change_pct": 0.017889087656519642,
+              "received_at": "2026-11-01T15:32:38+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            }
+          ],
+          "history_complete_5d": true,
+          "cumulative_return_5d_pct": 8.689736,
+          "received_at": {
+            "fused": "2026-10-30T20:40:43+08:00",
+            "ths_tag": "2026-10-30T17:15:54+08:00",
+            "price": "2026-11-01T15:32:38+08:00"
+          }
+        },
+        {
+          "status": "OBSERVED",
+          "stock_code": "603131",
+          "short_name": "上海沪工",
+          "trade_date": "2026-10-30",
+          "sector_names": [
+            "商业航天"
+          ],
+          "concept_tag": "工业母机;商业航天",
+          "tag_source": "同日同花顺个股标签；非PIT行业成员或完整概念成分表",
+          "pop_tag": "3天3板",
+          "heat_ranks": {
+            "fused": 14,
+            "ths": 26
+          },
+          "rank_basis": "source_attention_rank_not_price_strength_or_leadership",
+          "identity": "身份待确认",
+          "identity_limit": "热度及标签只构成观察候选，不能证明龙头、中军或容量身份",
+          "change_pct": 10.031348,
+          "ohlc": {
+            "status": "OBSERVED",
+            "open": 17.55,
+            "close": 17.55,
+            "pre_close": 15.95,
+            "high": 17.55,
+            "low": 17.55
+          },
+          "price_verification": {
+            "status": "OBSERVED",
+            "same_day_source_checks": {
+              "fused": {
+                "change_pct": 10.03,
+                "matches_unadjusted_close": true
+              },
+              "ths": {
+                "change_pct": 10.0313,
+                "matches_unadjusted_close": true
+              }
+            },
+            "source": "qmt_datadir",
+            "quality_status": "VERIFIED",
+            "previous_close_matches_pre_close": true,
+            "previous_close_note": "不一致可能涉及除权等原因，不擅自修正前收盘字段"
+          },
+          "amount_quality": {
+            "status": "UNKNOWN",
+            "trade_date": "2026-10-30",
+            "sample_count": 1,
+            "checked_count": 0,
+            "inconsistent_count": 1,
+            "missing_count": 0,
+            "suspended_count": 0,
+            "samples": [
+              {
+                "stock_code": "603131",
+                "reason": "implied_price_outside_daily_range",
+                "amount": 189684437.0,
+                "volume": 10808200.0,
+                "implied_price": 17.550048759275366,
+                "low": 17.55,
+                "high": 17.55,
+                "adjust_type": 0.0
+              }
+            ],
+            "units": {
+              "amount": "CNY",
+              "volume": "shares",
+              "price": "unadjusted_CNY"
+            },
+            "definition": "positive-volume amount/volume must lie in same-day unadjusted [low, high]",
+            "reason": "implied_price_outside_daily_range"
+          },
+          "amount": null,
+          "volume": 10808200.0,
+          "history": [
+            {
+              "trade_date": "2026-10-26",
+              "status": "OBSERVED",
+              "close": 13.42,
+              "change_pct": -0.4451038575667643,
+              "received_at": "2026-10-26T16:14:55+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-27",
+              "status": "OBSERVED",
+              "close": 13.18,
+              "change_pct": -1.788375558867361,
+              "received_at": "2026-10-28T16:19:55+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-28",
+              "status": "OBSERVED",
+              "close": 14.5,
+              "change_pct": 10.01517450682854,
+              "received_at": "2026-10-28T20:07:56+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-29",
+              "status": "OBSERVED",
+              "close": 15.95,
+              "change_pct": 9.999999999999986,
+              "received_at": "2026-10-30T14:41:35+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-30",
+              "status": "OBSERVED",
+              "close": 17.55,
+              "change_pct": 10.031347962382453,
+              "received_at": "2026-11-01T15:32:38+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            }
+          ],
+          "history_complete_5d": true,
+          "cumulative_return_5d_pct": 30.192878,
+          "received_at": {
+            "fused": "2026-10-30T20:40:43+08:00",
+            "ths_tag": "2026-10-30T17:15:54+08:00",
+            "price": "2026-11-01T15:32:38+08:00"
+          }
+        },
+        {
+          "status": "OBSERVED",
+          "stock_code": "603278",
+          "short_name": "大业股份",
+          "trade_date": "2026-10-30",
+          "sector_names": [
+            "人形机器人"
+          ],
+          "concept_tag": "人形机器人;高端装备",
+          "tag_source": "同日同花顺个股标签；非PIT行业成员或完整概念成分表",
+          "pop_tag": "11天6板",
+          "heat_ranks": {
+            "fused": 3,
+            "ths": 2
+          },
+          "rank_basis": "source_attention_rank_not_price_strength_or_leadership",
+          "identity": "身份待确认",
+          "identity_limit": "热度及标签只构成观察候选，不能证明龙头、中军或容量身份",
+          "change_pct": 9.17226,
+          "ohlc": {
+            "status": "OBSERVED",
+            "open": 18.11,
+            "close": 19.52,
+            "pre_close": 17.88,
+            "high": 19.67,
+            "low": 18.1
+          },
+          "price_verification": {
+            "status": "OBSERVED",
+            "same_day_source_checks": {
+              "fused": {
+                "change_pct": 9.17,
+                "matches_unadjusted_close": true
+              },
+              "ths": {
+                "change_pct": 9.1723,
+                "matches_unadjusted_close": true
+              }
+            },
+            "source": "qmt_datadir",
+            "quality_status": "VERIFIED",
+            "previous_close_matches_pre_close": true,
+            "previous_close_note": "不一致可能涉及除权等原因，不擅自修正前收盘字段"
+          },
+          "amount_quality": {
+            "status": "OBSERVED",
+            "trade_date": "2026-10-30",
+            "sample_count": 1,
+            "checked_count": 1,
+            "inconsistent_count": 0,
+            "missing_count": 0,
+            "suspended_count": 0,
+            "samples": [],
+            "units": {
+              "amount": "CNY",
+              "volume": "shares",
+              "price": "unadjusted_CNY"
+            },
+            "definition": "positive-volume amount/volume must lie in same-day unadjusted [low, high]",
+            "reason": null
+          },
+          "amount": 2144520600.0,
+          "volume": 112573500.0,
+          "history": [
+            {
+              "trade_date": "2026-10-26",
+              "status": "OBSERVED",
+              "close": 17.25,
+              "change_pct": 8.08270676691729,
+              "received_at": "2026-10-26T16:14:49+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-27",
+              "status": "OBSERVED",
+              "close": 17.4,
+              "change_pct": 0.8695652173912993,
+              "received_at": "2026-10-28T16:19:55+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-28",
+              "status": "OBSERVED",
+              "close": 17.92,
+              "change_pct": 2.9885057471264576,
+              "received_at": "2026-10-28T20:07:56+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-29",
+              "status": "OBSERVED",
+              "close": 17.88,
+              "change_pct": -0.22321428571430157,
+              "received_at": "2026-10-30T14:41:35+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-30",
+              "status": "OBSERVED",
+              "close": 19.52,
+              "change_pct": 9.172259507829983,
+              "received_at": "2026-11-01T15:32:38+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            }
+          ],
+          "history_complete_5d": true,
+          "cumulative_return_5d_pct": 22.305764,
+          "received_at": {
+            "fused": "2026-10-30T20:40:43+08:00",
+            "ths_tag": "2026-10-30T17:15:54+08:00",
+            "price": "2026-11-01T15:32:38+08:00"
+          }
+        },
+        {
+          "status": "OBSERVED",
+          "stock_code": "688836",
+          "short_name": "宇树科技-W",
+          "trade_date": "2026-10-30",
+          "sector_names": [
+            "人形机器人"
+          ],
+          "concept_tag": "人形机器人;科创次新股",
+          "tag_source": "同日同花顺个股标签；非PIT行业成员或完整概念成分表",
+          "pop_tag": "持续上榜",
+          "heat_ranks": {
+            "fused": 7,
+            "ths": 5
+          },
+          "rank_basis": "source_attention_rank_not_price_strength_or_leadership",
+          "identity": "身份待确认",
+          "identity_limit": "热度及标签只构成观察候选，不能证明龙头、中军或容量身份",
+          "change_pct": -2.315856,
+          "ohlc": {
+            "status": "OBSERVED",
+            "open": 641.77,
+            "close": 647.05,
+            "pre_close": 662.39,
+            "high": 699.0,
+            "low": 631.5
+          },
+          "price_verification": {
+            "status": "OBSERVED",
+            "same_day_source_checks": {
+              "fused": {
+                "change_pct": -2.32,
+                "matches_unadjusted_close": true
+              },
+              "ths": {
+                "change_pct": -2.3159,
+                "matches_unadjusted_close": true
+              }
+            },
+            "source": "qmt_datadir",
+            "quality_status": "VERIFIED",
+            "previous_close_matches_pre_close": true,
+            "previous_close_note": "不一致可能涉及除权等原因，不擅自修正前收盘字段"
+          },
+          "amount_quality": {
+            "status": "OBSERVED",
+            "trade_date": "2026-10-30",
+            "sample_count": 1,
+            "checked_count": 1,
+            "inconsistent_count": 0,
+            "missing_count": 0,
+            "suspended_count": 0,
+            "samples": [],
+            "units": {
+              "amount": "CNY",
+              "volume": "shares",
+              "price": "unadjusted_CNY"
+            },
+            "definition": "positive-volume amount/volume must lie in same-day unadjusted [low, high]",
+            "reason": null
+          },
+          "amount": 3987679294.0,
+          "volume": 6000000.0,
+          "history": [
+            {
+              "trade_date": "2026-10-26",
+              "status": "OBSERVED",
+              "close": 672.0,
+              "change_pct": 7.692307692307687,
+              "received_at": "2026-10-26T16:14:58+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-27",
+              "status": "OBSERVED",
+              "close": 639.96,
+              "change_pct": -4.767857142857135,
+              "received_at": "2026-10-28T16:19:55+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-28",
+              "status": "OBSERVED",
+              "close": 695.9,
+              "change_pct": 8.741171323207686,
+              "received_at": "2026-10-28T20:07:56+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-29",
+              "status": "OBSERVED",
+              "close": 662.39,
+              "change_pct": -4.815347032619632,
+              "received_at": "2026-10-30T14:41:35+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-30",
+              "status": "OBSERVED",
+              "close": 647.05,
+              "change_pct": -2.3158562176361364,
+              "received_at": "2026-11-01T15:32:38+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            }
+          ],
+          "history_complete_5d": true,
+          "cumulative_return_5d_pct": 3.69391,
+          "received_at": {
+            "fused": "2026-10-30T20:40:43+08:00",
+            "ths_tag": "2026-10-30T17:15:54+08:00",
+            "price": "2026-11-01T15:32:38+08:00"
+          }
+        },
+        {
+          "status": "OBSERVED",
+          "stock_code": "002636",
+          "short_name": "金安国纪",
+          "trade_date": "2026-10-30",
+          "sector_names": [
+            "PCB概念"
+          ],
+          "concept_tag": "PCB概念;2026中报预增",
+          "tag_source": "同日同花顺个股标签；非PIT行业成员或完整概念成分表",
+          "pop_tag": "3天2板",
+          "heat_ranks": {
+            "fused": 10,
+            "ths": 20
+          },
+          "rank_basis": "source_attention_rank_not_price_strength_or_leadership",
+          "identity": "身份待确认",
+          "identity_limit": "热度及标签只构成观察候选，不能证明龙头、中军或容量身份",
+          "change_pct": 10.001727,
+          "ohlc": {
+            "status": "OBSERVED",
+            "open": 55.67,
+            "close": 63.68,
+            "pre_close": 57.89,
+            "high": 63.68,
+            "low": 55.13
+          },
+          "price_verification": {
+            "status": "OBSERVED",
+            "same_day_source_checks": {
+              "fused": {
+                "change_pct": 10.0,
+                "matches_unadjusted_close": true
+              },
+              "ths": {
+                "change_pct": 10.0017,
+                "matches_unadjusted_close": true
+              }
+            },
+            "source": "qmt_datadir",
+            "quality_status": "VERIFIED",
+            "previous_close_matches_pre_close": true,
+            "previous_close_note": "不一致可能涉及除权等原因，不擅自修正前收盘字段"
+          },
+          "amount_quality": {
+            "status": "OBSERVED",
+            "trade_date": "2026-10-30",
+            "sample_count": 1,
+            "checked_count": 1,
+            "inconsistent_count": 0,
+            "missing_count": 0,
+            "suspended_count": 0,
+            "samples": [],
+            "units": {
+              "amount": "CNY",
+              "volume": "shares",
+              "price": "unadjusted_CNY"
+            },
+            "definition": "positive-volume amount/volume must lie in same-day unadjusted [low, high]",
+            "reason": null
+          },
+          "amount": 4080057726.0,
+          "volume": 66690200.0,
+          "history": [
+            {
+              "trade_date": "2026-10-26",
+              "status": "OBSERVED",
+              "close": 54.4,
+              "change_pct": -9.9933818663137,
+              "received_at": "2026-10-26T16:14:48+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-27",
+              "status": "OBSERVED",
+              "close": 53.26,
+              "change_pct": -2.0955882352941213,
+              "received_at": "2026-10-28T16:19:55+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-28",
+              "status": "OBSERVED",
+              "close": 58.59,
+              "change_pct": 10.00751032669922,
+              "received_at": "2026-10-28T20:07:56+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-29",
+              "status": "OBSERVED",
+              "close": 57.89,
+              "change_pct": -1.194743130227005,
+              "received_at": "2026-10-30T14:41:35+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-30",
+              "status": "OBSERVED",
+              "close": 63.68,
+              "change_pct": 10.001727414061158,
+              "received_at": "2026-11-01T15:32:38+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            }
+          ],
+          "history_complete_5d": true,
+          "cumulative_return_5d_pct": 5.360688,
+          "received_at": {
+            "fused": "2026-10-30T20:40:43+08:00",
+            "ths_tag": "2026-10-30T17:15:54+08:00",
+            "price": "2026-11-01T15:32:38+08:00"
+          }
+        },
+        {
+          "status": "OBSERVED",
+          "stock_code": "300476",
+          "short_name": "胜宏科技",
+          "trade_date": "2026-10-30",
+          "sector_names": [
+            "PCB概念",
+            "共封装光学(CPO)"
+          ],
+          "concept_tag": "共封装光学(CPO);PCB概念",
+          "tag_source": "同日同花顺个股标签；非PIT行业成员或完整概念成分表",
+          "pop_tag": null,
+          "heat_ranks": {
+            "fused": 30,
+            "ths": 27
+          },
+          "rank_basis": "source_attention_rank_not_price_strength_or_leadership",
+          "identity": "身份待确认",
+          "identity_limit": "热度及标签只构成观察候选，不能证明龙头、中军或容量身份",
+          "change_pct": -13.305898,
+          "ohlc": {
+            "status": "OBSERVED",
+            "open": 140.0,
+            "close": 139.04,
+            "pre_close": 160.38,
+            "high": 152.0,
+            "low": 136.99
+          },
+          "price_verification": {
+            "status": "OBSERVED",
+            "same_day_source_checks": {
+              "fused": {
+                "change_pct": -13.31,
+                "matches_unadjusted_close": true
+              },
+              "ths": {
+                "change_pct": -13.3059,
+                "matches_unadjusted_close": true
+              }
+            },
+            "source": "qmt_datadir",
+            "quality_status": "VERIFIED",
+            "previous_close_matches_pre_close": true,
+            "previous_close_note": "不一致可能涉及除权等原因，不擅自修正前收盘字段"
+          },
+          "amount_quality": {
+            "status": "UNKNOWN",
+            "trade_date": "2026-10-30",
+            "sample_count": 1,
+            "checked_count": 0,
+            "inconsistent_count": 1,
+            "missing_count": 0,
+            "suspended_count": 0,
+            "samples": [
+              {
+                "stock_code": "300476",
+                "reason": "implied_price_outside_daily_range",
+                "amount": 42969967.0,
+                "volume": 60419300.0,
+                "implied_price": 0.7111960416621841,
+                "low": 136.99,
+                "high": 152.0,
+                "adjust_type": 0.0
+              }
+            ],
+            "units": {
+              "amount": "CNY",
+              "volume": "shares",
+              "price": "unadjusted_CNY"
+            },
+            "definition": "positive-volume amount/volume must lie in same-day unadjusted [low, high]",
+            "reason": "implied_price_outside_daily_range"
+          },
+          "amount": null,
+          "volume": 60419300.0,
+          "history": [
+            {
+              "trade_date": "2026-10-26",
+              "status": "OBSERVED",
+              "close": 188.01,
+              "change_pct": 2.4689339437540925,
+              "received_at": "2026-10-26T16:14:24+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-27",
+              "status": "OBSERVED",
+              "close": 174.09,
+              "change_pct": -7.403861496728892,
+              "received_at": "2026-10-28T16:19:55+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-28",
+              "status": "OBSERVED",
+              "close": 180.31,
+              "change_pct": 3.572864610259052,
+              "received_at": "2026-10-28T20:07:56+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-29",
+              "status": "OBSERVED",
+              "close": 160.38,
+              "change_pct": -11.053186179357777,
+              "received_at": "2026-10-30T14:41:35+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-30",
+              "status": "OBSERVED",
+              "close": 139.04,
+              "change_pct": -13.305898491083678,
+              "received_at": "2026-11-01T15:32:38+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            }
+          ],
+          "history_complete_5d": true,
+          "cumulative_return_5d_pct": -24.220624,
+          "received_at": {
+            "fused": "2026-10-30T20:40:43+08:00",
+            "ths_tag": "2026-10-30T17:15:54+08:00",
+            "price": "2026-11-01T15:32:38+08:00"
+          }
+        },
+        {
+          "status": "OBSERVED",
+          "stock_code": "300502",
+          "short_name": "新易盛",
+          "trade_date": "2026-10-30",
+          "sector_names": [
+            "共封装光学(CPO)"
+          ],
+          "concept_tag": "共封装光学(CPO);5G",
+          "tag_source": "同日同花顺个股标签；非PIT行业成员或完整概念成分表",
+          "pop_tag": null,
+          "heat_ranks": {
+            "fused": 2,
+            "ths": 3
+          },
+          "rank_basis": "source_attention_rank_not_price_strength_or_leadership",
+          "identity": "身份待确认",
+          "identity_limit": "热度及标签只构成观察候选，不能证明龙头、中军或容量身份",
+          "change_pct": -14.185639,
+          "ohlc": {
+            "status": "OBSERVED",
+            "open": 200.0,
+            "close": 196.0,
+            "pre_close": 228.4,
+            "high": 214.4,
+            "low": 194.0
+          },
+          "price_verification": {
+            "status": "OBSERVED",
+            "same_day_source_checks": {
+              "fused": {
+                "change_pct": -14.19,
+                "matches_unadjusted_close": true
+              },
+              "ths": {
+                "change_pct": -14.1856,
+                "matches_unadjusted_close": true
+              }
+            },
+            "source": "qmt_datadir",
+            "quality_status": "VERIFIED",
+            "previous_close_matches_pre_close": true,
+            "previous_close_note": "不一致可能涉及除权等原因，不擅自修正前收盘字段"
+          },
+          "amount_quality": {
+            "status": "UNKNOWN",
+            "trade_date": "2026-10-30",
+            "sample_count": 1,
+            "checked_count": 0,
+            "inconsistent_count": 1,
+            "missing_count": 0,
+            "suspended_count": 0,
+            "samples": [
+              {
+                "stock_code": "300502",
+                "reason": "implied_price_outside_daily_range",
+                "amount": 132768394.0,
+                "volume": 106030100.0,
+                "implied_price": 1.2521764480086315,
+                "low": 194.0,
+                "high": 214.4,
+                "adjust_type": 0.0
+              }
+            ],
+            "units": {
+              "amount": "CNY",
+              "volume": "shares",
+              "price": "unadjusted_CNY"
+            },
+            "definition": "positive-volume amount/volume must lie in same-day unadjusted [low, high]",
+            "reason": "implied_price_outside_daily_range"
+          },
+          "amount": null,
+          "volume": 106030100.0,
+          "history": [
+            {
+              "trade_date": "2026-10-26",
+              "status": "OBSERVED",
+              "close": 251.69,
+              "change_pct": -3.5670498084291236,
+              "received_at": "2026-10-26T16:14:45+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-27",
+              "status": "OBSERVED",
+              "close": 237.59,
+              "change_pct": -5.602129603877781,
+              "received_at": "2026-10-28T16:19:55+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-28",
+              "status": "OBSERVED",
+              "close": 256.79,
+              "change_pct": 8.08114819647292,
+              "received_at": "2026-10-28T20:07:56+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-29",
+              "status": "OBSERVED",
+              "close": 228.4,
+              "change_pct": -11.05572646909927,
+              "received_at": "2026-10-30T14:41:35+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-30",
+              "status": "OBSERVED",
+              "close": 196.0,
+              "change_pct": -14.185639229422065,
+              "received_at": "2026-11-01T15:32:38+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            }
+          ],
+          "history_complete_5d": true,
+          "cumulative_return_5d_pct": -24.904215,
+          "received_at": {
+            "fused": "2026-10-30T20:40:43+08:00",
+            "ths_tag": "2026-10-30T17:15:54+08:00",
+            "price": "2026-11-01T15:32:38+08:00"
+          }
+        },
+        {
+          "status": "OBSERVED",
+          "stock_code": "300308",
+          "short_name": "中际旭创",
+          "trade_date": "2026-10-30",
+          "sector_names": [
+            "共封装光学(CPO)"
+          ],
+          "concept_tag": "共封装光学(CPO);F5G概念",
+          "tag_source": "同日同花顺个股标签；非PIT行业成员或完整概念成分表",
+          "pop_tag": null,
+          "heat_ranks": {
+            "fused": 4,
+            "ths": 6
+          },
+          "rank_basis": "source_attention_rank_not_price_strength_or_leadership",
+          "identity": "身份待确认",
+          "identity_limit": "热度及标签只构成观察候选，不能证明龙头、中军或容量身份",
+          "change_pct": -4.99098,
+          "ohlc": {
+            "status": "OBSERVED",
+            "open": 545.7,
+            "close": 553.0,
+            "pre_close": 582.05,
+            "high": 585.0,
+            "low": 537.0
+          },
+          "price_verification": {
+            "status": "OBSERVED",
+            "same_day_source_checks": {
+              "fused": {
+                "change_pct": -4.99,
+                "matches_unadjusted_close": true
+              },
+              "ths": {
+                "change_pct": -4.991,
+                "matches_unadjusted_close": true
+              }
+            },
+            "source": "qmt_datadir",
+            "quality_status": "VERIFIED",
+            "previous_close_matches_pre_close": true,
+            "previous_close_note": "不一致可能涉及除权等原因，不擅自修正前收盘字段"
+          },
+          "amount_quality": {
+            "status": "UNKNOWN",
+            "trade_date": "2026-10-30",
+            "sample_count": 1,
+            "checked_count": 0,
+            "inconsistent_count": 1,
+            "missing_count": 0,
+            "suspended_count": 0,
+            "samples": [
+              {
+                "stock_code": "300308",
+                "reason": "implied_price_outside_daily_range",
+                "amount": 3475659669.0,
+                "volume": 36696000.0,
+                "implied_price": 94.7149462884238,
+                "low": 537.0,
+                "high": 585.0,
+                "adjust_type": 0.0
+              }
+            ],
+            "units": {
+              "amount": "CNY",
+              "volume": "shares",
+              "price": "unadjusted_CNY"
+            },
+            "definition": "positive-volume amount/volume must lie in same-day unadjusted [low, high]",
+            "reason": "implied_price_outside_daily_range"
+          },
+          "amount": null,
+          "volume": 36696000.0,
+          "history": [
+            {
+              "trade_date": "2026-10-26",
+              "status": "OBSERVED",
+              "close": 594.5,
+              "change_pct": -2.9593718884155185,
+              "received_at": "2026-10-26T16:14:57+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-27",
+              "status": "OBSERVED",
+              "close": 577.0,
+              "change_pct": -2.9436501261564385,
+              "received_at": "2026-10-28T16:19:55+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-28",
+              "status": "OBSERVED",
+              "close": 636.3,
+              "change_pct": 10.277296360485266,
+              "received_at": "2026-10-28T20:07:56+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-29",
+              "status": "OBSERVED",
+              "close": 582.05,
+              "change_pct": -8.52585258525853,
+              "received_at": "2026-10-30T14:41:35+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-30",
+              "status": "OBSERVED",
+              "close": 553.0,
+              "change_pct": -4.99098015634395,
+              "received_at": "2026-11-01T15:32:38+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            }
+          ],
+          "history_complete_5d": true,
+          "cumulative_return_5d_pct": -9.733444,
+          "received_at": {
+            "fused": "2026-10-30T20:40:43+08:00",
+            "ths_tag": "2026-10-30T17:15:54+08:00",
+            "price": "2026-11-01T15:32:38+08:00"
+          }
+        },
+        {
+          "status": "OBSERVED",
+          "stock_code": "000995",
+          "short_name": "皇台酒业",
+          "trade_date": "2026-10-30",
+          "sector_names": [
+            "白酒概念"
+          ],
+          "concept_tag": "白酒概念;乡村振兴",
+          "tag_source": "同日同花顺个股标签；非PIT行业成员或完整概念成分表",
+          "pop_tag": "首板涨停",
+          "heat_ranks": {
+            "fused": 18,
+            "ths": 25
+          },
+          "rank_basis": "source_attention_rank_not_price_strength_or_leadership",
+          "identity": "身份待确认",
+          "identity_limit": "热度及标签只构成观察候选，不能证明龙头、中军或容量身份",
+          "change_pct": 10.007758,
+          "ohlc": {
+            "status": "OBSERVED",
+            "open": 12.84,
+            "close": 14.18,
+            "pre_close": 12.89,
+            "high": 14.18,
+            "low": 12.84
+          },
+          "price_verification": {
+            "status": "OBSERVED",
+            "same_day_source_checks": {
+              "fused": {
+                "change_pct": 10.01,
+                "matches_unadjusted_close": true
+              },
+              "ths": {
+                "change_pct": 10.0078,
+                "matches_unadjusted_close": true
+              }
+            },
+            "source": "qmt_datadir",
+            "quality_status": "VERIFIED",
+            "previous_close_matches_pre_close": true,
+            "previous_close_note": "不一致可能涉及除权等原因，不擅自修正前收盘字段"
+          },
+          "amount_quality": {
+            "status": "OBSERVED",
+            "trade_date": "2026-10-30",
+            "sample_count": 1,
+            "checked_count": 1,
+            "inconsistent_count": 0,
+            "missing_count": 0,
+            "suspended_count": 0,
+            "samples": [],
+            "units": {
+              "amount": "CNY",
+              "volume": "shares",
+              "price": "unadjusted_CNY"
+            },
+            "definition": "positive-volume amount/volume must lie in same-day unadjusted [low, high]",
+            "reason": null
+          },
+          "amount": 707748110.0,
+          "volume": 51066000.0,
+          "history": [
+            {
+              "trade_date": "2026-10-26",
+              "status": "OBSERVED",
+              "close": 13.37,
+              "change_pct": 10.041152263374475,
+              "received_at": "2026-10-26T16:14:45+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-27",
+              "status": "OBSERVED",
+              "close": 14.28,
+              "change_pct": 6.806282722513091,
+              "received_at": "2026-10-28T16:19:55+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-28",
+              "status": "OBSERVED",
+              "close": 13.61,
+              "change_pct": -4.691876750700274,
+              "received_at": "2026-10-28T20:07:56+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-29",
+              "status": "OBSERVED",
+              "close": 12.89,
+              "change_pct": -5.290227773695799,
+              "received_at": "2026-10-30T14:41:35+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-30",
+              "status": "OBSERVED",
+              "close": 14.18,
+              "change_pct": 10.007757951900697,
+              "received_at": "2026-11-01T15:32:38+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            }
+          ],
+          "history_complete_5d": true,
+          "cumulative_return_5d_pct": 16.707819,
+          "received_at": {
+            "fused": "2026-10-30T20:40:43+08:00",
+            "ths_tag": "2026-10-30T17:15:54+08:00",
+            "price": "2026-11-01T15:32:38+08:00"
+          }
+        },
+        {
+          "status": "OBSERVED",
+          "stock_code": "600519",
+          "short_name": "贵州茅台",
+          "trade_date": "2026-10-30",
+          "sector_names": [
+            "白酒概念"
+          ],
+          "concept_tag": "超级品牌;白酒概念",
+          "tag_source": "同日同花顺个股标签；非PIT行业成员或完整概念成分表",
+          "pop_tag": null,
+          "heat_ranks": {
+            "fused": 32,
+            "ths": 68
+          },
+          "rank_basis": "source_attention_rank_not_price_strength_or_leadership",
+          "identity": "身份待确认",
+          "identity_limit": "热度及标签只构成观察候选，不能证明龙头、中军或容量身份",
+          "change_pct": 2.810192,
+          "ohlc": {
+            "status": "OBSERVED",
+            "open": 1363.0,
+            "close": 1392.05,
+            "pre_close": 1354.0,
+            "high": 1393.37,
+            "low": 1352.98
+          },
+          "price_verification": {
+            "status": "OBSERVED",
+            "same_day_source_checks": {
+              "fused": {
+                "change_pct": 2.81,
+                "matches_unadjusted_close": true
+              },
+              "ths": {
+                "change_pct": 2.8102,
+                "matches_unadjusted_close": true
+              }
+            },
+            "source": "qmt_datadir",
+            "quality_status": "VERIFIED",
+            "previous_close_matches_pre_close": true,
+            "previous_close_note": "不一致可能涉及除权等原因，不擅自修正前收盘字段"
+          },
+          "amount_quality": {
+            "status": "UNKNOWN",
+            "trade_date": "2026-10-30",
+            "sample_count": 1,
+            "checked_count": 0,
+            "inconsistent_count": 1,
+            "missing_count": 0,
+            "suspended_count": 0,
+            "samples": [
+              {
+                "stock_code": "600519",
+                "reason": "implied_price_outside_daily_range",
+                "amount": 3962414482.0,
+                "volume": 5992700.0,
+                "implied_price": 661.2068820398151,
+                "low": 1352.98,
+                "high": 1393.37,
+                "adjust_type": 0.0
+              }
+            ],
+            "units": {
+              "amount": "CNY",
+              "volume": "shares",
+              "price": "unadjusted_CNY"
+            },
+            "definition": "positive-volume amount/volume must lie in same-day unadjusted [low, high]",
+            "reason": "implied_price_outside_daily_range"
+          },
+          "amount": null,
+          "volume": 5992700.0,
+          "history": [
+            {
+              "trade_date": "2026-10-26",
+              "status": "OBSERVED",
+              "close": 1349.98,
+              "change_pct": 1.1220973782771537,
+              "received_at": "2026-10-26T16:14:50+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-27",
+              "status": "OBSERVED",
+              "close": 1355.9,
+              "change_pct": 0.4385250151854203,
+              "received_at": "2026-10-28T16:19:55+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-28",
+              "status": "OBSERVED",
+              "close": 1330.75,
+              "change_pct": -1.8548565528431316,
+              "received_at": "2026-10-28T20:07:56+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-29",
+              "status": "OBSERVED",
+              "close": 1354.0,
+              "change_pct": 1.7471350742062741,
+              "received_at": "2026-10-30T14:41:35+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-30",
+              "status": "OBSERVED",
+              "close": 1392.05,
+              "change_pct": 2.810192023633684,
+              "received_at": "2026-11-01T15:32:38+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            }
+          ],
+          "history_complete_5d": true,
+          "cumulative_return_5d_pct": 4.273408,
+          "received_at": {
+            "fused": "2026-10-30T20:40:43+08:00",
+            "ths_tag": "2026-10-30T17:15:54+08:00",
+            "price": "2026-11-01T15:32:38+08:00"
+          }
+        },
+        {
+          "status": "OBSERVED",
+          "stock_code": "000559",
+          "short_name": "万向钱潮",
+          "trade_date": "2026-10-30",
+          "sector_names": [
+            "人形机器人",
+            "机器人概念"
+          ],
+          "concept_tag": "人形机器人;机器人概念",
+          "tag_source": "同日同花顺个股标签；非PIT行业成员或完整概念成分表",
+          "pop_tag": "6天3板",
+          "heat_ranks": {
+            "fused": 50,
+            "ths": 32
+          },
+          "rank_basis": "source_attention_rank_not_price_strength_or_leadership",
+          "identity": "身份待确认",
+          "identity_limit": "热度及标签只构成观察候选，不能证明龙头、中军或容量身份",
+          "change_pct": -3.225806,
+          "ohlc": {
+            "status": "OBSERVED",
+            "open": 12.52,
+            "close": 12.6,
+            "pre_close": 13.02,
+            "high": 13.4,
+            "low": 12.22
+          },
+          "price_verification": {
+            "status": "OBSERVED",
+            "same_day_source_checks": {
+              "fused": {
+                "change_pct": -3.23,
+                "matches_unadjusted_close": true
+              },
+              "ths": {
+                "change_pct": -3.2258,
+                "matches_unadjusted_close": true
+              }
+            },
+            "source": "qmt_datadir",
+            "quality_status": "VERIFIED",
+            "previous_close_matches_pre_close": true,
+            "previous_close_note": "不一致可能涉及除权等原因，不擅自修正前收盘字段"
+          },
+          "amount_quality": {
+            "status": "OBSERVED",
+            "trade_date": "2026-10-30",
+            "sample_count": 1,
+            "checked_count": 1,
+            "inconsistent_count": 0,
+            "missing_count": 0,
+            "suspended_count": 0,
+            "samples": [],
+            "units": {
+              "amount": "CNY",
+              "volume": "shares",
+              "price": "unadjusted_CNY"
+            },
+            "definition": "positive-volume amount/volume must lie in same-day unadjusted [low, high]",
+            "reason": null
+          },
+          "amount": 2223975918.0,
+          "volume": 174013600.0,
+          "history": [
+            {
+              "trade_date": "2026-10-26",
+              "status": "OBSERVED",
+              "close": 12.71,
+              "change_pct": 10.043290043290053,
+              "received_at": "2026-10-26T16:14:15+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-27",
+              "status": "OBSERVED",
+              "close": 11.98,
+              "change_pct": -5.743509047993712,
+              "received_at": "2026-10-28T16:19:55+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-28",
+              "status": "OBSERVED",
+              "close": 13.18,
+              "change_pct": 10.016694490818034,
+              "received_at": "2026-10-28T20:07:56+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-29",
+              "status": "OBSERVED",
+              "close": 13.02,
+              "change_pct": -1.2139605462822445,
+              "received_at": "2026-10-30T14:41:35+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-30",
+              "status": "OBSERVED",
+              "close": 12.6,
+              "change_pct": -3.2258064516129004,
+              "received_at": "2026-11-01T15:32:38+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            }
+          ],
+          "history_complete_5d": true,
+          "cumulative_return_5d_pct": 9.090909,
+          "received_at": {
+            "fused": "2026-10-30T20:40:43+08:00",
+            "ths_tag": "2026-10-30T17:15:54+08:00",
+            "price": "2026-11-01T15:32:38+08:00"
+          }
+        },
+        {
+          "status": "OBSERVED",
+          "stock_code": "002526",
+          "short_name": "山东矿机",
+          "trade_date": "2026-10-30",
+          "sector_names": [
+            "机器人概念"
+          ],
+          "concept_tag": "减速器;机器人概念",
+          "tag_source": "同日同花顺个股标签；非PIT行业成员或完整概念成分表",
+          "pop_tag": "3天2板",
+          "heat_ranks": {
+            "fused": 100,
+            "ths": 73
+          },
+          "rank_basis": "source_attention_rank_not_price_strength_or_leadership",
+          "identity": "身份待确认",
+          "identity_limit": "热度及标签只构成观察候选，不能证明龙头、中军或容量身份",
+          "change_pct": -10.060976,
+          "ohlc": {
+            "status": "OBSERVED",
+            "open": 2.96,
+            "close": 2.95,
+            "pre_close": 3.28,
+            "high": 3.12,
+            "low": 2.95
+          },
+          "price_verification": {
+            "status": "OBSERVED",
+            "same_day_source_checks": {
+              "fused": {
+                "change_pct": -10.061,
+                "matches_unadjusted_close": true
+              },
+              "ths": {
+                "change_pct": -10.061,
+                "matches_unadjusted_close": true
+              }
+            },
+            "source": "qmt_datadir",
+            "quality_status": "VERIFIED",
+            "previous_close_matches_pre_close": true,
+            "previous_close_note": "不一致可能涉及除权等原因，不擅自修正前收盘字段"
+          },
+          "amount_quality": {
+            "status": "OBSERVED",
+            "trade_date": "2026-10-30",
+            "sample_count": 1,
+            "checked_count": 1,
+            "inconsistent_count": 0,
+            "missing_count": 0,
+            "suspended_count": 0,
+            "samples": [],
+            "units": {
+              "amount": "CNY",
+              "volume": "shares",
+              "price": "unadjusted_CNY"
+            },
+            "definition": "positive-volume amount/volume must lie in same-day unadjusted [low, high]",
+            "reason": null
+          },
+          "amount": 514734802.0,
+          "volume": 171512400.0,
+          "history": [
+            {
+              "trade_date": "2026-10-26",
+              "status": "OBSERVED",
+              "close": 2.72,
+              "change_pct": -2.857142857142847,
+              "received_at": "2026-10-26T16:14:09+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-27",
+              "status": "OBSERVED",
+              "close": 2.71,
+              "change_pct": -0.3676470588235392,
+              "received_at": "2026-10-28T16:19:55+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-28",
+              "status": "OBSERVED",
+              "close": 2.98,
+              "change_pct": 9.963099630996307,
+              "received_at": "2026-10-28T20:07:56+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-29",
+              "status": "OBSERVED",
+              "close": 3.28,
+              "change_pct": 10.067114093959727,
+              "received_at": "2026-10-30T14:41:35+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-30",
+              "status": "OBSERVED",
+              "close": 2.95,
+              "change_pct": -10.060975609756085,
+              "received_at": "2026-11-01T15:32:38+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            }
+          ],
+          "history_complete_5d": true,
+          "cumulative_return_5d_pct": 5.357143,
+          "received_at": {
+            "fused": "2026-10-30T20:40:43+08:00",
+            "ths_tag": "2026-10-30T17:15:54+08:00",
+            "price": "2026-11-01T15:32:38+08:00"
+          }
+        },
+        {
+          "status": "OBSERVED",
+          "stock_code": "002185",
+          "short_name": "华天科技",
+          "trade_date": "2026-10-30",
+          "sector_names": [
+            "存储芯片"
+          ],
+          "concept_tag": "国家大基金持股;存储芯片",
+          "tag_source": "同日同花顺个股标签；非PIT行业成员或完整概念成分表",
+          "pop_tag": null,
+          "heat_ranks": {
+            "fused": 20,
+            "ths": 18
+          },
+          "rank_basis": "source_attention_rank_not_price_strength_or_leadership",
+          "identity": "身份待确认",
+          "identity_limit": "热度及标签只构成观察候选，不能证明龙头、中军或容量身份",
+          "change_pct": -1.120633,
+          "ohlc": {
+            "status": "OBSERVED",
+            "open": 14.35,
+            "close": 15.0,
+            "pre_close": 15.17,
+            "high": 15.66,
+            "low": 14.34
+          },
+          "price_verification": {
+            "status": "OBSERVED",
+            "same_day_source_checks": {
+              "fused": {
+                "change_pct": -1.12,
+                "matches_unadjusted_close": true
+              },
+              "ths": {
+                "change_pct": -1.1206,
+                "matches_unadjusted_close": true
+              }
+            },
+            "source": "qmt_datadir",
+            "quality_status": "VERIFIED",
+            "previous_close_matches_pre_close": true,
+            "previous_close_note": "不一致可能涉及除权等原因，不擅自修正前收盘字段"
+          },
+          "amount_quality": {
+            "status": "OBSERVED",
+            "trade_date": "2026-10-30",
+            "sample_count": 1,
+            "checked_count": 1,
+            "inconsistent_count": 0,
+            "missing_count": 0,
+            "suspended_count": 0,
+            "samples": [],
+            "units": {
+              "amount": "CNY",
+              "volume": "shares",
+              "price": "unadjusted_CNY"
+            },
+            "definition": "positive-volume amount/volume must lie in same-day unadjusted [low, high]",
+            "reason": null
+          },
+          "amount": 3235055866.0,
+          "volume": 212780400.0,
+          "history": [
+            {
+              "trade_date": "2026-10-26",
+              "status": "OBSERVED",
+              "close": 14.92,
+              "change_pct": -7.844348363187159,
+              "received_at": "2026-10-26T16:14:30+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-27",
+              "status": "OBSERVED",
+              "close": 15.39,
+              "change_pct": 3.150134048257369,
+              "received_at": "2026-10-28T16:19:55+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-28",
+              "status": "OBSERVED",
+              "close": 16.28,
+              "change_pct": 5.782975958414549,
+              "received_at": "2026-10-28T20:07:56+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-29",
+              "status": "OBSERVED",
+              "close": 15.17,
+              "change_pct": -6.818181818181824,
+              "received_at": "2026-10-30T14:41:35+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-30",
+              "status": "OBSERVED",
+              "close": 15.0,
+              "change_pct": -1.1206328279498967,
+              "received_at": "2026-11-01T15:32:38+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            }
+          ],
+          "history_complete_5d": true,
+          "cumulative_return_5d_pct": -7.350216,
+          "received_at": {
+            "fused": "2026-10-30T20:40:43+08:00",
+            "ths_tag": "2026-10-30T17:15:54+08:00",
+            "price": "2026-11-01T15:32:38+08:00"
+          }
+        },
+        {
+          "status": "OBSERVED",
+          "stock_code": "688825",
+          "short_name": "长鑫科技",
+          "trade_date": "2026-10-30",
+          "sector_names": [
+            "存储芯片"
+          ],
+          "concept_tag": "科创次新股;存储芯片",
+          "tag_source": "同日同花顺个股标签；非PIT行业成员或完整概念成分表",
+          "pop_tag": null,
+          "heat_ranks": {
+            "fused": 25,
+            "ths": 31
+          },
+          "rank_basis": "source_attention_rank_not_price_strength_or_leadership",
+          "identity": "身份待确认",
+          "identity_limit": "热度及标签只构成观察候选，不能证明龙头、中军或容量身份",
+          "change_pct": -2.495918,
+          "ohlc": {
+            "status": "OBSERVED",
+            "open": 40.9,
+            "close": 41.8,
+            "pre_close": 42.87,
+            "high": 43.91,
+            "low": 40.81
+          },
+          "price_verification": {
+            "status": "OBSERVED",
+            "same_day_source_checks": {
+              "fused": {
+                "change_pct": -2.5,
+                "matches_unadjusted_close": true
+              },
+              "ths": {
+                "change_pct": -2.4959,
+                "matches_unadjusted_close": true
+              }
+            },
+            "source": "qmt_datadir",
+            "quality_status": "VERIFIED",
+            "previous_close_matches_pre_close": true,
+            "previous_close_note": "不一致可能涉及除权等原因，不擅自修正前收盘字段"
+          },
+          "amount_quality": {
+            "status": "UNKNOWN",
+            "trade_date": "2026-10-30",
+            "sample_count": 1,
+            "checked_count": 0,
+            "inconsistent_count": 1,
+            "missing_count": 0,
+            "suspended_count": 0,
+            "samples": [
+              {
+                "stock_code": "688825",
+                "reason": "implied_price_outside_daily_range",
+                "amount": 3555088048.0,
+                "volume": 285513800.0,
+                "implied_price": 12.451545417419403,
+                "low": 40.81,
+                "high": 43.91,
+                "adjust_type": 0.0
+              }
+            ],
+            "units": {
+              "amount": "CNY",
+              "volume": "shares",
+              "price": "unadjusted_CNY"
+            },
+            "definition": "positive-volume amount/volume must lie in same-day unadjusted [low, high]",
+            "reason": "implied_price_outside_daily_range"
+          },
+          "amount": null,
+          "volume": 285513800.0,
+          "history": [
+            {
+              "trade_date": "2026-10-26",
+              "status": "OBSERVED",
+              "close": 42.66,
+              "change_pct": -0.443407234539106,
+              "received_at": "2026-10-26T16:14:56+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-27",
+              "status": "OBSERVED",
+              "close": 43.0,
+              "change_pct": 0.7969995311767564,
+              "received_at": "2026-10-28T16:19:55+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-28",
+              "status": "OBSERVED",
+              "close": 44.36,
+              "change_pct": 3.1627906976744224,
+              "received_at": "2026-10-28T20:07:56+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-29",
+              "status": "OBSERVED",
+              "close": 42.87,
+              "change_pct": -3.3588818755635796,
+              "received_at": "2026-10-30T14:41:35+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-30",
+              "status": "OBSERVED",
+              "close": 41.8,
+              "change_pct": -2.495917891299282,
+              "received_at": "2026-11-01T15:32:38+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            }
+          ],
+          "history_complete_5d": true,
+          "cumulative_return_5d_pct": -2.450408,
+          "received_at": {
+            "fused": "2026-10-30T20:40:43+08:00",
+            "ths_tag": "2026-10-30T17:15:54+08:00",
+            "price": "2026-11-01T15:32:38+08:00"
+          }
+        },
+        {
+          "status": "OBSERVED",
+          "stock_code": "000678",
+          "short_name": "襄阳轴承",
+          "trade_date": "2026-10-30",
+          "sector_names": [],
+          "concept_tag": "减速器;农机",
+          "tag_source": "同日同花顺个股标签；非PIT行业成员或完整概念成分表",
+          "pop_tag": "持续上榜",
+          "heat_ranks": {
+            "fused": 1,
+            "ths": 1
+          },
+          "rank_basis": "source_attention_rank_not_price_strength_or_leadership",
+          "identity": "身份待确认",
+          "identity_limit": "热度及标签只构成观察候选，不能证明龙头、中军或容量身份",
+          "change_pct": -3.573333,
+          "ohlc": {
+            "status": "OBSERVED",
+            "open": 18.56,
+            "close": 18.08,
+            "pre_close": 18.75,
+            "high": 19.86,
+            "low": 17.78
+          },
+          "price_verification": {
+            "status": "OBSERVED",
+            "same_day_source_checks": {
+              "fused": {
+                "change_pct": -3.57,
+                "matches_unadjusted_close": true
+              },
+              "ths": {
+                "change_pct": -3.5733,
+                "matches_unadjusted_close": true
+              }
+            },
+            "source": "qmt_datadir",
+            "quality_status": "VERIFIED",
+            "previous_close_matches_pre_close": true,
+            "previous_close_note": "不一致可能涉及除权等原因，不擅自修正前收盘字段"
+          },
+          "amount_quality": {
+            "status": "OBSERVED",
+            "trade_date": "2026-10-30",
+            "sample_count": 1,
+            "checked_count": 1,
+            "inconsistent_count": 0,
+            "missing_count": 0,
+            "suspended_count": 0,
+            "samples": [],
+            "units": {
+              "amount": "CNY",
+              "volume": "shares",
+              "price": "unadjusted_CNY"
+            },
+            "definition": "positive-volume amount/volume must lie in same-day unadjusted [low, high]",
+            "reason": null
+          },
+          "amount": 3224592082.0,
+          "volume": 170280900.0,
+          "history": [
+            {
+              "trade_date": "2026-10-26",
+              "status": "OBSERVED",
+              "close": 14.55,
+              "change_pct": 9.977324263038545,
+              "received_at": "2026-10-26T16:15:00+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-27",
+              "status": "OBSERVED",
+              "close": 16.01,
+              "change_pct": 10.034364261168394,
+              "received_at": "2026-10-28T16:19:55+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-28",
+              "status": "OBSERVED",
+              "close": 17.61,
+              "change_pct": 9.993753903810099,
+              "received_at": "2026-10-28T20:07:56+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-29",
+              "status": "OBSERVED",
+              "close": 18.75,
+              "change_pct": 6.473594548551964,
+              "received_at": "2026-10-30T14:41:35+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-30",
+              "status": "OBSERVED",
+              "close": 18.08,
+              "change_pct": -3.5733333333333395,
+              "received_at": "2026-11-01T15:32:38+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            }
+          ],
+          "history_complete_5d": true,
+          "cumulative_return_5d_pct": 36.659108,
+          "received_at": {
+            "fused": "2026-10-30T20:40:43+08:00",
+            "ths_tag": "2026-10-30T17:15:54+08:00",
+            "price": "2026-11-01T15:32:38+08:00"
+          }
+        },
+        {
+          "status": "OBSERVED",
+          "stock_code": "002724",
+          "short_name": "海洋王",
+          "trade_date": "2026-10-30",
+          "sector_names": [],
+          "concept_tag": "智慧灯杆;军工",
+          "tag_source": "同日同花顺个股标签；非PIT行业成员或完整概念成分表",
+          "pop_tag": "11天7板",
+          "heat_ranks": {
+            "fused": 5,
+            "ths": 4
+          },
+          "rank_basis": "source_attention_rank_not_price_strength_or_leadership",
+          "identity": "身份待确认",
+          "identity_limit": "热度及标签只构成观察候选，不能证明龙头、中军或容量身份",
+          "change_pct": 8.714919,
+          "ohlc": {
+            "status": "OBSERVED",
+            "open": 13.49,
+            "close": 14.72,
+            "pre_close": 13.54,
+            "high": 14.8,
+            "low": 13.03
+          },
+          "price_verification": {
+            "status": "OBSERVED",
+            "same_day_source_checks": {
+              "fused": {
+                "change_pct": 8.71,
+                "matches_unadjusted_close": true
+              },
+              "ths": {
+                "change_pct": 8.7149,
+                "matches_unadjusted_close": true
+              }
+            },
+            "source": "qmt_datadir",
+            "quality_status": "VERIFIED",
+            "previous_close_matches_pre_close": true,
+            "previous_close_note": "不一致可能涉及除权等原因，不擅自修正前收盘字段"
+          },
+          "amount_quality": {
+            "status": "OBSERVED",
+            "trade_date": "2026-10-30",
+            "sample_count": 1,
+            "checked_count": 1,
+            "inconsistent_count": 0,
+            "missing_count": 0,
+            "suspended_count": 0,
+            "samples": [],
+            "units": {
+              "amount": "CNY",
+              "volume": "shares",
+              "price": "unadjusted_CNY"
+            },
+            "definition": "positive-volume amount/volume must lie in same-day unadjusted [low, high]",
+            "reason": null
+          },
+          "amount": 1831503143.0,
+          "volume": 129463200.0,
+          "history": [
+            {
+              "trade_date": "2026-10-26",
+              "status": "OBSERVED",
+              "close": 11.9,
+              "change_pct": -3.48742903487429,
+              "received_at": "2026-10-26T16:14:15+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-27",
+              "status": "OBSERVED",
+              "close": 13.09,
+              "change_pct": 9.999999999999986,
+              "received_at": "2026-10-28T16:19:55+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-28",
+              "status": "OBSERVED",
+              "close": 13.4,
+              "change_pct": 2.3682200152788324,
+              "received_at": "2026-10-28T20:07:56+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-29",
+              "status": "OBSERVED",
+              "close": 13.54,
+              "change_pct": 1.044776119402968,
+              "received_at": "2026-10-30T14:41:35+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            },
+            {
+              "trade_date": "2026-10-30",
+              "status": "OBSERVED",
+              "close": 14.72,
+              "change_pct": 8.714918759231916,
+              "received_at": "2026-11-01T15:32:38+08:00",
+              "received_after_session_close": true,
+              "availability_note": "按实际入库时间使用；晚补的收盘事实仅作事后补记，不代表盘前或盘中已知"
+            }
+          ],
+          "history_complete_5d": true,
+          "cumulative_return_5d_pct": 19.383617,
+          "received_at": {
+            "fused": "2026-10-30T20:40:43+08:00",
+            "ths_tag": "2026-10-30T17:15:54+08:00",
+            "price": "2026-11-01T15:32:38+08:00"
+          }
+        }
+      ],
+      "amount_quality": {
+        "target": {
+          "status": "UNKNOWN",
+          "trade_date": "2026-10-30",
+          "sample_count": 16,
+          "checked_count": 9,
+          "inconsistent_count": 7,
+          "missing_count": 0,
+          "suspended_count": 0,
+          "samples": [
+            {
+              "stock_code": "300308",
+              "reason": "implied_price_outside_daily_range",
+              "amount": 3475659669.0,
+              "volume": 36696000.0,
+              "implied_price": 94.7149462884238,
+              "low": 537.0,
+              "high": 585.0,
+              "adjust_type": 0.0
+            },
+            {
+              "stock_code": "300476",
+              "reason": "implied_price_outside_daily_range",
+              "amount": 42969967.0,
+              "volume": 60419300.0,
+              "implied_price": 0.7111960416621841,
+              "low": 136.99,
+              "high": 152.0,
+              "adjust_type": 0.0
+            },
+            {
+              "stock_code": "300502",
+              "reason": "implied_price_outside_daily_range",
+              "amount": 132768394.0,
+              "volume": 106030100.0,
+              "implied_price": 1.2521764480086315,
+              "low": 194.0,
+              "high": 214.4,
+              "adjust_type": 0.0
+            },
+            {
+              "stock_code": "600118",
+              "reason": "implied_price_outside_daily_range",
+              "amount": 774950729.0,
+              "volume": 88600700.0,
+              "implied_price": 8.746553119783478,
+              "low": 54.9,
+              "high": 59.72,
+              "adjust_type": 0.0
+            },
+            {
+              "stock_code": "600519",
+              "reason": "implied_price_outside_daily_range",
+              "amount": 3962414482.0,
+              "volume": 5992700.0,
+              "implied_price": 661.2068820398151,
+              "low": 1352.98,
+              "high": 1393.37,
+              "adjust_type": 0.0
+            },
+            {
+              "stock_code": "603131",
+              "reason": "implied_price_outside_daily_range",
+              "amount": 189684437.0,
+              "volume": 10808200.0,
+              "implied_price": 17.550048759275366,
+              "low": 17.55,
+              "high": 17.55,
+              "adjust_type": 0.0
+            },
+            {
+              "stock_code": "688825",
+              "reason": "implied_price_outside_daily_range",
+              "amount": 3555088048.0,
+              "volume": 285513800.0,
+              "implied_price": 12.451545417419403,
+              "low": 40.81,
+              "high": 43.91,
+              "adjust_type": 0.0
+            }
+          ],
+          "units": {
+            "amount": "CNY",
+            "volume": "shares",
+            "price": "unadjusted_CNY"
+          },
+          "definition": "positive-volume amount/volume must lie in same-day unadjusted [low, high]",
+          "reason": "implied_price_outside_daily_range",
+          "coverage_scope": "same_day_attention_candidate_sample_not_whole_market",
+          "candidate_count": 16
+        },
+        "previous": {
+          "status": "UNKNOWN",
+          "trade_date": "2026-10-29",
+          "sample_count": 16,
+          "checked_count": 9,
+          "inconsistent_count": 7,
+          "missing_count": 0,
+          "suspended_count": 0,
+          "samples": [
+            {
+              "stock_code": "002526",
+              "reason": "implied_price_outside_daily_range",
+              "amount": 146112221.0,
+              "volume": 44546400.0,
+              "implied_price": 3.2800006510065907,
+              "low": 3.28,
+              "high": 3.28,
+              "adjust_type": 0.0
+            },
+            {
+              "stock_code": "002636",
+              "reason": "implied_price_outside_daily_range",
+              "amount": 225449349.0,
+              "volume": 74784900.0,
+              "implied_price": 3.0146372997757567,
+              "low": 57.74,
+              "high": 62.93,
+              "adjust_type": 0.0
+            },
+            {
+              "stock_code": "300308",
+              "reason": "implied_price_outside_daily_range",
+              "amount": 2296106888.0,
+              "volume": 32533100.0,
+              "implied_price": 70.57756217513855,
+              "low": 582.0,
+              "high": 619.7,
+              "adjust_type": 0.0
+            },
+            {
+              "stock_code": "300476",
+              "reason": "implied_price_outside_daily_range",
+              "amount": 839080625.0,
+              "volume": 30669000.0,
+              "implied_price": 27.359243046724707,
+              "low": 160.3,
+              "high": 177.6,
+              "adjust_type": 0.0
+            },
+            {
+              "stock_code": "300502",
+              "reason": "implied_price_outside_daily_range",
+              "amount": 1015117654.0,
+              "volume": 58804300.0,
+              "implied_price": 17.26264327608695,
+              "low": 228.07,
+              "high": 249.98,
+              "adjust_type": 0.0
+            },
+            {
+              "stock_code": "600519",
+              "reason": "implied_price_outside_daily_range",
+              "amount": 1503013038.0,
+              "volume": 4299200.0,
+              "implied_price": 349.602958224786,
+              "low": 1330.01,
+              "high": 1356.0,
+              "adjust_type": 0.0
+            },
+            {
+              "stock_code": "688825",
+              "reason": "implied_price_outside_daily_range",
+              "amount": 3362845845.0,
+              "volume": 273496500.0,
+              "implied_price": 12.295754589181215,
+              "low": 42.83,
+              "high": 44.82,
+              "adjust_type": 0.0
+            }
+          ],
+          "units": {
+            "amount": "CNY",
+            "volume": "shares",
+            "price": "unadjusted_CNY"
+          },
+          "definition": "positive-volume amount/volume must lie in same-day unadjusted [low, high]",
+          "reason": "implied_price_outside_daily_range",
+          "coverage_scope": "same_day_attention_candidate_sample_not_whole_market",
+          "candidate_count": 16
+        }
+      },
+      "sources": [
+        {
+          "stage": "calendar",
+          "status": "OBSERVED",
+          "rows": 5,
+          "seconds": 6.006
+        },
+        {
+          "stage": "theme_history",
+          "status": "OBSERVED",
+          "rows": 995,
+          "seconds": 0.91
+        },
+        {
+          "stage": "fused_attention",
+          "status": "OBSERVED",
+          "rows": 100,
+          "seconds": 0.842
+        },
+        {
+          "stage": "ths_tags",
+          "status": "OBSERVED",
+          "rows": 100,
+          "seconds": 0.159
+        },
+        {
+          "stage": "selected_stock_prices_five_sessions",
+          "status": "OBSERVED",
+          "rows": 80,
+          "seconds": 1.322
+        }
+      ],
+      "coverage": {
+        "theme_by_date_and_type": [
+          {
+            "trade_date": "2026-10-26",
+            "plate_type": 1,
+            "observed_rows": 20
+          },
+          {
+            "trade_date": "2026-10-26",
+            "plate_type": 2,
+            "observed_rows": 20
+          },
+          {
+            "trade_date": "2026-10-26",
+            "plate_type": 3,
+            "observed_rows": 31
+          },
+          {
+            "trade_date": "2026-10-26",
+            "plate_type": 4,
+            "observed_rows": 128
+          },
+          {
+            "trade_date": "2026-10-27",
+            "plate_type": 1,
+            "observed_rows": 20
+          },
+          {
+            "trade_date": "2026-10-27",
+            "plate_type": 2,
+            "observed_rows": 20
+          },
+          {
+            "trade_date": "2026-10-27",
+            "plate_type": 3,
+            "observed_rows": 31
+          },
+          {
+            "trade_date": "2026-10-27",
+            "plate_type": 4,
+            "observed_rows": 128
+          },
+          {
+            "trade_date": "2026-10-28",
+            "plate_type": 1,
+            "observed_rows": 20
+          },
+          {
+            "trade_date": "2026-10-28",
+            "plate_type": 2,
+            "observed_rows": 20
+          },
+          {
+            "trade_date": "2026-10-28",
+            "plate_type": 3,
+            "observed_rows": 31
+          },
+          {
+            "trade_date": "2026-10-28",
+            "plate_type": 4,
+            "observed_rows": 128
+          },
+          {
+            "trade_date": "2026-10-29",
+            "plate_type": 1,
+            "observed_rows": 20
+          },
+          {
+            "trade_date": "2026-10-29",
+            "plate_type": 2,
+            "observed_rows": 20
+          },
+          {
+            "trade_date": "2026-10-29",
+            "plate_type": 3,
+            "observed_rows": 31
+          },
+          {
+            "trade_date": "2026-10-29",
+            "plate_type": 4,
+            "observed_rows": 128
+          },
+          {
+            "trade_date": "2026-10-30",
+            "plate_type": 1,
+            "observed_rows": 20
+          },
+          {
+            "trade_date": "2026-10-30",
+            "plate_type": 2,
+            "observed_rows": 20
+          },
+          {
+            "trade_date": "2026-10-30",
+            "plate_type": 3,
+            "observed_rows": 31
+          },
+          {
+            "trade_date": "2026-10-30",
+            "plate_type": 4,
+            "observed_rows": 128
+          }
+        ],
+        "fused_same_day": 100,
+        "ths_same_day": 100,
+        "candidate_codes": 16,
+        "selected_stock_count": 16,
+        "price_rows": 80,
+        "excluded_after_cutoff_or_missing_receipt": 0
+      },
+      "source_descriptions": {
+        "1": {
+          "name": "同花顺概念热度榜",
+          "rank_basis": "source_attention_rank"
+        },
+        "2": {
+          "name": "同花顺行业热度榜",
+          "rank_basis": "source_attention_rank"
+        },
+        "3": {
+          "name": "东财一级行业行情榜",
+          "rank_basis": "source_quoted_turnover_rank"
+        },
+        "4": {
+          "name": "东财二级行业行情榜",
+          "rank_basis": "source_quoted_turnover_rank"
+        }
+      },
+      "limits": [
+        "热度不是价格强度、资金净流入或龙头身份；类型3/4为东财行业，不能称QMT行业。",
+        "同日THS标签是已存关联观察，不替代同日PIT成分表；不以最新成员回填历史。",
+        "量价核验限候选样本，不能据此确认全市场成交额；不一致金额不参与容量或金额排名。",
+        "晚补收盘事实保留实际入库时间，仅用于复盘补记；榜单缺失不当作零收益。"
+      ]
+    },
+    "indices": {
+      "status": "OBSERVED",
+      "source": "sm_index_kline",
+      "rows": [
+        {
+          "index_code": "000001",
+          "trade_date": "2026-10-30",
+          "open": 3605.645,
+          "close": 3599.016,
+          "high": 3660.206,
+          "low": 3595.258,
+          "amount": 4017979472.0,
+          "change_pct": -1.435519
+        },
+        {
+          "index_code": "000688",
+          "trade_date": "2026-10-30",
+          "open": 1190.954,
+          "close": 1160.839,
+          "high": 1218.804,
+          "low": 1159.573,
+          "amount": 1654726313.0,
+          "change_pct": -5.476141
+        },
+        {
+          "index_code": "399001",
+          "trade_date": "2026-10-30",
+          "open": 10871.126,
+          "close": 10833.784,
+          "high": 11171.581,
+          "low": 10833.784,
+          "amount": 4002725709.0,
+          "change_pct": -2.733063
+        },
+        {
+          "index_code": "399006",
+          "trade_date": "2026-10-30",
+          "open": 2434.798,
+          "close": 2413.629,
+          "high": 2518.243,
+          "low": 2413.629,
+          "amount": 3203181788.0,
+          "change_pct": -4.129309
+        }
+      ]
+    },
+    "events": {
+      "status": "OBSERVED",
+      "source": "st_news_flash",
+      "rows": [
+        {
+          "source": "sina",
+          "title": "",
+          "content": "美国特勤局：调查人员正与包括 Circle 在内的私营部门合作伙伴合作，以识别、冻结、追踪和追回从币安被盗的资金。",
+          "publish_time": "2026-10-30 23:33:03",
+          "first_seen_at": "2026-10-30 23:33:33"
+        },
+        {
+          "source": "sina",
+          "title": "",
+          "content": "【费城半导体指数日内跌7%】费城半导体指数日内跌7.00%，现报10711.48点。英伟达跌3.59%，博通跌5.34%，美光跌4.99%，英特尔跌28.34%，AMD跌9.63%，高通跌11.19%，台积电跌5.33%，阿斯麦跌5.65%。",
+          "publish_time": "2026-10-30 23:31:59",
+          "first_seen_at": "2026-10-30 23:33:33"
+        },
+        {
+          "source": "sina",
+          "title": "",
+          "content": "俄罗斯人权事务专员：载有前往乌克兰领土人员的车队正在前往那里。",
+          "publish_time": "2026-10-30 23:31:31",
+          "first_seen_at": "2026-10-30 23:33:33"
+        },
+        {
+          "source": "sina",
+          "title": "",
+          "content": "德国总理弗里德里希·默茨表示，伊朗战争导致的能源价格上涨已在八个月内使欧洲损失超过1000亿欧元。他表示，这场冲突无法通过军事手段解决，并敦促包括以色列在内的各方进行谈判。",
+          "publish_time": "2026-10-30 23:31:10",
+          "first_seen_at": "2026-10-30 23:33:33"
+        },
+        {
+          "source": "sina",
+          "title": "",
+          "content": "俄罗斯人权事务专员：一切顺利，没有发生任何事件。",
+          "publish_time": "2026-10-30 23:30:00",
+          "first_seen_at": "2026-10-30 23:33:33"
+        },
+        {
+          "source": "sina",
+          "title": "",
+          "content": "俄罗斯人权专员：载有从俄罗斯控制的乌克兰奥列什基撤离居民的人道主义车队现已抵达克里米亚。",
+          "publish_time": "2026-10-30 23:29:20",
+          "first_seen_at": "2026-10-30 23:33:33"
+        },
+        {
+          "source": "sina",
+          "title": "",
+          "content": "帝国石油公司首席执行官在电话会议上表示，公司正在考虑将阿斯彭项目的最终投资决定（FID）日期提前至本十年的早些时候。",
+          "publish_time": "2026-10-30 23:28:41",
+          "first_seen_at": "2026-10-30 23:33:33"
+        },
+        {
+          "source": "sina",
+          "title": "",
+          "content": "美国能源信息署（EIA）：8月份美国馏分油燃料出口量降至173.3万桶/日（7月份为174.5万桶/日）。",
+          "publish_time": "2026-10-30 23:28:12",
+          "first_seen_at": "2026-10-30 23:33:33"
+        },
+        {
+          "source": "sina",
+          "title": "",
+          "content": "美国能源信息署（EIA）：8月份美国天然气液产量增加7.5万桶/日，至805.9万桶/日（7月份为798.4万桶/日）。",
+          "publish_time": "2026-10-30 23:28:07",
+          "first_seen_at": "2026-10-30 23:33:33"
+        },
+        {
+          "source": "sina",
+          "title": "",
+          "content": "美国能源信息署(EIA)：8月美国汽油出口降至84.5万桶/日（7月为85.9万桶/日）。",
+          "publish_time": "2026-10-30 23:28:02",
+          "first_seen_at": "2026-10-30 23:33:33"
+        },
+        {
+          "source": "sina",
+          "title": "",
+          "content": "美国能源信息署（EIA）：8月份美国汽油需求较去年同期下降2.8%，即每日减少26万桶，至每日898万桶（7月份降幅为2.5%）。",
+          "publish_time": "2026-10-30 23:27:57",
+          "first_seen_at": "2026-10-30 23:33:33"
+        },
+        {
+          "source": "sina",
+          "title": "",
+          "content": "美国能源信息署（EIA）发布的《石油供应月报》显示，8月份美国石油总需求量为2059.5万桶/日，较去年同期下降2.9%，即减少61.8万桶/日（7月份降幅为2.7%）。",
+          "publish_time": "2026-10-30 23:27:51",
+          "first_seen_at": "2026-10-30 23:33:33"
+        },
+        {
+          "source": "sina",
+          "title": "",
+          "content": "美国能源信息署（EIA）：美国8月馏分油需求同比下降0.8%，即每日减少3万桶，至每日370.5万桶（7月降幅为3.8%）。",
+          "publish_time": "2026-10-30 23:27:48",
+          "first_seen_at": "2026-10-30 23:33:33"
+        },
+        {
+          "source": "sina",
+          "title": "",
+          "content": "美国卫生与公众服务部最终规则修订了《康复法案》第504条规定，将法定的残疾定义排除条款编入法典。",
+          "publish_time": "2026-10-30 23:27:33",
+          "first_seen_at": "2026-10-30 23:33:33"
+        },
+        {
+          "source": "sina",
+          "title": "",
+          "content": "【台积电跌超5%】台积电跌超5%，报409.7美元，总市值报2.12万亿美元。",
+          "publish_time": "2026-10-30 23:24:49",
+          "first_seen_at": "2026-10-30 23:33:33"
+        },
+        {
+          "source": "sina",
+          "title": "",
+          "content": "阿斯利康首席执行官：目前正在考虑内部开发癌症疫苗，未来可以期待更新 。",
+          "publish_time": "2026-10-30 23:24:22",
+          "first_seen_at": "2026-10-30 23:33:33"
+        },
+        {
+          "source": "sina",
+          "title": "",
+          "content": "雪佛龙首席执行官表示，延长哈萨克斯坦田吉兹chevroi项目合同的谈判已缩小到“基本核心问题”。",
+          "publish_time": "2026-10-30 23:23:25",
+          "first_seen_at": "2026-10-30 23:33:33"
+        },
+        {
+          "source": "sina",
+          "title": "",
+          "content": "【伊朗前官员：制造核弹对伊朗来说轻而易举】伊朗前高级司法官员穆罕默德・贾瓦德・拉里贾尼表示，制造核弹对伊朗来说轻而易举，若伊朗决定研发核弹，不会征求美国同意。法尔斯通讯社周五报道了拉里贾尼的发言，他称，如果我们想要制造核弹，对我们来说就像玩玩具一样。拉里贾尼还声称伊朗核工业领先于巴基斯坦、印度和以色列。",
+          "publish_time": "2026-10-30 23:22:19",
+          "first_seen_at": "2026-10-30 23:33:33"
+        },
+        {
+          "source": "eastmoney",
+          "title": "台积电股价跌幅扩大至5.1% 报409.850美元/股",
+          "content": "台积电股价跌幅扩大至5.1%，报409.850美元/股，总市值报2.13万亿美元。",
+          "publish_time": "2026-10-30 23:21:34",
+          "first_seen_at": "2026-10-30 23:33:33"
+        },
+        {
+          "source": "cls",
+          "title": "",
+          "content": "财联社10月30日电，台积电股价跌幅扩大至5.1%，报409.850美元/股，总市值报2.13万亿美元。",
+          "publish_time": "2026-10-30 23:21:34",
+          "first_seen_at": "2026-10-30 23:33:33"
+        },
+        {
+          "source": "sina",
+          "title": "",
+          "content": "帝国石油公司表示，伍德兰管道中断持续了18天，本季度炼油厂吞吐量减少了约12,000桶/日。",
+          "publish_time": "2026-10-30 23:20:41",
+          "first_seen_at": "2026-10-30 23:33:33"
+        },
+        {
+          "source": "sina",
+          "title": "",
+          "content": "【日本拟量产攻击型水下无人潜航器】据《日本经济新闻》10月29日报道，日本海上自卫队计划从2027年起，着手量产能够发现并攻击敌方潜艇的水下无人潜航器。据称这些无人潜航器旨在作为有人作战潜艇的补充，以应对有人作战潜艇目前所面临的人员短缺问题。日本海上自卫队现已装备水下无人潜航器，但主要用于扫雷任务。(CCTV国际)",
+          "publish_time": "2026-10-30 23:18:26",
+          "first_seen_at": "2026-10-30 23:33:33"
+        },
+        {
+          "source": "sina",
+          "title": "",
+          "content": "在收购AT&T墨西哥业务后，Grupo Televisa的资产负债表将继续保持强劲，净债务与EBITDA之比将从第三季度末的1.6倍升至1.9倍。",
+          "publish_time": "2026-10-30 23:16:37",
+          "first_seen_at": "2026-10-30 23:16:39"
+        },
+        {
+          "source": "sina",
+          "title": "",
+          "content": "俄罗斯国防部称，一艘海军舰艇在敖德萨以南约30公里处航行途中遭到打击，该舰当时正运载供乌克兰武装部队使用的军用货物和两用物资。",
+          "publish_time": "2026-10-30 23:14:29",
+          "first_seen_at": "2026-10-30 23:16:39"
+        },
+        {
+          "source": "sina",
+          "title": "",
+          "content": "日本要求Anthropic和OpenAI提供更多先进模型的访问权限。",
+          "publish_time": "2026-10-30 23:11:58",
+          "first_seen_at": "2026-10-30 23:16:39"
+        },
+        {
+          "source": "eastmoney",
+          "title": "国内商品期市夜盘收盘多数上涨 能源品涨幅居前",
+          "content": "【国内商品期市夜盘收盘多数上涨 能源品涨幅居前】国内商品期市夜盘收盘多数上涨，能源品涨幅居前，DCE LPG涨4.45%；化工品多数上涨，CZCE甲醇涨4.33%；油脂油料多数上涨，DCE棕榈油涨1.17%；农副产品多数上涨，DCE玉米淀粉涨0.24%；黑色系跌幅居前，DCE焦炭跌1.39%；非金属建材全部下跌，CZCE玻璃跌1.16%。",
+          "publish_time": "2026-10-30 23:11:15",
+          "first_seen_at": "2026-10-30 23:16:39"
+        },
+        {
+          "source": "cls",
+          "title": "国内商品期市夜盘收盘多数上涨 能源品涨幅居前",
+          "content": "【国内商品期市夜盘收盘多数上涨 能源品涨幅居前】财联社10月30日电，国内商品期市夜盘收盘多数上涨，能源品涨幅居前，DCE LPG涨4.45%；化工品多数上涨，CZCE甲醇涨4.33%；油脂油料多数上涨，DCE棕榈油涨1.17%；农副产品多数上涨，DCE玉米淀粉涨0.24%；黑色系跌幅居前，DCE焦炭跌1.39%；非金属建材全部下跌，CZCE玻璃跌1.16%。",
+          "publish_time": "2026-10-30 23:11:15",
+          "first_seen_at": "2026-10-30 23:16:39"
+        },
+        {
+          "source": "sina",
+          "title": "",
+          "content": "Reddit 股价有望创下其上市两年半以来的最大单日跌幅；最新下跌 26.8%。",
+          "publish_time": "2026-10-30 23:11:08",
+          "first_seen_at": "2026-10-30 23:16:39"
+        },
+        {
+          "source": "eastmoney",
+          "title": "欧盟委员会提议理事会批准2027年剩余的450亿欧元乌克兰贷款额度",
+          "content": "欧盟委员会提议理事会批准2027年剩余的450亿欧元乌克兰贷款额度。",
+          "publish_time": "2026-10-30 23:10:21",
+          "first_seen_at": "2026-10-30 23:16:39"
+        },
+        {
+          "source": "cls",
+          "title": "",
+          "content": "财联社10月30日电，欧盟委员会提议理事会批准2027年剩余的450亿欧元乌克兰贷款额度。",
+          "publish_time": "2026-10-30 23:10:21",
+          "first_seen_at": "2026-10-30 23:16:39"
+        },
+        {
+          "source": "sina",
+          "title": "",
+          "content": "墨西哥Grupo Televisa表示，收购AT&T墨西哥业务将实质性增强其竞争地位，并提供重大的价值创造机会。",
+          "publish_time": "2026-10-30 23:08:46",
+          "first_seen_at": "2026-10-30 23:16:39"
+        },
+        {
+          "source": "eastmoney",
+          "title": "德国10月通胀率回落至2.8%",
+          "content": "【德国10月通胀率回落至2.8%】德国联邦统计局30日公布的初步数据显示，受能源价格涨幅放缓等因素影响，德国10月通胀率降至2.8%。此前，德国通胀率在9月升至3.3%，为2023年年底以来最高水平。",
+          "publish_time": "2026-10-30 23:07:53",
+          "first_seen_at": "2026-10-30 23:16:39"
+        },
+        {
+          "source": "eastmoney",
+          "title": "中金公司：投资银行业务主体变更完成",
+          "content": "【中金公司：投资银行业务主体变更完成】中金公司(601995.SH)公告称，公司已完成换股吸收合并东兴证券、信达证券，东兴证券、信达证券存量客户与业务整体迁移并入中金公司，其承接的投资银行业务均由中金公司完整承继，对外签署的协议均由中金公司继续履行。",
+          "publish_time": "2026-10-30 23:07:30",
+          "first_seen_at": "2026-10-30 23:16:39"
+        },
+        {
+          "source": "eastmoney",
+          "title": "英特尔200亿美元股票增发投资者浮亏超60亿美元 股价较发行价下跌30%",
+          "content": "【英特尔200亿美元股票增发投资者浮亏超60亿美元 股价较发行价下跌30%】英特尔股价最新报66.40美元，较今年8月11日每股95美元的增发价格下跌30.1%。英特尔当时发行约2.105亿股普通股，募资总额约200亿美元，发行规模由原计划的150亿美元扩大至200亿美元。按最新股价计算，此次增发股份市值已缩水至约139.8亿美元，较发行时减少约60.2亿美元，相当于每股浮亏28.60美元。上述损失为按发行股份全部持有至今进行的静态测算。",
+          "publish_time": "2026-10-30 23:07:30",
+          "first_seen_at": "2026-10-30 23:16:39"
+        },
+        {
+          "source": "cls",
+          "title": "英特尔200亿美元股票增发投资者浮亏超60亿美元 股价较发行价下跌30%",
+          "content": "【英特尔200亿美元股票增发投资者浮亏超60亿美元 股价较发行价下跌30%】财联社10月30日电，英特尔股价最新报66.40美元，较今年8月11日每股95美元的增发价格下跌30.1%。英特尔当时发行约2.105亿股普通股，募资总额约200亿美元，发行规模由原计划的150亿美元扩大至200亿美元。按最新股价计算，此次增发股份市值已缩水至约139.8亿美元，较发行时减少约60.2亿美元，相当于每股浮亏28.60美元。上述损失为按发行股份全部持有至今进行的静态测算。",
+          "publish_time": "2026-10-30 23:07:30",
+          "first_seen_at": "2026-10-30 23:16:39"
+        },
+        {
+          "source": "sina",
+          "title": "",
+          "content": "【中国长安汽车与中国移动签署战略合作协议】10月30日，中国长安汽车集团有限公司与中国移动通信集团有限公司在北京举行战略合作协议签约仪式。主协议签署后，重庆移动、中移上海产业研究院与中国长安汽车三大数智新能源品牌阿维塔、深蓝汽车、长安启源分别签署业务合作框架协议。",
+          "publish_time": "2026-10-30 23:06:22",
+          "first_seen_at": "2026-10-30 23:16:39"
+        },
+        {
+          "source": "sina",
+          "title": "",
+          "content": "【商务部：中瑞双方将在原协定基础上，分别对近300个税目进一步降低关税水平】商务部国际司负责人解读中国—瑞士自由贸易协定升级议定书。在货物贸易市场准入方面，双方达成了互利共赢的高水平关税减让成果，将在原自贸协定基础上，进一步降低两国间关税水平。根据最新关税减让安排，中瑞双方将在原协定基础上，分别对近300个税目进一步降低关税水平，最终实施零关税的产品覆盖双方超过99%的贸易额。具体产品方面，瑞方在原协定中已取消全部工业品关税，在升级议定书中将通过立即实施零关税或部分降税的方式，进一步大幅开放农产品市场，作出其对外最高自由化水平的开放承诺，中方含油子仁、植物油、宠物食品等重点产品将以更优惠关税待遇进入瑞市场。中方在原协定基础上，通过立即实施零关税或5年、10年过渡期实施零关税的方式，进一步给予瑞方产品优惠关税待遇，瑞士咖啡、机床、手表等输华产品将在原协定部分降税或未予降税的基础上逐步取消关税。",
+          "publish_time": "2026-10-30 23:06:18",
+          "first_seen_at": "2026-10-30 23:16:39"
+        },
+        {
+          "source": "sina",
+          "title": "",
+          "content": "欧盟委员会提议理事会批准2027年剩余的450亿欧元乌克兰贷款额度。",
+          "publish_time": "2026-10-30 23:04:26",
+          "first_seen_at": "2026-10-30 23:16:39"
+        },
+        {
+          "source": "sina",
+          "title": "",
+          "content": "【夜盘期货收盘】液化石油气连续涨4.45%，甲醇连续涨4.33%，苯乙烯连续涨4.12%，聚丙烯连续涨3.66%，PTA连续涨3.02%，短纤连续涨2.21%。",
+          "publish_time": "2026-10-30 23:00:02",
+          "first_seen_at": "2026-10-30 23:16:39"
+        },
+        {
+          "source": "sina",
+          "title": "",
+          "content": "丹麦航空航天与防务公司A/S表示，全球民用航天飞行市场持续存在的不确定性短期内将继续对公司造成影响，原因是若干预期订单尚未落地。",
+          "publish_time": "2026-10-30 22:59:53",
+          "first_seen_at": "2026-10-30 23:16:39"
+        },
+        {
+          "source": "sina",
+          "title": "",
+          "content": "丹麦航空航天与防务公司A/S更新2026年业绩指引，并发布2027年初步指引。",
+          "publish_time": "2026-10-30 22:59:43",
+          "first_seen_at": "2026-10-30 23:16:39"
+        },
+        {
+          "source": "sina",
+          "title": "",
+          "content": "【黑龙江省秋收生产基本结束】记者30日从黑龙江省农业农村厅获悉，据农情调度，截至目前，全省农作物已收获2.3亿亩，占应收面积的99.7%，除少量玉米低洼地块和籽粒冻收地块外，其他各类农作物均已完成收获。 秋收生产以来，黑龙江省各地和涉农各部门提早部署、压实责任，克服局地雨雪天气带来的不利影响，全力推进秋收工作稳步开展。 为提升收获标准、增强农机保障，黑龙江省深入实施“优机优补”政策，将200马力以上动力换挡拖拉机、玉米籽粒收获机等高端智能农机纳入补贴范围。全省新购置收获机械9000余台，收获机保有量达22万台左右，有效提升收获质效。 黑龙江省坚持秋收、秋整地、秸秆综合利用一体推进。据农情调度，截至目前，全省已完成整地1.12亿亩。(新华社)",
+          "publish_time": "2026-10-30 22:58:27",
+          "first_seen_at": "2026-10-30 23:16:39"
+        },
+        {
+          "source": "eastmoney",
+          "title": "美国FBI称已知悉币安事件 正与合作伙伴协调",
+          "content": "【美国FBI称已知悉币安事件 正与合作伙伴协调】美国FBI称已知悉币安事件，正与合作伙伴协调；FBI将协调对币安遭黑客攻击事件的调查行动。",
+          "publish_time": "2026-10-30 22:57:39",
+          "first_seen_at": "2026-10-30 23:16:39"
+        },
+        {
+          "source": "cls",
+          "title": "美国FBI称已知悉币安事件 正与合作伙伴协调",
+          "content": "【美国FBI称已知悉币安事件 正与合作伙伴协调】财联社10月30日电，美国FBI称已知悉币安事件，正与合作伙伴协调；FBI将协调对币安遭黑客攻击事件的调查行动。",
+          "publish_time": "2026-10-30 22:57:39",
+          "first_seen_at": "2026-10-30 23:16:39"
+        },
+        {
+          "source": "sina",
+          "title": "",
+          "content": "【同比增长127% 今年前9个月中瑞双边贸易额达890亿美元】商务部有关负责人表示，中瑞自贸协定升级议定书签署，有利于释放双边贸易投资更大的合作潜力，将为两国企业和人民带来更多创新机遇和发展红利。商务部有关负责人介绍，中瑞自贸协定对深化中欧经贸合作起到了促进和示范作用。数据显示，过去5年，中瑞双边贸易额年均超过了500亿美元。今年1—9月，中瑞双边贸易额达到890亿美元，同比增长127%。商务部国际司司长陈超表示，当前全球经济增长面临诸多不稳定因素，单边主义、贸易保护主义抬头，中瑞两国签署自贸协定升级议定书，充分展现了双方选择确定性和支持自由贸易的鲜明态度。今年是中瑞建立创新战略伙伴关系10周年，也是中国“十五五”开局之年，两国创新合作面临非常广阔的机遇，自贸协定升级恰逢其时。升级议定书签署后，中瑞双方将分别履行各自国内程序，推动议定书早日生效实施。（央视新闻）",
+          "publish_time": "2026-10-30 22:57:19",
+          "first_seen_at": "2026-10-30 23:16:39"
+        },
+        {
+          "source": "sina",
+          "title": "",
+          "content": "阿联酋称，油轮泄漏已得到控制。",
+          "publish_time": "2026-10-30 22:55:38",
+          "first_seen_at": "2026-10-30 23:16:39"
+        },
+        {
+          "source": "sina",
+          "title": "",
+          "content": "阿联酋称，受影响海岸线的环境清理工作仍在继续。",
+          "publish_time": "2026-10-30 22:55:28",
+          "first_seen_at": "2026-10-30 23:16:39"
+        },
+        {
+          "source": "sina",
+          "title": "",
+          "content": "币安首席执行官谈黑客攻击：攻击者还使用了自毁机制，在行动过程中摧毁了工具和痕迹；我们正在重建提现服务，在通过严格测试之前不会重新启用；我们将在周一前分享完整的储备金证明报告；本次事件中受影响的是币安自己的热钱包；攻击者利用已知的多重签名协议EIP-7702，获取了对热钱包的链上执行权限。",
+          "publish_time": "2026-10-30 22:54:24",
+          "first_seen_at": "2026-10-30 23:16:39"
+        },
+        {
+          "source": "eastmoney",
+          "title": "币安联席CEO称：提现有望40小时内恢复 完整储备证明周一发布",
+          "content": "币安联席CEO称，提现有望40小时内恢复，完整储备证明周一发布。",
+          "publish_time": "2026-10-30 22:51:17",
+          "first_seen_at": "2026-10-30 23:16:39"
+        },
+        {
+          "source": "cls",
+          "title": "",
+          "content": "财联社10月30日电，币安联席CEO称，提现有望40小时内恢复，完整储备证明周一发布。",
+          "publish_time": "2026-10-30 22:51:17",
+          "first_seen_at": "2026-10-30 23:16:39"
+        }
+      ]
+    },
+    "market_turnover": {
+      "status": "OBSERVED",
+      "scope": "沪深两市，不含北交所",
+      "definition": "新闻报道值，独立于本库日线金额求和；不能视为资金净流入",
+      "reported_total_amount": 1674463000000.0,
+      "source": "sina",
+      "title": "",
+      "publish_time": "2026-10-30 15:01:02",
+      "first_seen_at": "2026-10-30 15:02:28",
+      "content": "【沪深两市今日成交额合计1.67万亿元，新易盛成交额居首】沪深两市今日全天成交额合计1.67万亿元，较上一日增量1179.46亿元。其中，沪市成交额为7642.27亿元（上一交易日为7156.21亿元），成交量为4.98亿手（上一交易日为4.44亿手）；深市成交额为9102.36亿元（上一交易日为8408.96亿元），成交量为6.08亿手（上一交易日为5.4亿手）。新易盛成交额居首，为216.08亿元。其次是中际旭创、长鑫科技、宁德时代、兆易创新，成交额分别为206.56亿元、121.45亿元、103.06亿元、100.17亿元。",
+      "reported_change_amount": 117946000000.0
+    }
+  }
+}

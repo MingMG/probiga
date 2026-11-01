@@ -716,27 +716,45 @@
     };
     function _renderProReview(text) {
         if (!text) return '';
-        function inline(s) {
-            return escHtml(s)
-                .replace(/\*\*(.+?)\*\*/g, '<strong style="color:#f8fafc">$1</strong>')
-                .replace(/&quot;([^&]+?)&quot;/g, '<span style="color:#4fc3f7">"$1"</span>');
+        // Decode textual entities once, then escape every HTML boundary. This
+        // repairs encoded Chinese without granting the report HTML privileges.
+        function plain(value) {
+            var named = {amp:'&',lt:'<',gt:'>',quot:'"',apos:"'",nbsp:' '};
+            return String(value).replace(/&(#x[0-9a-f]+|#\d+|amp|lt|gt|quot|apos|nbsp);/gi, function(entity, code) {
+                var key = code.toLowerCase();
+                if (key.charAt(0) !== '#') return named[key];
+                var point = key.charAt(1) === 'x' ? parseInt(key.slice(2), 16) : parseInt(key.slice(1), 10);
+                return point > 0 && point <= 0x10ffff && !(point >= 0xd800 && point <= 0xdfff)
+                    ? String.fromCodePoint(point) : entity;
+            });
         }
-        var lines = String(text).replace(/\r\n/g, '\n').split('\n');
+        function inline(value) {
+            return escHtml(plain(value)).replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+        }
+        var input = String(text).replace(/\r\n?/g, '\n');
+        // Some imported documents escape every Markdown block marker. Only
+        // unwrap that whole-document form; isolated literal escapes stay text.
+        var escapedDocument = /^\s*\\#{1,6}\s+/m.test(input) && !/^\s*#{1,6}\s+/m.test(input);
+        var lines = input.split('\n').map(function(line) {
+            return escapedDocument ? line.replace(/^(\s*)\\(?=#{1,6}\s|>\s?|\|)/, '$1') : line;
+        });
         var rendered = [];
         function tableCells(line) {
             return line.trim().replace(/^\|/, '').replace(/\|$/, '').split(/(?<!\\)\|/)
                 .map(function(cell) { return cell.replace(/\\\|/g, '|'); });
         }
+        function tableSeparator(line) {
+            return /^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?$/.test(line.trim());
+        }
+        function listItem(line) { return line.trim().match(/^(?:[-*•]\s+|\d+\.\s+)(.+)$/); }
         for (var lineIndex = 0; lineIndex < lines.length; lineIndex++) {
-            var line = lines[lineIndex];
-            var s = line.trim();
+            var s = lines[lineIndex].trim();
             var m;
-            if (!s) { rendered.push('<div style="height:10px"></div>'); continue; }
-            if (s.charAt(0) === '|' && lineIndex + 1 < lines.length &&
-                    /^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?$/.test(lines[lineIndex + 1].trim())) {
+            if (!s) continue;
+            if (s.charAt(0) === '|' && lineIndex + 1 < lines.length && tableSeparator(lines[lineIndex + 1])) {
                 var headers = tableCells(s);
-                var table = '<div style="overflow-x:auto;margin:12px 0"><table class="data-table"><thead><tr>';
-                headers.forEach(function(cell) { table += '<th>' + inline(cell.trim()) + '</th>'; });
+                var table = '<div class="review-table-wrap" style="overflow-x:auto;margin:16px 0"><table class="data-table"><thead><tr>';
+                headers.forEach(function(cell) { table += '<th scope="col">' + inline(cell.trim()) + '</th>'; });
                 table += '</tr></thead><tbody>';
                 lineIndex++;
                 while (lineIndex + 1 < lines.length && lines[lineIndex + 1].trim().charAt(0) === '|') {
@@ -751,25 +769,42 @@
             m = s.match(/^(#{1,6})\s+(.+)$/);
             if (m) {
                 var level = m[1].length;
-                rendered.push('<h' + level + ' style="color:#f8fafc;margin:18px 0 10px;font-size:' + (level === 1 ? '20' : level === 2 ? '17' : '15') + 'px">' + inline(m[2]) + '</h' + level + '>');
+                rendered.push('<h' + level + ' style="color:#f8fafc;margin:24px 0 12px;font-size:' + (level === 1 ? '23' : level === 2 ? '18' : '16') + 'px;line-height:1.5">' + inline(m[2]) + '</h' + level + '>');
+                continue;
+            }
+            if (/^>\s?/.test(s)) {
+                var quotes = [];
+                do {
+                    quotes.push('<p style="margin:4px 0">' + inline(lines[lineIndex].trim().replace(/^>\s?/, '')) + '</p>');
+                    if (lineIndex + 1 >= lines.length || !/^\s*>/.test(lines[lineIndex + 1])) break;
+                    lineIndex++;
+                } while (true);
+                rendered.push('<blockquote style="border-left:3px solid #475569;padding:6px 14px;margin:12px 0 20px;color:#94a3b8;font-size:13px">' + quotes.join('') + '</blockquote>');
+                continue;
+            }
+            m = listItem(s);
+            if (m) {
+                var ordered = /^\d+\./.test(s);
+                var tag = ordered ? 'ol' : 'ul';
+                var items = [];
+                do {
+                    items.push('<li style="margin:8px 0;padding-left:3px">' + inline(m[1]) + '</li>');
+                    if (lineIndex + 1 >= lines.length) break;
+                    var nextLine = lines[lineIndex + 1].trim();
+                    var nextItem = listItem(nextLine);
+                    if (!nextItem || /^\d+\./.test(nextLine) !== ordered) break;
+                    lineIndex++;
+                    m = nextItem;
+                } while (true);
+                rendered.push('<' + tag + ' style="margin:12px 0 18px;padding-left:24px">' + items.join('') + '</' + tag + '>');
                 continue;
             }
             m = s.match(/^\u3010(.+?)\u3011$/);
             if (m) {
-                rendered.push('<div style="font-size:18px;font-weight:800;color:#93c5fd;margin:0 0 18px;text-align:center">' + escHtml(m[1]) + '</div>');
+                rendered.push('<h2 style="color:#93c5fd;margin:20px 0 12px">' + inline(m[1]) + '</h2>');
                 continue;
             }
-            m = s.match(/^(\d+)\.\s+(.+)$/);
-            if (m) {
-                rendered.push('<div style="font-size:15px;font-weight:800;color:#f8fafc;margin:18px 0 10px;border-bottom:1px solid rgba(148,163,184,.28);padding-bottom:6px">' + escHtml(m[1]) + '. ' + escHtml(m[2]) + '</div>');
-                continue;
-            }
-            m = s.match(/^[-*]\s+(.+)$/);
-            if (m) {
-                rendered.push('<div style="display:flex;gap:8px;margin:7px 0;color:#cbd5e1;line-height:1.75"><span style="color:#60a5fa;font-weight:900">•</span><span>' + inline(m[1]) + '</span></div>');
-                continue;
-            }
-            rendered.push('<div style="margin:7px 0;color:#cbd5e1;line-height:1.75">' + inline(s) + '</div>');
+            rendered.push('<p style="margin:12px 0;color:#cbd5e1;line-height:1.9;overflow-wrap:anywhere">' + inline(s) + '</p>');
         }
         return rendered.join('');
     }
@@ -6921,16 +6956,22 @@
                     var gateColor = publishStatus === 'ready' ? (qualityStatus === 'warn' ? '#f59e0b' : '#22c55e') : '#ef4444';
                     var cutoff = quantData.data_cutoff_at ? String(quantData.data_cutoff_at).replace('T', ' ').replace(/\.\d+$/, '') : '-';
                     var html = '<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px">';
-                    html += '<span style="font-size:16px;font-weight:700;color:#e0e0e0">盘后复盘与早报 | ' + escHtml(reviewDate) + '</span>';
+                    html += '<span style="font-size:16px;font-weight:700;color:#e0e0e0">盘后复盘与次日计划 | ' + escHtml(reviewDate) + '</span>';
                     html += '<div><button onclick="exportReview(\'' + escAttr(reviewDate) + '\')" style="padding:6px 14px;border:none;border-radius:6px;background:#1a73e8;color:#fff;cursor:pointer;font-size:12px">导出 Markdown</button></div></div>';
                     if (quantRes.fallback) {
                         html += '<div style="margin-bottom:12px;padding:9px 12px;border:1px solid #854d0e;background:#422006;color:#fde68a;border-radius:6px;font-size:12px">请求日 ' + escHtml(quantRes.requested_date || d) + ' 暂无量化复盘，当前显示最近可发布日 ' + escHtml(reviewDate) + '。</div>';
                     }
-                    html += '<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px;font-size:12px">';
+                    html += '<details class="review-evidence" style="margin-bottom:20px;border:1px solid #334155;border-radius:8px;padding:10px 14px;color:#94a3b8;font-size:13px"><summary style="cursor:pointer">数据与研究范围 · 行情覆盖 ' + escHtml(coverageText) + '</summary><div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:12px;font-size:12px">';
                     html += '<span style="padding:5px 9px;border-radius:12px;background:#172554;color:#bfdbfe">数据截止：' + escHtml(cutoff) + '</span>';
                     html += '<span style="padding:5px 9px;border-radius:12px;background:#172554;color:#bfdbfe">目标覆盖：' + escHtml(coverageText) + '</span>';
-                    html += '<span style="padding:5px 9px;border-radius:12px;background:#111827;color:' + gateColor + ';border:1px solid ' + gateColor + '">质量门禁：' + escHtml(gateLabel) + '</span>';
+                    html += '<span style="padding:5px 9px;border-radius:12px;background:#111827;color:' + gateColor + ';border:1px solid ' + gateColor + '">数据校验：' + escHtml(gateLabel) + '</span>';
                     html += '</div>';
+                    if (Array.isArray(quality.warnings) && quality.warnings.length) {
+                        html += '<ul style="padding-left:20px;margin:10px 0 0">';
+                        quality.warnings.forEach(function(warning) { html += '<li>' + escHtml(warning) + '</li>'; });
+                        html += '</ul>';
+                    }
+                    html += '</details>';
 
                     var researchReports = jsonF(quantData.factor_validation_json, {});
                     var selectionReview = researchReports.selection_review;
@@ -6949,9 +6990,9 @@
                                 /^\d{4}-\d{2}-\d{2}$/.test(String(morning.next_trade_date || '')) &&
                                 morning.next_trade_date > String(reviewDate).slice(0, 10) &&
                                 typeof morning.content === 'string' && morning.content.trim()) {
-                            html += '<details class="review-early-briefing" style="margin-top:16px;background:#111827;border:1px solid #334155;border-radius:8px;padding:16px 20px">';
+                            html += '<details class="review-early-briefing" open style="margin-top:16px;background:#111827;border:1px solid #334155;border-radius:8px;padding:16px 20px">';
                             html += '<summary style="cursor:pointer;font-size:15px;font-weight:700;color:#93c5fd">下一交易日早报参考 | ' + escHtml(morning.next_trade_date) + '</summary>';
-                            html += '<div style="margin:12px 0;font-size:12px;color:#94a3b8">承接复盘：' + escHtml(morning.review_date) + ' · 生成时间：' + escHtml(morning.generated_at || 'UNKNOWN') + '</div>';
+                            html += '<div style="margin:12px 0;font-size:12px;color:#94a3b8">承接复盘：' + escHtml(morning.review_date) + ' · 生成时间：' + escHtml(String(morning.generated_at || '未记录').replace('T', ' ').replace(/\.\d+(?=[+-]|$)/, '')) + '</div>';
                             html += '<div style="font-size:14px;line-height:1.75;overflow-wrap:anywhere">' + _renderProReview(morning.content) + '</div></details>';
                         }
                     } else {

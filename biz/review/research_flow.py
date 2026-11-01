@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any
@@ -82,7 +83,10 @@ def collect_context(engine, review_date: str, *, now: datetime | None = None,
     current = current.replace(tzinfo=TZ) if current.tzinfo is None else current.astimezone(TZ)
     cutoff = current if overnight else min(current, datetime.combine(
         datetime.fromisoformat(review_date).date(), time(23, 59, 59), TZ))
-    context: dict[str, Any] = {"cutoff_at": cutoff.isoformat(), "source": "ProBigA"}
+    context: dict[str, Any] = {"cutoff_at": cutoff.isoformat(), "source": "ProBigA",
+                               "market_data_asof_at": current.isoformat()}
+    from biz.review.theme_evidence import collect_theme_evidence
+    context["theme_evidence"] = collect_theme_evidence(engine, review_date, asof=current)
     # Independent optional observations cannot upgrade the gated stock coverage.
     for name, sql, params in (
         ("indices", "SELECT index_code, trade_date, open, close, high, low, amount, change_pct FROM sm_index_kline "
@@ -101,6 +105,21 @@ def collect_context(engine, review_date: str, *, now: datetime | None = None,
                              "rows": rows}
         except Exception as exc:
             context[name] = {"status": "UNKNOWN", "reason": type(exc).__name__}
+    # A close bulletin is older than the latest evening headlines. Query its
+    # exact date separately so the latest-news window cannot silently omit it.
+    try:
+        rows = read_records(text(
+            "SELECT /*+ MAX_EXECUTION_TIME(15000) */ source, title, content, publish_time, first_seen_at "
+            "FROM st_news_flash WHERE publish_time>=:start AND publish_time<=:end "
+            "AND first_seen_at<=:cutoff AND (title LIKE '%成交额合计%' OR content LIKE '%成交额合计%') "
+            "ORDER BY publish_time DESC LIMIT 5"), engine,
+            params={"start": datetime.fromisoformat(review_date),
+                    "end": min(cutoff.replace(tzinfo=None), datetime.combine(
+                        date.fromisoformat(review_date), time(23, 59, 59))),
+                    "cutoff": cutoff.replace(tzinfo=None)})
+        context["market_turnover"] = reported_turnover(rows)
+    except Exception as exc:
+        context["market_turnover"] = {"status": "UNKNOWN", "reason": type(exc).__name__}
     if overnight:
         # Reuse captured source timestamps. Public refresh jobs own acquisition;
         # a report is a read-only consumer, not a second collector.
@@ -146,11 +165,57 @@ def collect_context(engine, review_date: str, *, now: datetime | None = None,
     return context
 
 
+def reported_turnover(rows: list[dict]) -> dict:
+    """Keep a media-reported SH/SZ total distinct from computed all-A turnover."""
+    for row in rows:
+        content = str(row.get("content") or "")
+        if "沪深" not in str(row.get("title") or "") + content:
+            continue
+        parts = []
+        for label in ("沪市", "深市"):
+            match = re.search(label + r"[^。；;]{0,30}?([\d,]+(?:\.\d+)?)\s*亿元", content)
+            if not match:
+                break
+            parts.append(float(match.group(1).replace(",", "")))
+        if len(parts) != 2 or not all(value > 0 for value in parts):
+            continue
+        result = {"status": "OBSERVED", "scope": "沪深两市，不含北交所",
+                  "definition": "新闻报道值，独立于本库日线金额求和；不能视为资金净流入",
+                  "reported_total_amount": round(sum(parts) * 100_000_000, 2),
+                  "source": row.get("source"), "title": row.get("title"),
+                  "publish_time": row.get("publish_time"), "first_seen_at": row.get("first_seen_at"),
+                  "content": content[:1800]}
+        change = re.search(r"(?:较|比)(?:上一交易日|前一交易日|上一日|昨日)[^。；;]{0,12}?(增加|增量|减少|减量)\s*([\d,]+(?:\.\d+)?)\s*亿元", content)
+        if change:
+            result["reported_change_amount"] = float(change.group(2).replace(",", "")) * 100_000_000 * (1 if change.group(1) in {"增加", "增量"} else -1)
+        return result
+    return {"status": "UNKNOWN", "reason": "no_exact_session_sh_sz_turnover_bulletin"}
+
+
 def attach_review(engine, digest: dict, *, now=None, completion=None, context=None) -> dict:
     from biz.review.market_decision import generate_research
 
     target = str(digest["review_date"])[:10]
     assert_digest(digest, target)
+    context = context if context is not None else collect_context(engine, target, now=now)
+    amount_quality = (context.get("theme_evidence") or {}).get("amount_quality")
+    if amount_quality is not None:
+        from biz.review.amount_integrity import apply_amount_integrity
+        market = digest.get("market_structure_json") or {}
+        def receipt(key: str, field: str) -> dict:
+            sampled = amount_quality.get(key) or {"status": "UNKNOWN"}
+            full = market.get(field)
+            # A limited clean sample cannot upgrade unknown market coverage,
+            # nor should it erase an existing complete calculation. A sampled
+            # inconsistency is a direct contradiction and must quarantine it.
+            if full and not sampled.get("inconsistent_count"):
+                return full
+            return sampled
+        verified = apply_amount_integrity(
+            digest, target_quality=receipt("target", "amount_quality"),
+            previous_quality=receipt("previous", "previous_amount_quality"))
+        digest.clear()
+        digest.update(verified)
     previous_date = (digest["quality_json"].get("source_dates") or {}).get("previous_bars")
     previous = load_digest(engine, str(previous_date)[:10], required=False) if previous_date else None
     prior_factors = (previous or {}).get("factor_validation_json") or {}
@@ -161,7 +226,7 @@ def attach_review(engine, digest: dict, *, now=None, completion=None, context=No
     research = generate_research(
         digest, report_kind="review", next_trade_date=next_session(engine, target),
         previous_research=previous_research, now=now, completion=completion,
-        context=context if context is not None else collect_context(engine, target, now=now),
+        context=context,
     )
     research["research_sha256"] = artifact_hash(research)
     digest["factor_validation_json"]["market_decision"] = research

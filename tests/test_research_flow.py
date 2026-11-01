@@ -336,3 +336,38 @@ def test_overnight_quotes_require_market_time_after_baseline_close(db):
     assert quotes['fresh']['change_pct'] == 2
     assert quotes['future']['availability'] == 'MISSING'
     assert quotes['unknown']['availability'] == 'MISSING'
+
+
+def test_reported_turnover_keeps_sh_sz_scope_and_source_instead_of_bad_kline_sum():
+    row = {"source": "sina", "title": "沪深两市今日成交额合计1.67万亿元",
+           "content": "沪深两市全天成交额合计1.67万亿元，较上一日增量1179.46亿元。"
+                      "其中，沪市成交额为7642.27亿元（上一交易日为7156.21亿元）；"
+                      "深市成交额为9102.36亿元（上一交易日为8408.96亿元）。",
+           "publish_time": "2026-10-30 15:01:02", "first_seen_at": "2026-10-30 15:02:28"}
+    observed = research_flow.reported_turnover([row])
+    assert observed["status"] == "OBSERVED"
+    assert observed["reported_total_amount"] == 1_674_463_000_000
+    assert observed["reported_change_amount"] == 117_946_000_000
+    assert "不含北交所" in observed["scope"]
+    assert observed["publish_time"] == row["publish_time"]
+    assert research_flow.reported_turnover([dict(row, content="沪深市场金额口径未给出")])["status"] == "UNKNOWN"
+
+
+@pytest.mark.parametrize("inconsistent,expected_amount", [(0, 100_000_000), (1, None)])
+def test_review_sample_preserves_full_verified_amount_unless_it_contradicts(db, monkeypatch, inconsistent, expected_amount):
+    digest = _digest()
+    market = digest["market_structure_json"]
+    market.update(previous_sample_count=5200, total_amount=100_000_000,
+                  previous_total_amount=90_000_000, amount_change_pct=11.11)
+    market["amount_quality"] = {"status": "OBSERVED", "trade_date": REVIEW, "sample_count": 5200, "checked_count": 5200}
+    market["previous_amount_quality"] = {"status": "OBSERVED", "trade_date": "2026-08-27", "sample_count": 5200, "checked_count": 5200}
+    context = {"theme_evidence": {"amount_quality": {
+        "target": {"status": "UNKNOWN" if inconsistent else "OBSERVED", "trade_date": REVIEW,
+                   "sample_count": 16, "inconsistent_count": inconsistent},
+        "previous": {"status": "OBSERVED", "trade_date": "2026-08-27", "sample_count": 16}}}}
+    complete = Mock(return_value={"content": "核验后的复盘"})
+    monkeypatch.setattr(market_decision, "generate_research", complete)
+    research_flow.attach_review(db, digest, context=context)
+    assert digest["market_structure_json"]["total_amount"] == expected_amount
+    assert digest["market_structure_json"]["previous_total_amount"] == 90_000_000
+    assert complete.call_args.args[0] is digest

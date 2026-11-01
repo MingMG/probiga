@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 from sqlalchemy import bindparam, text
 
+from biz.review.amount_integrity import assess_amount_integrity, apply_amount_integrity
 from server.common.batch_db import create_batch_engine, read_frame
 from server.common.runtime_table_schema import (
     RuntimeColumn,
@@ -56,7 +57,6 @@ _BAR_REQUIRED = {
     "open",
     "close",
     "pre_close",
-    "amount",
 }
 
 
@@ -276,7 +276,7 @@ def _normalise_bars(
     )
 
     for column in ("open", "close", "pre_close", "amount"):
-        bars[column] = pd.to_numeric(bars[column], errors="coerce")
+        bars[column] = pd.to_numeric(bars[column], errors="coerce") if column in bars else float("nan")
     bars["_valid_bar"] = (
         (bars["stock_code"] != "")
         & bars["trade_date"].eq(expected_date)
@@ -284,7 +284,6 @@ def _normalise_bars(
         & bars["open"].gt(0)
         & bars["close"].gt(0)
         & bars["pre_close"].gt(0)
-        & bars["amount"].ge(0)
     )
     bars["_return_pct"] = (bars["close"] / bars["pre_close"] - 1.0) * 100.0
     bars["_open_gap_pct"] = (bars["open"] / bars["pre_close"] - 1.0) * 100.0
@@ -335,8 +334,12 @@ def calc_market_cross_section(
 
     current = target_bars[target_bars["_valid_bar"]].copy()
     previous = previous_bars[previous_bars["_valid_bar"]].copy()
-    total_amount = float(current["amount"].sum())
-    previous_amount = float(previous["amount"].sum())
+    current_amount_quality = assess_amount_integrity(current)
+    previous_amount_quality = assess_amount_integrity(previous)
+    current_amount_ok = current_amount_quality["status"] == "OBSERVED"
+    previous_amount_ok = previous_amount_quality["status"] == "OBSERVED"
+    total_amount = float(current["amount"].sum()) if current_amount_ok else None
+    previous_amount = float(previous["amount"].sum()) if previous_amount_ok else None
 
     market_cap_weighted: float | None = None
     market_cap_coverage: float | None = None
@@ -361,7 +364,7 @@ def calc_market_cross_section(
             _weighted_average(current["_return_pct"], current["pre_close"])
         ),
         "amount_weighted_return_pct": _round(
-            _weighted_average(current["_return_pct"], current["amount"])
+            _weighted_average(current["_return_pct"], current["amount"]) if current_amount_ok else None
         ),
         "market_cap_weighted_return_pct": _round(market_cap_weighted),
         "market_cap_coverage": _round(market_cap_coverage),
@@ -370,8 +373,10 @@ def calc_market_cross_section(
         "total_amount": _round(total_amount, 2),
         "previous_total_amount": _round(previous_amount, 2),
         "amount_change_pct": _round(
-            (total_amount / previous_amount - 1.0) * 100.0 if previous_amount > 0 else None
+            (total_amount / previous_amount - 1.0) * 100.0
+            if total_amount is not None and previous_amount is not None and previous_amount > 0 else None
         ),
+        "amount_integrity": {"current": current_amount_quality, "previous": previous_amount_quality},
     }
 
 
@@ -495,6 +500,7 @@ def calc_decision_facts(
             "positive_share": _round(matched["_return_pct"].gt(0).mean()) if usable else None,
             "reason": None if usable else "昨日强势样本的当日匹配覆盖不足",
         }
+    amount_usable = assess_amount_integrity(current, trade_date=target)["status"] == "OBSERVED"
     mapping = _frame(membership)
     if current_usable and {"stock_code", "industry_name"}.issubset(mapping.columns) and not mapping.empty:
         groups = current.merge(mapping[["stock_code", "industry_name"]], on="stock_code")
@@ -510,7 +516,9 @@ def calc_decision_facts(
                 if len(group) < min_industry_members:
                     continue
                 for identity, column in (("相对强度前排候选", "_return_pct"), ("成交额容量核心候选", "amount")):
-                    traded = group[group["amount"].gt(0)]
+                    if column == "amount" and not amount_usable:
+                        continue
+                    traded = group[group["amount"].gt(0)] if column == "amount" else group
                     if traded.empty:
                         continue
                     row = traded.sort_values([column, "stock_code"], ascending=[False, True]).iloc[0]
@@ -524,10 +532,13 @@ def calc_decision_facts(
                             "evidence_type": "OBSERVED", "trade_date": target.isoformat(),
                             "return_pct": _round(row["_return_pct"]),
                             "previous_return_pct": _round(row.get("previous_return_pct")),
-                            "amount": _round(row["amount"], 2), "industry_sample_count": len(group),
+                            "amount": _round(row["amount"], 2) if amount_usable else None,
+                            "amount_status": "OBSERVED" if amount_usable else "UNKNOWN",
+                            "industry_sample_count": len(group),
                             "industry_median_return_pct": _round(group["_return_pct"].median()),
                             "industry_up_share": _round(group["_return_pct"].gt(0).mean()),
-                            "industry_amount_share": _round(float(row["amount"]) / float(group["amount"].sum())),
+                            "industry_amount_share": _round(float(row["amount"]) / float(group["amount"].sum()))
+                            if amount_usable and float(group["amount"].sum()) > 0 else None,
                         },
                         "invalidation": "相对强度或成交额领先消失、行业上涨广度收缩；仅日线身份候选，等待盘中联动与分歧承接验证",
                         "unknown": "定价权、龙头/跟风因果身份、边际买家及净资金流无法由此确认",
@@ -657,7 +668,7 @@ def _industry_daily(
     membership: pd.DataFrame,
     *,
     min_members: int,
-    market_amount: float,
+    market_amount: float | None,
 ) -> pd.DataFrame:
     merged = bars[bars["_valid_bar"]].merge(membership, on="stock_code", how="inner")
     if merged.empty:
@@ -671,10 +682,12 @@ def _industry_daily(
     grouped = grouped[grouped["sample_count"].ge(min_members)].copy()
     if grouped.empty:
         return grouped
-    grouped["amount_share"] = grouped["amount"] / market_amount if market_amount > 0 else None
+    if market_amount is None:
+        grouped["amount"] = float("nan")
+    grouped["amount_share"] = grouped["amount"] / market_amount if market_amount is not None and market_amount > 0 else None
     grouped = grouped.sort_values(
-        ["median_return_pct", "amount", "industry_name"],
-        ascending=[False, False, True],
+        ["median_return_pct", "industry_name"],
+        ascending=[False, True],
         kind="stable",
     )
     grouped["rank"] = range(1, len(grouped) + 1)
@@ -698,8 +711,12 @@ def calc_industry_rotation(
     introduce survivorship and classification look-ahead.
     """
 
-    target_amount = float(target_bars.loc[target_bars["_valid_bar"], "amount"].sum())
-    previous_amount = float(previous_bars.loc[previous_bars["_valid_bar"], "amount"].sum())
+    current_valid = target_bars.loc[target_bars["_valid_bar"]]
+    previous_valid = previous_bars.loc[previous_bars["_valid_bar"]]
+    amount_usable = assess_amount_integrity(current_valid)["status"] == "OBSERVED"
+    previous_amount_usable = assess_amount_integrity(previous_valid)["status"] == "OBSERVED"
+    target_amount = float(current_valid["amount"].sum()) if amount_usable else None
+    previous_amount = float(previous_valid["amount"].sum()) if previous_amount_usable else None
     current = _industry_daily(
         target_bars,
         industries,
@@ -786,7 +803,9 @@ def calc_industry_rotation(
             if comparison_available
             else []
         ),
-        "amount_concentration_top5": _round(amount_ranked["amount_share"].sum()),
+        "rank_basis": "median_return_pct_then_industry_name",
+        "amount_status": "OBSERVED" if amount_usable else "UNKNOWN",
+        "amount_concentration_top5": _round(amount_ranked["amount_share"].sum()) if amount_usable else None,
         "leaders": records(combined.head(5)),
         "laggards": records(combined.tail(3).sort_values("rank", ascending=False)),
         "industries": records(combined),
@@ -987,13 +1006,14 @@ def _market_paragraph(market: Mapping[str, Any]) -> str:
         opening = "市场全天跌多涨少。"
     weights = [
         f"价格加权{_pct_direction(market.get('price_weighted_return_pct'))}",
-        f"成交额加权{_pct_direction(market.get('amount_weighted_return_pct'))}",
+        *([f"成交额加权{_pct_direction(market.get('amount_weighted_return_pct'))}"]
+          if market.get("amount_weighted_return_pct") is not None else []),
     ]
     if market.get("market_cap_weighted_return_pct") is not None:
         weights.insert(1, f"市值加权{_pct_direction(market.get('market_cap_weighted_return_pct'))}")
     amount_change = market.get("amount_change_pct")
     if amount_change is None:
-        amount_sentence = "上一交易日成交额不可用，不判断量能变化。"
+        amount_sentence = "成交额量价一致性或前日口径未获验证，不判断量能变化。"
     elif amount_change > 0.05:
         amount_sentence = f"成交额为{_amount_text(market.get('total_amount'))}，较上一交易日放量{amount_change:.1f}%。"
     elif amount_change < -0.05:
@@ -1016,7 +1036,8 @@ def _industry_paragraph(industry: Mapping[str, Any]) -> str:
         return f"{industry.get('reason', '申万一级行业数据不足')}，本段不作轮动判断。"
     leaders = industry.get("leaders", [])[:4]
     leader_text = "、".join(
-        f"{item['industry_name']}（中位数{_pct_direction(item.get('median_return_pct'))}，成交占比{item.get('amount_share', 0):.1%}）"
+        f"{item['industry_name']}（中位数{_pct_direction(item.get('median_return_pct'))}"
+        + (f"，成交占比{item['amount_share']:.1%}" if item.get("amount_share") is not None else "") + "）"
         for item in leaders
     )
     state = industry.get("rotation_state")
@@ -1032,8 +1053,10 @@ def _industry_paragraph(industry: Mapping[str, Any]) -> str:
     return (
         f"申万一级行业中，领涨方向为{leader_text}。"
         + comparison
-        + f"成交额前五行业合计占全市场{industry.get('amount_concentration_top5', 0):.1%}；"
-        + "该指标仅描述成交集中度，不据此推断资金性质。"
+        + (f"成交额前五行业合计占全市场{industry['amount_concentration_top5']:.1%}；"
+           + "该指标仅描述成交集中度，不据此推断资金性质。"
+           if industry.get("amount_concentration_top5") is not None
+           else "成交额一致性未获验证，不展示行业金额占比和容量排名。")
     )
 
 
@@ -1239,15 +1262,15 @@ def generate_quant_digest_from_frames(
         expected=f">={config.min_market_coverage:.2%}",
         message=f"上一交易日有效行情覆盖率{previous_coverage:.2%}低于门槛" if previous_coverage < config.min_market_coverage else "",
     )
-    target_amount = float(current_valid["amount"].sum()) if not current_valid.empty else 0.0
-    previous_amount = float(previous_valid["amount"].sum()) if not previous_valid.empty else 0.0
-    quality.gate(
-        "positive_turnover",
-        target_amount > 0 and previous_amount > 0,
-        actual={"target": target_amount, "previous": previous_amount},
-        expected="both > 0",
-        message="目标日或上一交易日成交额为零，拒绝发布" if target_amount <= 0 or previous_amount <= 0 else "",
-    )
+    target_amount_quality = assess_amount_integrity(current_valid, trade_date=target)
+    previous_amount_quality = assess_amount_integrity(previous_valid, trade_date=expected_previous)
+    for label, receipt in (("target", target_amount_quality), ("previous", previous_amount_quality)):
+        quality.gate(
+            f"{label}_amount_integrity", receipt["status"] == "OBSERVED",
+            actual=receipt, expected="all same-day raw amount/volume prices inside [low, high]",
+            message=f"{label}成交额未通过量价一致性核验，金额产物降级为未知"
+            if receipt["status"] != "OBSERVED" else "", hard=False,
+        )
 
     current_snapshot = _industry_snapshot_contract(
         industries,
@@ -1581,6 +1604,9 @@ def generate_quant_digest_from_frames(
         "factor_validation_json": factor,
         "compact_review": "",
     }
+    result = apply_amount_integrity(
+        result, target_quality=target_amount_quality, previous_quality=previous_amount_quality,
+    )
     result["compact_review"] = render_compact_review(result)
     return result
 

@@ -1,4 +1,6 @@
 import json
+import hashlib
+import re
 from datetime import date
 from pathlib import Path
 import shutil
@@ -213,5 +215,66 @@ async function render(patch, asJsonString = true) {
   assert.doesNotMatch(container.innerHTML, /review-early-briefing/);
 })().catch(error => { console.error(error); process.exit(1); });
 """.replace("ESCAPING", json.dumps(escaping)).replace("RENDERER", json.dumps(renderer)).replace("REVIEW", json.dumps(review)), encoding="utf-8")
+    result = subprocess.run([node, str(runner)], capture_output=True, text=True, encoding="utf-8", timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+
+def test_app_script_cache_identity_tracks_its_own_content():
+    root = Path(__file__).resolve().parents[1]
+    app = (root / "server/static/js/app.js").read_bytes().replace(b"\r\n", b"\n")
+    index = (root / "server/static/index.html").read_text(encoding="utf-8")
+    script = re.search(r'<script src="(/static/js/app\.js\?v=([0-9a-f]{16}))"></script>', index)
+    assert script, "app.js must use its content identity, not the previously cached v=141 URL"
+    assert script.group(2) == hashlib.sha256(app).hexdigest()[:16]
+    assert script.group(1) != "/static/js/app.js?v=141"
+    # The observed old browser cache remains keyed to v=141. A content update
+    # must request a different URL even if that entry is still considered fresh.
+    old_browser_cache = {"/static/js/app.js?v=141": "old Markdown renderer"}
+    assert script.group(1) not in old_browser_cache
+
+
+def test_report_markdown_preserves_semantics_and_decodes_text_without_allowing_html(tmp_path):
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node.js unavailable")
+    source = (Path(__file__).resolve().parents[1] / "server/static/js/app.js").read_text(encoding="utf-8")
+    renderer = source[source.index("    function _renderProReview(text) {"):source.index("    function portfolioCapitalInflowAlerts(")]
+    escaping = source[source.index("    function escAttr(v) {"):source.index("    function safeText(v)")]
+    runner = tmp_path / "readable-reports.cjs"
+    runner.write_text(r"""
+const assert = require('node:assert/strict');
+const vm = require('node:vm');
+const context = {};
+vm.runInNewContext(ESCAPING + RENDERER, context);
+const markdown = '# A股盘后复盘｜2026-10-30\n\n> 行情日：10月30日\n> 新闻截止：23:59\n\n## 主线与身份\n\n先观察**分歧承接**。\n\n- &#x6765;源：同花顺\n- &lt;script&gt;alert(1)&lt;/script&gt;\n\n1. 验证条件\n2. 放弃条件\n\n| 方向 | 证据 |\n|---|---|\n| CRO | A\\|B |\n\n&#x3c;img src=x onerror=alert(2)&#x3e;\n\n<script>alert(3)</script>';
+const html = context._renderProReview(markdown);
+assert.match(html, /<h1[^>]*>A股盘后复盘｜2026-10-30<\/h1>/);
+assert.match(html, /<h2[^>]*>主线与身份<\/h2>/);
+assert.match(html, /<blockquote[^>]*><p[^>]*>行情日：10月30日<\/p><p[^>]*>新闻截止：23:59<\/p><\/blockquote>/);
+assert.match(html, /<ul[^>]*><li[^>]*>来源：同花顺<\/li>/);
+assert.match(html, /<ol[^>]*><li[^>]*>验证条件<\/li><li[^>]*>放弃条件<\/li><\/ol>/);
+assert.match(html, /<strong>分歧承接<\/strong>/);
+assert.match(html, /<th scope="col">方向<\/th>/);
+assert.match(html, /<td>A\|B<\/td>/);
+assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+assert.match(html, /&lt;img src=x onerror=alert\(2\)&gt;/);
+assert.doesNotMatch(html, /<(script|img)\b/);
+assert.doesNotMatch(html, /&#x6765;|&amp;#x6765;/);
+const imported = String.raw`\# 次日早报
+\> 目标：11月2日
+\## 盘中验证
+\| 时间 | 条件 |
+\|---|---|
+\| 开盘 | 等待确认 |`;
+const importedHtml = context._renderProReview(imported);
+assert.match(importedHtml, /<h1[^>]*>次日早报<\/h1>/);
+assert.match(importedHtml, /<blockquote/);
+assert.match(importedHtml, /<table class="data-table">/);
+assert.match(importedHtml, /<td>开盘<\/td>/);
+const literal = context._renderProReview('这是 \\# 字面符号，不是报告标题。');
+assert.doesNotMatch(literal, /<h1/);
+assert.match(literal, /\\# 字面符号/);
+""".replace("ESCAPING", json.dumps(escaping)).replace("RENDERER", json.dumps(renderer)), encoding="utf-8")
     result = subprocess.run([node, str(runner)], capture_output=True, text=True, encoding="utf-8", timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr

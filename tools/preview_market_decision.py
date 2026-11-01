@@ -61,6 +61,13 @@ def main() -> int:
         return complete
     if not args.resume:
         attach_review(engine, digest, completion=completion_for("review"))
+        # The research boundary may quarantine fields after independent source
+        # checks. Keep the accepted fact snapshot, not the pre-check replay.
+        accepted_facts = dict(digest)
+        accepted_facts["factor_validation_json"] = {
+            key: value for key, value in digest["factor_validation_json"].items()
+            if key not in {"market_decision", "early_briefing"}}
+        facts_path.write_text(json.dumps(accepted_facts, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     (output / "digest.json").write_text(json.dumps(digest, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     (output / "review.md").write_text(digest["compact_review"], encoding="utf-8")
     print("RUNNING stage=briefing completed=2 total=3", flush=True)

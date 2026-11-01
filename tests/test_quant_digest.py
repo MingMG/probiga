@@ -54,7 +54,7 @@ def _bars(
                 "low": previous_close * (1 + return_value - 0.01),
                 "pre_close": previous_close,
                 "amount": 100_000_000 + index * 1_000_000,
-                "volume": 1_000_000 + index,
+                "volume": (100_000_000 + index * 1_000_000) / (previous_close * (1 + return_value)),
                 "etl_sync_at": cutoff or f"{trade_date} 15:45:00",
             }
         )
@@ -672,3 +672,49 @@ def test_ready_upsert_guards_against_older_ready_generation_and_cutoff(monkeypat
     upsert_sql = engine.connection.calls[-1][0]
     assert "VALUES(generated_at) < generated_at" in upsert_sql
     assert "VALUES(data_cutoff_at) < data_cutoff_at" in upsert_sql
+
+
+def test_inconsistent_amount_is_isolated_while_price_breadth_and_return_ranks_remain_usable():
+    bars = _bars(TARGET)
+    bars.loc[0, "amount"] = 1  # Reproduces the observed amount/volume outside OHLC failure.
+    result = _ready_result(target_bars=bars)
+    market = result["market_structure_json"]
+    industry = result["industry_rotation_json"]
+    assert result["publish_status"] == PUBLISH_READY
+    assert market["sample_count"] == 125
+    assert market["decision_facts"]["breadth"]["evidence_type"] == "OBSERVED"
+    assert market["total_amount"] is None
+    assert market["amount_weighted_return_pct"] is None
+    assert market["amount_change_pct"] is None
+    assert market["previous_total_amount"] > 0
+    assert _gate(result, "target_amount_integrity")["status"] == "warn"
+    assert market["amount_integrity"]["current"]["samples"][0]["stock_code"] == "600000"
+    assert industry["status"] == "available"
+    assert industry["amount_concentration_top5"] is None
+    assert all(item["amount_share"] is None and item["rank"] is not None for item in industry["industries"])
+    assert all(item["identity"] == "相对强度前排候选" for item in market["decision_facts"]["stock_roles"]["candidates"])
+    assert "放量" not in result["compact_review"]
+    assert "缩量" not in result["compact_review"]
+    assert "成交额加权" not in result["compact_review"]
+
+
+def test_missing_amount_fields_never_remove_valid_price_samples_or_block_price_report():
+    result = _ready_result(target_bars=_bars(TARGET).drop(columns=["amount", "volume"]))
+    assert result["publish_status"] == PUBLISH_READY
+    market = result["market_structure_json"]
+    assert market["sample_count"] == 125
+    assert market["return_median_pct"] is not None
+    assert market["total_amount"] is None
+    assert result["quality_json"]["amount_integrity"]["current"]["missing_count"] == 125
+
+
+def test_bad_previous_amount_only_removes_previous_total_and_comparison():
+    bars = _bars(PREVIOUS)
+    bars.loc[0, "volume"] = 0
+    result = _ready_result(previous_bars=bars)
+    market = result["market_structure_json"]
+    assert market["total_amount"] > 0
+    assert market["amount_weighted_return_pct"] is not None
+    assert market["previous_total_amount"] is None
+    assert market["amount_change_pct"] is None
+    assert result["industry_rotation_json"]["amount_concentration_top5"] is not None

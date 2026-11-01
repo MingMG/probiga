@@ -4,6 +4,7 @@ import copy
 import json
 from datetime import datetime
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 from types import SimpleNamespace
@@ -41,9 +42,10 @@ def answer():
     return {
         "conclusion": claim(),
         "permission": {**claim(), "action": "OBSERVE", "risk_veto": False},
+        "market_reading": claim("广度尚未占优，修复需要强势股反馈与板块扩散共同支持。现有日线不足以判断分时承接，方向持续性仍待验证。"),
         "roles": [{"role": role, **claim()} for role in ROLES],
         "mainlines": [{"direction": "银行", "stage": "待确认", "assessment": claim(),
-                       "identities": [{"stock_code": "600000", "identity": "容量候选",
+                       "identities": [{"stock_code": "600000", "identity": "观察候选",
                                        "assessment": claim(), "trigger": "板块广度同步转强", "abandon": "仅个股上涨"}]}],
         "scenarios": [{"name": "修复待确认", "premise": "广度未占优", "trigger": "广度与前日强势反馈同步改善",
                        "action": "只观察持续性", "invalidation": "后排继续掉队", "counter_evidence": "新增成交未扩散"}],
@@ -60,12 +62,18 @@ def run(output=None, **kwargs):
                              completion=lambda _messages: json.dumps(answer() if output is None else output, ensure_ascii=False), **kwargs)
 
 
-def test_shared_research_renders_evidence_roles_scenarios_and_exact_content():
+def test_shared_research_merges_roles_into_a_readable_report_and_retains_audit():
     research = run()
     assert research["status"] == "COMPLETE"
     assert research["content"] == render_research(research)
-    assert "[OBSERVED]" in research["content"] and "[UNKNOWN]" in research["content"]
-    assert all(role in research["content"] for role in ROLES)
+    assert "[OBSERVED]" not in research["content"] and "[UNKNOWN]" not in research["content"]
+    assert all(role not in research["content"] for role in ROLES)
+    assert {role["role"] for role in research["roles"]} == set(ROLES)
+    assert "市场与情绪" in research["content"]
+    assert "仅做观察" in research["content"] and "OBSERVE" not in research["content"]
+    assert research["rules_sha256"] not in research["content"]
+    assert research["source_digest_sha256"] not in research["content"]
+    assert research["schema_version"] == "probiga.market-decision.v2"
     assert "放弃" in research["content"]
     assert "下一交易日：2026-11-02" in research["content"]
     assert "giant_ledger" not in json.dumps(research["evidence"])
@@ -291,7 +299,8 @@ def test_live_briefing_regression_accepts_correct_unknown_roles_with_same_frozen
     result = generate_research(data, report_kind="briefing", next_trade_date="2026-11-02", now=NOW,
                                previous_research=parent, completion=lambda _: json.dumps(output))
     assert result["status"] == "COMPLETE"
-    assert "尚待目标交易日盘中验证" in result["content"]
+    assert any("尚待目标交易日盘中验证" in role["text"] for role in result["roles"])
+    assert "尚待目标交易日盘中验证" not in result["content"]
     assert "本期为闭市复盘" not in result["content"]
 
 
@@ -351,8 +360,305 @@ def test_context_cutoff_is_persisted_and_inherited_independently_of_late_generat
     assert payload["previous_research"]["context_cutoff_at"] == parent["context_cutoff_at"]
     assert payload["previous_research"]["generated_at"] == "2026-11-01T16:00:00+08:00"
     assert payload["context_cutoff_at"] == "2026-11-01T15:00:00.000000+08:00"
-    assert "新闻/外围截止：2026-10-30T20:00:00.000000+08:00" in parent["content"]
+    assert "新闻截止：10月30日 20:00" in parent["content"]
+    assert "行情同步：10月30日 15:45" in parent["content"]
+    assert "补记" in parent["content"]
+    assert "T20:00" not in parent["content"]
     assert "不是 generated_at" in messages[0]["content"]
+
+
+@pytest.mark.parametrize("text_value,reason", [
+    ("收盘位置靠低显示尾盘无承接，修复失败。", "intraday_conclusion_without_intraday_evidence"),
+    ("收盘靠低说明尾盘承接薄弱。", "intraday_conclusion_without_intraday_evidence"),
+    ("边际买家缺位，反弹成为退出流动性。", "participant_intent_without_evidence"),
+    ("反抽更可能是存量资金自救。", "participant_intent_without_evidence"),
+    ("任何方向暴露都属不可恢复性风险，应保持空仓。", "portfolio_instruction_without_account_risk_budget"),
+    ("市场走弱，必须清仓。", "portfolio_instruction_without_account_risk_budget"),
+    ("当前权限WAIT，只能等待。", "internal_labels_in_public_narrative"),
+])
+def test_rejected_live_report_assertions_cannot_be_relabelled_as_inferences(text_value, reason):
+    output = answer()
+    output["market_reading"] = claim(text_value)
+    with pytest.raises(ResearchError, match=reason):
+        run(output)
+
+
+def test_daily_low_close_is_allowed_with_its_actual_evidence_but_is_not_intraday_support():
+    data = digest()
+    data["market_structure_json"]["decision_facts"]["close_position"] = {
+        "evidence_type": "OBSERVED", "median": 0.081}
+    result = _run_claim(data, claim("收盘位置中位数8.10%，多数样本收于全天区间低位；不能据此判断尾盘无承接。",
+                                   "OBSERVED", ["input.market.decision_facts.close_position.median"]))
+    assert "8.10%" in result["content"]
+    assert "日线不能说明尾盘分时承接" in result["content"]
+
+
+@pytest.mark.parametrize("target,text_value,reason", [
+    ("trigger", "前30分钟上涨占比超过50%且强势股转正。", "uncalibrated_percentage_trigger"),
+    ("trigger", "上涨比例回到30%以上再观察。", "uncalibrated_percentage_trigger"),
+    ("trigger", "前30分钟上涨家数回升至50%以上。", "uncalibrated_percentage_trigger"),
+    ("trigger", "尾盘收盘位置仍低于20%则放弃。", "uncalibrated_percentage_trigger"),
+    ("trigger", "上涨家数超过3000家。", "uncalibrated_count_trigger"),
+    ("trigger", "前30分钟极值下跌家数较昨日638家收缩。", "intraday_compared_with_full_session"),
+    ("trigger", "午间成交额较前一交易日全日增加。", "intraday_compared_with_full_session"),
+    ("action", "修复失败则必须空仓。", "portfolio_instruction_without_account_risk_budget"),
+])
+def test_next_day_conditions_reject_invented_thresholds_and_incomparable_time_windows(target, text_value, reason):
+    output = answer()
+    output["scenarios"][0][target] = text_value
+    with pytest.raises(ResearchError, match=reason):
+        run(output)
+
+
+def test_comparable_intraday_extreme_counts_are_allowed_when_that_dataset_exists():
+    output = answer()
+    output["checks"][1]["signal"] = "前30分钟极值下跌家数较昨日同期收缩时，继续观察强势反馈。"
+    result = run(output, context={"intraday_comparisons": {
+        "status": "OBSERVED", "window": "前30分钟", "extreme_down_count": 52}})
+    assert "昨日同期收缩" in result["content"]
+
+
+def test_unknown_amount_quality_blocks_volume_claims_even_when_breadth_is_valid():
+    data = digest()
+    data["market_structure_json"]["amount_quality"] = {"status": "UNKNOWN", "reason": "隐含均价不在高低价范围"}
+    output = answer()
+    output["market_reading"] = claim("放量普跌表明风险释放。", refs=["input.market.up_coverage", "input.market.amount_change_pct"])
+    with pytest.raises(ResearchError, match="turnover_conclusion_without_validated_comparison"):
+        generate_research(data, report_kind="review", next_trade_date="2026-11-02", now=NOW,
+                          completion=lambda _: json.dumps(output))
+    result = generate_research(data, report_kind="review", next_trade_date="2026-11-02", now=NOW,
+                               completion=lambda _: json.dumps(answer()))
+    assert "全A日线成交额及其变化待核验" in result["content"]
+    assert "12,340.00亿元" not in result["content"]
+
+
+def test_independent_sh_sz_turnover_can_be_reported_with_its_own_scope_and_units():
+    output = answer()
+    output["market_reading"] = claim("沪深两市成交额16744.63亿元，不含北交所；这不能证明资金净流入。", "OBSERVED",
+                                    ["input.context.market_turnover.reported_total_amount"])
+    result = run(output, context={"market_turnover": {"status": "OBSERVED", "scope": "沪深两市，不含北交所",
+                                                    "reported_total_amount": 1_674_463_000_000}})
+    assert "16744.63亿元" in result["content"]
+    assert "沪深两市成交额 16,744.63亿元（不含北交所）" in result["content"]
+    output["market_reading"] = claim("沪深两市放量，但不能推断净流入。", refs=["input.context.market_turnover.reported_total_amount"])
+    with pytest.raises(ResearchError, match="turnover_conclusion_without_validated_comparison"):
+        run(output, context={"market_turnover": {"status": "OBSERVED", "reported_total_amount": 1_674_463_000_000}})
+
+
+def theme_context(*, associated=True):
+    return {"theme_evidence": {"status": "OBSERVED", "scope": "热门概念/行业与热股样本，不是全市场",
+                               "history_dates": ["2026-10-29", "2026-10-30"],
+                               "sectors": [{"name": "银行", "change_pct": 0.8, "trade_date": "2026-10-30"}],
+                               "stocks": [{"stock_code": "600000", "short_name": "浦发银行", "change_pct": 1.2,
+                                           "sector_names": ["银行" if associated else "无关方向"]}]}}
+
+
+def theme_answer():
+    output = answer()
+    output["mainlines"][0]["assessment"] = claim("银行在热门方向样本中相对抗跌，尚不能证明持续主线。",
+                                                refs=["input.context.theme_evidence.sectors[0].change_pct"])
+    output["mainlines"][0]["identities"][0].update(
+        identity="身份待确认", assessment=claim("浦发银行是相关样本中的观察候选；缺少分歧承接和带动证据，不能确认为龙头或中军。",
+                                               refs=["input.context.theme_evidence.stocks[0].change_pct"]))
+    return output
+
+
+def test_existing_theme_and_linked_stock_evidence_must_be_used_even_without_pit_mapping():
+    output = theme_answer()
+    output["mainlines"] = []
+    with pytest.raises(ResearchError, match="available_themes_not_analysed"):
+        run(output, context=theme_context())
+    output = theme_answer()
+    output["mainlines"][0]["identities"] = []
+    with pytest.raises(ResearchError, match="linked_identity_observation_missing"):
+        run(output, context=theme_context())
+
+
+def test_stock_observation_needs_its_own_evidence_and_ranking_cannot_confirm_leader():
+    output = theme_answer()
+    identity = output["mainlines"][0]["identities"][0]
+    identity["assessment"]["evidence_ids"] = ["input.market.up_coverage"]
+    with pytest.raises(ResearchError, match="identity_requires_own_security_evidence"):
+        run(output, context=theme_context())
+    identity["assessment"]["evidence_ids"] = ["input.context.theme_evidence.stocks[0].change_pct"]
+    identity["identity"] = "龙头"
+    with pytest.raises(ResearchError, match="confirmed_identity_without_leadership_evidence"):
+        run(output, context=theme_context())
+    identity["identity"] = "身份待确认"
+    result = run(output, context=theme_context())
+    assert "浦发银行（600000）｜身份待确认" in result["content"]
+    assert "观察验证" in result["content"] and "放弃条件" in result["content"]
+
+
+def test_current_hot_sector_snapshot_cannot_prove_a_persistent_mainline():
+    output = theme_answer()
+    output["mainlines"][0]["assessment"]["text"] = "银行是持续主线，多日领涨。"
+    with pytest.raises(ResearchError, match="persistent_theme_without_history"):
+        run(output, context=theme_context())
+
+
+def test_unrelated_hot_stocks_do_not_force_an_identity_onto_the_selected_sector():
+    output = theme_answer()
+    output["mainlines"][0]["identities"] = []
+    assert run(output, context=theme_context(associated=False))["status"] == "COMPLETE"
+
+
+def test_direction_abbreviation_cannot_hide_an_explicitly_linked_stock_candidate():
+    context = theme_context()
+    context["theme_evidence"]["sectors"][0]["name"] = "共封装光学(CPO)"
+    context["theme_evidence"]["stocks"][0]["sector_names"] = ["共封装光学(CPO)"]
+    output = theme_answer()
+    output["mainlines"][0].update(direction="CPO", identities=[])
+    output["mainlines"][0]["assessment"]["text"] = "CPO在热度样本中有关注，但未证实持续性。"
+    with pytest.raises(ResearchError, match="linked_identity_observation_missing"):
+        run(output, context=context)
+
+
+def test_capacity_candidate_needs_the_same_security_current_amount_or_market_cap():
+    context = theme_context()
+    stock = context["theme_evidence"]["stocks"][0]
+    stock.update(amount=10_000_000_000, amount_quality={"status": "UNKNOWN"})
+    output = theme_answer()
+    identity = output["mainlines"][0]["identities"][0]
+    identity["identity"] = "容量候选"
+    with pytest.raises(ResearchError, match="capacity_identity_without_security_quantity_evidence"):
+        run(output, context=context)
+    stock["amount_quality"] = {"status": "OBSERVED", "sample_count": 1, "checked_count": 1}
+    identity["assessment"]["evidence_ids"].append("input.context.theme_evidence.stocks[0].amount")
+    assert run(output, context=context)["status"] == "COMPLETE"
+    context["theme_evidence"]["stocks"].append({"stock_code": "000001", "market_cap": 100_000_000_000})
+    identity["assessment"]["evidence_ids"] = ["input.context.theme_evidence.stocks[1].market_cap"]
+    with pytest.raises(ResearchError, match="capacity_identity_without_security_quantity_evidence"):
+        run(output, context=context)
+
+
+@pytest.mark.parametrize("size_claim", ["体量与稳定性较好的观察对象。", "市值与流动性较小，波动大。"])
+def test_security_size_cannot_be_filled_from_familiarity_or_stock_prices(size_claim):
+    context = theme_context()
+    output = theme_answer()
+    identity = output["mainlines"][0]["identities"][0]
+    identity["assessment"]["text"] = size_claim
+    with pytest.raises(ResearchError, match="security_size_without_market_cap_evidence"):
+        run(output, context=context)
+    context["theme_evidence"]["stocks"][0]["market_cap"] = 100_000_000_000
+    identity["assessment"]["evidence_ids"].append("input.context.theme_evidence.stocks[0].market_cap")
+    assert run(output, context=context)["status"] == "COMPLETE"
+
+
+def test_after_close_publication_does_not_establish_whether_news_was_priced_in():
+    context = {"events": {"status": "OBSERVED", "rows": [{"content": "海外科技股调整。", "publish_time": "2026-10-30T23:00:00+08:00"}]}}
+    output = answer()
+    output["events"] = [claim("消息在A股收盘后发布，尚未被A股价格交易。", refs=["input.context.events.rows[0].content"])]
+    with pytest.raises(ResearchError, match="priced_in_conclusion_without_evidence"):
+        run(output, context=context)
+    output["events"][0]["text"] = "消息在收盘后发布，是否已被价格交易仍待验证。"
+    assert run(output, context=context)["status"] == "COMPLETE"
+    context["events"]["rows"][0]["priced_in"] = {"status": "OBSERVED", "assessment": "原始预期与发布前价格已核对。"}
+    output["events"][0].update(text="该信息已被价格消化。", evidence_ids=["input.context.events.rows[0].priced_in.assessment"])
+    assert run(output, context=context)["status"] == "COMPLETE"
+
+
+def test_low_level_defensive_label_needs_long_term_position_or_valuation_evidence():
+    output = theme_answer()
+    output["mainlines"][0]["direction"] = "银行（低位防御）"
+    with pytest.raises(ResearchError, match="low_position_without_price_or_valuation_history"):
+        run(output, context=theme_context())
+    context = theme_context()
+    context["historical_price_position"] = {"status": "OBSERVED", "bank_percentile": 0.1}
+    assert run(output, context=context)["status"] == "COMPLETE"
+
+
+def test_extreme_return_definition_is_not_a_calibrated_action_threshold():
+    data = digest()
+    data["market_structure_json"]["decision_facts"]["extremes"] = {"threshold_pct": 7.0}
+    output = answer()
+    output["scenarios"][0]["trigger"] = "上涨占比超过7%则允许观察。"
+    with pytest.raises(ResearchError, match="uncalibrated_percentage_trigger"):
+        generate_research(data, report_kind="review", next_trade_date="2026-11-02", now=NOW,
+                          completion=lambda _: json.dumps(output))
+
+
+def test_llm_material_omits_raw_bars_redundant_gates_and_duplicate_news():
+    data = digest()
+    data["quality_json"]["gates"] = [{"massive": "duplicated fact"} for _ in range(100)]
+    data["factor_validation_json"]["history_bars"] = [{"raw": "bar"}] * 1000
+    data["factor_validation_json"]["quality_gates"] = [{"repeated": True}] * 1000
+    receipt = {"status": "UNKNOWN", "reason": "bad amount", "sample_count": 5200, "samples": [{"amount": 123}] * 10}
+    data["market_structure_json"].update(amount_quality=receipt, amount_integrity={"current": receipt})
+    context = {"events": {"status": "OBSERVED", "rows": [
+        {"title": "同一事件", "content": "公开新闻" * 2000, "source": "a", "publish_time": "2026-10-30T17:00:00+08:00"},
+        {"title": "同一事件", "content": "公开新闻" * 2000, "source": "b"},
+    ]}, "theme_evidence": {"status": "UNKNOWN", "amount_quality": {"target": receipt}}}
+    messages = build_messages(data, report_kind="review", next_trade_date="2026-11-02", now=NOW, context=context)
+    payload = json.loads(messages[1]["content"].split("\n", 1)[1])
+    assert not any("gates" in key or "history_bars" in key for key in payload["evidence"])
+    assert "input.context.events.rows[1].title" not in payload["evidence"]
+    assert len(payload["evidence"]["input.context.events.rows[0].content"]) == 1200
+    assert payload["evidence"]["input.quality.coverage.target"] == 1.0
+    assert len(data["factor_validation_json"]["history_bars"]) == 1000
+    assert "input.market.amount_quality.reason" in payload["evidence"]
+    assert not any("amount_integrity" in key or "samples" in key or key.startswith("input.context.theme_evidence.amount_quality")
+                   for key in payload["evidence"])
+
+
+def _live_budget_material():
+    from biz.review.amount_integrity import apply_amount_integrity
+    frozen = json.loads((Path(__file__).parent / "fixtures" / "market_decision_context_20261030.json").read_text(encoding="utf-8"))
+    context = frozen["context"]
+    receipts = context["theme_evidence"]["amount_quality"]
+    data = apply_amount_integrity(frozen["digest"], target_quality=receipts["target"], previous_quality=receipts["previous"])
+    return data, context
+
+
+def test_live_12_sector_16_stock_five_session_material_fits_both_report_budgets():
+    data, context = _live_budget_material()
+    before = copy.deepcopy((data, context))
+    raw_metadata = {}
+    raw_evidence = decision_module._register(context["theme_evidence"], path="input.context.theme_evidence", metadata=raw_metadata)
+    assert len(decision_module._json(raw_evidence)) + len(decision_module._json(raw_metadata)) > decision_module.MAX_INPUT_CHARS
+    current = datetime(2026, 11, 1, 19, 0, tzinfo=BEIJING)
+    messages = build_messages(data, report_kind="review", next_trade_date="2026-11-02", now=current, context=context)
+    payload = json.loads(messages[1]["content"].split("\n", 1)[1])
+    assert len(messages[1]["content"]) < 240_000
+    assert len(context["theme_evidence"]["sectors"]) == 12
+    assert len(context["theme_evidence"]["stocks"]) == 16
+    assert all(len(stock["history"]) == 5 for stock in context["theme_evidence"]["stocks"])
+    assert payload["evidence"]["input.context.theme_evidence.sectors[0].history.2026-10-30.change_pct"] == -0.5615
+    assert payload["evidence_metadata"]["input.context.theme_evidence.stocks[0].change_pct"]["state"] == "OBSERVED"
+    assert payload["evidence_metadata"]["input.context.theme_evidence.stocks[0].cumulative_return_5d_pct"]["unit"] == "percent"
+    assert "input.context.theme_evidence.source_descriptions.1.name" in payload["evidence"]
+    assert not any(key.endswith(".availability_note") or ".amount_quality.samples" in key for key in payload["evidence"])
+
+    previous = {**answer(), "status": "COMPLETE", "schema_version": "probiga.market-decision.v2", "report_kind": "review",
+                "review_date": "2026-10-30", "next_trade_date": "2026-11-02", "generated_at": current.isoformat(),
+                "context_cutoff_at": context["cutoff_at"], "source_digest_sha256": source_digest_identity(data)}
+    previous["market_reading"] = claim("广度与强势反馈偏弱，需观察不同方向是否扩散；不能把榜单热度当作带动能力。" * 40)
+    previous["mainlines"] = []
+    for sector in context["theme_evidence"]["sectors"][:3]:
+        line = {"direction": sector["name"], "stage": "待确认", "assessment": claim("这是相对强弱与持续性研究，需区分反抽和防守。" * 20), "identities": []}
+        for stock in context["theme_evidence"]["stocks"][:3]:
+            line["identities"].append({"stock_code": stock["stock_code"], "identity": "身份待确认",
+                                       "assessment": claim("该股具有样本内可观察反馈，但缺少带动与分歧承接证据。" * 15),
+                                       "trigger": "板块扩散与个股相对表现同步改善，继续核对承接。" * 3,
+                                       "abandon": "若仅个股脉冲且板块继续转弱，放弃方向修复解释。" * 3})
+        previous["mainlines"].append(line)
+    briefing = build_messages(data, report_kind="briefing", next_trade_date="2026-11-02", now=current,
+                              previous_research=previous, context=context)
+    briefing_payload = json.loads(briefing[1]["content"].split("\n", 1)[1])
+    assert len(briefing[1]["content"]) <= decision_module.MAX_INPUT_CHARS
+    assert len(briefing_payload["previous_research"]["mainlines"]) == 3
+    assert all(len(line["identities"]) == 3 for line in briefing_payload["previous_research"]["mainlines"])
+    assert (data, context) == before
+
+
+def test_projected_stock_history_preserves_unavailable_price_state():
+    data, context = _live_budget_material()
+    context["theme_evidence"]["stocks"][0]["history"][0]["status"] = "UNKNOWN"
+    messages = build_messages(data, report_kind="review", next_trade_date="2026-11-02", now=datetime(2026, 11, 1, 19, tzinfo=BEIJING), context=context)
+    payload = json.loads(messages[1]["content"].split("\n", 1)[1])
+    key = "input.context.theme_evidence.stocks[0].history.2026-10-26.change_pct"
+    assert payload["evidence_metadata"][key]["state"] == "UNKNOWN"
+    assert payload["evidence_metadata"][key]["kind"] == "limitation"
 
 
 def test_one_structured_repair_keeps_facts_original_response_and_all_validation_errors():
@@ -374,6 +680,36 @@ def test_one_structured_repair_keeps_facts_original_response_and_all_validation_
     assert "unsupported_observation_events[0]" in calls[1][3]["content"]
     assert [item["status"] for item in result["generation_attempts"]] == ["FAILED", "COMPLETE"]
     assert [item["raw_response"] for item in result["generation_attempts"]] == responses
+
+
+def test_repair_diagnostics_identify_limitation_only_refs_and_missing_event_time_tokens():
+    data = digest()
+    data["market_structure_json"]["missing_feedback"] = {"status": "UNKNOWN", "reason": "缺少强势样本反馈"}
+    context = {"events": {"status": "OBSERVED", "rows": [{"content": "半导体出口增长259%。", "publish_time": "2026-11-01T18:33:00+08:00"}]}}
+    bad = answer()
+    bad["roles"][1] = {"role": ROLES[1], **claim("强势样本不可用，无法核验修复。", refs=["input.market.missing_feedback.reason"])}
+    bad["events"] = [claim("半导体出口增长259%，18:33发布。", "OBSERVED", ["input.context.events.rows[0].content"])]
+    good = answer()
+    good["roles"][1] = {**bad["roles"][1], "status": "UNKNOWN"}
+    good["events"] = [claim("半导体出口增长259%。", "OBSERVED", ["input.context.events.rows[0].content"])]
+    calls = []
+    def completion(messages):
+        calls.append(copy.deepcopy(messages))
+        return json.dumps(bad if len(calls) == 1 else good)
+    result = generate_research(data, report_kind="review", next_trade_date="2026-11-02", now=NOW, context=context, completion=completion)
+    assert result["status"] == "COMPLETE"
+    repair = json.loads(calls[1][-1]["content"].split("\n", 1)[1])
+    errors = {error["field"]: error for error in repair["validation_errors"]}
+    role = errors["roles[1]"]
+    assert role["role"] == ROLES[1]
+    assert role["references"][0]["state"] == "UNKNOWN"
+    assert role["references"][0]["kind"] == "limitation"
+    assert role["references"][0]["usable_for_claim"] is False
+    assert "与此判断直接相关" in role["guidance"]
+    event = errors["events[0]"]
+    assert {token["value"] for token in event["unsupported_tokens"]} == {"18", "33"}
+    assert event["same_source_time_references"] == [{"id": "input.context.events.rows[0].publish_time", "value": "2026-11-01T18:33:00+08:00"}]
+    assert "不得仅改为INFERRED" in event["guidance"]
 
 
 def test_second_invalid_response_is_terminal_with_both_attempt_receipts():

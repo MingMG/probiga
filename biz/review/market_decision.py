@@ -20,7 +20,7 @@ import httpx
 
 from server.common.config import get_settings
 
-SCHEMA_VERSION = "probiga.market-decision.v1"
+SCHEMA_VERSION = "probiga.market-decision.v2"
 BEIJING = ZoneInfo("Asia/Shanghai")
 ROLES = (
     "总策略负责人", "情绪周期分析师", "相对强度分析师", "博弈与资金分析师",
@@ -126,15 +126,106 @@ def source_digest_identity(digest: dict) -> str:
     })
 
 
+def _theme_material(theme: dict) -> dict:
+    """One bounded research view; full source receipts stay in the raw artifact."""
+    def pick(value, fields):
+        return {key: item for key, item in value.items() if key in fields} if isinstance(value, dict) else {}
+
+    def history(rows, *, ranks=False):
+        projected = {}
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict) or not row.get("trade_date"):
+                continue
+            item = pick(row, {"change_pct", "rank"} if ranks else {"change_pct"})
+            # Unknown daily prices cannot inherit an observed parent.
+            if isinstance(row, dict) and row.get("status") not in {None, "OBSERVED"}:
+                item["status"] = row["status"]
+            projected[str(row["trade_date"])] = item
+        return projected
+
+    result = pick(theme, {"status", "trade_date", "asof", "history_dates", "coverage", "source_descriptions", "limits", "scope"})
+    result["sources"] = [pick(row, {"stage", "status", "rows", "reason"}) for row in theme.get("sources", [])]
+    result["sectors"] = []
+    for row in theme.get("sectors", []):
+        item = pick(row, {"status", "name", "concept_name", "concept_code", "plate_type",
+                          "rank", "change_pct", "hot_tag", "history_complete_5d", "cumulative_return_5d_pct", "received_at"})
+        # name and concept_name are aliases, not independent evidence.
+        if item.get("name"):
+            item.pop("concept_name", None)
+        item["history"] = history(row.get("history"), ranks=True)
+        result["sectors"].append(item)
+    result["stocks"] = []
+    for row in theme.get("stocks", []):
+        item = pick(row, {"status", "stock_code", "short_name", "stock_name", "sector_names", "concept_tag",
+                          "heat_ranks", "change_pct", "ohlc", "history_complete_5d", "cumulative_return_5d_pct",
+                          "market_cap", "total_market_cap", "circulating_market_cap", "float_market_cap"})
+        if isinstance(row.get("amount_quality"), dict) and row["amount_quality"].get("status") == "OBSERVED":
+            item["amount"] = row.get("amount")
+        item["history"] = history(row.get("history"))
+        verification = pick(row.get("price_verification"), {"status", "source", "previous_close_matches_pre_close"})
+        if verification:
+            item["price_verification"] = verification
+        received = row.get("received_at")
+        item["received_at"] = received.get("price") if isinstance(received, dict) else received
+        result["stocks"].append(item)
+    return result
+
+
 def _facts(digest: dict, context: dict | None) -> dict:
     factor = {k: v for k, v in (digest.get("factor_validation_json") or {}).items()
               if k not in {"research", "market_decision", "early_briefing", "selection_review"}}
-    # The large selection execution ledger is not an input to market regime research.
+    quality = digest.get("quality_json") or {}
+    quality = {key: value for key, value in quality.items() if key in {
+        "status", "overall", "target_date", "adjust_type", "coverage", "source_dates", "errors", "warnings"}}
+    material = dict(context or {})
+    if isinstance(material.get("theme_evidence"), dict):
+        # The flow has already applied these receipts; retain their single
+        # summarized market copy rather than repeating raw samples to the model.
+        material["theme_evidence"] = _theme_material(material["theme_evidence"])
+    for key in ("events", "news"):
+        group = material.get(key)
+        rows = group.get("rows") if isinstance(group, dict) else group
+        if not isinstance(rows, list):
+            continue
+        kept, seen = [], set()
+        for row in rows:
+            text_value = str(row.get("title") or row.get("content") or "") if isinstance(row, dict) else str(row)
+            identity = re.sub(r"\s+", "", text_value).casefold()
+            if not identity or identity in seen:
+                continue
+            seen.add(identity)
+            if isinstance(row, dict):
+                row = {field: (value[:1200] if field == "content" and isinstance(value, str) else value)
+                       for field, value in row.items() if field in {
+                           "title", "content", "source", "publish_time", "first_seen_at", "event_time", "status", "availability", "url", "priced_in"}}
+                if isinstance(row.get("title"), str):
+                    row["title"] = row["title"][:200]
+            else:
+                row = str(row)[:1200]
+            kept.append(row)
+            if len(kept) == 24:
+                break
+        material[key] = {**group, "rows": kept} if isinstance(group, dict) else kept
+    # Raw bars and execution ledgers remain in the digest audit, never the LLM payload.
+    def summarized(value):
+        if isinstance(value, dict):
+            result = {}
+            for key, item in value.items():
+                if key in {"history_bars", "target_bars", "previous_bars", "raw_bars", "quality_gates", "amount_integrity"}:
+                    continue
+                if key in {"amount_quality", "previous_amount_quality"} and isinstance(item, dict):
+                    item = {field: scalar for field, scalar in item.items() if field in {
+                        "status", "trade_date", "sample_count", "checked_count", "inconsistent_count", "missing_count", "suspended_count", "reason"}}
+                result[key] = summarized(item)
+            return result
+        if isinstance(value, list):
+            return [summarized(item) for item in value]
+        return value
     return {
-        "quality": digest.get("quality_json") or {},
-        "market": digest.get("market_structure_json") or {},
-        "industry": digest.get("industry_rotation_json") or {},
-        "factor": factor, "context": context or {},
+        "quality": quality,
+        "market": summarized(digest.get("market_structure_json") or {}),
+        "industry": summarized(digest.get("industry_rotation_json") or {}),
+        "factor": summarized(factor), "context": summarized(material),
     }
 
 
@@ -143,6 +234,7 @@ _METADATA_FIELDS = {
     "reason", "definition", "rule", "invalidation", "unknown", "unit", "methodology",
     "target_date", "trade_date", "previous_trade_date", "selection_date", "feedback_date",
     "snapshot_date", "data_cutoff_at", "context_cutoff_at", "cutoff_at", "captured_at", "publish_time", "first_seen_at",
+    "received_at", "market_data_asof_at", "scope", "kind", "short_name", "stock_name", "concept_name", "sector_name",
     "frozen_as_of", "index_code", "stock_code", "symbol", "name", "display_name", "industry_name",
     "factor", "factor_name", "industry_code", "exchange", "adjust_type", "id", "gate", "name",
 }
@@ -151,7 +243,8 @@ _RATIO_FIELDS = {
     "amount_share", "industry_up_share", "industry_amount_share", "coverage",
     "amount_concentration_top5", "rank_correlation",
 }
-_AMOUNT_FIELDS = {"total_amount", "previous_total_amount", "amount", "main_net_inflow", "net_inflow"}
+_AMOUNT_FIELDS = {"total_amount", "previous_total_amount", "amount", "main_net_inflow", "net_inflow",
+                  "market_cap", "total_market_cap", "circulating_market_cap", "float_market_cap"}
 _UNUSABLE_STATES = {"UNKNOWN", "UNAVAILABLE", "MISSING", "STALE", "FAILED", "BLOCKED", "ERROR", "PARTIAL"}
 _NUMBER = re.compile(r"(?<![\d.])([+-]?\d+(?:,\d{3})*(?:\.\d+)?)(%|％|亿元|亿|万元|万|元|bp|基点)?(?![\d.])")
 
@@ -160,7 +253,7 @@ def _unit(path: str, value: Any) -> str:
     field = path.rsplit(".", 1)[-1]
     if field.endswith("_pct") or field == "change_pct":
         return "percent"
-    if field in _AMOUNT_FIELDS:
+    if field in _AMOUNT_FIELDS or field.endswith(("_amount", "_amount_yuan")):
         return "CNY"
     if (field in _RATIO_FIELDS or field.endswith("_coverage") or field.endswith("_share")
             or ".coverage." in path or path.endswith("close_position.median")):
@@ -258,7 +351,7 @@ def _input(digest: dict, report_kind: str, next_trade_date: str,
     if previous_research:
         baseline = {key: previous_research.get(key) for key in
                     ("review_date", "next_trade_date", "generated_at", "context_cutoff_at", "conclusion", "permission",
-                     "mainlines", "scenarios", "counter_evidence", "unknowns")}
+                     "market_reading", "mainlines", "scenarios", "counter_evidence", "unknowns")}
         evidence.update(_register(baseline, path="previous", metadata=evidence_metadata))
     payload = {
         "report_kind": report_kind, "review_date": review_date,
@@ -384,6 +477,19 @@ def _numeric_supported(token: tuple[Decimal, str], views: list[tuple[Decimal, st
     return False
 
 
+def _observation_views(refs: list[str], evidence: dict, metadata: dict) -> list[tuple[Decimal, str]]:
+    views = []
+    for ref in refs:
+        if ref not in evidence:
+            continue
+        meta = metadata[ref]
+        if meta["kind"] in {"limitation", "previous_hypothesis"} or meta["state"] != "OBSERVED":
+            continue
+        raw = evidence[ref]
+        views += _numeric_views(raw, meta["unit"]) if isinstance(raw, (int, float, Decimal)) else _tokens(str(raw))
+    return views
+
+
 def _claim(value: Any, field: str, evidence: dict, metadata: dict) -> None:
     if not isinstance(value, dict) or value.get("status") not in {"OBSERVED", "INFERRED", "UNKNOWN"}:
         _fail("validate", f"invalid_claim_{field}")
@@ -399,16 +505,188 @@ def _claim(value: Any, field: str, evidence: dict, metadata: dict) -> None:
             _supports(metadata[ref], observation=value["status"] == "OBSERVED") for ref in refs):
         _fail("validate", f"unusable_evidence_{field}")
     if value["status"] == "OBSERVED":
-        views = []
-        for ref in refs:
-            meta = metadata[ref]
-            if meta["kind"] in {"limitation", "previous_hypothesis"} or meta["state"] != "OBSERVED":
-                continue
-            raw = evidence[ref]
-            views += _numeric_views(raw, meta["unit"]) if isinstance(raw, (int, float, Decimal)) else _tokens(str(raw))
+        views = _observation_views(refs, evidence, metadata)
         for token in _tokens(value["text"]):
             if not _numeric_supported(token, views):
                 _fail("validate", f"unsupported_observation_{field}")
+
+
+def _current_support(payload: dict, refs: list[str] | None = None, *, paths: tuple[str, ...]) -> bool:
+    evidence, metadata = payload["evidence"], payload["evidence_metadata"]
+    for ref in refs if refs is not None else evidence:
+        if (ref.startswith("input.") and ref in metadata
+                and _supports(metadata[ref], observation=True)
+                and any(part in ref for part in paths)):
+            return True
+    return False
+
+
+def _security_quantity_support(payload: dict, code: str, refs: list[str], *, market_cap_only=False) -> bool:
+    roots = [key[:-len("stock_code")] for key, value in payload["evidence"].items()
+             if key.startswith("input.") and key.endswith(".stock_code") and str(value) == code]
+    for ref in refs:
+        if ref not in payload["evidence_metadata"] or not any(ref.startswith(root) for root in roots):
+            continue
+        field = ref.rsplit(".", 1)[-1]
+        capital = field in {"market_cap", "total_market_cap", "circulating_market_cap", "float_market_cap"}
+        allowed = capital or (not market_cap_only and field in {"amount", "reported_amount", "reported_total_amount"})
+        meta = payload["evidence_metadata"][ref]
+        if allowed and meta["kind"] == "measurement" and _supports(meta, observation=True):
+            return True
+    return False
+
+
+def _assertive_match(text_value: str, pattern: str) -> bool:
+    """Do not mistake an explicit evidence limitation for the rejected assertion."""
+    for match in re.finditer(pattern, text_value):
+        prefix = re.split(r"[，,；;。\n]", text_value[:match.start()])[-1][-20:]
+        if not re.search(r"(?:不能|无法|不等于|不代表|不足以|不可据此|不应|禁止|没有证据|尚无证据|不支持|不作|不做|不判断|不判定|是否|有无|能否).{0,14}$", prefix):
+            return True
+    return False
+
+
+def _theme_observations(payload: dict) -> tuple[dict[str, str], dict[str, dict]]:
+    evidence, metadata = payload["evidence"], payload["evidence_metadata"]
+    sectors, stocks = {}, {}
+    for key, value in evidence.items():
+        if not key.startswith("input.context.theme_evidence.") or metadata[key]["state"] in _UNUSABLE_STATES:
+            continue
+        sector = re.match(r"(input\.context\.theme_evidence\.sectors\[\d+\])\.(?:name|concept_name|sector_name|industry_name)$", key)
+        if sector and isinstance(value, str) and value:
+            prefix = sector[1]
+            if _current_support(payload, paths=(prefix + ".change_pct", prefix + ".history", prefix + ".current")):
+                sectors[prefix] = value
+        stock = re.match(r"(input\.context\.theme_evidence\.(?:stocks|candidates)\[\d+\])\.(.+)$", key)
+        if stock:
+            stocks.setdefault(stock[1], {})[stock[2]] = value
+    return sectors, stocks
+
+
+def _validate_theme_usage(result: dict, payload: dict) -> None:
+    sectors, stocks = _theme_observations(payload)
+    if not sectors:
+        return
+    mainlines = result["mainlines"]
+    if not mainlines:
+        _fail("validate", "available_themes_not_analysed")
+    if not any(any(ref.startswith(prefix + ".") for prefix in sectors)
+               for item in mainlines for ref in item["assessment"]["evidence_ids"]):
+        _fail("validate", "available_sector_evidence_unused")
+    for item in mainlines:
+        description = item["direction"] + " " + item["assessment"]["text"]
+        selected = [name for prefix, name in sectors.items()
+                    if name in description or any(ref.startswith(prefix + ".") for ref in item["assessment"]["evidence_ids"])]
+        if (_assertive_match(item["assessment"]["text"], r"(?:持续|连续多日|多日).{0,6}(?:主线|走强|领涨)|主线.{0,6}(?:持续|延续)")
+                and not _current_support(payload, item["assessment"]["evidence_ids"],
+                                         paths=(".history[", ".history.", ".cumulative_return_5d", "previous_industries"))):
+            _fail("validate", "persistent_theme_without_history")
+        linked = set()
+        for fields in stocks.values():
+            code = str(fields.get("stock_code") or "")
+            associations = " ".join(str(value) for key, value in fields.items()
+                                    if re.match(r"(?:sector_names|concept_tag|industry_name|concept_name|sectors)(?:\[|$)", key))
+            if code and any(name in associations for name in selected):
+                linked.add(code)
+        identities = item["identities"]
+        if linked and not any(identity["stock_code"] in linked for identity in identities):
+            _fail("validate", "linked_identity_observation_missing")
+        for identity in identities:
+            prefixes = [prefix for prefix, fields in stocks.items()
+                        if str(fields.get("stock_code")) == identity["stock_code"]]
+            if (identity["assessment"]["status"] != "UNKNOWN" and prefixes
+                    and not _current_support(payload, identity["assessment"]["evidence_ids"],
+                                                  paths=tuple(prefix + "." for prefix in prefixes))):
+                _fail("validate", "identity_requires_own_security_evidence")
+
+
+def _validate_research_meaning(result: dict, payload: dict) -> None:
+    """Reject the observed research failures rather than cosmetically rewriting them."""
+    evidence = payload["evidence"]
+    amount_quality = str(evidence.get("input.market.amount_quality.status",
+                                    evidence.get("input.market.amount_quality", ""))).upper()
+    comparison_paths = ("input.context.market_turnover.reported_change_amount", "input.context.market_turnover.change_pct",
+                        "input.market.amount_change_pct")
+    claims = _claim_candidates(result)
+    for field, item in claims:
+        if not isinstance(item, dict):
+            continue
+        text_value, refs = item.get("text", ""), item.get("evidence_ids", [])
+        if _assertive_match(text_value, r"尾盘(?:明显|完全|持续)?(?:无|没有|缺乏)承接|尾盘承接(?:不足|薄弱|缺失)"):
+            if not _current_support(payload, refs, paths=("minute", "intraday_windows", "closing_auction", "order_flow")):
+                _fail("validate", "intraday_conclusion_without_intraday_evidence_" + field)
+        if _assertive_match(text_value, r"边际买家(?:缺位|缺席|不存在)|买盘(?:完全)?缺位|存量资金(?:退出|自救)|主力(?:故意|正在)(?:出货|砸盘)"):
+            if not _current_support(payload, refs, paths=("buyer_identity", "participant_identity", "order_flow")):
+                _fail("validate", "participant_intent_without_evidence_" + field)
+        if _assertive_match(text_value, r"(?:尚未|并未|未|已经|已|早已).{0,5}被.{0,8}(?:价格交易|价格反映|定价|计价|消化)|(?:尚未|并未|未|已经|已|早已).{0,6}(?:反映|体现|计入).{0,8}(?:股价|价格)"):
+            if not _current_support(payload, refs, paths=("priced_in",)):
+                _fail("validate", "priced_in_conclusion_without_evidence_" + field)
+        if _assertive_match(text_value, r"(?:应|必须|一律|全部|立即|建议|保持|维持).{0,4}(?:空仓|清仓|满仓)|不可恢复性风险|(?:任何|所有).{0,12}(?:不可恢复|不可承受)"):
+            if not (_current_support(payload, paths=("input.context.portfolio.",))
+                    and _current_support(payload, paths=("input.context.risk_budget.",))):
+                _fail("validate", "portfolio_instruction_without_account_risk_budget_" + field)
+        if _assertive_match(text_value, r"放量|缩量|成交额.{0,8}(?:放大|增长|增加|减少|萎缩)"):
+            amount_refs = [ref for ref in refs if not (amount_quality in _UNUSABLE_STATES and ref.startswith("input.market."))]
+            if not _current_support(payload, amount_refs, paths=comparison_paths):
+                _fail("validate", "turnover_conclusion_without_validated_comparison_" + field)
+    conditions = []
+    for index, scenario in enumerate(result["scenarios"]):
+        conditions.extend((f"scenarios[{index}].{key}", scenario[key])
+                          for key in ("premise", "trigger", "action", "invalidation", "counter_evidence"))
+    conditions.extend(("checks." + check["time_window"], check["signal"]) for check in result["checks"])
+    for line in result["mainlines"]:
+        for identity in line["identities"]:
+            refs = identity["assessment"]["evidence_ids"]
+            if "容量" in identity["identity"] and not _security_quantity_support(payload, identity["stock_code"], refs):
+                _fail("validate", "capacity_identity_without_security_quantity_evidence")
+            if (_assertive_match(identity["assessment"]["text"], r"(?:大|小|高|低)市值|市值.{0,10}(?:大|小|高|低)|体量.{0,12}(?:大|小|较好|稳定)")
+                    and not _security_quantity_support(payload, identity["stock_code"], refs, market_cap_only=True)):
+                _fail("validate", "security_size_without_market_cap_evidence")
+            if identity["identity"] in {"龙头", "中军", "后排补涨", "跟风"} and not _current_support(
+                    payload, identity["assessment"]["evidence_ids"],
+                    paths=("lead_lag", "leadership", "sector_response", "minute")):
+                _fail("validate", "confirmed_identity_without_leadership_evidence")
+            conditions += [("identity.trigger", identity["trigger"]), ("identity.abandon", identity["abandon"])]
+    threshold_views = []
+    for key, value in evidence.items():
+        if (key.startswith("input.") and any(part in key for part in ("calibrated_threshold", "historical_quantile"))
+                and _supports(payload["evidence_metadata"][key], observation=True)):
+            threshold_views += _numeric_views(value, payload["evidence_metadata"][key]["unit"])
+    for field, text_value in conditions:
+        if (_assertive_match(text_value, r"(?:应|必须|一律|全部|立即|建议|保持|维持).{0,4}(?:空仓|清仓|满仓)|不可恢复性风险")
+                and not (_current_support(payload, paths=("input.context.portfolio.",))
+                         and _current_support(payload, paths=("input.context.risk_budget.",)))):
+            _fail("validate", "portfolio_instruction_without_account_risk_budget_" + field)
+        threshold_phrases = re.findall(
+            r"(?:占比|比例|家数|涨幅|跌幅|收益|广度|收盘位置).{0,12}(?:超过|低于|不足|高于|达到|回到|升至|降至|小于|大于|[<>≤≥]).{0,6}[+-]?\d+(?:\.\d+)?[%％]"
+            r"|[+-]?\d+(?:\.\d+)?[%％](?:以上|以下).{0,6}(?:上涨|下跌|收正|收负)", text_value)
+        for number, unit in _tokens(" ".join(threshold_phrases)):
+            if unit == "%" and number != 0 and not _numeric_supported((number, unit), threshold_views):
+                _fail("validate", "uncalibrated_percentage_trigger_" + field)
+        if re.search(r"(?:超过|低于|不足|高于|少于|多于|达到|降至|升至)\s*\d[\d,，]*\s*家", text_value):
+            if not _current_support(payload, paths=("calibrated_threshold", "historical_quantile")):
+                _fail("validate", "uncalibrated_count_trigger_" + field)
+        intraday = bool(re.search(r"开盘|前30分钟|前半小时|午间|半日", field + text_value))
+        if (intraday and re.search(r"极值|极端|涨停|跌停|成交额", text_value)
+                and re.search(r"昨日|前日|前一交易日|前一日", text_value)
+                and not _current_support(payload, paths=("same_time_comparison", "intraday_comparisons"))):
+            _fail("validate", "intraday_compared_with_full_session_" + field)
+    public = [(field, item["text"]) for field, item in claims
+              if isinstance(item, dict) and not field.startswith("roles[")]
+    public += conditions
+    public += [("unknowns", value) for value in result["unknowns"]]
+    public += [("scenario.name", item["name"]) for item in result["scenarios"]]
+    for line in result["mainlines"]:
+        public += [("mainline.direction", line["direction"]), ("mainline.stage", line["stage"])]
+        public += [("identity.title", identity["identity"]) for identity in line["identities"]]
+    for field, text_value in public:
+        if (_assertive_match(text_value, r"低位(?:防御|防守|反抽|方向)|(?:白酒|医药|创新药|CRO|行业|板块|方向).{0,8}(?:处于|位于|处在|仍在)低位")
+                and not _current_support(payload, paths=("historical_price_position", "valuation_percentile"))):
+            _fail("validate", "low_position_without_price_or_valuation_history_" + field)
+        if re.search(r"(?<![A-Za-z_])(?:WAIT|OBSERVE|CONDITIONAL|OBSERVED|INFERRED|UNKNOWN|PIT|QMT_VALIDATED)(?![A-Za-z_])", text_value):
+            _fail("validate", "internal_labels_in_public_narrative_" + field)
+    if not payload["previous_research"] and result["audit"]["status"] != "UNKNOWN":
+        _fail("validate", "audit_without_prior_hypothesis")
+    _validate_theme_usage(result, payload)
 
 
 def _validate(result: Any, payload: dict) -> dict:
@@ -416,7 +694,7 @@ def _validate(result: Any, payload: dict) -> dict:
         _fail("validate", "response_not_object")
     evidence = payload["evidence"]
     metadata = payload["evidence_metadata"]
-    for field in ("conclusion", "permission", "counter_evidence", "audit"):
+    for field in ("conclusion", "permission", "market_reading", "counter_evidence", "audit"):
         _claim(result.get(field), field, evidence, metadata)
     permission = result["permission"]
     if permission.get("action") not in {"WAIT", "OBSERVE", "CONDITIONAL"} or not isinstance(permission.get("risk_veto"), bool):
@@ -432,13 +710,13 @@ def _validate(result: Any, payload: dict) -> dict:
     known_symbols = {str(value) for key, value in evidence.items()
                      if key.endswith(".stock_code") and re.fullmatch(r"\d{6}", str(value))
                      and metadata[key]["state"] not in _UNUSABLE_STATES and not key.startswith("previous.")}
-    for item in _list(result.get("mainlines"), "mainlines", maximum=12):
+    for item in _list(result.get("mainlines"), "mainlines", maximum=3):
         if not isinstance(item, dict):
             _fail("validate", "invalid_mainline")
         for key in ("direction", "stage"):
             _text(item.get(key), key)
         _claim(item.get("assessment"), "mainline", evidence, metadata)
-        for identity in _list(item.get("identities"), "identities", maximum=8):
+        for identity in _list(item.get("identities"), "identities", maximum=3):
             if (not isinstance(identity, dict) or not isinstance(identity.get("stock_code"), str)
                     or identity["stock_code"] not in known_symbols):
                 _fail("validate", "unknown_stock_identity")
@@ -467,12 +745,13 @@ def _validate(result: Any, payload: dict) -> dict:
     for field in ("events", "risks"):
         for item in _list(result.get(field), field, maximum=20):
             _claim(item, field, evidence, metadata)
-    for item in _list(result.get("unknowns"), "unknowns", maximum=40):
+    for item in _list(result.get("unknowns"), "unknowns", maximum=6):
         _text(item, "unknown")
     if (any(role["status"] == "UNKNOWN" for role in roles
                 if role["role"] in {"总策略负责人", "情绪周期分析师"})
             and permission["action"] == "CONDITIONAL"):
         _fail("validate", "uncertain_environment_requires_observation")
+    _validate_research_meaning(result, payload)
     return result
 
 
@@ -489,7 +768,7 @@ def _decode_validate(raw: Any, payload: dict) -> dict:
 def _claim_candidates(result: Any) -> list[tuple[str, Any]]:
     if not isinstance(result, dict):
         return []
-    candidates = [(key, result.get(key)) for key in ("conclusion", "permission", "counter_evidence", "audit")]
+    candidates = [(key, result.get(key)) for key in ("conclusion", "permission", "market_reading", "counter_evidence", "audit")]
     for field in ("roles", "events", "risks", "continuity"):
         if isinstance(result.get(field), list):
             candidates += [(f"{field}[{index}]", item) for index, item in enumerate(result[field])]
@@ -504,9 +783,51 @@ def _claim_candidates(result: Any) -> list[tuple[str, Any]]:
     return candidates
 
 
-def _validation_diagnostics(raw: Any, payload: dict, first_error: ResearchError) -> list[str]:
+def _claim_diagnostic(field: str, candidate: dict, error: ResearchError, payload: dict) -> dict:
+    evidence, metadata = payload["evidence"], payload["evidence_metadata"]
+    refs = candidate.get("evidence_ids", [])
+    refs = refs if isinstance(refs, list) else []
+    status = candidate.get("status")
+    detail = {"error": str(error), "field": field, "status": status, "role": candidate.get("role"),
+              "text_excerpt": str(candidate.get("text", ""))[:400], "references": []}
+    for ref in refs[:30]:
+        if not isinstance(ref, str):
+            continue
+        meta = metadata.get(ref, {})
+        detail["references"].append({"id": ref, "state": meta.get("state", "MISSING"), "kind": meta.get("kind", "MISSING"),
+                                      "usable_for_claim": _supports(meta, observation=status == "OBSERVED"),
+                                      "value": str(evidence.get(ref, "引用不存在"))[:180]})
+    if "unsupported_observation" in str(error):
+        views = _observation_views([ref for ref in refs if isinstance(ref, str)], evidence, metadata)
+        detail["unsupported_tokens"] = [{"value": str(number), "unit": unit or "number"}
+                                          for number, unit in _tokens(str(candidate.get("text", "")))
+                                          if not _numeric_supported((number, unit), views)][:20]
+        available = []
+        for ref in refs:
+            if not isinstance(ref, str) or not ref.startswith("input."):
+                continue
+            root = ref.rsplit(".", 1)[0]
+            for name in ("publish_time", "event_time", "market_time"):
+                sibling = root + "." + name
+                if sibling not in refs and sibling in evidence and metadata[sibling].get("state") == "OBSERVED":
+                    hint = {"id": sibling, "value": str(evidence[sibling])[:100]}
+                    if hint not in available:
+                        available.append(hint)
+        detail["same_source_time_references"] = available[:8]
+        detail["guidance"] = ("这些数字或时间没有被本项实际引用的证据支持。按已引用原值纠正或删除细节；"
+                              "若文本确实转述同一事件的发布时间，可补引所列同源时间字段。不得仅改为INFERRED保留无依据数字。")
+    elif any(word in str(error) for word in ("unusable_evidence", "missing_evidence", "stale_evidence", "unknown_evidence")):
+        detail["guidance"] = ("逐项查看references的state/kind：limitation、metadata、previous_hypothesis不是当前市场事实，"
+                              "STALE不可支撑当前判断。若本项只说明资料缺失或尚待验证，应使用UNKNOWN；"
+                              "若保留市场推断，须引用与此判断直接相关的当前有效测量/事实，禁止添加无关数字凑引用。")
+    else:
+        detail["guidance"] = "按列明的字段、状态和引用修正本项；返回整份JSON并自检全部字段，不新增输入之外的事实。"
+    return detail
+
+
+def _validation_diagnostics(raw: Any, payload: dict, first_error: ResearchError) -> list[dict]:
     """Give the one repair all claim errors without altering the rejected output."""
-    errors = [str(first_error)]
+    errors = [{"error": str(first_error), "field": "report", "guidance": "首个结构或语义错误；以下逐项列出可定位的引用与数字问题。"}]
     if not isinstance(raw, str) or len(raw) > MAX_OUTPUT_CHARS:
         return errors
     try:
@@ -518,8 +839,7 @@ def _validation_diagnostics(raw: Any, payload: dict, first_error: ResearchError)
         try:
             _claim(candidate, field, payload["evidence"], payload["evidence_metadata"])
         except ResearchError as error:
-            if str(error) not in errors:
-                errors.append(str(error))
+            errors.append(_claim_diagnostic(field, candidate if isinstance(candidate, dict) else {}, error, payload))
             if len(errors) >= 24:
                 break
     return errors
@@ -634,34 +954,57 @@ def _cell(value: Any) -> str:
 
 
 def _claim_text(claim: dict) -> str:
-    # Full machine references remain attached to the structured artifact.
-    return f"[{claim['status']}] {claim['text']}"
+    # Status, role deliberation and references belong to the audit artifact.
+    return ("待核验：" if claim["status"] == "UNKNOWN" else "") + claim["text"]
+
+
+def _display_time(value: Any) -> str:
+    if not value:
+        return "未提供"
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return "待核验"
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=BEIJING)
+    return parsed.astimezone(BEIJING).strftime("%m月%d日 %H:%M")
 
 
 def _fact_panel(evidence: dict) -> list[str]:
     def get(path):
         return evidence.get("input." + path)
     def pct(value):
-        return f"{value:.2f}%" if isinstance(value, (float, int, Decimal)) else "UNKNOWN"
+        return f"{value:.2f}%" if isinstance(value, (float, int, Decimal)) else "待核验"
     def ratio(value):
-        return pct(value * 100) if isinstance(value, (float, int, Decimal)) else "UNKNOWN"
+        return pct(value * 100) if isinstance(value, (float, int, Decimal)) else "待核验"
     def amount(value):
-        return f"{value / 100_000_000:,.2f}亿元" if isinstance(value, (float, int, Decimal)) else "UNKNOWN"
-    lines = [f"- [OBSERVED] 行情有效样本：{get('market.sample_count')}只；当日覆盖率：{ratio(get('quality.coverage.target'))}；上一交易日覆盖率：{ratio(get('quality.coverage.previous'))}。",
-             f"- [OBSERVED] 个股收益中位数：{pct(get('market.return_median_pct'))}；上涨占比：{ratio(get('market.up_coverage'))}。",
-             f"- [OBSERVED] 成交额：{amount(get('market.total_amount'))}；较上一交易日：{pct(get('market.amount_change_pct'))}。"]
+        return f"{value / 100_000_000:,.2f}亿元" if isinstance(value, (float, int, Decimal)) else "待核验"
+    lines = [f"- 有效样本 {get('market.sample_count')}只，行情覆盖 {ratio(get('quality.coverage.target'))}；个股收益中位数 {pct(get('market.return_median_pct'))}。"]
     base = "market.decision_facts."
     if get(base + "breadth.evidence_type") == "OBSERVED":
-        lines.append(f"- [OBSERVED] 上涨 {get(base + 'breadth.up_count')}只，下跌 {get(base + 'breadth.down_count')}只，平盘 {get(base + 'breadth.flat_count')}只。")
+        lines.append(f"- 上涨 {get(base + 'breadth.up_count')}只，下跌 {get(base + 'breadth.down_count')}只，平盘 {get(base + 'breadth.flat_count')}只；上涨占比 {ratio(get('market.up_coverage'))}。")
+    else:
+        lines.append(f"- 上涨占比 {ratio(get('market.up_coverage'))}。")
+    amount_state = str(get("market.amount_quality.status") or get("market.amount_quality") or "").upper()
+    if amount_state not in _UNUSABLE_STATES and isinstance(get("market.total_amount"), (float, int, Decimal)):
+        lines.append(f"- 成交额 {amount(get('market.total_amount'))}；较上一交易日 {pct(get('market.amount_change_pct'))}。")
+    else:
+        lines.append("- 本库全A日线成交额及其变化待核验，不用这些字段判断放量、缩量或资金净流入。")
+    if get('context.market_turnover.status') == 'OBSERVED':
+        reported = get('context.market_turnover.reported_total_amount')
+        if isinstance(reported, (float, int, Decimal)):
+            source = {"sina": "新浪", "cls": "财联社", "eastmoney": "东方财富"}.get(
+                str(get('context.market_turnover.source')), "新闻来源")
+            lines.append(f"- 另据{source}同日收盘报道，沪深两市成交额 {amount(reported)}（不含北交所）；这与全A样本范围不同，不混算。")
     if get(base + "extremes.evidence_type") == "OBSERVED":
         threshold = get(base + "extremes.threshold_pct")
-        lines.append(f"- [OBSERVED] 日收益≥{threshold}%：{get(base + 'extremes.up_count')}只；≤-{threshold}%：{get(base + 'extremes.down_count')}只。该口径不是涨停、跌停家数。")
+        lines.append(f"- 日收益≥{threshold}%：{get(base + 'extremes.up_count')}只；≤-{threshold}%：{get(base + 'extremes.down_count')}只。这是极端收益样本，不是交易所涨跌停家数。")
     if get(base + "previous_strength.evidence_type") == "OBSERVED":
-        lines.append(f"- [OBSERVED] 昨日强势样本今日平均收益：{pct(get(base + 'previous_strength.mean_return_pct'))}；上涨占比：{ratio(get(base + 'previous_strength.positive_share'))}；匹配覆盖率：{ratio(get(base + 'previous_strength.matched_coverage'))}。样本为昨日收益前10%（含边界并列），不是昨日涨停股。")
-    else:
-        lines.append("- [UNKNOWN] 昨日强势股反馈缺少足够匹配覆盖，不据此推断赚钱效应。")
+        selection = get(base + 'previous_strength.selection_date') or '上一交易日'
+        feedback = get(base + 'previous_strength.feedback_date') or '目标行情日'
+        lines.append(f"- {selection}收益前10%样本在{feedback}的平均收益 {pct(get(base + 'previous_strength.mean_return_pct'))}，上涨占比 {ratio(get(base + 'previous_strength.positive_share'))}；匹配覆盖 {ratio(get(base + 'previous_strength.matched_coverage'))}。含边界并列，不是涨停股样本。")
     if get(base + "close_position.evidence_type") == "OBSERVED":
-        lines.append(f"- [OBSERVED] 收盘在日内区间的位置中位数：{ratio(get(base + 'close_position.median'))}（0为最低、100%为最高）。")
+        lines.append(f"- 收盘在全天高低区间的位置中位数 {ratio(get(base + 'close_position.median'))}（0为最低、100%为最高）；日线不能说明尾盘分时承接。")
     indices = {}
     for key, value in evidence.items():
         match = re.match(r"input\.context\.indices\.rows\[(\d+)\]\.(.+)", key)
@@ -674,12 +1017,18 @@ def _fact_panel(evidence: dict) -> list[str]:
             change = pct(row.get("change_pct"))
             code = str(row.get("index_code"))
             parts.append(f"{names.get(code, code)} {change}")
-        lines.append("- [OBSERVED] 同日指数：" + "；".join(parts) + "。")
-    else:
-        lines.append("- [UNKNOWN] 同日指数行情缺失，不用股票加权收益冒充指数。")
-    lines.append("- 来源：ProBigA 同日未复权日线、交易日历与PIT行业快照；以上口径与原始字段对应关系保留于结构化证据。")
-    return [line.replace("None", "UNKNOWN").replace("[OBSERVED]", "[UNKNOWN]")
-            if "None" in line or "UNKNOWN" in line else line for line in lines]
+        lines.append("- 同日指数：" + "；".join(parts) + "。")
+    return [line.replace("None", "待核验") for line in lines]
+
+
+def _security_name(evidence: dict, code: str) -> str:
+    for key, value in evidence.items():
+        if key.startswith("input.") and key.endswith(".stock_code") and str(value) == code:
+            root = key[:-len("stock_code")]
+            for field in ("short_name", "stock_name", "name"):
+                if evidence.get(root + field):
+                    return f"{evidence[root + field]}（{code}）"
+    return code
 
 
 def render_research(research: dict) -> str:
@@ -688,42 +1037,46 @@ def render_research(research: dict) -> str:
     target = research["review_date"] if kind == "review" else research["next_trade_date"]
     lines = [f"# {title}｜{target}", "",
              f"> 行情日：{research['review_date']}；下一交易日：{research['next_trade_date']}",
-             f"> 行情数据截止：{research['data_cutoff_at']}；研究生成：{research['generated_at']}",
-             f"> 新闻/外围截止：{research.get('context_cutoff_at', 'UNKNOWN')}", "",
-             "## 一句话结论", "", _claim_text(research["conclusion"]), "",
-             "## 当前交易权限", "", _claim_text(research["permission"]),
-             f"权限：{research['permission']['action']}；风险否决：{'是' if research['permission']['risk_veto'] else '否'}", "",
-             "## 事实面板与覆盖", ""]
+             f"> 行情同步：{_display_time(research['data_cutoff_at'])}；新闻截止：{_display_time(research.get('context_cutoff_at'))}",
+             f"> 研究生成：{_display_time(research['generated_at'])}（北京时间）", ""]
+    generated_date = str(research["generated_at"])[:10]
+    if kind == "review" and generated_date > research["review_date"]:
+        lines += ["> 补记：本篇在行情日之后整理，可能包含之后补录的当日收盘事实，不能当作当日盘中已有的判断。", ""]
+    stance = {"WAIT": "等待验证", "OBSERVE": "仅做观察", "CONDITIONAL": "条件满足后再评估"}[research["permission"]["action"]]
+    lines += ["## 先看结论", "", _claim_text(research["conclusion"]), "",
+              f"**当前行动：{stance}。** " + _claim_text(research["permission"]), "", f"## 基准行情事实（{research['review_date']}）", ""]
     lines += _fact_panel(research["evidence"])
-    lines += ["", "## 八角色仲裁", ""]
-    by_role = {item["role"]: item for item in research["roles"]}
-    for role in ROLES:
-        lines.append(f"- **{role}**：{_claim_text(by_role[role])}")
-    lines += ["", "## 隔夜与事件", ""]
-    lines += ["- " + _claim_text(item) for item in research["events"]] or ["- [UNKNOWN] 未提供可核验的隔夜新增事件。"]
-    lines += ["", "## 主线和身份", ""]
+    lines += ["", "## 市场与情绪", "", _claim_text(research["market_reading"]), "",
+              "## 主线、防守与观察名单", ""]
     for item in research["mainlines"]:
         lines += [f"### {item['direction']}｜{item['stage']}", "", _claim_text(item["assessment"]), ""]
         if not item["identities"]:
-            lines.append("[UNKNOWN] 个股身份不足以确认，只观察方向。")
+            lines.append("个股层级尚待确认，现有证据只能观察方向；无法据此指定龙头、中军或跟风。")
         for identity in item["identities"]:
-            lines.append(f"- {identity['stock_code']}｜{identity['identity']}：{_claim_text(identity['assessment'])}；验证：{identity['trigger']}；放弃：{identity['abandon']}")
+            lines += [f"**{_security_name(research['evidence'], identity['stock_code'])}｜{identity['identity']}**", "",
+                      _claim_text(identity["assessment"]), "",
+                      f"- 观察验证：{identity['trigger']}", f"- 放弃条件：{identity['abandon']}", ""]
     if not research["mainlines"]:
-        lines.append("[UNKNOWN] 尚无证据充分的持续主线，等待。")
-    lines += ["", "## 下一交易日条件剧本", "", "| 剧本 | 前提 | 可观察触发 | 允许行动 | 失效信号 | 反证 |", "|---|---|---|---|---|---|"]
+        lines.append("当前材料不足以完成方向与个股层级比较，主线判断待补充；这项研究缺口不能证明市场没有主线。")
+    if research["events"]:
+        lines += ["", "## 新消息改变了什么", ""]
+        lines += ["- " + _claim_text(item) for item in research["events"]]
+    if any(key.startswith("previous.") and value is not None for key, value in research["evidence"].items()):
+        lines += ["", "## 前日计划如何更新", ""]
+        labels = {"EXTENDED": "延续", "CHANGED": "改变", "INVALIDATED": "失效", "UNKNOWN": "待核验"}
+        lines += [f"- **{labels[item['change']]}**：{_claim_text(item)}" for item in research["continuity"]]
+    lines += ["", "## 下一交易日的验证与放弃条件", "", "| 情景 | 可观察验证 | 允许行动 | 放弃条件 |", "|---|---|---|---|"]
     for item in research["scenarios"]:
-        lines.append("| " + " | ".join(_cell(item[k]) for k in ("name", "premise", "trigger", "action", "invalidation", "counter_evidence")) + " |")
-    lines += ["", "## 盘中验证", "", "| 时间窗 | 验证点 |", "|---|---|"]
+        lines.append("| " + " | ".join(_cell(item[k]) for k in ("name", "trigger", "action", "invalidation")) + " |")
+    lines += ["", "| 时间窗 | 重点看什么、何时放弃 |", "|---|---|"]
     by_window = {item["time_window"]: item for item in research["checks"]}
     for window in WINDOWS:
         lines.append(f"| {window} | {_cell(by_window[window]['signal'])} |")
-    lines += ["", "## 前日假设：延续、改变与失效", ""]
-    labels = {"EXTENDED": "延续", "CHANGED": "改变", "INVALIDATED": "失效", "UNKNOWN": "未知"}
-    for item in research["continuity"]:
-        lines.append(f"- **{labels[item['change']]}**：{_claim_text(item)}")
     lines += ["", "## 最强反证与风险", "", _claim_text(research["counter_evidence"])]
     lines += ["- " + _claim_text(item) for item in research["risks"]]
-    lines += ["", "## 过程复盘", "", _claim_text(research["audit"]), "", "## 缺口和不确定性", ""]
-    lines += ["- [UNKNOWN] " + item for item in research["unknowns"]] or ["- 未另列缺口；仍以列明的证据覆盖为准。"]
-    lines += ["", "> 本报告为有条件的研究参考，不构成确定性的买卖指令。", f"> 规则版本：{research['rules_sha256']}；事实身份：{research['source_digest_sha256']}"]
+    if research["audit"]["status"] != "UNKNOWN":
+        lines += ["", "## 上一期假设的实际结果", "", _claim_text(research["audit"])]
+    if research["unknowns"]:
+        lines += ["", "## 哪些信息还会改变判断", ""]
+        lines += ["- " + item for item in dict.fromkeys(research["unknowns"])]
     return "\n".join(lines)
