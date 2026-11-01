@@ -56,6 +56,28 @@ def _date(value: Any) -> str:
     return raw
 
 
+def _qmt_datadir_receipt_finished_at(
+    receipt: Mapping[str, Any],
+    *,
+    trade_date: str,
+) -> str:
+    """Validate source finality without rejecting a next-day completion."""
+
+    target = _date(trade_date)
+    started_at = _timestamp(receipt.get("started_at"))
+    finished_at = _timestamp(receipt.get("finished_at"))
+    if finished_at < started_at:
+        raise RuntimeError("QMT datadir daily receipt ends before it starts")
+    if (
+        started_at[:10] == target
+        and datetime.fromisoformat(started_at).time() < QMT_DAILY_FINAL_TIME
+    ):
+        raise QmtDailyMarketNotFinal(
+            "QMT datadir daily receipt predates the market-data cutoff"
+        )
+    return finished_at
+
+
 @dataclass(frozen=True)
 class QmtDailyMarketTruth:
     run_id: str
@@ -312,14 +334,13 @@ def load_qmt_daily_market_truth(
                 raise QmtDailyMarketNotFinal(
                     "QMT datadir daily receipt is not final"
                 )
-            finished_at = _timestamp(receipt["finished_at"])
+            finished_at = _qmt_datadir_receipt_finished_at(
+                receipt,
+                trade_date=start,
+            )
             if finished_at > decision_time:
                 raise QmtDailySourceAfterCutoff(
                     "QMT datadir daily receipt is after the decision cutoff"
-                )
-            if datetime.fromisoformat(finished_at).time() < QMT_DAILY_FINAL_TIME:
-                raise QmtDailyMarketNotFinal(
-                    "QMT datadir daily receipt predates the market-data cutoff"
                 )
             detail = receipt.get("detail") or {}
             fingerprint = persisted_fingerprint(
