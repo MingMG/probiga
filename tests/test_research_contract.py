@@ -261,3 +261,20 @@ def test_cli_schema_has_closed_required_objects_and_anyof():
             for value in node:
                 check(value)
     check(draft_json_schema())
+
+
+def test_real_automatic_briefing_cannot_omit_sentiment_from_native_conclusion_schema():
+    from biz.review.research_contract import _check_schema
+    failed = json.loads((Path(__file__).parent / "fixtures" / "briefing_missing_sentiment_20261102.json").read_text(encoding="utf-8"))
+    assert failed["report"]["conclusion_units"] == ["U1"]
+    assert any(unit["topic"] == "sentiment" for unit in failed["units"])
+    with pytest.raises(ContractError, match=r"schema_array path=\$\.report\.conclusion_units"):
+        _check_schema(failed, draft_json_schema())
+
+
+def test_two_environment_refs_do_not_replace_the_required_sentiment_research():
+    p = packet()
+    draft = answer(p)
+    draft["report"]["conclusion_units"] = ["Uenv", "Urisk"]
+    with pytest.raises(ContractError, match="conclusion_requires_market_research_sentiment"):
+        run(draft, p)
