@@ -77,7 +77,7 @@ def draft_json_schema() -> dict:
                          "assessment_units": ids, "watches": _array(watch, 0, 3)})
     continuity = _object({"baseline_fact_id": identifier, "change": {"type": "string", "enum": ["inherited", "strengthened", "weakened", "invalidated", "unassessable"]},
                           "new_fact_ids": _array(identifier, 0, 12), "reason_units": ids})
-    report = _object({"conclusion_units": ids, "permission": _object({"action": {"type": "string", "enum": ["WAIT", "OBSERVE", "CONDITIONAL"]}, "basis_units": ids}),
+    report = _object({"conclusion_units": _array(identifier, 2, 20), "permission": _object({"action": {"type": "string", "enum": ["WAIT", "OBSERVE", "CONDITIONAL"]}, "basis_units": ids}),
                       "market_reading_units": ids, "directions": _array(direction, 0, 3), "event_units": _array(identifier, 0, 8),
                       "scenarios": _array(_object({"name": string, "trigger_units": ids, "action_units": ids, "abandon_units": ids}), 1, 3),
                       "checks": _object({window: _array(identifier, 0, 12) for window in WINDOWS}), "counter_evidence_units": ids,

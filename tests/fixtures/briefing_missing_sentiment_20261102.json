@@ -1,0 +1,858 @@
+{
+  "report": {
+    "audit_units": [
+      "L3"
+    ],
+    "checks": {
+      "close": [
+        "C4"
+      ],
+      "first_30m": [
+        "C2"
+      ],
+      "midday": [
+        "C3",
+        "C5"
+      ],
+      "open": [
+        "C1"
+      ]
+    },
+    "conclusion_units": [
+      "U1"
+    ],
+    "continuity": [
+      {
+        "baseline_fact_id": "F44",
+        "change": "inherited",
+        "new_fact_ids": [],
+        "reason_units": [
+          "B1"
+        ]
+      },
+      {
+        "baseline_fact_id": "F47",
+        "change": "inherited",
+        "new_fact_ids": [],
+        "reason_units": [
+          "B1"
+        ]
+      },
+      {
+        "baseline_fact_id": "F51",
+        "change": "inherited",
+        "new_fact_ids": [],
+        "reason_units": [
+          "B1"
+        ]
+      }
+    ],
+    "counter_evidence_units": [
+      "U8",
+      "C2"
+    ],
+    "directions": [
+      {
+        "assessment_units": [
+          "U3"
+        ],
+        "classification": "defensive_candidate",
+        "entity_id": "E15",
+        "watches": [
+          {
+            "abandon_units": [
+              "C7"
+            ],
+            "assessment_units": [
+              "U4"
+            ],
+            "entity_id": "E24",
+            "identity": "unconfirmed",
+            "trigger_units": [
+              "C6"
+            ]
+          }
+        ]
+      },
+      {
+        "assessment_units": [
+          "U5"
+        ],
+        "classification": "unconfirmed",
+        "entity_id": "E10",
+        "watches": [
+          {
+            "abandon_units": [
+              "C9"
+            ],
+            "assessment_units": [
+              "U6"
+            ],
+            "entity_id": "E17",
+            "identity": "unconfirmed",
+            "trigger_units": [
+              "C8"
+            ]
+          }
+        ]
+      }
+    ],
+    "event_units": [
+      "N1"
+    ],
+    "limitation_units": [
+      "L1",
+      "L2",
+      "L4"
+    ],
+    "market_reading_units": [
+      "U2",
+      "U10"
+    ],
+    "permission": {
+      "action": "OBSERVE",
+      "basis_units": [
+        "U1",
+        "L4"
+      ]
+    },
+    "scenarios": [
+      {
+        "abandon_units": [
+          "C3"
+        ],
+        "action_units": [
+          "A1"
+        ],
+        "name": "修复扩散",
+        "trigger_units": [
+          "C2"
+        ]
+      },
+      {
+        "abandon_units": [
+          "C5"
+        ],
+        "action_units": [
+          "A2"
+        ],
+        "name": "午间负反馈延续",
+        "trigger_units": [
+          "C3"
+        ]
+      }
+    ]
+  },
+  "roles": [
+    {
+      "role": "总策略负责人",
+      "unit_ids": [
+        "U1"
+      ]
+    },
+    {
+      "role": "情绪周期分析师",
+      "unit_ids": [
+        "U2"
+      ]
+    },
+    {
+      "role": "相对强度分析师",
+      "unit_ids": [
+        "U3",
+        "U5"
+      ]
+    },
+    {
+      "role": "博弈与资金分析师",
+      "unit_ids": [
+        "U10"
+      ]
+    },
+    {
+      "role": "主线交易员",
+      "unit_ids": [
+        "U4",
+        "U6"
+      ]
+    },
+    {
+      "role": "风险经理",
+      "unit_ids": [
+        "L2",
+        "L4"
+      ]
+    },
+    {
+      "role": "反方审查员",
+      "unit_ids": [
+        "U8",
+        "C2"
+      ]
+    },
+    {
+      "role": "复盘审计员",
+      "unit_ids": [
+        "L3",
+        "B1"
+      ]
+    }
+  ],
+  "schema_version": "probiga.research-draft.v3",
+  "units": [
+    {
+      "confidence": "high",
+      "evidence_ids": [
+        "F1",
+        "F3",
+        "F4"
+      ],
+      "id": "U1",
+      "kind": "market_inference",
+      "statement": [
+        {
+          "text": "风险释放是当前基线，当前权限为观察。有效行情样本上涨占比为"
+        },
+        {
+          "fact_id": "F1",
+          "field": "up_coverage"
+        },
+        {
+          "text": "，极端下跌样本为"
+        },
+        {
+          "fact_id": "F3",
+          "field": "down_count"
+        },
+        {
+          "text": "，昨日强势样本平均收益为"
+        },
+        {
+          "fact_id": "F4",
+          "field": "mean_return_pct"
+        },
+        {
+          "text": "。广泛亏损与强势负反馈压低追涨容错，尚不支持进攻。极端样本不是交易所跌停家数，强势样本也不是昨日涨停股。"
+        }
+      ],
+      "topic": "environment"
+    },
+    {
+      "confidence": "medium",
+      "evidence_ids": [
+        "F3",
+        "F4",
+        "F5",
+        "F10"
+      ],
+      "id": "U2",
+      "kind": "market_inference",
+      "statement": [
+        {
+          "text": "情绪更接近退潮中的风险释放。样本收盘位置指标为"
+        },
+        {
+          "fact_id": "F5",
+          "field": "close_position_share"
+        },
+        {
+          "text": "，收盘靠近日内低位；"
+        },
+        {
+          "entity_id": "E5"
+        },
+        {
+          "text": "收于自身日内低点。这不能证明全天或尾盘抛压路径。缺少完整连板与炸板序列，不能精确定位冰点。"
+        }
+      ],
+      "topic": "sentiment"
+    },
+    {
+      "confidence": "medium",
+      "evidence_ids": [
+        "F20",
+        "F29",
+        "F30",
+        "F12"
+      ],
+      "id": "U3",
+      "kind": "market_inference",
+      "statement": [
+        {
+          "entity_id": "E15"
+        },
+        {
+          "text": "涨幅为"
+        },
+        {
+          "fact_id": "F20",
+          "field": "change_pct"
+        },
+        {
+          "text": "，关联股票共同上涨，可列防守观察候选。分类仅表示风险环境下相对价格较强，不确认避险资金、基本面防御属性或抱团；轮动和单日异动仍是竞争解释。另一来源的"
+        },
+        {
+          "entity_id": "E7"
+        },
+        {
+          "text": "仅作独立旁证。"
+        }
+      ],
+      "topic": "mainline"
+    },
+    {
+      "confidence": "medium",
+      "evidence_ids": [
+        "F29",
+        "F37",
+        "F30"
+      ],
+      "id": "U4",
+      "kind": "market_inference",
+      "statement": [
+        {
+          "entity_id": "E24"
+        },
+        {
+          "text": "身份未确认，仅观察局部强势资金是否继续响应。收盘为"
+        },
+        {
+          "fact_id": "F29",
+          "field": "close"
+        },
+        {
+          "text": "，高于冻结五日均线"
+        },
+        {
+          "fact_id": "F37",
+          "field": "ma5"
+        },
+        {
+          "text": "；MACD正动量增强、KDJ回升，但不能证明带动关系。"
+        },
+        {
+          "entity_id": "E25"
+        },
+        {
+          "text": "同涨提供同组旁证，两者具有共同方向风险，不能视作独立机会。"
+        }
+      ],
+      "topic": "identity"
+    },
+    {
+      "confidence": "medium",
+      "evidence_ids": [
+        "F15",
+        "F21",
+        "F22",
+        "F59"
+      ],
+      "id": "U5",
+      "kind": "market_inference",
+      "statement": [
+        {
+          "entity_id": "E10"
+        },
+        {
+          "text": "方向下跌与局部股票强势冲突，持续主线未获确认。合作报道提供主题线索，但未建立观察公司的直接订单受益链；有限样本不能证明板块排名或带动因果。"
+        }
+      ],
+      "topic": "mainline"
+    },
+    {
+      "confidence": "medium",
+      "evidence_ids": [
+        "F22",
+        "F33",
+        "F21"
+      ],
+      "id": "U6",
+      "kind": "market_inference",
+      "statement": [
+        {
+          "entity_id": "E17"
+        },
+        {
+          "text": "身份未确认。日内开高低收一致，价格强不能保证退出流动性；冻结五日均线偏离为"
+        },
+        {
+          "fact_id": "F33",
+          "field": "ma5_deviation_pct"
+        },
+        {
+          "text": "，MACD动量增强与KDJ偏热并存。后续推动仍依赖局部强势延续；"
+        },
+        {
+          "entity_id": "E16"
+        },
+        {
+          "text": "未同步强涨，不能据此确认完整带动链，两者也不能视为相互独立的方向押注。"
+        }
+      ],
+      "topic": "identity"
+    },
+    {
+      "confidence": "medium",
+      "evidence_ids": [
+        "F43"
+      ],
+      "id": "U10",
+      "kind": "market_inference",
+      "statement": [
+        {
+          "text": "独立报道显示沪深成交额较前日增加，增量为"
+        },
+        {
+          "fact_id": "F43",
+          "field": "reported_change_amount"
+        },
+        {
+          "text": "。范围不含北交所，仅作成交活跃度旁证，不能修复全市场金额认证缺口，也不能识别参与者意图或证明新增资金净流入。"
+        }
+      ],
+      "topic": "risk"
+    },
+    {
+      "confidence": "medium",
+      "evidence_ids": [
+        "F29",
+        "F30",
+        "F22",
+        "F53"
+      ],
+      "id": "U8",
+      "kind": "market_inference",
+      "statement": [
+        {
+          "text": "最强竞争解释是局部强股仍在，市场可能较快修复。机构企稳观点不是价格验证；上涨扩散改善与强势反馈转正可削弱继续风险释放的推断，不改变已经发生的普跌。"
+        }
+      ],
+      "topic": "counter_evidence"
+    },
+    {
+      "confidence": "medium",
+      "evidence_ids": [
+        "F52",
+        "F53",
+        "F54",
+        "F55",
+        "F56",
+        "F57",
+        "F58",
+        "F59"
+      ],
+      "id": "N1",
+      "kind": "market_inference",
+      "statement": [
+        {
+          "text": "机构估值与底部判断属于媒体转述的机构观点，不能据此认证估值便宜、稳市资金或融资企稳。产业报告及韩国出口报道提供需求线索，重复报道不构成独立验证；航天合作未证明观察公司受益。券商持股统计是历史持仓，不能解释为当前买盘。对于新闻晚于行情截止的审查分歧，采用任务另设的上下文截止"
+        },
+        {
+          "task": "context_cutoff_at"
+        },
+        {
+          "text": "作为新闻信息边界，因此保留这些冻结报道；发布时间不能证明此前未被预期。样本内没有足以确认反转的正式政策文件，新增消息尚不足以提升行动权限。"
+        }
+      ],
+      "topic": "event"
+    },
+    {
+      "effect": "reduce_confidence",
+      "evidence_ids": [
+        "F39"
+      ],
+      "id": "L1",
+      "kind": "data_limitation",
+      "statement": [
+        {
+          "text": "财务未经认证，盈利质量、估值及业绩催化均未验证，方向和个股缺少基本面背书。"
+        }
+      ],
+      "topic": "mainline"
+    },
+    {
+      "effect": "disable_turnover",
+      "evidence_ids": [
+        "F6",
+        "F38"
+      ],
+      "id": "L2",
+      "kind": "data_limitation",
+      "statement": [
+        {
+          "text": "全市场金额及个股量比认证不足，不能确认放量突破、容量排名或盘中同时间量能改善。技术指标仅按已认证覆盖使用。"
+        }
+      ],
+      "topic": "risk"
+    },
+    {
+      "effect": "missing_window",
+      "evidence_ids": [
+        "F41"
+      ],
+      "id": "L3",
+      "kind": "data_limitation",
+      "statement": [
+        {
+          "text": "没有逐窗触发与执行回执，不能证明假设已验证、策略盈利或交易能力；后续需留存触发、失效及执行记录。"
+        }
+      ],
+      "topic": "audit"
+    },
+    {
+      "effect": "no_portfolio_budget",
+      "evidence_ids": [
+        "F42",
+        "F40"
+      ],
+      "id": "L4",
+      "kind": "data_limitation",
+      "statement": [
+        {
+          "text": "未提供账户与风险预算，不能下达仓位命令或评估组合最坏损失；龙头、中军与跟风关系也未认证。"
+        }
+      ],
+      "topic": "risk"
+    },
+    {
+      "evidence_ids": [
+        "F44",
+        "F47",
+        "F51"
+      ],
+      "id": "B1",
+      "kind": "baseline_restatement",
+      "statement": [
+        {
+          "text": "继承父基线的风险释放、退潮判断及白酒防守观察候选。相同闭市行情再次输入不构成新增验证。"
+        }
+      ],
+      "topic": "continuity"
+    },
+    {
+      "conditions": [
+        {
+          "observable_id": "O4",
+          "operator": "holds_above",
+          "reference": {
+            "fact_id": "F7",
+            "field": "low",
+            "kind": "fact"
+          },
+          "window": "open"
+        }
+      ],
+      "id": "C1",
+      "kind": "future_condition",
+      "logic": "all",
+      "statement": [
+        {
+          "text": "开盘检查"
+        },
+        {
+          "entity_id": "E2"
+        },
+        {
+          "text": "是否守在前日低点之上。"
+        }
+      ],
+      "topic": "environment"
+    },
+    {
+      "conditions": [
+        {
+          "observable_id": "O1",
+          "operator": "improves",
+          "reference": {
+            "fact_id": "",
+            "field": "",
+            "kind": "same_session_open"
+          },
+          "window": "first_30m"
+        },
+        {
+          "observable_id": "O2",
+          "operator": "turns_positive",
+          "reference": {
+            "fact_id": "",
+            "field": "",
+            "kind": "zero"
+          },
+          "window": "first_30m"
+        }
+      ],
+      "id": "C2",
+      "kind": "future_condition",
+      "logic": "all",
+      "statement": [
+        {
+          "text": "前半小时检查时，上涨占比较开盘改善且昨日强势反馈转正，构成初步修复反证。"
+        }
+      ],
+      "topic": "counter_evidence"
+    },
+    {
+      "conditions": [
+        {
+          "observable_id": "O1",
+          "operator": "weakens",
+          "reference": {
+            "fact_id": "",
+            "field": "",
+            "kind": "same_session_open"
+          },
+          "window": "midday"
+        },
+        {
+          "observable_id": "O2",
+          "operator": "turns_negative",
+          "reference": {
+            "fact_id": "",
+            "field": "",
+            "kind": "zero"
+          },
+          "window": "midday"
+        }
+      ],
+      "id": "C3",
+      "kind": "future_condition",
+      "logic": "all",
+      "statement": [
+        {
+          "text": "午间上涨占比较开盘走弱且昨日强势反馈转负，放弃早间修复剧本，观察负反馈延续。"
+        }
+      ],
+      "topic": "risk"
+    },
+    {
+      "conditions": [
+        {
+          "observable_id": "O2",
+          "operator": "turns_positive",
+          "reference": {
+            "fact_id": "",
+            "field": "",
+            "kind": "zero"
+          },
+          "window": "close"
+        }
+      ],
+      "id": "C4",
+      "kind": "future_condition",
+      "logic": "all",
+      "statement": [
+        {
+          "text": "尾盘检查昨日强势反馈是否转正。"
+        }
+      ],
+      "topic": "sentiment"
+    },
+    {
+      "conditions": [
+        {
+          "observable_id": "O1",
+          "operator": "improves",
+          "reference": {
+            "fact_id": "",
+            "field": "",
+            "kind": "same_session_open"
+          },
+          "window": "midday"
+        },
+        {
+          "observable_id": "O2",
+          "operator": "turns_positive",
+          "reference": {
+            "fact_id": "",
+            "field": "",
+            "kind": "zero"
+          },
+          "window": "midday"
+        }
+      ],
+      "id": "C5",
+      "kind": "future_condition",
+      "logic": "all",
+      "statement": [
+        {
+          "text": "午间上涨占比较开盘改善且昨日强势反馈转正，放弃午间负反馈剧本。"
+        }
+      ],
+      "topic": "counter_evidence"
+    },
+    {
+      "conditions": [
+        {
+          "observable_id": "O48",
+          "operator": "holds_above",
+          "reference": {
+            "fact_id": "F37",
+            "field": "ma5",
+            "kind": "fact"
+          },
+          "window": "first_30m"
+        },
+        {
+          "observable_id": "O29",
+          "operator": "turns_positive",
+          "reference": {
+            "fact_id": "",
+            "field": "",
+            "kind": "zero"
+          },
+          "window": "first_30m"
+        }
+      ],
+      "id": "C6",
+      "kind": "future_condition",
+      "logic": "all",
+      "statement": [
+        {
+          "text": "前半小时检查时，"
+        },
+        {
+          "entity_id": "E24"
+        },
+        {
+          "text": "守在冻结五日均线之上且关联概念相对强度转正，继续观察。"
+        }
+      ],
+      "topic": "identity"
+    },
+    {
+      "conditions": [
+        {
+          "observable_id": "O48",
+          "operator": "breaks_below",
+          "reference": {
+            "fact_id": "F37",
+            "field": "ma5",
+            "kind": "fact"
+          },
+          "window": "first_30m"
+        },
+        {
+          "observable_id": "O29",
+          "operator": "turns_negative",
+          "reference": {
+            "fact_id": "",
+            "field": "",
+            "kind": "zero"
+          },
+          "window": "first_30m"
+        }
+      ],
+      "id": "C7",
+      "kind": "future_condition",
+      "logic": "any",
+      "statement": [
+        {
+          "text": "同一前半小时检查时，个股跌破冻结五日均线或关联概念相对强度转负，放弃该观察触发。"
+        }
+      ],
+      "topic": "risk"
+    },
+    {
+      "conditions": [
+        {
+          "observable_id": "O34",
+          "operator": "holds_above",
+          "reference": {
+            "fact_id": "F22",
+            "field": "close",
+            "kind": "fact"
+          },
+          "window": "first_30m"
+        },
+        {
+          "observable_id": "O19",
+          "operator": "turns_positive",
+          "reference": {
+            "fact_id": "",
+            "field": "",
+            "kind": "zero"
+          },
+          "window": "first_30m"
+        }
+      ],
+      "id": "C8",
+      "kind": "future_condition",
+      "logic": "all",
+      "statement": [
+        {
+          "text": "前半小时检查时，"
+        },
+        {
+          "entity_id": "E17"
+        },
+        {
+          "text": "守在前日收盘之上且关联方向相对强度转正，观察扩散可能。"
+        }
+      ],
+      "topic": "identity"
+    },
+    {
+      "conditions": [
+        {
+          "observable_id": "O34",
+          "operator": "breaks_below",
+          "reference": {
+            "fact_id": "F22",
+            "field": "close",
+            "kind": "fact"
+          },
+          "window": "first_30m"
+        },
+        {
+          "observable_id": "O19",
+          "operator": "turns_negative",
+          "reference": {
+            "fact_id": "",
+            "field": "",
+            "kind": "zero"
+          },
+          "window": "first_30m"
+        }
+      ],
+      "id": "C9",
+      "kind": "future_condition",
+      "logic": "any",
+      "statement": [
+        {
+          "text": "同一前半小时检查时，个股跌破前日收盘或关联方向相对强度转负，放弃该观察触发。"
+        }
+      ],
+      "topic": "risk"
+    },
+    {
+      "confidence": "medium",
+      "evidence_ids": [
+        "F1",
+        "F4"
+      ],
+      "id": "A1",
+      "kind": "market_inference",
+      "statement": [
+        {
+          "text": "修复条件满足后，跟踪方向与关联股票同步性，保留观察权限。"
+        }
+      ],
+      "topic": "action"
+    },
+    {
+      "confidence": "high",
+      "evidence_ids": [
+        "F1",
+        "F4"
+      ],
+      "id": "A2",
+      "kind": "market_inference",
+      "statement": [
+        {
+          "text": "负反馈延续时，停止将局部上涨解释为全面修复。"
+        }
+      ],
+      "topic": "action"
+    }
+  ]
+}
