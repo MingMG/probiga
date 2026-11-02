@@ -415,6 +415,163 @@ def test_normal_and_timeout_outputs_survive_terminal_database_failure(case,monke
     assert rows(case)[0]["status"]==rows(case)[2]["last_run_status"]=="running"
 
 
+@pytest.mark.parametrize("task_type", ["notice_eastmoney", "stock_finance"])
+@pytest.mark.parametrize("configured", [180, 0, -5])
+def test_resumable_linux_collector_always_has_a_positive_attempt_budget(
+    monkeypatch, task_type, configured,
+):
+    monkeypatch.setattr(runtime, "DEFAULT_TASK_TIMEOUT_MINUTES", configured)
+    assert runtime._task_timeout_minutes({"task_type": task_type}) == max(1, configured)
+
+
+@pytest.mark.parametrize("task_type", ["notice_eastmoney", "stock_finance"])
+def test_collector_timeout_terminates_real_child_and_releases_only_its_exact_run(
+    case, monkeypatch, task_type,
+):
+    """Scale only the wait; exercise the real kill, lease and terminal writes."""
+    import subprocess
+    import threading
+    from unittest.mock import MagicMock
+    from server.common import scheduler_task_lease
+
+    case.start(task_type=task_type)
+    stage = rows(case)[1]
+    other_uid = "d" * 32
+    other = daily.start_daily_stage_attempt(
+        case.engine, scheduler_run_uid=other_uid,
+        stage_name="capital_flow_batch_fast", trade_date="2026-09-30",
+        release_id="b" * 40, strategy_release_id="c" * 64,
+        lease_owner=runtime._scheduler_instance_id, lease_seconds=90,
+        preserve_session_status=True,
+    )
+    identity = dict(runtime._terminal_run_identities[case.uid])
+    identity["host_name"] = runtime.gethostname()
+    marker = scheduler_task_lease.encode(identity, case.now)
+    with case.engine.begin() as conn:
+        conn.execute(text("UPDATE st_scheduled_task_history SET host_name=:host,output=:output "
+                          "WHERE run_uid=:uid"),
+                     {"host": identity["host_name"], "output": marker, "uid": case.uid})
+    runtime._terminal_run_identities[case.uid] = identity
+    owner = scheduler_task_lease.TaskOwnerLease(
+        case.engine, identity, marker, clock=lambda: case.now, on_lost=lambda: None,
+    )
+    unrelated_owner = MagicMock()
+    monkeypatch.setattr(runtime, "_task_owner_leases", {case.uid: owner, other_uid: unrelated_owner})
+    monkeypatch.setattr(runtime, "_running_history_uids", {127: case.uid, 999: other_uid})
+    monkeypatch.setattr(runtime, "_running_task_ids", {127, 999})
+    monkeypatch.setattr(runtime, "_scheduler_stopping", False)
+    monkeypatch.setattr(runtime, "_windows_scheduler_lease", None)
+    monkeypatch.setattr(runtime, "DEFAULT_TASK_TIMEOUT_MINUTES", 180)
+    monkeypatch.setattr(runtime, "_task_lane_semaphore", lambda row: threading.Semaphore(1))
+    monkeypatch.setattr(runtime, "_scheduler_build_commit_sha", lambda: "b" * 40)
+    monkeypatch.setattr(runtime, "runtime_contract_build_sha", lambda **kw: "b" * 40)
+    monkeypatch.setattr(runtime, "strategy_release_identity", lambda: "c" * 64)
+    monkeypatch.setattr(runtime, "start_daily_stage_attempt", lambda *a, **kw: stage)
+    monkeypatch.setattr(runtime, "_task_dispatch_date", lambda *a, **kw: "2026-09-30")
+    monkeypatch.setattr(runtime, "_task_argument_row", lambda row, **kw: row)
+    monkeypatch.setattr(runtime, "_bind_release_validation_target", lambda row, *a, **kw: row)
+    monkeypatch.setattr(runtime, "_build_task_args", lambda *a: [])
+    monkeypatch.setattr(runtime, "build_child_env", lambda *a, **kw: {})
+    monkeypatch.setattr(runtime, "_try_revalidate_existing_notice_receipt", lambda *a, **kw: False)
+    monkeypatch.setattr(runtime, "_renew_daily_stage_lease_until_stopped", lambda **kw: kw["stop_event"].wait(2))
+    validate = MagicMock(side_effect=AssertionError("a timed-out child cannot publish success"))
+    monkeypatch.setattr(runtime, "validate_scheduler_task_result", validate)
+    observe, observation_errors = runtime._terminal_observe, []
+
+    def observe_terminal(*args, **kwargs):
+        try:
+            return observe(*args, **kwargs)
+        except Exception as exc:
+            observation_errors.append(repr(exc))
+            raise
+
+    monkeypatch.setattr(runtime, "_terminal_observe", observe_terminal)
+
+    # Both real checkpoint formats survive the scheduler's terminal cleanup.
+    if task_type == "notice_eastmoney":
+        from biz.notice import sync_notice_em as collector
+        from datetime import date
+        checkpoint = collector._notice_incremental_shards(
+            window_start=date(2026, 8, 16), window_end=date(2026, 10, 1),
+            target_trade_date=date(2026, 9, 30),
+        )
+        saved = dict(rows=[], captured_at="2026-09-30T18:05:00", page_count=1, total_hits=0)
+        checkpoint.save("000001", saved)
+        checkpoint_path = checkpoint._path("000001")
+    else:
+        from biz.stock_finance import sync_finance as collector
+        checkpoint_path = case.jobs / "stock-finance-daily-v2.json"
+        saved = dict(as_of="2026-09-30", input_root_sha256="f" * 64,
+                     completed_codes=["000001"], unresolved_codes=["000002"])
+        collector._write_checkpoint(checkpoint_path, saved)
+    original_checkpoint = checkpoint_path.read_bytes()
+
+    script = case.jobs / "blocked_collector.py"
+    script.write_text("import time\ntime.sleep(20)\n", encoding="utf-8")
+    monkeypatch.setattr(runtime, "resolve_scheduler_script", lambda *a: script)
+    spawn = subprocess.Popen
+    children, budgets = [], []
+
+    class ScaledDeadline:
+        def __init__(self, proc):
+            self.proc = proc
+
+        def __getattr__(self, name):
+            return getattr(self.proc, name)
+
+        def communicate(self, timeout=None):
+            if not budgets:
+                budgets.append(timeout)
+                assert timeout == 180 * 60
+                return self.proc.communicate(timeout=0.05)
+            return self.proc.communicate(timeout=5)
+
+    def launch(*args, **kwargs):
+        child = spawn(*args, **kwargs)
+        children.append(child)
+        return ScaledDeadline(child)
+
+    monkeypatch.setattr(runtime.subprocess, "Popen", launch)
+    row = dict(id=127, task_name=task_type, task_type=task_type,
+               script_path="tools/blocked_collector.py", _history_started=True,
+               _history_run_uid=case.uid)
+    try:
+        runtime._run_task_async(row, case.jobs, case.engine)
+    finally:
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=5)
+        owner.stop()
+
+    assert observation_errors == []
+    history, finished_stage, task = rows(case)
+    assert history["status"] == task["last_run_status"] == "timeout"
+    assert history["run_uid"] == case.uid and finished_stage["status"] == "TIMEOUT"
+    assert history["finished_at"] is not None and history["exit_code"] != 0
+    assert children and all(child.poll() is not None for child in children)
+    assert owner.stop_event.is_set() and not owner.thread.is_alive()
+    assert case.uid not in runtime._task_owner_leases
+    assert 127 not in runtime._running_task_ids and runtime._running_history_uids == {999: other_uid}
+    assert runtime._task_owner_leases[other_uid] is unrelated_owner
+    unrelated_owner.stop.assert_not_called()
+    with case.engine.connect() as conn:
+        assert conn.execute(text("SELECT status FROM st_daily_stage_attempt WHERE attempt_uid=:uid"),
+                            {"uid": other["attempt_uid"]}).scalar_one() == "RUNNING"
+    validate.assert_not_called()
+    assert checkpoint_path.read_bytes() == original_checkpoint
+    if task_type == "notice_eastmoney":
+        # The next attempt uses the real source-snapshot reader, accepting an
+        # older authoritative empty response without replacing its timestamp.
+        restored, restored_rows, _ = collector._notice_source_snapshot(
+            "000001", checkpoint.load("000001"), window_start=date(2026, 8, 16),
+            window_end=date(2026, 10, 1), batch_id="e" * 64, finished_at=case.now,
+        )
+        assert restored.captured_at == datetime(2026, 9, 30, 18, 5) and restored_rows == []
+    else:
+        assert collector._checkpoint_payload(checkpoint_path) == saved
+
+
 def test_late_terminal_wall_clock_does_not_replace_original_claim_stamp(case,monkeypatch):
     case.start()
     monkeypatch.setattr(runtime,"_now_shanghai_naive",lambda:case.now+timedelta(seconds=10))

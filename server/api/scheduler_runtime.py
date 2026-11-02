@@ -681,8 +681,8 @@ FAST_RUNNING_TASK_TYPES = {
     "trading_v2_paper_tick",
 }
 UNLIMITED_SELECTION_TASK_TYPES = frozenset({
-    # The full-market atomic finance seal is required by selection. A partial
-    # checkpoint cannot satisfy that dependency, so let the scan finish.
+    # Finance remains a selection dependency, but its collector receives a
+    # bounded execution budget before this group in _task_timeout_minutes.
     "stock_finance",
     "analysis_fast",
     "strategy_governance_daily",
@@ -4193,6 +4193,11 @@ def _task_timeout_minutes(
     now: datetime | None = None,
 ) -> int | None:
     task_type = str(row.get("task_type") or "").strip()
+    if task_type in {"notice_eastmoney", "stock_finance"}:
+        # These Linux collectors persist resumable checkpoints. A stalled
+        # attempt must terminate and release its claim so automatic recovery
+        # can continue the remaining work instead of renewing RUNNING forever.
+        return max(1, DEFAULT_TASK_TIMEOUT_MINUTES)
     # Selection must finish on its evidence, not an elapsed-time deadline.
     # Process ownership, explicit stops and renewable stage leases still apply.
     if task_type in UNLIMITED_SELECTION_TASK_TYPES or task_type in DAILY_RESULT_RECOVERY_TASK_TYPES:
