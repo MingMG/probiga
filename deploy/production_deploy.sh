@@ -3362,12 +3362,14 @@ controlled_guard_restore_previous_writer_states() {
 }
 controlled_guard_run_service_gate_with_deadline() {
   local service_user="$1"
-  shift
+  local gate_timeout="$2"
+  local gate_kill_after="$3"
+  shift 3
   test -n "$service_user" || return 1
   test "$service_user" != root || return 1
-  [[ "$CONTROLLED_DATABASE_GATE_TIMEOUT" =~ ^[1-9][0-9]*[smh]$ ]] || \
+  [[ "$gate_timeout" =~ ^[1-9][0-9]*[smh]$ ]] || \
     return 1
-  [[ "$CONTROLLED_DATABASE_GATE_KILL_AFTER" =~ ^[1-9][0-9]*[smh]$ ]] || \
+  [[ "$gate_kill_after" =~ ^[1-9][0-9]*[smh]$ ]] || \
     return 1
   test "$#" -gt 0 || return 1
   test -x /usr/bin/sudo || return 1
@@ -3377,8 +3379,8 @@ controlled_guard_run_service_gate_with_deadline() {
   # sudo has dropped privileges so sudo/use_pty cannot put Python outside the
   # process group which timeout owns.
   /usr/bin/sudo -u "$service_user" /usr/bin/timeout --signal=TERM \
-    "--kill-after=$CONTROLLED_DATABASE_GATE_KILL_AFTER" \
-    "$CONTROLLED_DATABASE_GATE_TIMEOUT" "$@" || return 1
+    "--kill-after=$gate_kill_after" \
+    "$gate_timeout" "$@" || return 1
   return 0
 }
 controlled_guard_capture_service_gate_with_deadline() {
@@ -5122,6 +5124,7 @@ controlled_guard_verify_restored_runtime() {
     fi
     RESTORED_RUNTIME_FAILURE_CODE=scheduler-schema-verify
     controlled_guard_run_service_gate_with_deadline "$service_user" \
+      "$CONTROLLED_DATABASE_GATE_TIMEOUT" "$CONTROLLED_DATABASE_GATE_KILL_AFTER" \
       "${guarded_command_prefix[@]}" "$python_path" -P \
       -c 'from tools.ensure_quality_gate import ensure_scheduler_columns; from server.common.batch_db import create_batch_engine; ensure_scheduler_columns(create_batch_engine())' || return 1
     if [ "$input_readiness_mode" = recover-input-readiness ]; then
@@ -5297,6 +5300,7 @@ controlled_guard_verify_restored_runtime() {
   else
     RESTORED_RUNTIME_FAILURE_CODE=governance-health
     controlled_guard_run_service_gate_with_deadline "$service_user" \
+      "$CONTROLLED_DATABASE_GATE_TIMEOUT" "$CONTROLLED_DATABASE_GATE_KILL_AFTER" \
       "${guarded_command_prefix[@]}" "$python_path" -P \
       "$code_root/tools/check_strategy_governance_health.py" \
       "${governance_health_args[@]}" || return 1
@@ -5307,6 +5311,7 @@ controlled_guard_verify_restored_runtime() {
     return 0
   fi
   controlled_guard_run_service_gate_with_deadline "$service_user" \
+      "$CONTROLLED_DATABASE_GATE_TIMEOUT" "$CONTROLLED_DATABASE_GATE_KILL_AFTER" \
     "${guarded_command_prefix[@]}" "$python_path" -P \
     -c 'from tools.ensure_quality_gate import ensure_scheduler_columns; from server.common.batch_db import create_batch_engine; ensure_scheduler_columns(create_batch_engine())' || return 1
   if [ "$input_readiness_mode" = recover-input-readiness ]; then
@@ -5467,6 +5472,7 @@ controlled_guard_governance_snapshot() {
   test -n "$service_user" || return 1
   test "$service_user" != root || return 1
   controlled_guard_run_service_gate_with_deadline "$service_user" \
+      "$CONTROLLED_DATABASE_GATE_TIMEOUT" "$CONTROLLED_DATABASE_GATE_KILL_AFTER" \
     /usr/bin/env -i \
     PATH=/usr/sbin:/usr/bin:/sbin:/bin \
     PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
@@ -5527,6 +5533,7 @@ controlled_guard_qmt_announcement_snapshot() {
   test -n "$service_user" || return 1
   test "$service_user" != root || return 1
   controlled_guard_run_service_gate_with_deadline "$service_user" \
+      "$CONTROLLED_DATABASE_GATE_TIMEOUT" "$CONTROLLED_DATABASE_GATE_KILL_AFTER" \
     /usr/bin/env -i \
     PATH=/usr/sbin:/usr/bin:/sbin:/bin \
     PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
@@ -5713,6 +5720,7 @@ controlled_guard_governance_contract_snapshot() {
     (
       cd "$code_root" || exit 1
       controlled_guard_run_service_gate_with_deadline "$service_user" \
+      "$CONTROLLED_DATABASE_GATE_TIMEOUT" "$CONTROLLED_DATABASE_GATE_KILL_AFTER" \
         /usr/bin/env -i \
         PATH=/usr/sbin:/usr/bin:/sbin:/bin \
         PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
@@ -6220,6 +6228,7 @@ controlled_guard_capture_current_governance_snapshot() {
   (
     cd "$code_root" || exit 1
     controlled_guard_run_service_gate_with_deadline "$service_user" \
+      "$CONTROLLED_DATABASE_GATE_TIMEOUT" "$CONTROLLED_DATABASE_GATE_KILL_AFTER" \
       /usr/bin/env -i \
       PATH=/usr/sbin:/usr/bin:/sbin:/bin \
       PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
@@ -6242,6 +6251,7 @@ controlled_guard_capture_current_governance_snapshot() {
   (
     cd "$code_root" || exit 1
     controlled_guard_run_service_gate_with_deadline "$service_user" \
+      "$CONTROLLED_DATABASE_GATE_TIMEOUT" "$CONTROLLED_DATABASE_GATE_KILL_AFTER" \
       /usr/bin/env -i \
       PATH=/usr/sbin:/usr/bin:/sbin:/bin \
       PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
@@ -13906,9 +13916,7 @@ prepare_scheduler_task_release_plan() {
 
 run_prepared_scheduler_task_release() {
   local action="$1"
-  local CONTROLLED_DATABASE_GATE_TIMEOUT=90s
-  local CONTROLLED_DATABASE_GATE_KILL_AFTER=5s
-  controlled_guard_run_service_gate_with_deadline "$SERVICE_USER" \
+  controlled_guard_run_service_gate_with_deadline "$SERVICE_USER" 90s 5s \
     /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
     PROBIGA_DEPLOYMENT_MODE=production PROBIGA_EXPECTED_GIT_SHA="$EXPECTED_SHA" \
     PROBIGA_BUILD_COMMIT_SHA="$EXPECTED_SHA" PROBIGA_CODE_ROOT="$PREPARED_CODE_ROOT" \
@@ -13957,8 +13965,6 @@ controlled_guard_restore_scheduler_task_plan() {
   local python_path="$RELEASE_VENV_ROOT/$guarded_sha/bin/python"
   local helper="$code_root/tools/scheduler_task_release.py"
   local adata_sha adata_tree adata_source
-  local CONTROLLED_DATABASE_GATE_TIMEOUT=90s
-  local CONTROLLED_DATABASE_GATE_KILL_AFTER=5s
   [[ "$guarded_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
   previous_sha="$(activation_snapshot_old_release "$guarded_sha")" || return 1
   [[ "$previous_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
@@ -13975,7 +13981,7 @@ controlled_guard_restore_scheduler_task_plan() {
   adata_tree="$(<"$RELEASE_VENV_ROOT/$guarded_sha/.adata.tree.sha256")" || return 1
   adata_source="$ADATA_RUNTIME_ROOT/$adata_sha-$adata_tree"
   "$BOOTSTRAP_PYTHON" -I "$helper" bundle --plan "$plan" --before "$before" | \
-    controlled_guard_run_service_gate_with_deadline "$SERVICE_USER" \
+    controlled_guard_run_service_gate_with_deadline "$SERVICE_USER" 90s 5s \
     /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
     PROBIGA_DEPLOYMENT_MODE=production PROBIGA_EXPECTED_GIT_SHA="$guarded_sha" \
     PROBIGA_BUILD_COMMIT_SHA="$guarded_sha" PROBIGA_CODE_ROOT="$code_root" \

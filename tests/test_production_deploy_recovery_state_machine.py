@@ -3238,7 +3238,7 @@ PID_FILE={pid_file!r}
 {deadline}
 started="$(date +%s)"
 set +e
-controlled_guard_run_service_gate_with_deadline test-user /usr/bin/bash -c \
+controlled_guard_run_service_gate_with_deadline test-user "$CONTROLLED_DATABASE_GATE_TIMEOUT" "$CONTROLLED_DATABASE_GATE_KILL_AFTER" /usr/bin/bash -c \
   'trap "" TERM; sleep 30 & child=$!; printf "%s\\n" "$child" > "$1"; wait "$child"' \
   deadline-child "$PID_FILE"
 status=$?

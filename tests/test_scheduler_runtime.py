@@ -2071,6 +2071,8 @@ class SchedulerRuntimeTest(unittest.TestCase):
     def test_selection_has_no_deadline_even_after_daily_recovery_window(self):
         now = datetime(2026, 9, 14, 23, 59)
         for task_type in scheduler_runtime.UNLIMITED_SELECTION_TASK_TYPES:
+            if task_type == "stock_finance":
+                continue  # The resumable collector has its own bounded budget.
             with self.subTest(task_type=task_type):
                 row = {"task_type": task_type, "cron_time": "22:20",
                        "_scheduler_target_trade_date": "2026-09-14"}
@@ -2098,25 +2100,29 @@ class SchedulerRuntimeTest(unittest.TestCase):
         terminate.assert_not_called()
         update.assert_not_called()
 
-    def test_finance_atomic_scan_can_finish_after_catchup_window(self):
-        self.assertIsNone(scheduler_runtime._task_timeout_minutes({
+    def test_finance_atomic_scan_has_bounded_attempt_after_catchup_window(self):
+        self.assertEqual(scheduler_runtime._task_timeout_minutes({
             "task_type": "stock_finance",
             "script_path": "biz/stock_finance/sync_finance.py",
             "_scheduler_target_trade_date": "2026-09-14",
             "_trigger_source": "release_catchup",
-        }, now=datetime(2026, 9, 15, 8, 0)))
+        }, now=datetime(2026, 9, 15, 8, 0)), max(1, scheduler_runtime.DEFAULT_TASK_TIMEOUT_MINUTES))
 
     def test_unlimited_child_still_requires_successful_data_validation(self):
         with patch.object(scheduler_runtime, "_task_timeout_minutes", return_value=None):
             self.test_run_task_marks_success_failed_when_data_validation_fails()
 
-    def test_daily_pipeline_has_no_wall_clock_deadline(self):
+    def test_daily_pipeline_preserves_selection_and_bounds_resumable_collectors(self):
         for task_type in scheduler_runtime.DAILY_RESULT_RECOVERY_TASK_TYPES:
             with self.subTest(task_type=task_type):
-                self.assertIsNone(scheduler_runtime._task_timeout_minutes({
+                budget = scheduler_runtime._task_timeout_minutes({
                     "task_type": task_type, "cron_time": "18:00",
                     "_scheduler_target_trade_date": "2026-09-14",
-                }, now=datetime(2026, 9, 14, 23, 59)))
+                }, now=datetime(2026, 9, 14, 23, 59))
+                if task_type in {"notice_eastmoney", "stock_finance"}:
+                    self.assertEqual(budget, max(1, scheduler_runtime.DEFAULT_TASK_TIMEOUT_MINUTES))
+                else:
+                    self.assertIsNone(budget)
 
     def test_historical_announcement_recovery_has_no_batch_deadline(self):
         now = datetime(2026, 9, 3, 13, 0)
@@ -5934,7 +5940,9 @@ def test_notice_collection_keeps_independent_daily_recovery():
     ] == ()
     assert "notice_eastmoney" in readiness_contract.DAILY_DATA_INGESTION_TASK_TYPES
     assert "notice_eastmoney" in readiness_contract.MANUAL_SCHEDULER_RUN_FORBIDDEN_TASK_TYPES
-    assert scheduler_runtime._task_timeout_minutes({"task_type": "notice_eastmoney"}) is None
+    assert scheduler_runtime._task_timeout_minutes({"task_type": "notice_eastmoney"}) == max(
+        1, scheduler_runtime.DEFAULT_TASK_TIMEOUT_MINUTES
+    )
     assert scheduler_runtime._attach_daily_recovery_targets(
         engine, [notice], now=now
     )
