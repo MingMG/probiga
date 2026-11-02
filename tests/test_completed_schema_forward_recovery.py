@@ -184,3 +184,33 @@ run_forward() {
     result = subprocess.run([bash,str(script)],capture_output=True,text=True,timeout=15)
     assert result.returncode == 1, result.stdout+result.stderr
     assert 'UNSAFE_FORWARD_ADMITTED' not in result.stdout
+
+
+def test_forward_recovery_branch_emits_numeric_deadline_accepted_by_actual_fenced_gate(tmp_path):
+    bash = shutil.which('bash') or str(Path(r'C:\Program Files\Git\bin\bash.exe'))
+    if not Path(bash).is_file(): pytest.skip('Bash required')
+    verifier = _function('controlled_guard_verify_restored_runtime')
+    prefix = '      if [ "$verification_mode" = forward-recovery ]; then\n'
+    branch = prefix + verifier.split(prefix, 1)[1].split('\n      fi', 1)[0] + '\n      fi\n'
+    deadline_gate = _function('controlled_guard_assert_activation_deadline')
+    harness = '''set -Eeuo pipefail
+readonly CONTROLLED_RECOVERY_CUTOVER_RESERVE_SECONDS=10800
+verification_mode=forward-recovery
+RESTORED_RUNTIME_GOVERNANCE_TRADE_DATE=""
+RESTORED_RUNTIME_GOVERNANCE_CUTOVER_EPOCH=""
+before="$(date +%s)"
+produce_forward_result() {
+''' + branch + '\nreturn 99\n}\nproduce_forward_result\n' + deadline_gate + '''
+after="$(date +%s)"
+[[ "$RESTORED_RUNTIME_GOVERNANCE_TRADE_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]
+[[ "$RESTORED_RUNTIME_GOVERNANCE_CUTOVER_EPOCH" =~ ^[1-9][0-9]{9,11}$ ]]
+test "$RESTORED_RUNTIME_GOVERNANCE_CUTOVER_EPOCH" -ge "$((before + 10800))"
+test "$RESTORED_RUNTIME_GOVERNANCE_CUTOVER_EPOCH" -le "$((after + 10800))"
+controlled_guard_assert_activation_deadline "$RESTORED_RUNTIME_GOVERNANCE_CUTOVER_EPOCH"
+printf 'FORWARD_DEADLINE_ACCEPTED\n'
+'''
+    script=tmp_path/'forward-deadline.sh'
+    script.write_text(harness,encoding='utf-8',newline='\n')
+    result=subprocess.run([bash,str(script)],capture_output=True,text=True,timeout=15)
+    assert result.returncode==0, result.stdout+result.stderr
+    assert result.stdout.strip()=='FORWARD_DEADLINE_ACCEPTED'
