@@ -52,7 +52,7 @@ from server.common.pit_facts import (
     FINANCE_INCREMENTAL_DISCOVERY_SOURCE,
     append_finance_atomic_batch_seal,
     append_finance_expected_unavailable,
-    append_finance_revision,
+    append_finance_revisions,
     append_source_coverage,
     build_finance_data_exclusion,
     canonical_hash,
@@ -1730,35 +1730,23 @@ def upsert_finance(
         ON DUPLICATE KEY UPDATE {update_clause}
     """)
 
-    count = 0
+    source_rows = [
+        {column: (None if pd.isna(row[column]) else row[column]) for column in source_columns}
+        for _, row in frame.iterrows()
+    ]
+    legacy_rows = [{**{column: row[column] for column in available}, "etl_sync_at": now}
+                   for row in source_rows]
     with engine.begin() as conn:
-        source_rows: list[dict] = []
-        fact_bindings: list[dict] = []
-        for _, row in frame.iterrows():
-            source_params = {
-                c: (None if pd.isna(row[c]) else row[c])
-                for c in source_columns
-            }
-            params = {c: source_params[c] for c in available}
-            # The append-only fact is the strategy source of truth.  A missing
-            # PIT schema or an invalid identity aborts the transaction before
-            # the mutable display cache can advance on its own.
-            receipt = append_finance_revision(
-                conn,
-                source_params,
-                known_at=now_dt,
-                received_at=now_dt,
-                source=PRIMARY_FINANCE_SOURCE,
-                batch_id=batch_id,
-            )
-            source_rows.append(dict(source_params))
-            fact_bindings.append({
-                "revision_id": receipt.revision_id,
-                "content_hash": receipt.content_hash,
-            })
-            params["etl_sync_at"] = now
-            conn.execute(sql, params)
-            count += 1
+        # Lock/read this issuer's existing report identities in bounded batches.
+        # Immutable fact comparison and append still precede every display write.
+        receipts = append_finance_revisions(
+            conn, source_rows, known_at=now_dt, received_at=now_dt,
+            source=PRIMARY_FINANCE_SOURCE, batch_id=batch_id,
+        )
+        fact_bindings = [{"revision_id": receipt.revision_id, "content_hash": receipt.content_hash}
+                         for receipt in receipts]
+        for offset in range(0, len(legacy_rows), 500):
+            conn.execute(sql, legacy_rows[offset:offset + 500])
         append_source_coverage(
             conn,
             fact_kind="finance",
@@ -1782,7 +1770,7 @@ def upsert_finance(
             batch_id=batch_id,
         )
 
-    return count
+    return len(source_rows)
 
 
 def minimum_expected_report_date(as_of: date) -> date:

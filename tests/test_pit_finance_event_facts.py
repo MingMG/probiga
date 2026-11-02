@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import json
 import hashlib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine, event, text
+from sqlalchemy.dialects import mysql
 from sqlalchemy.exc import DatabaseError, OperationalError
 from sqlalchemy.pool import QueuePool
 
@@ -23,6 +25,7 @@ from server.common.pit_facts import (
     append_finance_atomic_batch_seal,
     append_finance_expected_unavailable,
     append_finance_revision,
+    append_finance_revisions,
     append_source_coverage,
     ensure_pit_fact_schema,
     load_event_facts,
@@ -1287,6 +1290,306 @@ def test_same_source_content_is_idempotent_but_changed_content_supersedes():
         assert connection.execute(
             text(f"SELECT COUNT(*) FROM {FINANCE_REVISION_TABLE}")
         ).scalar_one() == 3
+
+
+def test_bulk_finance_matches_single_writer_and_preserves_duplicate_identity_chain():
+    source = {
+        "stock_code": "600000", "report_date": "2026-06-30",
+        "notice_date": "2026-08-18 20:00:00", "basic_eps": 0.8,
+    }
+    other_report = {**source, "report_date": "2026-03-31"}
+    rows = [
+        source, other_report, dict(source),
+        {**source, "basic_eps": 0.9}, source, dict(source),
+        {**source, "published_at": "2026-08-18 20:30:00"},
+    ]
+    single_engine = _engine()
+    bulk_engine = _engine()
+    arguments = {
+        "known_at": "2026-08-19 08:00:00",
+        "received_at": "2026-08-19 07:59:59",
+        "source": "eastmoney.finance.mainfinadata.direct",
+        "batch_id": "finance-first-batch",
+    }
+    expected = [
+        append_finance_revision(single_engine, row, **arguments) for row in rows
+    ]
+    actual = append_finance_revisions(bulk_engine, iter(rows), **arguments)
+    assert actual == expected
+    assert [receipt.revision_no for receipt in actual] == [1, 1, 1, 2, 3, 3, 4]
+    assert [receipt.idempotent for receipt in actual] == [
+        False, False, True, False, False, True, False,
+    ]
+    for engine in (single_engine, bulk_engine):
+        with engine.connect() as connection:
+            stored = connection.execute(text(
+                f"SELECT * FROM {FINANCE_REVISION_TABLE} "
+                "ORDER BY identity_hash, revision_no"
+            )).mappings().all()
+        if engine is single_engine:
+            expected_rows = [dict(row) for row in stored]
+        else:
+            assert [dict(row) for row in stored] == expected_rows
+
+
+def test_bulk_finance_reuses_immutable_rows_across_capture_times_and_batches():
+    engine = _engine()
+    source = {
+        "stock_code": "600000", "report_date": "2026-06-30",
+        "notice_date": "2026-08-18 20:00:00", "basic_eps": 0.8,
+    }
+    first = append_finance_revisions(
+        engine, [source], known_at="2026-08-19 08:00:00", batch_id="first",
+    )[0]
+    repeated = append_finance_revisions(
+        engine, [{**source, "etl_sync_at": "2026-08-20 09:00:00"}],
+        known_at="2026-08-20 09:00:00", batch_id="second",
+    )[0]
+    assert repeated.idempotent is True
+    assert repeated.revision_id == first.revision_id
+    with engine.connect() as connection:
+        stored = connection.execute(text(
+            f"SELECT batch_id, known_at FROM {FINANCE_REVISION_TABLE}"
+        )).mappings().all()
+    assert len(stored) == 1
+    assert stored[0]["batch_id"] == "first"
+    assert str(stored[0]["known_at"]).startswith("2026-08-19 08:00:00")
+
+
+def test_bulk_finance_reads_metadata_in_bounded_batches_instead_of_per_report():
+    engine = _engine()
+    rows = [{
+        "stock_code": "600000",
+        "report_date": (date(2020, 1, 1) + timedelta(days=index)).isoformat(),
+        "notice_date": "2026-08-18 20:00:00", "basic_eps": index / 10,
+    } for index in range(207)]
+    original = append_finance_revisions(
+        engine, rows, known_at="2026-08-19 08:00:00", batch_id="first",
+    )
+    statements = []
+
+    def record(conn, cursor, statement, parameters, context, executemany):
+        statements.append((statement, parameters))
+
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        repeated = append_finance_revisions(
+            engine, rows, known_at="2026-08-20 09:00:00", batch_id="second",
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+    assert all(receipt.idempotent for receipt in repeated)
+    assert [item.revision_id for item in repeated] == [
+        item.revision_id for item in original
+    ]
+    assert len(statements) == 3 < len(rows)
+    assert [len(parameters) for _, parameters in statements] == [100, 100, 7]
+    for statement, _ in statements:
+        assert "WHERE identity_hash IN" in statement
+        assert "ORDER BY identity_hash, revision_no DESC" in statement
+        assert "payload_json" not in statement
+        assert "FOR UPDATE" not in statement
+
+
+def test_bulk_finance_write_failure_rolls_back_entire_owned_transaction():
+    engine = _engine()
+    source = {
+        "stock_code": "600000", "report_date": "2026-06-30",
+        "notice_date": "2026-08-18 20:00:00", "basic_eps": 0.8,
+    }
+    original = append_finance_revision(
+        engine, source, known_at="2026-08-19 08:00:00",
+    )
+    writes = []
+
+    def fail_second_insert(conn, cursor, statement, parameters, context, executemany):
+        if statement.startswith(f"INSERT INTO {FINANCE_REVISION_TABLE}"):
+            writes.append(statement)
+            if len(writes) == 2:
+                raise OperationalError(statement, parameters, RuntimeError("write failed"))
+
+    event.listen(engine, "before_cursor_execute", fail_second_insert)
+    try:
+        with pytest.raises(OperationalError, match="write failed"):
+            append_finance_revisions(
+                engine,
+                [{**source, "basic_eps": 0.9}, {**source, "report_date": "2026-03-31"}],
+                known_at="2026-08-20 09:00:00",
+            )
+    finally:
+        event.remove(engine, "before_cursor_execute", fail_second_insert)
+    assert len(writes) == 2
+    with engine.connect() as connection:
+        assert connection.execute(text(
+            f"SELECT revision_id FROM {FINANCE_REVISION_TABLE}"
+        )).scalars().all() == [original.revision_id]
+
+
+def test_bulk_finance_keeps_caller_transaction_and_rolls_back_with_it():
+    engine = _engine()
+    source = {
+        "stock_code": "600000", "report_date": "2026-06-30",
+        "notice_date": "2026-08-18 20:00:00", "basic_eps": 0.8,
+    }
+    with pytest.raises(RuntimeError, match="caller failed"):
+        with engine.begin() as connection:
+            receipts = append_finance_revisions(
+                connection, [source], known_at="2026-08-19 08:00:00",
+            )
+            assert len(receipts) == 1
+            assert connection.in_transaction()
+            raise RuntimeError("caller failed")
+    with engine.connect() as connection:
+        assert connection.execute(text(
+            f"SELECT COUNT(*) FROM {FINANCE_REVISION_TABLE}"
+        )).scalar_one() == 0
+
+
+def test_bulk_finance_duplicate_insert_receipt_keeps_following_revision_chain():
+    engine = _engine()
+    source = {
+        "stock_code": "600000", "report_date": "2026-06-30",
+        "notice_date": "2026-08-18 20:00:00", "basic_eps": 0.8,
+    }
+    inserted = []
+
+    def insert_before_original(conn, cursor, statement, parameters, context, executemany):
+        if not inserted and statement.startswith(f"INSERT INTO {FINANCE_REVISION_TABLE}"):
+            # Materialize the same revision before the original INSERT reaches
+            # SQLite, exercising the actual unique violation and receipt lookup.
+            inserted.append(statement)
+            cursor.execute(statement, parameters)
+
+    event.listen(engine, "before_cursor_execute", insert_before_original)
+    try:
+        receipts = append_finance_revisions(
+            engine, [source, source, {**source, "basic_eps": 0.9}],
+            known_at="2026-08-19 08:00:00",
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", insert_before_original)
+    assert len(inserted) == 1
+    assert [item.idempotent for item in receipts] == [True, True, False]
+    assert receipts[0].revision_id == receipts[1].revision_id
+    assert receipts[2].revision_no == 2
+    assert receipts[2].supersedes_revision_id == receipts[0].revision_id
+    with engine.connect() as connection:
+        assert connection.execute(text(
+            f"SELECT COUNT(*) FROM {FINANCE_REVISION_TABLE}"
+        )).scalar_one() == 2
+
+
+@pytest.mark.parametrize("receipt_stage", ["fingerprint_lookup", "insert_conflict"])
+def test_bulk_finance_older_fingerprint_receipt_does_not_replace_locked_head(
+    monkeypatch, receipt_stage,
+):
+    source = {
+        "stock_code": "600000", "report_date": "2026-06-30",
+        "notice_date": "2026-08-18 20:00:00", "basic_eps": 0.8,
+    }
+    original_lookup = pit_module._existing_fingerprint
+    results = []
+    for bulk in (False, True):
+        engine = _engine()
+        first = append_finance_revision(
+            engine, source, known_at="2026-08-19 08:00:00",
+        )
+        head = append_finance_revision(
+            engine, {**source, "basic_eps": 0.9},
+            known_at="2026-08-19 09:00:00",
+        )
+        with engine.connect() as connection:
+            older = dict(connection.execute(text(
+                f"SELECT * FROM {FINANCE_REVISION_TABLE} "
+                "WHERE revision_id=:revision_id"
+            ), {"revision_id": first.revision_id}).mappings().one())
+        lookups = []
+
+        def older_receipt(connection, table_name, identity_hash, fingerprint):
+            lookups.append(fingerprint)
+            if receipt_stage == "fingerprint_lookup" and len(lookups) == 1:
+                return older
+            if receipt_stage == "insert_conflict":
+                if len(lookups) == 1:
+                    return None
+                if len(lookups) == 2:
+                    return older
+            return original_lookup(connection, table_name, identity_hash, fingerprint)
+
+        conflicts = []
+
+        def duplicate_existing_row(conn, cursor, statement, parameters, context, executemany):
+            if (
+                receipt_stage == "insert_conflict"
+                and not conflicts
+                and statement.startswith(f"INSERT INTO {FINANCE_REVISION_TABLE}")
+            ):
+                conflicts.append(statement)
+                # Trigger a real unique-key failure without adding another row.
+                return (
+                    f"INSERT INTO {FINANCE_REVISION_TABLE} "
+                    f"SELECT * FROM {FINANCE_REVISION_TABLE} "
+                    f"WHERE revision_id='{head.revision_id}'", (),
+                )
+            return statement, parameters
+
+        arguments = {"known_at": "2026-08-20 09:00:00", "batch_id": "later"}
+        rows = [source, {**source, "basic_eps": 1.0}]
+        event.listen(engine, "before_cursor_execute", duplicate_existing_row, retval=True)
+        try:
+            with monkeypatch.context() as scoped:
+                scoped.setattr(pit_module, "_existing_fingerprint", older_receipt)
+                receipts = (
+                    append_finance_revisions(engine, rows, **arguments)
+                    if bulk else [
+                        append_finance_revision(engine, row, **arguments) for row in rows
+                    ]
+                )
+        finally:
+            event.remove(engine, "before_cursor_execute", duplicate_existing_row)
+        assert receipts[0].revision_id == first.revision_id
+        assert receipts[0].idempotent is True
+        assert receipts[1].revision_no == 3
+        assert receipts[1].supersedes_revision_id == head.revision_id
+        assert len(conflicts) == (receipt_stage == "insert_conflict")
+        with engine.connect() as connection:
+            assert connection.execute(text(
+                f"SELECT COUNT(*) FROM {FINANCE_REVISION_TABLE}"
+            )).scalar_one() == 3
+        results.append(receipts)
+    assert results[0] == results[1]
+
+
+def test_bulk_finance_mysql_read_locks_identity_ranges_including_absent_keys():
+    existing_identity = "a" * 64
+    absent_identity = "b" * 64
+    statements = []
+
+    def execute(statement, parameters):
+        compiled = statement.params(**parameters).compile(
+            dialect=mysql.dialect(), compile_kwargs={"render_postcompile": True},
+        )
+        statements.append((str(compiled), parameters))
+        # The SQL order returns the newest metadata first for each identity.
+        return SimpleNamespace(mappings=lambda: iter([
+            {"identity_hash": existing_identity, "revision_id": "2" * 64},
+            {"identity_hash": existing_identity, "revision_id": "1" * 64},
+        ]))
+
+    connection = SimpleNamespace(dialect=mysql.dialect(), execute=execute)
+    latest = pit_module._latest_finance_revisions(
+        connection, [absent_identity, existing_identity, existing_identity],
+    )
+    assert latest[existing_identity]["revision_id"] == "2" * 64
+    assert latest[absent_identity] is None
+    statement, parameters = statements[0]
+    assert parameters["identity_hashes"] == [existing_identity, absent_identity]
+    assert "FORCE INDEX (uk_pit_finance_identity_revision)" in statement
+    assert "WHERE identity_hash IN (%s, %s)" in statement
+    assert statement.endswith("ORDER BY identity_hash, revision_no DESC FOR UPDATE")
+    assert not any(token in statement for token in (
+        "payload_json", "GROUP BY", "JOIN", "LIMIT", "MAX(",
+    ))
 
 
 def test_finance_date_only_publication_is_usable_only_after_local_receipt():

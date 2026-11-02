@@ -97,6 +97,11 @@ def _create_surface(engine) -> None:
 def test_auxiliary_runtime_validators_are_metadata_reads_only() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
     _create_surface(engine)
+    with engine.begin() as connection:
+        connection.execute(text(
+            f"CREATE INDEX {schema.QMT_DATADIR_STAGE_INDEX_NAME} ON "
+            "qmt_datadir_minute_stage(run_id,trade_date,stock_code,trade_time)"
+        ))
     statements: list[str] = []
 
     @event.listens_for(engine, "before_cursor_execute")
@@ -128,6 +133,78 @@ def test_auxiliary_runtime_validator_fails_closed_when_table_is_missing() -> Non
 
     with pytest.raises(RuntimeError, match="missing_tables"):
         schema.validate_hot_stats_runtime_schema(engine)
+
+
+def test_qmt_stage_index_migration_preserves_checkpoint_and_is_idempotent(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    _create_surface(engine)
+    with engine.begin() as connection:
+        connection.execute(text("CREATE INDEX idx_qdms_run_date ON qmt_datadir_minute_stage(run_id,trade_date)"))
+        connection.execute(text("INSERT INTO qmt_datadir_minute_stage(run_id,trade_date,stock_code,trade_time,price) VALUES ('retained-run','2026-11-02','600000','2026-11-02 09:30:00','10')"))
+    # Exercise the existing migration on actual old tables; SQLite's table DDL
+    # uses the same required surface while the production index path stays real.
+    monkeypatch.setattr(schema, "_QMT_DATADIR_IMPORT_DDL", tuple(
+        f"CREATE TABLE IF NOT EXISTS {table_name} (" + ",".join(f'\"{name}\" TEXT' for name in sorted(columns)) + ")"
+        for table_name, columns in schema.QMT_DATADIR_IMPORT_REQUIRED_COLUMNS.items()
+    ))
+    with pytest.raises(RuntimeError, match="index is not prepared"):
+        schema.validate_qmt_datadir_import_runtime_schema(engine)
+    statements = []
+
+    @event.listens_for(engine, "before_cursor_execute")
+    def capture(_conn, _cursor, statement, _params, _context, _many):
+        statements.append(statement)
+
+    first = schema.privileged_migrate_qmt_datadir_import_schema(engine)
+    second = schema.privileged_migrate_qmt_datadir_import_schema(engine)
+    assert first["minute_stage_index_verified"] is second["stage_rows_preserved"] is True
+    assert sum(statement.startswith("CREATE INDEX") for statement in statements) == 1
+    assert not any(word in statement.upper() for statement in statements for word in ("TRUNCATE", "DELETE FROM", "DROP "))
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT run_id,price FROM qmt_datadir_minute_stage")).one() == ("retained-run", "10")
+        assert connection.execute(text("SELECT COUNT(*) FROM sqlite_master WHERE name='idx_qdms_run_date'")).scalar() == 1
+    engine.dispose()
+
+
+@pytest.mark.parametrize("unique,columns,suffix", [
+    ("", "run_id,stock_code,trade_date,trade_time", ""),
+    ("", "run_id,trade_date,stock_code", ""),
+    ("UNIQUE ", "run_id,trade_date,stock_code,trade_time", ""),
+    ("", "run_id,trade_date,stock_code,trade_time", " WHERE price IS NOT NULL"),
+])
+def test_qmt_stage_index_same_name_wrong_shape_is_not_rebuilt(unique, columns, suffix) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    _create_surface(engine)
+    with engine.begin() as connection:
+        connection.execute(text(f"CREATE {unique}INDEX {schema.QMT_DATADIR_STAGE_INDEX_NAME} ON qmt_datadir_minute_stage({columns}){suffix}"))
+    with pytest.raises(RuntimeError, match="physical contract differs"):
+        schema.validate_qmt_datadir_import_runtime_schema(engine)
+    engine.dispose()
+
+
+@pytest.mark.parametrize("mutation", ["order", "unique", "prefix", "type"])
+def test_qmt_stage_mysql_index_requires_exact_physical_shape(mutation) -> None:
+    rows = [dict(column_name=column, position=i, non_unique=1, index_type="BTREE", sub_part=None)
+            for i, column in enumerate(schema.QMT_DATADIR_STAGE_INDEX_COLUMNS, 1)]
+    if mutation == "order":
+        rows[1]["column_name"], rows[2]["column_name"] = rows[2]["column_name"], rows[1]["column_name"]
+    elif mutation == "unique":
+        rows[0]["non_unique"] = 0
+    elif mutation == "prefix":
+        rows[0]["sub_part"] = 20
+    else:
+        rows[0]["index_type"] = "HASH"
+
+    class IndexConnection(_TriggerConnection):
+        def execute(self, statement, _params=None):
+            self.statements.append(str(statement))
+            return _TriggerRows(rows)
+
+    connection = IndexConnection(rows)
+    with pytest.raises(RuntimeError, match="physical contract differs"):
+        schema._qmt_datadir_stage_index_present(_TriggerEngine(connection))
+    assert len(connection.statements) == 1
+    assert connection.statements[0].startswith("SELECT ")
 
 
 @pytest.mark.parametrize(
@@ -173,7 +250,7 @@ def test_auxiliary_runtime_validator_fails_closed_when_table_is_missing() -> Non
             "privileged_migrate_qmt_datadir_import_schema",
             "validate_qmt_datadir_import_runtime_schema",
             "qmt_datadir_import_partition",
-            3,
+            2,
         ),
     ),
 )
@@ -195,6 +272,8 @@ def test_persistent_ddl_is_exposed_only_through_privileged_migrations(
         validator_name,
         lambda _engine, **_kwargs: {"read_only": True},
     )
+    if migration_name == "privileged_migrate_qmt_datadir_import_schema":
+        monkeypatch.setattr(schema, "_qmt_datadir_stage_index_present", lambda _engine: True)
 
     result = getattr(schema, migration_name)(object())
 
@@ -202,16 +281,8 @@ def test_persistent_ddl_is_exposed_only_through_privileged_migrations(
     assert len(captured) == statement_count
     assert expected_table in "\n".join(captured)
     if migration_name == "privileged_migrate_qmt_datadir_import_schema":
-        assert captured[-1] == "TRUNCATE TABLE `qmt_datadir_minute_stage`"
-        assert all(
-            "CREATE TABLE IF NOT EXISTS" in statement
-            for statement in captured[:-1]
-        )
-    else:
-        assert all(
-            "CREATE TABLE IF NOT EXISTS" in statement
-            for statement in captured
-        )
+        assert result["stage_rows_preserved"] is True
+    assert all("CREATE TABLE IF NOT EXISTS" in statement for statement in captured)
 
 
 def test_membership_compatibility_guard_is_read_only(monkeypatch) -> None:

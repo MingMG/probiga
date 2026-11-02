@@ -1238,6 +1238,65 @@ def test_verified_tencent_daily_row_can_be_frozen_as_turnover_target() -> None:
     assert targets[1].data_source == "tencent_qt"
 
 
+def test_verified_qmt_datadir_daily_rows_complete_turnover_publication() -> None:
+    engine = _engine()
+    with engine.begin() as connection:
+        connection.execute(text("""
+            UPDATE sm_stock_kline
+            SET data_source='qmt_datadir', quality_status='VERIFIED',
+                permission_status='SUPPORTED'
+        """))
+
+    run = _capture(engine)
+    assert all(row.target.data_source == "qmt_datadir" for row in run.rows)
+    receipt = publish_turnover_snapshot(
+        engine, run, min_expected_count=2,
+        published_at=datetime(2026, 8, 27, 18, 45),
+    )
+    evidence = verify_turnover_publication_evidence(
+        engine, target_date=TARGET_DATE, decision_at=DECISION_AT,
+        min_expected_count=2,
+    )
+
+    assert receipt["expected_count"] == receipt["promoted_count"] == 2
+    assert set(evidence) == {"000001", "600000"}
+    with engine.connect() as connection:
+        values = connection.execute(text(
+            "SELECT stock_code,turnover_ratio FROM sm_stock_kline ORDER BY stock_code"
+        )).all()
+    assert [(row[0], float(row[1])) for row in values] == [
+        ("000001", 0.45), ("600000", 0.15),
+    ]
+
+
+@pytest.mark.parametrize("changed", [
+    {"data_source": "unverified_qmt_datadir"},
+    {"quality_status": "QMT_ATTESTED"},
+    {"quality_status": ""},
+    {"permission_status": ""},
+    {"batch_id": ""},
+    {"data_version": ""},
+])
+def test_qmt_datadir_turnover_target_requires_exact_verified_contract(changed) -> None:
+    engine = _engine()
+    fields = {
+        "data_source": "qmt_datadir", "quality_status": "VERIFIED",
+        "permission_status": "SUPPORTED", "batch_id": "local-cache-batch",
+        "data_version": "local-cache-version", **changed,
+    }
+    with engine.begin() as connection:
+        connection.execute(text("""
+            UPDATE sm_stock_kline
+            SET data_source=:data_source, quality_status=:quality_status,
+                permission_status=:permission_status, batch_id=:batch_id,
+                data_version=:data_version
+            WHERE stock_code='000001'
+        """), fields)
+
+    with pytest.raises(TurnoverSnapshotBlocked, match="target contract differs for 000001"):
+        _targets(engine)
+
+
 def test_atomic_null_only_promotion_and_verified_proof_round_trip() -> None:
     engine = _engine()
     run = _capture(engine)

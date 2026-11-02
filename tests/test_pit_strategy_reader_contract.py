@@ -105,8 +105,8 @@ def test_finance_is_pit_first_but_eastmoney_notice_is_display_only():
         "biz/stock_finance/sync_finance.py", "upsert_finance"
     )
     notice = _function_source("biz/notice/sync_notice_em.py", "upsert_rows")
-    assert finance.index("append_finance_revision(") < finance.index(
-        "conn.execute(sql, params)"
+    assert finance.index("append_finance_revisions(") < finance.index(
+        "conn.execute(sql, legacy_rows["
     )
     assert "append_event_revision(" not in notice
     assert "append_source_coverage(" not in notice

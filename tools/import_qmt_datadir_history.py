@@ -21,18 +21,22 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
+
+from sqlalchemy import text
 
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from integrations.qmt.datadir import CST  # noqa: E402
+from integrations.qmt.datadir import CST, MINUTE_PERIOD, load_dat, iter_minute_rows, select_records  # noqa: E402
 from integrations.qmt.datadir_import import (  # noqa: E402
     DEFAULT_CHUNK_ROWS,
     DEFAULT_SESSIONS_PER_BATCH,
@@ -67,8 +71,10 @@ from server.common.qmt_datadir_result import (  # noqa: E402
     partition_from_receipt,
 )
 from server.common.qmt_datadir_minute_coverage import (  # noqa: E402
-    trade_scope, validate_code_scope, persisted_matrix,
+    trade_scope, validate_code_scope, validate_matrix, persisted_matrix, staged_matrix,
 )
+from server.common.mysql_lock import mysql_named_lock, STOCK_MINUTE_FREEZE_LOCK_NAME  # noqa: E402
+from server.common.qmt_attestation_contract import canonical_digest  # noqa: E402
 from server.common.qmt_datadir_progress import MinuteImportProgress  # noqa: E402
 from tools.env_config import load_project_env  # noqa: E402
 
@@ -77,6 +83,164 @@ DEFAULT_DATADIRS = (
     r"D:\国金证券QMT交易端\datadir",
 )
 ACTIONABLE = {"IMPORT", "REPLACE"}
+
+
+@contextmanager
+def _minute_write_connection(engine):
+    """Keep the existing minute freeze domain on the actual write connection."""
+    if engine.dialect.name == "sqlite":
+        with engine.connect() as connection:
+            yield connection
+        return
+    with mysql_named_lock(engine, STOCK_MINUTE_FREEZE_LOCK_NAME) as connection:
+        # GET_LOCK starts SQLAlchemy's implicit transaction, not business DML.
+        connection.commit()
+        yield connection
+
+
+def _completion_detail(fingerprint):
+    return {**{key: value for key, value in fingerprint.items() if key != "business_row_hash"},
+            "readback_rows": fingerprint["row_count"],
+            "readback_codes": fingerprint["code_count"]}
+
+
+def _source_matrix(root, *, universe, session, scope, run_id=""):
+    """Read native bytes once for content comparison; never land them in SQL."""
+    digest = hashlib.sha256()
+    fields = ("stock_code", "trade_time", "trade_date", "price", "change",
+              "change_pct", "volume", "amount", "qmt_code")
+    expected = set(scope["codes"])
+    def rows():
+        for member in universe:
+            if member.code not in expected:
+                continue
+            dat = load_dat(root, member.market, MINUTE_PERIOD, member.code)
+            if dat is None:
+                continue
+            selected = select_records(dat, [session])
+            if not len(selected):
+                continue
+            digest.update(member.qmt_code.encode())
+            digest.update(hashlib.sha256(selected.tobytes()).digest())
+            for _, native in iter_minute_rows(dat, selected, CORE_GRID):
+                row = dict(zip(fields, native))
+                yield {**row, "source_time": row["trade_time"], "data_source": SOURCE,
+                    "batch_id": "native-content-comparison", "data_version": "qmt_datadir_v1",
+                    "quality_status": "VERIFIED", "permission_status": "SUPPORTED"}
+    progress = MinuteImportProgress(run_id=run_id, total_units=len(scope["codes"]) * len(CORE_GRID),
+                                    operation="source_content_readback", days=[session])
+    actual = validate_matrix(rows(), day=session.isoformat(), scope=scope, progress=progress,
+                             include_business_fingerprint=True)
+    return {"content_sha256": digest.hexdigest(), "business_row_hash": actual["business_row_hash"]}
+
+
+def _prior_completed_partitions(connection, session, receipt):
+    """Read existing publication provenance, including overwritten cursors."""
+    from server.common.scheduler_validation import _qmt_datadir_payload
+
+    candidates = []
+    if receipt is not None and receipt.get("status") == STATUS_COMPLETE:
+        candidates.append(partition_from_receipt(receipt))
+    rows = connection.execute(text(
+        "SELECT build_sha,output FROM st_scheduled_task_history "
+        "WHERE task_type='qmt_stock_minute_canonical' AND status<>'running' "
+        "AND finished_at IS NOT NULL AND exit_code=0 AND run_at>=:day "
+        "ORDER BY id DESC LIMIT 20"
+    ), {"day": session}).mappings()
+    day = session.isoformat()
+    for row in rows:
+        payload = _qmt_datadir_payload(row["output"])
+        if (not isinstance(payload, dict) or payload.get("status") != "PASS"
+                or payload.get("dataset") != DATASET or payload.get("provider") != SOURCE
+                or payload.get("task_type") != "qmt_stock_minute_canonical"
+                or payload.get("execution") != {"source_kind": "local_qmt_datadir", "network_accessed": False}
+                or payload.get("build_sha") != row["build_sha"]
+                or payload.get("receipt_id") != canonical_digest(
+                    {key: value for key, value in payload.items() if key != "receipt_id"})):
+            continue
+        for partition in payload.get("partitions", []):
+            if partition.get("trade_date") == day and partition.get("status") == STATUS_COMPLETE:
+                candidates.append(dict(partition))
+    valid = []
+    for item in candidates:
+        try:
+            rows, codes = int(item["row_count"]), int(item["code_count"])
+            if (item.get("source_root") and item.get("run_id")
+                    and rows == codes * len(CORE_GRID) and codes > 0
+                    and int(item["readback_rows"]) == rows
+                    and int(item["readback_codes"]) == codes
+                    and all(len(str(item.get(key) or "")) == 64
+                            and set(str(item[key])) <= set("0123456789abcdef")
+                            for key in ("content_sha256", "row_hash"))):
+                valid.append({**item, "row_count": rows, "code_count": codes})
+        except (KeyError, TypeError, ValueError):
+            continue
+    return valid
+
+
+def _reuse_existing_partition(engine, *, session, scope, datadir_roots=(), universe=()):
+    """Rebind proven existing data to today's valid scope without rewriting rows."""
+    receipt = load_receipt(engine, dataset=DATASET, trade_date=session.isoformat())
+    with _minute_write_connection(engine) as connection:
+        with connection.begin():
+            candidates = _prior_completed_partitions(connection, session, receipt)
+            candidates = [item for item in candidates
+                          if item["code_count"] == len(scope["codes"])]
+            if not candidates and not datadir_roots:
+                return None
+            # Do not trust an old threshold or an old row hash on its own:
+            # verify the full current grid, stock set and daily close anchors.
+            try:
+                fingerprint = persisted_matrix(connection, session.isoformat(), scope=scope,
+                    run_id=candidates[0]["run_id"] if candidates else receipt.get("run_id", "") if receipt else "",
+                    operation="existing_partition_readback", include_business_fingerprint=bool(datadir_roots))
+            except ValueError:
+                return None
+            original = next((item for item in candidates
+                             if item["row_hash"] == fingerprint["row_hash"]
+                             and item["row_count"] == fingerprint["row_count"]), None)
+            if original is None:
+                for root in datadir_roots:
+                    try:
+                        source = _source_matrix(root, universe=universe, session=session, scope=scope,
+                            run_id=receipt.get("run_id", "") if receipt else "")
+                    except ValueError:
+                        continue
+                    if source["business_row_hash"] == fingerprint["business_row_hash"]:
+                        original = {"source_root": str(root), "run_id": new_run_id(),
+                                    "content_sha256": source["content_sha256"]}
+                        break
+            if original is None:
+                return None
+            trade_scope(connection, session.isoformat(), manifest_hash=scope["full_market_manifest_hash"])
+            write_receipt(connection, session=session, root=original["source_root"],
+                status=STATUS_COMPLETE, run_id=original["run_id"],
+                row_count=fingerprint["row_count"], code_count=fingerprint["code_count"],
+                content_sha256=original["content_sha256"], finished=True,
+                detail={**_completion_detail(fingerprint), "reused_existing_partition": True})
+    print(f"{session} REUSED rows={fingerprint['row_count']} codes={fingerprint['code_count']}", flush=True)
+    return {"session": session.isoformat(), "status": STATUS_COMPLETE,
+            "rows": fingerprint["row_count"], "codes": fingerprint["code_count"],
+            "run_id": original["run_id"], "reused_existing_partition": True}
+
+
+def _resume_staged_partition(engine, *, session, scope, replace, replace_sources):
+    receipt = load_receipt(engine, dataset=DATASET, trade_date=session.isoformat())
+    if (receipt is None or receipt.get("status") not in {STATUS_FAILED, STATUS_RUNNING}
+            or not receipt.get("detail", {}).get("staged_rows_retained")
+            or int(receipt["code_count"]) != len(scope["codes"])
+            or int(receipt["row_count"]) != len(scope["codes"]) * len(CORE_GRID)):
+        return None
+    with engine.connect() as connection:
+        try:
+            fingerprint = staged_matrix(connection, session.isoformat(), scope=scope,
+                                        run_id=receipt["run_id"])
+        except ValueError:
+            return None
+    entry = dict(rows=fingerprint["row_count"], codes=list(scope["codes"]),
+        code_rows={code: len(CORE_GRID) for code in scope["codes"]}, digest=receipt["content_sha256"])
+    return _publish_one(engine, session=session, entry=entry, run_id=receipt["run_id"],
+        root=Path(receipt["source_root"]), replace=replace, replace_sources=replace_sources, scope=scope)
 
 
 def _sessions(engine, start: dt.date, end: dt.date) -> list[dt.date]:
@@ -241,6 +405,15 @@ def main(argv: list[str] | None = None) -> int:
         return 3
     results: list[dict] = []
     published: dict[dt.date, dict] = {}
+    for item in todo:
+        outcome = _reuse_existing_partition(engine, session=item.session, scope=scopes[item.session],
+            datadir_roots=datadir_roots, universe=ordered)
+        if outcome is None:
+            outcome = _resume_staged_partition(engine, session=item.session, scope=scopes[item.session],
+                replace=item.action == "REPLACE", replace_sources=replace_sources)
+        if outcome is not None:
+            published[item.session] = outcome
+            results.append(outcome)
     # The client keeps only its own recent window, so an older snapshot may
     # hold the fuller cache for the same date.  Roots are tried in the given
     # order and a session is published from the first root that proves
@@ -304,7 +477,9 @@ def main(argv: list[str] | None = None) -> int:
                 published[session] = outcome
                 results.append(outcome)
             with engine.begin() as conn:
-                drop_staged(conn, run_id)
+                for item in group:
+                    if published.get(item.session, {}).get("status") == STATUS_COMPLETE:
+                        drop_staged(conn, run_id, session=item.session)
 
     failures = 0
     for item in todo:
@@ -361,48 +536,21 @@ def _publish_one(
     """Stage-to-canonical publication of one session, proven by readback."""
     progress = MinuteImportProgress(run_id=run_id, total_units=entry["rows"],
         operation="publication", days=[session])
-    with engine.begin() as conn:
-        write_receipt(
-            conn, session=session, root=str(root), status=STATUS_RUNNING,
-            run_id=run_id, row_count=entry["rows"], code_count=len(entry["codes"]),
-            content_sha256=entry["digest"],
-        )
     try:
-        with engine.begin() as conn:
-            # Recheck the frozen daily scope before replacing any live minute.
-            trade_scope(conn, session.isoformat(), manifest_hash=scope["full_market_manifest_hash"])
-            published_started = time.monotonic()
-            progress.emit("server_publication")
-            publish_session(
-                conn,
-                session=session,
-                run_id=run_id,
-                batch_id=new_batch_id(session, run_id),
-                replace_sources=replace_sources if replace else (),
-            )
-            progress.emit("server_publication", status="COMPLETE",
-                phase_seconds=round(time.monotonic()-published_started, 6))
-            fingerprint = persisted_matrix(conn, session.isoformat(), scope=scope,
-                run_id=run_id, operation="publication_readback")
-            rows, codes = fingerprint["row_count"], fingerprint["code_count"]
-            ok = rows == entry["rows"] and codes == len(entry["codes"])
-            if not ok:
-                raise ValueError("exact minute matrix differs from harvested partition")
-            write_receipt(
-                conn, session=session, root=str(root),
-                status=STATUS_COMPLETE if ok else STATUS_FAILED, run_id=run_id,
-                row_count=entry["rows"], code_count=len(entry["codes"]),
-                content_sha256=entry["digest"], finished=True,
-                detail={
-                    "readback_rows": rows,
-                    "readback_codes": codes,
-                    "row_hash": fingerprint["row_hash"],
-                    **{key: fingerprint[key] for key in (
-                        "eligible_code_count", "coverage", "full_market_manifest_hash",
-                        "expected_traded_code_set_sha256", "minute_grid_count",
-                        "minute_grid_sha256", "bad_grid_codes")},
-                },
-            )
+        with _minute_write_connection(engine) as conn:
+            with conn.begin():
+                write_receipt(
+                    conn, session=session, root=str(root), status=STATUS_RUNNING,
+                    run_id=run_id, row_count=entry["rows"], code_count=len(entry["codes"]),
+                    content_sha256=entry["digest"], detail={"staged_rows_retained": True},
+                )
+            with conn.begin():
+                outcome = _publish_locked(conn, session=session, entry=entry, run_id=run_id,
+                    root=root, replace=replace, replace_sources=replace_sources,
+                    scope=scope, progress=progress)
+        progress.emit("canonical_commit", status="COMPLETE", completed_units=outcome["rows"])
+        print(f"{session} COMPLETE rows={outcome['rows']} codes={outcome['codes']} root={root}")
+        return outcome
     except Exception as exc:  # noqa: BLE001 - the receipt records the cause
         progress.emit("publication", status="FAILED", error_type=type(exc).__name__)
         with engine.begin() as conn:
@@ -411,22 +559,33 @@ def _publish_one(
                 status=STATUS_FAILED, run_id=run_id,
                 row_count=entry["rows"], code_count=len(entry["codes"]),
                 content_sha256=entry["digest"], finished=True,
-                detail={"error": f"{type(exc).__name__}: {exc}"},
+                detail={"error": f"{type(exc).__name__}: {exc}", "staged_rows_retained": True},
             )
         print(f"{session} FAILED {type(exc).__name__}: {exc}")
         return {"session": session.isoformat(), "status": STATUS_FAILED,
                 "root": str(root), "error": str(exc)}
-    if ok:
-        progress.emit("canonical_commit", status="COMPLETE", completed_units=rows)
-        print(f"{session} COMPLETE rows={rows} codes={codes} root={root}")
-        return {"session": session.isoformat(), "status": STATUS_COMPLETE,
-                "rows": rows, "codes": codes, "root": str(root)}
-    print(f"{session} FAILED expected rows={entry['rows']} codes={len(entry['codes'])} "
-          f"readback rows={rows} codes={codes}")
-    return {"session": session.isoformat(), "status": STATUS_FAILED,
-            "rows": rows, "codes": codes, "root": str(root),
-            "expected_rows": entry["rows"],
-            "expected_codes": len(entry["codes"])}
+
+
+def _publish_locked(conn, *, session, entry, run_id, root, replace, replace_sources, scope, progress):
+    # Recheck the frozen daily scope before replacing any live minute.
+    trade_scope(conn, session.isoformat(), manifest_hash=scope["full_market_manifest_hash"])
+    published_started = time.monotonic()
+    progress.emit("server_publication")
+    publish_session(conn, session=session, run_id=run_id,
+        batch_id=new_batch_id(session, run_id),
+        replace_sources=replace_sources if replace else (), progress=progress)
+    progress.emit("server_publication", status="COMPLETE",
+        phase_seconds=round(time.monotonic()-published_started, 6))
+    fingerprint = persisted_matrix(conn, session.isoformat(), scope=scope,
+        run_id=run_id, operation="publication_readback")
+    rows, codes = fingerprint["row_count"], fingerprint["code_count"]
+    if rows != entry["rows"] or codes != len(entry["codes"]):
+        raise ValueError("exact minute matrix differs from harvested partition")
+    write_receipt(conn, session=session, root=str(root), status=STATUS_COMPLETE,
+        run_id=run_id, row_count=rows, code_count=codes,
+        content_sha256=entry["digest"], finished=True, detail=_completion_detail(fingerprint))
+    return {"session": session.isoformat(), "status": STATUS_COMPLETE,
+            "rows": rows, "codes": codes, "root": str(root)}
 
 
 if __name__ == "__main__":

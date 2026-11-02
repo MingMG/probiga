@@ -205,6 +205,7 @@ _DDL_CODE_ROOTS = ("server/db/", "db/")
 # can silently downgrade a release to LINUX by omission.
 _CONTRACT_PYTHON_FILES = (
     "server/api/scheduler_runtime.py",
+    "server/common/auxiliary_runtime_schema.py",
     "server/common/limit_up_event_schema.py",
     "server/common/qmt_daily_market_truth.py",
     "server/common/qmt_datadir_result.py",

@@ -594,6 +594,11 @@ def _qmt_target_from_row(row: Mapping[str, Any], *, target_date: date, decision_
                 and payload["permission_status"] in {"", "SUPPORTED"}
             )
             or (
+                payload["data_source"] == "qmt_datadir"
+                and payload["quality_status"] == "VERIFIED"
+                and payload["permission_status"] == "SUPPORTED"
+            )
+            or (
                 payload["data_source"] in VERIFIED_FREE_DAILY_ROW_SOURCES
                 and payload["quality_status"] == "SOURCE_VERIFIED"
                 and payload["permission_status"] == "SUPPORTED"

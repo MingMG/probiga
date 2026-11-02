@@ -13,7 +13,7 @@ import re
 from collections.abc import Iterable
 from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import inspect, text
 
 from server.common.legacy_table_surface import validate_required_table_surface
 
@@ -206,6 +206,9 @@ QMT_DATADIR_IMPORT_REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
     ),
 }
 
+QMT_DATADIR_STAGE_INDEX_NAME = "idx_qdms_run_date_code_time"
+QMT_DATADIR_STAGE_INDEX_COLUMNS = ("run_id", "trade_date", "stock_code", "trade_time")
+
 _QMT_DATADIR_IMPORT_DDL = (
     """
 CREATE TABLE IF NOT EXISTS `qmt_datadir_import_partition` (
@@ -236,6 +239,7 @@ CREATE TABLE IF NOT EXISTS `qmt_datadir_minute_stage` (
   `volume` DECIMAL(50,6) NULL,
   `amount` DECIMAL(50,6) NULL,
   `qmt_code` VARCHAR(32) NULL,
+  KEY `idx_qdms_run_date_code_time` (`run_id`, `trade_date`, `stock_code`, `trade_time`),
   KEY `idx_qdms_run_date` (`run_id`, `trade_date`),
   KEY `idx_qdms_date_run` (`trade_date`, `run_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
@@ -698,27 +702,61 @@ def privileged_migrate_market_overview_daily_schema(engine) -> dict[str, Any]:
     }
 
 
+def _qmt_datadir_stage_index_present(engine) -> bool:
+    if engine.dialect.name == "mysql":
+        with engine.connect() as connection:
+            rows = connection.execute(text(
+                "SELECT COLUMN_NAME AS column_name,SEQ_IN_INDEX AS position,"
+                "NON_UNIQUE AS non_unique,INDEX_TYPE AS index_type,SUB_PART AS sub_part "
+                "FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=DATABASE() "
+                "AND TABLE_NAME='qmt_datadir_minute_stage' AND INDEX_NAME=:name "
+                "ORDER BY SEQ_IN_INDEX"
+            ), {"name": QMT_DATADIR_STAGE_INDEX_NAME}).mappings().all()
+        if not rows:
+            return False
+        valid = (tuple(row["column_name"] for row in rows) == QMT_DATADIR_STAGE_INDEX_COLUMNS
+            and all(int(row["position"]) == position and int(row["non_unique"]) == 1
+                    and str(row["index_type"]).upper() == "BTREE" and row["sub_part"] is None
+                    for position, row in enumerate(rows, 1)))
+    else:
+        matches = [row for row in inspect(engine).get_indexes("qmt_datadir_minute_stage")
+                   if row["name"] == QMT_DATADIR_STAGE_INDEX_NAME]
+        if not matches:
+            return False
+        valid = (len(matches) == 1 and not matches[0]["unique"]
+                 and tuple(matches[0]["column_names"]) == QMT_DATADIR_STAGE_INDEX_COLUMNS
+                 and matches[0].get("dialect_options", {}).get("sqlite_where") is None)
+    if not valid:
+        raise RuntimeError("QMT minute stage publication index physical contract differs")
+    return True
+
+
 def validate_qmt_datadir_import_runtime_schema(engine) -> dict[str, Any]:
-    return validate_required_table_surface(
+    surface = validate_required_table_surface(
         engine,
         ("qmt_datadir_import_partition", "qmt_datadir_minute_stage"),
         context="QMT datadir history importer",
         required_columns=QMT_DATADIR_IMPORT_REQUIRED_COLUMNS,
     )
+    if not _qmt_datadir_stage_index_present(engine):
+        raise RuntimeError("QMT minute stage publication index is not prepared")
+    return {**surface, "minute_stage_index": QMT_DATADIR_STAGE_INDEX_NAME,
+            "minute_stage_index_verified": True}
 
 
 def privileged_migrate_qmt_datadir_import_schema(engine) -> dict[str, Any]:
-    # Import staging is disposable and interruption-safe only when a release
-    # starts from an empty landing table.  Scheduler writers are fenced before
-    # this privileged migration, so this cannot discard an active import.
-    _privileged_create(
-        engine,
-        (*_QMT_DATADIR_IMPORT_DDL, "TRUNCATE TABLE `qmt_datadir_minute_stage`"),
-    )
+    # Completed landing rows are resumable business progress across releases.
+    _privileged_create(engine, _QMT_DATADIR_IMPORT_DDL)
+    if not _qmt_datadir_stage_index_present(engine):
+        columns = ",".join(f"`{name}`" for name in QMT_DATADIR_STAGE_INDEX_COLUMNS)
+        statement = (f"ALTER TABLE `qmt_datadir_minute_stage` ADD INDEX `{QMT_DATADIR_STAGE_INDEX_NAME}` ({columns})"
+            if engine.dialect.name == "mysql" else
+            f"CREATE INDEX `{QMT_DATADIR_STAGE_INDEX_NAME}` ON `qmt_datadir_minute_stage` ({columns})")
+        _privileged_create(engine, (statement,))
     return {
         **validate_qmt_datadir_import_runtime_schema(engine),
         "privileged_migration": True,
-        "stale_minute_stage_purged": True,
+        "stage_rows_preserved": True,
     }
 
 
