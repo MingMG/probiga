@@ -29,6 +29,7 @@ from integrations.wecom.delivery import deliver_markdown
 from server.common.config import get_wecom_webhook
 from server.common.mysql_lock import mysql_named_lock
 
+from .research_policy import MAX_AGE_SECONDS as RESEARCH_SOURCE_VALIDITY_SECONDS
 from .schema import (
     BENCHMARK_TABLE,
     OBSERVATION_TABLE,
@@ -1103,7 +1104,7 @@ def drain_outbox(
             if (audit.get("schema_version") != "probiga.intraday-research.v1"
                     or (audit.get("research") or {}).get("status") != "COMPLETE"
                     or hashlib.sha256(content.encode("utf-8")).hexdigest() != row.get("content_sha256")
-                    or age is None or not 0 <= age <= 180):
+                    or age is None or not 0 <= age <= RESEARCH_SOURCE_VALIDITY_SECONDS):
                 connection.execute(text(f"UPDATE {OUTBOX_TABLE} SET status='EXPIRED',error_message='research validation or source freshness unavailable',updated_at=:now WHERE outbox_id=:outbox_id"), {"now": now, "outbox_id": outbox_id})
                 continue
             connection.execute(

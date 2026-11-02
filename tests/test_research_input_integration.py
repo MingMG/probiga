@@ -118,7 +118,7 @@ def test_enrichment_does_not_extend_original_source_expiration_or_launch_models(
     identity, clock = queue(db), [NOW]
 
     def too_late(engine, digest, context, **kwargs):
-        clock[0] += timedelta(seconds=181)
+        clock[0] += timedelta(seconds=301)
         return enhanced(context)
 
     monkeypatch.setattr(research_inputs, "enrich_context", too_late)
