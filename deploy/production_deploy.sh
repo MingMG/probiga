@@ -5120,10 +5120,10 @@ controlled_guard_verify_restored_runtime() {
         return 0
       fi
     fi
-    RESTORED_RUNTIME_FAILURE_CODE=premarket-task-ensure
+    RESTORED_RUNTIME_FAILURE_CODE=scheduler-schema-verify
     controlled_guard_run_service_gate_with_deadline "$service_user" \
       "${guarded_command_prefix[@]}" "$python_path" -P \
-      "$code_root/tools/ensure_quality_gate.py" || return 1
+      -c 'from tools.ensure_quality_gate import ensure_scheduler_columns; from server.common.batch_db import create_batch_engine; ensure_scheduler_columns(create_batch_engine())' || return 1
     if [ "$input_readiness_mode" = recover-input-readiness ]; then
       cutover_deadline_epoch="$(($(date +%s) + CONTROLLED_RECOVERY_CUTOVER_RESERVE_SECONDS))"
       RESTORED_RUNTIME_GOVERNANCE_TRADE_DATE="$(date -u +%F)"
@@ -5301,14 +5301,14 @@ controlled_guard_verify_restored_runtime() {
       "$code_root/tools/check_strategy_governance_health.py" \
       "${governance_health_args[@]}" || return 1
   fi
-  RESTORED_RUNTIME_FAILURE_CODE=premarket-task-ensure
+  RESTORED_RUNTIME_FAILURE_CODE=scheduler-schema-verify
   if [ "$verification_mode" = forward-recovery ]; then
     RESTORED_RUNTIME_FAILURE_CODE=""
     return 0
   fi
   controlled_guard_run_service_gate_with_deadline "$service_user" \
     "${guarded_command_prefix[@]}" "$python_path" -P \
-    "$code_root/tools/ensure_quality_gate.py" || return 1
+    -c 'from tools.ensure_quality_gate import ensure_scheduler_columns; from server.common.batch_db import create_batch_engine; ensure_scheduler_columns(create_batch_engine())' || return 1
   if [ "$input_readiness_mode" = recover-input-readiness ]; then
     RESTORED_RUNTIME_FAILURE_CODE=governance-date-final
     governance_result_file="$(mktemp \
@@ -5774,6 +5774,7 @@ controlled_guard_restore_and_verify_governance_snapshot() {
   # through to the exact restore, whose own failure remains visible.
   local qmt_snapshot="$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT"
   test "$2" = "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" || return 1
+  controlled_guard_restore_scheduler_task_plan "$1" || return 1
   if controlled_guard_governance_contract_snapshot verify "$1" "$2" \
       rollback-governance \
       >/dev/null 2>&1 && \
@@ -12281,6 +12282,8 @@ QMT_ANNOUNCEMENT_TASK_OLD_SOURCE=""
 QMT_ANNOUNCEMENT_TASK_NEW_SOURCE=""
 GOVERNANCE_TASK_TOUCHED=0
 QMT_ANNOUNCEMENT_TASK_TOUCHED=0
+SCHEDULER_TASK_PLAN_FILE=""
+SCHEDULER_TASK_BEFORE_FILE=""
 GOVERNANCE_TRADE_DATE=""
 QMT_HISTORY_PREFLIGHT_OUTPUT=""
 QMT_HISTORY_WINDOW=""
@@ -13771,6 +13774,131 @@ prepare_release_venv() {
   ADATA_BUILD_SOURCE=""
   ADATA_WHEEL_DIR=""
 }
+prepare_scheduler_task_release_plan() {
+  local base_export target_export plan_tmp
+  local export_code='import json; from tools.ensure_quality_gate import TASKS,TASK_PAYLOAD_COLUMNS; print(json.dumps({t["task_type"]:{k:t[k] for k in sorted(TASK_PAYLOAD_COLUMNS)} for t in TASKS},ensure_ascii=False,sort_keys=True,separators=(",",":")))'
+  local artifact_dir="$RELEASE_ARTIFACT_ROOT/$EXPECTED_SHA"
+  local helper="$CODE_VALIDATION_ROOT/tools/scheduler_task_release.py"
+  [[ "$PREVIOUS_RELEASE_REVISION" =~ ^[0-9a-f]{40}$ ]] || return 1
+  SCHEDULER_TASK_PLAN_FILE="$artifact_dir/scheduler-task-release-$PREVIOUS_RELEASE_REVISION.json"
+  SCHEDULER_TASK_BEFORE_FILE="$artifact_dir/scheduler-task-before-$PREVIOUS_RELEASE_REVISION.json"
+  test -d "$PREVIOUS_CODE_ROOT" && test ! -L "$PREVIOUS_CODE_ROOT" || return 1
+  test "$(git -C "$PREVIOUS_CODE_ROOT" rev-parse HEAD)" = "$PREVIOUS_RELEASE_REVISION" || return 1
+  test -x "$RELEASE_VENV_ROOT/$PREVIOUS_RELEASE_REVISION/bin/python" || return 1
+  test -d "$artifact_dir" && test ! -L "$artifact_dir" || return 1
+  test "$(stat -c '%U:%G' "$artifact_dir")" = root:root || return 1
+  base_export="$(mktemp)"; target_export="$(mktemp)"
+  plan_tmp="$(mktemp "$artifact_dir/.scheduler-task-plan.XXXXXX")"
+  if ! /usr/bin/timeout --kill-after=5 30 sudo -u "$SERVICE_USER" /usr/bin/env -i \
+    PATH=/usr/sbin:/usr/bin:/sbin:/bin PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
+    PROBIGA_EXPECTED_GIT_SHA="$PREVIOUS_RELEASE_REVISION" PROBIGA_BUILD_COMMIT_SHA="$PREVIOUS_RELEASE_REVISION" \
+    PROBIGA_CODE_ROOT="$PREVIOUS_CODE_ROOT" "PYTHONPATH=$PREVIOUS_ADATA_SOURCE:$PREVIOUS_CODE_ROOT" \
+    "$RELEASE_VENV_ROOT/$PREVIOUS_RELEASE_REVISION/bin/python" -P -c "$export_code" > "$base_export"; then
+    echo "TASK_RELEASE_PREVIOUS_IMMUTABLE_EXPORT_FAILED" >&2; return 1
+  fi
+  if ! /usr/bin/timeout --kill-after=5 30 sudo -u "$SERVICE_USER" /usr/bin/env -i \
+    PATH=/usr/sbin:/usr/bin:/sbin:/bin PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
+    PROBIGA_EXPECTED_GIT_SHA="$EXPECTED_SHA" PROBIGA_BUILD_COMMIT_SHA="$EXPECTED_SHA" \
+    PROBIGA_CODE_ROOT="$CODE_VALIDATION_ROOT" "PYTHONPATH=$ADATA_SOURCE:$CODE_VALIDATION_ROOT" \
+    "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P -c "$export_code" > "$target_export"; then
+    echo "TASK_RELEASE_TARGET_IMMUTABLE_EXPORT_FAILED" >&2; return 1
+  fi
+  /usr/bin/timeout --kill-after=5 30 "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P "$helper" build \
+    --base "$base_export" --target "$target_export" --previous-sha "$PREVIOUS_RELEASE_REVISION" \
+    --target-sha "$EXPECTED_SHA" > "$plan_tmp" || return 1
+  if [ -e "$SCHEDULER_TASK_PLAN_FILE" ] || [ -L "$SCHEDULER_TASK_PLAN_FILE" ]; then
+    controlled_guard_assert_file "$SCHEDULER_TASK_PLAN_FILE" 600 || return 1
+    cmp --silent "$plan_tmp" "$SCHEDULER_TASK_PLAN_FILE" || return 1
+  else
+    install -o root -g root -m 0600 "$plan_tmp" "$SCHEDULER_TASK_PLAN_FILE" || return 1
+    sync -f "$SCHEDULER_TASK_PLAN_FILE" || return 1
+    sync -f "$artifact_dir" || return 1
+  fi
+  rm -f -- "$base_export" "$target_export" "$plan_tmp"
+  "$BOOTSTRAP_PYTHON" -I "$helper" bundle --plan "$SCHEDULER_TASK_PLAN_FILE" | \
+    /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin PYTHONDONTWRITEBYTECODE=1 \
+    PROBIGA_EXPECTED_GIT_SHA="$EXPECTED_SHA" "PYTHONPATH=$ADATA_SOURCE:$CODE_VALIDATION_ROOT" \
+    "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P "$helper" check-source
+}
+
+run_prepared_scheduler_task_release() {
+  local action="$1"
+  local CONTROLLED_DATABASE_GATE_TIMEOUT=90s
+  local CONTROLLED_DATABASE_GATE_KILL_AFTER=5s
+  controlled_guard_run_service_gate_with_deadline "$SERVICE_USER" \
+    /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
+    PROBIGA_DEPLOYMENT_MODE=production PROBIGA_EXPECTED_GIT_SHA="$EXPECTED_SHA" \
+    PROBIGA_BUILD_COMMIT_SHA="$EXPECTED_SHA" PROBIGA_CODE_ROOT="$PREPARED_CODE_ROOT" \
+    PROBIGA_COMPONENT_RELEASE_PATH="$RELEASE_ARTIFACT_ROOT/$EXPECTED_SHA/component-release.json" \
+    PROBIGA_EXPECTED_ADATA_SHA="$EXPECTED_ADATA_SHA" PROBIGA_EXPECTED_ADATA_TREE_SHA256="$EXPECTED_ADATA_TREE_SHA256" \
+    PROBIGA_ADATA_SOURCE_DIR="$ADATA_SOURCE" "PYTHONPATH=$ADATA_SOURCE:$PREPARED_CODE_ROOT" \
+    "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P \
+    "$PREPARED_CODE_ROOT/tools/scheduler_task_release.py" "$action" || {
+      echo "TASK_RELEASE_${action}_FAILED_OR_DEADLINE" >&2; return 1;
+    }
+}
+
+capture_and_apply_scheduler_task_release() {
+  local helper="$PREPARED_CODE_ROOT/tools/scheduler_task_release.py"
+  local before_tmp audit_tmp
+  controlled_guard_assert_file "$SCHEDULER_TASK_PLAN_FILE" 600 || return 1
+  before_tmp="$(mktemp)"; audit_tmp="$(mktemp)"
+  "$BOOTSTRAP_PYTHON" -I "$helper" bundle --plan "$SCHEDULER_TASK_PLAN_FILE" | \
+    run_prepared_scheduler_task_release capture > "$before_tmp" || return 1
+  install -o root -g root -m 0600 "$before_tmp" "$SCHEDULER_TASK_BEFORE_FILE" || return 1
+  install -o root -g root -m 0600 "$before_tmp" \
+    "$RELEASE_ARTIFACT_ROOT/$EXPECTED_SHA/$RECEIPT_ID-scheduler-task-before.json" || return 1
+  sync -f "$SCHEDULER_TASK_BEFORE_FILE" || return 1
+  sync -f "$RELEASE_ARTIFACT_ROOT/$EXPECTED_SHA" || return 1
+  "$BOOTSTRAP_PYTHON" -I "$helper" bundle --plan "$SCHEDULER_TASK_PLAN_FILE" --before "$SCHEDULER_TASK_BEFORE_FILE" | \
+    run_prepared_scheduler_task_release apply > "$audit_tmp" || return 1
+  install -o root -g root -m 0600 "$audit_tmp" \
+    "$RELEASE_ARTIFACT_ROOT/$EXPECTED_SHA/$RECEIPT_ID-scheduler-task-applied.json" || return 1
+  sync -f "$RELEASE_ARTIFACT_ROOT/$EXPECTED_SHA/$RECEIPT_ID-scheduler-task-applied.json" || return 1
+  cat "$audit_tmp"
+  rm -f -- "$before_tmp" "$audit_tmp"
+}
+
+validate_prepared_scheduler_task_release() {
+  local helper="$PREPARED_CODE_ROOT/tools/scheduler_task_release.py"
+  controlled_guard_assert_file "$SCHEDULER_TASK_PLAN_FILE" 600 || return 1
+  "$BOOTSTRAP_PYTHON" -I "$helper" bundle --plan "$SCHEDULER_TASK_PLAN_FILE" | \
+    run_prepared_scheduler_task_release validate
+}
+
+controlled_guard_restore_scheduler_task_plan() {
+  local guarded_sha="$1"
+  local artifact_dir="$RELEASE_ARTIFACT_ROOT/$guarded_sha"
+  local previous_sha plan before
+  local code_root="$CODE_RELEASE_ROOT/$guarded_sha"
+  local python_path="$RELEASE_VENV_ROOT/$guarded_sha/bin/python"
+  local helper="$code_root/tools/scheduler_task_release.py"
+  local adata_sha adata_tree adata_source
+  local CONTROLLED_DATABASE_GATE_TIMEOUT=90s
+  local CONTROLLED_DATABASE_GATE_KILL_AFTER=5s
+  [[ "$guarded_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  previous_sha="$(activation_snapshot_old_release "$guarded_sha")" || return 1
+  [[ "$previous_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  plan="$artifact_dir/scheduler-task-release-$previous_sha.json"
+  before="$artifact_dir/scheduler-task-before-$previous_sha.json"
+  # No before-image means this release never acquired authority to change this task scope.
+  if [ ! -e "$before" ] && [ ! -L "$before" ]; then return 0; fi
+  controlled_guard_assert_file "$plan" 600 || return 1
+  controlled_guard_assert_file "$before" 600 || return 1
+  test -d "$code_root" && test ! -L "$code_root" || return 1
+  test "$(git -C "$code_root" rev-parse HEAD)" = "$guarded_sha" || return 1
+  test -x "$python_path" && test -f "$helper" && test ! -L "$helper" || return 1
+  adata_sha="$(<"$RELEASE_VENV_ROOT/$guarded_sha/.adata.gitsha")" || return 1
+  adata_tree="$(<"$RELEASE_VENV_ROOT/$guarded_sha/.adata.tree.sha256")" || return 1
+  adata_source="$ADATA_RUNTIME_ROOT/$adata_sha-$adata_tree"
+  "$BOOTSTRAP_PYTHON" -I "$helper" bundle --plan "$plan" --before "$before" | \
+    controlled_guard_run_service_gate_with_deadline "$SERVICE_USER" \
+    /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
+    PROBIGA_DEPLOYMENT_MODE=production PROBIGA_EXPECTED_GIT_SHA="$guarded_sha" \
+    PROBIGA_BUILD_COMMIT_SHA="$guarded_sha" PROBIGA_CODE_ROOT="$code_root" \
+    "PYTHONPATH=$adata_source:$code_root" "$python_path" -P "$helper" restore
+}
+
 prepare_release() {
   if [ "$STRATEGY_GOVERNANCE_MODE" = DEFERRED_DB ]; then
     capture_deferred_scheduler_identity
@@ -13837,6 +13965,7 @@ prepare_release() {
       'from server.engine.strategy_execution_adapters import bootstrap_strategy_execution_adapter_registry; p=bootstrap_strategy_execution_adapter_registry(); assert p["registry_sealed"] is True'
   )
   assert_service_cannot_write_release_paths "$CODE_VALIDATION_ROOT"
+  prepare_scheduler_task_release_plan
   if [ "$RELEASE_EXECUTION_SCOPE" = COORDINATED ]; then
     (
       cd "$CODE_VALIDATION_ROOT"
@@ -13844,15 +13973,6 @@ prepare_release() {
         "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P \
         tools/validate_production_release_boundary.py \
         --require-git-anchor --expected-git-sha "$EXPECTED_SHA"
-      sudo -u "$SERVICE_USER" /usr/bin/env -i \
-        PROBIGA_EXPECTED_GIT_SHA="$EXPECTED_SHA" \
-        PROBIGA_BUILD_COMMIT_SHA="$EXPECTED_SHA" \
-        PROBIGA_COMPONENT_RELEASE_PATH="$RELEASE_ARTIFACT_ROOT/$EXPECTED_SHA/component-release.json" \
-        PATH=/usr/sbin:/usr/bin:/sbin:/bin GIT_OPTIONAL_LOCKS=0 \
-        PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
-        "PYTHONPATH=$ADATA_SOURCE:$CODE_VALIDATION_ROOT" \
-        "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P \
-        tools/ensure_quality_gate.py --validate-review-delivery
     )
   fi
   release_identity_check 1 "$CODE_VALIDATION_ROOT"
@@ -16839,11 +16959,8 @@ CUTOVER_STEP=enable_strategy_governance_task
 run_prepared_python_tool \
   "$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" \
   --schema-prepared
-CUTOVER_STEP=normalize_daily_strategy_pipeline_schedule
-run_prepared_python_tool \
-  "$PREPARED_CODE_ROOT/tools/ensure_quality_gate.py" \
-  --task-type analysis_upper_evidence_prepare \
-  --task-type analysis_fast
+CUTOVER_STEP=publish_changed_scheduler_task_contracts
+capture_and_apply_scheduler_task_release
 CUTOVER_STEP=restore_qmt_user_enabled_policy
 prepared_qmt_announcement_snapshot restore-enabled-policy \
   "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT"
@@ -17089,38 +17206,8 @@ if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
 fi
 CUTOVER_STEP=verify_scheduler_triggers_quiescent
 assert_scheduler_triggers_quiescent
-CUTOVER_STEP=verify_premarket_quality_gate
-sudo -u "$SERVICE_USER" /usr/bin/env -i \
-  PATH=/usr/sbin:/usr/bin:/sbin:/bin PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
-  PROBIGA_DEPLOYMENT_MODE=production \
-  PROBIGA_EXPECTED_GIT_SHA="$EXPECTED_SHA" \
-  PROBIGA_COMPONENT_RELEASE_PATH="/var/lib/probiga/release-artifacts/$EXPECTED_SHA/component-release.json" \
-  PROBIGA_BUILD_COMMIT_SHA="$EXPECTED_SHA" \
-  PROBIGA_CODE_ROOT="$PREPARED_CODE_ROOT" \
-  PROBIGA_EXPECTED_ADATA_SHA="$EXPECTED_ADATA_SHA" \
-  PROBIGA_EXPECTED_ADATA_TREE_SHA256="$EXPECTED_ADATA_TREE_SHA256" \
-  PROBIGA_ADATA_SOURCE_DIR="$ADATA_SOURCE" \
-  PROBIGA_RELEASE_TREE_SHA256="$EXPECTED_RELEASE_TREE_SHA256" \
-  PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256="$EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256" \
-  "PYTHONPATH=$ADATA_SOURCE:$PREPARED_CODE_ROOT" \
-  "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P \
-  "$PREPARED_CODE_ROOT/tools/ensure_quality_gate.py"
-sudo -u "$SERVICE_USER" /usr/bin/env -i \
-  PATH=/usr/sbin:/usr/bin:/sbin:/bin PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
-  PROBIGA_DEPLOYMENT_MODE=production \
-  PROBIGA_EXPECTED_GIT_SHA="$EXPECTED_SHA" \
-  PROBIGA_COMPONENT_RELEASE_PATH="/var/lib/probiga/release-artifacts/$EXPECTED_SHA/component-release.json" \
-  PROBIGA_BUILD_COMMIT_SHA="$EXPECTED_SHA" \
-  PROBIGA_CODE_ROOT="$PREPARED_CODE_ROOT" \
-  PROBIGA_EXPECTED_ADATA_SHA="$EXPECTED_ADATA_SHA" \
-  PROBIGA_EXPECTED_ADATA_TREE_SHA256="$EXPECTED_ADATA_TREE_SHA256" \
-  PROBIGA_ADATA_SOURCE_DIR="$ADATA_SOURCE" \
-  PROBIGA_RELEASE_TREE_SHA256="$EXPECTED_RELEASE_TREE_SHA256" \
-  PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256="$EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256" \
-  "PYTHONPATH=$ADATA_SOURCE:$PREPARED_CODE_ROOT" \
-  "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P \
-  "$PREPARED_CODE_ROOT/tools/ensure_quality_gate.py" \
-  --validate-required-task-contracts
+CUTOVER_STEP=verify_changed_scheduler_task_contracts
+validate_prepared_scheduler_task_release
 if ! prune_release_venvs "$EXPECTED_SHA" "$PREVIOUS_RELEASE_REVISION"; then
   echo "Warning: release venv cleanup failed before final verification" >&2
 fi
