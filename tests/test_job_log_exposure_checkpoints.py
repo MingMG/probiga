@@ -209,6 +209,65 @@ os.open = real_open_with_one_atomic_replace
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("changed while quiescent", result.stderr)
 
+    def test_unrelated_flat_checkpoint_writes_do_not_restart_live_tree_validation(self):
+        injection = """
+import os
+import sys
+original_open = os.open
+sequence = 0
+
+def real_open_with_unrelated_checkpoint(name, flags, mode=0o777, *, dir_fd=None):
+    global sequence
+    if name == '000001.json' and dir_fd is not None:
+        sequence += 1
+        temporary = os.path.join(sys.argv[1], '.unrelated-checkpoint.tmp')
+        writer = original_open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.write(writer, str(sequence).encode())
+        os.close(writer)
+        os.replace(temporary, os.path.join(sys.argv[1], 'stock-finance-daily-v2.json'))
+    return original_open(name, flags, mode, dir_fd=dir_fd)
+os.open = real_open_with_unrelated_checkpoint
+"""
+        original = (self.results / "000001.json").read_bytes()
+        self._accepted("live", injection=injection)
+        assert (self.jobs / "stock-finance-daily-v2.json").read_bytes() == b"2"
+        assert (self.results / "000001.json").read_bytes() == original
+        result = self._run("quiescent", injection=injection)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("changed while quiescent", result.stderr)
+
+    def test_live_tree_created_after_absence_is_inspected(self):
+        # Remove only the private fixture; the injected writer then creates a
+        # real fixed subtree immediately after the validator observed absence.
+        import shutil
+        shutil.rmtree(self.risk)
+        injection = """
+import os
+original_lstat = os.lstat
+created = False
+
+def real_lstat_with_late_tree(name, *, dir_fd=None):
+    global created
+    try:
+        return original_lstat(name, dir_fd=dir_fd)
+    except FileNotFoundError:
+        if name == 'exposure-event-risk-watch-v1' and dir_fd is not None and not created:
+            created = True
+            os.mkdir(name, mode=0o755, dir_fd=dir_fd)
+            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY, dir_fd=dir_fd)
+            try:
+                writer = os.open('unexpected.json', os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                                 0o600, dir_fd=child)
+                os.close(writer)
+            finally:
+                os.close(child)
+        raise
+os.lstat = real_lstat_with_late_tree
+"""
+        result = self._run("live", injection=injection)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unknown exposure risk checkpoint namespace entry", result.stderr)
+
     def test_new_real_leaf_during_enumeration_live_allowed_quiescent_rejected(self):
         injection = """
 import os

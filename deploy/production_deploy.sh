@@ -733,12 +733,24 @@ try:
             raise SystemExit("exposure risk checkpoint job-log root changed")
         if not live and not (stable_identity(before_root) == stable_identity(held_root) == stable_identity(current_root)):
             raise SystemExit("exposure risk checkpoint job-log root changed while quiescent")
-        if not (stable_identity(round_root) == stable_identity(held_root) == stable_identity(current_root)):
-            # A live writer may have created this fixed subtree after the last
-            # absence check. Rescan rather than pruning a not-yet-proved tree.
-            # Unrelated flat-log atomic writes can also cause a bounded rescan.
-            stable_passes = 0
-            continue
+        if live:
+            # Other jobs atomically publish flat checkpoints in this parent.
+            # Their writes do not change the fixed namespace being inspected.
+            # Bind that namespace again so a late creation is still scanned,
+            # and disappearance/replacement of a verified directory fails.
+            try:
+                latest_subtree = os.lstat(subtree, dir_fd=directory)
+            except FileNotFoundError:
+                if seen_subtree:
+                    raise SystemExit("exposure risk checkpoint directory disappeared")
+            else:
+                require(latest_subtree, directory=True)
+                verified_identity = directory_identities.get(subtree)
+                if verified_identity is None:
+                    stable_passes = 0
+                    continue
+                if object_identity(latest_subtree) != verified_identity:
+                    raise SystemExit("exposure risk checkpoint directory changed")
         previous = snapshot
         stable_passes += 1
 finally:
