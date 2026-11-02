@@ -7790,6 +7790,89 @@ ensure_qmt_windows_edge_activation() {
     "$expected_windows_sha" "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" || return 1
   verify_qmt_windows_edge_activation "$expected_windows_sha"
 }
+prepare_qmt_windows_edge_handoff() {
+  local local_instance_id="$1"
+  local output status=0 kind
+  local -a exclusions=()
+  if [ -n "$local_instance_id" ]; then
+    exclusions=(--exclude-instance-id "$local_instance_id")
+  fi
+  # Resume a protected pending target when one exists; otherwise pin the fresh
+  # prior Windows identity. Both paths use the existing append-only hold ledger.
+  output="$(controlled_guard_run_qmt_activation_tool \
+    "$PREPARED_CODE_ROOT" "$RELEASE_VENV_ROOT/$EXPECTED_SHA" "$EXPECTED_SHA" \
+    --request-forward-quiescence "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" "$PREVIOUS_WINDOWS_SHA")" || status=$?
+  printf '%s\n' "$output"
+  test "$status" -eq 0 || return "$status"
+  kind="$(printf '%s' "$output" | "$BOOTSTRAP_PYTHON" -I -c '
+import json,sys
+p=json.load(sys.stdin)
+target,prior,attempt=sys.argv[1:]
+valid=(isinstance(p,dict) and p.get("mode")=="request-forward-quiescence"
+       and p.get("build_sha")==target and p.get("prior_build_sha")==prior
+       and p.get("deployment_attempt_id")==attempt and p.get("activation_granted") is False)
+if not valid: raise SystemExit(2)
+if p.get("status")=="not_applicable":
+    if p.get("database_writes") is not False or p.get("context") is not None: raise SystemExit(2)
+    print("fresh")
+else:
+    c=p.get("context")
+    valid=(isinstance(c,dict) and c.get("schema")=="probiga.qmt-edge-forward-only-supersession.v1"
+           and c.get("protocol")==c.get("schema") and c.get("scope")=="FORWARD_ONLY_SUPERSESSION"
+           and c.get("build_sha")==target and c.get("original_prior_build_sha")==prior
+           and c.get("deployment_attempt_id")==attempt and c.get("real_order") is False
+           and ((p.get("status")=="inserted" and p.get("database_writes") is True)
+                or (p.get("status")=="idempotent" and p.get("database_writes") is False)))
+    if not valid: raise SystemExit(2)
+    print("forward")
+' "$EXPECTED_SHA" "$PREVIOUS_WINDOWS_SHA" "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID")" || return $?
+  if [ "$kind" = fresh ]; then
+    # Set before the call: a lost COMMIT acknowledgement must still attempt the
+    # existing unchanged-schema abort, never strand a possibly persisted hold.
+    QMT_EDGE_RECOVERABLE_HANDOFF_ATTEMPTED=1
+    output="$(controlled_guard_run_qmt_activation_tool \
+      "$PREPARED_CODE_ROOT" "$RELEASE_VENV_ROOT/$EXPECTED_SHA" "$EXPECTED_SHA" \
+      --request-recoverable-quiescence "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" "$PREVIOUS_WINDOWS_SHA")" || status=$?
+    printf '%s\n' "$output"
+    test "$status" -eq 0 || return "$status"
+    printf '%s' "$output" | "$BOOTSTRAP_PYTHON" -I -c '
+import json,sys
+p=json.load(sys.stdin)
+c=p.get("context") if isinstance(p,dict) else None
+target,prior,attempt=sys.argv[1:]
+valid=(isinstance(c,dict) and p.get("mode")=="request-recoverable-quiescence"
+       and p.get("activation_granted") is False
+       and ((p.get("status")=="inserted" and p.get("database_writes") is True)
+            or (p.get("status")=="idempotent" and p.get("database_writes") is False))
+       and c.get("build_sha")==target and c.get("prior_build_sha")==prior
+       and c.get("deployment_attempt_id")==attempt
+       and c.get("protocol")=="probiga.qmt-edge-precutover-recovery.v1"
+       and c.get("schema")=="probiga.qmt-edge-precutover-context.v1"
+       and c.get("prior_running") is True and c.get("real_order") is False
+       and type(c.get("prior_pid")) is int and c["prior_pid"]>0
+       and c.get("prior_instance_id")=="{}-{}".format(c.get("prior_host_name"),c.get("prior_pid")))
+raise SystemExit(0 if valid else 2)
+' "$EXPECTED_SHA" "$PREVIOUS_WINDOWS_SHA" "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" || return $?
+  fi
+  # Keep Linux/API serving while the five-minute updater observes the exact
+  # hold, drains its owned process tree and stops renewing its writer heartbeat.
+  # The later stopped-Linux checks still inspect every other writer unchanged.
+  output="$(run_prepared_python_tool \
+    "$PREPARED_CODE_ROOT/tools/trading_v3_layer4_maintenance.py" \
+    wait-writers --timeout-seconds 600 --poll-seconds 5 \
+      --fast-exit-if-zero "${exclusions[@]}")" || status=$?
+  printf '%s\n' "$output"
+  test "$status" -eq 0 || return "$status"
+  printf '%s' "$output" | "$BOOTSTRAP_PYTHON" -I -c '
+import json,sys
+p=json.load(sys.stdin)
+expected=[sys.argv[1]] if sys.argv[1] else []
+valid=(isinstance(p,dict) and p.get("status")=="ok" and p.get("ready") is True
+       and p.get("live_writer_count")==0 and p.get("live_writers")==[]
+       and p.get("zero_confirmations")==2 and p.get("excluded_instance_ids")==expected)
+raise SystemExit(0 if valid else 2)
+' "$local_instance_id"
+}
 controlled_guard_run_writer_fence() {
   local adata_sha="$5"
   local adata_source="$3"
@@ -16558,9 +16641,8 @@ CUTOVER_STEP=preflight_qmt_announcement_rollback_channel
 prepared_qmt_announcement_snapshot verify \
   "$QMT_ANNOUNCEMENT_TASK_OLD_SOURCE"
 
-# QMT strategy releases are independent of Linux code/schema releases.  The
-# Windows updater tracks the strategy source on its own and is never fenced by
-# this broker.
+# A coordinated contract change must hold the existing Windows writer before
+# either scheduler is stopped. Unchanged QMT strategy bytes need no model reload.
 LOCAL_SCHEDULER_INSTANCE_ID=""
 LOCAL_SCHEDULER_PID=""
 if [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ]; then
@@ -16580,6 +16662,10 @@ if [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ]; then
         "$LOCAL_SCHEDULER_PID"
   )"
 fi
+if [ "$RELEASE_SCOPE" = COORDINATED ]; then
+  CUTOVER_STEP=request_qmt_windows_edge_quiescence_before_service_stop
+  prepare_qmt_windows_edge_handoff "$LOCAL_SCHEDULER_INSTANCE_ID"
+fi
 CUTOVER_STEP=stop_linux_scheduler_before_writer_quiescence
 if [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ]; then
   sudo systemctl stop probiga-scheduler
@@ -16594,11 +16680,15 @@ if [ -n "$LOCAL_SCHEDULER_INSTANCE_ID" ]; then
     --exclude-instance-id "$LOCAL_SCHEDULER_INSTANCE_ID"
   )
 fi
+WRITER_QUIESCENCE_STATUS=0
 WRITER_QUIESCENCE_OUTPUT="$(run_prepared_python_tool \
   "$PREPARED_CODE_ROOT/tools/trading_v3_layer4_maintenance.py" \
   wait-writers --timeout-seconds 30 --poll-seconds 5 \
-    --fast-exit-if-zero "${WRITER_EXCLUSION_ARGS[@]}")"
+    --fast-exit-if-zero "${WRITER_EXCLUSION_ARGS[@]}")" || WRITER_QUIESCENCE_STATUS=$?
 printf '%s\n' "$WRITER_QUIESCENCE_OUTPUT"
+if [ "$WRITER_QUIESCENCE_STATUS" -ne 0 ]; then
+  (exit "$WRITER_QUIESCENCE_STATUS")
+fi
 printf '%s' "$WRITER_QUIESCENCE_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
   'import json,sys; p=json.load(sys.stdin); expected=[sys.argv[1]] if sys.argv[1] else []; ok=isinstance(p,dict) and p.get("status")=="ok" and p.get("ready") is True and p.get("live_writer_count")==0 and p.get("live_writers")==[] and p.get("zero_confirmations")==2 and p.get("excluded_instance_ids")==expected; raise SystemExit(0 if ok else 2)' \
   "$LOCAL_SCHEDULER_INSTANCE_ID"
