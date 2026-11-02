@@ -2482,8 +2482,9 @@ def _release_catchup_dependencies_ready(
     rows: list[dict],
     *,
     engine=None,
+    now: datetime | None = None,
 ) -> tuple[bool, str]:
-    """Require exact-build validated upstream histories before downstream replay."""
+    """Require validated upstream data or runtime identities before replay."""
 
     task_type = str(row.get("task_type") or "").strip()
     dependencies = RELEASE_DATA_CATCHUP_DEPENDENCIES.get(task_type, ())
@@ -2494,6 +2495,27 @@ def _release_catchup_dependencies_ready(
         grouped.setdefault(
             str(candidate.get("task_type") or "").strip(), []
         ).append(candidate)
+    if task_type == "target_turnover_snapshot":
+        # Turnover freezes the exact persisted daily rows for its target.
+        # The Windows publisher's repository revision is not an input.
+        if len(grouped.get("qmt_stock_daily_canonical", ())) != 1:
+            return False, "qmt_stock_daily_canonical:missing_or_duplicate"
+        target = str(row.get("_scheduler_target_trade_date") or "")
+        if not target or target != row.get("_release_expected_target_date"):
+            return False, "qmt_stock_daily_canonical:target_date_mismatch"
+        if engine is None:
+            return False, "qmt_stock_daily_canonical:database_unavailable"
+        from server.common.qmt_datadir_daily_coverage import load_daily_manifest
+
+        try:
+            manifest = load_daily_manifest(
+                engine, target, decision_known_at=now or _now_shanghai_naive(),
+            )
+        except Exception as exc:
+            return False, f"qmt_stock_daily_canonical:{type(exc).__name__}"
+        if manifest is None:
+            return False, "qmt_stock_daily_canonical:exact_target_manifest_unavailable"
+        return True, "ready"
     build_sha = _scheduler_build_commit_sha()
     component_build_shas = None
     if engine is not None:
@@ -10647,7 +10669,11 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                     )
                     continue
 
-                if not release_recovery_requested:
+                turnover_release_catchup = (
+                    release_catchup_due
+                    and row.get("task_type") == "target_turnover_snapshot"
+                )
+                if not release_recovery_requested and not turnover_release_catchup:
                     dependency_ready, dependency_reason = (
                         _strategy_pipeline_dependencies_ready(row, engine, now)
                     )
@@ -10661,7 +10687,7 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
 
                 if release_catchup_due and not release_recovery_requested:
                     release_dependencies_ready, release_dependency_reason = (
-                        _release_catchup_dependencies_ready(row, rows, engine=engine)
+                        _release_catchup_dependencies_ready(row, rows, engine=engine, now=now)
                     )
                     if not release_dependencies_ready:
                         logger.info(

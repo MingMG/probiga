@@ -27,6 +27,7 @@ import os
 import sys
 import time
 from contextlib import contextmanager
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 
 from sqlalchemy import text
@@ -109,6 +110,7 @@ def _source_matrix(root, *, universe, session, scope, run_id=""):
     digest = hashlib.sha256()
     fields = ("stock_code", "trade_time", "trade_date", "price", "change",
               "change_pct", "volume", "amount", "qmt_code")
+    stored_scale = Decimal("0.000001")
     expected = set(scope["codes"])
     def rows():
         for member in universe:
@@ -124,6 +126,13 @@ def _source_matrix(root, *, universe, session, scope, run_id=""):
             digest.update(hashlib.sha256(selected.tobytes()).digest())
             for _, native in iter_minute_rows(dat, selected, CORE_GRID):
                 row = dict(zip(fields, native))
+                # Only the calculated percentage can exceed the stored scale.
+                # MySQL DECIMAL(50,6) rounds ties away from zero and stores
+                # unsigned zero. Keep the raw DAT digest and other values.
+                pct = row["change_pct"]
+                if pct.is_finite():
+                    stored_pct = pct.quantize(stored_scale, rounding=ROUND_HALF_UP)
+                    row["change_pct"] = stored_pct if stored_pct else stored_pct.copy_abs()
                 yield {**row, "source_time": row["trade_time"], "data_source": SOURCE,
                     "batch_id": "native-content-comparison", "data_version": "qmt_datadir_v1",
                     "quality_status": "VERIFIED", "permission_status": "SUPPORTED"}

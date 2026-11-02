@@ -5,10 +5,9 @@ trading session at a time.  Reading it per session instead would re-read the
 whole ~16 GiB cache once per date, so the harvest loop is file-major and the
 publish loop is date-major.
 
-``sm_stock_minute`` has no unique business key, so a session is published as a
-date-scoped replace: the previous ``qmt_datadir`` rows for that date are
-removed, the staged rows are inserted, and only then are superseded rows from
-another source removed.  A crash therefore never leaves a session empty.
+``sm_stock_minute`` has no unique business key. Publication reconciles the
+staged session in one transaction, keeping exact existing bars and replacing
+only differences and explicitly superseded sources.
 """
 from __future__ import annotations
 
@@ -16,6 +15,7 @@ import dataclasses
 import datetime as dt
 import hashlib
 import json
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -461,14 +461,36 @@ def publish_session(
     deadline_seconds: float = 900,
     progress=None,
 ) -> None:
-    """Replace bounded stock batches inside the caller's one atomic transaction."""
+    """Reconcile bounded stock batches inside the caller's one atomic transaction."""
     if batch_codes < 1 or deadline_seconds <= 0:
         raise ValueError("minute publication batch/deadline is invalid")
     sources = sorted({SOURCE, *replace_sources})
-    stage_index = f" FORCE INDEX (`{QMT_DATADIR_STAGE_INDEX_NAME}`)" if conn.dialect.name == "mysql" else ""
-    codes = {str(row[0]) for row in conn.execute(text(
-        f"SELECT DISTINCT stock_code FROM `{STAGE_TABLE}`{stage_index} WHERE run_id=:r AND trade_date=:d"
+    mysql = conn.dialect.name == "mysql"
+    stage_index = f" FORCE INDEX (`{QMT_DATADIR_STAGE_INDEX_NAME}`)" if mysql else ""
+    target_index = " FORCE INDEX (idx_smm_date_source_code_time)" if mysql else ""
+    stock_encodings = {}
+    if mysql:
+        stock_encodings = {
+            table: (charset, collation)
+            for table, charset, collation in conn.execute(text("""
+                SELECT TABLE_NAME, CHARACTER_SET_NAME, COLLATION_NAME
+                FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA=DATABASE() AND COLUMN_NAME='stock_code'
+                  AND TABLE_NAME IN (:target, :stage)
+            """), {"target": TARGET_TABLE, "stage": STAGE_TABLE})
+        }
+        if set(stock_encodings) != {TARGET_TABLE, STAGE_TABLE} or any(
+            not isinstance(charset, str) or not re.fullmatch(r"[a-z0-9_]+", charset)
+            or not isinstance(collation, str) or not re.fullmatch(r"[a-z0-9_]+", collation)
+            or not collation.startswith(charset + "_")
+            for charset, collation in stock_encodings.values()
+        ):
+            raise RuntimeError("minute_publication: stock code collation metadata differs")
+    staged_counts = {str(code): int(count) for code, count in conn.execute(text(
+        f"SELECT stock_code,COUNT(*) FROM `{STAGE_TABLE}`{stage_index} "
+        "WHERE run_id=:r AND trade_date=:d GROUP BY stock_code"
     ), {"r": run_id, "d": session})}
+    codes = set(staged_counts)
     current_codes = text(
         f"SELECT DISTINCT stock_code FROM `{TARGET_TABLE}` "
         "WHERE trade_date=:d AND data_source IN :sources"
@@ -476,29 +498,84 @@ def publish_session(
     codes.update(str(row[0]) for row in conn.execute(current_codes, {"d": session, "sources": sources}))
     ordered = sorted(codes)
     deadline = time.monotonic() + deadline_seconds
+
+    def exact_text(expression):
+        return f"CAST({expression} AS BINARY)" if mysql else f"{expression} COLLATE BINARY"
+
+    def indexed_stock_match(indexed_alias, indexed_table, outer_alias, outer_table):
+        outer = f"{outer_alias}.stock_code"
+        if mysql:
+            charset, collation = stock_encodings[indexed_table]
+            outer_charset, outer_collation = stock_encodings[outer_table]
+            if charset != outer_charset:
+                outer = f"CONVERT({outer} USING {charset})"
+            if collation != outer_collation:
+                outer = f"{outer} COLLATE {collation}"
+        return f"{indexed_alias}.stock_code={outer}"
+
+    identity = f"""
+        e.trade_date=s.trade_date
+        AND e.trade_time=s.trade_time
+        AND {exact_text('e.stock_code')}={exact_text('s.stock_code')}
+    """
+    numeric_match = " AND ".join(
+        f"(e.`{field}`=s.`{field}` OR (e.`{field}` IS NULL AND s.`{field}` IS NULL))"
+        for field in ("price", "change", "change_pct", "volume", "amount")
+    )
+    # The physical key is id, so retain only the first exact row per bar.
+    # Select only victim IDs over the wire and delete by their primary keys.
+    victims = text(f"""
+        SELECT id FROM (
+            SELECT id, is_exact, ROW_NUMBER() OVER (
+                PARTITION BY stock_code, trade_time, is_exact ORDER BY id
+            ) AS identity_rank
+            FROM (
+                SELECT e.id, e.stock_code, e.trade_time, CASE WHEN
+                    {exact_text('e.data_source')}={exact_text(':source')}
+                    AND {exact_text('e.data_version')}={exact_text(':version')}
+                    AND {exact_text('e.quality_status')}={exact_text(':quality')}
+                    AND {exact_text('e.permission_status')}={exact_text(':permission')}
+                    AND EXISTS (
+                        SELECT 1 FROM `{STAGE_TABLE}` AS s{stage_index}
+                        WHERE s.run_id=:run_id AND s.trade_date=:d AND {identity}
+                          AND {indexed_stock_match('s', STAGE_TABLE, 'e', TARGET_TABLE)}
+                          AND e.source_time=s.trade_time
+                          AND {exact_text('e.qmt_code')}={exact_text('s.qmt_code')}
+                          AND {numeric_match}
+                    )
+                    THEN 1 ELSE 0 END AS is_exact
+                FROM `{TARGET_TABLE}` AS e{target_index}
+                WHERE e.trade_date=:d AND e.data_source IN :sources AND e.stock_code IN :codes
+                  AND (e.data_source=:source OR {exact_text('e.data_source')} IN :sources)
+            ) AS compared
+        ) AS ranked
+        WHERE is_exact=0 OR identity_rank>1
+    """).bindparams(bindparam("sources", expanding=True), bindparam("codes", expanding=True))
     delete = text(
-        f"DELETE FROM `{TARGET_TABLE}` WHERE trade_date=:d "
-        "AND data_source IN :sources AND stock_code IN :codes"
-    ).bindparams(bindparam("sources", expanding=True), bindparam("codes", expanding=True))
+        f"DELETE FROM `{TARGET_TABLE}` WHERE id IN :ids"
+    ).bindparams(bindparam("ids", expanding=True))
     insert = text(f"""
             INSERT INTO `{TARGET_TABLE}` ({','.join(MINUTE_COLUMNS)})
-            SELECT stock_code, trade_time, trade_date, price, `change`, change_pct,
-                   volume, amount, NOW(), qmt_code, :source, trade_time, NOW(),
+            SELECT s.stock_code, s.trade_time, s.trade_date, s.price, s.`change`, s.change_pct,
+                   s.volume, s.amount, NOW(), s.qmt_code, :source, s.trade_time, NOW(),
                    :batch_id, :version, :quality, :permission
-            FROM `{STAGE_TABLE}`{stage_index}
-            WHERE run_id=:run_id AND trade_date=:d AND stock_code IN :codes
-            ORDER BY stock_code, trade_time
+            FROM `{STAGE_TABLE}` AS s{stage_index}
+            LEFT JOIN `{TARGET_TABLE}` AS e{target_index}
+              ON e.data_source=:source AND {identity}
+             AND {indexed_stock_match('e', TARGET_TABLE, 's', STAGE_TABLE)}
+             AND {exact_text('e.data_source')}={exact_text(':source')}
+            WHERE s.run_id=:run_id AND s.trade_date=:d AND s.stock_code IN :codes
+              AND e.id IS NULL
+            ORDER BY s.stock_code, s.trade_time
         """).bindparams(bindparam("codes", expanding=True))
-    published_rows = 0
+    processed_rows = inserted_rows = deleted_rows = 0
     for offset in range(0, len(ordered), batch_codes):
         if time.monotonic() >= deadline:
             raise TimeoutError("minute_publication: total deadline exceeded")
         batch = ordered[offset:offset + batch_codes]
-        conn.execute(delete, {"d": session, "sources": sources, "codes": batch})
-        if time.monotonic() >= deadline:
-            raise TimeoutError("minute_publication: total deadline exceeded")
-        inserted = conn.execute(insert, {
+        params = {
             "source": SOURCE,
+            "sources": sources,
             "batch_id": batch_id,
             "version": DATA_VERSION,
             "quality": QUALITY_STATUS,
@@ -506,10 +583,21 @@ def publish_session(
             "run_id": run_id,
             "d": session,
             "codes": batch,
-        })
-        published_rows += max(0, int(inserted.rowcount or 0))
+        }
+        ids = conn.execute(victims, params).scalars().all()
+        for start in range(0, len(ids), 500):
+            if time.monotonic() >= deadline:
+                raise TimeoutError("minute_publication: total deadline exceeded")
+            deleted = conn.execute(delete, {"ids": ids[start:start + 500]})
+            deleted_rows += max(0, int(deleted.rowcount or 0))
+        if time.monotonic() >= deadline:
+            raise TimeoutError("minute_publication: total deadline exceeded")
+        inserted = conn.execute(insert, params)
+        processed_rows += sum(staged_counts.get(code, 0) for code in batch)
+        inserted_rows += max(0, int(inserted.rowcount or 0))
         if progress is not None:
-            progress.emit("server_publication", current_unit=batch[-1], completed_units=published_rows,
+            progress.emit("server_publication", current_unit=batch[-1], completed_units=processed_rows,
+                inserted_rows=inserted_rows, deleted_rows=deleted_rows,
                 completed_securities=min(offset + len(batch), len(ordered)),
                 total_securities=len(ordered), budget_seconds=deadline_seconds,
                 budget_remaining_seconds=round(max(0.0, deadline - time.monotonic()), 6))

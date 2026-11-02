@@ -151,6 +151,37 @@ def test_real_database_replay_rejects_mutated_bars_and_entity_partitions(monkeyp
     engine.dispose()
 
 
+@pytest.mark.parametrize("case", ["same_day", "old_day", "bad_inventory", "changed_bar"])
+def test_turnover_release_catchup_reuses_only_verified_target_daily_content(monkeypatch, case):
+    from server.api import scheduler_runtime
+
+    engine = database(monkeypatch)
+    target = "2026-11-03" if case == "old_day" else DAY
+    now = datetime(2026, 11, 3, 21)
+    daily = {"task_type": "qmt_stock_daily_canonical", "enabled": 1,
+             "_release_terminal_build_sha": "a" * 40}
+    turnover = {"task_type": "target_turnover_snapshot",
+                "_scheduler_target_trade_date": target,
+                "_release_expected_target_date": target}
+    monkeypatch.setattr(scheduler_runtime, "_scheduler_build_commit_sha", lambda: "b" * 40)
+    with engine.begin() as connection:
+        if case == "bad_inventory":
+            connection.execute(text("DELETE FROM qmt_history_coverage_entity WHERE stock_code='000831'"))
+        elif case == "changed_bar":
+            connection.execute(text("UPDATE sm_stock_kline SET volume=101"))
+
+    result = scheduler_runtime._release_catchup_dependencies_ready(
+        turnover, [daily, turnover], engine=engine, now=now,
+    )
+    assert result == {
+        "same_day": (True, "ready"),
+        "old_day": (False, "qmt_stock_daily_canonical:exact_target_manifest_unavailable"),
+        "bad_inventory": (False, "qmt_stock_daily_canonical:ValueError"),
+        "changed_bar": (False, "qmt_stock_daily_canonical:ValueError"),
+    }[case]
+    engine.dispose()
+
+
 def test_consumers_share_exact_trade_scope_and_readback_proof(monkeypatch):
     engine = database(monkeypatch)
     monkeypatch.setattr(daily_stock_universe, "validate_stock_catalog_runtime_schema", lambda *args, **kwargs: None)

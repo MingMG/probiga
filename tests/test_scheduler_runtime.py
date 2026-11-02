@@ -5131,7 +5131,7 @@ def test_release_catchup_dependency_graph_is_acyclic_and_never_holds_worker_lane
 
 def test_release_catchup_requires_exact_build_evidence_for_dependencies():
     build_sha = "c" * 40
-    downstream = {"id": 905, "task_type": "target_turnover_snapshot"}
+    downstream = {"id": 905, "task_type": "capital_flow_batch_fast"}
     dependency = _release_terminal_row(
         "qmt_stock_daily_canonical",
         task_id=904,

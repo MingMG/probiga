@@ -480,15 +480,18 @@ def main(argv: list[str] | None = None) -> int:
         ),
         timeout_seconds=args.timeout_seconds,
     )
-    input_root = turnover_capture_input_sha256(
+    capture_inputs = dict(
         targets=targets,
         target_date=args.target_date,
         decision_at=decision_at,
-        collector_build_sha=build_sha,
-        collector_binary_sha256=binary_sha,
         authority=authority,
         transport_contract=collector.transport_contract,
         resolved_endpoint=collector.resolved_endpoint,
+    )
+    input_root = turnover_capture_input_sha256(
+        **capture_inputs,
+        collector_build_sha=build_sha,
+        collector_binary_sha256=binary_sha,
     )
     checkpoint_path = Path(args.checkpoint_file)
     if (
@@ -503,9 +506,24 @@ def main(argv: list[str] | None = None) -> int:
     target_by_code = {item.stock_code: item for item in targets}
     completed = {}
     request_started_at = now.replace(tzinfo=None)
+    checkpoint_build = checkpoint.get("collector_build_sha")
+    checkpoint_bundle = checkpoint.get("collector_binary_sha256")
     if (
         checkpoint.get("schema") == "probiga.turnover-capture-checkpoint.v1"
-        and checkpoint.get("input_root_sha256") == input_root
+        and checkpoint.get("target_date") == args.target_date
+        and isinstance(checkpoint_build, str)
+        and _SHA40.fullmatch(checkpoint_build)
+        and checkpoint_build != "0" * 40
+        and isinstance(checkpoint_bundle, str)
+        and re.fullmatch(r"[0-9a-f]{64}", checkpoint_bundle)
+        and checkpoint_bundle != "0" * 64
+        # v1 includes the old program bundle identity. Rebuild that root with
+        # today's actual capture inputs, then reparse every retained response.
+        and checkpoint.get("input_root_sha256") == turnover_capture_input_sha256(
+            **capture_inputs,
+            collector_build_sha=checkpoint_build,
+            collector_binary_sha256=checkpoint_bundle,
+        )
     ):
         try:
             request_started_at = datetime.fromisoformat(

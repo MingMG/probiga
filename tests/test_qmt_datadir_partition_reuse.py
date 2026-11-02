@@ -34,10 +34,11 @@ def existing_partition(tmp_path, monkeypatch):
         daily_close_by_code={code: "10" for code in CODES}, eligible_code_count=2,
         expected_traded_code_set_sha256=importer.canonical_digest(list(CODES)))
     with engine.begin() as connection:
-        connection.execute(text("CREATE TABLE sm_stock_minute (" + ",".join(key + " " + (
+        connection.execute(text("CREATE TABLE sm_stock_minute (id INTEGER PRIMARY KEY," + ",".join(key + " " + (
             "REAL" if key in {"price", "change", "change_pct", "volume", "amount"} else "TEXT")
             for key in native[0]) + ")"))
-        connection.execute(text("INSERT INTO sm_stock_minute VALUES (" + ",".join(":" + key for key in native[0]) + ")"), native)
+        connection.execute(text("INSERT INTO sm_stock_minute (" + ",".join("`"+key+"`" for key in native[0]) +
+                                ") VALUES (" + ",".join(":" + key for key in native[0]) + ")"), native)
         connection.execute(text("ALTER TABLE sm_stock_minute ADD COLUMN etl_sync_at TEXT"))
         connection.execute(text("ALTER TABLE sm_stock_minute ADD COLUMN received_at TEXT"))
         connection.execute(text("""CREATE TABLE qmt_datadir_import_partition (
@@ -131,6 +132,35 @@ def test_native_fallback_compares_nonterminating_percentage_at_actual_mysql_scal
     assert receipt["status"] == ("COMPLETE" if expected_reuse else "FAILED")
     with item.engine.connect() as connection:
         assert connection.execute(text("SELECT COUNT(*) FROM qmt_datadir_minute_stage")).scalar() == 0
+
+
+@pytest.mark.parametrize(("delta", "stored_pct", "expected_reuse"), [
+    (10, "0.039063", True),
+    (-10, "-0.039063", True),
+    (10, "0.039062", False),
+])
+def test_native_fallback_rounds_dat_midpoints_like_mysql(
+        existing_partition, delta, stored_pct, expected_reuse):
+    item = existing_partition
+    moment = "09:53:00"
+    index = coverage.CORE_GRID.index(moment)
+    code = CODES[0]
+    path = item.root / "SZ" / MINUTE_PERIOD / (code + ".DAT")
+    records = np.frombuffer(path.read_bytes()[len(DAT_HEADER):], dtype="<u4").reshape(-1, 16).copy()
+    records[index, 4] = 25600 + delta
+    records[index, 13] = 25600
+    path.write_bytes(DAT_HEADER + records.tobytes())
+    with item.engine.begin() as connection:
+        connection.execute(text(
+            "UPDATE sm_stock_minute SET price=:price,`change`=:delta,change_pct=:pct "
+            "WHERE stock_code=:code AND trade_time=:stamp"
+        ), dict(price=str((25600 + delta) / 1000), delta=str(delta / 1000),
+                pct=stored_pct, code=code, stamp=f"{DAY} {moment}"))
+    before = _stored_rows(item.engine)
+    outcome = importer._reuse_existing_partition(item.engine, session=DAY, scope=item.scope,
+        datadir_roots=[item.root], universe=item.universe)
+    assert bool(outcome) is expected_reuse
+    assert _stored_rows(item.engine) == before
 
 
 def test_prior_completed_history_preserves_original_identity_after_failed_cursor(existing_partition):

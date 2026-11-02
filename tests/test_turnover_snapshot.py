@@ -1702,6 +1702,100 @@ def test_turnover_cli_after_cutoff_only_recovers_and_never_collects(
     frozen.assert_called_once()
 
 
+@pytest.mark.parametrize("change", ["none", "endpoint", "transport", "authority", "bad_shard", "zero_build", "zero_bundle"])
+def test_turnover_cli_revalidates_old_build_checkpoint(tmp_path, monkeypatch, change):
+    engine = _engine()
+    targets = _targets(engine)
+    authority = _authority()
+    old_build = "d" * 40 if change != "zero_build" else "0" * 40
+    old_bundle = "e" * 64 if change != "zero_bundle" else "0" * 64
+    endpoint = "push2his.eastmoney.com:443:61.129.129.48"
+    transport = "HTTPS_TLS_VERIFIED_PINNED_RESOLVE_V1"
+    old_start = CAPTURED_AT - timedelta(minutes=2)
+    previous = parse_eastmoney_turnover_response(
+        target=targets[0], raw_payload=_raw_payload(targets[0].stock_code),
+        provider_http_date=HTTP_DATE, captured_at=CAPTURED_AT, decision_at=DECISION_AT,
+    )
+    shard = turnover_module.serialize_turnover_checkpoint_row(previous)
+    if change == "bad_shard":
+        shard["raw_payload_sha256"] = "0" * 64
+    root = turnover_module.turnover_capture_input_sha256(
+        targets=targets, target_date=TARGET_DATE, decision_at=DECISION_AT,
+        collector_build_sha=old_build, collector_binary_sha256=old_bundle,
+        authority=replace(authority, truth_run_id="old-authority") if change == "authority" else authority,
+        transport_contract="old-transport" if change == "transport" else transport,
+        resolved_endpoint="old-endpoint" if change == "endpoint" else endpoint,
+    )
+    checkpoint = tmp_path / "turnover.json"
+    turnover_command._write_checkpoint(checkpoint, {
+        "schema": "probiga.turnover-capture-checkpoint.v1",
+        "target_date": TARGET_DATE,
+        "collector_build_sha": old_build,
+        "collector_binary_sha256": old_bundle,
+        "request_started_at": old_start.isoformat(),
+        "input_root_sha256": root,
+        "shards": {previous.target.stock_code: shard},
+    })
+
+    calls = []
+
+    class LocalTransport:
+        transport_contract = transport
+        resolved_endpoint = endpoint
+        now = staticmethod(lambda: DECISION_AT)
+
+        def fetch(self, target, *, decision_at):
+            calls.append(target.stock_code)
+            return parse_eastmoney_turnover_response(
+                target=target, raw_payload=_raw_payload(target.stock_code),
+                provider_http_date=HTTP_DATE, captured_at=DECISION_AT,
+                decision_at=decision_at or DECISION_AT,
+            )
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return DECISION_AT.replace(tzinfo=tz)
+
+    monkeypatch.setattr(turnover_command, "datetime", Clock)
+    monkeypatch.setattr(turnover_command, "load_project_env", lambda: None)
+    monkeypatch.setattr(turnover_command, "create_tool_engine", lambda: engine)
+    monkeypatch.setattr(turnover_command, "validate_market_field_capture_runtime", lambda *_: None)
+    monkeypatch.setattr(turnover_command, "_require_open_closed_target", lambda *_a, **_k: None)
+    monkeypatch.setattr(turnover_command, "resolve_build_sha", lambda _: BUILD_SHA)
+    monkeypatch.setattr(turnover_command, "collector_bundle_sha256", lambda: BINARY_SHA)
+    monkeypatch.setattr(turnover_command, "load_turnover_universe_authority",
+                        lambda *_a, decision_at, **_k: replace(authority, decision_at=decision_at))
+    monkeypatch.setattr(turnover_command, "recover_completed_turnover_receipt", lambda *_a, **_k: None)
+    monkeypatch.setattr(turnover_command, "freeze_qmt_turnover_targets", lambda *_a, **_k: targets)
+    monkeypatch.setattr(turnover_command, "PinnedCurlEastmoneyTurnoverCollector", lambda **_: LocalTransport())
+    publish = MagicMock(return_value={"status": "COMPLETE"})
+    monkeypatch.setattr(turnover_command, "publish_turnover_snapshot", publish)
+    argv = ["--target-date", TARGET_DATE, "--checkpoint-file", str(checkpoint),
+            "--workers", "1", "--delay-seconds", "0", "--batch-pause-seconds", "0"]
+    if change == "bad_shard":
+        old_bytes = checkpoint.read_bytes()
+        with pytest.raises(TurnoverSnapshotBlocked, match="checkpoint shard hash differs"):
+            turnover_command.main(argv)
+        assert checkpoint.read_bytes() == old_bytes
+        assert not calls
+        publish.assert_not_called()
+        return
+
+    assert turnover_command.main(argv) == 0
+    assert calls == [target.stock_code for target in targets
+                     if change != "none" or target != previous.target]
+    run = publish.call_args.args[1]
+    assert run.collector_build_sha == BUILD_SHA
+    assert run.collector_binary_sha256 == BINARY_SHA
+    saved = turnover_command._read_checkpoint(checkpoint)
+    assert saved["collector_build_sha"] == BUILD_SHA
+    assert saved["collector_binary_sha256"] == BINARY_SHA
+    if change == "none":
+        assert saved["shards"][previous.target.stock_code] == shard
+        assert datetime.fromisoformat(saved["request_started_at"]) == old_start
+
+
 def test_pool_receipt_hash_binds_generic_field_capture_root() -> None:
     engine = _engine()
     run = _capture(engine)
