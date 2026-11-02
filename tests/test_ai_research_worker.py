@@ -36,7 +36,8 @@ class Api:
 
     def renew_research(self, request_id, worker_id, generation):
         self.renewals += 1
-        return {"request_id": request_id, "worker_id": worker_id, "claim_generation": generation, "status": "processing"}
+        return {"request_id": request_id, "worker_id": worker_id, "claim_generation": generation, "status": "processing",
+                'lease_expires_at':(datetime.now(timezone.utc)+timedelta(seconds=60)).isoformat()}
 
     def complete_research(self, request_id, payload):
         self.posts.append(deepcopy(payload))
@@ -242,6 +243,59 @@ def test_lease_renews_while_provider_runs_and_fences_changed_owner(tmp_path, mon
     with bridge.ResearchLease(api, "research-1", "worker", 1) as lease:
         assert lease.lost.wait(timeout=1)
     assert api.renewals == 2
+
+
+@pytest.mark.parametrize('failure',[TimeoutError('observed progress read timeout'),
+    bridge.httpx.HTTPStatusError('observed progress 500',request=bridge.httpx.Request('POST','http://unit/progress'),response=bridge.httpx.Response(500))])
+def test_transient_progress_failure_does_not_kill_a_still_verified_owner(monkeypatch,failure):
+    monkeypatch.setattr(bridge,'RESEARCH_RENEW_SECONDS',0.02)
+    api=Api();original=api.renew_research;recovered=threading.Event();records=[]
+    def renew(*args):
+        row=original(*args)
+        if api.renewals==2: raise failure
+        if api.renewals==3: recovered.set()
+        return row
+    api.renew_research=renew
+    with bridge.ResearchLease(api,'research-1','worker',1,checkpoint=records.append) as lease:
+        assert recovered.wait(1)
+        assert not lease.lost.is_set()
+        assert lease.transient_errors==1
+    assert any(x['status']=='TRANSPORT_RETRY' for x in records)
+    assert records[-1]['status']=='VERIFIED'
+
+
+def test_verified_expiry_fences_during_a_hung_renewal_and_cannot_be_revived(monkeypatch):
+    monkeypatch.setattr(bridge,'RESEARCH_RENEW_SECONDS',0.02)
+    api=Api();original=api.renew_research;release=threading.Event();hung=threading.Event()
+    def renew(*args):
+        row=original(*args)
+        if api.renewals==1:
+            row['lease_expires_at']=(datetime.now(timezone.utc)+timedelta(seconds=1.2)).isoformat()
+        else:
+            hung.set();release.wait(1)
+        return row
+    api.renew_research=renew
+    with bridge.ResearchLease(api,'research-1','worker',1) as lease:
+        try:
+            assert hung.wait(0.5)
+            assert lease.lost.wait(0.6)
+        finally: release.set()
+    assert lease.lost.is_set()
+
+
+def test_transport_retry_requires_prior_verified_expiry_and_is_bounded(monkeypatch):
+    api=Api()
+    def fail(*args):
+        api.renewals+=1
+        raise TimeoutError('transport down')
+    api.renew_research=fail
+    with pytest.raises(TimeoutError):
+        with bridge.ResearchLease(api,'research-1','worker',1): pass
+    assert api.renewals==1
+    with pytest.raises(TimeoutError):
+        with bridge.ResearchLease(api,'research-1','worker',1,
+            lease_expires_at=(datetime.now(timezone.utc)+timedelta(seconds=60)).isoformat()): pass
+    assert api.renewals==3
 
 
 def test_different_completed_output_is_rejected_not_relabelled(tmp_path):

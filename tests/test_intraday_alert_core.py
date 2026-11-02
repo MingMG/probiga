@@ -9,6 +9,7 @@ from biz.intraday_alert.core import (
     DeliveryDispatchError,
     QualityGateError,
     advance_states,
+    publication_reservations,
     drain_outbox,
     make_observation_id,
     prepare_benchmark_snapshot,
@@ -19,6 +20,30 @@ from biz.intraday_alert.core import (
 
 
 NOW = datetime(2026, 8, 13, 10, 15, 30)
+
+
+def test_real_failed_batches_do_not_consume_delivery_cap_and_retry_respects_cooldown():
+    from pathlib import Path
+    from copy import deepcopy
+    ledger=json.loads((Path(__file__).parent/'fixtures/failed_intraday_publications_20261102.json').read_text(encoding='utf-8'))
+    assert sum(x['emission_count'] for x in ledger)==12
+    row=ledger[-1];event=json.loads(row['source_events'])[0] if isinstance(row['source_events'],str) else row['source_events'][0]
+    created=datetime.fromisoformat(row['created_at'])
+    target=event['transition_name'];key=event['event_key']
+    previous={key:{**event,'state':target,'last_sent_state':target,'last_sent_at':created,'cooldown_until':created+timedelta(minutes=15)}}
+    current,used=publication_reservations(previous,ledger,rules_sha256='new-rules')
+    assert used==0 and current[key]['publication_retry']
+    candidate={**event,'target_state':target,'severity':max(2,int(event.get('severity') or 0))}
+    # Detector candidates do not carry the persistence fields added at emission.
+    for field in ('cooldown_until','last_sent_state','last_sent_at'):
+        candidate.pop(field,None)
+    assert advance_states(current,[candidate],now=created+timedelta(minutes=14),emitted_today=used)[1]==[]
+    assert len(advance_states(current,[candidate],now=created+timedelta(minutes=16),emitted_today=used)[1])==1
+    protected=deepcopy(row);protected['status']='ANALYZING'
+    current,used=publication_reservations(previous,[*ledger,protected],rules_sha256='new-rules')
+    assert used==row['emission_count'] and not current[key].get('publication_retry')
+    protected['status']='SENT'
+    assert not publication_reservations(previous,[*ledger,protected],rules_sha256='new-rules')[0][key].get('publication_retry')
 
 
 def _receipt(**overrides):

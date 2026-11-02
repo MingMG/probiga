@@ -962,7 +962,7 @@ def advance_states(
         cooldown_until = _as_naive_cn(updated.get("cooldown_until"))
         state_changed = last_sent_state != target
         cooldown_ready = cooldown_until is None or now >= cooldown_until
-        upgrade = STATE_RANK.get(target, 0) > STATE_RANK.get(last_sent_state, 0)
+        upgrade = STATE_RANK.get(target, 0) > STATE_RANK.get(last_sent_state, 0) and not previous.get("publication_retry")
         cap = hard_cap if int(event.get("severity") or 0) >= 3 else normal_cap
         first_material_suspected = (
             target == "SUSPECTED"
@@ -992,6 +992,44 @@ def _state_rows(connection: Connection, trade_date: date) -> dict[str, dict[str,
         item["evidence"] = _json_object(item.pop("evidence_json", None))
         result[str(item["event_key"])] = item
     return result
+
+
+def publication_reservations(previous_states, ledger, *, rules_sha256):
+    """Failed attempts are not sent alerts; never reopen the old business job."""
+    states={key:dict(value) for key,value in previous_states.items()}
+    used=0;protected=set();failed=[]
+    for row in ledger:
+        terminal=row['status'] in {'EXPIRED','BLOCKED'}
+        if not terminal: used+=max(1,int(row.get('emission_count') or 1))
+        events=row.get('source_events') or []
+        if isinstance(events,str): events=json.loads(events)
+        for event in events:
+            marker=(event.get('event_key'),int(event.get('cycle') or 1),event.get('transition_name') or event.get('state'))
+            if not terminal:
+                protected.add(marker)
+            elif row['status']=='EXPIRED' or row.get('rules_sha256') and row['rules_sha256']!=rules_sha256:
+                failed.append((marker,_as_naive_cn(row['created_at'])))
+    for (key,cycle,target),created in failed:
+        state=states.get(key)
+        if ((key,cycle,target) not in protected and state and state.get('state') in ACTIVE_STATES
+                and int(state.get('cycle') or 1)==cycle and state.get('last_sent_state')==target
+                and _as_naive_cn(state.get('last_sent_at'))==created):
+            state.update(last_sent_state=None,publication_retry=True)
+    return states,used
+
+
+def _publication_reservations(connection,trade_date,mode,previous_states):
+    from biz.review.market_decision import rules_identity
+    rows=connection.execute(text(f"""SELECT /*+ MAX_EXECUTION_TIME(15000) */ status,created_at,
+        JSON_EXTRACT(evidence_json,'$.source_events') AS source_events,
+        JSON_UNQUOTE(JSON_EXTRACT(evidence_json,'$.checkpoint.rules_sha256')) AS rules_sha256,
+        CASE WHEN JSON_UNQUOTE(JSON_EXTRACT(evidence_json,'$.schema_version'))='probiga.intraday-research.v1'
+        THEN JSON_LENGTH(JSON_EXTRACT(evidence_json,'$.emissions')) ELSE 1 END AS emission_count
+        FROM {OUTBOX_TABLE} WHERE trade_date=:day AND mode=:mode ORDER BY created_at LIMIT 201"""),
+        {'day':trade_date,'mode':mode}).mappings().all()
+    if len(rows)>200:
+        raise QualityGateError('publication_ledger_oversized','日内播报台账超过可核验上限')
+    return publication_reservations(previous_states,rows,rules_sha256=rules_identity())
 
 
 def _upsert_state(connection: Connection, trade_date: date, state: Mapping[str, Any]) -> None:
@@ -1395,17 +1433,7 @@ def run_intraday_scan(
                     if (int(item["session_minute"]) >= 121) == (minute_number >= 121)
                 ]
                 candidates = _evaluate(current, history, previous_states)
-                emitted_today = int(
-                    connection.execute(
-                        text(
-                            f"SELECT COALESCE(SUM(CASE WHEN JSON_UNQUOTE(JSON_EXTRACT(evidence_json,'$.schema_version'))='probiga.intraday-research.v1' "
-                            "THEN JSON_LENGTH(JSON_EXTRACT(evidence_json,'$.emissions')) ELSE 1 END),0) "
-                            f"FROM {OUTBOX_TABLE} WHERE trade_date=:trade_date AND mode=:mode"
-                        ),
-                        {"trade_date": observed_at.date(), "mode": normalized_mode},
-                    ).scalar()
-                    or 0
-                )
+                previous_states,emitted_today=_publication_reservations(connection,observed_at.date(),normalized_mode,previous_states)
                 states, emissions = advance_states(
                     previous_states,
                     candidates,

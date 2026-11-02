@@ -96,7 +96,10 @@ class Providers:
                     final_draft["units"].append(unit)
             if self.invalid_final and (stage == "codex_final" or self.repeat_invalid_final):
                 final_draft["report"]["scenarios"][0].update(trigger_units=["Cmid"], abandon_units=["Cearly"])
-            value = {"schema_version": "probiga.research-final.v3", "draft": final_draft, "dispositions": dispositions}
+            for key,entry in dispositions.items():
+                allowed=schema['properties']['dispositions']['properties'][key]['properties']
+                dispositions[key]={k:v for k,v in entry.items() if k in allowed}
+            value = {"schema_version": schema['properties']['schema_version']['const'], "draft": final_draft, "dispositions": dispositions}
         raw = json.dumps(value, ensure_ascii=False)
         if self.invalid_json_final and stage == "codex_final":
             raw = '{"schema_version":"probiga.research-final.v3","draft":'
@@ -105,8 +108,8 @@ class Providers:
                    "provider_response_id": "provider-" + stage, "model": "unit-provider"}
         if stage.startswith("deepseek"):
             policy = decision._deepseek_policy(packet["task"]["kind"])
-            receipt.update(source="deepseek_api", transport="live_http", endpoint="https://api.deepseek.com/v1/chat/completions",
-                           model=policy["model"], request_policy=policy)
+            receipt.update(source="deepseek_api", transport="live_http", endpoint=decision.DEEPSEEK_ENDPOINT,
+                           model=policy["model"], request_policy=policy, response_schema_sha256=decision._hash(schema), response_status='completed')
         else:
             receipt.update(source="codex_gpt", transport="live_codex_bridge", request_id=request_id,
                            rules_sha256=rules_sha256, ephemeral=True, process_exit_code=0, session_id="unit-" + stage,
@@ -268,3 +271,44 @@ def test_real_duplicate_deepseek_review_is_rejected_without_selecting_a_version(
     assert json.loads(raw[end:])['schema_version'] == first['schema_version']
     with pytest.raises(decision.ResearchError, match='peer_review.*Extra data'):
         decision._parse_review(raw, '0' * 64, {'facts': {}}, final=True, require_pass=False)
+
+
+def test_intraday_schema_bounds_real_oversized_provider_draft_and_keeps_daily_contract():
+    from pathlib import Path
+    from biz.review.research_contract import _check_schema, ContractError
+    raw=json.loads((Path(__file__).parent/'fixtures/deepseek_oversized_intraday_20261102.json').read_text(encoding='utf-8'))
+    assert len(raw['units'])==21
+    _check_schema(raw,decision.draft_json_schema())
+    rules,_=decision._load_rules()
+    packet={'task':{'kind':'intraday'}}
+    schema=decision.build_stage_request('deepseek_draft',packet,rules)[1]
+    with pytest.raises(ContractError,match='schema_array.*units'):
+        _check_schema(raw,schema)
+    for stage in ('codex_final','codex_arbitration'):
+        final=decision.build_stage_request(stage,packet,rules,drafts={},reviews={},final_raw='{}')[1]
+        assert final['properties']['draft']==schema
+    daily=decision.build_stage_request('deepseek_draft',{'task':{'kind':'review'}},rules)[1]
+    assert daily==decision.draft_json_schema()
+
+
+def test_compact_ledger_keeps_all_real_findings_and_requires_cited_fact_evidence():
+    from pathlib import Path
+    frozen=json.loads((Path(__file__).parent/'fixtures/intraday_ledger_evidence_20261102.json').read_text(encoding='utf-8'))
+    old=frozen['final'];packet=frozen['packet'];reviews=frozen['reviews']
+    assert len(old['dispositions'])==30
+    final=deepcopy(old);final['schema_version']='probiga.research-final.v4'
+    final['dispositions']={k:{field:v[field] for field in ('resolution','unit_ids')} for k,v in old['dispositions'].items()}
+    schema=decision._final_schema(reviews,draft_schema=decision._draft_contract(packet,decision._load_rules()[0]),unit_citations=True)
+    accepted=decision._validate_final(json.dumps(final,ensure_ascii=False),packet,reviews,schema=schema)
+    assert accepted['draft']==old['draft']
+    assert set(accepted['dispositions'])==set(old['dispositions'])
+    assert len(json.dumps(accepted,ensure_ascii=False)) < len(json.dumps(old,ensure_ascii=False))*0.8
+    template={'draft':old['draft'],'input_packet':packet,'verification':{'peer_reviews':{k:v for k,v in reviews.items() if k!='deepseek_final_review'},'synthesis_review':reviews['deepseek_final_review']}}
+    assert decision.render_research({**template,'model_output':accepted})==decision.render_research({**template,'model_output':old})
+    changed=deepcopy(final);key=next(iter(changed['dispositions']))
+    changed['dispositions'][key]={'resolution':'disputed_with_evidence','unit_ids':[]}
+    with pytest.raises(decision.ResearchError,match='schema_array'):
+        decision._validate_final(json.dumps(changed),packet,reviews,schema=schema)
+    changed['dispositions'][key]['unit_ids']=['does_not_exist']
+    with pytest.raises(decision.ResearchError,match='unknown_disposition_reference'):
+        decision._validate_final(json.dumps(changed),packet,reviews,schema=schema)

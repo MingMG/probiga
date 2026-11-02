@@ -496,6 +496,18 @@ def test_measured_dual_model_latency_past_three_minutes_is_accepted_before_five(
     assert research._time(state["analysis"]["deadline_at"]) == NOW + timedelta(seconds=280)
 
 
+def test_model_receives_source_budget_remaining_after_evidence_preparation(db,verifier,monkeypatch):
+    identity,clock=queue(db),[NOW]
+    def enrich(engine,state,**kwargs):
+        clock[0]+=timedelta(seconds=45)
+        return state
+    monkeypatch.setattr(research,'_freeze_research_evidence',enrich)
+    def generate(_digest,**kwargs):
+        assert kwargs['timeout_seconds']==235
+        return final_result()
+    assert research.process_research_batch(db[0],outbox_id=identity,generator=generate,now_fn=lambda:clock[0])['status']=='SHADOW'
+
+
 def test_silent_provider_wait_renews_owner_without_fabricating_progress(db, verifier, monkeypatch):
     import time
     monkeypatch.setattr(research, "LEASE_RENEW_INTERVAL_SECONDS", 0.01)

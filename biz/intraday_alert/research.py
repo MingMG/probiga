@@ -403,7 +403,8 @@ def process_research_batch(engine, *, outbox_id: str, generator=None, now_fn: Ca
                              deadline=deadline, now_fn=now_fn):
             research = generator(state["digest"], report_kind="intraday",
                 next_trade_date=state["digest"]["review_date"], context=state["context"], previous_research=None,
-                engine=engine, now=now.replace(tzinfo=TZ), checkpoint=state.get("checkpoint"), progress=progress)
+                engine=engine, now=now.replace(tzinfo=TZ), checkpoint=state.get("checkpoint"), progress=progress,
+                timeout_seconds=max(0,(deadline-_time(now_fn())).total_seconds()))
         from biz.review.market_decision import verify_automatic_research
         verify_automatic_research(research)
         actual_units = _verified_research_units(research)
