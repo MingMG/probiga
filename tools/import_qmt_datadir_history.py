@@ -24,6 +24,7 @@ import datetime as dt
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 
@@ -68,6 +69,7 @@ from server.common.qmt_datadir_result import (  # noqa: E402
 from server.common.qmt_datadir_minute_coverage import (  # noqa: E402
     trade_scope, validate_code_scope, persisted_matrix,
 )
+from server.common.qmt_datadir_progress import MinuteImportProgress  # noqa: E402
 from tools.env_config import load_project_env  # noqa: E402
 
 DEFAULT_DATADIRS = (
@@ -357,6 +359,8 @@ def _publish_one(
     scope,
 ):
     """Stage-to-canonical publication of one session, proven by readback."""
+    progress = MinuteImportProgress(run_id=run_id, total_units=entry["rows"],
+        operation="publication", days=[session])
     with engine.begin() as conn:
         write_receipt(
             conn, session=session, root=str(root), status=STATUS_RUNNING,
@@ -367,6 +371,8 @@ def _publish_one(
         with engine.begin() as conn:
             # Recheck the frozen daily scope before replacing any live minute.
             trade_scope(conn, session.isoformat(), manifest_hash=scope["full_market_manifest_hash"])
+            published_started = time.monotonic()
+            progress.emit("server_publication")
             publish_session(
                 conn,
                 session=session,
@@ -374,7 +380,10 @@ def _publish_one(
                 batch_id=new_batch_id(session, run_id),
                 replace_sources=replace_sources if replace else (),
             )
-            fingerprint = persisted_matrix(conn, session.isoformat(), scope=scope)
+            progress.emit("server_publication", status="COMPLETE",
+                phase_seconds=round(time.monotonic()-published_started, 6))
+            fingerprint = persisted_matrix(conn, session.isoformat(), scope=scope,
+                run_id=run_id, operation="publication_readback")
             rows, codes = fingerprint["row_count"], fingerprint["code_count"]
             ok = rows == entry["rows"] and codes == len(entry["codes"])
             if not ok:
@@ -395,6 +404,7 @@ def _publish_one(
                 },
             )
     except Exception as exc:  # noqa: BLE001 - the receipt records the cause
+        progress.emit("publication", status="FAILED", error_type=type(exc).__name__)
         with engine.begin() as conn:
             write_receipt(
                 conn, session=session, root=str(root),
@@ -407,6 +417,7 @@ def _publish_one(
         return {"session": session.isoformat(), "status": STATUS_FAILED,
                 "root": str(root), "error": str(exc)}
     if ok:
+        progress.emit("canonical_commit", status="COMPLETE", completed_units=rows)
         print(f"{session} COMPLETE rows={rows} codes={codes} root={root}")
         return {"session": session.isoformat(), "status": STATUS_COMPLETE,
                 "rows": rows, "codes": codes, "root": str(root)}

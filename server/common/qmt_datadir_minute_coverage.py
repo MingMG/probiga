@@ -14,6 +14,7 @@ from sqlalchemy import text
 from server.common.qmt_attestation_contract import canonical_digest
 from server.common.qmt_datadir_daily_coverage import load_daily_manifest
 from server.common.qmt_index_minute_grid import CORE_GRID
+from server.common.qmt_datadir_progress import MinuteImportProgress
 
 GRID_HASH = canonical_digest(list(CORE_GRID))
 SCHEMA = "probiga.qmt-datadir-minute-coverage.v1"
@@ -49,7 +50,8 @@ def validate_code_scope(entry: dict, scope: dict) -> None:
         raise ValueError("exact native minute grid is incomplete")
 
 
-def validate_matrix(rows, *, day: str, scope: dict, deadline_seconds: float = 180) -> dict:
+def validate_matrix(rows, *, day: str, scope: dict, deadline_seconds: float = 180,
+                    progress=None, query_started=None) -> dict:
     """Consume ordered rows in bounded memory; hash matches canonical_rows JSON."""
     from server.common.qmt_datadir_result import _normalize
 
@@ -57,8 +59,13 @@ def validate_matrix(rows, *, day: str, scope: dict, deadline_seconds: float = 18
     seen_codes, current_times = set(), set()
     current_code, count = None, 0
     digest = sha256(b"[")
-    deadline = time.monotonic() + deadline_seconds
+    consume_started = time.monotonic()
+    deadline = consume_started + deadline_seconds
     for source in rows:
+        if progress is not None and count == 0:
+            progress.emit("execute_firstrow", status="COMPLETE",
+                phase_seconds=round(time.monotonic() - (query_started or consume_started), 6))
+            progress.emit("consume", budget_seconds=deadline_seconds)
         if time.monotonic() > deadline:
             raise TimeoutError("minute_matrix_readback: total deadline exceeded")
         row = dict(source)
@@ -100,9 +107,18 @@ def validate_matrix(rows, *, day: str, scope: dict, deadline_seconds: float = 18
         digest.update(json.dumps({str(key): _normalize(value) for key, value in sorted(row.items())},
             ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8"))
         count += 1
+        if progress is not None and count % 50000 == 0:
+            progress.emit("consume", completed_units=count, current_unit=code,
+                phase_seconds=round(time.monotonic() - consume_started, 6),
+                budget_seconds=deadline_seconds,
+                budget_remaining_seconds=round(max(0.0, deadline-time.monotonic()), 6))
     if seen_codes != expected or current_times != grid or count != len(expected) * len(grid):
         raise ValueError("minute matrix exact security/time coverage is incomplete")
     digest.update(b"]")
+    if progress is not None:
+        progress.emit("consume", status="COMPLETE", completed_units=count,
+            current_unit=current_code, phase_seconds=round(time.monotonic() - consume_started, 6),
+            budget_seconds=deadline_seconds)
     return dict(row_count=count, code_count=len(seen_codes), row_hash=digest.hexdigest(),
         full_market_manifest_hash=scope["full_market_manifest_hash"],
         expected_traded_code_set_sha256=scope["expected_traded_code_set_sha256"],
@@ -110,7 +126,11 @@ def validate_matrix(rows, *, day: str, scope: dict, deadline_seconds: float = 18
         minute_grid_count=len(CORE_GRID), minute_grid_sha256=GRID_HASH, bad_grid_codes=0)
 
 
-def persisted_matrix(engine, day: str, *, scope: dict) -> dict:
+def persisted_matrix(engine, day: str, *, scope: dict, run_id: str = "",
+                     operation: str = "matrix_readback") -> dict:
+    progress = MinuteImportProgress(run_id=run_id,
+        total_units=len(scope["codes"])*len(CORE_GRID), operation=operation, days=[day])
+    progress.emit("provider_probe")
     connection_scope = engine.connect() if callable(getattr(engine, "connect", None)) else nullcontext(engine)
     with connection_scope as connection:
         foreign = connection.execute(text(
@@ -118,17 +138,41 @@ def persisted_matrix(engine, day: str, *, scope: dict) -> dict:
             "WHERE trade_date=:day AND (data_source IS NULL OR data_source<>'qmt_datadir') LIMIT 1"
         ), {"day": day}).first()
         if foreign is not None:
+            progress.emit("provider_probe", status="FAILED", error_type="UnexpectedProvider")
             raise ValueError("minute matrix contains an unexpected provider")
-        rows = connection.execution_options(stream_results=True, max_row_buffer=2000).execute(text(
-            "SELECT /*+ MAX_EXECUTION_TIME(120000) */ stock_code,trade_time,trade_date,price,"
-            "`change`,change_pct,volume,amount,qmt_code,data_source,source_time,batch_id,"
-            "data_version,quality_status,permission_status FROM sm_stock_minute "
-            "WHERE trade_date=:day AND data_source='qmt_datadir' ORDER BY stock_code,trade_time"
-        ), {"day": day}).mappings()
+        query_started = time.monotonic()
+        progress.emit("execute_firstrow", query_budget_seconds=120,
+            consume_budget_seconds=180)
         try:
-            return validate_matrix(rows, day=day, scope=scope)
+            rows = connection.execution_options(stream_results=True, max_row_buffer=2000).execute(text(
+                "SELECT /*+ MAX_EXECUTION_TIME(120000) */ stock_code,trade_time,trade_date,price,"
+                "`change`,change_pct,volume,amount,qmt_code,data_source,source_time,batch_id,"
+                "data_version,quality_status,permission_status FROM sm_stock_minute "
+                "WHERE trade_date=:day AND data_source='qmt_datadir' ORDER BY stock_code,trade_time"
+            ), {"day": day}).mappings()
+        except Exception as exc:
+            progress.emit("execute_firstrow", status="FAILED", error_type=type(exc).__name__,
+                phase_seconds=round(time.monotonic()-query_started, 6))
+            raise
+        try:
+            return validate_matrix(rows, day=day, scope=scope, progress=progress,
+                query_started=query_started)
+        except Exception as exc:
+            progress.emit("consume", status="FAILED", error_type=type(exc).__name__,
+                budget_seconds=180)
+            raise
         finally:
-            rows.close()
+            close_started = time.monotonic()
+            progress.emit("close")
+            try:
+                rows.close()
+            except Exception as exc:
+                progress.emit("close", status="FAILED", error_type=type(exc).__name__,
+                    phase_seconds=round(time.monotonic()-close_started, 6))
+                raise
+            else:
+                progress.emit("close", status="COMPLETE",
+                    phase_seconds=round(time.monotonic()-close_started, 6))
 
 
 def load_verified_minute_publication(engine, day: str, *, decision_known_at=None) -> dict | None:
@@ -149,7 +193,8 @@ def load_verified_minute_publication(engine, day: str, *, decision_known_at=None
     if len(daily_hash) != 64 or detail.get("coverage") != 1.0:
         raise ValueError("exact minute receipt lacks its daily scope proof")
     scope = trade_scope(engine, day, manifest_hash=daily_hash, decision_known_at=cutoff)
-    actual = persisted_matrix(engine, day, scope=scope)
+    actual = persisted_matrix(engine, day, scope=scope, run_id=str(receipt["run_id"]),
+        operation="receipt_readback")
     if (int(receipt["row_count"]) != actual["row_count"]
             or int(receipt["code_count"]) != actual["code_count"]
             or detail.get("readback_rows") != actual["row_count"]

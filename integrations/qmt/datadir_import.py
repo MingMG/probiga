@@ -16,6 +16,7 @@ import dataclasses
 import datetime as dt
 import hashlib
 import json
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +38,7 @@ from server.common.auxiliary_runtime_schema import (
 )
 from server.common.qmt_index_minute_grid import CORE_GRID
 from server.common.qmt_stock_catalog import load_stock_catalog
+from server.common.qmt_datadir_progress import MinuteImportProgress
 
 DATASET = "stock_minute"
 SOURCE = "qmt_datadir"
@@ -334,13 +336,47 @@ def harvest(
     }
     chunk: list[tuple] = []
     missing = 0
+    total = (sum(len(codes_by_session[day]) * len(CORE_GRID) for day in sessions)
+             if codes_by_session is not None else len(universe) * len(sessions) * len(CORE_GRID))
+    progress = MinuteImportProgress(run_id=run_id, total_units=total,
+        operation="harvest", days=sessions)
+    progress.emit("source_read", total_securities=len(universe))
+    source_seconds, stage_seconds, committed, next_report = 0.0, 0.0, 0, 50000
+
+    def commit_chunk(values, current):
+        nonlocal stage_seconds, committed, next_report
+        if not values:
+            return
+        progress.emit("stage_commit", current_unit=current, batch_rows=len(values),
+            source_read_seconds=round(source_seconds, 6), stage_commit_seconds=round(stage_seconds, 6))
+        started = time.monotonic()
+        try:
+            _insert_stage(conn, values)
+        except Exception as exc:
+            progress.emit("stage_commit", status="FAILED", current_unit=current,
+                batch_rows=len(values), phase_seconds=round(time.monotonic() - started, 6),
+                error_type=type(exc).__name__, console=True)
+            raise
+        stage_seconds += time.monotonic() - started
+        committed += len(values)
+        progress.emit("stage_commit", status="COMPLETE", completed_units=committed, current_unit=current,
+            batch_rows=len(values), source_read_seconds=round(source_seconds, 6),
+            stage_commit_seconds=round(stage_seconds, 6))
+        if committed >= next_report:
+            progress.emit("source_read", completed_units=committed, current_unit=current,
+                source_read_seconds=round(source_seconds, 6), stage_commit_seconds=round(stage_seconds, 6))
+            next_report = (committed // 50000 + 1) * 50000
+
     for member in universe:
+        source_started = time.monotonic()
         dat = load_dat(root, member.market, MINUTE_PERIOD, member.code)
         if dat is None:
             missing += 1
+            source_seconds += time.monotonic() - source_started
             continue
         selected = select_records(dat, sessions)
         if len(selected) == 0:
+            source_seconds += time.monotonic() - source_started
             continue
         selected_digest = hashlib.sha256(selected.tobytes()).digest()
         per_session: dict[dt.date, int] = {}
@@ -357,15 +393,19 @@ def harvest(
         for session, count in per_session.items():
             stats[session]["rows"] += count
             stats[session]["code_rows"][member.code] = count
+        source_seconds += time.monotonic() - source_started
         if len(chunk) >= chunk_rows:
-            _insert_stage(conn, chunk)
+            commit_chunk(chunk, member.code)
             chunk = []
-    _insert_stage(conn, chunk)
+    commit_chunk(chunk, "final_chunk")
     for entry in stats.values():
         entry["codes"] = sorted(entry["codes"])
         entry["code_rows"] = dict(sorted(entry["code_rows"].items()))
         entry["digest"] = entry["digest"].hexdigest()
     stats["_missing_files"] = missing
+    progress.emit("harvest_complete", status="COMPLETE", completed_units=committed,
+        source_read_seconds=round(source_seconds, 6), stage_commit_seconds=round(stage_seconds, 6),
+        missing_files=missing)
     return stats
 
 
