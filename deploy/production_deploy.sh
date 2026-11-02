@@ -5115,9 +5115,7 @@ controlled_guard_verify_restored_runtime() {
       activation_snapshot_validate_governance_new || return 1
       if [ "$verification_mode" = forward-recovery ]; then
         RESTORED_RUNTIME_GOVERNANCE_TRADE_DATE="$(date -u +%F)"
-        RESTORED_RUNTIME_GOVERNANCE_CUTOVER_EPOCH="$(
-          (($(date +%s) + CONTROLLED_RECOVERY_CUTOVER_RESERVE_SECONDS))
-        )"
+        RESTORED_RUNTIME_GOVERNANCE_CUTOVER_EPOCH="$(($(date +%s) + CONTROLLED_RECOVERY_CUTOVER_RESERVE_SECONDS))"
         RESTORED_RUNTIME_FAILURE_CODE=""
         return 0
       fi
