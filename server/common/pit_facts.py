@@ -3243,13 +3243,6 @@ def _select_finance_atomic_batch_members(
     chunk; raw payload JSON is never retained for the full universe.
     """
 
-    statement = text(
-        f"SELECT * FROM {SOURCE_COVERAGE_TABLE} "
-        "WHERE fact_kind='finance' AND stock_code IN :codes "
-        "AND known_at<=:completed_known_at "
-        "AND received_at<=:completed_known_at "
-        "ORDER BY stock_code, scope_hash, revision_no"
-    ).bindparams(bindparam("codes", expanding=True))
     gate = finance_disclosure_gate(as_of_date)
     selected: list[dict[str, Any]] = []
     source_cutoff: datetime | None = None
@@ -3258,17 +3251,25 @@ def _select_finance_atomic_batch_members(
         dialect = str(
             getattr(getattr(connection, "dialect", None), "name", "") or ""
         ).lower()
-        if dialect == "mysql":
+        mysql = dialect == "mysql"
+        if mysql:
             isolation = str(connection.get_isolation_level() or "").upper()
             if isolation not in {"REPEATABLE READ", "SERIALIZABLE"}:
                 raise ValueError(
                     "finance atomic batch requires a repeatable-read snapshot"
                 )
+        statement = text(
+            f"SELECT {_finance_coverage_payload_columns(mysql)} FROM {SOURCE_COVERAGE_TABLE} "
+            "WHERE fact_kind='finance' AND stock_code IN :codes "
+            "AND known_at<=:completed_known_at "
+            "AND received_at<=:completed_known_at "
+            "ORDER BY stock_code, scope_hash, revision_no"
+        ).bindparams(bindparam("codes", expanding=True))
         with connection.begin():
             for offset in range(0, len(codes), batch_size):
                 code_batch = codes[offset : offset + batch_size]
                 raw_rows = [
-                    dict(row)
+                    _finance_coverage_payload_row(row, mysql=mysql)
                     for row in connection.execute(
                         statement,
                         {
@@ -4105,6 +4106,26 @@ def _decode_finance_seal_payload(packed: object, *, expected_bytes: int) -> str:
         raise ValueError("finance_seal_history: compressed payload is not UTF-8") from exc
 
 
+def _finance_coverage_payload_columns(mysql: bool) -> str:
+    if not mysql:
+        return "*"
+    metadata = sorted(_REQUIRED_COLUMNS[SOURCE_COVERAGE_TABLE] - {"payload_json"})
+    return (
+        ",".join(metadata) + ",OCTET_LENGTH(payload_json) AS payload_json_bytes,"
+        "COMPRESS(payload_json) AS payload_json_compressed"
+    )
+
+
+def _finance_coverage_payload_row(row: Mapping[str, Any], *, mysql: bool) -> dict[str, Any]:
+    current = dict(row)
+    if mysql:
+        current["payload_json"] = _decode_finance_seal_payload(
+            current.pop("payload_json_compressed"),
+            expected_bytes=current.pop("payload_json_bytes"),
+        )
+    return current
+
+
 def _load_latest_finance_atomic_seal_evidence(
     engine: Engine,
     *,
@@ -4146,15 +4167,8 @@ def _load_latest_finance_atomic_seal_evidence(
             "ORDER BY scope_hash, revision_no LIMIT 1"
         )
         mysql = connection.dialect.name == "mysql"
-        payload_columns = "*"
-        if mysql:
-            metadata = sorted(_REQUIRED_COLUMNS[SOURCE_COVERAGE_TABLE] - {"payload_json"})
-            payload_columns = (
-                ",".join(metadata) + ",OCTET_LENGTH(payload_json) AS payload_json_bytes,"
-                "COMPRESS(payload_json) AS payload_json_compressed"
-            )
         payload_statement = text(
-            f"SELECT {payload_columns} FROM {SOURCE_COVERAGE_TABLE} "
+            f"SELECT {_finance_coverage_payload_columns(mysql)} FROM {SOURCE_COVERAGE_TABLE} "
             "WHERE coverage_id=:coverage_id"
         )
 
@@ -4191,12 +4205,7 @@ def _load_latest_finance_atomic_seal_evidence(
                     )
                 if raw is None:
                     return
-                current = dict(raw)
-                if mysql:
-                    current["payload_json"] = _decode_finance_seal_payload(
-                        current.pop("payload_json_compressed"),
-                        expected_bytes=current.pop("payload_json_bytes"),
-                    )
+                current = _finance_coverage_payload_row(raw, mysql=mysql)
                 # The consumer validates every original payload and chain link.
                 # Keeping all full-catalog seal JSONs used over 226 MB before
                 # parsing; retain only the latest payload and parent root index.

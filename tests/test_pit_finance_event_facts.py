@@ -2428,7 +2428,7 @@ def _mysql_seal_transport(engine, *, corrupt=None):
 
         def execute(self, statement, params):
             sql = str(statement).replace(" FORCE INDEX (idx_pit_coverage_decision)", "")
-            return self.connection.execute(text(sql), params)
+            return self.connection.execute(statement if sql == str(statement) else text(sql), params)
 
     return SimpleNamespace(connect=MysqlConnection)
 
@@ -2442,6 +2442,54 @@ def test_finance_compressed_history_is_byte_exact_and_preserves_all_seal_results
         mysql_reader, decision_at=kwargs["decision_at"])
     assert packed == plain  # Original payload bytes, IDs, roots, members and every parent.
     assert len(packed[3]) == 3
+    engine.dispose()
+
+
+@pytest.mark.parametrize("tamper_oldest", [False, True])
+def test_finance_compressed_member_reads_preserve_original_revision_bytes(monkeypatch, tamper_oldest):
+    engine = _engine()
+    _install_prior_finance_coverage(engine)
+    with engine.connect() as connection:
+        original = json.loads(connection.execute(text(
+            f"SELECT payload_json FROM {SOURCE_COVERAGE_TABLE} WHERE stock_code='000001'"
+        )).scalar_one())
+    append_source_coverage(
+        engine, fact_kind="finance", stock_code="000001",
+        window_start="1900-01-01", window_end="2026-08-30",
+        known_at="2026-08-30 01:12:00", covered_through_at="2026-08-30 01:12:00",
+        watermark_kind="CAPTURED_AT", watermark_evidence={"source_call": "success"},
+        source_rows=original["source_rows"], fact_bindings=original["fact_bindings"],
+        source="adata.finance.core_index", batch_id="finance-second-coverage",
+    )
+    with engine.connect() as connection:
+        expected_bytes = [value.encode("utf-8") for value in connection.execute(text(
+            f"SELECT payload_json FROM {SOURCE_COVERAGE_TABLE} "
+            "WHERE stock_code IN ('000001','002731') ORDER BY stock_code, scope_hash, revision_no"
+        )).scalars()]
+    assert len(expected_bytes) == 3
+    kwargs = dict(codes=["000001", "002731"], listing_dates={},
+                  completed_known_at=datetime(2026, 8, 30, 1, 13), as_of_date=date(2026, 8, 30))
+    plain = pit_module._select_finance_atomic_batch_members(engine, **kwargs)
+    mysql_reader = _mysql_seal_transport(engine)
+    if tamper_oldest:
+        with engine.begin() as connection:
+            connection.execute(text("DROP TRIGGER trg_pit_source_coverage_immutable_bu"))
+            connection.execute(text(f"UPDATE {SOURCE_COVERAGE_TABLE} SET payload_json='{{}}' "
+                                    "WHERE stock_code='000001' AND revision_no=1"))
+        with pytest.raises(ValueError, match="coverage payload schema differs"):
+            pit_module._select_finance_atomic_batch_members(mysql_reader, **kwargs)
+    else:
+        decoded = []
+        original_decode = pit_module._decode_finance_seal_payload
+
+        def observe(frame, *, expected_bytes):
+            payload = original_decode(frame, expected_bytes=expected_bytes)
+            decoded.append(payload.encode("utf-8"))
+            return payload
+
+        monkeypatch.setattr(pit_module, "_decode_finance_seal_payload", observe)
+        assert pit_module._select_finance_atomic_batch_members(mysql_reader, **kwargs) == plain
+        assert decoded == expected_bytes
     engine.dispose()
 
 
