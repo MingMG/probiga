@@ -296,7 +296,7 @@ def _read_rollback_snapshot(
             "identities": identities,
             "rows": rows,
         }
-    if snapshot_kind != "rollback-qmt":
+    if snapshot_kind not in {"rollback-qmt", "forward-qmt"}:
         raise RuntimeError("invalid sealed rollback scheduler snapshot")
     operation_types = sorted(item[0] for item in _QMT_OPERATION_IDENTITIES)
     operation_paths = sorted(item[1] for item in _QMT_OPERATION_IDENTITIES)
@@ -794,6 +794,7 @@ def _verify_rollback_state(
     lock: bool,
     stable_only: bool = False,
 ) -> None:
+    ignored_runtime_diff_fields = set()
     for identity in payload["identities"]:
         expected = payload["rows"].get(identity)
         current = _require_rollback_live_identity(
@@ -816,15 +817,80 @@ def _verify_rollback_state(
         _require_additive_rollback_value(
             current, snapshot_columns=snapshot_columns
         )
+        if stable_only and current is not None:
+            ignored_runtime_diff_fields.update(key for key in set(expected) - _ROLLBACK_STABLE_COLUMNS
+                if _json_normalized(current.get(key)) != _json_normalized(expected.get(key)))
         expected_projection = _rollback_projection(
             expected, expected, stable_only=stable_only
         )
         if current is None or _rollback_projection(
             current, expected, stable_only=stable_only
         ) != expected_projection:
-            raise RuntimeError(
-                "live rollback scheduler projection differs from sealed OLD"
-            )
+            error = RuntimeError("live rollback scheduler projection differs from sealed OLD")
+            actual = _rollback_projection(current or {}, expected, stable_only=stable_only)
+            error.differing_fields = tuple(key for key in sorted(expected_projection)
+                                          if actual.get(key) != expected_projection[key])
+            raise error
+
+    return sorted(ignored_runtime_diff_fields)
+
+
+def reconcile_forward_qmt_snapshot(engine, payload, *, action):
+    """Compare/repair configuration without replaying execution history."""
+    if action not in {"restore", "verify", "verify-stable"}:
+        raise ValueError("unsupported governance contract action")
+    if getattr(getattr(engine, "dialect", None), "name", None) != "mysql":
+        raise RuntimeError("governance contract recovery requires MySQL")
+    if payload.get("snapshot_kind") != "forward-qmt":
+        raise RuntimeError("invalid sealed rollback scheduler snapshot")
+    projection_columns = _rollback_projection_columns(payload)
+    snapshot_columns = _rollback_snapshot_columns(payload)
+    changed = 0
+    context = engine.begin() if action == "restore" else engine.connect()
+    with context as connection:
+        _require_innodb(connection)
+        live_columns = _require_rollback_schema(connection, snapshot_columns=snapshot_columns)
+        if action == "restore":
+            for identity in payload["identities"]:
+                expected = payload["rows"].get(identity)
+                current = _require_rollback_live_identity(_rollback_matching_rows(
+                    connection, identity=identity, expected=expected,
+                    projection_columns=projection_columns, lock=True), identity=identity, expected=expected)
+                if expected is None and current is None:
+                    continue
+                if expected is None or current is None:
+                    raise RuntimeError("live rollback scheduler identity is not unique")
+                _require_additive_rollback_value(current, snapshot_columns=snapshot_columns)
+                # Row birth and source identity are immutable even during repair.
+                if _json_normalized(current.get("created_at")) != _json_normalized(expected.get("created_at")):
+                    raise RuntimeError("live rollback scheduler task identity differs")
+                current_projection = _rollback_projection(current, expected, stable_only=True)
+                expected_projection = _rollback_projection(expected, expected, stable_only=True)
+                mutable = TASK_PAYLOAD_COLUMNS - _IDENTITY_COLUMNS
+                columns = sorted(key for key in mutable if key in expected_projection
+                                 and current_projection.get(key) != expected_projection[key])
+                if columns:
+                    volatile_before = _json_normalized({k:v for k,v in current.items() if k not in TASK_PAYLOAD_COLUMNS})
+                    assignments = [f"{quote_identifier(key)}=:restore_value_{key}" for key in columns]
+                    if "updated_at" in live_columns:
+                        assignments.append("`updated_at`=`updated_at`")
+                    result = connection.execute(text("UPDATE st_scheduled_tasks SET " + ", ".join(assignments)
+                        + " WHERE id=:restore_id AND task_type=:task_type AND script_path=:script_path"), {
+                            **_identity_payload((current["task_type"],current["script_path"])),
+                            **{f"restore_value_{key}":expected[key] for key in columns}, "restore_id":current["id"]})
+                    if result.rowcount not in {0,1}:
+                        raise RuntimeError("rollback scheduler restore changed unexpected rows")
+                    after = _require_rollback_live_identity(_rollback_matching_rows(connection,
+                        identity=identity, expected=expected, projection_columns=projection_columns, lock=True),
+                        identity=identity, expected=expected)
+                    if _json_normalized({k:v for k,v in after.items() if k not in TASK_PAYLOAD_COLUMNS}) != volatile_before:
+                        raise RuntimeError("governance runtime or audit fields changed during restore")
+                    changed += 1
+        ignored = _verify_rollback_state(connection,payload,projection_columns=projection_columns,
+                               snapshot_columns=snapshot_columns,lock=action=="restore",stable_only=True)
+    return {"action":action,"changed":bool(changed),"changed_row_count":changed,
+            "snapshot_kind":payload["snapshot_kind"],"row_count":len(payload["rows"]),"verified":True,
+            "ignored_runtime_diff_fields":ignored}
 
 
 def reconcile_rollback_snapshot(
@@ -1022,6 +1088,7 @@ def main(argv: list[str] | None = None) -> int:
             "forward-governance",
             "rollback-governance",
             "rollback-qmt",
+            "forward-qmt",
         ),
         default="forward-governance",
     )
@@ -1038,6 +1105,8 @@ def main(argv: list[str] | None = None) -> int:
         try:
             if args.snapshot_kind == "forward-governance":
                 result = reconcile_contract(engine, expected, action=args.action)
+            elif args.snapshot_kind == "forward-qmt":
+                result = reconcile_forward_qmt_snapshot(engine, expected, action=args.action)
             else:
                 result = reconcile_rollback_snapshot(
                     engine, expected, action=args.action
@@ -1050,7 +1119,13 @@ def main(argv: list[str] | None = None) -> int:
             f"{_static_failure_code(error)}",
             file=sys.stderr,
         )
+        fields = tuple(field for field in getattr(error, "differing_fields", ())
+                       if field in _SCHEDULER_SNAPSHOT_COLUMNS)
+        if fields:
+            print("probiga_governance_contract_fields=" + ",".join(fields), file=sys.stderr)
         return 2
+    if result.get("ignored_runtime_diff_fields"):
+        print("probiga_governance_ignored_runtime_fields=" + ",".join(result["ignored_runtime_diff_fields"]), file=sys.stderr)
     print(
         json.dumps(
             {"status": "ok", "governance_contract": result},

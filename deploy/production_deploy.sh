@@ -5509,6 +5509,8 @@ controlled_guard_qmt_announcement_snapshot() {
       ;;
     "$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT")
       activation_snapshot_validate_governance_new || return 1
+      controlled_guard_governance_contract_snapshot "$action" "$guarded_sha" "$snapshot" forward-qmt
+      return $?
       ;;
     *) return 1 ;;
   esac
@@ -5617,7 +5619,8 @@ controlled_guard_governance_contract_snapshot() {
     *) GOVERNANCE_CONTRACT_FAILURE_CODE=action; return 1 ;;
   esac
   case "$snapshot_kind:$snapshot" in
-    "forward-governance:$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT")
+    "forward-governance:$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT"|\
+    "forward-qmt:$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT")
       if ! activation_snapshot_validate_governance_new; then
         GOVERNANCE_CONTRACT_FAILURE_CODE=snapshot-seal
         return 1
@@ -5740,6 +5743,12 @@ controlled_guard_governance_contract_snapshot() {
           "$snapshot_kind" < "$snapshot"
     ) 2>&1
   )"; then
+    local ignored_line
+    while IFS= read -r ignored_line; do
+      if [[ "$ignored_line" =~ ^probiga_governance_ignored_runtime_fields=[a-z_]+(,[a-z_]+)*$ ]]; then
+        printf '%s\n' "$ignored_line" >&2
+      fi
+    done <<< "$gate_output"
     if [ "$snapshot_kind" = forward-governance ]; then
       if ! controlled_guard_qmt_announcement_snapshot "$action" "$guarded_sha" \
           "$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT"; then
@@ -5749,6 +5758,12 @@ controlled_guard_governance_contract_snapshot() {
     fi
     return 0
   fi
+  local diagnostic_line
+  while IFS= read -r diagnostic_line; do
+    if [[ "$diagnostic_line" =~ ^probiga_governance_contract_fields=[a-z_]+(,[a-z_]+)*$ ]]; then
+      printf '%s\n' "$diagnostic_line" >&2
+    fi
+  done <<< "$gate_output"
   case "$gate_output" in
     *"probiga_governance_contract_failure=snapshot-envelope"*)
       GOVERNANCE_CONTRACT_FAILURE_CODE=snapshot-envelope ;;
@@ -6504,7 +6519,7 @@ controlled_v2_forward_preserve_no_receipt_recovery() {
   RESTORED_RUNTIME_GOVERNANCE_CUTOVER_EPOCH=""
   V2_RECOVERY_STEP=forward-validate-request
   case "$DEPLOY_OPERATION:$DEPLOY_ARTIFACT_MODE" in
-    deploy:ci-resolved-freeze-v1)
+    deploy:ci-resolved-freeze-v1|deploy:static-wheel-lock-v2)
       [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] || return 1
       ;;
     recover-database-guard:static-wheel-lock-v2) ;;

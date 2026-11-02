@@ -1616,8 +1616,9 @@ test "$(grep -n -E 'phase-restoring-new|contract-restore-failed|refenced' \
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+@pytest.mark.parametrize("artifact_mode", ["ci-resolved-freeze-v1", "static-wheel-lock-v2"])
 def test_forward_no_receipt_commit_retry_never_refences_verified_runtime(
-    tmp_path: Path,
+    tmp_path: Path, artifact_mode: str,
 ) -> None:
     bash = _bash()
     if bash is None:
@@ -1629,6 +1630,10 @@ def test_forward_no_receipt_commit_retry_never_refences_verified_runtime(
             "controlled_v2_forward_preserve_no_receipt_recovery"
         ],
     )
+    keep_evidence = _function(
+        "controlled_v2_keep_no_receipt_evidence",
+        _shell_function_bodies(source)["controlled_v2_keep_no_receipt_evidence"],
+    )
     root = tmp_path.as_posix()
     guarded_sha = "a" * 40
     harness = f"""
@@ -1637,7 +1642,7 @@ TEST_ROOT={root!r}
 EXPECTED_SHA={'c' * 40}
 GUARDED_SHA={guarded_sha}
 DEPLOY_OPERATION=deploy
-DEPLOY_ARTIFACT_MODE=ci-resolved-freeze-v1
+DEPLOY_ARTIFACT_MODE={artifact_mode}
 DATABASE_WRITER_GUARD_DIR="$TEST_ROOT/guards"
 DATABASE_WRITER_GUARD_FILE="$DATABASE_WRITER_GUARD_DIR/guard"
 DATABASE_WRITER_RESTORE_FILE="$DATABASE_WRITER_GUARD_DIR/restore"
@@ -1693,6 +1698,7 @@ activation_snapshot_remove_new_runtime_preserved_no_receipt() {{
   printf 'retire\n' >> "$TRACE"
 }}
 sync() {{ return 0; }}
+{keep_evidence}
 {recovery}
 controlled_v2_forward_preserve_no_receipt_recovery || exit 30
 test "$V2_RECOVERY_STEP" = complete || exit 31

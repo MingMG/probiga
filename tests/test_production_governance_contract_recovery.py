@@ -1018,3 +1018,84 @@ def test_old_projection_requires_innodb_primary_id_and_snapshot_columns() -> Non
     engine = _RollbackEngine([live])
     with pytest.raises(RuntimeError, match="additive column value differs"):
         recovery.reconcile_rollback_snapshot(engine, payload, action="verify")
+
+
+def _forward_qmt_fixture():
+    sealed_operations = [_old_row(task, 300 + index) for index, task in enumerate(QMT_OPERATION_TASKS)]
+    announcement = _old_row(QMT_ANNOUNCEMENT_TASK, 399)
+    payload = _qmt_rollback_payload(sealed_operations, announcement_rows=[announcement])
+    payload['snapshot_kind'] = 'forward-qmt'
+    live = [{**row, 'created_at':None, 'last_run_output':'current durable progress',
+             'last_run_at':'2026-11-03 05:00:00','updated_at':'2026-11-03 05:01:00'}
+            for row in [announcement,*sealed_operations]]
+    return _RollbackEngine(live), payload
+
+
+def test_forward_qmt_verify_accepts_progress_and_reports_only_ignored_field_names():
+    engine,payload = _forward_qmt_fixture()
+    before=deepcopy(engine.rows)
+    result=recovery.reconcile_forward_qmt_snapshot(engine,payload,action='verify')
+    assert result['verified'] is True
+    assert set(result['ignored_runtime_diff_fields']) == {'last_run_output','last_run_at','updated_at'}
+    assert engine.rows == before
+    assert not any(sql.startswith(('UPDATE ','DELETE ','INSERT ')) for sql,_ in engine.executions)
+
+
+@pytest.mark.parametrize('field,value', [('enabled',0), ('script_args','--changed'), ('cron_time','19:00:00')])
+def test_forward_qmt_verify_rejects_configuration_drift_with_field_names_only(field,value):
+    engine,payload=_forward_qmt_fixture()
+    engine.rows[0][field]=value
+    with pytest.raises(RuntimeError,match='projection differs') as error:
+        recovery.reconcile_forward_qmt_snapshot(engine,payload,action='verify')
+    assert error.value.differing_fields == (field,)
+    assert str(value) not in str(error.value)
+
+
+def test_forward_qmt_configuration_restore_preserves_current_progress_and_audit():
+    engine,payload=_forward_qmt_fixture()
+    engine.rows[0]['enabled']=0
+    before=deepcopy(engine.rows)
+    result=recovery.reconcile_forward_qmt_snapshot(engine,payload,action='restore')
+    assert result['changed'] is True
+    assert engine.rows[0]['enabled']==1
+    for row,prior in zip(engine.rows,before):
+        assert {k:v for k,v in row.items() if k not in TASK_PAYLOAD_COLUMNS} == {
+            k:v for k,v in prior.items() if k not in TASK_PAYLOAD_COLUMNS}
+    assert not any(sql.startswith(('DELETE ','INSERT ')) for sql,_ in engine.executions)
+
+
+def test_forward_qmt_snapshot_reader_accepts_original_sealed_envelope():
+    operations=[_old_row(task,300+i) for i,task in enumerate(QMT_OPERATION_TASKS)]
+    envelope={"schema":"probiga.qmt-announcement-task-snapshot.v1","task_type":QMT_ANNOUNCEMENT_TASK['task_type'],
+        "script_path":QMT_ANNOUNCEMENT_TASK['script_path'],"rows":[_old_row(QMT_ANNOUNCEMENT_TASK,399)],
+        "operations":{"task_types":sorted(t['task_type'] for t in QMT_OPERATION_TASKS),
+            "script_paths":sorted(t['script_path'] for t in QMT_OPERATION_TASKS),"rows":operations}}
+    payload=recovery._read_rollback_snapshot(io.StringIO(json.dumps(envelope)),snapshot_kind='forward-qmt')
+    assert payload['snapshot_kind']=='forward-qmt'
+    assert len(payload['rows'])==6
+
+
+def test_new_qmt_snapshot_uses_authenticated_current_tool_instead_of_guarded_full_row_comparator(tmp_path):
+    from pathlib import Path
+    import shutil
+    import subprocess
+    bash=shutil.which('bash') or str(Path(r'C:\Program Files\Git\bin\bash.exe'))
+    if not Path(bash).is_file(): pytest.skip('Bash required')
+    root=Path(__file__).resolve().parents[1]
+    source=(root/'deploy/production_deploy.sh').read_text(encoding='utf-8')
+    fn=re.search(r'(?ms)^controlled_guard_qmt_announcement_snapshot\(\) \{\n.*?^\}$',source).group(0)
+    harness='''set -Eeuo pipefail
+CODE_RELEASE_ROOT=/immutable-old-code
+RELEASE_VENV_ROOT=/immutable-old-venv
+ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT=/sealed-old
+ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT=/sealed-new
+activation_snapshot_validate_governance_new() { return 0; }
+controlled_guard_governance_contract_snapshot() {
+ test "$1:$2:$3:$4" = verify:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:/sealed-new:forward-qmt
+ printf CURRENT_AUTHENTICATED_TOOL
+}
+'''+fn+'\ncontrolled_guard_qmt_announcement_snapshot verify '+ 'b'*40 +' /sealed-new\n'
+    script=tmp_path/'new-qmt-projection.sh';script.write_text(harness,encoding='utf-8',newline='\n')
+    result=subprocess.run([bash,str(script)],capture_output=True,text=True,timeout=15)
+    assert result.returncode==0, result.stdout+result.stderr
+    assert result.stdout=='CURRENT_AUTHENTICATED_TOOL'
