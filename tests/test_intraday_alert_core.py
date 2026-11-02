@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -360,3 +360,24 @@ def test_live_drain_revalidates_untouched_provider_provenance_before_resolving_w
                      webhook_getter=lambda *a, **k: called.append("webhook"))
     assert called == []
     assert any("SET status='BLOCKED'" in sql for sql, _ in engine.connection.statements)
+
+
+@pytest.mark.parametrize("source_age,expected", [(240, 1), (300, 1), (301, 0)])
+def test_delivery_uses_five_minute_source_freshness_before_webhook(monkeypatch, source_age, expected):
+    from biz.review import market_decision
+    engine, sent = _Engine(), []
+    original = engine.connection.execute
+    def execute(statement, params=None):
+        result = original(statement, params)
+        if result.row and "evidence_json" in result.row:
+            evidence = json.loads(result.row["evidence_json"])
+            evidence["raw_observation"]["source_snapshot_at"] = (NOW - timedelta(seconds=source_age)).isoformat()
+            result.row["evidence_json"] = json.dumps(evidence)
+        return result
+    engine.connection.execute = execute
+    monkeypatch.setattr(market_decision, "verify_automatic_research", lambda value: None)
+    delivered = drain_outbox(engine, mode="live", now=NOW,
+        delivery_fn=lambda *a, **k: sent.append("mock delivery"),
+        webhook_getter=lambda *a, **k: "unused mock webhook")
+    assert delivered == expected and len(sent) == expected
+    assert any("SET status='EXPIRED'" in sql for sql, _ in engine.connection.statements) is (expected == 0)

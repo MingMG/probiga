@@ -205,7 +205,7 @@ def test_arbitration_cannot_extend_original_source_deadline_or_publish_draft(db)
     def too_late(_digest, **kwargs):
         checkpoint = {"stages": {}}
         for index in range(7):
-            clock[0] += timedelta(seconds=15 if index < 6 else 80)
+            clock[0] += timedelta(seconds=15 if index < 6 else 200)
             checkpoint["stages"][str(index)] = {"status": "COMPLETE", "raw_response": "original raw"}
             kwargs["progress"]({"stage": str(index), "status": "COMPLETE", "completed": index + 1, "total": 7, "checkpoint": deepcopy(checkpoint)})
         pytest.fail("the expired arbitration stage must never return a report")
@@ -216,7 +216,7 @@ def test_arbitration_cannot_extend_original_source_deadline_or_publish_draft(db)
     assert saved["status"] == "EXPIRED" and saved["content_markdown"] == "" and state["research"] is None
     assert state["analysis"]["completed_units"] == 6
     assert len(state["checkpoint"]["stages"]) == 6
-    assert research._time(state["analysis"]["deadline_at"]) == NOW + timedelta(seconds=160)
+    assert research._time(state["analysis"]["deadline_at"]) == NOW + timedelta(seconds=280)
 
 
 @pytest.mark.parametrize("event", [
@@ -325,7 +325,7 @@ def test_late_model_draft_is_expired_with_no_content_or_delivery(db, verifier):
     identity = queue(db, mode="live")
     clock = [NOW]
     def generate(*_args, **_kwargs):
-        clock[0] += timedelta(seconds=181)
+        clock[0] += timedelta(seconds=301)
         return final_result()
     with pytest.raises(research.IntradayResearchError):
         research.process_research_batch(db[0], outbox_id=identity, generator=generate, now_fn=lambda: clock[0])
@@ -476,3 +476,21 @@ def test_old_owner_cleanup_is_bounded_to_ten_rows_and_never_overwrites_checkpoin
     assert sum(load(db, identity)[0]["status"] == "EXPIRED" for identity in identities) == 10
     assert research.expire_research_batches(engine, now=NOW) == 2
     assert all(load(db, identity)[1]["checkpoint"] == {"kept": True} for identity in identities)
+
+
+def test_measured_dual_model_latency_past_three_minutes_is_accepted_before_five(db, verifier):
+    identity, clock = queue(db), [NOW]
+    def generate(_digest, **kwargs):
+        checkpoint = {"stages": {}}
+        for index, elapsed in enumerate((47, 19, 30, 40, 43, 20, 45)):
+            clock[0] += timedelta(seconds=elapsed)
+            checkpoint["stages"][str(index)] = {"status": "COMPLETE", "raw_response": "original raw"}
+            kwargs["progress"]({"stage": str(index), "status": "COMPLETE", "completed": index + 1,
+                                "total": 7, "checkpoint": deepcopy(checkpoint)})
+        return final_result()
+    result = research.process_research_batch(db[0], outbox_id=identity, generator=generate, now_fn=lambda: clock[0])
+    row, state = load(db, identity)
+    assert (clock[0] - NOW).total_seconds() == 244
+    assert result["status"] == row["status"] == "SHADOW"
+    assert state["analysis"]["completed_units"] == 7
+    assert research._time(state["analysis"]["deadline_at"]) == NOW + timedelta(seconds=280)

@@ -17,13 +17,11 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import text
 
 from .schema import OBSERVATION_TABLE, OUTBOX_TABLE
+from .research_policy import MAX_AGE_SECONDS, TOTAL_DEADLINE_SECONDS, LEASE_SECONDS
 from server.ai_bridge.research import get_research_engine
 
 SCHEMA = "probiga.intraday-research.v1"
 TZ = ZoneInfo("Asia/Shanghai")
-MAX_AGE_SECONDS = 180
-TOTAL_DEADLINE_SECONDS = 180
-LEASE_SECONDS = 60
 MAX_RESEARCH_STAGES = 7
 
 

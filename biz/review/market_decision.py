@@ -20,12 +20,12 @@ from zoneinfo import ZoneInfo
 import httpx
 from biz.review.research_contract import ContractError, ROLES, WINDOWS, build_packet, draft_json_schema, render_draft, validate_draft
 from server.common.config import get_settings
+from biz.intraday_alert.research_policy import TOTAL_DEADLINE_SECONDS as INTRADAY_DEADLINE_SECONDS
 
 SCHEMA_VERSION = "probiga.market-decision.v3"
 BEIJING = ZoneInfo("Asia/Shanghai")
 RULES_DIR = Path(__file__).with_name("market_decision_rules")
 DEADLINE_SECONDS = 600
-INTRADAY_DEADLINE_SECONDS = 180
 MAX_OUTPUT_CHARS = 60_000
 WORKFLOW_VERSION = "independent-drafts.cross-review.evidence-arbitration.v4"
 STAGES = ("deepseek_draft", "codex_draft", "deepseek_review", "codex_review", "codex_final", "deepseek_final_review", "codex_arbitration")
