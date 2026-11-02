@@ -9844,8 +9844,13 @@ classify_component_release() {
     controlled_guard_component_sha "$PREVIOUS_SHA" contract 2>/dev/null || true
   )"
   COMPONENT_SCOPE_FILE="$COMPONENT_TOOL_ROOT/$EXPECTED_SHA/scope.json"
+  local -a windows_base_args=()
+  if [ -n "$PREVIOUS_WINDOWS_SHA" ]; then
+    windows_base_args=(--windows-base-sha "$PREVIOUS_WINDOWS_SHA")
+  fi
   "$BOOTSTRAP_PYTHON" -I "$COMPONENT_CLASSIFIER" --git-dir "$CODE_GIT_CACHE" \
-    --base-sha "$PREVIOUS_SHA" --target-sha "$EXPECTED_SHA" > "$COMPONENT_SCOPE_FILE"
+    --base-sha "$PREVIOUS_SHA" --target-sha "$EXPECTED_SHA" \
+    "${windows_base_args[@]}" > "$COMPONENT_SCOPE_FILE"
   chmod 0600 "$COMPONENT_SCOPE_FILE"
   RELEASE_SCOPE="$("$BOOTSTRAP_PYTHON" -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["scope"])' "$COMPONENT_SCOPE_FILE")"
   # A published Windows manifest may have been signed under an older contract

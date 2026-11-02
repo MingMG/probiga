@@ -4,14 +4,15 @@
 Schema transitions live under ``server/db``, in ``.sql`` files, in the guarded
 strategy-schema preparation tools, or in the QMT release controller path.
 Application, UI, deployment, dependency and unrelated tool changes remain normal
-Linux code releases; the Windows/QMT updater tracks its own strategy source
-independently.
+Linux code releases. The minute importer and its proven Windows dependencies
+also compare their own committed content against the actual Windows build.
 
 The cross-end contract for the policy files below is the set of their
 module-level bindings, not their whole bytes.  A change to a declaration
 (threshold, task table, receipt schema, protocol constant) therefore selects the
 coordinated release, while an ordinary change to a function body, a docstring or
-a comment stays a single-end Linux release.  PowerShell controllers have no
+a comment leaves that contract unchanged. Windows runtime artifacts separately
+select their required owner by content. PowerShell controllers have no
 trusted stdlib parser, so they stay whole-file: that is a deliberate, documented
 boundary rather than an oversight.
 
@@ -246,6 +247,16 @@ _CONTRACT_WHOLE_FILE_FILES = (
     "tools/update_qmt_windows_edge.ps1",
 )
 
+# These are runtime artifacts owned by the Windows minute task, not shared
+# protocol declarations. Their content must reach that owner even when a prior
+# Linux-only release already contains the change. Keep this separate from the
+# contract digest: ordinary implementation changes do not invent schema drift.
+_WINDOWS_RUNTIME_FILES = (
+    "tools/import_qmt_datadir_history.py",
+    "integrations/qmt/datadir_import.py",
+    "server/common/qmt_datadir_minute_coverage.py",
+)
+
 # The export list is packaging, not a runtime contract with the other endpoint.
 _CONTRACT_EXCLUDED_NAMES = frozenset({"__all__"})
 
@@ -444,19 +455,30 @@ def _contract(git: Git, tree: dict[str, Entry], *, strict: bool) -> str:
 
 
 def classify_release_scope(*, base_sha: str, target_sha: str,
+                           windows_base_sha: str | None = None,
                            repository: str | Path | None = None,
                            git_dir: str | Path | None = None) -> dict[str, object]:
-    if not _SHA.fullmatch(base_sha) or not _SHA.fullmatch(target_sha):
+    if (not _SHA.fullmatch(base_sha) or not _SHA.fullmatch(target_sha)
+            or (windows_base_sha is not None and not _SHA.fullmatch(windows_base_sha))):
         raise ScopeError("full_commit_sha_required")
     base_sha, target_sha = base_sha.lower(), target_sha.lower()
+    windows_base_sha = windows_base_sha.lower() if windows_base_sha is not None else None
+    windows_comparison_base = windows_base_sha or base_sha
     git = Git(repository=repository, git_dir=git_dir)
-    for sha in {base_sha, target_sha}:
+    for sha in {base_sha, target_sha, windows_comparison_base}:
         if git.run("cat-file", "-t", sha) != b"commit\n":
             raise ScopeError("commit_object_required")
     if git.run("merge-base", "--is-ancestor", base_sha, target_sha,
                allow_false=True) is None:
         raise ScopeError("base_not_ancestor")
+    if windows_comparison_base != base_sha and git.run(
+            "merge-base", "--is-ancestor", windows_comparison_base, target_sha,
+            allow_false=True) is None:
+        raise ScopeError("windows_base_not_ancestor")
     base, target = git.tree(base_sha), git.tree(target_sha)
+    windows_base = (base if windows_comparison_base == base_sha else
+                    target if windows_comparison_base == target_sha else
+                    git.tree(windows_comparison_base))
     # Comparing both complete committed trees is the full base→target diff.
     # It cannot omit an earlier commit as target^ would. Rename detection is
     # deliberately unnecessary: every rename includes a forbidden deletion.
@@ -472,10 +494,18 @@ def classify_release_scope(*, base_sha: str, target_sha: str,
     reasons: set[str] = set()
     if base_contract != target_contract:
         reasons.add("schema_contract_changed")
+    windows_runtime_changes = [path for path in _WINDOWS_RUNTIME_FILES
+                               if windows_base.get(path) != target.get(path)]
+    if windows_runtime_changes:
+        reasons.add("windows_runtime_changed")
     return {
         "schema": SCHEMA,
         "base_sha": base_sha,
         "target_sha": target_sha,
+        # Omission describes a historical base-to-target comparison only; it
+        # does not assert which Windows build is deployed at a live endpoint.
+        "windows_base_sha": windows_base_sha,
+        "windows_runtime_changed_paths": windows_runtime_changes,
         "scope": "COORDINATED" if reasons else "LINUX",
         "changed_paths": changed,
         "reason_codes": sorted(reasons) if reasons else ["code_only_delta"],
@@ -499,6 +529,7 @@ def main(argv: list[str] | None = None) -> int:
     source.add_argument("--git-dir")
     parser.add_argument("--base-sha", required=True)
     parser.add_argument("--target-sha", required=True)
+    parser.add_argument("--windows-base-sha")
     args = parser.parse_args(argv)
     try:
         result = classify_release_scope(**vars(args))
