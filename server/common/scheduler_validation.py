@@ -2609,7 +2609,7 @@ def _news_sync_output_status(
     payload = _news_sync_payload(output)
     if payload is None or return_code is None:
         return "failed"
-    required_sources = ["cls", "eastmoney", "sina"]
+    required_sources = ["cls", "eastmoney", "federal_reserve", "sina"]
     try:
         started_at = _machine_timestamp(payload.get("batch_started_at"))
         finished_at = _machine_timestamp(payload.get("batch_finished_at"))
@@ -2624,14 +2624,7 @@ def _news_sync_output_status(
         return "failed"
     if not isinstance(source_results, Mapping):
         return "failed"
-    expected_sources = sorted(
-        set(required_sources)
-        | (
-            {"federal_reserve"}
-            if "federal_reserve" in source_results
-            else set()
-        )
-    )
+    expected_sources = sorted(required_sources)
     if set(source_results) != set(expected_sources):
         return "failed"
     successful: list[str] = []
@@ -2655,6 +2648,28 @@ def _news_sync_output_status(
         status = str(result.get("status") or "")
         outcome = str(result.get("outcome") or "")
         if status == "SUCCESS":
+            archive_rows = None
+            if source == "federal_reserve":
+                try:
+                    from server.common.federal_reserve_news_coverage import (
+                        validate_federal_reserve_news_coverage,
+                    )
+
+                    archive_rows = validate_federal_reserve_news_coverage(
+                        result.get("archive_coverage"),
+                        batch_started_at=started_at, batch_finished_at=finished_at,
+                    )
+                    if (
+                        type(result["fetched_count"]) is not int
+                        or fetched_count != len(archive_rows)
+                        or result.get("health_schema") != "probiga.news-source-health.v1"
+                        or result.get("max_age_seconds") != 86400
+                        or (archive_rows and result.get("latest_publish_time")
+                            != max(row["publish_time"] for row in archive_rows))
+                    ):
+                        return "failed"
+                except (ImportError, KeyError, TypeError, ValueError, OSError, OverflowError):
+                    return "failed"
             successful.append(source)
             if outcome == "NONEMPTY" and fetched_count > 0:
                 try:
@@ -2672,6 +2687,13 @@ def _news_sync_output_status(
                     return "failed"
                 nonempty.append(source)
                 fetched_total += fetched_count
+            elif (
+                outcome == "EMPTY" and source == "federal_reserve"
+                and archive_rows == [] and fetched_count == 0
+                and result.get("latest_publish_time") is None
+                and result.get("latest_age_seconds") is None
+            ):
+                empty.append(source)
             else:
                 return "failed"
         elif status == "FAILED" and fetched_count == 0:
@@ -5974,6 +5996,21 @@ def _validate_news_sync_receipt(
             != submitted["latest_publish_time"]
         ):
             return False, "news_sync: persisted per-source health evidence differs"
+    if "federal_reserve" in payload["successful_sources"]:
+        try:
+            from server.common.federal_reserve_news_coverage import (
+                validate_federal_reserve_news_coverage,
+            )
+
+            source_fed_rows = validate_federal_reserve_news_coverage(
+                payload["source_results"]["federal_reserve"].get("archive_coverage"),
+                batch_started_at=receipt_started, batch_finished_at=receipt_finished,
+            )
+            persisted_fed_rows = [row for row in canonical if row["source"] == "federal_reserve"]
+            if news_row_hash(persisted_fed_rows) != news_row_hash(source_fed_rows):
+                return False, "news_sync: persisted Federal Reserve rows differ from exact archive coverage"
+        except (ImportError, KeyError, TypeError, ValueError, OSError, OverflowError) as exc:
+            return False, f"news_sync: Federal Reserve archive coverage invalid: {exc}"
     latest_publish = max(
         datetime.fromisoformat(str(row["publish_time"])) for row in canonical
     ).replace(tzinfo=None)

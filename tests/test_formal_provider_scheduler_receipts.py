@@ -372,6 +372,11 @@ def test_news_scheduler_recomputes_fresh_persisted_batch_hash():
             "requested_pages": 1,
             "fetched_count": 0,
         },
+        "federal_reserve": {
+            "status": "FAILED",
+            "requested_pages": 1,
+            "fetched_count": 0,
+        },
         "sina": {
             "status": "FAILED",
             "requested_pages": 1,
@@ -409,7 +414,7 @@ def test_news_scheduler_recomputes_fresh_persisted_batch_hash():
     assert "rows=1" in result.message
 
 
-def test_news_sync_output_status_accepts_optional_federal_reserve_source():
+def test_news_sync_output_status_rejects_federal_reserve_without_exact_archive_proof():
     started_at = datetime(2026, 10, 29, 19, 10, 39)
     source_results = {
         "cls": {
@@ -470,4 +475,4 @@ def test_news_sync_output_status_accepts_optional_federal_reserve_source():
         {"task_type": "news_sync"},
         json.dumps(receipt, ensure_ascii=False, sort_keys=True),
         return_code=0,
-    ) == "success"
+    ) == "failed"

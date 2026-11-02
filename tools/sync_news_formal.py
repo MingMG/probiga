@@ -52,11 +52,11 @@ def _fetch_sina(client: Any, pages: int) -> list[dict[str, Any]]:
     return fetch_sina(client, pages)
 
 
-def _fetch_federal_reserve(client: Any, pages: int) -> list[dict[str, Any]]:
+def _fetch_federal_reserve(client: Any, pages: int, *, now=None) -> dict[str, Any]:
     del client, pages
-    from biz.news.official_macro import fetch_official_macro_news
+    from biz.news.federal_reserve_archive import fetch_federal_reserve_news
 
-    return fetch_official_macro_news()
+    return fetch_federal_reserve_news(observed_at=now or datetime.now(SHANGHAI).replace(tzinfo=None))
 
 
 SOURCE_FETCHERS: dict[str, Callable[[Any, int], list[dict[str, Any]]]] = {
@@ -222,7 +222,23 @@ def collect_sources(
     for source in sorted(selected):
         requested_pages = _source_pages(source, pages)
         try:
-            items = selected[source](client, requested_pages)
+            captured = (selected[source](client, requested_pages, now=observed_at)
+                        if source == "federal_reserve" and selected[source] is _fetch_federal_reserve
+                        else selected[source](client, requested_pages))
+            archive_coverage = None
+            if source == "federal_reserve":
+                if not isinstance(captured, Mapping):
+                    raise NewsSyncContractError("federal_reserve SOURCE_COVERAGE_UNPROVEN")
+                items = captured["items"]
+                archive_coverage = captured["archive_coverage"]
+                from server.common.federal_reserve_news_coverage import validate_federal_reserve_news_coverage
+                verified = validate_federal_reserve_news_coverage(
+                    archive_coverage, batch_started_at=observed_at,
+                    batch_finished_at=datetime.now(SHANGHAI).replace(tzinfo=None))
+                if canonical_news_items(items) != canonical_news_items(verified):
+                    raise NewsSyncContractError("federal_reserve archive projection differs")
+            else:
+                items = captured
             if not isinstance(items, list):
                 raise TypeError(f"fetcher returned {type(items).__name__}, expected list")
             normalized_items = canonical_news_items(items)
@@ -233,6 +249,13 @@ def collect_sources(
                 raise NewsSyncContractError(
                     f"source={source} returned rows owned by {wrong_sources}"
                 )
+            if not normalized_items and archive_coverage is not None:
+                results[source] = {"status": "SUCCESS", "outcome": "EMPTY",
+                    "health_schema": SOURCE_HEALTH_SCHEMA, "max_age_seconds": MAX_SOURCE_AGE_SECONDS,
+                    "requested_pages": requested_pages, "fetched_count": 0,
+                    "latest_publish_time": None, "latest_age_seconds": None,
+                    "archive_coverage": archive_coverage}
+                continue
             if not normalized_items:
                 raise NewsSyncContractError(
                     f"source={source} EMPTY_UNPROVEN: an empty rolling feed cannot prove no new news"
@@ -253,6 +276,8 @@ def collect_sources(
                 "latest_age_seconds": age,
                 "max_age_seconds": MAX_SOURCE_AGE_SECONDS,
             }
+            if archive_coverage is not None:
+                results[source]["archive_coverage"] = archive_coverage
             all_items.extend(normalized_items)
         except Exception as exc:
             results[source] = {
@@ -494,7 +519,6 @@ def main(argv: list[str] | None = None) -> int:
         receipt = sync_news_formal(
             create_batch_engine(pool_size=2, max_overflow=2),
             pages=args.pages,
-            now=started_at,
         )
     except Exception as exc:
         source_results = getattr(exc, "source_results", {})

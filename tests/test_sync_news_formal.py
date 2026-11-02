@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import base64
+import hashlib
 from datetime import datetime
 
 import pytest
@@ -9,6 +11,30 @@ from tools import sync_news_formal as news
 
 
 NOW = datetime(2026, 8, 26, 17, 30)
+
+
+@pytest.fixture
+def fed_capture(monkeypatch, tmp_path):
+    from server.common import federal_reserve_news_coverage as fed
+    monkeypatch.setenv("PROBIGA_JOB_LOG_ROOT", str(tmp_path))
+    def capture():
+        def doc(url, body):
+            raw = body.encode()
+            return {"url": url, "http_status": 200, "body_base64": base64.b64encode(raw).decode(),
+                    "source_response_sha256": hashlib.sha256(raw).hexdigest(),
+                    "request_started_at": NOW.isoformat(), "captured_at": NOW.isoformat()}
+        documents = []
+        for url, title, day, identity in ((fed.archive_urls(NOW)[0], "2026 Press Releases", "8/26/2026", "20260826a"),
+                                         (fed.archive_urls(NOW)[1], "2026 FOMC Press Releases", "7/29/2026", "20260729a")):
+            documents.append(doc(url, '<html><h2>'+title+'</h2><div class="row"><time>'+day+'</time>'
+                '<a href="/newsevents/pressreleases/monetary'+identity+'.htm">Official</a>'
+                '<p class="eventlist__press">Monetary Policy</p></div>Last Update: August 26, 2026</html>'))
+        documents.append(doc(fed.RSS_URL, '<rss><channel><item><title>Native publication</title>'
+            '<link>https://www.federalreserve.gov/newsevents/pressreleases/monetary20260826a.htm</link>'
+            '<description>Native content</description><pubDate>Wed, 26 Aug 2026 09:00:00 GMT</pubDate></item></channel></rss>'))
+        items, proof = fed.seal_federal_reserve_news_coverage(documents, observed_at=NOW, captured_at=NOW)
+        return {"items": items, "archive_coverage": proof}
+    return capture
 
 
 def _item(source: str, source_id: str, minute: int = 0):
@@ -78,7 +104,7 @@ def _receipt_hash(receipt):
     return news._hash_payload(payload)
 
 
-def test_formal_news_reports_each_source_and_verifies_db_readback(monkeypatch):
+def test_formal_news_reports_each_source_and_verifies_db_readback(monkeypatch, fed_capture):
     engine = _Engine()
     monkeypatch.setattr(
         news,
@@ -89,7 +115,7 @@ def test_formal_news_reports_each_source_and_verifies_db_readback(monkeypatch):
         "cls": lambda _client, pages: [_item("cls", "c1", 1), _item("cls", "c2", 2)],
         "eastmoney": lambda _client, pages: [],
         "sina": lambda _client, pages: (_ for _ in ()).throw(RuntimeError("blocked")),
-        "federal_reserve": lambda _client, pages: [_item("federal_reserve", "fed1")],
+        "federal_reserve": lambda _client, pages: fed_capture(),
     }
 
     receipt = news.sync_news_formal(
@@ -146,10 +172,11 @@ def test_formal_news_all_failed_or_empty_is_non_success(mode):
         result["status"] for result in caught.value.source_results.values()
     } == {expected}
     if mode == "empty":
-        assert all("EMPTY_UNPROVEN" in result["error"] for result in caught.value.source_results.values())
+        assert all(("SOURCE_COVERAGE_UNPROVEN" if source == "federal_reserve" else "EMPTY_UNPROVEN") in result["error"]
+                   for source, result in caught.value.source_results.items())
 
 
-def test_invalid_rows_fail_only_their_source_when_another_source_is_valid(monkeypatch):
+def test_invalid_rows_fail_only_their_source_when_another_source_is_valid(monkeypatch, fed_capture):
     engine = _Engine()
     monkeypatch.setattr(news, "_readback_batch", lambda _connection, items: _as_db_rows(items))
     bad = _item("eastmoney", "wrong-owner")
@@ -157,7 +184,7 @@ def test_invalid_rows_fail_only_their_source_when_another_source_is_valid(monkey
         "cls": lambda _client, _pages: [bad],
         "eastmoney": lambda _client, _pages: [_item("eastmoney", "e1")],
         "sina": lambda _client, _pages: [],
-        "federal_reserve": lambda _client, _pages: [_item("federal_reserve", "f1")],
+        "federal_reserve": lambda _client, _pages: fed_capture(),
     }
 
     receipt = news.sync_news_formal(
@@ -272,7 +299,7 @@ def test_formal_news_cli_success_is_one_hashed_receipt(monkeypatch, capsys):
     assert receipt["receipt_id"] == _receipt_hash(receipt)
 
 
-def test_stale_source_cannot_hide_behind_fresh_other_sources(monkeypatch):
+def test_stale_source_cannot_hide_behind_fresh_other_sources(monkeypatch, fed_capture):
     engine = _Engine()
     monkeypatch.setattr(news, "_readback_batch", lambda _connection, items: _as_db_rows(items))
     stale = _item("cls", "month-old")
@@ -281,7 +308,7 @@ def test_stale_source_cannot_hide_behind_fresh_other_sources(monkeypatch):
         "cls": lambda *_args: [stale],
         "eastmoney": lambda *_args: [_item("eastmoney", "e1")],
         "sina": lambda *_args: [_item("sina", "s1")],
-        "federal_reserve": lambda *_args: [_item("federal_reserve", "f1")],
+        "federal_reserve": lambda *_args: fed_capture(),
     }
     receipt = news.sync_news_formal(engine, client=object(), fetchers=fetchers, now=NOW)
     assert receipt["status"] == "PARTIAL"
@@ -291,10 +318,11 @@ def test_stale_source_cannot_hide_behind_fresh_other_sources(monkeypatch):
     assert engine.committed
 
 
-def test_fresh_repeated_feed_is_valid_no_new_content(monkeypatch):
+def test_fresh_repeated_feed_is_valid_no_new_content(monkeypatch, fed_capture):
     engine = _Engine()
     monkeypatch.setattr(news, "_readback_batch", lambda _connection, items: _as_db_rows(items))
     fetchers = {source: (lambda *_args, source=source: [_item(source, source)]) for source in news.SOURCE_FETCHERS}
+    fetchers["federal_reserve"] = lambda *_args: fed_capture()
     receipt = news.sync_news_formal(engine, client=object(), fetchers=fetchers, now=NOW)
     assert receipt["status"] == "PASS"
     assert receipt["failed_sources"] == []
