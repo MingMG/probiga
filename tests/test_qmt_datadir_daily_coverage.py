@@ -70,6 +70,37 @@ def test_incident_six_suspensions_and_future_listing_are_exact_without_fake_bars
     assert [item["stock_code"] for item in proof["entities"] if item["classification"] == "NOT_LISTED"] == [IPO]
 
 
+def test_after_midnight_envelope_reuses_target_day_native_suspensions():
+    quotes = snapshot()
+    quotes["generated_at"] = "2026-11-03 01:50:26"
+    quotes["last_poll_at"] = "2026-11-02 20:54:09"
+    for tick in quotes["quotes"].values():
+        tick["_probiga_observed_at"] = "2026-11-02 20:54:09"
+    catalog, calendar = authorities()
+    proof = coverage.build_manifest(
+        catalog=catalog, calendar=calendar, day=DAY, rows=[bar()], run_id="qdd-recovery",
+        captured_at=datetime(2026, 11, 3, 1, 51), snapshot=quotes, listings=listing(),
+    )
+    assert coverage.validate_manifest(proof, catalog=catalog, calendar=calendar) == proof
+    assert {item["stock_code"] for item in proof["entities"]
+            if item["classification"] == "NO_TRADE"} == set(SUSPENDED)
+    assert all(item["evidence"]["snapshot_generated_at"] == "2026-11-03 01:50:26"
+               for item in proof["entities"] if item["classification"] == "NO_TRADE")
+
+
+@pytest.mark.parametrize("observed,generated", [
+    ("2026-11-03 01:50:00", "2026-11-03 01:50:26"),
+    ("2026-11-02 20:54:09", "2026-11-02 20:54:08"),
+    ("2026-11-02 20:54:09", "2026-11-03 01:51:01"),
+])
+def test_rewritten_envelope_rejects_wrong_day_acquisition_or_invalid_time_order(observed, generated):
+    quotes = snapshot()
+    quotes["generated_at"] = generated
+    quotes["quotes"]["000831.SZ"]["_probiga_observed_at"] = observed
+    with pytest.raises(ValueError, match="suspension"):
+        coverage.suspension_evidence(quotes, "000831", DAY, datetime(2026, 11, 3, 1, 51))
+
+
 @pytest.mark.parametrize("change", [
     {"stockStatus": 0}, {"volume": 1}, {"amount": 1}, {"open": 1},
     {"time": 1793322900000}, {"_probiga_observed_at": "2026-11-02 14:00:00"},

@@ -58,8 +58,11 @@ def suspension_evidence(snapshot: Mapping[str, Any], code: str, day: str, cutoff
     observed = _stamp(raw.get("_probiga_observed_at"))
     event = datetime.fromtimestamp(float(raw["time"]) / 1000, CHINA).replace(tzinfo=None)
     closed = datetime.combine(datetime.fromisoformat(day).date(), time(15, 0))
+    # The bridge may serialize the same native observations after midnight.
+    # Acquisition time and native event date bind the suspension to its session;
+    # generated_at only dates the envelope containing those observations.
     if (not closed <= observed <= generated <= cutoff
-            or observed.date().isoformat() != day or generated.date().isoformat() != day
+            or observed.date().isoformat() != day
             or event.date().isoformat() != day
             or raw.get("_probiga_acquisition_method") != "ContextInfo.get_full_tick"
             or type(raw.get("stockStatus")) is not int or raw["stockStatus"] != 7
