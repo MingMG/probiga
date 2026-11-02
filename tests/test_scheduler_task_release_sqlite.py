@@ -149,3 +149,115 @@ def test_genuinely_changed_review_contract_is_migrated_then_strictly_validated(d
         conn.execute(text("UPDATE st_scheduled_tasks SET " + field + "=:value WHERE id=29"), {"value": value})
     with pytest.raises(RuntimeError, match="news_daily drifted fields: " + field):
         release.validate_applied_plan(database, plan)
+
+
+def test_readonly_global_deadlines_allow_real_bash_scheduler_capture_apply_validate_restore(tmp_path):
+    """Exercise actual shell wrappers and Python NOOP plans without a database."""
+    from pathlib import Path
+    import re
+    import shlex
+    import shutil
+    import site
+    import subprocess
+    import sys
+
+    root = Path(__file__).resolve().parents[1]
+    bash = shutil.which("bash") or str(Path(r"C:\Program Files\Git\bin\bash.exe"))
+    if not Path(bash).is_file():
+        pytest.skip("Bash required for the production readonly-variable regression")
+    source = (root / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    names = (
+        "controlled_guard_run_service_gate_with_deadline",
+        "run_prepared_scheduler_task_release",
+        "capture_and_apply_scheduler_task_release",
+        "validate_prepared_scheduler_task_release",
+        "controlled_guard_restore_scheduler_task_plan",
+    )
+    functions = []
+    for name in names:
+        match = re.search(rf"(?ms)^{name}\(\) \{{\n(.*?)^\}}$", source)
+        assert match is not None
+        body = match.group(0)
+        if name == "controlled_guard_run_service_gate_with_deadline":
+            # Run as the test account; timeout still owns the real child.
+            body = body.replace('test -x /usr/bin/sudo || return 1', 'true')
+            body = body.replace('/usr/bin/sudo -u "$service_user" ', '')
+            body = body.replace('/usr/bin/timeout --signal=TERM', 'record_timeout --signal=TERM')
+        functions.append(body)
+
+    target, previous = "b" * 40, "a" * 40
+    code = tmp_path / "code" / target
+    artifacts = tmp_path / "artifacts" / target
+    venv = tmp_path / "venvs" / target
+    (code / "tools").mkdir(parents=True)
+    artifacts.mkdir(parents=True)
+    (venv / "bin").mkdir(parents=True)
+    helper = root / "tools/scheduler_task_release.py"
+    shutil.copyfile(helper, code / "tools/scheduler_task_release.py")
+    (venv / ".adata.gitsha").write_text("c" * 40, encoding="utf-8")
+    (venv / ".adata.tree.sha256").write_text("d" * 64, encoding="utf-8")
+    q = lambda value: shlex.quote(str(value).replace("\\", "/"))
+    # Delegate the fixture's immutable venv to the installed test interpreter;
+    # keep the production arguments and env-isolation boundary intact.
+    (venv / "bin/python").write_text(
+        "#!/usr/bin/bash\nexport PYTHONUSERBASE=" + q(site.getuserbase()) + "\nexec "
+        + q(sys.executable) + " -P " + q(helper) + ' "${@:3}"\n', encoding="utf-8", newline="\n")
+    contracts = [{key: task[key] for key in release.FIELDS} for task in gate.TASKS]
+    plan = release.build_plan(contracts, contracts, previous_sha=previous, target_sha=target)
+    plan_path = artifacts / f"scheduler-task-release-{previous}.json"
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    before_path = artifacts / f"scheduler-task-before-{previous}.json"
+    trace = tmp_path / "timeout-trace"
+    harness = f'''set -Eeuo pipefail
+readonly CONTROLLED_DATABASE_GATE_TIMEOUT=30m
+readonly CONTROLLED_DATABASE_GATE_KILL_AFTER=30s
+SERVICE_USER=test-user
+EXPECTED_SHA={target}
+PREPARED_CODE_ROOT={q(code)}
+CODE_RELEASE_ROOT={q(tmp_path / 'code')}
+RELEASE_VENV_ROOT={q(tmp_path / 'venvs')}
+RELEASE_ARTIFACT_ROOT={q(tmp_path / 'artifacts')}
+ADATA_RUNTIME_ROOT={q(tmp_path / 'adata')}
+ADATA_SOURCE=/unused-adata
+EXPECTED_ADATA_SHA={'c' * 40}
+EXPECTED_ADATA_TREE_SHA256={'d' * 64}
+BOOTSTRAP_PYTHON={q(sys.executable)}
+SCHEDULER_TASK_PLAN_FILE={q(plan_path)}
+SCHEDULER_TASK_BEFORE_FILE={q(before_path)}
+RECEIPT_ID=readonly-deadline-regression
+TRACE={q(trace)}
+activation_snapshot_old_release() {{ printf '%s\\n' {previous}; }}
+controlled_guard_assert_file() {{ test -f "$1" && test ! -L "$1"; }}
+git() {{ printf '%s\\n' "$EXPECTED_SHA"; }}
+sync() {{ return 0; }}
+install() {{
+  local -a args=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in -o|-g) shift 2 ;; *) args+=("$1"); shift ;; esac
+  done
+  command install "${{args[@]}}"
+}}
+record_timeout() {{
+  printf '%s,%s,%s\\n' "$1" "$2" "$3" >> "$TRACE"
+  /usr/bin/timeout "$@"
+}}
+{chr(10).join(functions)}
+chmod +x "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python"
+capture_and_apply_scheduler_task_release
+validate_prepared_scheduler_task_release
+controlled_guard_restore_scheduler_task_plan "$EXPECTED_SHA"
+test "$CONTROLLED_DATABASE_GATE_TIMEOUT" = 30m
+test "$CONTROLLED_DATABASE_GATE_KILL_AFTER" = 30s
+printf 'READONLY_GLOBALS_PRESERVED\\n'
+'''
+    harness_path = tmp_path / "readonly-scheduler-release.sh"
+    harness_path.write_text(harness, encoding="utf-8", newline="\n")
+    completed = subprocess.run([bash, str(harness_path)], capture_output=True,
+                               text=True, encoding="utf-8", errors="replace", timeout=40)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "readonly variable" not in completed.stderr
+    assert "READONLY_GLOBALS_PRESERVED" in completed.stdout
+    assert '"status":"NOOP"' in completed.stdout
+    assert json.loads(before_path.read_text(encoding="utf-8"))["rows"] == {}
+    assert trace.read_text(encoding="utf-8").splitlines() == [
+        "--signal=TERM,--kill-after=5s,90s"] * 4
