@@ -3,6 +3,9 @@
 import importlib.util
 import json
 from pathlib import Path
+import re
+import shlex
+import shutil
 import subprocess
 import sys
 
@@ -52,10 +55,11 @@ class Repo:
         self.git("commit", "--no-gpg-sign", "-m", "release scope fixture")
         return self.git("rev-parse", "HEAD")
 
-    def classify(self, target=None, base=None):
+    def classify(self, target=None, base=None, windows_base=None):
         return policy.classify_release_scope(
             repository=self.root, base_sha=base or self.base,
             target_sha=target or self.git("rev-parse", "HEAD"),
+            windows_base_sha=windows_base,
         )
 
 
@@ -80,6 +84,111 @@ def test_application_and_deployment_changes_are_linux(repo, path):
     assert result["scope"] == "LINUX"
     assert result["reason_codes"] == ["code_only_delta"]
     assert result["base_contract_sha256"] == result["contract_sha256"]
+
+
+@pytest.mark.parametrize("path", policy._WINDOWS_RUNTIME_FILES)
+def test_windows_minute_runtime_body_change_is_not_a_schema_change(repo, path):
+    repo.write(path, "REVISION = 1\n\ndef read():\n    return 1\n")
+    windows = repo.commit()
+    repo.write(path, "REVISION = 1\n\ndef read():\n    return 2\n")
+    result = repo.classify(repo.commit(), base=windows, windows_base=windows)
+    assert result["scope"] == "COORDINATED"
+    assert result["reason_codes"] == ["windows_runtime_changed"]
+    assert result["windows_runtime_changed_paths"] == [path]
+    assert result["base_contract_sha256"] == result["contract_sha256"]
+
+
+def _missed_windows_runtime_release(repo):
+    path = "server/common/qmt_datadir_minute_coverage.py"
+    repo.write(path, "REVISION = 1\n\ndef persisted_matrix():\n    return 1\n")
+    windows = repo.commit()
+    repo.write(path, "REVISION = 1\n\ndef persisted_matrix():\n    return 2\n")
+    linux = repo.commit()
+    repo.write("tools/classify_release_scope.py", "POLICY_IMPLEMENTATION = 2\n")
+    return windows, linux, repo.commit()
+
+
+def test_deployed_windows_base_catches_a_runtime_change_already_in_linux(repo):
+    windows, linux, target = _missed_windows_runtime_release(repo)
+    historical = repo.classify(target, base=linux)
+    assert historical["scope"] == "LINUX"
+    assert historical["windows_base_sha"] is None
+    result = repo.classify(target, base=linux, windows_base=windows)
+    assert result["scope"] == "COORDINATED"
+    assert result["reason_codes"] == ["windows_runtime_changed"]
+    assert result["windows_base_sha"] == windows
+    assert result["base_contract_sha256"] == result["contract_sha256"]
+    # Once the artifact reached Windows, another Linux repository commit does
+    # not force that unchanged runtime to reload.
+    assert repo.classify(target, base=linux, windows_base=linux)["scope"] == "LINUX"
+
+
+def test_linux_function_change_preserves_unchanged_windows_artifacts(repo):
+    repo.write("server/common/qmt_datadir_minute_coverage.py", "READER = 1\n")
+    windows = repo.commit()
+    repo.write("server/common/pit_facts.py", "def read():\n    return 1\n")
+    linux = repo.commit()
+    repo.write("server/common/pit_facts.py", "def read():\n    return 2\n")
+    result = repo.classify(repo.commit(), base=linux, windows_base=windows)
+    assert result["scope"] == "LINUX"
+    assert result["reason_codes"] == ["code_only_delta"]
+    assert result["windows_runtime_changed_paths"] == []
+
+
+def test_deploy_passes_the_guarded_windows_base_and_targets_the_new_artifact(repo, tmp_path):
+    windows, linux, target = _missed_windows_runtime_release(repo)
+    git_bash = Path("C:/Program Files/Git/bin/bash.exe")
+    bash = str(git_bash) if git_bash.is_file() else shutil.which("bash")
+    if not bash:
+        pytest.skip("Bash unavailable")
+    script = (TOOL.parents[1] / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    bodies = dict(re.findall(r"(?ms)^([a-zA-Z_][a-zA-Z0-9_]*)\(\) \{\n(.*?)^[ \t]*\}\s*$", script))
+    tools_root, artifacts = tmp_path / "scope-tools", tmp_path / "artifacts"
+    (tools_root / target).mkdir(parents=True)
+    artifacts.mkdir()
+    values = {
+        "BOOTSTRAP_PYTHON": Path(sys.executable).as_posix(),
+        "COMPONENT_CLASSIFIER": TOOL.as_posix(),
+        "CODE_GIT_CACHE": (repo.root / ".git").as_posix(),
+        "COMPONENT_TOOL_ROOT": tools_root.as_posix(),
+        "RELEASE_ARTIFACT_ROOT": artifacts.as_posix(),
+        "PREVIOUS_SHA": linux, "EXPECTED_SHA": target,
+        "TARGET_WINDOWS_SHA": target, "TARGET_CONTRACT_SHA": target,
+        "STRICT_WINDOWS_MANIFEST": "0", "RELEASE_MODE": "full", "I_KNOW_DDL_CHANGED": "0",
+    }
+    harness = "set -eu\n" + "\n".join(f"{key}={shlex.quote(value)}" for key, value in values.items())
+    harness += f"""
+controlled_guard_component_sha() {{ printf '%s\\n' {windows}; }}
+log_release() {{ printf '%s\\n' "$*"; }}
+log_release_warning() {{ printf '%s\\n' "$*"; }}
+log_release_error() {{ printf '%s\\n' "$*" >&2; }}
+resolve_release_execution_scope() {{
+{bodies['resolve_release_execution_scope']}
+}}
+classify_component_release() {{
+{bodies['classify_component_release']}
+}}
+classify_component_release
+printf 'RESULT:%s:%s:%s\\n' "$RELEASE_SCOPE" "$RELEASE_EXECUTION_SCOPE" "$TARGET_WINDOWS_SHA"
+"""
+    completed = subprocess.run([bash, "-c", harness], capture_output=True, text=True, timeout=60)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert f"RESULT:COORDINATED:COORDINATED:{target}" in completed.stdout
+    report = json.loads((tools_root / target / "scope.json").read_text())
+    assert report["windows_base_sha"] == windows
+    assert report["reason_codes"] == ["windows_runtime_changed"]
+
+
+def test_windows_comparison_base_requires_a_full_ancestor_commit(repo):
+    repo.write("server/static/index.html", "branch one")
+    windows = repo.commit()
+    repo.git("checkout", "--detach", repo.base)
+    repo.write("server/static/index.html", "branch two")
+    target = repo.commit()
+    with pytest.raises(policy.ScopeError, match="^windows_base_not_ancestor$"):
+        repo.classify(target, windows_base=windows)
+    with pytest.raises(policy.ScopeError, match="^full_commit_sha_required$"):
+        repo.classify(target, windows_base=windows[:12])
 
 
 def test_qmt_strategy_source_change_is_coordinated(repo):
