@@ -15,10 +15,10 @@ def _isolated_source_shards(monkeypatch, tmp_path):
     monkeypatch.setenv("PROBIGA_JOB_LOG_ROOT", str(tmp_path))
 
 
-def _fixture():
+def _fixture(*, code_count=205):
     engine = create_engine("sqlite+pysqlite:///:memory:")
     captured = datetime(2026, 11, 2, 21, 0)
-    codes = [f"{index:06d}" for index in range(1, 206)]
+    codes = [f"{index:06d}" for index in range(1, code_count + 1)]
     rows = [{"stock_code": code, "art_code": "AN-" + code,
         "notice_date": date(2026, 11, 2), "title": "真实公告", "column_name": "公司公告",
         "display_time": "2026-11-02 20:00:00", "detail_url": "https://data.eastmoney.com/" + code,
@@ -98,7 +98,101 @@ def test_completed_notice_batch_revalidates_with_real_stock_date_index_and_exact
     ok, message = validation._validate_notice_eastmoney_receipt(engine,
         task={"task_type": "notice_eastmoney"}, output=json.dumps(receipt, default=str),
         started_at=datetime(2026, 11, 2, 18), now=datetime(2026, 11, 2, 21, 1))
-    assert not ok and "invalid association or provenance" in message
+    assert not ok and "source checkpoint root differs from receipt" in message
+    engine.dispose()
+
+
+def _resumed_mixed_publications():
+    engine, codes, _previous = _fixture(code_count=3)
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE si_notice_eastmoney SET batch_id=:batch "
+                                "WHERE stock_code=:code AND notice_date=:day"),
+            {"batch": "d" * 64, "code": codes[1], "day": date(2026, 11, 2)})
+        connection.execute(text("DELETE FROM si_notice_eastmoney WHERE stock_code=:code "
+                                "AND notice_date=:day"),
+            {"code": codes[2], "day": date(2026, 11, 2)})
+    shards = notice._notice_incremental_shards(window_start=date(2026, 9, 18),
+        window_end=date(2026, 11, 3), target_trade_date=date(2026, 11, 2))
+    empty = shards.load(codes[2])
+    shards.save(codes[2], {**empty, "rows": [], "total_hits": 0})
+    actual = validation._read_notice_validation_window(engine, codes=codes,
+        window_start=date(2026, 9, 18), window_end=date(2026, 11, 3))
+    rows_by_code = {code: [row for row in actual if row["stock_code"] == code]
+                    for code in codes}
+    source_manifest, persisted_manifest = [], []
+    for code, rows in rows_by_code.items():
+        source = shards.load(code)
+        _fetch, parsed, entry = notice._notice_source_snapshot(code, source,
+            window_start=date(2026, 9, 18), window_end=date(2026, 11, 3),
+            batch_id=rows[0]["batch_id"] if rows else "e" * 64,
+            finished_at=datetime(2026, 11, 3, 5))
+        assert notice._notice_row_hash(parsed) == notice._notice_row_hash(rows)
+        source_manifest.append(entry)
+        persisted_manifest.append({"stock_code": code, "row_count": len(rows),
+                                   "row_hash": notice._notice_row_hash(rows)})
+    receipt = notice._notice_sync_result(started_at=datetime(2026, 11, 3, 4),
+        finished_at=datetime(2026, 11, 3, 5), codes=codes, succeeded_codes=codes,
+        nonempty_codes=codes[:2], failed_codes=[], failure_sample=[], written_rows=2,
+        minimum_coverage=1, minimum_row_coverage=0,
+        request_window_start=date(2026, 9, 18), request_window_end=date(2026, 11, 3),
+        target_trade_date=date(2026, 11, 2), batch_id="e" * 64,
+        source_manifest=source_manifest, persisted_manifest=persisted_manifest)
+    return engine, codes, receipt, shards
+
+
+def _validate_resumed(engine, receipt):
+    return validation._validate_notice_eastmoney_receipt(engine,
+        task={"task_type": "notice_eastmoney"}, output=json.dumps(receipt),
+        started_at=datetime(2026, 11, 3, 4), now=datetime(2026, 11, 3, 5, 1))
+
+
+def test_notice_validator_accepts_older_mixed_batches_and_authoritative_empty():
+    engine, _codes, receipt, _shards = _resumed_mixed_publications()
+    statements = []
+    event.listen(engine, "before_cursor_execute",
+        lambda _conn, _cursor, sql, _params, _context, _many: statements.append(sql))
+    ok, message = _validate_resumed(engine, receipt)
+    assert ok, message
+    assert "authoritative_empty=1 rows=2" in message
+    assert not any(sql.lstrip().upper().startswith(("DELETE", "INSERT", "UPDATE"))
+                   for sql in statements)
+    engine.dispose()
+
+
+@pytest.mark.parametrize("mutation", ["batch", "source", "missing", "extra", "future"])
+def test_notice_validator_rejects_changed_mixed_publication_or_source(mutation):
+    engine, codes, receipt, shards = _resumed_mixed_publications()
+    if mutation == "source":
+        saved = shards.load(codes[0])
+        saved["rows"][0]["title"] = "源端内容已变化"
+        shards.save(codes[0], saved)
+    else:
+        with engine.begin() as connection:
+            if mutation == "batch":
+                connection.execute(text("UPDATE si_notice_eastmoney SET batch_id=:batch "
+                                        "WHERE stock_code=:code AND notice_date=:day"),
+                    {"batch": "f" * 64, "code": codes[1], "day": date(2026, 11, 2)})
+            elif mutation == "future":
+                connection.execute(text("UPDATE si_notice_eastmoney SET etl_sync_at=:future "
+                                        "WHERE stock_code=:code AND notice_date=:day"),
+                    {"future": datetime(2026, 11, 3, 5, 1), "code": codes[0],
+                     "day": date(2026, 11, 2)})
+            elif mutation == "missing":
+                connection.execute(text("DELETE FROM si_notice_eastmoney WHERE stock_code=:code "
+                                        "AND notice_date=:day"),
+                    {"code": codes[0], "day": date(2026, 11, 2)})
+            else:
+                columns = ",".join(notice.NOTICE_REQUIRED_COLUMNS)
+                selection = ",".join("'EXTRA'" if column == "art_code" else column
+                                     for column in notice.NOTICE_REQUIRED_COLUMNS)
+                connection.execute(text(f"INSERT INTO si_notice_eastmoney ({columns}) "
+                    f"SELECT {selection} FROM si_notice_eastmoney "
+                    "WHERE stock_code=:code AND notice_date=:day"),
+                    {"code": codes[2], "day": date(2020, 1, 1)})
+                connection.execute(text("UPDATE si_notice_eastmoney SET notice_date=:day "
+                                        "WHERE art_code='EXTRA'"), {"day": date(2026, 11, 2)})
+    ok, _message = _validate_resumed(engine, receipt)
+    assert not ok
     engine.dispose()
 
 

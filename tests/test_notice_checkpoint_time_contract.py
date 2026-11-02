@@ -85,13 +85,13 @@ def _resign_with_current_database_hash(case):
     return receipt
 
 
-def test_cross_attempt_resume_preserves_source_capture_and_advances_only_publication(resumed_notice):
+def test_cross_attempt_resume_preserves_source_and_publication_before_attempt(resumed_notice):
     case = resumed_notice
     row, = _db_rows(case)
     assert validation._coerce_datetime(row["source_time"]) == datetime(2026, 11, 2, 18, 1)
     assert validation._coerce_datetime(row["received_at"]) == case.captured < case.started
-    assert case.started <= validation._coerce_datetime(row["etl_sync_at"]) <= case.finished
-    assert row["batch_id"] == case.receipt["batch_id"] != case.first["batch_id"]
+    assert case.captured <= validation._coerce_datetime(row["etl_sync_at"]) < case.started
+    assert row["batch_id"] == case.first["batch_id"] != case.receipt["batch_id"]
     assert case.receipt["written_notice_count"] == 1
     assert case.receipt["authoritative_empty_code_count"] == 1
     ok, message = _validate(case)
@@ -110,9 +110,9 @@ def test_forged_old_capture_fails_even_with_matching_database_and_receipt_conten
     assert not ok, "an independently replayed raw shard must bind the original capture"
 
 
-@pytest.mark.parametrize("value", [datetime(2026, 11, 2, 18, 5, 17),
+@pytest.mark.parametrize("value", [datetime(2026, 11, 2, 18, 5, 16),
                                     datetime(2026, 11, 2, 22, 2)])
-def test_source_capture_cannot_replace_or_exceed_current_publication_window(resumed_notice, value):
+def test_publication_cannot_precede_capture_or_exceed_receipt_finish(resumed_notice, value):
     case = resumed_notice
     with case.engine.begin() as connection:
         connection.execute(text("UPDATE si_notice_eastmoney SET etl_sync_at=:value"),
@@ -216,25 +216,18 @@ def test_old_parsed_only_source_root_cannot_claim_the_final_capture_contract(res
 
 
 @pytest.mark.parametrize("start_us,finish_us", [(100000, 200000), (500000, 600000)])
-def test_resumed_publication_retains_database_second_precision_at_attempt_start(
+def test_prior_second_precision_publication_survives_fractional_attempt_clock(
     resumed_notice, start_us, finish_us,
 ):
     case = resumed_notice
-    # MySQL's existing DATETIME column has second precision. Model that
-    # durable representation rather than SQLite's arbitrary fractional text.
-    with case.engine.begin() as connection:
-        connection.execute(text("""CREATE TRIGGER notice_datetime0 AFTER INSERT
-            ON si_notice_eastmoney BEGIN
-            UPDATE si_notice_eastmoney
-            SET etl_sync_at=strftime('%Y-%m-%d %H:%M:%S',NEW.etl_sync_at,'+0.5 seconds')
-            WHERE stock_code=NEW.stock_code AND art_code=NEW.art_code;
-            END"""))
+    # Existing MySQL DATETIME(0) values remain valid even when a new attempt's
+    # local clock has fractions; resuming must not rewrite those old values.
     case.started = datetime(2026, 11, 2, 22, 2, 0, start_us)
     case.finished = datetime(2026, 11, 2, 22, 2, 0, finish_us)
     case.clock[0] = case.finished
     case.receipt = case.run(case.started)
     assert case.fetched == []
     row, = _db_rows(case)
-    assert validation._coerce_datetime(row["etl_sync_at"]) == datetime(2026, 11, 2, 22, 2)
+    assert validation._coerce_datetime(row["etl_sync_at"]) == datetime(2026, 11, 2, 18, 6)
     ok, message = _validate(case)
     assert ok, message
