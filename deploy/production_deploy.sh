@@ -6477,6 +6477,7 @@ controlled_v2_assert_preserved_no_receipt_transaction() {
 }
 controlled_v2_forward_preserve_no_receipt_recovery() {
   local guarded_sha
+  local continuing_windows_instance="${1:-}"
   local old_runtime_sha
   local phase
   local main_record
@@ -6518,10 +6519,13 @@ controlled_v2_forward_preserve_no_receipt_recovery() {
   test "$old_runtime_sha" != "$guarded_sha" || return 1
   phase="$(activation_snapshot_phase)" || return 1
   case "$phase" in
-    runtime-units-installed|restoring-old|restoring-new-no-receipt|\
+    runtime-units-installed|restoring-old|old-set-restored|restoring-new-no-receipt|\
     new-runtime-preserved-no-receipt) ;;
     *) return 1 ;;
   esac
+  if [ "$phase" = old-set-restored ] && [ -z "$continuing_windows_instance" ]; then
+    return 1
+  fi
   activation_snapshot_validate_new "$guarded_sha" || return 1
   activation_snapshot_validate_governance_new || return 1
   activation_snapshot_assert_pending_receipt_absent || return 1
@@ -6667,7 +6671,8 @@ controlled_v2_forward_preserve_no_receipt_recovery() {
       "$ai_timer_record" || true
     return 1
   fi
-  if [ "$phase" = runtime-units-installed ] || [ "$phase" = restoring-old ]; then
+  if [ "$phase" = runtime-units-installed ] || [ "$phase" = restoring-old ] || \
+    [ "$phase" = old-set-restored ]; then
     # The sealed NEW governance pair is created only after the guarded release
     # installed, captured and verified its task contract.  Persist forward
     # intent before changing that state so an interruption can never fall back
@@ -6684,6 +6689,10 @@ controlled_v2_forward_preserve_no_receipt_recovery() {
   V2_RECOVERY_STEP=forward-governance-verify-current
   if ! controlled_guard_governance_contract_snapshot verify \
       "$guarded_sha" "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT"; then
+    if [ -n "$continuing_windows_instance" ]; then
+      echo "Runtime-only recovery refuses changed shared task snapshots" >&2
+      return 1
+    fi
     V2_RECOVERY_STEP=forward-governance-restore-exec
     if ! controlled_guard_governance_contract_snapshot restore \
         "$guarded_sha" "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT"; then
@@ -7891,6 +7900,8 @@ controlled_guard_run_writer_fence() {
   local guarded_sha="$4"
   local release_venv="$2"
   local service_user="$7"
+  local -a excluded_instance_args=()
+  if [ -n "${8:-}" ]; then excluded_instance_args=(--exclude-instance-id "$8"); fi
   local release_tree_sha=""
   local adapter_registry_seal_sha=""
   local -a attested_env=()
@@ -7933,7 +7944,7 @@ controlled_guard_run_writer_fence() {
       --writer-fence \
       --require-no-live-scheduler-writers \
       --writer-drain-timeout-seconds 660 \
-      --writer-drain-poll-seconds 5
+      --writer-drain-poll-seconds 5 "${excluded_instance_args[@]}"
   )
 }
 controlled_guard_validate_writer_fence_json() {
@@ -9109,6 +9120,109 @@ controlled_guard_certify_database_boundary() {
     "$scheduler_record" "$ai_service_record" "$ai_timer_record" || \
     controlled_guard_fail certify_boundary_final || return 1
 }
+controlled_guard_completed_forward_windows_instance() {
+  local guarded_sha="$1"
+  local code_root="$CODE_RELEASE_ROOT/$guarded_sha"
+  local release_venv="$RELEASE_VENV_ROOT/$guarded_sha"
+  local previous_sha plan adata_sha adata_tree adata_source phase
+  phase="$(activation_snapshot_phase)" || return 1
+  case "$phase" in
+    runtime-units-installed|restoring-old|old-set-restored|restoring-new-no-receipt) ;;
+    *) return 1 ;;
+  esac
+  activation_snapshot_validate_new "$guarded_sha" || return 1
+  activation_snapshot_validate_governance_new || return 1
+  activation_snapshot_assert_pending_receipt_absent || return 1
+  controlled_guard_assert_governance_restore_runtime "$guarded_sha" || return 1
+  test "$(controlled_guard_component_sha "$guarded_sha" windows)" = "$guarded_sha" || return 1
+  test "$(controlled_guard_component_sha "$guarded_sha" contract)" = "$guarded_sha" || return 1
+  previous_sha="$(activation_snapshot_old_release "$guarded_sha")" || return 1
+  plan="$RELEASE_ARTIFACT_ROOT/$guarded_sha/scheduler-task-release-$previous_sha.json"
+  controlled_guard_assert_file "$plan" 600 || return 1
+  adata_sha="$(<"$release_venv/.adata.gitsha")" || return 1
+  adata_tree="$(<"$release_venv/.adata.tree.sha256")" || return 1
+  adata_source="$ADATA_RUNTIME_ROOT/$adata_sha-$adata_tree"
+  # All validators below are read-only. A prepared/migratable schema is not
+  # sufficient: require the exact physical bundle and privileged VERIFIED seal.
+  (
+    cd "$code_root" || return 1
+    /usr/bin/timeout --signal=TERM --kill-after=5s 180s /usr/bin/env -i \
+      PATH=/usr/sbin:/usr/bin:/sbin:/bin PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
+      PROBIGA_DEPLOYMENT_MODE=production PROBIGA_EXPECTED_GIT_SHA="$guarded_sha" \
+      PROBIGA_BUILD_COMMIT_SHA="$guarded_sha" PROBIGA_CODE_ROOT="$code_root" \
+      PROBIGA_COMPONENT_RELEASE_PATH="$RELEASE_ARTIFACT_ROOT/$guarded_sha/component-release.json" \
+      PROBIGA_EXPECTED_ADATA_SHA="$adata_sha" PROBIGA_EXPECTED_ADATA_TREE_SHA256="$adata_tree" \
+      PROBIGA_ADATA_SOURCE_DIR="$adata_source" "PYTHONPATH=$adata_source:$code_root" \
+      "$release_venv/bin/python" -P -c '
+import json,sys
+from tools.check_schema_expected import _open_read_only_boundary, collect_schema_guard
+from tools.scheduler_task_release import validate_plan, _current
+from tools.add_trading_v3_tasks import TASKS
+from server.api.scheduler_runtime import scheduler_task_host_owner
+from server.common.scheduler_tasks import read_fresh_scheduler_writers_on_connection
+from server.common.scheduler_runtime_health import check_qmt_windows_edge_identity
+from server.common.qmt_edge_release_receipt import check_qmt_edge_release_activation
+from server.engine.strategy_governance import validate_prepared_governance_runtime, validate_privileged_trigger_migration_seal
+boundary=None
+stage="plan_scope"
+try:
+    target,plan_path=sys.argv[1:]
+    with open(plan_path,encoding="utf-8") as stream: plan=validate_plan(json.load(stream))
+    assert plan["target_sha"]==target
+    _current(plan)
+    scoped=[task for key in plan["upsert_task_types"]+plan["retired_task_types"]
+            for side in ("base_tasks","target_tasks")
+            for task in [plan[side].get(key)] if task is not None]
+    assert all(scheduler_task_host_owner(task)=="linux_standalone" for task in [*TASKS,*scoped])
+    stage="physical_schema"
+    boundary=_open_read_only_boundary()
+    guard=collect_schema_guard(boundary.migrator_engine)
+    assert guard["status"]=="READY" and guard["read_only"] is True and guard["mismatch_count"]==0
+    assert guard["check_count"]==len(guard["checks"]) and guard["check_count"]>0
+    assert all(item["status"]=="READY" and item["read_only"] is True for item in guard["checks"].values())
+    stage="core_runtime"
+    validate_prepared_governance_runtime(boundary.runtime_engine)
+    from server.common.scheduler_runtime_schema import validate_scheduler_runtime_heartbeat_schema
+    from server.common.stock_dividend_schema import validate_stock_dividend_schema
+    from server.common.pit_facts import pit_fact_schema_health
+    from tools.sync_guojin_qmt_reference_data import validate_reference_tables
+    from server.common.qmt_history_coverage import validate_coverage_schema
+    from tools.prepare_strategy_governance_schema import _direct_acquisition_progress_schema
+    assert validate_scheduler_runtime_heartbeat_schema(boundary.migrator_engine)["physical_contract_verified"] is True
+    assert validate_stock_dividend_schema(boundary.runtime_engine)["status"]=="PASS"
+    assert pit_fact_schema_health(boundary.migrator_engine)["valid"] is True
+    stage="reference"
+    validate_reference_tables(boundary.migrator_engine,verify_triggers=True)
+    stage="coverage"
+    with boundary.migrator_engine.connect() as connection:
+        assert validate_coverage_schema(connection,require_triggers=True)["physical_schema_verified"] is True
+        progress=_direct_acquisition_progress_schema(connection,allow_absent=False)
+        assert progress["status"]=="READY" and progress["physical_schema_verified"] is True
+    with boundary.runtime_engine.connect() as connection:
+        stage="seal"
+        seal=validate_privileged_trigger_migration_seal(connection,expected_build_sha=target)
+        assert seal["authority"]=="PRIVILEGED_CUTOVER_TABLE_METADATA_SEAL" and seal["attested_build_sha"]==target
+        stage="activation"
+        granted,activation=check_qmt_edge_release_activation(connection,expected_build_sha=target)
+        assert granted and activation["status"]=="READY" and activation["activation_granted"] is True
+        stage="windows_identity"
+        ready,identity=check_qmt_windows_edge_identity(connection,expected_build_sha=target)
+        assert ready
+        current=identity["current"]
+        stage="writer_inventory"
+        live=read_fresh_scheduler_writers_on_connection(connection)
+        assert len(live)==1 and live[0]["instance_id"]==current["instance_id"]
+    print(current["instance_id"])
+except Exception as exc:
+    print("completed_schema_forward_recovery_requires_exact_schema_and_windows_identity stage="+stage+" error_type="+type(exc).__name__,file=sys.stderr)
+    raise SystemExit(2)
+finally:
+    if boundary is not None:
+        boundary.runtime_engine.dispose()
+        if boundary.migrator_engine is not None: boundary.migrator_engine.dispose()
+' "$guarded_sha" "$plan"
+  )
+}
 controlled_database_guard_recovery() {
   local authorized_sha="${1:-}"
   local ai_service_record
@@ -9116,6 +9230,7 @@ controlled_database_guard_recovery() {
   local ai_timer_record
   local ai_timer_load
   local guarded_sha
+  local forward_windows_instance writer_fence_output adata_sha adata_tree adata_source
   local main_record
   local scheduler_record
   local scheduler_load
@@ -9161,6 +9276,25 @@ controlled_database_guard_recovery() {
     controlled_guard_assert_restore_file "$guarded_sha" "$main_record" \
       "$scheduler_record" "$ai_service_record" "$ai_timer_record"
   fi
+  if forward_windows_instance="$(controlled_guard_completed_forward_windows_instance "$guarded_sha")"; then
+    # The shared schema is already VERIFIED at this exact W/C version. Only
+    # Linux-owned task definitions are fenced here; never call schema resume.
+    adata_sha="$(<"$RELEASE_VENV_ROOT/$guarded_sha/.adata.gitsha")" || return 1
+    adata_tree="$(<"$RELEASE_VENV_ROOT/$guarded_sha/.adata.tree.sha256")" || return 1
+    adata_source="$ADATA_RUNTIME_ROOT/$adata_sha-$adata_tree"
+    writer_fence_output="$(controlled_guard_run_writer_fence \
+      "$CODE_RELEASE_ROOT/$guarded_sha" "$RELEASE_VENV_ROOT/$guarded_sha" \
+      "$adata_source" "$guarded_sha" "$adata_sha" "$adata_tree" \
+      "$(systemctl show -p User --value probiga)" "$forward_windows_instance")" || return 1
+    printf '%s\n' "$writer_fence_output"
+    printf '%s' "$writer_fence_output" | controlled_guard_validate_writer_fence_json \
+      "$RELEASE_VENV_ROOT/$guarded_sha/bin/python" || return 1
+    controlled_guard_governance_contract_snapshot verify "$guarded_sha" \
+      "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || return 1
+    controlled_v2_forward_preserve_no_receipt_recovery "$forward_windows_instance" || return 1
+    return 0
+  fi
+  echo "Completed-schema forward recovery is unverified; all writers must stop for schema recovery" >&2
   controlled_guard_certify_database_boundary "$guarded_sha" \
     "$main_record" "$scheduler_record" "$ai_service_record" \
     "$ai_timer_record" || return 1

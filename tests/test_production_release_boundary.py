@@ -4828,7 +4828,7 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
         "/usr/bin/timeout --signal=TERM", sudo_boundary
     )
     assert sudo_boundary < timeout_boundary
-    assert '"--kill-after=$CONTROLLED_DATABASE_GATE_KILL_AFTER"' in gate_deadline
+    assert '"--kill-after=$gate_kill_after"' in gate_deadline
     assert "--foreground" not in gate_deadline
     assert "CONTROLLED_DATABASE_GATE_TIMEOUT=30m" in normalized
     assert "CONTROLLED_DATABASE_GATE_KILL_AFTER=30s" in normalized
@@ -5729,6 +5729,8 @@ def test_governance_contract_handoff_reads_all_release_metadata_before_runner(
         "set -Eeuo pipefail\n"
         + handoff_definition
         + r'''
+readonly CONTROLLED_DATABASE_GATE_TIMEOUT=30m
+readonly CONTROLLED_DATABASE_GATE_KILL_AFTER=30s
 sandbox="$(mktemp -d)"
 controlled_tool="$(mktemp /tmp/.probiga-governance-contract.XXXXXX)"
 trap 'command chmod 0600 "$controlled_tool" 2>/dev/null || true; command rm -f -- "$controlled_tool"; command rm -rf -- "$sandbox"' EXIT
