@@ -70,6 +70,49 @@ def test_public_minute_tasks_roll_over_to_the_last_closed_session(
     ) == "2026-09-21"
 
 
+def test_degraded_public_flow_resumes_after_midnight_with_completion_backoff(calendar_engine):
+    with calendar_engine.begin() as connection:
+        connection.execute(text("INSERT INTO si_trade_calendar VALUES ('2026-11-02',1),('2026-11-03',1)"))
+    row = {
+        **PUBLIC_STOCK_MINUTE_FLOW_TASK,
+        "id": 73,
+        "last_triggered_at": datetime(2026, 11, 2, 19, 49),
+        "last_run_at": datetime(2026, 11, 2, 19, 49),
+        "last_run_duration": 8 * 60 * 60,
+        "last_run_status": "degraded",
+        "last_run_output": json.dumps({"trade_date": "2026-11-02"}),
+    }
+    for now, due in ((datetime(2026, 11, 3, 3, 50), False),
+                     (datetime(2026, 11, 3, 4, 4), True)):
+        assert runtime._attach_daily_recovery_targets(calendar_engine, [row], now=now)
+        assert row["_scheduler_target_trade_date"] == "2026-11-02"
+        assert row["_scheduler_historical_recovery"] is True
+        assert runtime._cron_due(row, now=now) is due
+        assert runtime._overdue_cron_allowed(
+            row, now=now, cron_time=row["cron_time"],
+            startup_time=datetime(2026, 11, 3, 3, 45),
+        ) is due
+    args = runtime._build_task_args(row, row["script_path"], "2026-11-02")
+    assert args[-2:] == ["--trade-date", "2026-11-02"]
+    # A verified complete result consumes the same session across restarts.
+    row.update(last_triggered_at=datetime(2026, 11, 3, 4, 4),
+               last_run_at=datetime(2026, 11, 3, 4, 4), last_run_duration=60,
+               last_run_status="success")
+    now = datetime(2026, 11, 3, 6)
+    assert runtime._attach_daily_recovery_targets(calendar_engine, [row], now=now)
+    assert not runtime._cron_due(row, now=now)
+
+
+def test_public_minute_recovery_uses_latest_close_without_old_delivery_dependency(calendar_engine, monkeypatch):
+    rows = [dict(PUBLIC_STOCK_MINUTE_TASK), dict(PUBLIC_STOCK_MINUTE_FLOW_TASK)]
+    monkeypatch.setattr(runtime, "_daily_result_recovery_target",
+                        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unrelated delivery")))
+    assert runtime._attach_daily_recovery_targets(
+        calendar_engine, rows, now=datetime(2026, 9, 22, 0, 5),
+    )
+    assert all(row["_scheduler_target_trade_date"] == "2026-09-21" for row in rows)
+
+
 def test_prior_session_success_does_not_consume_today_postclose_run(calendar_engine):
     now = datetime(2026, 9, 21, 16)
     row = {
