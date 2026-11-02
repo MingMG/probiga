@@ -138,7 +138,15 @@ def _xq_frame(count: int = 100) -> pd.DataFrame:
         }
         for rank, code in list(enumerate(_codes(), 1))[:count]
     ]
-    return pd.DataFrame(rows)
+    frame = pd.DataFrame(rows)
+    items = [{"symbol": "SH" + row["stock_code"], "exchange": "SH", "stock_type": 11,
+              "name": row["short_name"], "current": row["current"], "percent": row["percent"],
+              "chg": row["chg"], "amount": row["amount"], "market_capital": row["market_capital"],
+              "following": row["followers"], "level1": row["sector"],
+              "increment": row["increment"], "diff": row["diff"]} for row in rows]
+    if len(items) == 100:
+        frame.attrs["source_evidence"] = contract.xueqiu_source_inventory(items)[1]
+    return frame
 
 
 def _install_memory_publish(monkeypatch, module, *, clock: datetime = NOW):
@@ -203,6 +211,7 @@ def test_exact_inventory_rejects_partial_and_duplicate_codes():
         contract.validate_rank_inventory(
             duplicate,
             task_type=contract.HOT_RANK_XQ_TASK_TYPE,
+        source_evidence=_xq_frame().attrs["source_evidence"],
         )
 
 
@@ -463,11 +472,13 @@ def test_exported_current_receipt_parser_and_db_revalidation_are_exact(monkeypat
     provider_inventory = contract.validate_rank_inventory(
         _xq_frame().to_dict(orient="records"),
         task_type=contract.HOT_RANK_XQ_TASK_TYPE,
+        source_evidence=_xq_frame().attrs["source_evidence"],
     )
     persisted = frame.to_dict(orient="records")
     persisted_inventory = contract.validate_rank_inventory(
         persisted,
         task_type=contract.HOT_RANK_XQ_TASK_TYPE,
+        source_evidence=_xq_frame().attrs["source_evidence"],
         target_date=TARGET,
     )
     assert (
@@ -547,6 +558,7 @@ def test_scheduler_requires_and_revalidates_exact_hot_rank_receipt(monkeypatch):
     inventory = contract.validate_rank_inventory(
         _xq_frame().to_dict(orient="records"),
         task_type=contract.HOT_RANK_XQ_TASK_TYPE,
+        source_evidence=_xq_frame().attrs["source_evidence"],
     )
     receipt = contract.build_pass_receipt(
         task_type=contract.HOT_RANK_XQ_TASK_TYPE,

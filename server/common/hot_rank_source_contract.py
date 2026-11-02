@@ -53,6 +53,7 @@ SINA_ATTENTION_DATA_BLOCK_REASON = (
     "PROVIDER_ATTENTION_SEMANTICS_UNVERIFIABLE"
 )
 EXACT_TOP_ROWS = 100
+XQ_SOURCE_INVENTORY_SCHEMA = "probiga.xueqiu-hushen-source-inventory.v1"
 
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
@@ -241,14 +242,115 @@ def canonical_rank_rows(
     return sorted(result, key=lambda row: (row["rank"], row["stock_code"]))
 
 
+def _xueqiu_security_kind(symbol: str, security_type: int) -> str:
+    if ((security_type == 11 and re.fullmatch(
+            r"(?:SH60[0-9]{4}|SZ(?:00|30)[0-9]{4}|BJ[489][0-9]{5})", symbol))
+            or (security_type == 82 and re.fullmatch(r"SH68[0-9]{4}", symbol))):
+        return "A_SHARE"
+    if security_type == 13 and re.fullmatch(r"(?:SH5[0-9]{5}|SZ1[56][0-9]{4})", symbol):
+        return "FUND"
+    raise RuntimeError(f"Xueqiu native security type unsupported: {symbol}:{security_type}")
+
+
+def xueqiu_source_inventory(items: Sequence[Mapping[str, Any]]) -> tuple[list[dict], dict]:
+    """Bind the A-share projection to all 100 native Shanghai/Shenzhen ranks.
+
+    Xueqiu's type=12 inventory includes exchange-traded funds. A fund in that
+    source is neither a missing stock nor permission to invent rank 101.
+    """
+    if not isinstance(items, (list, tuple)) or len(items) != EXACT_TOP_ROWS:
+        raise RuntimeError("Xueqiu native Top100 inventory differs")
+    source, projected, seen = [], [], set()
+    for raw in items:
+        if not isinstance(raw, Mapping):
+            raise RuntimeError("Xueqiu native security identity differs")
+        symbol = str(raw.get("symbol") or "").upper().strip()
+        exchange = str(raw.get("exchange") or "").upper().strip()
+        security_type = raw.get("stock_type")
+        if (symbol in seen or symbol[:2] != exchange
+                or not re.fullmatch(r"(?:SH|SZ|BJ)[0-9]{6}", symbol)
+                or type(security_type) is not int):
+            raise RuntimeError("Xueqiu native security identity differs")
+        seen.add(symbol)
+        kind = _xueqiu_security_kind(symbol, security_type)
+        row = {
+            "rank": len(projected) + 1, "stock_code": symbol[2:],
+            "short_name": str(raw.get("name") or ""),
+            "current": raw.get("current") or 0, "percent": raw.get("percent") or 0,
+            "chg": raw.get("chg") or 0, "amount": raw.get("amount") or 0,
+            "market_capital": raw.get("market_capital") or 0,
+            "followers": raw.get("following") or 0,
+            "sector": str(raw.get("level1") or ""), "exchange": exchange,
+            "increment": raw.get("increment") or 0, "diff": raw.get("diff") or 0,
+        }
+        canonical = canonical_rank_rows([row], task_type=HOT_RANK_XQ_TASK_TYPE)[0]
+        if not canonical["short_name"]:
+            raise RuntimeError("Xueqiu native security name missing")
+        # Positional inventory keeps all source ranks and securities in the
+        # bounded scheduler receipt. Values persisted in the stock table are
+        # re-bound to their original source row by this per-row commitment.
+        source.append([symbol, security_type, str(raw.get("sub_type") or ""),
+                       canonical["short_name"], _number(raw.get("value")), canonical_hash(canonical)])
+        if kind == "A_SHARE":
+            projected.append(canonical)
+    if not projected:
+        raise RuntimeError("Xueqiu native Top100 contains no A-share stocks")
+    evidence = {"schema": XQ_SOURCE_INVENTORY_SCHEMA,
+                "scope": "XUEQIU_NATIVE_TYPE_12_SECURITIES_TOP100",
+                "source_row_count": EXACT_TOP_ROWS, "a_share_row_count": len(projected),
+                "excluded_security_count": EXACT_TOP_ROWS - len(projected),
+                "item_fields": ["symbol", "stock_type", "sub_type", "short_name", "value", "row_sha256"],
+                "items": source}
+    return projected, {**evidence, "source_inventory_sha256": canonical_hash(evidence)}
+
+
+def _xueqiu_projection(evidence: Mapping[str, Any]) -> list[dict]:
+    if not isinstance(evidence, Mapping):
+        raise RuntimeError("Xueqiu source inventory evidence missing")
+    items = evidence.get("items")
+    if not isinstance(items, list) or len(items) != EXACT_TOP_ROWS:
+        raise RuntimeError("Xueqiu source inventory evidence missing")
+    projected, seen = [], set()
+    for item in items:
+        if not isinstance(item, list) or len(item) != 6:
+            raise RuntimeError("Xueqiu source inventory entry differs")
+        symbol, security_type, sub_type, name, value, row_hash = item
+        if (not isinstance(symbol, str) or symbol in seen
+                or not re.fullmatch(r"(?:SH|SZ|BJ)[0-9]{6}", symbol)
+                or type(security_type) is not int or not isinstance(sub_type, str)
+                or not isinstance(name, str) or not name
+                or _number(value) != value or _HEX64.fullmatch(str(row_hash)) is None):
+            raise RuntimeError("Xueqiu source inventory entry identity differs")
+        seen.add(symbol)
+        if _xueqiu_security_kind(symbol, security_type) == "A_SHARE":
+            projected.append({"rank": len(projected) + 1, "stock_code": symbol[2:],
+                              "row_sha256": row_hash})
+    unsigned = dict(evidence)
+    supplied_hash = unsigned.pop("source_inventory_sha256", None)
+    if (set(unsigned) != {"schema", "scope", "source_row_count", "a_share_row_count",
+                          "excluded_security_count", "item_fields", "items"}
+            or unsigned.get("schema") != XQ_SOURCE_INVENTORY_SCHEMA
+            or unsigned.get("scope") != "XUEQIU_NATIVE_TYPE_12_SECURITIES_TOP100"
+            or unsigned.get("item_fields") != ["symbol", "stock_type", "sub_type", "short_name", "value", "row_sha256"]
+            or unsigned.get("source_row_count") != EXACT_TOP_ROWS
+            or unsigned.get("a_share_row_count") != len(projected) or not projected
+            or unsigned.get("excluded_security_count") != EXACT_TOP_ROWS - len(projected)
+            or supplied_hash != canonical_hash(unsigned)):
+        raise RuntimeError("Xueqiu source inventory evidence differs")
+    return projected
+
+
 def validate_rank_inventory(
     rows: Sequence[Mapping[str, Any]],
     *,
     task_type: str,
     target_date: str | None = None,
+    source_evidence: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     provider = canonical_rank_rows(rows, task_type=task_type)
-    if len(provider) != EXACT_TOP_ROWS:
+    expected_count = (len(_xueqiu_projection(source_evidence))
+                      if task_type == HOT_RANK_XQ_TASK_TYPE else EXACT_TOP_ROWS)
+    if len(provider) != expected_count:
         raise RuntimeError(
             f"{task_type} exact Top100 inventory differs: rows={len(provider)}"
         )
@@ -258,10 +360,15 @@ def validate_rank_inventory(
         len(codes) != len(set(codes))
         or any(_A_SHARE_CODE.fullmatch(code) is None for code in codes)
         or "000000" in codes
-        or ranks != list(range(1, EXACT_TOP_ROWS + 1))
+        or ranks != list(range(1, expected_count + 1))
         or len(ranks) != len(set(ranks))
     ):
         raise RuntimeError(f"{task_type} code/rank inventory differs")
+    if (task_type == HOT_RANK_XQ_TASK_TYPE
+            and [{"rank": row["rank"], "stock_code": row["stock_code"],
+                  "row_sha256": canonical_hash(row)} for row in provider]
+            != _xueqiu_projection(source_evidence)):
+        raise RuntimeError("Xueqiu persisted A-share projection differs from native Top100")
     persisted = None
     if target_date is not None:
         persisted = canonical_rank_rows(
@@ -275,13 +382,17 @@ def validate_rank_inventory(
                 f"{task_type} persisted date differs: observed={sorted(dates)}"
             )
     return {
-        "row_count": EXACT_TOP_ROWS,
+        "row_count": expected_count,
         "provider_payload_sha256": canonical_hash(provider),
         "persisted_row_sha256": (
             canonical_hash(persisted) if persisted is not None else None
         ),
         "code_set_sha256": canonical_hash(sorted(codes)),
         "rank_set_sha256": canonical_hash(ranks),
+        **({"source_evidence": dict(source_evidence),
+            **{key: source_evidence[key] for key in (
+                "source_row_count", "a_share_row_count", "excluded_security_count")}}
+           if task_type == HOT_RANK_XQ_TASK_TYPE else {}),
     }
 
 
@@ -457,6 +568,9 @@ def _hot_rank_batch_id(payload: Mapping[str, Any]) -> str:
         "provider_response_evidence_sha256": payload.get(
             "provider_response_evidence_sha256"
         ),
+        **({"source_inventory_sha256": (payload.get("source_evidence") or {}).get(
+            "source_inventory_sha256")}
+           if payload.get("task_type") == HOT_RANK_XQ_TASK_TYPE else {}),
     })
 
 
@@ -638,9 +752,20 @@ def validate_receipt_shape(
         return
     if status != "PASS":
         raise ValueError("hot-rank receipt status differs")
+    expected_count = EXACT_TOP_ROWS
+    if observed_task == HOT_RANK_XQ_TASK_TYPE:
+        projection = _xueqiu_projection(payload.get("source_evidence"))
+        expected_count = len(projection)
+        evidence = payload["source_evidence"]
+        if (any(payload.get(key) != evidence[key] for key in (
+                "source_row_count", "a_share_row_count", "excluded_security_count"))
+                or payload.get("code_set_sha256") != canonical_hash(sorted(
+                    row["stock_code"] for row in projection))
+                or payload.get("rank_set_sha256") != canonical_hash(list(range(1, expected_count + 1)))):
+            raise ValueError("Xueqiu source projection receipt differs")
     if (
         payload.get("requested_date") != payload.get("data_date")
-        or int(payload.get("row_count") or 0) != EXACT_TOP_ROWS
+        or int(payload.get("row_count") or 0) != expected_count
         or any(
             _HEX64.fullmatch(str(payload.get(field) or "").lower()) is None
             for field in (
@@ -734,6 +859,7 @@ def validate_persisted_hot_rank_receipt(
         rows,
         task_type=task_type,
         target_date=target_date,
+        source_evidence=payload.get("source_evidence"),
     )
     if payload.get("source_capability") == AUTHORITATIVE_DATED_HISTORY:
         _reconstructed, evidence = _east_history_receipt_evidence(

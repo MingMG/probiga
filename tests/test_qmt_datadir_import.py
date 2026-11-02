@@ -208,21 +208,44 @@ def test_eligible_codes_follow_the_catalog_listing_window():
     assert universe.eligible_codes(SESSION) == 2                 # old one expired
 
 
-def test_coverage_gate_rejects_a_fragment_of_a_session():
-    from integrations.qmt.datadir_import import coverage_shortfall
+def test_exact_minute_scope_rejects_even_one_missing_traded_security():
+    from server.common.qmt_datadir_minute_coverage import validate_code_scope
 
-    universe = _universe({f"{600000 + i}.SH": ("1999-01-01", None) for i in range(100)})
-    assert coverage_shortfall(universe, SESSION, 96) is None
-    # 2026-07-22 holds 3 of ~5500 instruments in the real cache.
-    assert coverage_shortfall(universe, SESSION, 3) == 100
+    expected = [f"{600000 + i}" for i in range(100)]
+    entry = dict(codes=expected[:-1], code_rows={code: 241 for code in expected[:-1]}, rows=99*241)
+    with pytest.raises(ValueError, match="exact minute trade scope"):
+        validate_code_scope(entry, {"codes": expected})
 
 
-def test_coverage_gate_tolerates_a_handful_of_untraded_codes():
-    from integrations.qmt.datadir_import import coverage_shortfall
+def test_exact_minute_scope_uses_proven_traded_set_instead_of_catalog_floor():
+    from server.common.qmt_datadir_minute_coverage import validate_code_scope
 
-    # The publisher covered 5563 of 5575 eligible codes on 2026-10-14.
-    universe = _universe({f"{600000 + i}.SH": ("1999-01-01", None) for i in range(5575)})
-    assert coverage_shortfall(universe, SESSION, 5563) is None
+    traded = [f"{600000 + i}" for i in range(5563)]
+    validate_code_scope(dict(codes=traded, code_rows={code: 241 for code in traded}, rows=len(traded)*241),
+                        {"codes": traded})
+
+
+def test_harvest_filters_each_dates_exact_traded_set_without_padding(tmp_path, monkeypatch):
+    from integrations.qmt import datadir_import as importer
+    from server.common.qmt_index_minute_grid import CORE_GRID
+
+    root = tmp_path / "native"
+    tomorrow = SESSION + dt.timedelta(days=1)
+    universe = _universe({"600000.SH": ("1999-01-01", None), "600001.SH": ("1999-01-01", None)})
+    for code in ("600000", "600001"):
+        _write(root / "SH" / MINUTE_PERIOD / (code + ".DAT"), [
+            _record(moment[:5], 10000, 10000, 10000, 10000, 1, 1000, 10000, offset=offset)
+            for offset in (0, 86400) for moment in CORE_GRID])
+    staged = []
+    monkeypatch.setattr(importer, "_insert_stage", lambda conn, chunk: staged.extend(chunk))
+    stats = importer.harvest(object(), root=root, universe=universe.ordered(),
+        sessions=[SESSION, tomorrow], run_id="scope-run",
+        codes_by_session={SESSION: {"600000"}, tomorrow: {"600001"}})
+    assert stats[SESSION]["codes"] == ["600000"]
+    assert stats[tomorrow]["codes"] == ["600001"]
+    assert stats[SESSION]["rows"] == stats[tomorrow]["rows"] == 241
+    assert len(staged) == 482
+    assert {(row[1], row[3]) for row in staged} == {("600000", SESSION), ("600001", tomorrow)}
 
 
 class _Recorder:

@@ -13,16 +13,12 @@ import ast
 import hashlib
 import json
 import math
-import os
-import shutil
-import subprocess
 import sys
 import time
 from datetime import datetime, time as datetime_time
 from pathlib import Path
 from typing import Any, Mapping
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 _ROOT_STR = str(ROOT)
@@ -37,7 +33,6 @@ FORMAL_RESULT_SCHEMA = "probiga.sector-heat-east-result.v1"
 FORMAL_SOURCE = "eastmoney.push2.industry"
 SECTOR_HEAT_CLOSE_READY_TIME = datetime_time(15, 10)
 
-from server.common.process_env import build_child_env
 
 
 class SectorHeatContractError(RuntimeError):
@@ -117,120 +112,29 @@ def _warn(message: str, exc: Exception) -> None:
     print(f"[WARN] {message}: {exc}", file=sys.stderr)
 
 
-def _node_binary_candidates() -> list[str]:
-    candidates: list[str] = []
-    seen: set[str] = set()
+def _fetch_json(url: str, timeout: int = 20) -> dict:
+    """Use the same bounded, certificate-verified edge transport as concepts.
 
-    def add(path: str | os.PathLike[str] | None) -> None:
-        if not path:
-            return
-        value = str(path).strip()
-        if not value:
-            return
-        try:
-            resolved = str(Path(value).expanduser())
-        except Exception:
-            resolved = value
-        key = os.path.normcase(os.path.abspath(resolved))
-        if key in seen or not os.path.exists(resolved):
-            return
-        seen.add(key)
-        candidates.append(resolved)
-
-    add(os.environ.get("NODE_BINARY", "").strip())
-    add(os.environ.get("PROBIGA_NODE_BINARY", "").strip())
-    add(shutil.which("node"))
-    add(shutil.which("node.exe"))
-
-    for env_name in ("CODEX_PRIMARY_RUNTIME", "CODEX_RUNTIME_DIR"):
-        root = os.environ.get(env_name, "").strip()
-        if root:
-            add(Path(root) / "dependencies" / "node" / "bin" / "node")
-            add(Path(root) / "dependencies" / "node" / "bin" / "node.exe")
-
-    cache_root = Path.home() / ".cache" / "codex-runtimes"
-    if cache_root.is_dir():
-        for pattern in (
-            "codex-primary-runtime/dependencies/node/bin/node",
-            "codex-primary-runtime/dependencies/node/bin/node.exe",
-            "*/dependencies/node/bin/node",
-            "*/dependencies/node/bin/node.exe",
-        ):
-            for path in cache_root.glob(pattern):
-                add(path)
-
-    return candidates
-
-
-def _fetch_json(url: str, timeout: int = 30, retries: int = 5) -> dict:
-    last_error: Exception | None = None
-    for attempt in range(1, retries + 1):
-        try:
-            req = Request(url, headers=EASTMONEY_HEADERS, method="GET")
-            with urlopen(req, timeout=timeout) as resp:
-                return json.loads(resp.read().decode("utf-8", errors="replace"))
-        except Exception as exc:
-            last_error = exc
-            if attempt < retries:
-                time.sleep(1.2 * attempt)
-
-    for node_exe in _node_binary_candidates():
-        node_script = r"""
-const url = process.env.EASTMONEY_URL;
-const timeoutMs = Number(process.env.EASTMONEY_TIMEOUT_MS || 30000);
-const transport = require(url.startsWith('https:') ? 'https' : 'http');
-const req = transport.get(url, {
-  headers: {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-    'Accept': 'application/json, text/plain, */*',
-    'Referer': 'https://data.eastmoney.com/'
-  }
-}, (resp) => {
-  let body = '';
-  resp.setEncoding('utf8');
-  resp.on('data', (chunk) => { body += chunk; });
-  resp.on('error', fail);
-  resp.on('end', () => {
-    clearTimeout(timer);
-    if (resp.statusCode < 200 || resp.statusCode >= 300) {
-      console.error(`HTTP ${resp.statusCode}: ${body.slice(0, 500)}`);
-      process.exit(2);
-    }
-    process.stdout.write(body);
-  });
-});
-const timer = setTimeout(() => req.destroy(new Error('request deadline exceeded')), timeoutMs);
-function fail(err) {
-  clearTimeout(timer);
-  console.error(err && err.stack ? err.stack : String(err));
-  process.exit(1);
-}
-req.on('error', fail);
-"""
-        env = build_child_env(ROOT)
-        env["EASTMONEY_URL"] = url
-        env["EASTMONEY_TIMEOUT_MS"] = str(timeout * 1000)
-        for attempt in range(1, retries + 1):
-            try:
-                proc = subprocess.run(
-                    [node_exe, "-e", node_script],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    env=env,
-                    cwd=str(ROOT),
-                    timeout=timeout + 10,
-                )
-                if proc.returncode == 0 and proc.stdout.strip():
-                    return json.loads(proc.stdout)
-                last_error = RuntimeError((proc.stderr or proc.stdout or "node fetch failed").strip())
-            except Exception as exc:
-                last_error = exc
-            if attempt < retries:
-                time.sleep(1.2 * attempt)
-
-    raise RuntimeError(f"东财请求失败: {last_error}")
+    The provider's public DNS path resets these industry requests. The existing
+    concept collector proves the public edge route while retaining the original
+    HTTPS host for SNI and certificate verification. There is one transport and
+    one bounded attempt, with no Python/Node fallback chain.
+    """
+    from tools.sync_eastmoney_concept_market import _resolved_curl_json
+    parts = urlsplit(url)
+    if (parts.scheme != "https" or parts.hostname not in {
+            "push2delay.eastmoney.com", "push2his.eastmoney.com"}
+            or parts.username or parts.password or parts.port not in (None, 443)
+            or parts.fragment or parts.path not in {
+                "/api/qt/clist/get", "/api/qt/stock/kline/get"}):
+        raise SectorHeatContractError("sector_source: endpoint identity differs")
+    try:
+        return _resolved_curl_json(
+            f"https://{parts.hostname}{parts.path}", dict(parse_qsl(parts.query, keep_blank_values=True)),
+            host=parts.hostname, timeout=max(1, min(20, int(timeout))),
+        )
+    except Exception as exc:
+        raise SectorHeatContractError("sector_source: verified edge request failed") from exc
 
 
 def _cache_rows(db_rows: list[dict], snapshot_date: str, requested_date: str) -> None:

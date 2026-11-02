@@ -357,6 +357,26 @@ def load_turnover_universe_authority(
             stock_set_sha256=str(stock_set["stock_set_hash"]).lower(),
             expected_codes=codes,
         )
+    if getattr(truth, "provider", "") == "qmt_datadir":
+        from server.common.qmt_datadir_daily_coverage import load_daily_manifest
+        manifest = load_daily_manifest(connection, target.isoformat(), decision_known_at=cutoff,
+                                       manifest_hash=truth.truth_hash)
+        if manifest is None:
+            raise _blocked("exact local-cache daily universe proof is unavailable")
+        codes = tuple(
+            item["stock_code"] for item in manifest["entities"]
+            if item["classification"] == "TRADED"
+            and (Decimal(item["evidence"]["volume"]) > 0
+                 or Decimal(item["evidence"]["amount"]) > 0)
+        )
+        if not codes:
+            raise _blocked("exact local-cache daily trade universe is empty")
+        stock_set = expected_stock_set_contract(target.isoformat(), codes)
+        return TurnoverUniverseAuthority(
+            target_date=target, decision_at=cutoff,
+            truth_run_id=manifest["run_id"], truth_sha256=manifest["manifest_hash"],
+            stock_set_sha256=stock_set["stock_set_hash"], expected_codes=codes,
+        )
     catalog = load_stock_catalog(
         connection,
         batch_id=truth.catalog_batch_id,

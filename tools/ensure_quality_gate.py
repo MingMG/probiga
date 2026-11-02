@@ -1293,6 +1293,23 @@ def _load_qmt_coverage_bundle(
     dataset: str,
     trade_date: str,
 ) -> dict[str, Any]:
+    # Local-cache publications are a distinct formal provider. Their exact
+    # proof includes native no-bar evidence and is never re-labelled as the
+    # older embedded-QMT attestation schema.
+    from server.common.qmt_datadir_result import load_receipt
+    current = datetime.now(ZoneInfo("Asia/Shanghai"))
+    if dataset == "stock_daily":
+        from server.common.qmt_datadir_daily_coverage import load_daily_manifest
+        proof = load_daily_manifest(connection, trade_date, decision_known_at=current)
+        if proof is not None:
+            return {"manifest": proof, "entities": proof["entities"]}
+        if load_receipt(connection, dataset=dataset, trade_date=trade_date) is not None:
+            raise RuntimeError("local-cache daily publication lacks exact full-market proof")
+    elif dataset == "stock_minute":
+        if load_receipt(connection, dataset=dataset, trade_date=trade_date) is not None:
+            from server.common.qmt_datadir_minute_coverage import load_verified_minute_publication
+            proof = load_verified_minute_publication(connection, trade_date, decision_known_at=current)
+            return {"manifest": proof}
     rows = connection.execute(text("""
         SELECT manifest_hash, schema_version, dataset, trade_date, status,
                strategy_eligible, provider, expected_entity_count,
@@ -1365,6 +1382,23 @@ def _validate_qmt_canonical_strategy_partitions(
     with history_engine.connect() as connection:
         for (dataset, trade_date), bundle in bundles.items():
             manifest = bundle["manifest"]
+            if manifest.get("provider") == "qmt_datadir":
+                current = datetime.now(ZoneInfo("Asia/Shanghai"))
+                if dataset == "stock_daily":
+                    from server.common.qmt_datadir_daily_coverage import SCHEMA, load_daily_manifest
+                    proof = load_daily_manifest(connection, trade_date, decision_known_at=current,
+                                                manifest_hash=str(manifest.get("manifest_hash") or ""))
+                    if (manifest.get("schema") != SCHEMA or proof != manifest
+                            or bundle.get("entities") != proof["entities"]):
+                        raise RuntimeError("local-cache daily release proof differs")
+                elif dataset == "stock_minute":
+                    from server.common.qmt_datadir_minute_coverage import SCHEMA, load_verified_minute_publication
+                    proof = load_verified_minute_publication(connection, trade_date, decision_known_at=current)
+                    if manifest.get("schema") != SCHEMA or proof != manifest:
+                        raise RuntimeError("local-cache minute release proof differs")
+                else:
+                    raise RuntimeError("unsupported local-cache coverage dataset")
+                continue
             entities = list(bundle["entities"])
             if dataset == "stock_daily":
                 rows = connection.execute(text("""

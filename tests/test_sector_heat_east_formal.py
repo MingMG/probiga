@@ -13,40 +13,31 @@ from tools import fetch_sector_heat_east_daily as sector
 TARGET_DATE = "2026-08-26"
 
 
-def test_node_fallback_without_fetch_or_abortcontroller(monkeypatch):
-    import shutil
-    import subprocess
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-    from threading import Thread
-    node = shutil.which("node")
-    if not node:
-        pytest.skip("Node runtime unavailable")
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b'{"ok":true}')
-        def log_message(self, *_args):
-            pass
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    thread = Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    original_run = subprocess.run
-    def legacy_node(args, **kwargs):
-        args = list(args)
-        args[2] = "global.fetch = undefined; global.AbortController = undefined;\n" + args[2]
-        return original_run(args, **kwargs)
-    def unavailable(*_args, **_kwargs):
-        raise OSError("force existing Node fallback")
-    monkeypatch.setattr(sector, "urlopen", unavailable)
-    monkeypatch.setattr(sector, "_node_binary_candidates", lambda: [node])
-    monkeypatch.setattr(sector.subprocess, "run", legacy_node)
-    try:
-        assert sector._fetch_json(f"http://127.0.0.1:{server.server_port}", timeout=1, retries=1) == {"ok": True}
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+def test_provider_dns_reset_uses_proven_edge_without_changing_source(monkeypatch):
+    from tools import sync_eastmoney_concept_market as provider
+    seen = {}
+    def edge(url, params, *, host, timeout):
+        seen.update(url=url, params=params, host=host, timeout=timeout)
+        # The industry response that succeeded through the verified edge in
+        # the production canary; the DNS route reset before returning JSON.
+        return {"data": {"total": 1, "diff": [{"f12": "BK1201", "f14": "电子",
+                "f6": 396532043173.0, "f3": 2.72, "f124": 1793605170}]}}
+    monkeypatch.setattr(provider, "_resolved_curl_json", edge)
+    rows = sector._fetch_eastmoney_industries()
+    assert len(rows) == 1 and rows[0]["concept_code"] == "BK1201"
+    assert rows[0]["_trade_date_hint"] == "2026-11-02"
+    assert seen["host"] == "push2delay.eastmoney.com" and seen["params"]["fs"] == "m:90+t:2"
+
+
+@pytest.mark.parametrize("url", [
+    "http://push2delay.eastmoney.com/api/qt/clist/get",
+    "https://push2delay.eastmoney.com.attacker.test/api/qt/clist/get",
+    "https://user:password@push2delay.eastmoney.com/api/qt/clist/get",
+    "https://push2delay.eastmoney.com/api/other",
+])
+def test_sector_source_identity_cannot_be_changed(url):
+    with pytest.raises(sector.SectorHeatContractError, match="endpoint identity"):
+        sector._fetch_json(url)
 
 
 def _engine():

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Publish Xueqiu's exact current-session A-share hot-stock Top100."""
+"""Publish the A-share projection of Xueqiu's native Shanghai/Shenzhen Top100."""
 
 from __future__ import annotations
 
@@ -36,6 +36,7 @@ from server.common.hot_rank_source_contract import (
     require_current_capture_window,
     shanghai_now,
     validate_rank_inventory,
+    xueqiu_source_inventory,
 )
 
 
@@ -52,9 +53,9 @@ _SESSION.headers.update({
 
 # Xueqiu's ``type=10`` feed is a global cross-market Top100.  Filtering that
 # response after the fact yields only about half an A-share list and cannot be
-# relabelled as an A-share Top100.  ``type=12`` is the provider's dedicated
-# Shanghai/Shenzhen A-share ranking and is still verified as an exact Top100
-# before any database write.
+# relabelled as an A-share Top100. ``type=12`` is the native Shanghai/Shenzhen
+# securities Top100, which also contains ETFs. Preserve that complete source
+# inventory and publish its exact A-share subset, without inventing rank 101.
 _XQ_A_SHARE_HOT_TYPE = 12
 
 
@@ -99,31 +100,10 @@ def _fetch_hot_rank_xq() -> pd.DataFrame | None:
     if not items:
         return None
 
-    rows: list[dict[str, Any]] = []
-    for item in items:
-        symbol = str(item.get("symbol") or "").upper().strip()
-        matched = re.fullmatch(r"(?:SH|SZ|BJ)([0-9]{6})", symbol)
-        if not matched:
-            continue
-        stock_code = matched.group(1)
-        if not stock_code.startswith(("0", "3", "4", "6", "8")):
-            continue
-        rows.append({
-            "rank": len(rows) + 1,
-            "stock_code": stock_code,
-            "short_name": str(item.get("name") or ""),
-            "current": float(item.get("current") or 0),
-            "percent": float(item.get("percent") or 0),
-            "chg": float(item.get("chg") or 0),
-            "amount": float(item.get("amount") or 0),
-            "market_capital": float(item.get("market_capital") or 0),
-            "followers": int(item.get("following") or 0),
-            "sector": str(item.get("level1") or ""),
-            "exchange": str(item.get("exchange") or ""),
-            "increment": int(item.get("increment") or 0),
-            "diff": int(item.get("diff") or 0),
-        })
-    return pd.DataFrame(rows)
+    rows, evidence = xueqiu_source_inventory(items)
+    frame = pd.DataFrame(rows)
+    frame.attrs["source_evidence"] = evidence
+    return frame
 
 
 def _readback_hot_rank(engine, snapshot_date: str) -> list[dict[str, Any]]:
@@ -150,7 +130,7 @@ def fetch_hot_rank_xq(
     if snapshot_date != current.date().isoformat():
         raise HotRankDataBlocked("CURRENT_ONLY_HISTORICAL_LABEL_PROHIBITED")
 
-    print(f"开始获取雪球热股TOP100，快照日期: {snapshot_date}")
+    print(f"开始获取雪球热门Top100中的A股，快照日期: {snapshot_date}")
     engine = create_batch_engine()
     _ensure_snapshot_date_column(engine)
     started_at = require_current_capture_window(
@@ -178,6 +158,7 @@ def fetch_hot_rank_xq(
     source_inventory = validate_rank_inventory(
         frame.to_dict(orient="records"),
         task_type=HOT_RANK_XQ_TASK_TYPE,
+        source_evidence=frame.attrs.get("source_evidence"),
     )
     captured_at = shanghai_now()
     batch_at = captured_at.isoformat(sep=" ", timespec="seconds")
@@ -206,6 +187,7 @@ def fetch_hot_rank_xq(
         persisted,
         task_type=HOT_RANK_XQ_TASK_TYPE,
         target_date=snapshot_date,
+        source_evidence=source_inventory["source_evidence"],
     )
     if (
         persisted_inventory["provider_payload_sha256"]
@@ -226,14 +208,15 @@ def fetch_hot_rank_xq(
         inventory=persisted_inventory,
     )
     print(
-        f"写入完成: st_hot_rank_xq, 共 {len(frame)} 行, "
+        f"写入完成: st_hot_rank_xq, 原生榜单 {source_inventory['source_row_count']} 项, "
+        f"A股 {len(frame)} 只, 排除基金 {source_inventory['excluded_security_count']} 项, "
         f"快照日期: {snapshot_date}"
     )
     return receipt
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="雪球当前交易日热股Top100同步")
+    parser = argparse.ArgumentParser(description="雪球当前交易日原生Top100榜单的A股投影同步")
     parser.add_argument("date", help="快照日期，格式：YYYY-MM-DD")
     args = parser.parse_args()
     try:

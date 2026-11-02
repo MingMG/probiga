@@ -64,7 +64,7 @@ def test_datadir_result_requires_build_and_complete_readback(monkeypatch):
         "coverage": 1.0,
         "readback_rows": 1,
         "readback_codes": 1,
-        "attestation_run_id": "attest-1",
+        "full_market_manifest_hash": "d" * 64,
     }
     payload = result.build_result(
         dataset="stock_daily",
@@ -109,18 +109,17 @@ def test_datadir_result_requires_build_and_complete_readback(monkeypatch):
                     "row_hash": fingerprint["row_hash"],
                     "eligible_code_count": 1,
                     "coverage": 1.0,
-                    "attestation_run_id": "attest-1",
+                    "full_market_manifest_hash": "d" * 64,
                 }),
             },
         )
 
-    from types import SimpleNamespace
-    from server.common import qmt_daily_market_truth
+    from server.common import qmt_datadir_daily_coverage
 
     monkeypatch.setattr(
-        qmt_daily_market_truth,
-        "load_qmt_daily_market_truth",
-        lambda *_args, **_kwargs: SimpleNamespace(run_id="attest-1"),
+        qmt_datadir_daily_coverage,
+        "load_daily_manifest",
+        lambda *_args, **_kwargs: {"run_id": "run-1"},
     )
     proof = result.validate_persisted_result(
         engine,

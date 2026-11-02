@@ -6,7 +6,6 @@ import argparse
 import datetime as dt
 import hashlib
 import json
-import math
 import os
 import sys
 import uuid
@@ -42,13 +41,21 @@ from server.common.qmt_datadir_result import (  # noqa: E402
     partition_from_receipt,
     persisted_fingerprint,
 )
+from server.common.qmt_datadir_daily_coverage import (  # noqa: E402
+    build_manifest,
+    canonical_bar,
+    insert_manifest,
+    load_daily_manifest,
+    retained_listing_evidence,
+    suspension_evidence,
+)
+from server.common.qmt_stock_catalog import load_stock_catalog  # noqa: E402
 from tools.env_config import load_project_env  # noqa: E402
 
 DATASET = "stock_daily"
 SOURCE = "qmt_datadir"
 TARGET_TABLE = "sm_stock_kline"
 RECEIPT_TABLE = "qmt_datadir_import_partition"
-MIN_COVERAGE = 0.95
 
 
 def _build_sha() -> str:
@@ -143,6 +150,91 @@ def _harvest(root: Path, universe, session: dt.date) -> dict:
     }
 
 
+def _harvested_daily_rows(harvested):
+    fields = ("stock_code", "trade_time", "trade_date", "open", "close", "high", "low",
+              "volume", "amount", "pre_close", "change", "change_pct")
+    return [dict(zip(fields, row)) for row in harvested["rows"]]
+
+
+def _reusable_partition(engine, *, session, harvested):
+    """Keep the same immutable publication when source content is unchanged."""
+    cutoff = dt.datetime.now(CST).replace(tzinfo=None, microsecond=0)
+    day = session.isoformat()
+    proof = load_daily_manifest(engine, day, decision_known_at=cutoff)
+    if proof is None:
+        return None
+    bars = sorted((canonical_bar(row) for row in _harvested_daily_rows(harvested)),
+                  key=lambda row: row["stock_code"])
+    if bars != [item["evidence"] for item in proof["entities"] if item["classification"] == "TRADED"]:
+        return None
+    with engine.connect() as connection:
+        catalog = load_stock_catalog(connection, decision_known_at=cutoff)
+        calendar = load_trade_calendar_receipt(connection, start_date=day, end_date=day,
+                                               decision_known_at=cutoff)
+    if (catalog.member_set_hash != proof["catalog_member_set_hash"]
+            or sorted(catalog.eligible_codes(day)) != [item["stock_code"] for item in proof["entities"]]
+            or calendar.sessions_between(day, day) != [day]):
+        return None
+    receipt = load_receipt(engine, dataset=DATASET, trade_date=day)
+    if receipt is None:
+        return None
+    detail = receipt.get("detail") or {}
+    fingerprint = persisted_fingerprint(engine, dataset=DATASET, trade_date=day)
+    if (receipt.get("status") != "COMPLETE" or receipt.get("run_id") != proof["run_id"]
+            or int(receipt.get("row_count") or 0) != len(bars)
+            or int(receipt.get("code_count") or 0) != len(bars)
+            or detail.get("full_market_manifest_hash") != proof["manifest_hash"]
+            or detail.get("coverage") != 1.0
+            or detail.get("readback_rows") != len(bars) or detail.get("readback_codes") != len(bars)
+            or detail.get("row_hash") != fingerprint["row_hash"]):
+        return None
+    return proof
+
+
+def _coverage_manifest(engine, *, session, harvested, run_id):
+    """Account for every catalog security before touching the live partition."""
+    cutoff = dt.datetime.now(CST).replace(tzinfo=None, microsecond=0)
+    day = session.isoformat()
+    with engine.connect() as connection:
+        catalog = load_stock_catalog(connection, decision_known_at=cutoff)
+        calendar = load_trade_calendar_receipt(
+            connection, start_date=day, end_date=day, decision_known_at=cutoff,
+        )
+    rows = _harvested_daily_rows(harvested)
+    missing = sorted(set(catalog.eligible_codes(day)) - set(harvested["codes"]))
+    snapshot = {}
+    unresolved = []
+    if missing:
+        from integrations.bigqmt.spool import read_snapshot
+        try:
+            snapshot = read_snapshot("full", max_age_seconds=None)
+        except (OSError, ValueError):
+            snapshot = {}
+        # Catalog reads may take time while the native snapshot keeps polling.
+        # Bind the observation to the time it was actually read, not the
+        # earlier instant at which the database authority lookup began.
+        cutoff = dt.datetime.now(CST).replace(tzinfo=None, microsecond=0)
+        for code in missing:
+            try:
+                suspension_evidence(snapshot, code, day, cutoff)
+            except (ValueError, KeyError, TypeError, OverflowError):
+                unresolved.append(code)
+    listings = {}
+    if unresolved:
+        listings = retained_listing_evidence(
+            engine, unresolved, target_date=day, decision_known_at=cutoff,
+        )
+        unresolved = sorted(set(unresolved) - set(listings))
+    if unresolved:
+        from server.common.official_listing_evidence import load_official_listing_evidence
+        listings.update(load_official_listing_evidence(
+            unresolved, target_date=day, deadline_seconds=20,
+        ))
+    cutoff = dt.datetime.now(CST).replace(tzinfo=None, microsecond=0)
+    return build_manifest(catalog=catalog, calendar=calendar, day=day, rows=rows,
+                          run_id=run_id, captured_at=cutoff, snapshot=snapshot, listings=listings)
+
+
 def _publish(
     engine,
     *,
@@ -154,6 +246,7 @@ def _publish(
     source_root: Path,
     content_sha256: str,
     eligible_code_count: int,
+    coverage_manifest: dict,
 ) -> dict:
     now = dt.datetime.now(CST).replace(tzinfo=None, microsecond=0)
     batch_id = f"qmt_dat_daily_{session:%Y%m%d}_{run_id}"
@@ -341,6 +434,13 @@ def _publish(
             dataset=DATASET,
             trade_date=session.isoformat(),
         )
+        if (fingerprint["row_count"] != len(rows)
+                or fingerprint["code_count"] != len(covered_codes)):
+            raise ValueError("daily database readback differs before completion")
+        insert_manifest(connection, coverage_manifest)
+        if load_daily_manifest(connection, session.isoformat(), decision_known_at=now,
+                               manifest_hash=coverage_manifest["manifest_hash"]) is None:
+            raise ValueError("daily immutable proof readback failed before completion")
         connection.execute(
             text(
                 f"""
@@ -373,10 +473,8 @@ def _publish(
                         "readback_codes": fingerprint["code_count"],
                         "row_hash": fingerprint["row_hash"],
                         "eligible_code_count": int(eligible_code_count),
-                        "coverage": (
-                            len(covered_codes) / int(eligible_code_count)
-                            if int(eligible_code_count) else 0.0
-                        ),
+                        "coverage": 1.0,
+                        "full_market_manifest_hash": coverage_manifest["manifest_hash"],
                     },
                     ensure_ascii=False,
                     separators=(",", ":"),
@@ -434,19 +532,16 @@ def main(argv: list[str] | None = None) -> int:
             })
             continue
         harvested = _harvest(root, universe, session)
-        eligible = universe.eligible_codes(session)
-        required = math.ceil(eligible * MIN_COVERAGE)
-        if len(harvested["codes"]) < required:
-            failures += 1
-            results.append({
-                "session": session.isoformat(),
-                "status": "FAILED",
-                "reason": "insufficient_code_coverage",
-                "codes": len(harvested["codes"]),
-                "eligible": eligible,
-                "required": required,
-            })
+        reused = _reusable_partition(engine, session=session, harvested=harvested)
+        if reused is not None:
+            results.append({"session": session.isoformat(), "status": "REUSED",
+                            "run_id": reused["run_id"], "manifest_hash": reused["manifest_hash"]})
             continue
+        eligible = universe.eligible_codes(session)
+        run_id = new_run_id()
+        coverage_manifest = _coverage_manifest(
+            engine, session=session, harvested=harvested, run_id=run_id,
+        )
         if not args.apply:
             results.append({
                 "session": session.isoformat(),
@@ -455,7 +550,6 @@ def main(argv: list[str] | None = None) -> int:
                 "codes": len(harvested["codes"]),
             })
             continue
-        run_id = new_run_id()
         published = _publish(
             engine,
             session=session,
@@ -466,6 +560,7 @@ def main(argv: list[str] | None = None) -> int:
             source_root=root,
             content_sha256=harvested["digest"],
             eligible_code_count=eligible,
+            coverage_manifest=coverage_manifest,
         )
         results.append({
             "session": session.isoformat(),

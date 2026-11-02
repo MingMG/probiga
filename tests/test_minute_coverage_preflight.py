@@ -70,6 +70,23 @@ def test_missing_first_batch_stops_after_one_index_bounded_select(database):
     assert "SHA2" not in sql and "GROUP_CONCAT" not in sql
 
 
+def test_preflight_uses_code_and_time_range_of_existing_production_index(database):
+    """Reproduce the timeout's plan boundary without scanning code history."""
+    with database.begin() as connection:
+        connection.execute(text("CREATE INDEX idx_scfm_code_time ON sm_stock_capital_flow_min(stock_code,trade_time)"))
+        put_minutes(connection, "000001", 240)
+    calls = []
+    def record(connection, cursor, statement, params, context, many):
+        calls.append((statement, params))
+    event.listen(database, "before_cursor_execute", record)
+    with database.connect() as connection:
+        assert probe(connection, ["000001"]) is True
+    event.remove(database, "before_cursor_execute", record)
+    with database.connect() as connection:
+        plan = connection.exec_driver_sql("EXPLAIN QUERY PLAN " + calls[0][0], calls[0][1]).all()
+    assert any("stock_code=? AND trade_time>? AND trade_time<?" in row[-1] for row in plan)
+
+
 @pytest.mark.parametrize("counts,expected", [((240, 241), True), ((241,), False)])
 def test_public_and_native_counts_remain_distinct_for_native_fallback(database, counts, expected):
     with database.begin() as connection:

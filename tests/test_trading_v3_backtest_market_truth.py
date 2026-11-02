@@ -159,6 +159,25 @@ def test_v3_market_truth_accepts_exact_catalog_attested_rows(monkeypatch):
     assert "selected_run_id" not in connection.params[1]
 
 
+def test_native_history_range_is_not_replaced_by_the_first_days_cache_proof(monkeypatch):
+    from server.common import qmt_datadir_daily_coverage
+    _bind_roots(monkeypatch)
+    def first_day_is_not_a_range(*args, **kwargs):
+        raise AssertionError("a first-day local-cache proof cannot stand for the history range")
+    monkeypatch.setattr(qmt_datadir_daily_coverage, "load_daily_manifest", first_day_is_not_a_range)
+    connection = _Connection(_manifest(), [
+        {"trade_date": "2026-08-21", "attested_row_count": 2, "attested_stock_count": 2},
+        {"trade_date": "2026-08-24", "attested_row_count": 3, "attested_stock_count": 3},
+    ])
+    truth = truth_module.load_qmt_daily_market_truth(
+        connection, start_date="2026-08-21", end_date="2026-08-24",
+        decision_known_at="2026-08-24 20:00:00",
+    )
+    assert truth.provider == truth_module.QMT_DAILY_PROVIDER
+    assert truth.attested_row_count == 5
+    assert truth.requested_sessions == ("2026-08-21", "2026-08-24")
+
+
 def test_v3_market_truth_blocks_missing_or_stale_attested_symbol(monkeypatch):
     _bind_roots(monkeypatch)
     connection = _Connection(_manifest(), [

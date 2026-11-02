@@ -34,15 +34,12 @@ if str(ROOT) not in sys.path:
 from integrations.qmt.datadir import CST  # noqa: E402
 from integrations.qmt.datadir_import import (  # noqa: E402
     DEFAULT_CHUNK_ROWS,
-    DEFAULT_MIN_COVERAGE,
     DEFAULT_SESSIONS_PER_BATCH,
     DATASET,
-    REASON_THIN_CACHE,
     SOURCE,
     STATUS_COMPLETE,
     STATUS_FAILED,
     STATUS_RUNNING,
-    coverage_shortfall,
     require_schema,
     completed_sessions,
     drop_staged,
@@ -53,10 +50,10 @@ from integrations.qmt.datadir_import import (  # noqa: E402
     new_run_id,
     plan,
     publish_session,
-    readback_session,
     write_receipt,
 )
-from server.common.minute_data import get_minute_engine  # noqa: E402
+from server.common.config import get_minute_mysql_url  # noqa: E402
+from server.common.engine_factory import create_pooled_engine  # noqa: E402
 from server.common.qmt_index_minute_grid import CORE_GRID  # noqa: E402
 from server.common.authoritative_market_clock import (  # noqa: E402
     authoritative_closed_trade_date,
@@ -64,9 +61,12 @@ from server.common.authoritative_market_clock import (  # noqa: E402
 from server.common.qmt_trade_calendar import load_trade_calendar_receipt  # noqa: E402
 from server.common.qmt_datadir_result import (  # noqa: E402
     build_result,
+    build_unavailable_result,
     load_receipt,
     partition_from_receipt,
-    persisted_fingerprint,
+)
+from server.common.qmt_datadir_minute_coverage import (  # noqa: E402
+    trade_scope, validate_code_scope, persisted_matrix,
 )
 from tools.env_config import load_project_env  # noqa: E402
 
@@ -154,17 +154,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--batch-sessions", type=int, default=DEFAULT_SESSIONS_PER_BATCH)
     parser.add_argument("--chunk-rows", type=int, default=DEFAULT_CHUNK_ROWS)
-    parser.add_argument(
-        "--min-coverage",
-        type=float,
-        default=DEFAULT_MIN_COVERAGE,
-        help="fraction of the day's catalog-eligible codes the cache must hold",
-    )
     parser.add_argument("--json", action="store_true", help="emit a JSON report")
     args = parser.parse_args(argv)
 
     load_project_env()
-    engine = get_minute_engine()
+    engine = create_pooled_engine(get_minute_mysql_url(), pool_size=2, max_overflow=0,
+        pool_timeout=10, connect_args={"connect_timeout": 8, "read_timeout": 45, "write_timeout": 45})
     if args.latest_session:
         latest = authoritative_closed_trade_date(engine)
         start = end = dt.date.fromisoformat(latest)
@@ -235,6 +230,13 @@ def main(argv: list[str] | None = None) -> int:
         for source in item.existing_sources
     })
     ordered = universe.ordered()
+    try:
+        scopes = {item.session: trade_scope(engine, item.session.isoformat()) for item in todo}
+    except ValueError as exc:
+        print(json.dumps(build_unavailable_result(dataset=DATASET,
+            sessions=[item.session.isoformat() for item in todo],
+            reason=str(exc), build_sha=_build_sha()), ensure_ascii=False), flush=True)
+        return 3
     results: list[dict] = []
     published: dict[dt.date, dict] = {}
     # The client keeps only its own recent window, so an older snapshot may
@@ -258,6 +260,7 @@ def main(argv: list[str] | None = None) -> int:
                     sessions=wanted,
                     run_id=run_id,
                     chunk_rows=args.chunk_rows,
+                    codes_by_session={day: set(scopes[day]["codes"]) for day in wanted},
                 )
             for item in group:
                 session = item.session
@@ -281,23 +284,20 @@ def main(argv: list[str] | None = None) -> int:
                         "bad_grid_codes": bad_grid_codes,
                     }
                     continue
-                shortfall = coverage_shortfall(universe, session, len(entry["codes"]),
-                                               args.min_coverage)
-                if shortfall is not None:
-                    # A cached fragment of a day is a gap, not a session:
-                    # publishing it would make the date look covered while
-                    # most instruments are missing from it.
+                try:
+                    validate_code_scope(entry, scopes[session])
+                except ValueError as exc:
                     shortfalls[session] = {
                         "run_id": run_id, "root": str(root),
-                        "reason": REASON_THIN_CACHE, "rows": entry["rows"],
+                        "reason": str(exc), "rows": entry["rows"],
                         "imported_codes": len(entry["codes"]),
-                        "eligible_codes": shortfall, "digest": entry["digest"],
+                        "eligible_codes": scopes[session]["eligible_code_count"], "digest": entry["digest"],
                     }
                     continue
                 outcome = _publish_one(
                     engine, session=session, entry=entry, run_id=run_id, root=root,
                     replace=item.action == "REPLACE", replace_sources=replace_sources,
-                    eligible_codes=universe.eligible_codes(session),
+                    scope=scopes[session],
                 )
                 published[session] = outcome
                 results.append(outcome)
@@ -354,7 +354,7 @@ def _publish_one(
     root,
     replace,
     replace_sources,
-    eligible_codes,
+    scope,
 ):
     """Stage-to-canonical publication of one session, proven by readback."""
     with engine.begin() as conn:
@@ -365,6 +365,8 @@ def _publish_one(
         )
     try:
         with engine.begin() as conn:
+            # Recheck the frozen daily scope before replacing any live minute.
+            trade_scope(conn, session.isoformat(), manifest_hash=scope["full_market_manifest_hash"])
             publish_session(
                 conn,
                 session=session,
@@ -372,19 +374,11 @@ def _publish_one(
                 batch_id=new_batch_id(session, run_id),
                 replace_sources=replace_sources if replace else (),
             )
-        with engine.begin() as conn:
-            rows, codes = readback_session(conn, session)
-            fingerprint = persisted_fingerprint(
-                conn,
-                dataset=DATASET,
-                trade_date=session.isoformat(),
-            )
-            ok = (
-                rows == entry["rows"]
-                and codes == len(entry["codes"])
-                and fingerprint["row_count"] == rows
-                and fingerprint["code_count"] == codes
-            )
+            fingerprint = persisted_matrix(conn, session.isoformat(), scope=scope)
+            rows, codes = fingerprint["row_count"], fingerprint["code_count"]
+            ok = rows == entry["rows"] and codes == len(entry["codes"])
+            if not ok:
+                raise ValueError("exact minute matrix differs from harvested partition")
             write_receipt(
                 conn, session=session, root=str(root),
                 status=STATUS_COMPLETE if ok else STATUS_FAILED, run_id=run_id,
@@ -394,13 +388,10 @@ def _publish_one(
                     "readback_rows": rows,
                     "readback_codes": codes,
                     "row_hash": fingerprint["row_hash"],
-                    "eligible_code_count": int(eligible_codes),
-                    "coverage": (
-                        len(entry["codes"]) / int(eligible_codes)
-                        if int(eligible_codes) else 0.0
-                    ),
-                    "minute_grid_count": len(CORE_GRID),
-                    "bad_grid_codes": 0,
+                    **{key: fingerprint[key] for key in (
+                        "eligible_code_count", "coverage", "full_market_manifest_hash",
+                        "expected_traded_code_set_sha256", "minute_grid_count",
+                        "minute_grid_sha256", "bad_grid_codes")},
                 },
             )
     except Exception as exc:  # noqa: BLE001 - the receipt records the cause

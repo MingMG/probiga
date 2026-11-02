@@ -109,6 +109,12 @@ from server.common.scheduler_tasks import (
     claim_scheduler_task_run,
     update_scheduler_task,
 )
+from server.common.scheduler_task_lease import (
+    TaskOwnerLease,
+    encode as encode_task_owner_lease,
+    expired as task_owner_lease_expired,
+    read as read_task_owner_lease,
+)
 from server.common.strategy_governance_mode import (
     StrategyGovernanceModeError,
     strategy_governance_database_deferred,
@@ -518,6 +524,7 @@ _running_timeout_minutes: dict[int, int | None] = {}
 _running_task_ids: set[int] = set()
 _core_running_task_ids: set[int] = set()
 _running_history_uids: dict[int, str] = {}
+_task_owner_leases: dict[str, TaskOwnerLease] = {}
 # ``*_pending`` means termination is being attempted; workers only treat the
 # corresponding ``*_requested`` set as authoritative after exit confirmation.
 _stop_pending_task_ids: set[int] = set()
@@ -4951,17 +4958,15 @@ def _recover_interrupted_manual_claim(
     row: dict,
     started_at: datetime,
 ) -> bool:
-    """Release a proven-dead previous-build claim after scheduler restart.
+    """Release an expired exact-run lease only after its owner has exited.
 
     A generic missing process registry is not sufficient evidence: another
     host may still own the writer.  Recovery is allowed only when the durable
     running history identifies only manual/scheduled owners on this host,
-    each owner belongs to an older build or a corroborated previous OS boot,
-    every PID is proven absent,
-    and the newest start timestamp is the task-table claim being released. A
-    same-build process is never reclaimed from PID evidence alone. Windows
-    reboot recovery additionally requires its history to predate boot by a
-    minute, and keeps the PID-absence check conservative in case of PID reuse.
+    New audits have a renewable run lease even for a manual launcher that is
+    not a standalone scheduler. Unleased historical audits still require the
+    established previous-build/OS-boot evidence. Every PID must be absent;
+    a live or reused PID prevents recovery even after the lease expires.
     """
 
     task_id = int(row["id"])
@@ -4973,8 +4978,8 @@ def _recover_interrupted_manual_claim(
                 dict(item)
                 for item in connection.execute(
                     text(
-                        "SELECT run_uid, run_at, status, host_name, "
-                        "scheduler_instance_id, build_sha, trigger_source "
+                        "SELECT run_uid, task_id, task_name, task_type, run_at, status, host_name, "
+                        "scheduler_instance_id, build_sha, trigger_source, output "
                         "FROM st_scheduled_task_history "
                         "WHERE task_id=:task_id AND status='running' "
                         "ORDER BY run_at DESC, id DESC LIMIT 101 FOR UPDATE"
@@ -5003,8 +5008,21 @@ def _recover_interrupted_manual_claim(
                     or re.fullmatch(r"[0-9a-f]{40}", previous_build) is None
                 ):
                     return False
+                owner_lease = read_task_owner_lease(history)
                 owner_evidence = "previous_build"
-                if previous_build == current_build:
+                if owner_lease is not None:
+                    if not task_owner_lease_expired(history, now=_now_shanghai_naive()):
+                        return False
+                    stages = connection.execute(text(
+                        "SELECT lease_until FROM st_daily_stage_attempt "
+                        "WHERE scheduler_run_uid=:run_uid AND status='RUNNING' FOR UPDATE"
+                    ), {"run_uid": run_uid}).mappings().all()
+                    if any(_coerce_datetime(stage.get("lease_until")) is None
+                           or _coerce_datetime(stage["lease_until"]) >= _now_shanghai_naive()
+                           for stage in stages):
+                        return False
+                    owner_evidence = "expired_exact_run_lease:" + owner_lease["lease_until"].isoformat()
+                elif previous_build == current_build:
                     if str(history.get("trigger_source") or "").strip() == "release_catchup":
                         # Release catch-up runs synchronously in a short-lived
                         # helper outside the daemon process registry.  Its
@@ -7417,15 +7435,25 @@ def _task_history_start(engine, row: dict, *, run_uid: str | None = None) -> str
                 or claimed_at != triggered_at
             ):
                 raise RuntimeError("scheduler task claim identity differs")
+            original_identity = _terminal_run_identity({
+                "run_uid": run_uid, "task_id": task_id,
+                "task_name": str(row.get("task_name") or "")[:255],
+                "task_type": str(row.get("task_type") or "")[:64],
+                "run_at": claimed_at, "host_name": gethostname()[:128],
+                "scheduler_instance_id": _scheduler_instance_id[:128],
+                "build_sha": _scheduler_build_commit_sha(),
+                "trigger_source": str(row.get("_trigger_source") or "scheduled")[:32],
+            })
+            lease_output = encode_task_owner_lease(original_identity, claimed_at)
             conn.execute(
                 text(
                     "INSERT INTO st_scheduled_task_history "
                     "(run_uid, task_id, task_name, task_type, run_at, status, "
                     "host_name, scheduler_instance_id, build_sha, "
-                    "trigger_source) "
+                    "trigger_source, output) "
                     "VALUES (:run_uid, :task_id, :task_name, :task_type, :run_at, "
                     "'running', :host_name, :instance_id, :build_sha, "
-                    ":trigger_source)"
+                    ":trigger_source, :owner_lease)"
                 ),
                 {
                     "run_uid": run_uid,
@@ -7437,6 +7465,7 @@ def _task_history_start(engine, row: dict, *, run_uid: str | None = None) -> str
                     "instance_id": _scheduler_instance_id[:128],
                     "build_sha": _scheduler_build_commit_sha(),
                     "trigger_source": str(row.get("_trigger_source") or "scheduled")[:32],
+                    "owner_lease": lease_output,
                 },
             )
             # Preserve the actual committed claim tuple while this worker is
@@ -7453,6 +7482,10 @@ def _task_history_start(engine, row: dict, *, run_uid: str | None = None) -> str
             })
         with _running_lock:
             _terminal_run_identities[run_uid] = original_identity
+            _task_owner_leases[run_uid] = TaskOwnerLease(
+                engine, original_identity, lease_output, clock=_now_shanghai_naive,
+                on_lost=lambda: _stop_exact_child_after_owner_lease_loss(task_id, run_uid),
+            )
             _terminal_stage_identities[run_uid] = None
             _terminal_session_identities[run_uid] = None
             if task_id in _running_task_ids:
@@ -7465,6 +7498,16 @@ def _task_history_start(engine, row: dict, *, run_uid: str | None = None) -> str
     except Exception as exc:
         logger.warning("Failed to append scheduler history start for task %s: %s", task_id, exc)
         return None
+
+
+def _stop_exact_child_after_owner_lease_loss(task_id: int, run_uid: str) -> None:
+    """Lease loss never authorizes stopping QMT or a different job process."""
+    with _running_lock:
+        if _running_history_uids.get(task_id) != run_uid:
+            return
+        proc = _running_procs.get(task_id)
+    if proc is not None:
+        _terminate_process_and_confirm(proc, timeout_seconds=5.0)
 
 
 def _activate_analysis_strategy_pool(
@@ -8899,23 +8942,29 @@ def _terminal_check_running(connection, uid, intent, *, for_update=False):
 
 def _terminal_expired_publication(connection, journal, uid, intent):
     """Known publication rejection under the already held original daily locks."""
-    if (intent["outcome"]["task_type"] not in DAILY_RESULT_RECOVERY_TASK_TYPES
-            or intent["outcome"]["status"] not in {"success", "degraded"}):
+    if intent["outcome"]["status"] not in {"success", "degraded"}:
         return intent
-    stage = _terminal_stage_row(connection, uid)
-    if stage is None:
-        return intent  # Existing stage validator gives a definite rejection.
-    until = _coerce_datetime(stage["lease_until"])
-    if until is not None and until >= _now_shanghai_naive():
-        return intent
+    owner_expired = task_owner_lease_expired(
+        _terminal_history_row(connection, uid), now=_now_shanghai_naive())
+    if not owner_expired:
+        if intent["outcome"]["task_type"] not in DAILY_RESULT_RECOVERY_TASK_TYPES:
+            return intent
+        stage = _terminal_stage_row(connection, uid)
+        if stage is None:
+            return intent  # Existing stage validator gives a definite rejection.
+        until = _coerce_datetime(stage["lease_until"])
+        if until is not None and until >= _now_shanghai_naive():
+            return intent
     from server.common.scheduler_terminal_journal import digest
     original = journal.read(uid, "OBSERVED")
     journal.preserve(uid, "REJECTED", dict(
         schema="probiga.scheduler-terminal-rejection.v1",
-        observed_sha256=digest(original), exception_type="DailyPublicationLeaseExpired"))
+        observed_sha256=digest(original), exception_type=(
+            "SchedulerTaskOwnerLeaseExpired" if owner_expired else "DailyPublicationLeaseExpired")))
     outcome = dict(intent["outcome"], status="failed", exit_code=None,
         output=intent["outcome"]["output"] +
-        "\nDAILY_DELIVERY_FINALIZATION_FAILED: publication lease expired; "
+        ("\nTASK_OWNER_LEASE_EXPIRED: exact run lease expired; " if owner_expired else
+         "\nDAILY_DELIVERY_FINALIZATION_FAILED: publication lease expired; ") +
         "original process result retained in OBSERVED; no publication retried.")
     failed = dict(intent, outcome=outcome)
     journal.preserve(uid, "FAILED_FINALIZATION", failed)
@@ -8994,6 +9043,12 @@ def _task_history_finish(
     if not run_uid:
         return
     run_uid = str(run_uid)
+    with _running_lock:
+        owner_lease = _task_owner_leases.get(run_uid)
+    if (owner_lease is not None and owner_lease.lost.is_set()
+            and status in {"success", "degraded"}):
+        status, publication_receipt = "failed", None
+        output = "TASK_OWNER_LEASE_LOST: exact run ownership could not be renewed.\n" + str(output or "")
     normalized_task_type = str(task_type or "").strip()
     daily_control_required = normalized_task_type in DAILY_RESULT_RECOVERY_TASK_TYPES
     journal = intent = None
@@ -9386,7 +9441,12 @@ def _run_task(row: dict, root: Path, engine) -> None:
             )
         return
     started_at = datetime.now()
+    with _running_lock:
+        owner_lease = _task_owner_leases.get(history_run_uid)
     try:
+        if owner_lease is None:
+            raise RuntimeError("scheduler task execution requires its original owner lease")
+        owner_lease.start()
         _run_task_impl(row, root, engine, history_run_uid=history_run_uid)
     except Exception as exc:
         duration = max(0, int((datetime.now() - started_at).total_seconds()))
@@ -9422,6 +9482,9 @@ def _run_task(row: dict, root: Path, engine) -> None:
             task_type=task_type,
         )
         logger.exception("Scheduler task %s failed before completion", row.get("task_name"))
+    finally:
+        if owner_lease is not None:
+            owner_lease.stop()
 
 
 def _run_task_impl(
@@ -9661,6 +9724,9 @@ def _run_task_impl(
                 _windows_scheduler_lease is not None and not _windows_scheduler_lease.authorized()
             ):
                 raise SchedulerOwnerLeaseLost("scheduler_owner_lost_before_child_launch")
+            owner_lease = _task_owner_leases.get(exact_history_uid)
+            if owner_lease is None or not owner_lease.authorized():
+                raise SchedulerOwnerLeaseLost("task_owner_lease_lost_before_child_launch")
             proc = subprocess.Popen(cmd, **popen_kwargs)
             _running_procs[task_id] = proc
             _running_timeout_minutes[task_id] = task_timeout_minutes
@@ -9922,6 +9988,7 @@ def _release_task_registry(task_id, history_run_uid):
     _running_procs.pop(task_id, None)
     _running_timeout_minutes.pop(task_id, None)
     _running_history_uids.pop(task_id, None)
+    _task_owner_leases.pop(history_run_uid, None)
     for values in (_stop_pending_task_ids, _stop_requested_task_ids,
             _service_stop_requested_task_ids, _timeout_pending_task_ids,
             _timeout_requested_task_ids, _running_task_ids, _core_running_task_ids,

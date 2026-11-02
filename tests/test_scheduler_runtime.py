@@ -26,6 +26,50 @@ from tools.qmt_announcement_task_contract import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_task_owner_lease_boundary(monkeypatch):
+    """These worker tests mock audit/SQL; lease SQL has real-DB tests of its own."""
+    class Leases(dict):
+        def get(self, key, default=None):
+            if key not in self:
+                lease = MagicMock()
+                lease.authorized.return_value = True
+                lease.lost.is_set.return_value = False
+                self[key] = lease
+            return self[key]
+
+    monkeypatch.setattr(scheduler_runtime, "_task_owner_leases", Leases())
+
+
+def test_expired_exact_owner_lease_preserves_success_but_finishes_failed():
+    """A dead/late owner must leave a terminal audit, never another phantom run."""
+    uid = "d" * 32
+    claimed_at = datetime(2026, 11, 1, 14, 36, 19)
+    with _terminal_history_case(uid, now=claimed_at) as engine:
+        with engine.begin() as connection:
+            connection.execute(sql_text("UPDATE st_scheduled_task_history SET host_name=:host"),
+                {"host": scheduler_runtime.gethostname()})
+            original = scheduler_runtime._terminal_history_row(connection, uid)
+            marker = scheduler_runtime.encode_task_owner_lease(original, claimed_at)
+            connection.execute(sql_text("UPDATE st_scheduled_task_history SET output=:marker"),
+                {"marker": marker})
+        with patch.object(scheduler_runtime, "_now_shanghai_naive",
+                return_value=claimed_at + timedelta(minutes=16)):
+            scheduler_runtime._task_history_finish(engine, uid, status="success", duration=1,
+                exit_code=0, output="source data was written", task_type="news_daily")
+        with engine.connect() as connection:
+            actual = scheduler_runtime._terminal_history_row(connection, uid)
+            task_status = connection.execute(sql_text(
+                "SELECT last_run_status FROM st_scheduled_tasks WHERE id=75")).scalar()
+        assert actual["status"] == task_status == "failed"
+        assert actual["finished_at"] is not None
+        assert "TASK_OWNER_LEASE_EXPIRED" in actual["output"]
+        journal = scheduler_runtime._terminal_journal()
+        assert json.loads(journal.read(uid, "OBSERVED"))["outcome"]["status"] == "success"
+        assert json.loads(journal.read(uid, "FAILED_FINALIZATION"))["outcome"]["status"] == "failed"
+        assert journal.read(uid, "COMMITTED") is not None
+
+
 @contextmanager
 def _terminal_history_case(run_uid, *, task_id=75, task_type="news_daily", now=None,
                            daily_target=None):

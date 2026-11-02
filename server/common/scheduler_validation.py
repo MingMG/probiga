@@ -5089,9 +5089,12 @@ def validate_scheduler_task_result(
                     ),
                 )
             messages.append(
-                f"{task_type} exact persisted Top100 verified: "
+                (f"{task_type} exact native Top100 A-share projection verified: "
+                 if task_type == "fetch_hot_rank_xq" else f"{task_type} exact persisted Top100 verified: ") +
                 f"date={payload['requested_date']} "
-                f"rows={int(inventory['row_count'])}"
+                f"rows={int(inventory['row_count'])}" +
+                (f" source_rows={payload['source_row_count']} excluded_funds={payload['excluded_security_count']}"
+                 if task_type == "fetch_hot_rank_xq" else "")
             )
         if task_type == "sector_heat_east":
             ok, message = _validate_sector_heat_east_receipt(

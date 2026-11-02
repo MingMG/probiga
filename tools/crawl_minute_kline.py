@@ -124,7 +124,7 @@ FLOW_WRITE_COLUMNS = (
     "received_at",
     "data_source",
 )
-RESULT_SCHEMA = "probiga.public-minute-collection.v1"
+RESULT_SCHEMA = "probiga.public-minute-collection.v2"
 PUBLIC_MINUTE_TASKS = {
     "intraday_minute_kline": "stock", "intraday_minute_flow": "flow",
     "stock_minute": "stock", "stock_minute_flow": "flow",
@@ -573,7 +573,22 @@ def catalog_stock_codes(catalog, codes):
 
 
 def verified_no_trade_codes(engine, catalog, *, trade_date, decision_known_at):
-    """Only an independently replayed free daily partition exempts a code."""
+    """Only an independently replayed full-market publication exempts a code."""
+    from server.common.qmt_datadir_daily_coverage import load_daily_manifest
+    manifest = load_daily_manifest(engine, trade_date, decision_known_at=decision_known_at)
+    if manifest is not None:
+        if manifest["catalog_member_set_hash"] != catalog.member_set_hash:
+            raise ValueError("daily no-trade proof catalog content differs")
+        codes = {item["stock_code"] for item in manifest["entities"]
+                 if item["classification"] in {"NO_TRADE", "NOT_LISTED"}
+                 or (item["classification"] == "TRADED"
+                     and Decimal(item["evidence"]["volume"]) == 0
+                     and Decimal(item["evidence"]["amount"]) == 0)}
+        return codes, {
+            "proof_provider": "qmt_datadir", "receipt_id": manifest["manifest_hash"],
+            "truth_hash": manifest["manifest_hash"], "target_date": trade_date,
+            "code_count": len(manifest["entities"]), "no_trade_count": len(codes),
+        }
     try:
         with engine.connect() as connection:
             truth = load_verified_daily_market_truth(
@@ -975,6 +990,20 @@ def validate_result(result):
         raise ValueError("invalid execution time")
     if result.get("requested_trade_date") not in (None, target.isoformat()):
         raise ValueError("invalid requested date")
+    source_min = datetime.fromisoformat(result["source_capture_min_at"])
+    source_max = datetime.fromisoformat(result["source_capture_max_at"])
+    checkpoint_scope = result.get("checkpoint_scope")
+    if (source_min.tzinfo or source_max.tzinfo or not source_min <= source_max <= collection_finished
+            or type(result.get("checkpoint_reused_count")) is not int
+            or not 0 <= result["checkpoint_reused_count"] <= collected):
+        raise ValueError("invalid source capture window")
+    if checkpoint_scope is None:
+        if source_min < started or result["checkpoint_reused_count"] or result.get("source_checkpoints_sha256") is not None:
+            raise ValueError("source capture predates attempt without durable proof")
+    elif (kind != "flow" or not isinstance(checkpoint_scope, dict)
+            or source_min < datetime.combine(target, wall_time(15))
+            or not re.fullmatch(r"[0-9a-f]{64}", str(result.get("source_checkpoints_sha256") or ""))):
+        raise ValueError("invalid closed-session source checkpoint")
     return "degraded" if missing else "success"
 
 
@@ -1000,6 +1029,48 @@ def _validate_grid(rows, *, trade_date, captured_at):
         raise MinuteSourceError("FUTURE_MINUTE")
     if len(actual) < len(required):
         raise MinuteSourceError("STALE_SOURCE_MINUTE")
+
+
+def _checkpoint_identity(kind, trade_date, context, expected):
+    member_hash = context.get("catalog_member_set_hash")
+    if not re.fullmatch(r"[0-9a-f]{64}", str(member_hash or "")):
+        raise ValueError("minute_checkpoint: immutable catalog content proof is missing")
+    return {
+        "kind": kind, "trade_date": trade_date, "provider": PUBLIC_MINUTE_PROVIDER,
+        "catalog_member_set_hash": member_hash,
+        "expected_codes_sha256": _digest(sorted(expected)),
+        "native_no_trade_evidence": context.get("native_no_trade_evidence"),
+        "grid_sha256": _digest(MINUTE_GRID), "source_contract": RESULT_SCHEMA,
+    }
+
+
+def _checkpoint_store(kind, trade_date, context, expected):
+    # Incomplete intraday prefixes are mutable source facts. Only complete
+    # closed sessions can be reused by a later scheduler attempt.
+    if kind != "flow" or _now() < datetime.fromisoformat(trade_date + " 15:00:00"):
+        return None
+    from server.common.acquisition_shards import AcquisitionShards
+    return AcquisitionShards("public-minute-source", _checkpoint_identity(kind, trade_date, context, expected))
+
+
+def _read_source_checkpoint(store, code, *, kind, trade_date):
+    payload = store.load(code)
+    if not isinstance(payload, dict):
+        return None
+    try:
+        captured = datetime.fromisoformat(payload["captured_at"])
+        if (captured.tzinfo is not None or captured < datetime.fromisoformat(trade_date + " 15:00:00")
+                or captured > _now()):
+            return None
+        parser = parse_flow if kind == "flow" else parse_kline
+        rows = parser(code, payload["native"], trade_date=trade_date)
+        _validate_grid(rows, trade_date=trade_date, captured_at=captured)
+        if (len(rows) != len(MINUTE_GRID) or len(rows) != payload["row_count"]
+                or _code_rows_digest(rows, kind) != payload["rows_sha256"]):
+            return None
+        return payload, captured
+    except (ValueError, KeyError, TypeError, MinuteSourceError):
+        return None
 
 
 def replay_result(result, engine, *, started_at, now):
@@ -1032,6 +1103,13 @@ def replay_result(result, engine, *, started_at, now):
     )
     if native_ref != result.get("native_no_trade_evidence") or not no_trade <= native_codes:
         raise ValueError("native no-trade evidence differs")
+    store, source_checkpoints = None, {}
+    if result.get("checkpoint_scope") is not None:
+        from server.common.acquisition_shards import AcquisitionShards
+        if result["checkpoint_scope"] != _checkpoint_identity(kind=result["dataset"], trade_date=target,
+                context={**result, "catalog_member_set_hash": catalog.member_set_hash}, expected=expected):
+            raise ValueError("source checkpoint scope differs from current immutable authority")
+        store = AcquisitionShards("public-minute-source", result["checkpoint_scope"], create=False)
     collected = set(expected) - missing - no_trade
     selected = set(expected[:result["requested_limit"]]) if result["requested_limit"] else set(expected)
     if not collected | no_trade <= selected:
@@ -1053,6 +1131,12 @@ def replay_result(result, engine, *, started_at, now):
     def finish_code():
         if rows:
             _validate_grid(rows, trade_date=target, captured_at=current_capture)
+            if store is not None:
+                cached = _read_source_checkpoint(store, current_code, kind=kind, trade_date=target)
+                if (cached is None or cached[1] != current_capture
+                        or cached[0]["rows_sha256"] != _code_rows_digest(rows, kind)):
+                    raise ValueError("durable source checkpoint and database values differ")
+                source_checkpoints[current_code] = _digest(cached[0])
             proofs.append([current_code, len(rows), _code_rows_digest(rows, kind),
                            current_capture.isoformat(sep=" ")])
             rows.clear()
@@ -1068,7 +1152,8 @@ def replay_result(result, engine, *, started_at, now):
             synced = datetime.fromisoformat(str(row["etl_sync_at"]))
             captured = datetime.fromisoformat(str(row["received_at"]))
             source_time = datetime.fromisoformat(str(row["source_time"]))
-            if (code not in collected or not started <= captured <= synced <= finished
+            if (code not in collected or not captured <= synced <= finished
+                    or (store is None and captured < started)
                     or source_time != stamp or row["data_source"] != PUBLIC_MINUTE_SOURCE
                     or stamp.date().isoformat() != target or stamp.second or stamp.microsecond
                     or stamp > finished
@@ -1088,6 +1173,10 @@ def replay_result(result, engine, *, started_at, now):
     if (count != result["written_rows"] or {proof[0] for proof in proofs} != collected
             or _digest(proofs) != result["business_rows_sha256"]):
         raise ValueError("persisted business values differ")
+    if (min(proof[3] for proof in proofs) != result["source_capture_min_at"]
+            or max(proof[3] for proof in proofs) != result["source_capture_max_at"]
+            or (store is not None and _digest(sorted(source_checkpoints.items())) != result["source_checkpoints_sha256"])):
+        raise ValueError("persisted source capture/checkpoint seal differs")
     return disposition
 
 
@@ -1099,8 +1188,14 @@ def _collect_minutes(engine, codes, *, kind, table, trade_date, min_coverage,
     if not 0 < min_coverage <= 1:
         raise ValueError("invalid coverage gate")
     selected = codes[:limit] if limit > 0 else codes
-    missing = set(expected)
-    no_trade, proofs, reasons = set(), {}, {}
+    if not set(no_trade_codes) <= set(expected):
+        raise ValueError("no-trade proof contains foreign securities")
+    no_trade = set(no_trade_codes) & {code for code, _market in selected}
+    missing = set(expected) - no_trade
+    proofs, reasons = {}, {}
+    selected = [(code, market) for code, market in selected if code not in no_trade]
+    store = _checkpoint_store(kind, trade_date, context, expected)
+    source_checkpoints, reused_count = {}, 0
     buffer, staged_rows = [], 0
     is_flow = kind == "flow"
     if is_flow:
@@ -1120,47 +1215,67 @@ def _collect_minutes(engine, codes, *, kind, table, trade_date, min_coverage,
         staged_rows += count
         buffer.clear()
 
+    def progress(code):
+        if store is not None:
+            store.save("__progress__", dict(total_units=len(expected),
+                completed_units=len(proofs) + len(no_trade), current_unit=code,
+                last_progress_at=_now().isoformat(sep=" "), run_uid=context["run_uid"],
+                durable_completed_codes_sha256=_digest(sorted(proofs))))
+
+    def consume(code, native, captured_at, *, restored=False):
+        nonlocal reused_count
+        if code not in missing:
+            raise RuntimeError("unexpected or duplicate source identity")
+        try:
+            if isinstance(native, MinuteSourceError):
+                raise native
+            rows = parser(code, native or [], trade_date=trade_date)
+            if not captured_at <= _now() or (
+                    captured_at < datetime.fromisoformat(context["started_at"]) and not restored):
+                raise MinuteSourceError("INVALID_CAPTURE_TIME")
+            _validate_grid(rows, trade_date=trade_date, captured_at=captured_at)
+            if not rows:
+                raise MinuteSourceError("NO_TARGET_BARS")
+            digest = _code_rows_digest(rows, kind)
+            if store is not None:
+                payload = dict(native=native, captured_at=captured_at.isoformat(sep=" "),
+                               rows_sha256=digest, row_count=len(rows))
+                if len(rows) != len(MINUTE_GRID):
+                    raise MinuteSourceError("INCOMPLETE_CLOSED_CHECKPOINT")
+                if not restored:
+                    store.save(code, payload)
+                source_checkpoints[code] = _digest(payload)
+                reused_count += int(restored)
+            proofs[code] = [code, len(rows), digest, captured_at.isoformat(sep=" ")]
+            for row in rows:
+                row.update(source_time=row["trade_time"], received_at=captured_at,
+                           data_source=row.pop("_source", PUBLIC_MINUTE_SOURCE))
+            buffer.extend(rows)
+            missing.remove(code)
+        except MinuteSourceError as exc:
+            reason = str(exc)
+            reasons[reason] = reasons.get(reason, 0) + 1
+        if len(buffer) >= 5000:
+            append()
+        progress(code)
+
     try:
         fetcher = partial(fetch_minute_flow if is_flow else fetch_minute_kline, trade_date=trade_date)
         parser = parse_flow if is_flow else parse_kline
-        with _minute_fetch_workers(selected, fetcher) as fetches:
+        pending = []
+        for code, market in selected:
+            cached = _read_source_checkpoint(store, code, kind=kind, trade_date=trade_date) if store is not None else None
+            if cached is None:
+                pending.append((code, market))
+            else:
+                consume(code, cached[0]["native"], cached[1], restored=True)
+        with _minute_fetch_workers(pending, fetcher) as fetches:
             visited = set()
             for index, (code, native, captured_at) in enumerate(fetches, 1):
                 if code not in missing or code in visited:
                     raise RuntimeError("unexpected or duplicate source identity")
                 visited.add(code)
-                try:
-                    if isinstance(native, MinuteSourceError):
-                        raise native
-                    rows = parser(code, native or [], trade_date=trade_date)
-                    if rows and code in no_trade_codes:
-                        raise MinuteSourceError("NO_TRADE_CONTRADICTION")
-                    if not datetime.fromisoformat(context["started_at"]) <= captured_at <= _now():
-                        raise MinuteSourceError("INVALID_CAPTURE_TIME")
-                    _validate_grid(rows, trade_date=trade_date, captured_at=captured_at)
-                    if rows:
-                        proofs[code] = [code, len(rows), _code_rows_digest(rows, kind), captured_at.isoformat(sep=" ")]
-                        for row in rows:
-                            row.update(
-                                source_time=row["trade_time"],
-                                received_at=captured_at,
-                                data_source=row.pop(
-                                    "_source",
-                                    PUBLIC_MINUTE_SOURCE,
-                                ),
-                            )
-                        buffer.extend(rows)
-                        missing.remove(code)
-                    elif code in no_trade_codes:
-                        no_trade.add(code)
-                        missing.remove(code)
-                    else:
-                        raise MinuteSourceError("NO_TARGET_BARS")
-                except MinuteSourceError as exc:
-                    reason = str(exc)
-                    reasons[reason] = reasons.get(reason, 0) + 1
-                if len(buffer) >= 5000:
-                    append()
+                consume(code, native, captured_at)
                 if index % 200 == 0:
                     print(f"Minute {kind}: checked={index}/{len(selected)} collected={len(proofs)} missing={len(missing)}", file=sys.stderr, flush=True)
             append()
@@ -1182,6 +1297,11 @@ def _collect_minutes(engine, codes, *, kind, table, trade_date, min_coverage,
             "coverage": coverage, "min_coverage": min_coverage,
             "staged_rows": staged_rows, "written_rows": staged_rows,
             "business_rows_sha256": _digest([proofs[code] for code in sorted(proofs)]),
+            "checkpoint_scope": store.scope["identity"] if store is not None else None,
+            "source_checkpoints_sha256": _digest(sorted(source_checkpoints.items())) if store is not None else None,
+            "checkpoint_reused_count": reused_count,
+            "source_capture_min_at": min((proof[3] for proof in proofs.values()), default=collection_finished_text),
+            "source_capture_max_at": max((proof[3] for proof in proofs.values()), default=collection_finished_text),
             "failure_reason_counts": reasons,
             "collection_finished_at": collection_finished_text,
             "finished_at": collection_finished_text,
@@ -1357,6 +1477,7 @@ def main():
             "started_at": started.isoformat(sep=" "), "decision_known_at": started.isoformat(sep=" "),
             "requested_trade_date": args.trade_date, "build_sha": build, "run_uid": run_uid,
             "catalog_batch_id": catalog.batch_id, "catalog_manifest_hash": catalog.manifest_hash,
+            "catalog_member_set_hash": catalog.member_set_hash,
             "catalog_captured_at": catalog.captured_at, "native_no_trade_evidence": native_ref,
         }
         if args.type == "stock":

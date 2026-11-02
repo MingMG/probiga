@@ -20,6 +20,12 @@ from server.common import daily_stock_universe
 from server.common import scheduler_validation
 
 
+@pytest.fixture(autouse=True)
+def native_catalog_fixture_has_no_local_cache_publication(monkeypatch):
+    from server.common import qmt_datadir_daily_coverage
+    monkeypatch.setattr(qmt_datadir_daily_coverage, "load_daily_manifest", lambda *args, **kwargs: None)
+
+
 def _universe(*codes: str) -> DailyStockUniverse:
     return DailyStockUniverse(
         target_date="2026-08-26",

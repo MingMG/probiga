@@ -179,7 +179,7 @@ def load_receipt(
 def partition_from_receipt(receipt: Mapping[str, Any]) -> dict[str, Any]:
     detail = receipt.get("detail")
     detail = detail if isinstance(detail, Mapping) else {}
-    return {
+    result = {
         "trade_date": str(receipt.get("trade_date") or "")[:10],
         "status": str(receipt.get("status") or ""),
         "source_root": str(receipt.get("source_root") or ""),
@@ -193,6 +193,13 @@ def partition_from_receipt(receipt: Mapping[str, Any]) -> dict[str, Any]:
         "readback_rows": int(detail.get("readback_rows") or 0),
         "readback_codes": int(detail.get("readback_codes") or 0),
     }
+    if receipt.get("dataset") in {"stock_daily", "stock_minute"}:
+        result["full_market_manifest_hash"] = str(detail.get("full_market_manifest_hash") or "")
+    if receipt.get("dataset") == "stock_minute":
+        for name in ("expected_traded_code_set_sha256", "minute_grid_sha256"):
+            result[name] = str(detail.get(name) or "")
+        result["minute_grid_count"] = int(detail.get("minute_grid_count") or 0)
+    return result
 
 
 def validate_task_result(
@@ -260,6 +267,21 @@ def validate_task_result(
             or int(partition.get("readback_codes") or 0) != code_count
         ):
             return "failed"
+        if dataset == "stock_daily" and (
+            float(partition.get("coverage") or 0) != 1.0
+            or SHA64.fullmatch(str(partition.get("full_market_manifest_hash") or "")) is None
+        ):
+            return "failed"
+        if dataset == "stock_minute":
+            from server.common.qmt_datadir_minute_coverage import GRID_HASH, CORE_GRID
+            if (float(partition.get("coverage") or 0) != 1.0
+                    or code_count != int(partition.get("eligible_code_count") or 0)
+                    or row_count != code_count * len(CORE_GRID)
+                    or int(partition.get("minute_grid_count") or 0) != len(CORE_GRID)
+                    or partition.get("minute_grid_sha256") != GRID_HASH
+                    or any(SHA64.fullmatch(str(partition.get(key) or "")) is None
+                        for key in ("full_market_manifest_hash", "expected_traded_code_set_sha256"))):
+                return "failed"
     return "complete"
 
 
@@ -389,6 +411,28 @@ def validate_persisted_result(
         ):
             if stored.get(key) != partition.get(key):
                 raise ValueError(f"QMT datadir receipt field differs: {key}")
+        if dataset == "stock_daily":
+            from datetime import datetime
+            from zoneinfo import ZoneInfo
+            from server.common.qmt_datadir_daily_coverage import load_daily_manifest
+            manifest_hash = str(partition.get("full_market_manifest_hash") or "")
+            if stored.get("full_market_manifest_hash") != manifest_hash:
+                raise ValueError("QMT datadir full-market receipt differs")
+            proof = load_daily_manifest(engine, trade_date, decision_known_at=datetime.now(ZoneInfo("Asia/Shanghai")),
+                                        manifest_hash=manifest_hash)
+            if proof is None or proof["run_id"] != partition["run_id"]:
+                raise ValueError("QMT datadir exact full-market proof is missing")
+        if dataset == "stock_minute":
+            from server.common.qmt_datadir_minute_coverage import load_verified_minute_publication
+            actual = load_verified_minute_publication(engine, trade_date)
+            if actual is None or actual["run_id"] != partition["run_id"]:
+                raise ValueError("QMT datadir exact minute publication is missing")
+            for key in ("row_count", "code_count", "row_hash", "full_market_manifest_hash",
+                        "expected_traded_code_set_sha256", "minute_grid_count", "minute_grid_sha256"):
+                if actual[key] != partition.get(key):
+                    raise ValueError("QMT datadir exact minute receipt differs: " + key)
+            verified.append({key: actual[key] for key in ("trade_date", "row_count", "code_count", "row_hash")})
+            continue
         row_count, code_count, rows = persisted_rows(
             engine, dataset=dataset, trade_date=trade_date
         )

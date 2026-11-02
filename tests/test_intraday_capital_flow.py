@@ -18,6 +18,13 @@ def _crawler():
     return importlib.import_module("tools.crawl_minute_kline")
 
 
+@pytest.fixture(autouse=True)
+def free_source_fixtures_have_no_local_cache_daily_publication(monkeypatch):
+    from server.common import qmt_datadir_daily_coverage
+    monkeypatch.setattr(qmt_datadir_daily_coverage, "load_daily_manifest", lambda *args, **kwargs: None)
+    monkeypatch.setattr(_crawler(), "_checkpoint_store", lambda *args, **kwargs: None)
+
+
 def _context(day="2026-09-11", clock="09:32:00"):
     return {
         "started_at": f"{day} {clock}", "decision_known_at": f"{day} {clock}",
@@ -130,6 +137,9 @@ def test_tencent_minute_fallback_forward_fills_cumulative_series():
 def _collection(monkeypatch, kind, native, *, minimum=0.5, no_trade=(), context=None, limit=0):
     c = _crawler()
     context = context or _context()
+    # These cases exercise live-attempt parsing/publication; durable closed
+    # response recovery is covered separately with real AcquisitionShards.
+    monkeypatch.setattr(c, "_checkpoint_store", lambda *args, **kwargs: None)
     day = context["started_at"][:10]
     now = datetime.fromisoformat(context["started_at"]) + timedelta(seconds=5)
     monkeypatch.setattr(c, "_now", lambda: now)
@@ -192,24 +202,24 @@ def test_published_partial_keeps_exact_missing_and_value_proof(monkeypatch, kind
 
 
 @pytest.mark.parametrize("kind", ["stock", "flow"])
-def test_no_trade_requires_proof_and_actual_bar_contradiction_stays_missing(monkeypatch, kind):
+def test_independently_proven_no_trade_codes_skip_unnecessary_source_requests(monkeypatch, kind):
     result, rows, _, _ = _collection(monkeypatch, kind, {
         "000001": [_line(kind)], "000002": None, "600000": [_line(kind)],
     }, no_trade={"000002", "600000"})
-    assert result["no_trade_codes_csv"] == "000002"
-    assert result["missing_codes_csv"] == "600000"
-    assert result["failure_reason_counts"] == {"NO_TRADE_CONTRADICTION": 1}
+    assert result["no_trade_codes_csv"] == "000002,600000"
+    assert result["missing_codes_csv"] == ""
+    assert result["failure_reason_counts"] == {}
     assert [row["stock_code"] for row in rows] == ["000001"]
-    assert result["coverage"] == 2 / 3
+    assert result["coverage"] == 1
 
 
-def test_invalid_identity_cannot_borrow_daily_no_trade(monkeypatch):
+def test_proven_no_trade_does_not_query_an_unneeded_source_identity(monkeypatch):
     c = _crawler()
     result, _, _, _ = _collection(monkeypatch, "flow", {
         "000001": [_line("flow")], "000002": c.MinuteSourceError("WRONG_IDENTITY"),
     }, no_trade={"000002"})
-    assert result["missing_codes_csv"] == "000002"
-    assert result["no_trade_count"] == 0
+    assert result["missing_codes_csv"] == ""
+    assert result["no_trade_count"] == 1
 
 
 def test_limit_preserves_full_catalog_denominator(monkeypatch):
@@ -346,7 +356,7 @@ def test_catalog_preserves_newly_listed_and_resumed_codes_and_native_bse_market(
 def test_flow_main_uses_primary_catalog_and_separate_minute_database(monkeypatch):
     c = _crawler()
     primary, minute = object(), object()
-    catalog = SimpleNamespace(batch_id="catalog", manifest_hash="c" * 64, captured_at="2026-09-11 08:00:00",
+    catalog = SimpleNamespace(batch_id="catalog", manifest_hash="c" * 64, member_set_hash="d" * 64, captured_at="2026-09-11 08:00:00",
         members=[{"stock_code": "301686", "qmt_code": "301686.SZ"}])
     load = MagicMock(return_value=(catalog, ["301686"]))
     collect = MagicMock(return_value={"status": "written"})

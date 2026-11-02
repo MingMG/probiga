@@ -917,6 +917,10 @@ def test_successful_checked_scheduler_run_persists_replay_envelope(
         lambda *_args, **_kwargs: "9" * 32,
     )
     monkeypatch.setattr(scheduler_runtime, "_task_history_finish", history_finish)
+    owner_lease = MagicMock()
+    owner_lease.authorized.return_value = True
+    owner_lease.lost.is_set.return_value = False
+    monkeypatch.setattr(scheduler_runtime, "_task_owner_leases", {"9" * 32: owner_lease})
     monkeypatch.setattr(
         scheduler_runtime,
         "resolve_scheduler_script",

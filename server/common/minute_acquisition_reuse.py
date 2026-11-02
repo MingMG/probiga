@@ -92,12 +92,15 @@ def has_minute_code_coverage(connection, *, table: str, trade_date: str,
                COUNT(*) row_count,COUNT(DISTINCT trade_time) time_count
           FROM `{table}`
          WHERE trade_date=:day AND stock_code IN :codes
+           AND trade_time>=:day_start AND trade_time<:day_end
          GROUP BY stock_code ORDER BY stock_code
     """).bindparams(bindparam("codes", expanding=True))
     for offset in range(0, len(codes), 100):
         batch = codes[offset:offset + 100]
         rows = connection.execute(statement, {
             "day": trade_date,
+            "day_start": trade_date + " 00:00:00",
+            "day_end": (date.fromisoformat(trade_date) + timedelta(days=1)).isoformat() + " 00:00:00",
             "codes": batch,
         }).mappings().all()
         if (len(rows) != len(batch)
@@ -139,6 +142,7 @@ def _query(kind: str) -> Any:
                LENGTH(GROUP_CONCAT({row_hash} ORDER BY trade_time SEPARATOR '')) hashed_bytes{closing_price}
           FROM `{TABLES[kind]}`
          WHERE trade_date=:day AND stock_code IN :codes
+           AND trade_time>=:day_start AND trade_time<:day_end
          GROUP BY stock_code ORDER BY stock_code
     """).bindparams(bindparam("codes", expanding=True))
 
@@ -307,6 +311,8 @@ def inspect_complete_partition(primary_engine, data_engine, *, kind: str,
             for offset in range(0, len(codes), 100):
                 rows.extend(connection.execute(_query(kind), {
                     "day": trade_date,
+                    "day_start": trade_date + " 00:00:00",
+                    "day_end": (target + timedelta(days=1)).isoformat() + " 00:00:00",
                     "codes": codes[offset:offset + 100],
                 }).mappings().all())
         finally:

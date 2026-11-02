@@ -36,7 +36,7 @@ def test_cli_opens_shared_tls_engine_only_when_run():
 @pytest.mark.parametrize("body,match", [
     (response("885002", 1, ["600000"]), "identity differs"),
     (response("885001", 2, ["600000"]), "identity differs"),
-    (response("885001", 2, ["600000", "600000"]), "identity invalid"),
+    (response("885001", 2, ["600000", "600000"]), "full member identity differs"),
     (response("885001", 1, ["60000"]), "identity invalid"),
     ("<html>login</html>", "identity differs"),
 ])
@@ -67,17 +67,22 @@ def test_native_requests_exact_rounded_limit_and_refuses_changing_total():
 def test_native_directory_resolves_non_quoted_members_only_with_matching_date_and_total(day, total, codes, error):
     data = {"result": {"report": day, "listdata": {day: [[code, "XD股票", "", 0, 0, 0, 0, 0] for code in codes]}}}
     html = f'<title>概念(885001) 最新动态_F10_同花顺金融服务网</title><p>概念股数量：{total}家</p><div id="concept_data">{json.dumps(data)}</div>'
-    replies = iter([response("885001", 2, ["600000"]), html])
+    def fetch(url):
+        if "basic." in url:
+            return html
+        suffix = url.rsplit("/", 1)[-1].removesuffix(".js")
+        return response("885001", 2, ["600000"], limit=int(suffix[1:]), order=suffix[0])
     if error:
         with pytest.raises(RuntimeError, match=error):
-            members.collect_members("885001", as_of="2026-09-11", fetch=lambda _: next(replies))
+            members.collect_members("885001", as_of="2026-09-11", fetch=fetch)
     else:
-        collected = members.collect_members("885001", as_of="2026-09-11", fetch=lambda _: next(replies))["members"]
+        collected = members.collect_members("885001", as_of="2026-09-11", fetch=fetch)["members"]
         assert collected == [{"stock_code": "600000", "short_name": "股票"}, {"stock_code": "600001", "short_name": "XD股票"}]
 
 
 @pytest.fixture
-def member_db(monkeypatch):
+def member_db(monkeypatch, tmp_path):
+    monkeypatch.setenv("PROBIGA_JOB_LOG_ROOT", str(tmp_path))
     engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
     with engine.begin() as conn:
         conn.execute(text("CREATE TABLE si_trade_calendar (trade_date DATE,trade_status INTEGER)"))
@@ -190,3 +195,78 @@ def test_persistent_gateway_failure_is_bounded_and_preserves_old_partition(membe
     assert result["rows_written"] == 0
     with member_db.connect() as conn:
         assert conn.execute(text("SELECT stock_code,etl_sync_at FROM si_concept_constituent_ths WHERE query_key='885002'")).one() == ("600999", "2026-08-11")
+
+
+def _dated_members(index, expected, codes, day="2026-11-02"):
+    data = {"result": {"report": day, "listdata": {
+        day: [[code, "股票", "", 0, 0, 0, 0, 0] for code in codes]}}}
+    return (f'<title>概念({index}) 最新动态_F10_同花顺金融服务网</title>'
+            f'<p>概念股数量：{expected}家</p><div id="concept_data">{json.dumps(data)}</div>')
+
+
+@pytest.mark.parametrize("index,expected,duplicated", [
+    ("885431", 1068, "603836"), ("885494", 799, "600287"),
+    ("885935", 82, "600468"), ("886113", 105, "600346"),
+])
+def test_complete_native_raw_records_project_identical_duplicates_to_unique_members(index, expected, duplicated):
+    # Exact source defect captured 2026-11-02: header counts raw records,
+    # one identical native member is repeated; the dated F10 has unique rows.
+    codes = [duplicated] + [f"6{i:05d}" for i in range(1, expected + 1)
+                            if f"6{i:05d}" != duplicated][:expected - 2]
+    calls = []
+    def fetch(url):
+        calls.append(url)
+        if "basic." in url:
+            return _dated_members(index, expected, codes)
+        if url.endswith("/d15.js"):
+            return response(index, expected, codes[:15])
+        if url.endswith("/a3000.js"):
+            return response(index, expected, codes + [duplicated], limit=3000, order="a")
+        limit = min(3000, ((expected + 14) // 15) * 15)
+        return response(index, expected, codes, limit=limit, order="a" if f"/a{limit}.js" in url else "d")
+    result = members.collect_members(index, as_of="2026-11-02", fetch=fetch)
+    members.validate_collection(result)
+    assert result["expected_count"] == expected - 1
+    assert result["raw_record_count"] == result["expected_raw_record_count"] == expected
+    assert result["unique_security_count"] == expected - 1
+    assert result["duplicate_record_count"] == 1
+    assert set(row["stock_code"] for row in result["members"]) == set(codes)
+    assert calls[-1].endswith("/a3000.js")
+
+
+def test_conflicting_duplicate_cannot_be_projected_or_published():
+    body = response("885001", 2, ["600000", "600000"]).replace(
+        '"55": "\\u80a1\\u7968"}', '"55": "different"}', 1)
+    with pytest.raises(RuntimeError, match="conflicting duplicate"):
+        members.collect_members("885001", as_of="2026-09-11", fetch=lambda _: body)
+
+
+def test_resume_uses_durable_source_shards_and_rechecks_db_without_refetching_success(member_db, monkeypatch):
+    calls = Counter()
+    ready = False
+    payloads = {index: collection(index, (code,)) for index, code in
+                [("885001", "600001"), ("885002", "600002")]}
+    def collect(index, **_kwargs):
+        calls[index] += 1
+        if index == "885002" and not ready:
+            raise RuntimeError("THS native members incomplete: 885002")
+        return payloads[index]
+    monkeypatch.setattr(members, "collect_members", collect)
+    catalog = pd.DataFrame([{"index_code": "885001", "concept_code": "300001"},
+                            {"index_code": "885002", "concept_code": "300002"}])
+    first = members.sync_member_partitions(member_db, catalog)
+    assert first["status"] == "PARTIAL"
+    ready = True
+    second = members.sync_member_partitions(member_db, catalog)
+    assert second["status"] == "COMPLETE"
+    assert second["reused_indices"] == ["885001"]
+    assert second["rows_written"] == 1
+    assert calls == {"885001": 1, "885002": 2}
+    assert second["completed_units"] == second["total_units"] == 2
+    # Reusing a source shard never trusts a mutable DB row without readback.
+    with member_db.begin() as conn:
+        conn.execute(text("UPDATE si_concept_constituent_ths SET short_name='corrupted' WHERE query_key='885001'"))
+    third = members.sync_member_partitions(member_db, catalog)
+    assert third["status"] == "COMPLETE"
+    assert third["rows_written"] == 1
+    assert calls == {"885001": 1, "885002": 2}

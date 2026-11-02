@@ -255,10 +255,26 @@ def load_daily_stock_universe(
     # and bind the immutable catalog/attestation hashes below.
     validate_stock_catalog_runtime_schema(engine, require_triggers=False)
     known_at = decision_known_at or datetime.now().replace(microsecond=0)
+    from server.common.qmt_datadir_daily_coverage import load_daily_manifest
+    manifest = load_daily_manifest(engine, target_date, decision_known_at=known_at)
+    if manifest is not None:
+        entities = manifest["entities"]
+        expected = tuple(item["stock_code"] for item in entities if item["classification"] == "TRADED")
+        excluded = tuple(item["stock_code"] for item in entities if item["classification"] != "TRADED")
+        return DailyStockUniverse(
+            target_date=target_date,
+            catalog_batch_id=manifest["catalog_batch_id"],
+            catalog_manifest_hash=manifest["catalog_manifest_hash"],
+            catalog_member_set_hash=manifest["catalog_member_set_hash"],
+            expected_codes=expected,
+            expected_code_set_hash=_code_set_sha256(expected),
+            catalog_captured_at=manifest["captured_at"],
+            catalog_knowledge_mode="EXACT_QMT_DATADIR_FULL_MARKET",
+            no_row_exception_proof_sha256=manifest["manifest_hash"],
+            excluded_no_row_codes=excluded,
+        )
     receipt = _load_attested_target_receipt(
-        engine,
-        target_date=target_date,
-        decision_known_at=known_at,
+        engine, target_date=target_date, decision_known_at=known_at,
     )
     catalog, codes = load_target_stock_catalog(
         engine,

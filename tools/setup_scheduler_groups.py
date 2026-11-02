@@ -75,7 +75,7 @@ def insert_xq_task(engine):
             (task_name, group_name, script_path, script_args, cron_time, enabled, sort_order, date_param, created_at, updated_at)
             VALUES (:name, :grp, :script, :args, :cron, :enabled, :sort, :dp, NOW(), NOW())
         """), {
-            "name": "雪球热股榜TOP100",
+            "name": "雪球热门Top100中的A股",
             "grp": "复盘数据",
             "script": "tools/fetch_hot_rank_xq.py",
             "args": "",

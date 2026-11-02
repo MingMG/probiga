@@ -373,6 +373,13 @@ def test_error_paths_do_not_publish_summary_before_terminal_transaction(case,mon
 def test_normal_and_timeout_outputs_survive_terminal_database_failure(case,monkeypatch,timeout):
     from server.common.scheduler_validation import SchedulerValidationResult
     case.start(task_type="model_task",stage=False)
+    # This test injects only the terminal transaction failure. The independent
+    # owner-lease boundary is verified against real audit rows in its own suite.
+    from unittest.mock import MagicMock
+    owner_lease = MagicMock()
+    owner_lease.authorized.return_value = True
+    owner_lease.lost.is_set.return_value = False
+    monkeypatch.setattr(runtime, "_task_owner_leases", {case.uid: owner_lease})
     row=dict(id=127,task_name="model_task",task_type=case.task_type,script_path="tools/model.py")
     script=case.jobs/"model.py"
     script.touch()

@@ -16,7 +16,6 @@ import dataclasses
 import datetime as dt
 import hashlib
 import json
-import math
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,12 +54,6 @@ STATUS_FAILED = "FAILED"
 
 DEFAULT_CHUNK_ROWS = 5000
 DEFAULT_SESSIONS_PER_BATCH = 20
-# A session is only complete when the cache holds (nearly) every instrument the
-# catalog proves was listed that day.  The production publisher covers 5563 of
-# 5575 eligible codes on 2026-10-14 (99.8%), so a 95% floor rejects a cache that
-# only holds a fragment of the day without touching a healthy one.
-DEFAULT_MIN_COVERAGE = 0.95
-REASON_THIN_CACHE = "insufficient_code_coverage"
 
 MINUTE_COLUMNS = (
     "stock_code",
@@ -130,22 +123,6 @@ class Universe:
             for listed, expired in self.listed_on.values()
             if listed <= day and (expired is None or day <= expired)
         )
-
-
-def coverage_shortfall(
-    universe: Universe, session: dt.date, imported_codes: int,
-    min_coverage: float = DEFAULT_MIN_COVERAGE,
-) -> int | None:
-    """Return the eligible-code count when the cache holds too few instruments.
-
-    ``None`` means the session clears the coverage floor and may be published.
-    """
-    eligible = universe.eligible_codes(session)
-    if eligible == 0:
-        return None
-    if imported_codes >= math.ceil(eligible * min_coverage):
-        return None
-    return eligible
 
 
 @dataclass(frozen=True)
@@ -308,6 +285,9 @@ def completed_sessions(engine: Engine) -> set[dt.date]:
             and detail.get("bad_grid_codes") == 0
             and isinstance(detail.get("row_hash"), str)
             and len(detail["row_hash"]) == 64
+            and detail.get("coverage") == 1.0
+            and len(str(detail.get("full_market_manifest_hash") or "")) == 64
+            and len(str(detail.get("expected_traded_code_set_sha256") or "")) == 64
         ):
             complete.add(trade_date)
     return complete
@@ -336,6 +316,7 @@ def harvest(
     sessions: Sequence[dt.date],
     run_id: str,
     chunk_rows: int = DEFAULT_CHUNK_ROWS,
+    codes_by_session: dict[dt.date, set[str]] | None = None,
 ) -> dict[dt.date, dict]:
     """Read every instrument once and stage its rows for ``sessions``.
 
@@ -364,6 +345,8 @@ def harvest(
         selected_digest = hashlib.sha256(selected.tobytes()).digest()
         per_session: dict[dt.date, int] = {}
         for session, row in iter_minute_rows(dat, selected, CORE_GRID):
+            if codes_by_session is not None and member.code not in codes_by_session[session]:
+                continue
             chunk.append((run_id, *row))
             per_session[session] = per_session.get(session, 0) + 1
         for session in per_session:

@@ -24,7 +24,7 @@ def _bytes(value):
 
 
 class AcquisitionShards:
-    def __init__(self, dataset: str, scope: dict, *, root: Path | None = None):
+    def __init__(self, dataset: str, scope: dict, *, root: Path | None = None, create: bool = True):
         if root is None:
             base = os.environ.get("PROBIGA_JOB_LOG_ROOT")
             if not base:
@@ -34,7 +34,8 @@ class AcquisitionShards:
             root = Path(base) / "acquisition-shards"
         self.scope = json.loads(_bytes({"dataset": dataset, "identity": scope}))
         self.root = Path(root) / hashlib.sha256(_bytes(self.scope)).hexdigest()
-        self.root.mkdir(parents=True, exist_ok=True)
+        if create:
+            self.root.mkdir(parents=True, exist_ok=True)
 
     def _path(self, key):
         return self.root / (hashlib.sha256(_bytes(key)).hexdigest() + ".json")
