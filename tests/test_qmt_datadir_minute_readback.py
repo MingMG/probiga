@@ -3,6 +3,8 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 import json
 import re
+import threading
+import time
 from types import SimpleNamespace
 import zlib
 
@@ -164,3 +166,68 @@ def test_explicit_consume_deadline_still_stops_progressing_rows(monkeypatch):
     monkeypatch.setattr(coverage.time, "monotonic", lambda: next(clock))
     with pytest.raises(TimeoutError, match="total deadline exceeded"):
         coverage.validate_matrix(_native(["600000"]), day=DAY, scope=_scope(["600000"]), deadline_seconds=1)
+
+
+def test_mysql_trailing_dot_is_required_only_for_a_stream_ending_in_space():
+    native = _native(["600000"])
+    raw = json.dumps(_json_rows(native)).encode("utf-8")
+    # A valid JSON trailing tab changes the Adler checksum until the real zlib
+    # frame ends in 0x20, the condition for MySQL's additional '.' byte.
+    raw = next(raw + b"\t" * count for count in range(1024)
+               if zlib.adler32(raw + b"\t" * count) & 255 == 0x20)
+    packed = _pack(raw)
+    assert packed.endswith(b" .")
+    group = dict(stock_code="600000", row_count=241, packed_rows=packed)
+    assert coverage._decode_matrix_group(group, expected_codes={"600000"}) == native
+    with pytest.raises(RuntimeError, match="stream boundary"):
+        coverage._decode_matrix_group({**group, "packed_rows": packed[:-1]}, expected_codes={"600000"})
+
+
+def test_query_expired_before_start_sends_no_sql():
+    connection = SimpleNamespace(execute=lambda *_args: pytest.fail("expired query was sent"))
+    with pytest.raises(TimeoutError, match="total deadline"):
+        coverage._read_matrix_query(connection, "SELECT 1", {}, deadline=coverage.time.monotonic() - 1)
+
+
+def test_fragmented_reply_cannot_reset_the_remaining_total_deadline():
+    closed = threading.Event()
+    original_timeout = 45.0
+    raw = SimpleNamespace(_read_timeout=original_timeout, _write_timeout=original_timeout,
+        _sock=SimpleNamespace(shutdown=lambda _how: closed.set()))
+    observed = {}
+
+    class Reply:
+        def mappings(self):
+            return self
+
+        def all(self):
+            # Individual fragments make progress faster than socket timeout,
+            # but must still stop at the absolute reply/consume deadline.
+            while not closed.wait(0.002):
+                observed["fragments"] = observed.get("fragments", 0) + 1
+            raise OSError("reply socket shut down")
+
+    class Connection:
+        connection = SimpleNamespace(dbapi_connection=raw)
+
+        def execute(self, sql, _params):
+            observed["read_timeout"] = raw._read_timeout
+            observed["query_ms"] = int(re.search(r"MAX_EXECUTION_TIME\((\d+)\)", str(sql))[1])
+            return Reply()
+
+    started = time.monotonic()
+    with pytest.raises(TimeoutError, match="query/reply deadline"):
+        coverage._read_matrix_query(Connection(), "SELECT /*+ MAX_EXECUTION_TIME(20000) */ 1", {}, deadline=started + 0.04)
+    assert time.monotonic() - started < 1
+    assert 0 < observed["read_timeout"] <= 0.04
+    assert 0 < observed["query_ms"] <= 40
+    assert observed["fragments"] > 0
+    assert raw._read_timeout == raw._write_timeout == original_timeout
+
+
+def test_driver_value_error_is_transport_failure_not_replaceable_bad_data():
+    def fail(*_args):
+        raise ValueError("malformed driver response")
+
+    with pytest.raises(RuntimeError, match="invalid transport response"):
+        coverage._read_matrix_query(SimpleNamespace(execute=fail), "SELECT 1", {}, deadline=coverage.time.monotonic() + 1)

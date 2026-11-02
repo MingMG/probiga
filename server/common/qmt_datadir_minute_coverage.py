@@ -7,6 +7,8 @@ from decimal import Decimal
 from functools import lru_cache
 from hashlib import sha256
 import json
+import socket
+import threading
 import time
 import zlib
 from zoneinfo import ZoneInfo
@@ -238,6 +240,57 @@ def _decode_matrix_group(group, *, expected_codes):
     return sorted(rows, key=lambda row: (row["stock_code"], row["trade_time"]))
 
 
+def _read_matrix_query(connection, sql, params, *, deadline):
+    """Bound execute and the complete reply by the remaining consume budget."""
+    started = time.monotonic()
+    remaining = deadline - started
+    if remaining <= 0:
+        raise TimeoutError("minute_matrix_readback: total deadline exceeded")
+    call_limit = min(20.0, remaining)
+    raw = getattr(connection, "connection", None)
+    dbapi = getattr(raw, "dbapi_connection", None)
+    original = {name: getattr(dbapi, name) for name in ("_read_timeout", "_write_timeout")
+                if hasattr(dbapi, name)}
+    call_limit = min(call_limit, remaining, *(value for value in original.values() if value is not None))
+    for name in original:
+        setattr(dbapi, name, call_limit)
+    call_deadline = started + call_limit
+    expired = threading.Event()
+    sock = getattr(dbapi, "_sock", None)
+
+    def abort_reply():
+        expired.set()
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    watchdog = threading.Timer(max(0.0, call_deadline - time.monotonic()), abort_reply) if sock is not None else None
+    if watchdog is not None:
+        watchdog.daemon = True
+        watchdog.start()
+    try:
+        # This is the same socket watchdog used by reference publication, but
+        # it also covers fetch: a fragmented TLS reply must not reset the cap.
+        sql = sql.replace("MAX_EXECUTION_TIME(20000)", f"MAX_EXECUTION_TIME({max(1, int(call_limit * 1000))})")
+        rows = connection.execute(text(sql), params).mappings().all()
+    except Exception as exc:
+        if expired.is_set() or time.monotonic() >= call_deadline:
+            raise TimeoutError("minute_matrix_readback: query/reply deadline exceeded") from exc
+        if isinstance(exc, ValueError):
+            raise RuntimeError("minute_matrix_readback: invalid transport response") from exc
+        raise
+    finally:
+        if watchdog is not None:
+            watchdog.cancel()
+            watchdog.join()  # An old timer must never affect the next query.
+        for name, value in original.items():
+            setattr(dbapi, name, value)
+    if expired.is_set() or time.monotonic() >= call_deadline:
+        raise TimeoutError("minute_matrix_readback: query/reply deadline exceeded")
+    return rows
+
+
 def _mysql_matrix_rows(connection, day, *, scope, deadline, run_id=None):
     """Read each stock once in compressed batches over the existing indexes."""
     staged = run_id is not None
@@ -246,11 +299,11 @@ def _mysql_matrix_rows(connection, day, *, scope, deadline, run_id=None):
     predicate = "trade_date=:day AND " + ("run_id=:run" if staged else "data_source='qmt_datadir'")
     params = {"day": day, "run": run_id}
     expected = set(scope["codes"])
-    directory = connection.execute(text(
+    directory = _read_matrix_query(connection,
         f"SELECT /*+ MAX_EXECUTION_TIME(20000) */ stock_code,COUNT(*) AS row_count "
         f"FROM {table} FORCE INDEX (`{index}`) WHERE {predicate} "
-        f"GROUP BY stock_code ORDER BY stock_code LIMIT {len(expected) + 1}"
-    ), params).mappings().all()
+        f"GROUP BY stock_code ORDER BY stock_code LIMIT {len(expected) + 1}",
+        params, deadline=deadline)
     if (len(directory) != len(expected) or {row["stock_code"] for row in directory} != expected
             or any(row["row_count"] != len(CORE_GRID) for row in directory)):
         raise ValueError("minute_matrix_readback: exact security/count directory differs")
@@ -267,12 +320,12 @@ def _mysql_matrix_rows(connection, day, *, scope, deadline, run_id=None):
                 data_version="'qmt_datadir_v1'", quality_status="'VERIFIED'", permission_status="'SUPPORTED'")
         fields = ",".join(f"'{field}'," + (f"CAST({projections[field]} AS CHAR)" if field in _NUMERIC_FIELDS
                          else projections[field]) for field in _MATRIX_FIELDS)
-        groups = connection.execute(text(
+        groups = _read_matrix_query(connection,
             "SELECT /*+ MAX_EXECUTION_TIME(20000) */ stock_code,COUNT(*) AS row_count,"
             f"COMPRESS(CAST(JSON_ARRAYAGG(JSON_OBJECT({fields})) AS CHAR CHARACTER SET utf8mb4)) AS packed_rows "
             f"FROM {table} FORCE INDEX (`{index}`) WHERE {predicate} AND stock_code IN ({placeholders}) "
-            "GROUP BY stock_code ORDER BY stock_code"
-        ), batch_params).mappings().all()
+            "GROUP BY stock_code ORDER BY stock_code",
+            batch_params, deadline=deadline)
         if (len(groups) != len(batch) or {group["stock_code"] for group in groups} != set(batch)):
             raise RuntimeError("minute_matrix_readback: compressed batch security groups differ")
         if time.monotonic() >= deadline:
