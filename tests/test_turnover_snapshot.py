@@ -1238,7 +1238,10 @@ def test_verified_tencent_daily_row_can_be_frozen_as_turnover_target() -> None:
     assert targets[1].data_source == "tencent_qt"
 
 
-def test_verified_qmt_datadir_daily_rows_complete_turnover_publication() -> None:
+def test_verified_qmt_datadir_daily_rows_complete_turnover_publication(monkeypatch) -> None:
+    from functools import partial
+    from server.common.scheduler_validation import _validate_target_turnover_scheduler_receipt
+
     engine = _engine()
     with engine.begin() as connection:
         connection.execute(text("""
@@ -1249,17 +1252,33 @@ def test_verified_qmt_datadir_daily_rows_complete_turnover_publication() -> None
 
     run = _capture(engine)
     assert all(row.target.data_source == "qmt_datadir" for row in run.rows)
+    published_at = DECISION_AT + timedelta(seconds=1)
     receipt = publish_turnover_snapshot(
         engine, run, min_expected_count=2,
-        published_at=datetime(2026, 8, 27, 18, 45),
+        published_at=published_at,
     )
     evidence = verify_turnover_publication_evidence(
-        engine, target_date=TARGET_DATE, decision_at=DECISION_AT,
+        engine, target_date=TARGET_DATE, decision_at=published_at,
         min_expected_count=2,
     )
 
     assert receipt["expected_count"] == receipt["promoted_count"] == 2
     assert set(evidence) == {"000001", "600000"}
+    proof = validate_turnover_evidence(evidence["000001"]["turnover_evidence_json"])
+    assert proof["snapshot_run_id"] == receipt["run_id"]
+    for field, invalid in (("qmt_quality_status", "QMT_ATTESTED"),
+                           ("qmt_permission_status", "NO_TRADE")):
+        with pytest.raises(ValueError, match="direct turnover snapshot proof differs"):
+            validate_turnover_evidence(build_turnover_evidence({**proof, field: invalid}))
+    monkeypatch.setattr(turnover_module, "MIN_TURNOVER_UNIVERSE_COUNT", 2)
+    monkeypatch.setattr(turnover_module, "verify_turnover_publication_evidence",
+                        partial(verify_turnover_publication_evidence, min_expected_count=2))
+    valid, message = _validate_target_turnover_scheduler_receipt({
+        "_scheduler_pipeline_target_date": TARGET_DATE,
+        "_scheduler_pipeline_decision_at": DECISION_AT.isoformat(timespec="seconds"),
+        "_scheduler_expected_build_sha": BUILD_SHA,
+    }, engine=engine, output=json.dumps(receipt))
+    assert valid, message
     with engine.connect() as connection:
         values = connection.execute(text(
             "SELECT stock_code,turnover_ratio FROM sm_stock_kline ORDER BY stock_code"

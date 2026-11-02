@@ -895,6 +895,10 @@ def validate_turnover_evidence(value: Any) -> dict[str, Any]:
         and target_quality == "QMT_ATTESTED"
         and target_permission == "SUPPORTED"
     ) or (
+        target_source == "qmt_datadir"
+        and target_quality == "VERIFIED"
+        and target_permission == "SUPPORTED"
+    ) or (
         target_source in VERIFIED_FREE_DAILY_ROW_SOURCES
         and target_quality == "SOURCE_VERIFIED"
         and target_permission == "SUPPORTED"
