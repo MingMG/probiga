@@ -51,7 +51,9 @@ def _safe_print(text_value: str) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="A股统一次日早报")
-    parser.add_argument("--test", action="store_true", help="真实研究预览，不写数据库、不推送")
+    delivery = parser.add_mutually_exclusive_group()
+    delivery.add_argument("--test", action="store_true", help="真实研究预览，不写数据库、不推送")
+    delivery.add_argument("--push", action="store_true", help="显式推送企业微信；默认仅发布或核验网站正式报告")
     parser.add_argument("--output", default="")
     args = parser.parse_args()
     engine = get_engine()
@@ -64,7 +66,7 @@ def main():
         Path(args.output).write_text(content, encoding="utf-8")
     if args.test:
         _safe_print(content)
-    else:
+    elif args.push:
         push_to_wecom(content, engine=engine)
     return 0
 
