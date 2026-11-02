@@ -61,7 +61,7 @@ class Providers:
             if self.invalid_initial:
                 value["units"][0]["statement"] = [{"text": "上涨率99.9%。"}]
         elif stage in {"deepseek_review", "codex_review", "deepseek_final_review", "deepseek_final_review_2"}:
-            value = {"schema_version": "probiga.research-review.v3",
+            value = {"schema_version": schema['properties']['schema_version']['const'],
                      "reviewed_sha256": schema["properties"]["reviewed_sha256"]["const"], "findings": []}
             if self.findings and stage in {"deepseek_review", "codex_review"}:
                 value["findings"] = [{"id": "R1", "severity": "warning", "category": "missed_evidence",
@@ -79,6 +79,8 @@ class Providers:
                     value["findings"] = [{"id": "A1", "severity": "blocker", "category": "unsupported_fact",
                         "target": "units.Uenv", "fact_ids": [next(iter(packet["facts"]))],
                         "explanation": "最终原句仍需由作者复核证据并自动修正或反驳。"}]
+            allowed=schema['properties']['findings']['items']['properties']
+            value['findings']=[{k:v for k,v in entry.items() if k in allowed} for entry in value['findings']]
         else:
             assert stage in {"codex_final", "codex_arbitration"}
             final_draft = getattr(self, "draft_factory", answer)(packet)
@@ -87,7 +89,7 @@ class Providers:
             for name, review in material["peer_reviews"].items():
                 for finding in review["findings"]:
                     dispositions[name+":"+finding["id"]] = {"review": name, "finding_id": finding["id"], "resolution": "corrected",
-                                         "unit_ids": ["Uenv"], "fact_ids": finding["fact_ids"],
+                                         "unit_ids": ["Uenv"], "fact_ids": finding.get("fact_ids",[]),
                                          "reason": "最终环境段依据实际广度说明行动边界。"}
             if self.oversized_final:
                 while len(final_draft["units"]) < 52:
@@ -109,7 +111,10 @@ class Providers:
         if stage.startswith("deepseek"):
             policy = decision._deepseek_policy(packet["task"]["kind"])
             receipt.update(source="deepseek_api", transport="live_http", endpoint=decision.DEEPSEEK_ENDPOINT,
-                           model=policy["model"], request_policy=policy, response_schema_sha256=decision._hash(schema), response_status='completed')
+                           model=policy["model"], request_policy=policy, response_schema_sha256=decision._hash(schema), response_status='tool_calls',
+                           wire_schema_sha256=decision._hash(decision._deepseek_request(messages,schema,policy)['tools'][0]['function']['parameters']),
+                           wire_request_sha256=decision._hash(decision._deepseek_request(messages,schema,policy)),
+                           provider_arguments_sha256=decision._body_hash('{"report":'+raw+'}'),provider_arguments_prefix='{"report":',provider_arguments_suffix='}')
         else:
             receipt.update(source="codex_gpt", transport="live_codex_bridge", request_id=request_id,
                            rules_sha256=rules_sha256, ephemeral=True, process_exit_code=0, session_id="unit-" + stage,
@@ -188,6 +193,18 @@ def test_unresolved_finding_blocks_even_when_draft_is_valid(monkeypatch):
         decision._validate_final(json.dumps(final),result["input_packet"],result["verification"]["peer_reviews"])
 
 
+def test_unverified_review_locations_cannot_become_final_report_evidence(monkeypatch):
+    result,_=completed_research(monkeypatch,findings=True)
+    rules,_=decision._load_rules();packet=result['input_packet'];target='0'*64
+    opinion={'schema_version':'probiga.research-review.v4','reviewed_sha256':target,
+        'findings':[{'id':'R1','target':'条件C2','explanation':'质疑条件窗口是否一致；这是审查意见而非行情事实。'}]}
+    assert decision._parse_review(json.dumps(opinion),target,packet,rules=rules)==opinion
+    final=deepcopy(result['model_output']);entry=next(iter(final['dispositions'].values()))
+    entry.update(resolution='disputed_with_evidence',fact_ids=['C2'])
+    with pytest.raises(decision.ResearchError,match='unknown_disposition_reference'):
+        decision._validate_final(json.dumps(final),packet,result['verification']['peer_reviews'])
+
+
 @pytest.mark.parametrize("mutation,reason", [
     (lambda r: r.update(editorial_review={"status": "PASS"}), "nonautomatic_artifact"),
     (lambda r: r["generation_attempts"][0]["provider_receipt"].update(source="manual"), "deepseek_identity_missing"),
@@ -234,9 +251,10 @@ def test_top_level_scope_cannot_relabel_genuine_old_model_output_even_after_rere
         decision.verify_automatic_research(result)
 
 
-def test_real_prior_briefing_remains_auditable_when_research_rules_advance():
+@pytest.mark.parametrize('fixture',['automatic_briefing_20261102_0831.json','automatic_intraday_20261102_1448.json'])
+def test_real_prior_briefing_remains_auditable_when_research_rules_advance(fixture):
     from pathlib import Path
-    prior = json.loads((Path(__file__).parent / "fixtures" / "automatic_briefing_20261102_0831.json").read_text(encoding="utf-8"))
+    prior = json.loads((Path(__file__).parent / "fixtures" / fixture).read_text(encoding="utf-8"))
     assert prior["rules_sha256"] != decision.rules_identity()
     original = deepcopy(prior)
     decision.verify_automatic_research(prior)
