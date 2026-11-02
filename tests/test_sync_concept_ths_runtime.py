@@ -88,6 +88,10 @@ def member_db(monkeypatch, tmp_path):
         conn.execute(text("CREATE TABLE si_trade_calendar (trade_date DATE,trade_status INTEGER)"))
         conn.execute(text("INSERT INTO si_trade_calendar VALUES ('2026-09-11',1)"))
         conn.execute(text("CREATE TABLE si_concept_constituent_ths (query_type TEXT,query_key TEXT,stock_code TEXT,short_name TEXT,etl_sync_at DATETIME)"))
+        conn.execute(text("CREATE TABLE st_scheduled_tasks (id INTEGER PRIMARY KEY,script_path TEXT)"))
+        conn.execute(text("INSERT INTO st_scheduled_tasks VALUES (27,'tools/sync_concept_ths.py')"))
+        conn.execute(text("CREATE TABLE st_scheduled_task_history (id INTEGER PRIMARY KEY,task_id INTEGER,task_type TEXT,run_at DATETIME,finished_at DATETIME,status TEXT,output TEXT)"))
+        conn.execute(text("CREATE INDEX idx_member_history_task ON st_scheduled_task_history(task_id,id)"))
         for kind, key in [("index_code", "885001"), ("concept_code", "300001"), ("index_code", "885002")]:
             conn.execute(text("INSERT INTO si_concept_constituent_ths VALUES (:kind,:key,'600999','old','2026-08-11')"), {"kind": kind, "key": key})
     @contextmanager
@@ -270,3 +274,137 @@ def test_resume_uses_durable_source_shards_and_rechecks_db_without_refetching_su
     assert third["status"] == "COMPLETE"
     assert third["rows_written"] == 1
     assert calls == {"885001": 1, "885002": 2}
+
+
+def _store_member_receipt(engine, result, *, started="2026-09-11 17:00:00", history_id=1):
+    with engine.begin() as connection:
+        connection.execute(text(
+            "INSERT INTO st_scheduled_task_history VALUES "
+            "(:id,27,'sync_concept_ths',:started,:finished,:status,:output)"
+        ), {"id": history_id, "started": started, "finished": result["observed_at"],
+            "status": "failed" if result["status"] == "PARTIAL" else "success",
+            "output": json.dumps(result, ensure_ascii=False)})
+
+
+def _published_receipt(complete, failed, *, rows, empty=()):
+    result = dict(schema=members.RESULT_SCHEMA, provider="ths_native_members", status="PARTIAL",
+        source_trade_date="2026-09-11", observed_at="2026-09-11T18:00:00",
+        catalog_count=len(complete) + len(failed), completed_indices=complete,
+        empty_indices=list(empty), failed_indices=[{"index_code": index, "error": "source incomplete"}
+                                                  for index in failed],
+        rows_written=rows, publication_scope="exact_native_index_partition")
+    return {**result, "result_sha256": members.result_hash(result)}
+
+
+def test_386_published_partitions_resume_without_raw_shards_or_rewriting_them(member_db, monkeypatch):
+    # Production shape: the prior native collector published 68,534 rows in
+    # 386 of 390 partitions, and retained only this scheduler receipt.
+    completed = [f"{885001 + i:06d}" for i in range(386)]
+    failed = ["885431", "885494", "885935", "886113"]
+    catalog = pd.DataFrame([{"index_code": index, "concept_code": f"{300000 + i:06d}"}
+                            for i, index in enumerate(completed + failed)])
+    old_rows = [dict(index=index, code=f"{600000 + j:06d}", name="原有股票")
+                for i, index in enumerate(completed) for j in range(177 + (i < 212))]
+    assert len(old_rows) == 68534
+    with member_db.begin() as connection:
+        connection.execute(text("DELETE FROM si_concept_constituent_ths"))
+        connection.execute(text("INSERT INTO si_concept_constituent_ths VALUES "
+                                "('index_code',:index,:code,:name,'2026-09-11 17:30:00')"), old_rows)
+    _store_member_receipt(member_db, _published_receipt(completed, failed, rows=len(old_rows)))
+    fetched, published = [], []
+    publisher = members.publish_members
+    remaining = {index: collection(index) for index in failed}
+
+    def fetch(index, **kwargs):
+        fetched.append(index)
+        assert index in failed, "a verified published partition must not be fetched again"
+        return remaining[index]
+
+    def publish(engine, payload, **kwargs):
+        published.append(payload["index_code"])
+        return publisher(engine, payload, **kwargs)
+
+    monkeypatch.setattr(members, "collect_members", fetch)
+    monkeypatch.setattr(members, "publish_members", publish)
+    result = members.sync_member_partitions(member_db, catalog)
+    assert result["status"] == "COMPLETE"
+    assert sorted(fetched) == sorted(published) == sorted(failed)
+    assert result["reused_published_indices"] == result["reused_indices"] == completed
+    assert result["source_proven_indices"] == sorted(failed)
+    assert result["raw_record_count"] == result["unique_security_count"] == 4
+    assert result["rows_written"] == 4 and result["published_row_count"] == 68538
+    with member_db.connect() as connection:
+        assert connection.execute(text("SELECT COUNT(*) FROM si_concept_constituent_ths "
+            "WHERE etl_sync_at='2026-09-11 17:30:00'")).scalar_one() == 68534
+    # A subsequent run can still reuse published rows after its local raw
+    # checkpoint files disappear, without inventing raw-inventory evidence.
+    _store_member_receipt(member_db, result, history_id=2, started="2026-09-12 00:00:00")
+    scope = dict(source_trade_date="2026-09-11", catalog_sha256=result["catalog_sha256"])
+    shards = members.AcquisitionShards("ths_native_members", scope)
+    for index in failed:
+        shards._path(index).unlink()
+    second = members.sync_member_partitions(member_db, catalog)
+    assert second["status"] == "COMPLETE" and second["rows_written"] == 0
+    assert second["raw_record_count"] == 0 and second["source_proven_indices"] == []
+    assert len(second["reused_published_indices"]) == 390
+    assert second["published_partition_root_sha256"] == result["published_partition_root_sha256"]
+    assert len(fetched) == len(published) == 4
+    # The new content binding cannot be bypassed by falling back to the older
+    # summary-only receipt if a mutable DB partition later changes.
+    with member_db.begin() as connection:
+        connection.execute(text("UPDATE si_concept_constituent_ths SET short_name='changed' "
+                                "WHERE query_key=:index"), {"index": completed[0]})
+    assert members._reuse_published_partitions(member_db, sorted(catalog.to_dict("records"),
+        key=lambda row: row["index_code"]), as_of="2026-09-11", now=members.datetime.now()) == {}
+
+
+@pytest.mark.parametrize("corruption", ["hash", "date", "catalog", "count", "timestamp", "duplicate"])
+def test_published_partition_reuse_rejects_unproven_receipt_or_readback(member_db, corruption):
+    receipt = _published_receipt(["885001"], ["885002"], rows=1)
+    with member_db.begin() as connection:
+        connection.execute(text("UPDATE si_concept_constituent_ths SET etl_sync_at='2026-09-11 17:30:00' "
+                                "WHERE query_key='885001'"))
+        if corruption == "timestamp":
+            connection.execute(text("UPDATE si_concept_constituent_ths SET etl_sync_at='2026-09-10' "
+                                    "WHERE query_key='885001'"))
+        elif corruption == "duplicate":
+            connection.execute(text("INSERT INTO si_concept_constituent_ths VALUES "
+                "('index_code','885001','600999','old','2026-09-11 17:30:00')"))
+    if corruption == "hash":
+        receipt["result_sha256"] = "0" * 64
+    else:
+        if corruption == "date": receipt["source_trade_date"] = "2026-09-10"
+        if corruption == "catalog": receipt["failed_indices"][0]["index_code"] = "885003"
+        if corruption == "count": receipt["rows_written"] = 2
+        unsigned = {key: value for key, value in receipt.items() if key != "result_sha256"}
+        receipt["result_sha256"] = members.result_hash(unsigned)
+    _store_member_receipt(member_db, receipt)
+    records = [dict(index_code="885001", concept_code="300001"),
+               dict(index_code="885002", concept_code="300002")]
+    assert members._reuse_published_partitions(member_db, records, as_of="2026-09-11",
+                                              now=members.datetime.now()) == {}
+
+
+def test_published_authoritative_empty_partition_is_reused_without_synthetic_members(member_db, monkeypatch):
+    with member_db.begin() as connection:
+        connection.execute(text("DELETE FROM si_concept_constituent_ths WHERE query_key='885001'"))
+    _store_member_receipt(member_db, _published_receipt(["885001"], ["885002"], rows=0,
+                                                       empty=["885001"]))
+    remaining = collection("885002")
+    fetched = []
+
+    def fetch(index, **kwargs):
+        fetched.append(index)
+        return remaining
+
+    monkeypatch.setattr(members, "collect_members", fetch)
+    result = members.sync_member_partitions(member_db, pd.DataFrame([
+        dict(index_code="885001", concept_code="300001"),
+        dict(index_code="885002", concept_code="300002"),
+    ]))
+    assert result["status"] == "COMPLETE" and fetched == ["885002"]
+    assert result["empty_indices"] == result["reused_published_indices"] == ["885001"]
+    assert result["published_row_count"] == result["rows_written"] == 1
+    with member_db.connect() as connection:
+        assert connection.execute(text("SELECT COUNT(*) FROM si_concept_constituent_ths "
+                                       "WHERE query_key='885001'")).scalar_one() == 0

@@ -13,7 +13,7 @@ from typing import Any
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 
 from biz.stock_info.ths_catalog import PublicReader, INDEX_PATTERN, _valid_text, identity_hash
 from server.common.mysql_lock import mysql_named_lock
@@ -248,6 +248,134 @@ def _retryable_member_source_error(error: Exception) -> bool:
     return False
 
 
+def _published_root(partitions):
+    return result_hash([[index, result_hash(value)] for index, value in sorted(partitions.items())])
+
+
+def _reuse_published_partitions(engine, records, *, as_of, now):
+    """Reuse a completed publication, without claiming its raw source records."""
+    expected = {str(row["index_code"]) for row in records}
+    catalog_hash = result_hash([[str(row["index_code"]), str(row["concept_code"])] for row in records])
+    with engine.connect() as connection:
+        tasks = connection.execute(text(
+            "SELECT id FROM st_scheduled_tasks WHERE script_path='tools/sync_concept_ths.py' "
+            "ORDER BY id LIMIT 2"
+        )).scalars().all()
+        if len(tasks) != 1:
+            return {}
+        # Locate a bounded set of audit keys before fetching LONGTEXT output;
+        # ordering history must never materialize every old receipt payload.
+        identifiers = connection.execute(text(
+            "SELECT id FROM st_scheduled_task_history WHERE task_id=:task_id "
+            "AND task_type='sync_concept_ths' AND finished_at IS NOT NULL "
+            "AND status IN ('success','failed','degraded') ORDER BY id DESC LIMIT 10"
+        ), {"task_id": tasks[0]}).scalars().all()
+        if not identifiers:
+            return {}
+        candidates = connection.execute(text(
+            "SELECT run_at,finished_at,output FROM st_scheduled_task_history "
+            "WHERE id IN :identifiers AND LENGTH(output)<=262144 ORDER BY id DESC"
+        ).bindparams(bindparam("identifiers", expanding=True)),
+            {"identifiers": identifiers}).mappings().all()
+        for candidate in candidates:
+            receipts = {}
+            for line in str(candidate["output"] or "").splitlines():
+                try:
+                    value = json.loads(line)
+                    if isinstance(value, dict) and value.get("schema") == RESULT_SCHEMA:
+                        supplied = value.pop("result_sha256", None)
+                        if supplied == result_hash(value):
+                            receipts[supplied] = value
+                except (ValueError, TypeError):
+                    continue
+            if len(receipts) != 1:
+                continue
+            receipt = next(iter(receipts.values()))
+            try:
+                started = datetime.fromisoformat(str(candidate["run_at"]))
+                observed = datetime.fromisoformat(str(receipt["observed_at"]))
+                complete, empty = receipt["completed_indices"], receipt["empty_indices"]
+                failed = [item["index_code"] for item in receipt["failed_indices"]]
+                if (receipt.get("provider") != "ths_native_members"
+                    or receipt.get("publication_scope") != "exact_native_index_partition"
+                    or receipt.get("status") not in {"COMPLETE", "PARTIAL"}
+                    or receipt.get("source_trade_date") != as_of
+                    or type(receipt.get("catalog_count")) is not int or receipt["catalog_count"] != len(records)
+                    or not isinstance(complete, list) or not isinstance(empty, list)
+                    or len(complete) != len(set(complete)) or len(failed) != len(set(failed))
+                    or len(empty) != len(set(empty)) or not set(empty) <= set(complete)
+                    or set(complete) & set(failed) or set(complete) | set(failed) != expected
+                    or bool(failed) != (receipt["status"] == "PARTIAL")
+                    or not complete or started.tzinfo or observed.tzinfo
+                    or not started <= observed <= now
+                    or observed.date().isoformat() < as_of
+                    or receipt.get("catalog_sha256", catalog_hash) != catalog_hash):
+                    continue
+                # New receipts bind every published partition by content. The
+                # earlier complete-publication receipt instead binds the exact
+                # write window and total rows; it does not contain raw proofs.
+                published_count = receipt.get("published_row_count", receipt.get("rows_written"))
+                if type(published_count) is not int or published_count < 0:
+                    continue
+                if "published_row_count" not in receipt and receipt.get("reused_indices"):
+                    continue
+            except (KeyError, ValueError, TypeError):
+                continue
+            statement = text(
+                "SELECT /*+ MAX_EXECUTION_TIME(20000) */ query_key,stock_code,short_name,etl_sync_at "
+                "FROM si_concept_constituent_ths "
+                "WHERE query_type='index_code' AND query_key IN :indices "
+                "ORDER BY query_key,stock_code LIMIT :row_limit"
+            ).bindparams(bindparam("indices", expanding=True))
+            partitions = {index: {"members": [], "observed_at": None} for index in complete}
+            deadline = time.monotonic() + 60
+            valid, total = True, 0
+            for offset in range(0, len(complete), 50):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("THS published partition readback: total deadline exceeded")
+                indices = complete[offset:offset + 50]
+                stored = connection.execute(statement, {
+                    "indices": indices, "row_limit": 6000 * len(indices) + 1,
+                }).mappings().all()
+                if len(stored) > 6000 * len(indices):
+                    valid = False
+                    break
+                for row in stored:
+                    index, code, name = str(row["query_key"]), row["stock_code"], row["short_name"]
+                    try:
+                        stamp = datetime.fromisoformat(str(row["etl_sync_at"]))
+                    except (ValueError, TypeError):
+                        valid = False
+                        break
+                    partition = partitions[index]
+                    stamp_text = stamp.isoformat()
+                    if (not isinstance(code, str) or not re.fullmatch(r"[0234689][0-9]{5}", code)
+                        or not isinstance(name, str) or not _valid_text(name)
+                        or stamp.tzinfo or stamp > observed
+                        or (stamp < started if "published_partition_root_sha256" not in receipt
+                            else stamp.date().isoformat() < as_of)
+                        or partition["observed_at"] not in {None, stamp_text}
+                        or len(partition["members"]) >= 6000
+                        or (partition["members"] and partition["members"][-1]["stock_code"] >= code)):
+                        valid = False
+                        break
+                    partition["observed_at"] = stamp_text
+                    partition["members"].append({"stock_code": code, "short_name": name})
+                    total += 1
+                if not valid:
+                    break
+            if (not valid or total != published_count
+                or {index for index, value in partitions.items() if not value["members"]} != set(empty)):
+                return {}
+            if time.monotonic() >= deadline:
+                raise TimeoutError("THS published partition readback: total deadline exceeded")
+            if ("published_partition_root_sha256" in receipt
+                and receipt["published_partition_root_sha256"] != _published_root(partitions)):
+                return {}
+            return partitions
+    return {}
+
+
 def sync_member_partitions(engine, catalog):
     if catalog is None or catalog.empty or not {"index_code", "concept_code"}.issubset(catalog.columns):
         raise RuntimeError("THS native catalog is empty or lacks identity columns")
@@ -257,18 +385,24 @@ def sync_member_partitions(engine, catalog):
     if not as_of:
         raise RuntimeError("THS completed source trade date unavailable")
     reader = PublicReader()
-    complete, failed, empty, reused = [], [], [], []
+    complete, failed, empty, reused, reused_published = [], [], [], [], []
     written = 0
     records = sorted(catalog.to_dict("records"), key=lambda row: str(row["index_code"]))
+    catalog_hash = result_hash([[str(row["index_code"]), str(row["concept_code"])] for row in records])
     shards = AcquisitionShards("ths_native_members", {
         "source_trade_date": as_of,
-        "catalog_sha256": result_hash([[str(row["index_code"]), str(row["concept_code"])] for row in records]),
+        "catalog_sha256": catalog_hash,
     })
-    collections, pending, last_progress_at = {}, [], None
+    collections, partitions, saved, pending, last_progress_at = {}, {}, {}, [], None
 
-    def remember(index, collection):
+    def remember(index, collection, *, published_reuse=False):
         nonlocal last_progress_at
-        collections[index] = collection
+        if not published_reuse:
+            collections[index] = collection
+        observed = collection["observed_at"]
+        partitions[index] = {"members": collection["members"], "observed_at": (
+            observed.isoformat() if isinstance(observed, datetime) else observed
+        ) if collection["members"] else None}
         complete.append(index)
         if not collection["members"]:
             empty.append(index)
@@ -287,7 +421,20 @@ def sync_member_partitions(engine, catalog):
                 raise ValueError("THS source shard identity differs")
             validate_collection(collection)
         except (ValueError, RuntimeError, KeyError, TypeError):
-            pending.append(row)
+            continue
+        saved[index] = collection
+    published = (_reuse_published_partitions(engine, records, as_of=as_of,
+                 now=datetime.now().replace(microsecond=0)) if len(saved) < len(records) else {})
+    for row in records:
+        index = str(row["index_code"])
+        collection = saved.get(index)
+        if collection is None:
+            if index in published:
+                reused.append(index)
+                reused_published.append(index)
+                remember(index, published[index], published_reuse=True)
+            else:
+                pending.append(row)
             continue
         with engine.connect() as connection:
             stored = [dict(item) for item in connection.execute(text(
@@ -353,5 +500,8 @@ def sync_member_partitions(engine, catalog):
         duplicate_indices=[[index, value["raw_record_count"], value["unique_security_count"],
                             value["duplicate_record_count"], value["raw_inventory_sha256"]]
             for index, value in sorted(collections.items()) if value["duplicate_record_count"]])
+    result.update(catalog_sha256=catalog_hash, published_row_count=sum(len(value["members"]) for value in partitions.values()),
+        published_partition_root_sha256=_published_root(partitions), reused_published_indices=sorted(reused_published),
+        source_proven_indices=sorted(collections))
     return {**result, "result_sha256": result_hash(result)}
 

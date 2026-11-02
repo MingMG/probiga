@@ -950,6 +950,10 @@ def _retryable_blocked_marker(value: object) -> str:
 def _task_status_is_retryable(row: dict) -> bool:
     status = str(row.get("last_run_status") or "").strip().lower()
     task_type = str(row.get("task_type") or "").strip()
+    if status == "degraded" and task_type in PRIOR_SESSION_PUBLIC_MINUTE_TASK_TYPES:
+        # Partial public minute data remains useful, but its missing securities
+        # still need the existing checkpointed collector and retry backoff.
+        return True
     if status == "pending":
         # Dispatch may fail after updating the compact cursor but before the
         # immutable execution row exists. Retry that orphan after the normal
@@ -3751,7 +3755,7 @@ def _attach_daily_recovery_targets(
         row
         for row in rows
         if str(row.get("task_type") or "").strip()
-        in (DAILY_RESULT_TARGET_BOUND_TASK_TYPES | FINALIZED_MINUTE_TASK_TYPES)
+        in (DAILY_RESULT_TARGET_BOUND_TASK_TYPES | FINALIZED_MINUTE_TASK_TYPES | PRIOR_SESSION_PUBLIC_MINUTE_TASK_TYPES)
     ]
     for row in selected:
         row["_scheduler_target_trade_date"] = ""
@@ -3769,8 +3773,8 @@ def _attach_daily_recovery_targets(
         if str(row.get("task_type") or "").strip()
         in DAILY_DATA_INGESTION_TASK_TYPES
     ]
-    minute_rows = [row for row in selected if row["task_type"] in FINALIZED_MINUTE_TASK_TYPES]
-    stock_minute_rows = [row for row in minute_rows if row["task_type"] == "qmt_stock_minute_canonical"]
+    minute_rows = [row for row in selected if row["task_type"] in (FINALIZED_MINUTE_TASK_TYPES | PRIOR_SESSION_PUBLIC_MINUTE_TASK_TYPES)]
+    stock_minute_rows = [row for row in minute_rows if row["task_type"] == "qmt_stock_minute_canonical" or row["task_type"] in PRIOR_SESSION_PUBLIC_MINUTE_TASK_TYPES]
     elapsed_minute_rows = [row for row in minute_rows if row not in stock_minute_rows]
     delivery_rows = [row for row in selected if row not in ingestion_rows and row not in minute_rows]
     authorities_available = True
