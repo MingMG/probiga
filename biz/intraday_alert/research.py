@@ -8,6 +8,8 @@ from __future__ import annotations
 import hashlib
 import json
 from copy import deepcopy
+from contextlib import contextmanager
+from threading import Event, Thread
 from decimal import Decimal
 from datetime import datetime, timedelta
 from typing import Any, Callable, Mapping
@@ -255,6 +257,41 @@ def expire_research_batches(engine, *, now: datetime, limit: int = 10) -> int:
     return changed
 
 
+LEASE_RENEW_INTERVAL_SECONDS = LEASE_SECONDS / 4
+
+
+@contextmanager
+def _renewing_owner(engine, *, outbox_id, owner, generation, deadline, now_fn):
+    """Renew ownership independently of provider output, never business progress."""
+    stopped, failures = Event(), []
+    def heartbeat():
+        while not stopped.wait(LEASE_RENEW_INTERVAL_SECONDS):
+            try:
+                current = _time(now_fn())
+                with engine.begin() as connection:
+                    _prepare(connection)
+                    snapshot = _owned(_load_locked(connection, engine, outbox_id), owner, generation, current)
+                    snapshot["analysis"].update(
+                        lease_expires_at=_stamp(min(deadline, current + timedelta(seconds=LEASE_SECONDS))),
+                        last_heartbeat_at=_stamp(current))
+                    connection.execute(text(f"UPDATE {OUTBOX_TABLE} SET evidence_json=:evidence,updated_at=:now WHERE outbox_id=:id AND status='ANALYZING'"),
+                        {"id": outbox_id, "evidence": _json(snapshot), "now": current})
+            except Exception as exc:
+                failures.append(exc)
+                stopped.set()
+    worker = Thread(target=heartbeat, name="intraday-research-owner", daemon=True)
+    worker.start()
+    try:
+        yield
+    finally:
+        stopped.set()
+        worker.join(timeout=20)
+    if worker.is_alive():
+        raise IntradayResearchError("INTRADAY_RESEARCH_BLOCKED stage=owner_lease reason=heartbeat_shutdown_timeout")
+    if failures:
+        raise IntradayResearchError("INTRADAY_RESEARCH_BLOCKED stage=owner_lease reason=renewal_failed") from failures[0]
+
+
 def process_research_batch(engine, *, outbox_id: str, generator=None, now_fn: Callable = _now) -> dict:
     engine = get_research_engine(engine)
     now = _time(now_fn())
@@ -339,9 +376,11 @@ def process_research_batch(engine, *, outbox_id: str, generator=None, now_fn: Ca
         if generator is None:
             from biz.review.market_decision import generate_research
             generator = generate_research
-        research = generator(state["digest"], report_kind="intraday",
-            next_trade_date=state["digest"]["review_date"], context=state["context"], previous_research=None,
-            engine=engine, now=now.replace(tzinfo=TZ), checkpoint=state.get("checkpoint"), progress=progress)
+        with _renewing_owner(engine, outbox_id=outbox_id, owner=owner, generation=generation,
+                             deadline=deadline, now_fn=now_fn):
+            research = generator(state["digest"], report_kind="intraday",
+                next_trade_date=state["digest"]["review_date"], context=state["context"], previous_research=None,
+                engine=engine, now=now.replace(tzinfo=TZ), checkpoint=state.get("checkpoint"), progress=progress)
         from biz.review.market_decision import verify_automatic_research
         verify_automatic_research(research)
         actual_units = _verified_research_units(research)

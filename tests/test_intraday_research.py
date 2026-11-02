@@ -494,3 +494,27 @@ def test_measured_dual_model_latency_past_three_minutes_is_accepted_before_five(
     assert result["status"] == row["status"] == "SHADOW"
     assert state["analysis"]["completed_units"] == 7
     assert research._time(state["analysis"]["deadline_at"]) == NOW + timedelta(seconds=280)
+
+
+def test_silent_provider_wait_renews_owner_without_fabricating_progress(db, verifier, monkeypatch):
+    import time
+    monkeypatch.setattr(research, "LEASE_RENEW_INTERVAL_SECONDS", 0.01)
+    identity, clock = queue(db), [NOW]
+    def generate(_digest, **kwargs):
+        clock[0] = NOW + timedelta(seconds=45)
+        limit = time.monotonic() + 2
+        while time.monotonic() < limit:
+            _, state = load(db, identity)
+            if state["analysis"].get("last_heartbeat_at") == research._stamp(clock[0]):
+                break
+            time.sleep(0.005)
+        else:
+            pytest.fail("owner heartbeat never renewed during provider wait")
+        assert state["analysis"]["completed_units"] == 0
+        assert state["analysis"]["last_progress_at"] == research._stamp(NOW)
+        assert research._time(state["analysis"]["lease_expires_at"]) == NOW + timedelta(seconds=105)
+        clock[0] = NOW + timedelta(seconds=70)
+        return final_result()
+    result = research.process_research_batch(db[0], outbox_id=identity, generator=generate, now_fn=lambda: clock[0])
+    assert result["status"] == "SHADOW"
+    assert load(db, identity)[1]["analysis"]["completed_units"] == 7
