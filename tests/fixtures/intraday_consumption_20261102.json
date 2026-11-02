@@ -1,0 +1,1270 @@
+{
+  "observation_id": "d04803a7551301cd20c9a0bf3e2b9e06686da6d13e6b40f25f6e85957062372c",
+  "trade_date": "2026-11-02",
+  "source_snapshot_at": "2026-11-02 10:19:45",
+  "observed_at": "2026-11-02 10:20:06",
+  "coverage": "0.99820724",
+  "quality_status": "PASS",
+  "market": {
+    "amount_delta": 10529010900.0,
+    "equal_weight_return_pct": 0.5072194813218391,
+    "median_return_pct": 0.45811599999999997,
+    "positive_breadth_pct": 60.0933908045977,
+    "stock_count": 5568,
+    "total_amount": 755369884900.0
+  },
+  "sectors": {
+    "available": true,
+    "items": [
+      {
+        "amount": 26888823800.0,
+        "amount_delta": 370274300.0,
+        "code": "SW1非银金融",
+        "equal_weight_return_pct": 2.827789769230769,
+        "industry_code": "SW1非银金融",
+        "industry_name": "非银金融",
+        "leaders": [
+          {
+            "amount": 467660400.0,
+            "change_pct": 10.026042,
+            "short_name": "国金证券",
+            "stock_code": "600109"
+          },
+          {
+            "amount": 1019636900.0,
+            "change_pct": 9.937888,
+            "short_name": "太平洋",
+            "stock_code": "601099"
+          },
+          {
+            "amount": 4398078800.0,
+            "change_pct": 6.306818,
+            "short_name": "东方财富",
+            "stock_code": "300059"
+          }
+        ],
+        "median_return_pct": 3.0990260000000003,
+        "member_count": 78,
+        "name": "非银金融",
+        "positive_breadth_pct": 92.3076923076923
+      },
+      {
+        "amount": 30154031900.0,
+        "amount_delta": 312286000.0,
+        "code": "SW1食品饮料",
+        "equal_weight_return_pct": 2.324093118644068,
+        "industry_code": "SW1食品饮料",
+        "industry_name": "食品饮料",
+        "leaders": [
+          {
+            "amount": 180541900.0,
+            "change_pct": 10.015649,
+            "short_name": "水井坊",
+            "stock_code": "600779"
+          },
+          {
+            "amount": 186437700.0,
+            "change_pct": 10.014104,
+            "short_name": "皇台酒业",
+            "stock_code": "000995"
+          },
+          {
+            "amount": 738210800.0,
+            "change_pct": 9.97994,
+            "short_name": "青岛食品",
+            "stock_code": "001219"
+          }
+        ],
+        "median_return_pct": 1.9296479999999998,
+        "member_count": 118,
+        "name": "食品饮料",
+        "positive_breadth_pct": 83.05084745762711
+      },
+      {
+        "amount": 25630550100.0,
+        "amount_delta": 355870600.0,
+        "code": "SW1传媒",
+        "equal_weight_return_pct": 1.657358902255639,
+        "industry_code": "SW1传媒",
+        "industry_name": "传媒",
+        "leaders": [
+          {
+            "amount": 240363700.0,
+            "change_pct": 10.075567,
+            "short_name": "大晟文化",
+            "stock_code": "600892"
+          },
+          {
+            "amount": 221421100.0,
+            "change_pct": 10.007252,
+            "short_name": "电魂网络",
+            "stock_code": "603258"
+          },
+          {
+            "amount": 270279600.0,
+            "change_pct": 9.98308,
+            "short_name": "龙版传媒",
+            "stock_code": "605577"
+          }
+        ],
+        "median_return_pct": 1.772152,
+        "member_count": 133,
+        "name": "传媒",
+        "positive_breadth_pct": 75.18796992481202
+      },
+      {
+        "amount": 10460547000.0,
+        "amount_delta": 104916400.0,
+        "code": "SW1商贸零售",
+        "equal_weight_return_pct": 1.8380611263157893,
+        "industry_code": "SW1商贸零售",
+        "industry_name": "商贸零售",
+        "leaders": [
+          {
+            "amount": 251520100.0,
+            "change_pct": 10.056926,
+            "short_name": "广百股份",
+            "stock_code": "002187"
+          },
+          {
+            "amount": 458985500.0,
+            "change_pct": 10.0,
+            "short_name": "合百集团",
+            "stock_code": "000417"
+          },
+          {
+            "amount": 361295200.0,
+            "change_pct": 9.990663,
+            "short_name": "百大集团",
+            "stock_code": "600865"
+          }
+        ],
+        "median_return_pct": 1.680672,
+        "member_count": 95,
+        "name": "商贸零售",
+        "positive_breadth_pct": 82.10526315789474
+      },
+      {
+        "amount": 4739266300.0,
+        "amount_delta": 60372600.0,
+        "code": "SW1社会服务",
+        "equal_weight_return_pct": 1.2321034705882352,
+        "industry_code": "SW1社会服务",
+        "industry_name": "社会服务",
+        "leaders": [
+          {
+            "amount": 565827800.0,
+            "change_pct": 10.0,
+            "short_name": "锦江酒店",
+            "stock_code": "600754"
+          },
+          {
+            "amount": 37013100.0,
+            "change_pct": 5.719237,
+            "short_name": "同庆楼",
+            "stock_code": "605108"
+          },
+          {
+            "amount": 552633200.0,
+            "change_pct": 5.631537,
+            "short_name": "首旅酒店",
+            "stock_code": "600258"
+          }
+        ],
+        "median_return_pct": 1.4144975,
+        "member_count": 68,
+        "name": "社会服务",
+        "positive_breadth_pct": 76.47058823529412
+      },
+      {
+        "amount": 40125427800.0,
+        "amount_delta": 591713700.0,
+        "code": "SW1计算机",
+        "equal_weight_return_pct": 1.49268372815534,
+        "industry_code": "SW1计算机",
+        "industry_name": "计算机",
+        "leaders": [
+          {
+            "amount": 1597314700.0,
+            "change_pct": 20.017994,
+            "short_name": "银之杰",
+            "stock_code": "300085"
+          },
+          {
+            "amount": 106421500.0,
+            "change_pct": 14.901257,
+            "short_name": "*ST航图",
+            "stock_code": "688066"
+          },
+          {
+            "amount": 48601900.0,
+            "change_pct": 14.355949,
+            "short_name": "云涌科技",
+            "stock_code": "688060"
+          }
+        ],
+        "median_return_pct": 1.295097,
+        "member_count": 309,
+        "name": "计算机",
+        "positive_breadth_pct": 76.37540453074433
+      },
+      {
+        "amount": 7992408200.0,
+        "amount_delta": 96814900.0,
+        "code": "SW1农林牧渔",
+        "equal_weight_return_pct": 1.10680381,
+        "industry_code": "SW1农林牧渔",
+        "industry_name": "农林牧渔",
+        "leaders": [
+          {
+            "amount": 255301500.0,
+            "change_pct": 7.51938,
+            "short_name": "万辰集团",
+            "stock_code": "300972"
+          },
+          {
+            "amount": 158988200.0,
+            "change_pct": 5.40023,
+            "short_name": "中宠股份",
+            "stock_code": "002891"
+          },
+          {
+            "amount": 44885800.0,
+            "change_pct": 5.105105,
+            "short_name": "博闻科技",
+            "stock_code": "600883"
+          }
+        ],
+        "median_return_pct": 1.14861,
+        "member_count": 100,
+        "name": "农林牧渔",
+        "positive_breadth_pct": 75.0
+      },
+      {
+        "amount": 46903916700.0,
+        "amount_delta": 831298900.0,
+        "code": "SW1电力设备",
+        "equal_weight_return_pct": 1.0611796209150326,
+        "industry_code": "SW1电力设备",
+        "industry_name": "电力设备",
+        "leaders": [
+          {
+            "amount": 185335300.0,
+            "change_pct": 14.214047,
+            "short_name": "南网科技",
+            "stock_code": "688248"
+          },
+          {
+            "amount": 1150469200.0,
+            "change_pct": 12.702366,
+            "short_name": "欣旺达",
+            "stock_code": "300207"
+          },
+          {
+            "amount": 8471700.0,
+            "change_pct": 10.23622,
+            "short_name": "*ST亿晶",
+            "stock_code": "600537"
+          }
+        ],
+        "median_return_pct": 1.0624224999999998,
+        "member_count": 306,
+        "name": "电力设备",
+        "positive_breadth_pct": 74.18300653594771
+      },
+      {
+        "amount": 2512071700.0,
+        "amount_delta": 50588000.0,
+        "code": "SW1钢铁",
+        "equal_weight_return_pct": 0.7086654222222222,
+        "industry_code": "SW1钢铁",
+        "industry_name": "钢铁",
+        "leaders": [
+          {
+            "amount": 82566000.0,
+            "change_pct": 6.432749,
+            "short_name": "安阳钢铁",
+            "stock_code": "600569"
+          },
+          {
+            "amount": 69875300.0,
+            "change_pct": 3.168568,
+            "short_name": "海南矿业",
+            "stock_code": "601969"
+          },
+          {
+            "amount": 58493900.0,
+            "change_pct": 3.041825,
+            "short_name": "久立特材",
+            "stock_code": "002318"
+          }
+        ],
+        "median_return_pct": 0.952381,
+        "member_count": 45,
+        "name": "钢铁",
+        "positive_breadth_pct": 73.33333333333333
+      },
+      {
+        "amount": 43303887500.0,
+        "amount_delta": 662738500.0,
+        "code": "SW1通信",
+        "equal_weight_return_pct": 0.910658625,
+        "industry_code": "SW1通信",
+        "industry_name": "通信",
+        "leaders": [
+          {
+            "amount": 9353900.0,
+            "change_pct": 10.126582,
+            "short_name": "*ST实达",
+            "stock_code": "600734"
+          },
+          {
+            "amount": 156004900.0,
+            "change_pct": 10.013986,
+            "short_name": "长江通信",
+            "stock_code": "600345"
+          },
+          {
+            "amount": 694396800.0,
+            "change_pct": 10.004034,
+            "short_name": "润建股份",
+            "stock_code": "002929"
+          }
+        ],
+        "median_return_pct": 0.7417935,
+        "member_count": 112,
+        "name": "通信",
+        "positive_breadth_pct": 63.39285714285714
+      },
+      {
+        "amount": 536149400.0,
+        "amount_delta": 7641400.0,
+        "code": "SW1综合",
+        "equal_weight_return_pct": 0.7502468235294117,
+        "industry_code": "SW1综合",
+        "industry_name": "综合",
+        "leaders": [
+          {
+            "amount": 35918600.0,
+            "change_pct": 3.760684,
+            "short_name": "鲁银投资",
+            "stock_code": "600784"
+          },
+          {
+            "amount": 14817500.0,
+            "change_pct": 2.586207,
+            "short_name": "ST三木",
+            "stock_code": "000632"
+          },
+          {
+            "amount": 13235700.0,
+            "change_pct": 2.310231,
+            "short_name": "泰达股份",
+            "stock_code": "000652"
+          }
+        ],
+        "median_return_pct": 0.684932,
+        "member_count": 17,
+        "name": "综合",
+        "positive_breadth_pct": 76.47058823529412
+      },
+      {
+        "amount": 134667344400.0,
+        "amount_delta": 1722075300.0,
+        "code": "SW1电子",
+        "equal_weight_return_pct": 0.6905550537897311,
+        "industry_code": "SW1电子",
+        "industry_name": "电子",
+        "leaders": [
+          {
+            "amount": 1092719300.0,
+            "change_pct": 17.721519,
+            "short_name": "安集科技",
+            "stock_code": "688019"
+          },
+          {
+            "amount": 204321400.0,
+            "change_pct": 13.655761,
+            "short_name": "经纬辉开",
+            "stock_code": "300120"
+          },
+          {
+            "amount": 314062000.0,
+            "change_pct": 12.5,
+            "short_name": "格科微",
+            "stock_code": "688728"
+          }
+        ],
+        "median_return_pct": 0.645161,
+        "member_count": 409,
+        "name": "电子",
+        "positive_breadth_pct": 62.34718826405869
+      },
+      {
+        "amount": 10435650500.0,
+        "amount_delta": 175094300.0,
+        "code": "SW1交通运输",
+        "equal_weight_return_pct": 0.5178801652892562,
+        "industry_code": "SW1交通运输",
+        "industry_name": "交通运输",
+        "leaders": [
+          {
+            "amount": 203377500.0,
+            "change_pct": 7.633588,
+            "short_name": "中原高速",
+            "stock_code": "600020"
+          },
+          {
+            "amount": 38061400.0,
+            "change_pct": 4.12675,
+            "short_name": "厦门空港",
+            "stock_code": "600897"
+          },
+          {
+            "amount": 62059500.0,
+            "change_pct": 3.863988,
+            "short_name": "四川成渝",
+            "stock_code": "601107"
+          }
+        ],
+        "median_return_pct": 0.588928,
+        "member_count": 121,
+        "name": "交通运输",
+        "positive_breadth_pct": 68.59504132231406
+      },
+      {
+        "amount": 7159458500.0,
+        "amount_delta": 97987100.0,
+        "code": "SW1轻工制造",
+        "equal_weight_return_pct": 0.3462590680272109,
+        "industry_code": "SW1轻工制造",
+        "industry_name": "轻工制造",
+        "leaders": [
+          {
+            "amount": 574830800.0,
+            "change_pct": 10.011779,
+            "short_name": "华瓷股份",
+            "stock_code": "001216"
+          },
+          {
+            "amount": 82624300.0,
+            "change_pct": 9.990917,
+            "short_name": "松炀资源",
+            "stock_code": "603863"
+          },
+          {
+            "amount": 218212600.0,
+            "change_pct": 8.41914,
+            "short_name": "明月镜片",
+            "stock_code": "301101"
+          }
+        ],
+        "median_return_pct": 0.583431,
+        "member_count": 147,
+        "name": "轻工制造",
+        "positive_breadth_pct": 63.26530612244898
+      },
+      {
+        "amount": 5038116600.0,
+        "amount_delta": 61627600.0,
+        "code": "SW1纺织服饰",
+        "equal_weight_return_pct": 0.8026928365384616,
+        "industry_code": "SW1纺织服饰",
+        "industry_name": "纺织服饰",
+        "leaders": [
+          {
+            "amount": 234729600.0,
+            "change_pct": 10.021023,
+            "short_name": "富春染织",
+            "stock_code": "605189"
+          },
+          {
+            "amount": 232572300.0,
+            "change_pct": 10.0,
+            "short_name": "地素时尚",
+            "stock_code": "603587"
+          },
+          {
+            "amount": 68891100.0,
+            "change_pct": 7.703488,
+            "short_name": "百隆东方",
+            "stock_code": "601339"
+          }
+        ],
+        "median_return_pct": 0.5671585,
+        "member_count": 104,
+        "name": "纺织服饰",
+        "positive_breadth_pct": 70.1923076923077
+      },
+      {
+        "amount": 28678171100.0,
+        "amount_delta": 398408000.0,
+        "code": "SW1基础化工",
+        "equal_weight_return_pct": 0.4663369564032698,
+        "industry_code": "SW1基础化工",
+        "industry_name": "基础化工",
+        "leaders": [
+          {
+            "amount": 239736700.0,
+            "change_pct": 12.486188,
+            "short_name": "扬帆新材",
+            "stock_code": "300637"
+          },
+          {
+            "amount": 109966600.0,
+            "change_pct": 11.094378,
+            "short_name": "久日新材",
+            "stock_code": "688199"
+          },
+          {
+            "amount": 291120700.0,
+            "change_pct": 10.068027,
+            "short_name": "安迪苏",
+            "stock_code": "600299"
+          }
+        ],
+        "median_return_pct": 0.514139,
+        "member_count": 367,
+        "name": "基础化工",
+        "positive_breadth_pct": 62.125340599455036
+      },
+      {
+        "amount": 9926099300.0,
+        "amount_delta": 149244200.0,
+        "code": "SW1公用事业",
+        "equal_weight_return_pct": 0.3543922213114754,
+        "industry_code": "SW1公用事业",
+        "industry_name": "公用事业",
+        "leaders": [
+          {
+            "amount": 84249800.0,
+            "change_pct": 10.025063,
+            "short_name": "深南电A",
+            "stock_code": "000037"
+          },
+          {
+            "amount": 35014400.0,
+            "change_pct": 4.175365,
+            "short_name": "联美控股",
+            "stock_code": "600167"
+          },
+          {
+            "amount": 55671900.0,
+            "change_pct": 2.816901,
+            "short_name": "嘉泽新能",
+            "stock_code": "601619"
+          }
+        ],
+        "median_return_pct": 0.391889,
+        "member_count": 122,
+        "name": "公用事业",
+        "positive_breadth_pct": 62.295081967213115
+      },
+      {
+        "amount": 6963668100.0,
+        "amount_delta": 72845500.0,
+        "code": "SW1建筑材料",
+        "equal_weight_return_pct": 0.3082271756756757,
+        "industry_code": "SW1建筑材料",
+        "industry_name": "建筑材料",
+        "leaders": [
+          {
+            "amount": 236112100.0,
+            "change_pct": 10.0,
+            "short_name": "华新建材",
+            "stock_code": "600801"
+          },
+          {
+            "amount": 454039700.0,
+            "change_pct": 9.969789,
+            "short_name": "三峡新材",
+            "stock_code": "600293"
+          },
+          {
+            "amount": 58172700.0,
+            "change_pct": 5.279035,
+            "short_name": "凯伦股份",
+            "stock_code": "300715"
+          }
+        ],
+        "median_return_pct": 0.3291215,
+        "member_count": 74,
+        "name": "建筑材料",
+        "positive_breadth_pct": 56.75675675675676
+      },
+      {
+        "amount": 9951719900.0,
+        "amount_delta": 148211200.0,
+        "code": "SW1建筑装饰",
+        "equal_weight_return_pct": 0.3344872567567568,
+        "industry_code": "SW1建筑装饰",
+        "industry_name": "建筑装饰",
+        "leaders": [
+          {
+            "amount": 33654600.0,
+            "change_pct": 10.015488,
+            "short_name": "园林股份",
+            "stock_code": "605303"
+          },
+          {
+            "amount": 469096300.0,
+            "change_pct": 9.517685,
+            "short_name": "郑中设计",
+            "stock_code": "002811"
+          },
+          {
+            "amount": 103905000.0,
+            "change_pct": 8.540177,
+            "short_name": "中公高科",
+            "stock_code": "603860"
+          }
+        ],
+        "median_return_pct": 0.309066,
+        "member_count": 148,
+        "name": "建筑装饰",
+        "positive_breadth_pct": 54.729729729729726
+      },
+      {
+        "amount": 2279475400.0,
+        "amount_delta": 30457000.0,
+        "code": "SW1美容护理",
+        "equal_weight_return_pct": 0.2056053448275862,
+        "industry_code": "SW1美容护理",
+        "industry_name": "美容护理",
+        "leaders": [
+          {
+            "amount": 218345400.0,
+            "change_pct": 10.091743,
+            "short_name": "青岛金王",
+            "stock_code": "002094"
+          },
+          {
+            "amount": 43882900.0,
+            "change_pct": 6.104651,
+            "short_name": "锦盛新材",
+            "stock_code": "300849"
+          },
+          {
+            "amount": 46633100.0,
+            "change_pct": 2.420982,
+            "short_name": "名臣健康",
+            "stock_code": "002919"
+          }
+        ],
+        "median_return_pct": 0.294334,
+        "member_count": 29,
+        "name": "美容护理",
+        "positive_breadth_pct": 58.620689655172406
+      },
+      {
+        "amount": 5074452900.0,
+        "amount_delta": 76998300.0,
+        "code": "SW1环保",
+        "equal_weight_return_pct": 0.4392660327868852,
+        "industry_code": "SW1环保",
+        "industry_name": "环保",
+        "leaders": [
+          {
+            "amount": 93957600.0,
+            "change_pct": 20.0,
+            "short_name": "美埃科技",
+            "stock_code": "688376"
+          },
+          {
+            "amount": 46873500.0,
+            "change_pct": 10.542399,
+            "short_name": "金科环境",
+            "stock_code": "688466"
+          },
+          {
+            "amount": 41346100.0,
+            "change_pct": 10.005851,
+            "short_name": "劲旅环境",
+            "stock_code": "001230"
+          }
+        ],
+        "median_return_pct": 0.28818999999999995,
+        "member_count": 122,
+        "name": "环保",
+        "positive_breadth_pct": 55.73770491803278
+      },
+      {
+        "amount": 33152541300.0,
+        "amount_delta": 485821100.0,
+        "code": "SW1有色金属",
+        "equal_weight_return_pct": 0.1796159318181818,
+        "industry_code": "SW1有色金属",
+        "industry_name": "有色金属",
+        "leaders": [
+          {
+            "amount": 823971200.0,
+            "change_pct": 10.0,
+            "short_name": "中稀有色",
+            "stock_code": "600259"
+          },
+          {
+            "amount": 95556200.0,
+            "change_pct": 6.430868,
+            "short_name": "闽发铝业",
+            "stock_code": "002578"
+          },
+          {
+            "amount": 44485300.0,
+            "change_pct": 6.344461,
+            "short_name": "云路股份",
+            "stock_code": "688190"
+          }
+        ],
+        "median_return_pct": 0.28246,
+        "member_count": 132,
+        "name": "有色金属",
+        "positive_breadth_pct": 55.3030303030303
+      },
+      {
+        "amount": 10019368000.0,
+        "amount_delta": 144873100.0,
+        "code": "SW1家用电器",
+        "equal_weight_return_pct": 0.23358281707317072,
+        "industry_code": "SW1家用电器",
+        "industry_name": "家用电器",
+        "leaders": [
+          {
+            "amount": 815010100.0,
+            "change_pct": 12.568757,
+            "short_name": "石头科技",
+            "stock_code": "688169"
+          },
+          {
+            "amount": 146993300.0,
+            "change_pct": 10.510228,
+            "short_name": "极米科技",
+            "stock_code": "688696"
+          },
+          {
+            "amount": 64592600.0,
+            "change_pct": 10.02445,
+            "short_name": "阳光照明",
+            "stock_code": "600261"
+          }
+        ],
+        "median_return_pct": 0.2502175,
+        "member_count": 82,
+        "name": "家用电器",
+        "positive_breadth_pct": 58.536585365853654
+      },
+      {
+        "amount": 5988575800.0,
+        "amount_delta": 120422200.0,
+        "code": "SW1房地产",
+        "equal_weight_return_pct": -0.010494980582524285,
+        "industry_code": "SW1房地产",
+        "industry_name": "房地产",
+        "leaders": [
+          {
+            "amount": 21474400.0,
+            "change_pct": 6.504065,
+            "short_name": "ST云城",
+            "stock_code": "600239"
+          },
+          {
+            "amount": 124689400.0,
+            "change_pct": 4.489164,
+            "short_name": "黑牡丹",
+            "stock_code": "600510"
+          },
+          {
+            "amount": 66700300.0,
+            "change_pct": 4.282116,
+            "short_name": "珠免集团",
+            "stock_code": "600185"
+          }
+        ],
+        "median_return_pct": 0.0,
+        "member_count": 103,
+        "name": "房地产",
+        "positive_breadth_pct": 42.71844660194174
+      },
+      {
+        "amount": 49987591300.0,
+        "amount_delta": 622958300.0,
+        "code": "SW1医药生物",
+        "equal_weight_return_pct": -0.08054429241071429,
+        "industry_code": "SW1医药生物",
+        "industry_name": "医药生物",
+        "leaders": [
+          {
+            "amount": 641544400.0,
+            "change_pct": 12.418953,
+            "short_name": "贝达药业",
+            "stock_code": "300558"
+          },
+          {
+            "amount": 112658900.0,
+            "change_pct": 11.631206,
+            "short_name": "恩威医药",
+            "stock_code": "301331"
+          },
+          {
+            "amount": 145776000.0,
+            "change_pct": 10.013351,
+            "short_name": "桂林三金",
+            "stock_code": "002275"
+          }
+        ],
+        "median_return_pct": 0.0,
+        "member_count": 448,
+        "name": "医药生物",
+        "positive_breadth_pct": 48.4375
+      },
+      {
+        "amount": 26618859500.0,
+        "amount_delta": 389475000.0,
+        "code": "SW1汽车",
+        "equal_weight_return_pct": -0.1932961375,
+        "industry_code": "SW1汽车",
+        "industry_name": "汽车",
+        "leaders": [
+          {
+            "amount": 89356400.0,
+            "change_pct": 9.946237,
+            "short_name": "青岛双星",
+            "stock_code": "000599"
+          },
+          {
+            "amount": 67828300.0,
+            "change_pct": 9.919571,
+            "short_name": "渤海汽车",
+            "stock_code": "600960"
+          },
+          {
+            "amount": 1813887000.0,
+            "change_pct": 6.637168,
+            "short_name": "襄阳轴承",
+            "stock_code": "000678"
+          }
+        ],
+        "median_return_pct": 0.0,
+        "member_count": 240,
+        "name": "汽车",
+        "positive_breadth_pct": 49.583333333333336
+      },
+      {
+        "amount": 57698978000.0,
+        "amount_delta": 765395400.0,
+        "code": "SW1机械设备",
+        "equal_weight_return_pct": -0.2925599322033898,
+        "industry_code": "SW1机械设备",
+        "industry_name": "机械设备",
+        "leaders": [
+          {
+            "amount": 272875500.0,
+            "change_pct": 20.023838,
+            "short_name": "联赢激光",
+            "stock_code": "688518"
+          },
+          {
+            "amount": 715785700.0,
+            "change_pct": 15.315315,
+            "short_name": "正帆科技",
+            "stock_code": "688596"
+          },
+          {
+            "amount": 138401800.0,
+            "change_pct": 10.006028,
+            "short_name": "宏英智能",
+            "stock_code": "001266"
+          }
+        ],
+        "median_return_pct": -0.101548,
+        "member_count": 472,
+        "name": "机械设备",
+        "positive_breadth_pct": 44.70338983050847
+      },
+      {
+        "amount": 21636108400.0,
+        "amount_delta": 428980000.0,
+        "code": "SW1银行",
+        "equal_weight_return_pct": -0.21266033333333334,
+        "industry_code": "SW1银行",
+        "industry_name": "银行",
+        "leaders": [
+          {
+            "amount": 1601675700.0,
+            "change_pct": 4.240283,
+            "short_name": "北京银行",
+            "stock_code": "601169"
+          },
+          {
+            "amount": 704957100.0,
+            "change_pct": 2.347418,
+            "short_name": "华夏银行",
+            "stock_code": "600015"
+          },
+          {
+            "amount": 207706300.0,
+            "change_pct": 2.272727,
+            "short_name": "郑州银行",
+            "stock_code": "002936"
+          }
+        ],
+        "median_return_pct": -0.24474100000000001,
+        "member_count": 42,
+        "name": "银行",
+        "positive_breadth_pct": 35.714285714285715
+      },
+      {
+        "amount": 7319229500.0,
+        "amount_delta": 108273600.0,
+        "code": "SW1石油石化",
+        "equal_weight_return_pct": 0.06646497826086954,
+        "industry_code": "SW1石油石化",
+        "industry_name": "石油石化",
+        "leaders": [
+          {
+            "amount": 500980400.0,
+            "change_pct": 10.017371,
+            "short_name": "统一股份",
+            "stock_code": "600506"
+          },
+          {
+            "amount": 78740600.0,
+            "change_pct": 10.009355,
+            "short_name": "岳阳兴长",
+            "stock_code": "000819"
+          },
+          {
+            "amount": 40771500.0,
+            "change_pct": 5.797101,
+            "short_name": "渤海化学",
+            "stock_code": "600800"
+          }
+        ],
+        "median_return_pct": -0.32122249999999997,
+        "member_count": 46,
+        "name": "石油石化",
+        "positive_breadth_pct": 39.130434782608695
+      },
+      {
+        "amount": 4760388300.0,
+        "amount_delta": 129800500.0,
+        "code": "SW1煤炭",
+        "equal_weight_return_pct": -0.6573124054054054,
+        "industry_code": "SW1煤炭",
+        "industry_name": "煤炭",
+        "leaders": [
+          {
+            "amount": 139127400.0,
+            "change_pct": 2.2,
+            "short_name": "盘江股份",
+            "stock_code": "600395"
+          },
+          {
+            "amount": 173727000.0,
+            "change_pct": 1.728395,
+            "short_name": "郑州煤电",
+            "stock_code": "600121"
+          },
+          {
+            "amount": 58939800.0,
+            "change_pct": 1.595745,
+            "short_name": "恒源煤电",
+            "stock_code": "600971"
+          }
+        ],
+        "median_return_pct": -0.331126,
+        "member_count": 37,
+        "name": "煤炭",
+        "positive_breadth_pct": 37.83783783783784
+      },
+      {
+        "amount": 18486859200.0,
+        "amount_delta": 208348700.0,
+        "code": "SW1国防军工",
+        "equal_weight_return_pct": -0.6883776916666666,
+        "industry_code": "SW1国防军工",
+        "industry_name": "国防军工",
+        "leaders": [
+          {
+            "amount": 91896700.0,
+            "change_pct": 14.730878,
+            "short_name": "高凌信息",
+            "stock_code": "688175"
+          },
+          {
+            "amount": 93574200.0,
+            "change_pct": 7.506427,
+            "short_name": "国光电气",
+            "stock_code": "688776"
+          },
+          {
+            "amount": 765989000.0,
+            "change_pct": 4.433213,
+            "short_name": "睿创微纳",
+            "stock_code": "688002"
+          }
+        ],
+        "median_return_pct": -0.540301,
+        "member_count": 120,
+        "name": "国防军工",
+        "positive_breadth_pct": 33.33333333333333
+      }
+    ],
+    "member_count": 4753,
+    "quality_status": "QMT_VALIDATED",
+    "snapshot_date": "2026-10-23",
+    "source": "gj_big_qmt_inner"
+  },
+  "key_stocks": {
+    "laggards": [
+      {
+        "amount": 19131100.0,
+        "change_pct": -20.081967,
+        "price": 1.95,
+        "short_name": "ST合纵",
+        "stock_code": "300477"
+      },
+      {
+        "amount": 5195000.0,
+        "change_pct": -19.976498,
+        "price": 13.62,
+        "short_name": "奥精医疗",
+        "stock_code": "688613"
+      },
+      {
+        "amount": 129875300.0,
+        "change_pct": -17.415254,
+        "price": 19.49,
+        "short_name": "森鹰窗业",
+        "stock_code": "301227"
+      },
+      {
+        "amount": 231847900.0,
+        "change_pct": -12.09744,
+        "price": 42.58,
+        "short_name": "明微电子",
+        "stock_code": "688699"
+      },
+      {
+        "amount": 48785700.0,
+        "change_pct": -12.050599,
+        "price": 13.21,
+        "short_name": "交控科技",
+        "stock_code": "688015"
+      },
+      {
+        "amount": 881300300.0,
+        "change_pct": -10.135266,
+        "price": 93.01,
+        "short_name": "百普赛斯",
+        "stock_code": "301080"
+      },
+      {
+        "amount": 45687200.0,
+        "change_pct": -10.11236,
+        "price": 3.2,
+        "short_name": "*ST仕净",
+        "stock_code": "301030"
+      },
+      {
+        "amount": 584808300.0,
+        "change_pct": -10.037175,
+        "price": 7.26,
+        "short_name": "慈文传媒",
+        "stock_code": "002343"
+      },
+      {
+        "amount": 70643300.0,
+        "change_pct": -10.010764,
+        "price": 8.36,
+        "short_name": "台华新材",
+        "stock_code": "603055"
+      },
+      {
+        "amount": 77771500.0,
+        "change_pct": -10.007097,
+        "price": 12.68,
+        "short_name": "四通股份",
+        "stock_code": "603838"
+      }
+    ],
+    "leaders": [
+      {
+        "amount": 272875500.0,
+        "change_pct": 20.023838,
+        "price": 20.14,
+        "short_name": "联赢激光",
+        "stock_code": "688518"
+      },
+      {
+        "amount": 1597314700.0,
+        "change_pct": 20.017994,
+        "price": 26.68,
+        "short_name": "银之杰",
+        "stock_code": "300085"
+      },
+      {
+        "amount": 93957600.0,
+        "change_pct": 20.0,
+        "price": 50.76,
+        "short_name": "美埃科技",
+        "stock_code": "688376"
+      },
+      {
+        "amount": 1092719300.0,
+        "change_pct": 17.721519,
+        "price": 186.0,
+        "short_name": "安集科技",
+        "stock_code": "688019"
+      },
+      {
+        "amount": 715785700.0,
+        "change_pct": 15.315315,
+        "price": 40.96,
+        "short_name": "正帆科技",
+        "stock_code": "688596"
+      },
+      {
+        "amount": 166079200.0,
+        "change_pct": 15.0,
+        "price": 27.6,
+        "short_name": "华信永道",
+        "stock_code": "920592"
+      },
+      {
+        "amount": 106421500.0,
+        "change_pct": 14.901257,
+        "price": 6.4,
+        "short_name": "*ST航图",
+        "stock_code": "688066"
+      },
+      {
+        "amount": 91896700.0,
+        "change_pct": 14.730878,
+        "price": 24.3,
+        "short_name": "高凌信息",
+        "stock_code": "688175"
+      },
+      {
+        "amount": 48601900.0,
+        "change_pct": 14.355949,
+        "price": 34.89,
+        "short_name": "云涌科技",
+        "stock_code": "688060"
+      },
+      {
+        "amount": 185335300.0,
+        "change_pct": 14.214047,
+        "price": 40.98,
+        "short_name": "南网科技",
+        "stock_code": "688248"
+      }
+    ],
+    "top_turnover": [
+      {
+        "amount": 7553270500.0,
+        "change_pct": 0.475588,
+        "price": 555.63,
+        "short_name": "中际旭创",
+        "stock_code": "300308"
+      },
+      {
+        "amount": 6715397100.0,
+        "change_pct": 0.188776,
+        "price": 196.37,
+        "short_name": "新易盛",
+        "stock_code": "300502"
+      },
+      {
+        "amount": 6061073200.0,
+        "change_pct": 2.558098,
+        "price": 1427.66,
+        "short_name": "贵州茅台",
+        "stock_code": "600519"
+      },
+      {
+        "amount": 5444201700.0,
+        "change_pct": 7.610969,
+        "price": 92.61,
+        "short_name": "东山精密",
+        "stock_code": "002384"
+      },
+      {
+        "amount": 5135228600.0,
+        "change_pct": 3.477589,
+        "price": 241.02,
+        "short_name": "宁德时代",
+        "stock_code": "300750"
+      },
+      {
+        "amount": 4398078800.0,
+        "change_pct": 6.306818,
+        "price": 18.71,
+        "short_name": "东方财富",
+        "stock_code": "300059"
+      },
+      {
+        "amount": 4240368700.0,
+        "change_pct": -3.985507,
+        "price": 26.5,
+        "short_name": "紫金矿业",
+        "stock_code": "601899"
+      },
+      {
+        "amount": 4196065400.0,
+        "change_pct": -2.778409,
+        "price": 855.55,
+        "short_name": "寒武纪",
+        "stock_code": "688256"
+      },
+      {
+        "amount": 4094755500.0,
+        "change_pct": -0.358852,
+        "price": 41.65,
+        "short_name": "长鑫科技",
+        "stock_code": "688825"
+      },
+      {
+        "amount": 3726276900.0,
+        "change_pct": -3.394707,
+        "price": 134.32,
+        "short_name": "胜宏科技",
+        "stock_code": "300476"
+      },
+      {
+        "amount": 3572308400.0,
+        "change_pct": 8.623066,
+        "price": 70.92,
+        "short_name": "阳光电源",
+        "stock_code": "300274"
+      },
+      {
+        "amount": 3275443200.0,
+        "change_pct": -2.567568,
+        "price": 144.2,
+        "short_name": "天孚通信",
+        "stock_code": "300394"
+      },
+      {
+        "amount": 3246956600.0,
+        "change_pct": 0.488751,
+        "price": 259.06,
+        "short_name": "兆易创新",
+        "stock_code": "603986"
+      },
+      {
+        "amount": 3052205100.0,
+        "change_pct": 2.528266,
+        "price": 65.29,
+        "short_name": "金安国纪",
+        "stock_code": "002636"
+      },
+      {
+        "amount": 2961902700.0,
+        "change_pct": 4.333546,
+        "price": 114.36,
+        "short_name": "君正股份",
+        "stock_code": "300223"
+      }
+    ]
+  }
+}

@@ -771,20 +771,72 @@ class ResearchBridgeApi(BridgeApi):
 class ResearchLease:
     """Renew during subprocess I/O, and immediately fence a lost owner."""
 
-    def __init__(self, api, request_id: str, worker_id: str, generation: int) -> None:
+    def __init__(self, api, request_id: str, worker_id: str, generation: int, *, lease_expires_at=None, deadline_at=None, checkpoint=None) -> None:
         self.api, self.request_id, self.worker_id, self.generation = api, request_id, worker_id, generation
         self.stop = threading.Event()
         self.lost = threading.Event()
         self.thread: threading.Thread | None = None
+        self.watchdog: threading.Thread | None = None
+        self.valid_until = None
+        self.deadline = _research_deadline({"deadline_at":deadline_at}) if deadline_at else float('inf')
+        self.checkpoint = checkpoint
+        self.renewals = 0
+        self.transient_errors = 0
+        if lease_expires_at:
+            self.valid_until = min(self.deadline,self._expiry(lease_expires_at))
+
+    @staticmethod
+    def _expiry(stamp):
+        try:
+            value=datetime.fromisoformat(str(stamp).replace('Z','+00:00'))
+            if value.tzinfo is None: raise ValueError('timezone required')
+            return time.monotonic()+value.timestamp()-time.time()
+        except (ValueError,TypeError) as exc:
+            raise ProviderUnavailable('RESEARCH_FAILED stage=lease reason=invalid_verified_expiry') from exc
+
+    def _record(self,status,**extra):
+        if self.checkpoint:
+            self.checkpoint({'status':status,'request_id':self.request_id,'worker_id':self.worker_id,
+                'claim_generation':self.generation,'renewals':self.renewals,'transient_errors':self.transient_errors,
+                'updated_at':_utc_iso(),**extra})
+
+    @staticmethod
+    def _transient(exc):
+        return (isinstance(exc,(httpx.TransportError,TimeoutError,OSError)) or
+                isinstance(exc,httpx.HTTPStatusError) and exc.response.status_code>=500)
 
     def renew(self) -> None:
-        row = self.api.renew_research(self.request_id, self.worker_id, self.generation)
-        if (row.get("worker_id") != self.worker_id or row.get("claim_generation") != self.generation
-                or row.get("status") != "processing"):
-            raise ProviderUnavailable("RESEARCH_FAILED stage=lease reason=owner_fenced")
+        for attempt in range(2):
+            if self.lost.is_set() or self.valid_until is not None and time.monotonic()>=self.valid_until-1:
+                raise ProviderUnavailable('RESEARCH_FAILED stage=lease reason=verified_lease_expired')
+            try:
+                self.renewals+=1
+                row=self.api.renew_research(self.request_id,self.worker_id,self.generation)
+                if (row.get('request_id')!=self.request_id or row.get('worker_id')!=self.worker_id
+                        or row.get('claim_generation')!=self.generation or row.get('status')!='processing'):
+                    raise ProviderUnavailable('RESEARCH_FAILED stage=lease reason=owner_fenced')
+                expiry=min(self.deadline,self._expiry(row.get('lease_expires_at')))
+                if self.lost.is_set() or expiry<=time.monotonic()+1:
+                    raise ProviderUnavailable('RESEARCH_FAILED stage=lease reason=verified_lease_expired')
+                self.valid_until=expiry
+                self._record('VERIFIED',lease_expires_at=row['lease_expires_at'])
+                return
+            except Exception as exc:
+                if self._transient(exc):
+                    self.transient_errors+=1
+                    self._record('TRANSPORT_RETRY',error_type=type(exc).__name__)
+                    if attempt==0 and self.valid_until is not None and time.monotonic()<self.valid_until-1:
+                        continue
+                raise
 
     def __enter__(self):
         self.renew()
+        def expiry_watchdog():
+            while not self.stop.wait(min(0.2,max(0,self.valid_until-time.monotonic()-1))):
+                if time.monotonic()>=self.valid_until-1:
+                    self.lost.set()
+                    self._record('FENCED',reason='verified_lease_expired')
+                    return
         def heartbeat():
             # Start-to-start scheduling prevents a slow HTTP response from
             # adding its latency to the renewal interval.
@@ -795,8 +847,11 @@ class ResearchLease:
                     self.renew()
                 except Exception:
                     self.lost.set()
+                    self._record('FENCED',reason='renewal_unconfirmed_or_owner_changed')
                     return
         self.thread = threading.Thread(target=heartbeat, name="research-owner-lease", daemon=True)
+        self.watchdog = threading.Thread(target=expiry_watchdog,name='research-lease-expiry',daemon=True)
+        self.watchdog.start()
         self.thread.start()
         return self
 
@@ -804,6 +859,8 @@ class ResearchLease:
         self.stop.set()
         if self.thread:
             self.thread.join(timeout=16)
+        if self.watchdog:
+            self.watchdog.join(timeout=1)
 
 
 _WINDOWS_INTERNET_SETTINGS = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
@@ -1082,7 +1139,8 @@ def process_research_job(api, provider, *, job: dict[str, Any], worker_id: str, 
         # An interrupted unknown model outcome must never cause a duplicate call.
         raise ProviderUnavailable("RESEARCH_FAILED stage=checkpoint reason=interrupted_model_outcome_unknown")
     _research_checkpoint(directory, checkpoint)
-    with ResearchLease(api, request_id, worker_id, generation) as lease:
+    with ResearchLease(api, request_id, worker_id, generation,lease_expires_at=job.get('lease_expires_at'),
+                       deadline_at=payload['deadline_at'],checkpoint=lambda value:_research_checkpoint(directory/'lease',value)) as lease:
         try:
             answer = provider.ask(payload, directory, lease.lost)
             completion = {"worker_id": worker_id, "claim_generation": generation, "status": "completed", **answer}

@@ -17,7 +17,7 @@ from server.common.authoritative_market_clock import authoritative_closed_trade_
 from server.common.config import get_wecom_webhook
 from integrations.wecom.delivery import deliver_markdown
 from biz.review.research_flow import artifact_hash, assert_digest, load_digest
-from biz.review.market_decision import rules_identity, source_digest_identity
+from biz.review.market_decision import source_digest_identity
 log = logging.getLogger("evening")
 
 
@@ -113,7 +113,6 @@ def published_report(digest: dict, target: str) -> str:
                                    if key != "research_sha256"})
     if (research.get("status") != "COMPLETE" or research.get("report_kind") != "review"
             or research.get("review_date") != target
-            or research.get("rules_sha256") != rules_identity()
             or research.get("source_digest_sha256") != source_digest_identity(digest)
             or research.get("research_sha256") != expected_hash
             or not content or research.get("content") != content):

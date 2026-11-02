@@ -101,7 +101,7 @@ def project_observation(observation: Mapping[str, Any]) -> dict:
                         "source": "QMT当时行业成员样本收益中位数，非行业指数", "history": []})
     stocks = {}
     buckets = raw.get("key_stocks") or {}
-    for rows in buckets.values() if isinstance(buckets, dict) else [buckets]:
+    for rows in ([buckets.get(name, []) for name in ("leaders", "top_turnover", "laggards")] if isinstance(buckets, dict) else [buckets]):
         if not isinstance(rows, list):
             continue
         for row in rows:
@@ -117,6 +117,12 @@ def project_observation(observation: Mapping[str, Any]) -> dict:
         for sector in raw_sectors.get("items", []):
             for leader in sector.get("leaders", []):
                 code = str(leader.get("stock_code") or "")
+                if code and code not in stocks:
+                    stocks[code] = {"status": "OBSERVED", "stock_code": code,
+                        "short_name": leader.get("short_name") or code, "change_pct": leader.get("change_pct"),
+                        "ohlc": {"status": "OBSERVED", "close": leader.get("price")},
+                        "price_verification": {"status": "OBSERVED", "source": raw.get("source_provider")},
+                        "sector_names": [], "amount_quality": {"status": "UNKNOWN"}}
                 if code in stocks:
                     stocks[code]["sector_names"].append(sector.get("name") or sector.get("industry_name"))
     benchmarks = raw.get("benchmarks") or {}
@@ -126,7 +132,24 @@ def project_observation(observation: Mapping[str, Any]) -> dict:
                           "trade_date": str(raw.get("trade_date") or raw["observed_at"])[:10],
                           "change_pct": row.get("change_pct"), "close": row.get("price")}
                          for row in benchmark_rows if row.get("instrument_type", "INDEX") == "INDEX"]
-    return {**raw, "market": market, "sectors": sectors, "key_stocks": list(stocks.values())[:12]}
+    selected = []
+    def select(code):
+        code = str(code or "")
+        if code in stocks and code not in selected and len(selected) < 12:
+            selected.append(code)
+    # Reserve samples for strong sectors before retaining market leadership,
+    # capacity and adverse feedback; JSON key order must never select stocks.
+    strong = [row for row in (raw_sectors.get("items", []) if isinstance(raw_sectors, dict) else [])
+              if isinstance(row.get("median_return_pct"), (int, float)) and row["median_return_pct"] > 0][:4]
+    for rank in range(2):
+        for sector in strong:
+            leaders = sector.get("leaders") or []
+            if rank < len(leaders): select(leaders[rank].get("stock_code"))
+    if isinstance(buckets, dict):
+        for name, count in (("leaders", 1), ("top_turnover", 1), ("laggards", 2)):
+            for row in (buckets.get(name) or [])[:count]: select(row.get("stock_code"))
+    for code in stocks: select(code)
+    return {**raw, "market": market, "sectors": sectors, "key_stocks": [stocks[code] for code in selected]}
 
 
 def freeze_inputs(observation: Mapping[str, Any], history: list, emissions: list, *, mode: str) -> dict:
@@ -380,7 +403,8 @@ def process_research_batch(engine, *, outbox_id: str, generator=None, now_fn: Ca
                              deadline=deadline, now_fn=now_fn):
             research = generator(state["digest"], report_kind="intraday",
                 next_trade_date=state["digest"]["review_date"], context=state["context"], previous_research=None,
-                engine=engine, now=now.replace(tzinfo=TZ), checkpoint=state.get("checkpoint"), progress=progress)
+                engine=engine, now=now.replace(tzinfo=TZ), checkpoint=state.get("checkpoint"), progress=progress,
+                timeout_seconds=max(0,(deadline-_time(now_fn())).total_seconds()))
         from biz.review.market_decision import verify_automatic_research
         verify_automatic_research(research)
         actual_units = _verified_research_units(research)

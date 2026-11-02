@@ -30,10 +30,9 @@ MAX_OUTPUT_CHARS = 60_000
 WORKFLOW_VERSION = "independent-drafts.cross-review.evidence-arbitration.v4"
 STAGES = ("deepseek_draft", "codex_draft", "deepseek_review", "codex_review", "codex_final", "deepseek_final_review", "codex_arbitration")
 LOCAL_REVIEW_VERSION = "probiga.research-local-contract-review.v1"
-DEEPSEEK_RESEARCH_POLICY = {"model": "deepseek-v4-pro", "thinking": {"type": "disabled"},
-                            "reasoning_effort": "none", "max_tokens": 16000}
-DEEPSEEK_INTRADAY_POLICY = {"model": "deepseek-flash", "thinking": {"type": "enabled"},
-                            "reasoning_effort": "low", "max_tokens": 16000}
+DEEPSEEK_ENDPOINT = "https://api.deepseek.com/responses"
+DEEPSEEK_RESEARCH_POLICY = {"model": "deepseek-v4-pro", "reasoning": {"effort": "none"}, "max_output_tokens": 16000}
+DEEPSEEK_INTRADAY_POLICY = {"model": "deepseek-flash", "reasoning": {"effort": "none"}, "max_output_tokens": 8000}
 
 
 def _deepseek_policy(report_kind):
@@ -84,13 +83,48 @@ def source_digest_identity(digest):
         "factor_validation_json":factor})
 
 
-def _load_rules():
+class ResearchRules(str):
+    """Immutable rule text and its versioned output contract travel together."""
+    def __new__(cls, text, bundle):
+        value = super().__new__(cls, text)
+        value.bundle = bundle
+        return value
+
+
+def _rules_bundle(identity=None):
     documents={name:(RULES_DIR/name).read_text(encoding="utf-8")
                for name in ("decision-model.md","report-templates.md","output-contract.md")}
-    rules="决策模型规定分析思路。只使用本次事实卡；缺失项目不得补造。输出字段、证据和行动边界以最后的v3研究合同为准。\n\n"+"\n\n".join(documents.values())
-    return rules, _hash({"documents":documents, "draft_schema":draft_json_schema(), "workflow":WORKFLOW_VERSION,
-                         "deepseek_research_policy":DEEPSEEK_RESEARCH_POLICY,
-                         "deepseek_intraday_policy":DEEPSEEK_INTRADAY_POLICY})
+    current={"documents":documents,"draft_schema":draft_json_schema(),"workflow":WORKFLOW_VERSION,
+             "deepseek_research_policy":DEEPSEEK_RESEARCH_POLICY,"deepseek_intraday_policy":DEEPSEEK_INTRADAY_POLICY,
+             "deepseek_endpoint":DEEPSEEK_ENDPOINT,
+             "output_profiles":{"intraday":{"max_units":12,"max_directions":2,"max_scenarios":1,"disposition_contract":"unit_citations"}}}
+    if identity is None or identity==_hash(current): return current
+    if not isinstance(identity,str) or not re.fullmatch(r"[0-9a-f]{64}",identity):
+        _fail("automatic_provenance","rules_changed")
+    path=RULES_DIR/"archive"/(identity+".json")
+    if not path.is_file(): _fail("automatic_provenance","rules_changed")
+    saved=json.loads(path.read_text(encoding="utf-8"))
+    if _hash(saved)!=identity or saved.get("workflow")!=WORKFLOW_VERSION or saved.get("draft_schema")!=draft_json_schema():
+        _fail("automatic_provenance","rules_archive_identity_mismatch")
+    return saved
+
+
+def _load_rules(identity=None):
+    bundle=_rules_bundle(identity)
+    documents=bundle["documents"]
+    rules="决策模型规定分析思路。只使用本次事实卡；缺失项目不得补造。输出字段、证据和行动边界以最后的v3研究合同为准。\n\n"+"\n\n".join(documents[name] for name in ("decision-model.md","report-templates.md","output-contract.md"))
+    return ResearchRules(rules,bundle),_hash(bundle)
+
+
+def _draft_contract(packet,rules):
+    schema=deepcopy(rules.bundle["draft_schema"])
+    profile=rules.bundle.get("output_profiles",{}).get(packet["task"]["kind"],{})
+    if profile:
+        schema["properties"]["units"]["maxItems"]=profile["max_units"]
+        report=schema["properties"]["report"]["properties"]
+        report["directions"]["maxItems"]=profile["max_directions"]
+        report["scenarios"]["maxItems"]=profile["max_scenarios"]
+    return schema
 
 
 def rules_identity(): return _load_rules()[1]
@@ -117,35 +151,52 @@ class ProviderReply:
 def _call_deepseek(messages, *, timeout_seconds, stage):
     settings=get_settings()
     try:
-        policy=_deepseek_policy(json.loads(messages[1]["content"])["material"]["input"]["task"]["kind"])
+        material=json.loads(messages[1]["content"])
+        policy=_deepseek_policy(material["material"]["input"]["task"]["kind"])
+        schema=material["response_schema"]
+        if not isinstance(schema,dict): raise TypeError("response schema required")
     except (KeyError,IndexError,ValueError,TypeError):
         _fail(stage,"missing_typed_provider_scope")
     key=(settings.deepseek_api_key or "").strip()
     if not key: _fail(stage,"deepseek_key_unconfigured")
-    endpoint="https://api.deepseek.com/v1/chat/completions"
+    endpoint=DEEPSEEK_ENDPOINT
     started=datetime.now(timezone.utc).isoformat()
     async def request():
         async with asyncio.timeout(timeout_seconds):
             async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_seconds,connect=min(10,timeout_seconds)),transport=httpx.AsyncHTTPTransport(retries=0)) as client:
                 response=await client.post(endpoint,headers={"Authorization":"Bearer "+key},
-                    json={**policy,"messages":messages,"response_format":{"type":"json_object"}})
+                    json={**policy,"input":messages,"text":{"format":{"type":"json_schema","name":"market_research","schema":schema}},
+                          "tools":[],"tool_choice":"none","store":False})
         if response.status_code!=200: _fail(stage,"http_"+str(response.status_code))
         if len(response.content)>MAX_OUTPUT_CHARS*6: _fail(stage,"response_byte_budget")
-        body=response.json(); choice=body["choices"][0]
-        if choice.get("finish_reason")!="stop":
-            error=ResearchError("RESEARCH_BLOCKED stage="+stage+" reason=response_incomplete")
-            error.provider_failure_receipt={"source":"deepseek_api","endpoint":endpoint,
-                "provider_response_id":body.get("id"),"model":body.get("model"),"request_policy":policy,
-                "finish_reason":choice.get("finish_reason"),"usage":body.get("usage"),"started_at":started,
-                "completed_at":datetime.now(timezone.utc).isoformat(),"messages_sha256":_hash(messages),"transport":"live_http"}
-            partial=(choice.get("message") or {}).get("content")
-            if isinstance(partial,str): error.partial_raw_response=partial
-            raise error
-        raw=choice["message"]["content"]
-        if not isinstance(raw,str) or not raw.strip() or len(raw)>MAX_OUTPUT_CHARS: _fail(stage,"response_size")
-        return ProviderReply(raw,{"source":"deepseek_api","endpoint":endpoint,"provider_response_id":body.get("id"),
+        body=response.json()
+        receipt={"source":"deepseek_api","endpoint":endpoint,"provider_response_id":body.get("id"),
             "model":body.get("model"),"request_policy":policy,"usage":body.get("usage"),"started_at":started,
-            "completed_at":datetime.now(timezone.utc).isoformat(),"messages_sha256":_hash(messages),"raw_sha256":_body_hash(raw),"transport":"live_http"})
+            "completed_at":datetime.now(timezone.utc).isoformat(),"messages_sha256":_hash(messages),"transport":"live_http",
+            "response_status":body.get("status"),"incomplete_details":body.get("incomplete_details"),"response_schema_sha256":_hash(schema)}
+        outputs=body.get("output") or []
+        texts=[part.get("text","") for item in outputs if item.get("type")=="message"
+               for part in item.get("content",[]) if part.get("type")=="output_text"]
+        raw="".join(texts)
+        def reject(reason):
+            error=ResearchError("RESEARCH_BLOCKED stage="+stage+" reason="+reason)
+            error.provider_failure_receipt=receipt
+            if raw: error.partial_raw_response=raw[:MAX_OUTPUT_CHARS]
+            raise error
+        if body.get("status")!="completed": reject("response_incomplete")
+        if len(outputs)!=1 or outputs[0].get("type")!="message" or outputs[0].get("status")!="completed": reject("unexpected_output_items")
+        if not texts or any(part.get("type")!="output_text" for part in outputs[0].get("content",[])): reject("unexpected_output_content")
+        if not raw.strip() or len(raw)>MAX_OUTPUT_CHARS: reject("response_size")
+        try:
+            from biz.review.research_contract import _check_schema
+            value=json.loads(raw)
+            if not isinstance(value,dict): raise ValueError("object required")
+            # Independent drafts may contain contract errors for cross-review.
+            # Reviews must be structurally usable; final publication is checked
+            # against the complete task-specific contract below.
+            if not stage.endswith("_draft"): _check_schema(value,schema)
+        except (ValueError,TypeError): reject("response_schema_mismatch")
+        return ProviderReply(raw,{**receipt,"raw_sha256":_body_hash(raw)})
     future=Future()
     def worker():
         try: future.set_result(asyncio.run(request()))
@@ -199,44 +250,56 @@ def _parse_review(raw,target_hash,packet,*,final=False,require_pass=True):
     return value
 
 
-def _final_schema(reviews):
+def _final_schema(reviews,*,draft_schema=None,unit_citations=False):
     entries={}
     for name,review in reviews.items():
         for finding in review["findings"]:
-            entries[name+":"+finding["id"]]=_object({"review":{"type":"string","const":name},
+            fields={"review":{"type":"string","const":name},
                 "finding_id":{"type":"string","const":finding["id"]},
                 "resolution":{"type":"string","enum":["corrected","disputed_with_evidence","retained_disagreement","unresolved"]},
                 "unit_ids":{"type":"array","items":{"type":"string"},"maxItems":12},
                 "fact_ids":{"type":"array","items":{"type":"string"},"maxItems":12},
-                "reason":{"type":"string","minLength":1,"maxLength":1200}})
-    return _object({"schema_version":{"type":"string","const":"probiga.research-final.v3"},"draft":draft_json_schema(),"dispositions":_object(entries)})
+                "reason":{"type":"string","minLength":1,"maxLength":1200}}
+            if unit_citations:
+                fields={key:fields[key] for key in ("resolution","unit_ids")}
+                fields["unit_ids"]["minItems"]=1
+            entries[name+":"+finding["id"]]=_object(fields)
+    return _object({"schema_version":{"type":"string","const":"probiga.research-final.v4" if unit_citations else "probiga.research-final.v3"},"draft":draft_schema or draft_json_schema(),"dispositions":_object(entries)})
 
 
-def _validate_final(raw,packet,reviews):
+def _validate_final(raw,packet,reviews,*,schema=None):
     from biz.review.research_contract import _check_schema
     try:
-        result=json.loads(raw);_check_schema(result,_final_schema(reviews));validate_draft(_json(result["draft"]),packet)
+        result=json.loads(raw);_check_schema(result,schema or _final_schema(reviews));validate_draft(_json(result["draft"]),packet)
     except (ValueError,TypeError) as exc: _fail("final_contract",str(exc)[:900])
-    expected={(name,x["id"]) for name,review in reviews.items() for x in review["findings"]}
-    supplied=[(x["review"],x["finding_id"]) for x in result["dispositions"].values()]
-    if len(supplied)!=len(set(supplied)) or set(supplied)!=expected: _fail("final_contract","unresolved_peer_findings")
-    units={x["id"] for x in result["draft"]["units"]}
+    expected={name+":"+x["id"] for name,review in reviews.items() for x in review["findings"]}
+    if set(result["dispositions"])!=expected: _fail("final_contract","unresolved_peer_findings")
+    units={x["id"]:x for x in result["draft"]["units"]}
     for item in result["dispositions"].values():
-        if any(x not in packet["facts"] for x in item["fact_ids"]) or any(x not in units for x in item["unit_ids"]): _fail("final_contract","unknown_disposition_reference")
+        if any(x not in units for x in item["unit_ids"]): _fail("final_contract","unknown_disposition_reference")
+        facts=item.get("fact_ids")
+        if facts is None:
+            facts=set()
+            for uid in item["unit_ids"]:
+                unit=units[uid]
+                facts.update(unit.get("evidence_ids",[]))
+                facts.update(span["fact_id"] for span in unit["statement"] if "fact_id" in span)
+                facts.update(c["reference"]["fact_id"] for c in unit.get("conditions",[]) if c["reference"]["fact_id"])
+        if any(x not in packet["facts"] for x in facts): _fail("final_contract","unknown_disposition_reference")
         if item["resolution"]=="unresolved": _fail("final_contract","unresolved_finding")
-        if item["resolution"] in {"disputed_with_evidence","retained_disagreement"} and (not item["fact_ids"] or not item["unit_ids"]):
+        if item["resolution"] in {"disputed_with_evidence","retained_disagreement"} and (not facts or not item["unit_ids"]):
             _fail("final_contract","dispute_without_evidence")
     return result
 
 
-def _inspect_first_final(raw, packet, reviews):
+def _inspect_first_final(raw, packet, reviews,*,schema=None):
     """Return the untouched valid final, or a reproducible local rejection.
 
     This finding is program evidence about the original raw target.  It never
     impersonates a provider response and never changes the rejected content.
     """
     try:
-        return _validate_final(raw, packet, reviews), None
+        return _validate_final(raw, packet, reviews,schema=schema), None
     except ResearchError as exc:
         original, visited = exc, set()
         while (cause := original.__cause__ or original.__context__) is not None and id(cause) not in visited:
@@ -268,21 +331,33 @@ def _diagnostic(raw,packet):
 
 
 def _draft_request(packet,rules):
-    schema=draft_json_schema()
+    schema=_draft_contract(packet,rules)
     instruction="分别独立完成研究。不预设另一模型意见，也不因部分资料缺失而放弃已有事实分析。"
     if packet["task"]["kind"]=="intraday":
         instruction+="这是有时效的盘中快报，简洁说明当时变化及剩余时段的验证；优先十二至十八个研究单元、最多两个方向、一个核心情景。八角色共用单元，不复述日线，不填过去窗口。"
     return _messages(instruction,{"input":packet},schema,rules),schema
 
 
+def _draft_diagnostic(raw,packet,rules):
+    errors=_diagnostic(raw,packet)
+    if rules.bundle.get("output_profiles",{}).get(packet["task"]["kind"]):
+        from biz.review.research_contract import _check_schema
+        try: _check_schema(json.loads(raw),_draft_contract(packet,rules))
+        except (ValueError,TypeError) as exc:
+            message=str(exc)[:1500]
+            if message not in errors: errors.append(message)
+    return errors
+
+
 def _peer_request(packet,rules,raw):
     schema=_review_schema(_body_hash(raw),packet["facts"])
-    return _messages("审查另一模型草稿的事实、范围、关联、时序、因果、竞争解释和遗漏。只列具体问题，不改稿；无问题则findings为空。两模型一致不是事实证据。",{"input":packet,"target_draft":raw,"deterministic_errors":_diagnostic(raw,packet)},schema,rules),schema
+    return _messages("审查另一模型草稿的事实、范围、关联、时序、因果、竞争解释和遗漏。只列具体问题，不改稿；无问题则findings为空。两模型一致不是事实证据。",{"input":packet,"target_draft":raw,"deterministic_errors":_draft_diagnostic(raw,packet,rules)},schema,rules),schema
 
 
 def _final_request(packet,rules,drafts,reviews):
-    material={"input":packet,"drafts":drafts,"peer_reviews":reviews,"deterministic_errors":{name:_diagnostic(raw,packet) for name,raw in drafts.items()}}
-    schema=_final_schema(reviews)
+    material={"input":packet,"drafts":drafts,"peer_reviews":reviews,"deterministic_errors":{name:_draft_diagnostic(raw,packet,rules) for name,raw in drafts.items()}}
+    schema=_final_schema(reviews,draft_schema=_draft_contract(packet,rules),
+        unit_citations=rules.bundle.get("output_profiles",{}).get(packet["task"]["kind"],{}).get("disposition_contract")=="unit_citations")
     instruction="你是主编。综合两稿、双方审查和程序诊断，一次完成最终draft并逐条处置双方finding。优先以通过程序合同的草稿为结构基线，但仍须修复其被审查发现的事实或语义错误；不把不合格稿的问题带入定稿。程序诊断不是完整语义清单，须自行逐项检查全部单元和报告引用。不要机械拼接，不以多数代替证据；争议要给事实支持，随后还会独立复审。"
     if packet["task"]["kind"]=="intraday":
         instruction+="保持盘中短稿的篇幅，只解释当时变化和剩余时段条件；八角色共享单元，不扩写成长篇复盘。"
@@ -290,7 +365,8 @@ def _final_request(packet,rules,drafts,reviews):
 
 
 def _revision_request(packet,rules,final_raw,reviews):
-    schema=_final_schema(reviews)
+    schema=_final_schema(reviews,draft_schema=_draft_contract(packet,rules),
+        unit_citations=rules.bundle.get("output_profiles",{}).get(packet["task"]["kind"],{}).get("disposition_contract")=="unit_citations")
     material={"input":packet,"prior_final_raw":final_raw,"peer_reviews":reviews}
     instruction="这是用户授权的最终证据仲裁，不要求模型一致。逐条核验前轮终审与双方互审发现，完整处置全部finding。真实无据断言必须修复；误报可依据事实反驳，也可自动澄清引发误读的措辞并保留真实证据。不要因审查意见错误而删除有效事实，不机械迎合，也不固守歧义原句。不加入输入之外的证据，不程序修稿；返回完整draft及全部finding处置。未解决问题必须unresolved，程序将阻断；研究解释分歧可retained_disagreement并给证据，误报可disputed_with_evidence；重要分歧将公开，不得冒称共识。"
     if packet["task"]["kind"]=="intraday":
@@ -319,11 +395,12 @@ def _arbitration_material(stages,packet,rules):
     reviews={name:_parse_review(by[name]["raw_response"],_body_hash(drafts[other]),packet)
              for name,other in (("deepseek_review","codex"),("codex_review","deepseek"))}
     raw=by["codex_final"]["raw_response"]
-    _,local=_inspect_first_final(raw,packet,reviews)
+    _,local=_inspect_first_final(raw,packet,reviews,schema=build_stage_request("codex_final",packet,rules,drafts=drafts,reviews=reviews)[1])
     audit=_parse_review(by["deepseek_final_review"]["raw_response"],_body_hash(raw),packet,final=True,require_pass=False)
     all_reviews={**reviews,"deepseek_final_review":audit}
     if local: all_reviews["deterministic_contract"]=local
-    final=_validate_final(by["codex_arbitration"]["raw_response"],packet,all_reviews)
+    final=_validate_final(by["codex_arbitration"]["raw_response"],packet,all_reviews,
+        schema=build_stage_request("codex_arbitration",packet,rules,final_raw=raw,reviews=all_reviews)[1])
     requests={stage:build_stage_request(stage,packet,rules,drafts=drafts,reviews=reviews) for stage in STAGES[:5]}
     requests["deepseek_final_review"]=build_stage_request("deepseek_final_review",packet,rules,final_raw=raw)
     requests["codex_arbitration"]=build_stage_request("codex_arbitration",packet,rules,final_raw=raw,reviews=all_reviews)
@@ -331,7 +408,7 @@ def _arbitration_material(stages,packet,rules):
 
 
 def generate_research(digest,*,report_kind,next_trade_date,context=None,previous_research=None,now=None,
-                      engine=None,checkpoint=None,progress:Callable[[dict],None]|None=None):
+                      engine=None,checkpoint=None,progress:Callable[[dict],None]|None=None,timeout_seconds=None):
     """Independent drafts, cross-review, one revision, final audit. No editorial hook."""
     if checkpoint:
         try:
@@ -344,6 +421,10 @@ def generate_research(digest,*,report_kind,next_trade_date,context=None,previous
     else:
         current=_now(now)
         operation_deadline=datetime.now(timezone.utc)+timedelta(seconds=INTRADAY_DEADLINE_SECONDS if report_kind=="intraday" else DEADLINE_SECONDS)
+    if timeout_seconds is not None:
+        if report_kind!="intraday" or not 0 < float(timeout_seconds) <= INTRADAY_DEADLINE_SECONDS:
+            _fail("input","invalid_remaining_source_budget")
+        operation_deadline=min(operation_deadline,datetime.now(timezone.utc)+timedelta(seconds=float(timeout_seconds)))
     rules,rule_hash=_load_rules()
     try:
         packet=build_packet(digest,report_kind=report_kind,next_trade_date=next_trade_date,context=context,
@@ -370,7 +451,7 @@ def generate_research(digest,*,report_kind,next_trade_date,context=None,previous
             if saved.get("messages_sha256")!=message_hash or _body_hash(saved["raw_response"])!=saved["raw_sha256"]: _fail("resume","stage_identity_mismatch_"+stage)
             emit(stage,"COMPLETE",reused=True);return saved["raw_response"]
         if saved and saved.get("status") in {"RUNNING","FAILED"}: _fail("resume","prior_attempt_not_reusable_"+stage)
-        budget=min(90 if report_kind=="intraday" else 150,deadline-time.monotonic())
+        budget=min(INTRADAY_DEADLINE_SECONDS if report_kind=="intraday" else 150,deadline-time.monotonic())
         if budget<5: _fail(stage,"total_deadline_exceeded")
         recovery=state.get("recovery") or {}
         request_id=(recovery.get("request_ids") or {}).get(stage) or str(uuid5(namespace,stage))
@@ -414,14 +495,14 @@ def generate_research(digest,*,report_kind,next_trade_date,context=None,previous
             reviews={"deepseek_review":ds.result(),"codex_review":cx.result()}
         messages,schema=build_stage_request("codex_final",packet,rules,drafts=drafts,reviews=reviews)
         first_raw=call("codex_final",messages,schema)
-        _,local=_inspect_first_final(first_raw,packet,reviews)
+        _,local=_inspect_first_final(first_raw,packet,reviews,schema=schema)
         messages,schema=build_stage_request("deepseek_final_review",packet,rules,final_raw=first_raw)
         audit=_parse_review(call("deepseek_final_review",messages,schema),_body_hash(first_raw),packet,final=True,require_pass=False)
         all_reviews={**reviews,"deepseek_final_review":audit}
         if local: all_reviews["deterministic_contract"]=local
         messages,schema=build_stage_request("codex_arbitration",packet,rules,reviews=all_reviews,final_raw=first_raw)
         final_raw=call("codex_arbitration",messages,schema)
-        final=_validate_final(final_raw,packet,all_reviews)
+        final=_validate_final(final_raw,packet,all_reviews,schema=schema)
         if time.monotonic()>deadline: _fail("completion","total_deadline_exceeded")
         result={"schema_version":SCHEMA_VERSION,"status":"COMPLETE","report_kind":report_kind,"review_date":str(digest["review_date"])[:10],"next_trade_date":next_trade_date,
             "generated_at":current.isoformat(),"data_cutoff_at":packet["task"].get("data_cutoff_at"),"context_cutoff_at":packet["task"].get("context_cutoff_at"),
@@ -443,13 +524,14 @@ def render_research(research):
     content=render_draft(research["draft"],research["input_packet"],{})
     content+="\n\n## 交叉校验说明\n\n双模型独立研究与互审，最终由Codex据事实仲裁；不代表双方一致认可最终稿。\n"
     units={u["id"]:u for u in research["draft"]["units"]}
-    disputes=[x for x in research["model_output"]["dispositions"].values() if x["resolution"] in {"disputed_with_evidence","retained_disagreement"}]
+    disputes=[(key,x) for key,x in research["model_output"]["dispositions"].items() if x["resolution"] in {"disputed_with_evidence","retained_disagreement"}]
     sources={**research["verification"]["peer_reviews"],"deepseek_final_review":research["verification"]["synthesis_review"]}
     if research["verification"].get("local_contract_review"): sources["deterministic_contract"]=research["verification"]["local_contract_review"]
     if disputes:
         content+="\n重要分歧对应的采用判断（完整审查和处置保留在结构化报告中）：\n"
-        for item in disputes:
-            finding=next(x for x in sources[item["review"]]["findings"] if x["id"]==item["finding_id"])
+        for key,item in disputes:
+            reviewer,finding_id=key.split(":",1)
+            finding=next(x for x in sources[reviewer]["findings"] if x["id"]==finding_id)
             content+="\n- 模型质疑（非行情事实）："+finding["explanation"]+"\n  仲裁采用判断："+"；".join(_span_text(units[uid]["statement"],research["input_packet"]) for uid in item["unit_ids"])+"\n"
     return content
 
@@ -457,6 +539,7 @@ def render_research(research):
 def verify_automatic_research(research):
     """Rebuild from untouched provider raw responses, not a body hash alone."""
     if research.get("schema_version")!=SCHEMA_VERSION or research.get("status")!="COMPLETE" or research.get("editorial_review"): _fail("automatic_provenance","nonautomatic_artifact")
+    bundle=_rules_bundle(research.get("rules_sha256"))
     stages=research.get("generation_attempts") or []
     if [x.get("stage") for x in stages]!=list(STAGES) or any(x.get("status")!="COMPLETE" for x in stages):
         _fail("automatic_provenance","incomplete_provider_stages")
@@ -466,8 +549,8 @@ def verify_automatic_research(research):
         transport="live_http" if stage.startswith("deepseek") else "live_codex_bridge"
         if not isinstance(raw,str) or _body_hash(raw)!=item.get("raw_sha256") or receipt.get("raw_sha256")!=item.get("raw_sha256") or receipt.get("messages_sha256")!=item.get("messages_sha256") or receipt.get("transport")!=transport: _fail("automatic_provenance","provider_receipt_mismatch_"+stage)
         if stage.startswith("deepseek"):
-            expected_policy=_deepseek_policy(research["input_packet"]["task"]["kind"])
-            if (receipt.get("source")!="deepseek_api" or receipt.get("endpoint")!="https://api.deepseek.com/v1/chat/completions"
+            expected_policy=bundle["deepseek_intraday_policy" if research["input_packet"]["task"]["kind"]=="intraday" else "deepseek_research_policy"]
+            if (receipt.get("source")!="deepseek_api" or receipt.get("endpoint")!=bundle.get("deepseek_endpoint","https://api.deepseek.com/v1/chat/completions")
                     or not receipt.get("provider_response_id") or receipt.get("model")!=expected_policy["model"]
                     or receipt.get("request_policy")!=expected_policy):
                 _fail("automatic_provenance","deepseek_identity_missing_"+stage)
@@ -486,8 +569,7 @@ def verify_automatic_research(research):
     if _hash(packet)!=proof.get("input_sha256"): _fail("automatic_provenance","input_packet_changed")
     reviews={"deepseek_review":_parse_review(by_stage["deepseek_review"]["raw_response"],_body_hash(by_stage["codex_draft"]["raw_response"]),packet),
         "codex_review":_parse_review(by_stage["codex_review"]["raw_response"],_body_hash(by_stage["deepseek_draft"]["raw_response"]),packet)}
-    rules,rule_hash=_load_rules()
-    if research.get("rules_sha256")!=rule_hash: _fail("automatic_provenance","rules_changed")
+    rules,rule_hash=_load_rules(research.get("rules_sha256"))
     final,reviews,audit,local,requests=_arbitration_material(stages,packet,rules)
     if final!=research.get("model_output") or final["draft"]!=research.get("draft"): _fail("automatic_provenance","model_semantics_edited")
     if (proof.get("peer_reviews")!=reviews or proof.get("synthesis_review")!=audit or proof.get("local_contract_review")!=local
@@ -498,6 +580,9 @@ def verify_automatic_research(research):
     for stage,(messages,schema) in requests.items():
         item=by_stage[stage];receipt=item["provider_receipt"]
         if _hash(messages)!=item["messages_sha256"]: _fail("automatic_provenance","stage_input_changed_"+stage)
+        if stage.startswith("deepseek") and bundle.get("deepseek_endpoint"):
+            if receipt.get("response_schema_sha256")!=_hash(schema) or receipt.get("response_status")!="completed":
+                _fail("automatic_provenance","deepseek_input_changed_"+stage)
         if stage.startswith("codex"):
             expected=research_input_sha256({"stage":stage,"messages":messages,"response_schema":schema,"rules_sha256":rule_hash})
             if receipt.get("input_sha256")!=expected or receipt.get("schema_sha256")!=_body_hash(json.dumps(schema,ensure_ascii=False,sort_keys=True,separators=(",", ":"))):
