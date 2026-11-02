@@ -20,6 +20,7 @@ import hashlib
 import json
 import math
 import re
+import zlib
 from typing import Any, Callable, Iterable, Mapping
 from zoneinfo import ZoneInfo
 
@@ -3895,9 +3896,26 @@ def append_finance_atomic_batch_seal(
     delta_source_cutoff: datetime | None = None
     source_changed = sorted(set(changed) - set(excluded_members))
     if source_changed:
-        prior_exclusions = load_finance_data_exclusions(
-            engine, codes=source_changed, decision_at=completed, as_of_date=target,
-        )
+        if changed_codes is None:
+            prior_exclusions = load_finance_data_exclusions(
+                engine, codes=source_changed, decision_at=completed, as_of_date=target,
+            )
+        else:
+            # The parent payload and its exclusions were validated above in
+            # this operation. Derive the same result without rereading every
+            # historical full-catalog seal a second time.
+            prior_baseline = {}
+            if prior_evidence.get("as_of_date") == target.isoformat():
+                prior_baseline = {
+                    **prior_evidence,
+                    **_finance_exclusion_summary(prior_members,
+                        target=target,
+                        completed=_row_datetime(prior_evidence.get("completed_known_at"))),
+                    "seal_coverage_id": str(prior_row.get("coverage_id") or ""),
+                }
+            prior_exclusions = _finance_data_exclusions_from_baseline(
+                prior_baseline, codes=source_changed, target=target,
+            )
         selected, delta_source_cutoff = _select_finance_atomic_batch_members(
             engine,
             codes=source_changed,
@@ -4058,6 +4076,35 @@ def _date_time_value(
         return None
 
 
+def _decode_finance_seal_payload(packed: object, *, expected_bytes: int) -> str:
+    """Decode one MySQL COMPRESS frame within that exact stored payload size.
+
+    The database's OCTET_LENGTH from the same row is the inflation bound; no
+    smaller business limit is imposed on existing valid full-catalog seals.
+    """
+    if (type(expected_bytes) is not int or expected_bytes <= 0
+            or not isinstance(packed, (bytes, bytearray, memoryview))):
+        raise ValueError("finance_seal_history: compressed payload type/size differs")
+    packed = bytes(packed)
+    if len(packed) <= 4 or int.from_bytes(packed[:4], "little") != expected_bytes:
+        raise ValueError("finance_seal_history: compressed payload length differs")
+    try:
+        decoder = zlib.decompressobj()
+        raw = decoder.decompress(packed[4:], expected_bytes + 1)
+    except zlib.error as exc:
+        raise ValueError("finance_seal_history: invalid MySQL zlib payload") from exc
+    if (len(raw) != expected_bytes or decoder.unconsumed_tail or not decoder.eof):
+        raise ValueError("finance_seal_history: compressed payload inflation/boundary differs")
+    tail = decoder.unused_data
+    if (tail not in (b"", b".") or (tail == b"." and packed[-2] != 0x20)
+            or (not tail and packed[-1] == 0x20)):
+        raise ValueError("finance_seal_history: invalid MySQL compressed trailing bytes")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeError as exc:
+        raise ValueError("finance_seal_history: compressed payload is not UTF-8") from exc
+
+
 def _load_latest_finance_atomic_seal_evidence(
     engine: Engine,
     *,
@@ -4098,8 +4145,16 @@ def _load_latest_finance_atomic_seal_evidence(
             "OR (scope_hash=:after_scope AND revision_no>:after_revision)) "
             "ORDER BY scope_hash, revision_no LIMIT 1"
         )
+        mysql = connection.dialect.name == "mysql"
+        payload_columns = "*"
+        if mysql:
+            metadata = sorted(_REQUIRED_COLUMNS[SOURCE_COVERAGE_TABLE] - {"payload_json"})
+            payload_columns = (
+                ",".join(metadata) + ",OCTET_LENGTH(payload_json) AS payload_json_bytes,"
+                "COMPRESS(payload_json) AS payload_json_compressed"
+            )
         payload_statement = text(
-            f"SELECT * FROM {SOURCE_COVERAGE_TABLE} "
+            f"SELECT {payload_columns} FROM {SOURCE_COVERAGE_TABLE} "
             "WHERE coverage_id=:coverage_id"
         )
 
@@ -4137,6 +4192,11 @@ def _load_latest_finance_atomic_seal_evidence(
                 if raw is None:
                     return
                 current = dict(raw)
+                if mysql:
+                    current["payload_json"] = _decode_finance_seal_payload(
+                        current.pop("payload_json_compressed"),
+                        expected_bytes=current.pop("payload_json_bytes"),
+                    )
                 # The consumer validates every original payload and chain link.
                 # Keeping all full-catalog seal JSONs used over 226 MB before
                 # parsing; retain only the latest payload and parent root index.
@@ -4865,6 +4925,13 @@ def load_finance_data_exclusions(
     decision = normalize_decision_at(decision_at)
     target = _date_value(as_of_date, required=True)
     baseline = load_latest_finance_atomic_batch_baseline(engine, decision_at=decision)
+    return _finance_data_exclusions_from_baseline(baseline, codes=codes, target=target)
+
+
+def _finance_data_exclusions_from_baseline(
+    baseline: Mapping[str, Any], *, codes: Iterable[str], target: date,
+) -> dict[str, dict[str, Any]]:
+    """Project exclusions from an already validated exact-date baseline."""
     if not baseline or baseline.get("as_of_date") != target.isoformat():
         return {}
     requested = {str(code).strip().zfill(6) for code in codes}

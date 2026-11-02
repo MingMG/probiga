@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 import json
 import hashlib
+import zlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -195,6 +196,41 @@ def test_finance_excluded_member_requires_fresh_recovery(changed_codes):
     )
     assert restored["data_excluded_count"] == 0
     assert restored["available_code_count"] == 2
+
+
+def test_finance_delta_reuses_validated_exclusions_without_rereading_parent_history():
+    engine = _engine()
+    _install_finance_test_catalog(engine)
+    _install_prior_finance_coverage(engine)
+    append_finance_atomic_batch_seal(
+        engine, as_of_date="2026-08-30", completed_known_at="2026-08-30 01:30:00",
+        data_exclusions=[_finance_data_exclusion()],
+    )
+    baseline = pit_module.load_latest_finance_atomic_batch_baseline(
+        engine, decision_at="2026-08-30 01:40:00")
+    for target in ("2026-08-30", "2026-08-31"):
+        original = pit_module.load_finance_data_exclusions(engine,
+            codes=["000001", "002731"], decision_at="2026-08-30 01:40:00",
+            as_of_date=target)
+        assert pit_module._finance_data_exclusions_from_baseline(baseline,
+            codes=["000001", "002731"], target=date.fromisoformat(target)) == original
+        assert bool(original) == (target == "2026-08-30")
+
+    history_reads = []
+
+    def record(_conn, _cursor, statement, _parameters, _context, _many):
+        if f"SELECT * FROM {SOURCE_COVERAGE_TABLE} WHERE coverage_id=" in statement:
+            history_reads.append(statement)
+
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        with pytest.raises(ValueError, match="fresh source observation"):
+            append_finance_atomic_batch_seal(engine, as_of_date="2026-08-30",
+                completed_known_at="2026-08-30 01:40:00", changed_codes=[])
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+    assert len(history_reads) == 1
+    engine.dispose()
 
 
 def _nonfiling_evidence(report_date="2026-03-31") -> dict:
@@ -2357,6 +2393,104 @@ def test_finance_seal_pages_validate_oldest_payload_and_all_links(damage):
     assert result["status"] == PIT_DATA_BLOCKED
     assert result["fact_cutoff_at"] == ""
     engine.dispose()
+
+
+def _mysql_compress_frame(raw):
+    encoded = zlib.compress(raw)
+    return len(raw).to_bytes(4, "little") + encoded + (b"." if encoded[-1] == 0x20 else b"")
+
+
+def _mysql_seal_transport(engine, *, corrupt=None):
+    """Execute the real MySQL payload projection over the same SQLite facts."""
+    with engine.connect() as connection:
+        dbapi = connection.connection.driver_connection
+        dbapi.create_function("OCTET_LENGTH", 1, lambda value: len(value.encode("utf-8")))
+        dbapi.create_function("COMPRESS", 1, lambda value:
+            (corrupt or (lambda packed: packed))(_mysql_compress_frame(value.encode("utf-8"))))
+
+    class MysqlConnection:
+        dialect = SimpleNamespace(name="mysql")
+
+        def __init__(self):
+            self.connection = engine.connect()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return self.connection.__exit__(*args)
+
+        def get_isolation_level(self):
+            return "REPEATABLE READ"
+
+        def begin(self):
+            return self.connection.begin()
+
+        def execute(self, statement, params):
+            sql = str(statement).replace(" FORCE INDEX (idx_pit_coverage_decision)", "")
+            return self.connection.execute(text(sql), params)
+
+    return SimpleNamespace(connect=MysqlConnection)
+
+
+def test_finance_compressed_history_is_byte_exact_and_preserves_all_seal_results():
+    engine, kwargs = _multi_seal_common_cutoff_case()
+    plain = pit_module._load_latest_finance_atomic_seal_evidence(
+        engine, decision_at=kwargs["decision_at"])
+    mysql_reader = _mysql_seal_transport(engine)
+    packed = pit_module._load_latest_finance_atomic_seal_evidence(
+        mysql_reader, decision_at=kwargs["decision_at"])
+    assert packed == plain  # Original payload bytes, IDs, roots, members and every parent.
+    assert len(packed[3]) == 3
+    engine.dispose()
+
+
+@pytest.mark.parametrize("damage", ["result_count=result_count+1", "payload_json='{}'",
+                                    "revision_no=7", "supersedes_coverage_id='broken'"])
+def test_finance_compressed_history_still_rejects_oldest_payload_or_chain_damage(damage):
+    engine, kwargs = _multi_seal_common_cutoff_case()
+    with engine.begin() as connection:
+        connection.execute(text("DROP TRIGGER trg_pit_source_coverage_immutable_bu"))
+        connection.execute(text(f"UPDATE {SOURCE_COVERAGE_TABLE} SET {damage} "
+            "WHERE fact_kind='finance' AND stock_code='000000' "
+            "AND source='probiga.finance.atomic_batch' AND revision_no=1"))
+    with pytest.raises(ValueError):
+        pit_module._load_latest_finance_atomic_seal_evidence(
+            _mysql_seal_transport(engine), decision_at=kwargs["decision_at"])
+    engine.dispose()
+
+
+@pytest.mark.parametrize("corrupt", [lambda frame: frame[:-1],
+    lambda frame: (int.from_bytes(frame[:4], "little") + 1).to_bytes(4, "little") + frame[4:],
+    lambda frame: frame + b"unexpected", lambda frame: None])
+def test_finance_history_rejects_broken_compressed_transport(corrupt):
+    engine, kwargs = _multi_seal_common_cutoff_case()
+    with pytest.raises(ValueError, match="finance_seal_history"):
+        pit_module._load_latest_finance_atomic_seal_evidence(
+            _mysql_seal_transport(engine, corrupt=corrupt), decision_at=kwargs["decision_at"])
+    engine.dispose()
+
+
+def test_finance_payload_bound_uses_stored_size_and_preserves_large_unicode_json():
+    raw = json.dumps({"title": "原始公告\u0000", "members": "A" * (8 * 1024 * 1024)},
+                     ensure_ascii=False).encode("utf-8")
+    assert pit_module._decode_finance_seal_payload(_mysql_compress_frame(raw),
+        expected_bytes=len(raw)).encode("utf-8") == raw
+    # The trusted SQL byte length, not the frame's claim, bounds inflation.
+    forged = len(raw).to_bytes(4, "little") + zlib.compress(raw + b"X")
+    with pytest.raises(ValueError, match="inflation/boundary"):
+        pit_module._decode_finance_seal_payload(forged, expected_bytes=len(raw))
+    with pytest.raises(ValueError, match="UTF-8"):
+        pit_module._decode_finance_seal_payload(_mysql_compress_frame(b"\xff"), expected_bytes=1)
+
+
+def test_finance_mysql_space_marker_is_accepted_only_at_the_real_stream_boundary():
+    raw = b"\x1f"  # Adler checksum ends in 0x20; MySQL appends the marker.
+    frame = _mysql_compress_frame(raw)
+    assert frame.endswith(b" .")
+    assert pit_module._decode_finance_seal_payload(frame, expected_bytes=len(raw)) == raw.decode()
+    with pytest.raises(ValueError, match="trailing bytes"):
+        pit_module._decode_finance_seal_payload(frame[:-1], expected_bytes=len(raw))
 
 
 def test_finance_seal_read_error_reports_only_stage_and_numeric_errno():

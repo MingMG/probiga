@@ -284,9 +284,9 @@ def test_notice_historical_recovery_uses_bound_target_not_execution_day(monkeypa
 @pytest.mark.parametrize(
     "field,value,message",
     (
-        ("association_validated", 0, "invalid association"),
-        ("data_source", "legacy_unverified", "invalid association"),
-        ("batch_id", "d" * 64, "invalid association"),
+        ("association_validated", 0, "content hash differs"),
+        ("data_source", "legacy_unverified", "content hash differs"),
+        ("batch_id", "d" * 64, "source checkpoint root differs"),
         ("title", "被篡改公告", "content hash differs"),
     ),
 )

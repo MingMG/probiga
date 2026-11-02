@@ -1546,6 +1546,8 @@ def _notice_sync_result(
     source_manifest: list[dict[str, Any]] | None = None,
     persisted_manifest: list[dict[str, Any]] | None = None,
     batch_id: str = "",
+    reused_codes: int = 0,
+    reused_rows: int = 0,
 ) -> dict[str, Any]:
     requested = len(codes)
     succeeded = len(succeeded_codes)
@@ -1581,7 +1583,12 @@ def _notice_sync_result(
             succeeded_codes
         ),
         "failure_sample": failure_sample[:20],
+        # The durable scope includes reused rows; report this attempt's DML
+        # separately so resuming never presents old data as newly captured.
         "written_notice_count": int(written_rows),
+        "newly_written_notice_count": int(written_rows - reused_rows),
+        "reused_notice_count": int(reused_rows),
+        "reused_code_count": int(reused_codes),
         "replaced_existing_notice_count": int(replaced_existing_rows),
         "request_coverage": coverage,
         "row_coverage": row_coverage,
@@ -1699,6 +1706,62 @@ def _notice_source_snapshot(
     }
 
 
+def _reuse_notice_publication(
+    stock_code: str, payload: dict[str, Any],
+    published_rows: list[dict[str, Any]], *, window_start: date,
+    window_end: date, batch_id: str, finished_at: datetime,
+) -> tuple[NoticeFetchResult, list[dict[str, Any]], dict[str, Any]] | None:
+    """Reuse only a complete database partition equal to its retained source.
+
+    A prior publication's batch and timestamps are facts, not this attempt's
+    clocks. They remain unchanged and participate in the final content roots.
+    An authoritative-empty source also needs an empty database partition.
+    """
+    batches = {str(row.get("batch_id") or "").strip() for row in published_rows}
+    if published_rows:
+        if len(batches) != 1 or not re.fullmatch(r"[0-9a-f]{64}", next(iter(batches))):
+            return None
+        batch_id = next(iter(batches))
+    fetch, source_rows, source_entry = _notice_source_snapshot(stock_code, payload,
+        window_start=window_start, window_end=window_end, batch_id=batch_id,
+        finished_at=finished_at)
+    by_identity = {str(row.get("art_code") or "").strip(): row for row in published_rows}
+    if len(by_identity) != len(published_rows) or len(source_rows) != len(published_rows):
+        return None
+    for expected in source_rows:
+        row = by_identity.get(expected["art_code"])
+        if row is None:
+            return None
+        source_business = _canonical_notice_row(expected)
+        try:
+            published_business = _canonical_notice_row(row)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        # First capture and publication batch are durable local provenance,
+        # not source business changes. Reobserving identical source content
+        # must not relabel those original facts with this attempt's clocks.
+        for field in ("received_at", "batch_id"):
+            source_business.pop(field)
+            published_business.pop(field)
+        if expected["published_at"] is None:
+            source_business.pop("source_time")
+            published_business.pop("source_time")
+        if source_business != published_business:
+            return None
+        try:
+            source_time = datetime.fromisoformat(_canonical_timestamp(row["source_time"]))
+            received = datetime.fromisoformat(_canonical_timestamp(row["received_at"]))
+            published = datetime.fromisoformat(_canonical_timestamp(row["etl_sync_at"]))
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not source_time <= received <= published <= finished_at.replace(microsecond=0):
+            return None
+        if expected["published_at"] is None and source_time != received:
+            return None
+    source_entry["row_hash"] = _notice_row_hash(published_rows)
+    return fetch, published_rows, source_entry
+
+
 def _run_incremental(
     *,
     engine: Engine,
@@ -1721,6 +1784,8 @@ def _run_incremental(
     failure_sample: list[dict[str, str]] = []
     source_manifest: list[dict[str, Any]] = []
     persisted_manifest: list[dict[str, Any]] = []
+    reused_code_count = 0
+    reused_row_count = 0
     shards = _notice_incremental_shards(window_start=window_start,
         window_end=window_end, target_trade_date=target_trade_date)
     batch_id = _sha256(
@@ -1738,9 +1803,37 @@ def _run_incremental(
         headers={"User-Agent": "Mozilla/5.0 ProBigA-notice-sync"},
         trust_env=False,
     ) as client:
+        # A source shard is independent of a scheduler attempt. Read existing
+        # publications with the same bounded, compressed reader used by final
+        # validation; identical partitions retain their real batch and clocks.
+        from server.common.scheduler_validation import _read_notice_validation_window
+
+        saved_by_code: dict[str, Any] = {}
+        published_by_code: dict[str, list[dict[str, Any]]] = {}
+        read_error: Exception | None = None
         for index, code in enumerate(codes):
+            reused = False
             try:
-                saved = shards.load(code)
+                if index % 50 == 0:
+                    batch_codes = codes[index:index + 50]
+                    saved_by_code = {}
+                    for candidate in batch_codes:
+                        try:
+                            saved_by_code[candidate] = shards.load(candidate)
+                        except Exception as exc:  # handled for this stock below
+                            saved_by_code[candidate] = exc
+                    published_by_code = {candidate: [] for candidate in batch_codes}
+                    read_error = None
+                    try:
+                        for row in _read_notice_validation_window(engine,
+                                codes=batch_codes, window_start=window_start,
+                                window_end=window_end):
+                            published_by_code[row["stock_code"]].append(row)
+                    except Exception as exc:
+                        read_error = exc
+                saved = saved_by_code[code]
+                if isinstance(saved, Exception):
+                    raise saved
                 reused = saved is not None
                 if saved is not None:
                     logger.info("%s resume: verified source already captured", code)
@@ -1764,31 +1857,50 @@ def _run_incremental(
                         "captured_at": fetch.captured_at.isoformat(),
                         "page_count": fetch.page_count, "total_hits": fetch.total_hits,
                     }
-                fetch, rows, source_entry = _notice_source_snapshot(
+                source_snapshot = None
+                if not reused:
+                    source_snapshot = _notice_source_snapshot(
+                        code, saved, window_start=window_start, window_end=window_end,
+                        batch_id=batch_id, finished_at=_shanghai_now())
+                    shards.save(code, saved)
+                if read_error is not None:
+                    raise read_error
+                prior = _reuse_notice_publication(code, saved,
+                    published_by_code[code], window_start=window_start,
+                    window_end=window_end, batch_id=batch_id,
+                    finished_at=_shanghai_now())
+                fetch, rows, source_entry = prior or source_snapshot or _notice_source_snapshot(
                     code, saved, window_start=window_start, window_end=window_end,
                     batch_id=batch_id, finished_at=_shanghai_now(),
                 )
-                if not reused:
-                    shards.save(code, saved)
                 source_hash = _notice_row_hash(rows)
-                persisted = reconcile_rows(
-                    engine,
-                    rows,
-                    stock_code=code,
-                    captured_at=fetch.captured_at,
-                    window_start=window_start,
-                    window_end=window_end,
-                )
-                if (
-                    persisted.written_count != len(rows)
-                    or persisted.persisted_count != len(rows)
-                    or persisted.persisted_row_hash != source_hash
-                ):
-                    raise RuntimeError(
-                        f"{code} notice persisted proof differs from source"
+                if prior is not None:
+                    persisted_count, persisted_hash, deleted_count = len(rows), source_hash, 0
+                    reused_code_count += 1
+                    reused_row_count += len(rows)
+                    logger.info("%s resume: existing publication matches source", code)
+                else:
+                    persisted = reconcile_rows(
+                        engine,
+                        rows,
+                        stock_code=code,
+                        captured_at=fetch.captured_at,
+                        window_start=window_start,
+                        window_end=window_end,
                     )
-                total_items += persisted.written_count
-                replaced_existing += persisted.deleted_count
+                    if (
+                        persisted.written_count != len(rows)
+                        or persisted.persisted_count != len(rows)
+                        or persisted.persisted_row_hash != source_hash
+                    ):
+                        raise RuntimeError(
+                            f"{code} notice persisted proof differs from source"
+                        )
+                    persisted_count = persisted.persisted_count
+                    persisted_hash = persisted.persisted_row_hash
+                    deleted_count = persisted.deleted_count
+                total_items += persisted_count
+                replaced_existing += deleted_count
                 succeeded_codes.append(code)
                 if rows:
                     nonempty_codes.append(code)
@@ -1796,8 +1908,8 @@ def _run_incremental(
                 persisted_manifest.append(
                     {
                         "stock_code": code,
-                        "row_count": persisted.persisted_count,
-                        "row_hash": persisted.persisted_row_hash,
+                        "row_count": persisted_count,
+                        "row_hash": persisted_hash,
                     }
                 )
                 logger.info(
@@ -1806,7 +1918,7 @@ def _run_incremental(
                     len(codes),
                     code,
                     len(rows),
-                    persisted.deleted_count,
+                    deleted_count,
                 )
             except Exception as exc:  # noqa: BLE001
                 failed_codes.append(code)
@@ -1814,7 +1926,7 @@ def _run_incremental(
                     {"stock_code": code, "error_type": type(exc).__name__}
                 )
                 logger.warning("%s 失败：%s", code, exc)
-            if index + 1 < len(codes):
+            if not reused and index + 1 < len(codes):
                 time.sleep(max(0.0, sleep_seconds))
 
     coverage = _coverage_ratio(len(succeeded_codes), len(codes))
@@ -1849,6 +1961,8 @@ def _run_incremental(
         source_manifest=source_manifest,
         persisted_manifest=persisted_manifest,
         batch_id=batch_id,
+        reused_codes=reused_code_count,
+        reused_rows=reused_row_count,
     )
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     if coverage < minimum_coverage or row_coverage < minimum_row_coverage:

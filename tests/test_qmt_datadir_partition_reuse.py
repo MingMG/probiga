@@ -92,6 +92,23 @@ def test_failed_cursor_without_any_prior_history_reuses_exact_native_data_withou
     assert receipt["detail"]["full_market_manifest_hash"] == item.scope["full_market_manifest_hash"]
 
 
+def test_bad_compressed_transport_does_not_authorize_replacement(existing_partition, monkeypatch):
+    item = existing_partition
+    before = _stored_rows(item.engine)
+
+    def corrupt_readback(*_args, **_kwargs):
+        return coverage._decode_matrix_group(dict(stock_code=CODES[0], row_count=241,
+            packed_rows=b"\x01\x00\x00\x00bad-zlib"), expected_codes=set(CODES))
+
+    monkeypatch.setattr(importer, "persisted_matrix", corrupt_readback)
+    monkeypatch.setattr(importer, "_source_matrix", lambda *_args, **_kwargs: pytest.fail("bad transport authorized a source replacement"))
+    with pytest.raises(RuntimeError, match="compressed package"):
+        importer._reuse_existing_partition(item.engine, session=DAY, scope=item.scope,
+            datadir_roots=[item.root], universe=item.universe)
+    assert _stored_rows(item.engine) == before
+    assert results.load_receipt(item.engine, dataset="stock_minute", trade_date=str(DAY))["status"] == "FAILED"
+
+
 @pytest.mark.parametrize("stored_pct,expected_reuse", [("11.111111", True), ("11.111112", False)])
 def test_native_fallback_compares_nonterminating_percentage_at_actual_mysql_scale(
         existing_partition, stored_pct, expected_reuse):

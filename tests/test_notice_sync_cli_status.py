@@ -139,6 +139,9 @@ def _install_cli_fakes(monkeypatch, *, codes: list[str], outcomes: dict[str, obj
         ),
     )
     monkeypatch.setattr(sync_notice_em.time, "sleep", lambda _seconds: None)
+    from server.common import scheduler_validation
+    monkeypatch.setattr(scheduler_validation, "_read_notice_validation_window",
+                        lambda _engine, **_kwargs: [])
     return observed
 
 

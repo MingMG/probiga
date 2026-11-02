@@ -6181,7 +6181,7 @@ def _validate_notice_eastmoney_receipt(
     )
     if receipt_window is None:
         return False, "notice_eastmoney: receipt execution window is stale or invalid"
-    receipt_started, receipt_finished = receipt_window
+    _receipt_started, receipt_finished = receipt_window
     request_window_start = date.fromisoformat(
         str(payload["request_window_start"])
     )
@@ -6216,13 +6216,20 @@ def _validate_notice_eastmoney_receipt(
     ):
         return False, "notice_eastmoney: requested universe differs from si_all_code"
 
-    # The source checkpoint outlives scheduler attempts. Its capture clock must
-    # stay immutable, including for authoritative-empty securities, while the
-    # actual database publication belongs to this receipt's execution window.
-    from biz.notice.sync_notice_em import (
-        _notice_incremental_shards, _notice_source_snapshot, _sha256,
+    # A source checkpoint and its matching database publication outlive scheduler
+    # attempts. Read every row in the exact window before replaying the source so
+    # the content roots include each partition's real batch, including old ones.
+    fresh_rows = _read_notice_validation_window(
+        engine, codes=expected_codes,
+        window_start=request_window_start, window_end=request_window_end,
     )
-    captures: dict[str, datetime] = {}
+    rows_by_code: dict[str, list[Mapping[str, Any]]] = {}
+    for row in fresh_rows:
+        code = str(row.get("stock_code") or "").strip().zfill(6)
+        rows_by_code.setdefault(code, []).append(row)
+    from biz.notice.sync_notice_em import (
+        _notice_incremental_shards, _reuse_notice_publication, _sha256,
+    )
     source_manifest: list[dict[str, Any]] = []
     source_persisted_manifest: list[dict[str, Any]] = []
     replay_deadline = monotonic() + 60.0
@@ -6235,12 +6242,17 @@ def _validate_notice_eastmoney_receipt(
         for code in expected_codes:
             if monotonic() >= replay_deadline:
                 raise ValueError("source checkpoint replay deadline exceeded")
-            fetch, _rows, entry = _notice_source_snapshot(
-                code, shards.load(code), window_start=request_window_start,
+            replay = _reuse_notice_publication(
+                code, shards.load(code), rows_by_code.get(code, []),
+                window_start=request_window_start,
                 window_end=request_window_end, batch_id=batch_id,
                 finished_at=receipt_finished,
             )
-            captures[code] = fetch.captured_at.replace(microsecond=0)
+            if replay is None:
+                raise ValueError(
+                    "persisted content hash differs from source or publication bounds"
+                )
+            fetch, _rows, entry = replay
             source_manifest.append(entry)
             source_persisted_manifest.append({
                 "stock_code": code, "row_count": fetch.total_hits,
@@ -6256,10 +6268,6 @@ def _validate_notice_eastmoney_receipt(
     except (KeyError, TypeError, ValueError, OverflowError, OSError) as exc:
         return False, f"notice_eastmoney: source checkpoint proof invalid: {exc}"
 
-    fresh_rows = _read_notice_validation_window(
-        engine, codes=expected_codes,
-        window_start=request_window_start, window_end=request_window_end,
-    )
     from integrations.qmt.backend import to_qmt_symbol
 
     identities: set[tuple[str, str]] = set()
@@ -6297,11 +6305,9 @@ def _validate_notice_eastmoney_receipt(
             and received_at is not None
             and etl_sync_at is not None
             and source_time <= received_at
-            and received_at == captures.get(code)
-            and receipt_started.replace(microsecond=0) <= etl_sync_at
-            <= receipt_finished.replace(microsecond=0)
+            and etl_sync_at <= receipt_finished.replace(microsecond=0)
             and received_at <= etl_sync_at
-            and str(row.get("batch_id") or "").strip() == batch_id
+            and _is_hex(str(row.get("batch_id") or "").strip(), 64)
             and str(row.get("data_version") or "").strip()
             == _NOTICE_DATA_VERSION
             and str(row.get("quality_status") or "").strip()

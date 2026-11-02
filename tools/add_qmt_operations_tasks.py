@@ -220,6 +220,11 @@ def _restore_snapshot(engine, path: Path) -> dict[str, Any]:
 
 def install(engine, *, disabled: bool = False) -> dict[str, Any]:
     _require_unique_tasks(engine)
+    # The scoped release plan owns intentional definition changes. Preserve
+    # existing operator settings while allowing this maintenance disable.
+    update_fields = {"task_type", "script_path"}
+    if disabled:
+        update_fields.add("enabled")
     results: dict[str, Any] = {}
     for frozen in TASKS:
         task = {**frozen, "enabled": 0 if disabled else frozen["enabled"]}
@@ -231,6 +236,7 @@ def install(engine, *, disabled: bool = False) -> dict[str, Any]:
                 "task_type": task["task_type"],
                 "script_path": task["script_path"],
             },
+            update_exclude=set(task) - update_fields,
         )
     return {
         "schema": "probiga.qmt-operations-task-install.v1",
