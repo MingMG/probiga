@@ -742,6 +742,7 @@ def aggregate_sectors(
                         "stock_code": str(row.get("stock_code")),
                         "short_name": str(row.get("short_name") or row.get("stock_code")),
                         "change_pct": _finite(row.get("change_pct")),
+                        "price": row.get("price"),
                         "amount": _finite(row.get("amount")),
                     }
                     for row in leaders

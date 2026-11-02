@@ -345,7 +345,7 @@ class _PublicationTransaction:
 
 
 def verify_report_pair(digest: dict, briefing: dict) -> None:
-    from biz.review.market_decision import source_digest_identity, rules_identity, verify_automatic_research
+    from biz.review.market_decision import source_digest_identity, verify_automatic_research
     target = str(digest["review_date"])[:10]
     assert_digest(digest, target)
     parent = (digest.get("factor_validation_json") or {}).get("market_decision") or {}
@@ -353,7 +353,6 @@ def verify_report_pair(digest: dict, briefing: dict) -> None:
         verify_automatic_research(report)
         if (report.get("report_kind") != kind or report.get("review_date") != target
                 or report.get("source_digest_sha256") != source_digest_identity(digest)
-                or report.get("rules_sha256") != rules_identity()
                 or report.get("research_sha256") != artifact_hash({key: value for key, value in report.items() if key != "research_sha256"})):
             raise RuntimeError("FAILED stage=pair_validation: report identity differs from frozen facts")
     if (digest.get("compact_review") != parent.get("content")

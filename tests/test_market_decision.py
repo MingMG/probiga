@@ -52,7 +52,7 @@ class Providers:
         with self.lock:
             assert stage not in self.calls, "duplicate provider attempt"
             self.calls[stage] = {"messages": deepcopy(messages), "schema": deepcopy(schema)}
-        assert 0 < timeout_seconds <= 150
+        assert 0 < timeout_seconds <= (300 if packet['task']['kind'] == 'intraday' else 150)
         if stage == self.failed_stage:
             raise decision.ResearchError("RESEARCH_BLOCKED stage=" + stage + " reason=unit_provider_failure")
         if stage.endswith("_draft"):
@@ -125,6 +125,34 @@ def completed_research(monkeypatch, **options):
     data,context=material()
     result=decision.generate_research(data,report_kind="review",next_trade_date="2026-11-02",context=context,now=NOW,engine=object())
     return result,providers
+
+
+def test_intraday_call_can_finish_after_ninety_seconds_within_total_deadline(monkeypatch):
+    from pathlib import Path
+    from types import SimpleNamespace
+    from biz.intraday_alert.research import freeze_inputs
+    raw = json.loads((Path(__file__).parent / 'fixtures/intraday_consumption_20261102.json').read_text(encoding='utf-8'))
+    raw['quality'] = {'status': raw['quality_status']}
+    frozen = freeze_inputs(raw, [], [], mode='replay')
+    clock = SimpleNamespace(value=1000.)
+    monkeypatch.setattr(decision, 'time', SimpleNamespace(monotonic=lambda: clock.value))
+    budgets = {}
+    def provider(*args, stage, timeout_seconds, **kwargs):
+        budgets[stage] = timeout_seconds
+        if stage.endswith('_draft'):
+            if stage == 'codex_draft':
+                if timeout_seconds <= 91:
+                    raise decision.ResearchError('premature_per_call_timeout')
+                clock.value += 91
+            return decision.ProviderReply('{}', {})
+        raise decision.ResearchError('peer_boundary_reached_after_slow_draft')
+    monkeypatch.setattr(decision, '_call_deepseek', provider)
+    monkeypatch.setattr(decision, '_call_codex', provider)
+    with pytest.raises(decision.ResearchError, match='peer_boundary_reached_after_slow_draft'):
+        decision.generate_research(frozen['digest'], report_kind='intraday', next_trade_date='2026-11-02',
+            context=frozen['context'], now=decision._now(), engine=object())
+    assert 290 < budgets['codex_draft'] <= 300
+    assert 200 < budgets['deepseek_review'] <= 209
 
 
 def test_fixed_seven_stages_preserve_reject_and_arbitrate(monkeypatch):
@@ -201,3 +229,42 @@ def test_top_level_scope_cannot_relabel_genuine_old_model_output_even_after_rere
     assert result["content"] == original_content
     with pytest.raises(decision.ResearchError, match="report_scope_changed_" + field):
         decision.verify_automatic_research(result)
+
+
+def test_real_prior_briefing_remains_auditable_when_research_rules_advance():
+    from pathlib import Path
+    prior = json.loads((Path(__file__).parent / "fixtures" / "automatic_briefing_20261102_0831.json").read_text(encoding="utf-8"))
+    assert prior["rules_sha256"] != decision.rules_identity()
+    original = deepcopy(prior)
+    decision.verify_automatic_research(prior)
+    assert prior == original
+    prior["content"] += "事后改成预测成功"
+    with pytest.raises(decision.ResearchError, match="rendered_content_edited"):
+        decision.verify_automatic_research(prior)
+
+
+def test_archived_rule_bundle_must_match_its_content_identity(tmp_path, monkeypatch):
+    from pathlib import Path
+    import shutil
+    prior = json.loads((Path(__file__).parent / "fixtures" / "automatic_briefing_20261102_0831.json").read_text(encoding="utf-8"))
+    root = tmp_path / "rules"
+    shutil.copytree(decision.RULES_DIR, root)
+    p = root / "archive" / (prior["rules_sha256"] + ".json")
+    changed = json.loads(p.read_text(encoding="utf-8"))
+    changed["deepseek_intraday_policy"]["max_tokens"] = 42
+    p.write_text(json.dumps(changed), encoding="utf-8")
+    monkeypatch.setattr(decision, "RULES_DIR", root)
+    with pytest.raises(decision.ResearchError, match="rules_archive_identity_mismatch"):
+        decision.verify_automatic_research(prior)
+
+
+def test_real_duplicate_deepseek_review_is_rejected_without_selecting_a_version():
+    from pathlib import Path
+    raw = (Path(__file__).parent / 'fixtures/deepseek_duplicate_review_20261102.txt').read_text(encoding='utf-8')
+    # Production returned two different reviews despite requesting JSON mode.
+    # Neither the first nor last object may be silently selected for publication.
+    first, end = json.JSONDecoder().raw_decode(raw)
+    assert first['schema_version'] == 'probiga.research-review.v3'
+    assert json.loads(raw[end:])['schema_version'] == first['schema_version']
+    with pytest.raises(decision.ResearchError, match='peer_review.*Extra data'):
+        decision._parse_review(raw, '0' * 64, {'facts': {}}, final=True, require_pass=False)

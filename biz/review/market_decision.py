@@ -32,8 +32,8 @@ STAGES = ("deepseek_draft", "codex_draft", "deepseek_review", "codex_review", "c
 LOCAL_REVIEW_VERSION = "probiga.research-local-contract-review.v1"
 DEEPSEEK_RESEARCH_POLICY = {"model": "deepseek-v4-pro", "thinking": {"type": "disabled"},
                             "reasoning_effort": "none", "max_tokens": 16000}
-DEEPSEEK_INTRADAY_POLICY = {"model": "deepseek-flash", "thinking": {"type": "enabled"},
-                            "reasoning_effort": "low", "max_tokens": 16000}
+DEEPSEEK_INTRADAY_POLICY = {"model": "deepseek-flash", "thinking": {"type": "disabled"},
+                            "reasoning_effort": "none", "max_tokens": 8000}
 
 
 def _deepseek_policy(report_kind):
@@ -84,13 +84,27 @@ def source_digest_identity(digest):
         "factor_validation_json":factor})
 
 
-def _load_rules():
+def _rules_bundle(identity=None):
     documents={name:(RULES_DIR/name).read_text(encoding="utf-8")
                for name in ("decision-model.md","report-templates.md","output-contract.md")}
-    rules="决策模型规定分析思路。只使用本次事实卡；缺失项目不得补造。输出字段、证据和行动边界以最后的v3研究合同为准。\n\n"+"\n\n".join(documents.values())
-    return rules, _hash({"documents":documents, "draft_schema":draft_json_schema(), "workflow":WORKFLOW_VERSION,
-                         "deepseek_research_policy":DEEPSEEK_RESEARCH_POLICY,
-                         "deepseek_intraday_policy":DEEPSEEK_INTRADAY_POLICY})
+    current={"documents":documents,"draft_schema":draft_json_schema(),"workflow":WORKFLOW_VERSION,
+             "deepseek_research_policy":DEEPSEEK_RESEARCH_POLICY,"deepseek_intraday_policy":DEEPSEEK_INTRADAY_POLICY}
+    if identity is None or identity==_hash(current): return current
+    if not isinstance(identity,str) or not re.fullmatch(r"[0-9a-f]{64}",identity):
+        _fail("automatic_provenance","rules_changed")
+    path=RULES_DIR/"archive"/(identity+".json")
+    if not path.is_file(): _fail("automatic_provenance","rules_changed")
+    saved=json.loads(path.read_text(encoding="utf-8"))
+    if _hash(saved)!=identity or saved.get("workflow")!=WORKFLOW_VERSION or saved.get("draft_schema")!=draft_json_schema():
+        _fail("automatic_provenance","rules_archive_identity_mismatch")
+    return saved
+
+
+def _load_rules(identity=None):
+    bundle=_rules_bundle(identity)
+    documents=bundle["documents"]
+    rules="决策模型规定分析思路。只使用本次事实卡；缺失项目不得补造。输出字段、证据和行动边界以最后的v3研究合同为准。\n\n"+"\n\n".join(documents[name] for name in ("decision-model.md","report-templates.md","output-contract.md"))
+    return rules,_hash(bundle)
 
 
 def rules_identity(): return _load_rules()[1]
@@ -370,7 +384,7 @@ def generate_research(digest,*,report_kind,next_trade_date,context=None,previous
             if saved.get("messages_sha256")!=message_hash or _body_hash(saved["raw_response"])!=saved["raw_sha256"]: _fail("resume","stage_identity_mismatch_"+stage)
             emit(stage,"COMPLETE",reused=True);return saved["raw_response"]
         if saved and saved.get("status") in {"RUNNING","FAILED"}: _fail("resume","prior_attempt_not_reusable_"+stage)
-        budget=min(90 if report_kind=="intraday" else 150,deadline-time.monotonic())
+        budget=min(INTRADAY_DEADLINE_SECONDS if report_kind=="intraday" else 150,deadline-time.monotonic())
         if budget<5: _fail(stage,"total_deadline_exceeded")
         recovery=state.get("recovery") or {}
         request_id=(recovery.get("request_ids") or {}).get(stage) or str(uuid5(namespace,stage))
@@ -457,6 +471,7 @@ def render_research(research):
 def verify_automatic_research(research):
     """Rebuild from untouched provider raw responses, not a body hash alone."""
     if research.get("schema_version")!=SCHEMA_VERSION or research.get("status")!="COMPLETE" or research.get("editorial_review"): _fail("automatic_provenance","nonautomatic_artifact")
+    bundle=_rules_bundle(research.get("rules_sha256"))
     stages=research.get("generation_attempts") or []
     if [x.get("stage") for x in stages]!=list(STAGES) or any(x.get("status")!="COMPLETE" for x in stages):
         _fail("automatic_provenance","incomplete_provider_stages")
@@ -466,7 +481,7 @@ def verify_automatic_research(research):
         transport="live_http" if stage.startswith("deepseek") else "live_codex_bridge"
         if not isinstance(raw,str) or _body_hash(raw)!=item.get("raw_sha256") or receipt.get("raw_sha256")!=item.get("raw_sha256") or receipt.get("messages_sha256")!=item.get("messages_sha256") or receipt.get("transport")!=transport: _fail("automatic_provenance","provider_receipt_mismatch_"+stage)
         if stage.startswith("deepseek"):
-            expected_policy=_deepseek_policy(research["input_packet"]["task"]["kind"])
+            expected_policy=bundle["deepseek_intraday_policy" if research["input_packet"]["task"]["kind"]=="intraday" else "deepseek_research_policy"]
             if (receipt.get("source")!="deepseek_api" or receipt.get("endpoint")!="https://api.deepseek.com/v1/chat/completions"
                     or not receipt.get("provider_response_id") or receipt.get("model")!=expected_policy["model"]
                     or receipt.get("request_policy")!=expected_policy):
@@ -486,8 +501,7 @@ def verify_automatic_research(research):
     if _hash(packet)!=proof.get("input_sha256"): _fail("automatic_provenance","input_packet_changed")
     reviews={"deepseek_review":_parse_review(by_stage["deepseek_review"]["raw_response"],_body_hash(by_stage["codex_draft"]["raw_response"]),packet),
         "codex_review":_parse_review(by_stage["codex_review"]["raw_response"],_body_hash(by_stage["deepseek_draft"]["raw_response"]),packet)}
-    rules,rule_hash=_load_rules()
-    if research.get("rules_sha256")!=rule_hash: _fail("automatic_provenance","rules_changed")
+    rules,rule_hash=_load_rules(research.get("rules_sha256"))
     final,reviews,audit,local,requests=_arbitration_material(stages,packet,rules)
     if final!=research.get("model_output") or final["draft"]!=research.get("draft"): _fail("automatic_provenance","model_semantics_edited")
     if (proof.get("peer_reviews")!=reviews or proof.get("synthesis_review")!=audit or proof.get("local_contract_review")!=local

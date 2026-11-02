@@ -381,3 +381,11 @@ def test_delivery_uses_five_minute_source_freshness_before_webhook(monkeypatch, 
         webhook_getter=lambda *a, **k: "unused mock webhook")
     assert delivered == expected and len(sent) == expected
     assert any("SET status='EXPIRED'" in sql for sql, _ in engine.connection.statements) is (expected == 0)
+
+
+def test_sector_leaders_keep_the_verified_current_price_for_research_conditions():
+    from biz.intraday_alert.core import aggregate_sectors
+    rows = [{"stock_code": str(600000+i), "short_name": "sample", "change_pct": i, "price": 10+i, "amount": 100} for i in range(5)]
+    members = {row["stock_code"]: {"industry_code": "sector", "industry_name": "sample"} for row in rows}
+    result = aggregate_sectors(rows, members, {"available": True})
+    assert [row["price"] for row in result["items"][0]["leaders"]] == [14, 13, 12]

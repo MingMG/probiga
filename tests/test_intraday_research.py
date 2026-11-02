@@ -518,3 +518,16 @@ def test_silent_provider_wait_renews_owner_without_fabricating_progress(db, veri
     result = research.process_research_batch(db[0], outbox_id=identity, generator=generate, now_fn=lambda: clock[0])
     assert result["status"] == "SHADOW"
     assert load(db, identity)[1]["analysis"]["completed_units"] == 7
+
+
+def test_real_consumption_leaders_survive_sorted_bucket_projection():
+    from pathlib import Path
+    raw = json.loads((Path(__file__).parent / "fixtures" / "intraday_consumption_20261102.json").read_text(encoding="utf-8"))
+    projected = research.project_observation(raw)
+    codes = {row["stock_code"] for row in projected["key_stocks"]}
+    assert len(codes) <= 12
+    assert {"600779", "000995", "002187", "000417"} <= codes
+    laggards = {row["stock_code"] for row in raw["key_stocks"]["laggards"]}
+    assert len(codes & laggards) == 2
+    assert projected == research.project_observation(json.loads(json.dumps(raw, sort_keys=True)))
+    assert next(row for row in projected["key_stocks"] if row["stock_code"] == "600779")["ohlc"]["close"] is None
