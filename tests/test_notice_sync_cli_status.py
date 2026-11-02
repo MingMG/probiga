@@ -88,6 +88,7 @@ def _write_complete_history_ledger(
 def _install_cli_fakes(monkeypatch, *, codes: list[str], outcomes: dict[str, object]):
     engine = object()
     observed: dict[str, object] = {}
+    monkeypatch.setattr(sync_notice_em, "_shanghai_now", lambda: datetime(2026, 8, 26, 20, 16))
     monkeypatch.setattr(sync_notice_em, "create_batch_engine", lambda: engine)
     monkeypatch.setattr(sync_notice_em, "run_ddl", lambda value: observed.setdefault("ddl", value))
 
@@ -121,14 +122,12 @@ def _install_cli_fakes(monkeypatch, *, codes: list[str], outcomes: dict[str, obj
         )
 
     monkeypatch.setattr(sync_notice_em, "fetch_pages", fetch)
-    monkeypatch.setattr(
-        sync_notice_em,
-        "_parse_item",
-        lambda stock_code, item, _captured_at, **_kwargs: {
-            "stock_code": stock_code,
-            "art_code": item["art_code"],
-        },
-    )
+    original_parse = sync_notice_em._parse_item
+    monkeypatch.setattr(sync_notice_em, "_parse_item",
+        lambda stock_code, item, captured_at, **kwargs: original_parse(stock_code,
+            {"title": "Source notice", "notice_date": "2026-08-26",
+             "display_time": "2026-08-26 20:00:00", "codes": [{"stock_code": stock_code}],
+             **item}, captured_at, **kwargs))
     monkeypatch.setattr(
         sync_notice_em,
         "reconcile_rows",
@@ -208,7 +207,9 @@ def test_full_market_limit_zero_is_preserved_and_complete_run_succeeds(
             "stock_code": "000001",
             "row_count": 1,
             "row_hash": sync_notice_em._notice_row_hash(
-                [{"stock_code": "000001", "art_code": "a"}]
+                    [sync_notice_em._parse_item("000001", {"art_code": "a"},
+                        datetime(2026, 8, 26, 20, 15),
+                        validated_stock_identity=True, batch_id=receipt["batch_id"])]
             ),
         },
         {

@@ -755,6 +755,7 @@ def reconcile_rows(
 
     canonical_rows: list[dict[str, Any]] = []
     seen_art_codes: set[str] = set()
+    published_at = _shanghai_now().replace(microsecond=0)
     expected_qmt_code = to_qmt_symbol(code)
     if expected_qmt_code is None:
         raise ValueError("notice reconciliation lacks a canonical QMT identity")
@@ -801,7 +802,9 @@ def reconcile_rows(
         row["stock_code"] = code
         row["art_code"] = art_code
         row["notice_date"] = row_date
-        row["etl_sync_at"] = captured_at
+        if datetime.fromisoformat(_canonical_timestamp(row["received_at"])) > published_at:
+            raise ValueError("notice source capture is later than publication")
+        row["etl_sync_at"] = published_at
         canonical_rows.append(row)
 
     with engine.begin() as connection:
@@ -1607,7 +1610,8 @@ def _notice_sync_result(
             else None
         ),
         "request_scope_evidence": "eastmoney_stock_date_window_v1",
-        "source_manifest_sha256": _sha256(source_manifest or []),
+        "source_manifest_sha256": _sha256(sorted(source_manifest or [],
+            key=lambda item: str(item.get("stock_code") or ""))),
         "persisted_manifest_sha256": _sha256(
             sorted(
                 persisted_manifest or [],
@@ -1623,6 +1627,76 @@ def _notice_sync_result(
     }
     receipt["result_sha256"] = _sha256(receipt)
     return receipt
+
+
+def _notice_incremental_shards(
+    *, window_start: date, window_end: date, target_trade_date: date,
+    create: bool = True,
+):
+    from server.common.acquisition_shards import AcquisitionShards
+
+    return AcquisitionShards("eastmoney-notice-incremental", {
+        "window_start": window_start.isoformat(),
+        "window_end": window_end.isoformat(),
+        "target": target_trade_date.isoformat(),
+        "data_version": NOTICE_DATA_VERSION,
+    }, create=create)
+
+
+def _notice_source_snapshot(
+    stock_code: str, payload: dict[str, Any], *, window_start: date,
+    window_end: date, batch_id: str, finished_at: datetime,
+) -> tuple[NoticeFetchResult, list[dict[str, Any]], dict[str, Any]]:
+    """Replay one immutable, exact-scope source checkpoint without refetching."""
+    if not isinstance(payload, dict):
+        raise ValueError("notice source checkpoint is missing")
+    raw = payload.get("rows")
+    total = payload.get("total_hits")
+    pages = payload.get("page_count")
+    if (
+        not isinstance(raw, list)
+        or any(not isinstance(item, dict) for item in raw)
+        or type(total) is not int or total < 0 or len(raw) != total
+        or type(pages) is not int or not 1 <= pages <= max(1, total)
+    ):
+        raise ValueError("notice source checkpoint pagination is incomplete")
+    try:
+        captured = datetime.fromisoformat(payload["captured_at"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("notice source checkpoint capture time is invalid") from exc
+    if (
+        captured.tzinfo is not None
+        or captured.date() < window_end - timedelta(days=1)
+        or captured > finished_at
+    ):
+        raise ValueError("notice source checkpoint capture is outside its target lifetime")
+    rows = [
+        _parse_item(stock_code, item, captured,
+                    validated_stock_identity=True, batch_id=batch_id)
+        for item in raw
+    ]
+    dates = [_coerce_date(row.get("notice_date")) for row in rows]
+    arts = [str(row.get("art_code") or "").strip() for row in rows]
+    if (
+        any(value is None or not window_start <= value <= window_end for value in dates)
+        or any(not value for value in arts) or len(set(arts)) != len(arts)
+        or any(not str(row.get("title") or "").strip() for row in rows)
+        or any(left < right for left, right in zip(dates, dates[1:]))
+    ):
+        raise ValueError("notice source checkpoint contains invalid window identities")
+    fetch = NoticeFetchResult(
+        rows=raw, captured_at=captured, window_start=window_start,
+        window_end=window_end, exhausted=True, bounded=True,
+        page_count=pages, total_hits=total,
+    )
+    return fetch, rows, {
+        "stock_code": stock_code,
+        "total_hits": total,
+        "page_count": pages,
+        "captured_at": captured.isoformat(sep=" ", timespec="microseconds"),
+        "raw_sha256": _sha256(raw),
+        "row_hash": _notice_row_hash(rows),
+    }
 
 
 def _run_incremental(
@@ -1647,13 +1721,8 @@ def _run_incremental(
     failure_sample: list[dict[str, str]] = []
     source_manifest: list[dict[str, Any]] = []
     persisted_manifest: list[dict[str, Any]] = []
-    from server.common.acquisition_shards import AcquisitionShards
-    shards = AcquisitionShards("eastmoney-notice-incremental", {
-        "window_start": window_start.isoformat(),
-        "window_end": window_end.isoformat(),
-        "target": target_trade_date.isoformat(),
-        "data_version": NOTICE_DATA_VERSION,
-    })
+    shards = _notice_incremental_shards(window_start=window_start,
+        window_end=window_end, target_trade_date=target_trade_date)
     batch_id = _sha256(
         {
             "mode": "incremental",
@@ -1672,47 +1741,35 @@ def _run_incremental(
         for index, code in enumerate(codes):
             try:
                 saved = shards.load(code)
+                reused = saved is not None
                 if saved is not None:
-                    fetch = NoticeFetchResult(
-                        rows=saved["rows"],
-                        captured_at=datetime.fromisoformat(saved["captured_at"]),
-                        window_start=window_start, window_end=window_end,
-                        exhausted=True, bounded=True,
-                        page_count=saved["page_count"],
-                        total_hits=saved["total_hits"],
-                    )
                     logger.info("%s resume: verified source already captured", code)
                 else:
                     fetch = fetch_pages(
                         client, code, page_size=page_size, max_pages=max_pages,
                         begin_date=window_start, end_date=window_end,
                     )
-                if (
-                    not fetch.bounded
-                    or fetch.window_start != window_start
-                    or fetch.window_end != window_end
-                    or not fetch.exhausted
-                    or len(fetch.rows) != fetch.total_hits
-                ):
-                    raise RuntimeError(
-                        f"{code} notice response lacks exact bounded pagination proof"
-                    )
-                rows = [
-                    _parse_item(
-                        code,
-                        item,
-                        fetch.captured_at,
-                        validated_stock_identity=True,
-                        batch_id=batch_id,
-                    )
-                    for item in fetch.rows
-                ]
-                if saved is None:
-                    shards.save(code, {
+                    if (
+                        not fetch.bounded
+                        or fetch.window_start != window_start
+                        or fetch.window_end != window_end
+                        or not fetch.exhausted
+                        or len(fetch.rows) != fetch.total_hits
+                    ):
+                        raise RuntimeError(
+                            f"{code} notice response lacks exact bounded pagination proof"
+                        )
+                    saved = {
                         "rows": fetch.rows,
                         "captured_at": fetch.captured_at.isoformat(),
                         "page_count": fetch.page_count, "total_hits": fetch.total_hits,
-                    })
+                    }
+                fetch, rows, source_entry = _notice_source_snapshot(
+                    code, saved, window_start=window_start, window_end=window_end,
+                    batch_id=batch_id, finished_at=_shanghai_now(),
+                )
+                if not reused:
+                    shards.save(code, saved)
                 source_hash = _notice_row_hash(rows)
                 persisted = reconcile_rows(
                     engine,
@@ -1735,14 +1792,7 @@ def _run_incremental(
                 succeeded_codes.append(code)
                 if rows:
                     nonempty_codes.append(code)
-                source_manifest.append(
-                    {
-                        "stock_code": code,
-                        "total_hits": fetch.total_hits,
-                        "page_count": fetch.page_count,
-                        "row_hash": source_hash,
-                    }
-                )
+                source_manifest.append(source_entry)
                 persisted_manifest.append(
                     {
                         "stock_code": code,

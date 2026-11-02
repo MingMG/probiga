@@ -8,6 +8,7 @@ import math
 import os
 import re
 import shlex
+import zlib
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -5991,42 +5992,130 @@ def _validate_news_sync_receipt(
     )
 
 
-def _read_notice_validation_window(engine, *, codes, window_start, window_end):
-    """Read the frozen universe through the existing stock/date access path.
+_NOTICE_READBACK_FIELDS = (
+    "stock_code", "art_code", "notice_date", "title", "column_name", "display_time",
+    "detail_url", "association_validated", "etl_sync_at", "qmt_code", "data_source",
+    "source_time", "received_at", "batch_id", "data_version", "quality_status", "permission_status",
+)
+_NOTICE_READBACK_MAX_JSON_BYTES = 4 * 1024 * 1024
+_NOTICE_READBACK_MAX_PACKAGE_BYTES = _NOTICE_READBACK_MAX_JSON_BYTES + 65536
 
-    The production join selected (stock_code,art_code) and filtered the date
-    after reading years of history, timing out after an otherwise complete
-    collector run. Batches keep both the index range and response bounded.
+
+def _decode_notice_readback_group(group, *, expected_codes):
+    """Decode the bounded MySQL COMPRESS frame, never a partial row package."""
+    code, count, packed = group.get("stock_code"), group.get("row_count"), group.get("packed_rows")
+    if (not isinstance(code, str) or code not in expected_codes
+            or re.fullmatch(r"[0-9]{6}", code) is None
+            or type(count) is not int or not 0 < count <= 10000
+            or not isinstance(packed, (bytes, bytearray, memoryview))):
+        raise RuntimeError("notice_readback: compressed group identity/type differs")
+    packed = bytes(packed)
+    if not 4 < len(packed) <= _NOTICE_READBACK_MAX_PACKAGE_BYTES:
+        raise RuntimeError("notice_readback: compressed package size exceeds budget or is truncated")
+    # MySQL 8.4 stores the uncompressed length little-endian, then a zlib
+    # stream. It appends exactly '.' only when that stream ends in byte 0x20.
+    declared = int.from_bytes(packed[:4], "little")
+    if not 0 < declared <= _NOTICE_READBACK_MAX_JSON_BYTES:
+        raise RuntimeError("notice_readback: declared decompressed size exceeds budget")
+    try:
+        decoder = zlib.decompressobj()
+        raw = decoder.decompress(packed[4:], _NOTICE_READBACK_MAX_JSON_BYTES + 1)
+    except zlib.error as exc:
+        raise RuntimeError("notice_readback: invalid MySQL zlib package") from exc
+    if (len(raw) > _NOTICE_READBACK_MAX_JSON_BYTES or decoder.unconsumed_tail
+            or not decoder.eof or len(raw) != declared):
+        raise RuntimeError("notice_readback: compressed length, inflation limit or stream boundary differs")
+    tail = decoder.unused_data
+    if (tail not in (b"", b".") or (tail == b"." and packed[-2] != 0x20)
+            or (not tail and packed[-1] == 0x20)):
+        raise RuntimeError("notice_readback: invalid MySQL compressed trailing bytes")
+
+    def object_pairs(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = value
+        return result
+
+    def invalid_constant(_value):
+        raise ValueError("non-finite JSON constant")
+
+    try:
+        rows = json.loads(raw.decode("utf-8"), object_pairs_hook=object_pairs,
+                          parse_constant=invalid_constant)
+    except (ValueError, UnicodeError, RecursionError) as exc:
+        raise RuntimeError("notice_readback: malformed compressed JSON") from exc
+    if not isinstance(rows, list) or len(rows) != count:
+        raise RuntimeError("notice_readback: compressed JSON row count differs")
+    seen = set()
+    for row in rows:
+        if (not isinstance(row, dict) or set(row) != set(_NOTICE_READBACK_FIELDS)
+                or row.get("stock_code") != code
+                or not isinstance(row.get("art_code"), str) or not row["art_code"].strip()
+                or row["art_code"] in seen
+                or any(row[field] is not None and not isinstance(row[field], str)
+                       for field in _NOTICE_READBACK_FIELDS if field != "association_validated")
+                or (row["association_validated"] is not None
+                    and type(row["association_validated"]) is not int)):
+            raise RuntimeError("notice_readback: compressed JSON row fields/security identity differ")
+        seen.add(row["art_code"])
+    # DATE/DATETIME JSON strings intentionally retain their full SQL values.
+    # The existing validator normalizes date/time for provenance and hashing;
+    # display_time is VARCHAR and must remain byte-for-byte unchanged here.
+    return rows
+
+
+def _read_notice_validation_window(engine, *, codes, window_start, window_end):
+    """Read exact full rows in batches, grouping MySQL wire packages per stock.
+
+    Production measurements distinguish the fast indexed query from the slow
+    uncompressed full result. Per-stock JSON compression retains every field
+    while avoiding the expensive single whole-window JSON aggregate.
     """
-    deadline = monotonic() + 180.0
+    deadline = monotonic() + 900.0
     rows = []
     mysql = getattr(getattr(engine, "dialect", None), "name", None) == "mysql"
     index_hint = " FORCE INDEX (idx_notice_stock_date)" if mysql else ""
-    for offset in range(0, len(codes), 100):
+    for offset in range(0, len(codes), 50):
         if monotonic() >= deadline:
             raise RuntimeError("notice_readback: total deadline exceeded")
-        batch = codes[offset:offset + 100]
-        placeholders = ",".join(f":code_{index}" for index in range(len(batch)))
+        batch = codes[offset:offset + 50]
         params = {f"code_{index}": code for index, code in enumerate(batch)}
         params.update(request_window_start=window_start, request_window_end=window_end)
-        rows.extend(_read_all(engine, f"""
-            SELECT /*+ MAX_EXECUTION_TIME(15000) */
-                   notice.stock_code, notice.art_code, notice.notice_date,
-                   notice.title, notice.column_name, notice.display_time,
-                   notice.detail_url, notice.association_validated,
-                   notice.etl_sync_at, notice.qmt_code, notice.data_source,
-                   notice.source_time, notice.received_at, notice.batch_id,
-                   notice.data_version, notice.quality_status,
-                   notice.permission_status
+        placeholders = ",".join(f":code_{index}" for index in range(len(batch)))
+        columns = ",".join("notice." + field for field in _NOTICE_READBACK_FIELDS)
+        if mysql:
+            fields = ",".join(f"'{field}',notice.{field}" for field in _NOTICE_READBACK_FIELDS)
+            selection = ("notice.stock_code,COUNT(*) AS row_count,"
+                         f"COMPRESS(CAST(JSON_ARRAYAGG(JSON_OBJECT({fields})) "
+                         "AS CHAR CHARACTER SET utf8mb4)) AS packed_rows")
+            ordering = "GROUP BY notice.stock_code"
+        else:
+            selection, ordering = columns, "ORDER BY notice.stock_code, notice.art_code"
+        fetched = _read_all(engine, f"""
+            SELECT /*+ MAX_EXECUTION_TIME(15000) */ {selection}
               FROM si_notice_eastmoney AS notice{index_hint}
              WHERE notice.stock_code IN ({placeholders})
                AND notice.notice_date >= :request_window_start
                AND notice.notice_date <= :request_window_end
-             ORDER BY notice.stock_code, notice.art_code
-        """, params))
+             {ordering}
+        """, params)
+        if mysql:
+            seen_groups = set()
+            if len(fetched) > len(batch):
+                raise RuntimeError("notice_readback: compressed group count exceeds requested stocks")
+            for group in fetched:
+                code = group.get("stock_code")
+                if code in seen_groups:
+                    raise RuntimeError("notice_readback: duplicate compressed stock group")
+                seen_groups.add(code)
+                rows.extend(_decode_notice_readback_group(group, expected_codes=set(batch)))
+        else:
+            rows.extend(fetched)
         if monotonic() >= deadline:
             raise RuntimeError("notice_readback: total deadline exceeded")
-    return rows
+    return sorted(rows, key=lambda row: (row["stock_code"], row["art_code"]))
 
 
 def _validate_notice_eastmoney_receipt(
@@ -6090,6 +6179,46 @@ def _validate_notice_eastmoney_receipt(
     ):
         return False, "notice_eastmoney: requested universe differs from si_all_code"
 
+    # The source checkpoint outlives scheduler attempts. Its capture clock must
+    # stay immutable, including for authoritative-empty securities, while the
+    # actual database publication belongs to this receipt's execution window.
+    from biz.notice.sync_notice_em import (
+        _notice_incremental_shards, _notice_source_snapshot, _sha256,
+    )
+    captures: dict[str, datetime] = {}
+    source_manifest: list[dict[str, Any]] = []
+    source_persisted_manifest: list[dict[str, Any]] = []
+    replay_deadline = monotonic() + 60.0
+    try:
+        shards = _notice_incremental_shards(
+            window_start=request_window_start, window_end=request_window_end,
+            target_trade_date=request_window_end - timedelta(days=1),
+            create=False,
+        )
+        for code in expected_codes:
+            if monotonic() >= replay_deadline:
+                raise ValueError("source checkpoint replay deadline exceeded")
+            fetch, _rows, entry = _notice_source_snapshot(
+                code, shards.load(code), window_start=request_window_start,
+                window_end=request_window_end, batch_id=batch_id,
+                finished_at=receipt_finished,
+            )
+            captures[code] = fetch.captured_at.replace(microsecond=0)
+            source_manifest.append(entry)
+            source_persisted_manifest.append({
+                "stock_code": code, "row_count": fetch.total_hits,
+                "row_hash": entry["row_hash"],
+            })
+        if (
+            _sha256(source_manifest) != payload.get("source_manifest_sha256")
+            or _sha256(source_persisted_manifest) != payload.get("persisted_manifest_sha256")
+            or sum(entry["total_hits"] for entry in source_manifest)
+            != int(payload["written_notice_count"])
+        ):
+            raise ValueError("source checkpoint root differs from receipt")
+    except (KeyError, TypeError, ValueError, OverflowError, OSError) as exc:
+        return False, f"notice_eastmoney: source checkpoint proof invalid: {exc}"
+
     fresh_rows = _read_notice_validation_window(
         engine, codes=expected_codes,
         window_start=request_window_start, window_end=request_window_end,
@@ -6131,10 +6260,10 @@ def _validate_notice_eastmoney_receipt(
             and received_at is not None
             and etl_sync_at is not None
             and source_time <= received_at
-            and receipt_started <= received_at <= receipt_finished
-            and receipt_started <= etl_sync_at <= receipt_finished
-            and received_at.replace(microsecond=0)
-            == etl_sync_at.replace(microsecond=0)
+            and received_at == captures.get(code)
+            and receipt_started.replace(microsecond=0) <= etl_sync_at
+            <= receipt_finished.replace(microsecond=0)
+            and received_at <= etl_sync_at
             and str(row.get("batch_id") or "").strip() == batch_id
             and str(row.get("data_version") or "").strip()
             == _NOTICE_DATA_VERSION

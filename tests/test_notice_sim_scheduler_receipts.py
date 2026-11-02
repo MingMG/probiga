@@ -17,7 +17,32 @@ def _engine():
     return create_engine("sqlite+pysqlite:///:memory:")
 
 
-def test_notice_scheduler_requires_exact_full_universe_receipt_and_readback():
+def _retain_incremental_sources(monkeypatch, tmp_path, *, rows_by_code, captured,
+                                window_start, window_end, target, batch_id):
+    """Use the same durable source proof that the real incremental job retains."""
+    monkeypatch.setenv("PROBIGA_JOB_LOG_ROOT", str(tmp_path))
+    shards = sync_notice_em._notice_incremental_shards(window_start=window_start,
+        window_end=window_end, target_trade_date=target)
+    manifest = []
+    for code, rows in rows_by_code.items():
+        raw_rows = [{"art_code": row["art_code"], "title": row["title"],
+                     "notice_date": str(row["notice_date"]),
+                     "display_time": row["display_time"],
+                     "columns": [{"column_name": row["column_name"]}],
+                     "codes": [{"stock_code": code}]} for row in rows]
+        saved = {"rows": raw_rows, "captured_at": captured.isoformat(),
+                 "page_count": 1, "total_hits": len(raw_rows)}
+        shards.save(code, saved)
+        _fetch, parsed, entry = sync_notice_em._notice_source_snapshot(code, saved,
+            window_start=window_start, window_end=window_end, batch_id=batch_id,
+            finished_at=captured)
+        for row, actual in zip(rows, parsed, strict=True):
+            row.update(actual)
+        manifest.append(entry)
+    return manifest
+
+
+def test_notice_scheduler_requires_exact_full_universe_receipt_and_readback(monkeypatch, tmp_path):
     engine = _engine()
     captured = datetime(2026, 8, 26, 20, 15, 30)
     persisted_row = {
@@ -38,6 +63,10 @@ def test_notice_scheduler_requires_exact_full_universe_receipt_and_readback():
         "quality_status": sync_notice_em.NOTICE_QUALITY_STATUS,
         "permission_status": "PUBLIC",
     }
+    source_manifest = _retain_incremental_sources(monkeypatch, tmp_path,
+        rows_by_code={"000001": [persisted_row], "000002": []}, captured=captured,
+        window_start=datetime(2026, 7, 12).date(), window_end=datetime(2026, 8, 27).date(),
+        target=datetime(2026, 8, 26).date(), batch_id="c" * 64)
     with engine.begin() as connection:
         connection.execute(text("CREATE TABLE si_all_code (stock_code TEXT)"))
         connection.execute(
@@ -93,6 +122,7 @@ def test_notice_scheduler_requires_exact_full_universe_receipt_and_readback():
         request_window_start=datetime(2026, 7, 12).date(),
         request_window_end=datetime(2026, 8, 27).date(),
         batch_id="c" * 64,
+        source_manifest=source_manifest,
         persisted_manifest=[
             {
                 "stock_code": "000001",
@@ -131,7 +161,7 @@ def test_notice_scheduler_requires_exact_full_universe_receipt_and_readback():
     assert "codes=2" in result.message
 
 
-def test_notice_historical_recovery_uses_bound_target_not_execution_day():
+def test_notice_historical_recovery_uses_bound_target_not_execution_day(monkeypatch, tmp_path):
     """Reproduce the 2026-09-01 recovery that finished after midnight."""
 
     engine = _engine()
@@ -156,6 +186,10 @@ def test_notice_historical_recovery_uses_bound_target_not_execution_day():
         "quality_status": sync_notice_em.NOTICE_QUALITY_STATUS,
         "permission_status": "PUBLIC",
     }
+    source_manifest = _retain_incremental_sources(monkeypatch, tmp_path,
+        rows_by_code={"000001": [persisted_row]}, captured=captured,
+        window_start=datetime(2026, 7, 18).date(), window_end=datetime(2026, 9, 2).date(),
+        target=datetime(2026, 9, 1).date(), batch_id="e" * 64)
     with engine.begin() as connection:
         connection.execute(text("CREATE TABLE si_all_code (stock_code TEXT)"))
         connection.execute(text("INSERT INTO si_all_code VALUES ('000001')"))
@@ -199,6 +233,7 @@ def test_notice_historical_recovery_uses_bound_target_not_execution_day():
         request_window_end=datetime(2026, 9, 2).date(),
         target_trade_date=datetime(2026, 9, 1).date(),
         batch_id="e" * 64,
+        source_manifest=source_manifest,
         persisted_manifest=[{
             "stock_code": "000001",
             "row_count": 1,
@@ -256,7 +291,7 @@ def test_notice_historical_recovery_uses_bound_target_not_execution_day():
     ),
 )
 def test_notice_scheduler_rejects_unvalidated_provenance_or_content(
-    monkeypatch, field, value, message
+    monkeypatch, tmp_path, field, value, message
 ):
     captured = datetime(2026, 8, 26, 20, 15, 30)
     persisted_row = {
@@ -278,6 +313,10 @@ def test_notice_scheduler_rejects_unvalidated_provenance_or_content(
         "quality_status": sync_notice_em.NOTICE_QUALITY_STATUS,
         "permission_status": "PUBLIC",
     }
+    source_manifest = _retain_incremental_sources(monkeypatch, tmp_path,
+        rows_by_code={"000001": [persisted_row]}, captured=captured,
+        window_start=datetime(2026, 7, 12).date(), window_end=datetime(2026, 8, 27).date(),
+        target=datetime(2026, 8, 26).date(), batch_id="c" * 64)
     receipt = sync_notice_em._notice_sync_result(
         started_at=datetime(2026, 8, 26, 20, 15),
         finished_at=datetime(2026, 8, 26, 20, 16),
@@ -292,6 +331,7 @@ def test_notice_scheduler_rejects_unvalidated_provenance_or_content(
         request_window_start=datetime(2026, 7, 12).date(),
         request_window_end=datetime(2026, 8, 27).date(),
         batch_id="c" * 64,
+        source_manifest=source_manifest,
         persisted_manifest=[
             {
                 "stock_code": "000001",

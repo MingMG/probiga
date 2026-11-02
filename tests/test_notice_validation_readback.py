@@ -1,12 +1,18 @@
 """Regression for the completed 2026-11-02 collector's MySQL readback timeout."""
 from datetime import date, datetime, timedelta
 import json
+import zlib
 
 import pytest
 from sqlalchemy import create_engine, event, text
 
 from biz.notice import sync_notice_em as notice
 from server.common import scheduler_validation as validation
+
+
+@pytest.fixture(autouse=True)
+def _isolated_source_shards(monkeypatch, tmp_path):
+    monkeypatch.setenv("PROBIGA_JOB_LOG_ROOT", str(tmp_path))
 
 
 def _fixture():
@@ -21,6 +27,21 @@ def _fixture():
         "source_time": captured, "received_at": captured, "batch_id": "c" * 64,
         "data_version": notice.NOTICE_DATA_VERSION, "quality_status": notice.NOTICE_QUALITY_STATUS,
         "permission_status": notice.NOTICE_PERMISSION_STATUS} for code in codes]
+    shards = notice._notice_incremental_shards(window_start=date(2026, 9, 18),
+        window_end=date(2026, 11, 3), target_trade_date=date(2026, 11, 2))
+    source_manifest = []
+    for row in rows:
+        code = row["stock_code"]
+        saved = {"rows": [{"art_code": row["art_code"], "title": row["title"],
+            "notice_date": str(row["notice_date"]), "display_time": row["display_time"],
+            "columns": [{"column_name": row["column_name"]}], "codes": [{"stock_code": code}]}],
+            "captured_at": captured.isoformat(), "total_hits": 1, "page_count": 1}
+        shards.save(code, saved)
+        _fetch, parsed, entry = notice._notice_source_snapshot(code, saved,
+            window_start=date(2026, 9, 18), window_end=date(2026, 11, 3),
+            batch_id="c" * 64, finished_at=captured)
+        row.update({field: parsed[0][field] for field in row if field in parsed[0]})
+        source_manifest.append(entry)
     with engine.begin() as conn:
         conn.execute(text("CREATE TABLE si_all_code (stock_code TEXT PRIMARY KEY)"))
         conn.execute(text("INSERT INTO si_all_code VALUES (:code)"), [{"code": code} for code in codes])
@@ -45,6 +66,7 @@ def _fixture():
         written_rows=len(rows), minimum_coverage=1.0, minimum_row_coverage=0.0,
         request_window_start=date(2026, 9, 18), request_window_end=date(2026, 11, 3),
         target_trade_date=date(2026, 11, 2), batch_id="c" * 64,
+        source_manifest=source_manifest,
         persisted_manifest=[{"stock_code": row["stock_code"], "row_count": 1,
                              "row_hash": notice._notice_row_hash([row])} for row in rows])
     return engine, codes, receipt
@@ -62,10 +84,10 @@ def test_completed_notice_batch_revalidates_with_real_stock_date_index_and_exact
         task={"task_type": "notice_eastmoney"}, output=json.dumps(receipt, default=str),
         started_at=datetime(2026, 11, 2, 18), now=datetime(2026, 11, 2, 21, 1))
     assert ok, message
-    assert batches == [100, 100, 5]
+    assert batches == [50, 50, 50, 50, 5]
     assert len(codes) == 205
     searches = [plan for plan in plans if "SEARCH notice" in plan]
-    assert len(searches) == 3
+    assert len(searches) == 5
     assert all("idx_notice_stock_date" in plan and "stock_code=?" in plan
                and "notice_date>?" in plan and "notice_date<?" in plan for plan in searches)
     # A wrong batch in any later code batch is still read, never hidden by
@@ -82,9 +104,48 @@ def test_completed_notice_batch_revalidates_with_real_stock_date_index_and_exact
 
 def test_notice_readback_stops_at_total_deadline_after_one_real_batch(monkeypatch):
     engine, codes, _receipt = _fixture()
-    clock = iter([0.0, 1.0, 181.0])
+    clock = iter([0.0, 1.0, 901.0])
     monkeypatch.setattr(validation, "monotonic", lambda: next(clock))
     with pytest.raises(RuntimeError, match="notice_readback: total deadline exceeded"):
         validation._read_notice_validation_window(engine, codes=codes,
             window_start=date(2026, 9, 18), window_end=date(2026, 11, 3))
     engine.dispose()
+
+
+def _compressed_group(code, rows, *, padding=b""):
+    raw = json.dumps(rows, ensure_ascii=False, default=str).encode("utf8") + padding
+    compressed = zlib.compress(raw)
+    trailer = b"." if compressed[-1] == 0x20 else b""
+    return {"stock_code": code, "row_count": len(rows),
+            "packed_rows": len(raw).to_bytes(4, "little") + compressed + trailer}
+
+
+def test_mysql_group_decode_preserves_all_fields_and_existing_value_hash():
+    engine, codes, _receipt = _fixture()
+    rows = validation._read_notice_validation_window(engine, codes=codes[:1],
+        window_start=date(2026, 9, 18), window_end=date(2026, 11, 3))
+    mysql_rows = [dict(row) for row in rows]
+    for row in mysql_rows:
+        for field in ("etl_sync_at", "source_time", "received_at"):
+            row[field] += ".000000"
+    decoded = validation._decode_notice_readback_group(_compressed_group(codes[0], mysql_rows),
+                                                       expected_codes={codes[0]})
+    assert set(decoded[0]) == set(validation._NOTICE_READBACK_FIELDS)
+    assert decoded[0]["display_time"] == rows[0]["display_time"]
+    assert notice._notice_row_hash(decoded) == notice._notice_row_hash(rows)
+    assert validation._notice_persisted_manifest_hash(decoded, requested_codes=codes[:1]) == (
+        validation._notice_persisted_manifest_hash(rows, requested_codes=codes[:1]))
+    engine.dispose()
+
+
+def test_mysql_native_space_protection_trailer_is_verified():
+    row = {field: None for field in validation._NOTICE_READBACK_FIELDS}
+    row.update(stock_code="000001", art_code="AN-1", association_validated=1)
+    # MySQL adds '.' when the *compressed stream*, not input, ends in 0x20.
+    group = next(candidate for size in range(512)
+                 if (candidate := _compressed_group("000001", [row], padding=b"\t" * size))[
+                     "packed_rows"].endswith(b" ."))
+    assert validation._decode_notice_readback_group(group, expected_codes={"000001"}) == [row]
+    missing_trailer = {**group, "packed_rows": group["packed_rows"][:-1]}
+    with pytest.raises(RuntimeError, match="trailing bytes"):
+        validation._decode_notice_readback_group(missing_trailer, expected_codes={"000001"})
