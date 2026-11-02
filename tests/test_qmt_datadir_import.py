@@ -248,44 +248,95 @@ def test_harvest_filters_each_dates_exact_traded_set_without_padding(tmp_path, m
     assert {(row[1], row[3]) for row in staged} == {("600000", SESSION), ("600001", tomorrow)}
 
 
-class _Recorder:
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, dict | None]] = []
+def _publication_database():
+    from sqlalchemy import create_engine, text
+    from integrations.qmt.datadir_import import MINUTE_COLUMNS, MINUTE_STAGE_COLUMNS
+    engine = create_engine("sqlite:///:memory:")
+    with engine.begin() as connection:
+        connection.connection.driver_connection.create_function("NOW", 0, lambda: "2026-11-03 04:40:00")
+        connection.execute(text("CREATE TABLE sm_stock_minute (" + ",".join(name + " TEXT" for name in MINUTE_COLUMNS) + ")"))
+        connection.execute(text("CREATE TABLE qmt_datadir_minute_stage (" + ",".join(name + " TEXT" for name in MINUTE_STAGE_COLUMNS) + ")"))
+        for code in ("600000", "600001"):
+            connection.execute(text("INSERT INTO sm_stock_minute (stock_code,trade_date,trade_time,price,data_source) VALUES (:code,:day,:stamp,'1','qmt_datadir')"),
+                               {"code": code, "day": SESSION, "stamp": str(SESSION) + " 09:15:00"})
+            connection.execute(text("INSERT INTO qmt_datadir_minute_stage VALUES ('run-1',:code,:stamp,:day,'10','0','0','100','1000',:symbol)"),
+                               {"code": code, "day": SESSION, "stamp": str(SESSION) + " 09:15:00", "symbol": code + ".SH"})
+        connection.execute(text("INSERT INTO sm_stock_minute (stock_code,trade_date,trade_time,price,data_source) VALUES ('600002',:day,:stamp,'2','old')"),
+                           {"day": SESSION, "stamp": str(SESSION) + " 09:15:00"})
+        connection.execute(text("INSERT INTO sm_stock_minute (stock_code,trade_date,trade_time,price,data_source) VALUES ('600000','2026-10-30','2026-10-30 09:15:00','3','qmt_datadir')"))
+    return engine
 
-    def execute(self, statement, params=None):
-        self.calls.append((" ".join(str(statement).split()), params))
-        return None
 
-
-def test_publish_replaces_its_own_rows_before_dropping_the_old_source():
+def test_publish_replaces_its_own_rows_and_superseded_source_in_stock_batches():
     from integrations.qmt.datadir_import import publish_session
-
-    recorder = _Recorder()
-    publish_session(
-        recorder,
-        session=SESSION,
-        run_id="run-1",
-        batch_id="batch-1",
-        replace_sources=["gj_big_qmt_inner"],
-    )
-
-    assert len(recorder.calls) == 3
-    first, second, third = recorder.calls
-    assert first[0].startswith("DELETE FROM `sm_stock_minute`")
-    assert "data_source=:s" in first[0]
-    assert "INSERT INTO `sm_stock_minute`" in second[0]
-    assert "FROM `qmt_datadir_minute_stage`" in second[0]
-    assert "trade_time, NOW()" in second[0]  # source_time mirrors the bar start
-    assert third[0].startswith("DELETE FROM `sm_stock_minute`")
-    assert "data_source IN" in third[0]
-    assert third[1] == {"d": SESSION, "sources": ["gj_big_qmt_inner"]}
+    from sqlalchemy import text
+    engine = _publication_database()
+    with engine.begin() as connection:
+        publish_session(connection, session=SESSION, run_id="run-1", batch_id="batch-1",
+                        replace_sources=["old"], batch_codes=1)
+    with engine.connect() as connection:
+        rows = connection.execute(text("SELECT stock_code,price,data_source,batch_id,source_time FROM sm_stock_minute WHERE trade_date=:day ORDER BY stock_code"), {"day": SESSION}).fetchall()
+        assert [tuple(row[:4]) for row in rows] == [("600000", "10", "qmt_datadir", "batch-1"), ("600001", "10", "qmt_datadir", "batch-1")]
+        assert all(row[4] == str(SESSION) + " 09:15:00" for row in rows)
+        assert connection.execute(text("SELECT price FROM sm_stock_minute WHERE trade_date='2026-10-30'")).scalar() == "3"
+    engine.dispose()
 
 
 def test_publish_never_touches_a_foreign_source_by_default():
     from integrations.qmt.datadir_import import publish_session
+    from sqlalchemy import text
+    engine = _publication_database()
+    with engine.begin() as connection:
+        publish_session(connection, session=SESSION, run_id="run-1", batch_id="batch-1", replace_sources=(), batch_codes=1)
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT price FROM sm_stock_minute WHERE data_source='old'")).scalar() == "2"
+        assert connection.execute(text("SELECT COUNT(*) FROM sm_stock_minute WHERE batch_id='batch-1'")).scalar() == 2
+    engine.dispose()
 
-    recorder = _Recorder()
-    publish_session(
-        recorder, session=SESSION, run_id="run-1", batch_id="batch-1", replace_sources=()
-    )
-    assert len(recorder.calls) == 2
+
+def test_later_stock_batch_failure_rolls_back_all_prior_batches():
+    from integrations.qmt.datadir_import import publish_session
+    from sqlalchemy import text
+    engine = _publication_database()
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TRIGGER fail_second_batch BEFORE INSERT ON sm_stock_minute WHEN NEW.stock_code='600001' BEGIN SELECT RAISE(ABORT,'source batch rejected'); END"))
+    with pytest.raises(Exception, match="source batch rejected"):
+        with engine.begin() as connection:
+            publish_session(connection, session=SESSION, run_id="run-1", batch_id="batch-1", replace_sources=["old"], batch_codes=1)
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT COUNT(*) FROM sm_stock_minute WHERE batch_id='batch-1'")).scalar() == 0
+        assert connection.execute(text("SELECT COUNT(*) FROM sm_stock_minute WHERE trade_date=:day AND price='1'"), {"day": SESSION}).scalar() == 2
+        assert connection.execute(text("SELECT COUNT(*) FROM qmt_datadir_minute_stage WHERE run_id='run-1'")).scalar() == 2
+    engine.dispose()
+
+
+def test_new_day_publication_uses_stage_stock_ranges_without_full_run_rescans():
+    from integrations.qmt.datadir_import import publish_session
+    from server.common.auxiliary_runtime_schema import QMT_DATADIR_STAGE_INDEX_NAME
+    from sqlalchemy import event, text
+
+    engine = _publication_database()
+    with engine.begin() as connection:
+        connection.execute(text("DELETE FROM sm_stock_minute WHERE trade_date=:day AND data_source='qmt_datadir'"), {"day": SESSION})
+        connection.execute(text(f"CREATE INDEX {QMT_DATADIR_STAGE_INDEX_NAME} ON qmt_datadir_minute_stage(run_id,trade_date,stock_code,trade_time)"))
+    statements = []
+
+    @event.listens_for(engine, "before_cursor_execute")
+    def capture(_conn, _cursor, statement, parameters, _context, _many):
+        if statement.lstrip().startswith("INSERT INTO `sm_stock_minute`"):
+            statements.append((statement, parameters))
+
+    with engine.begin() as connection:
+        publish_session(connection, session=SESSION, run_id="run-1", batch_id="new-date", replace_sources=(), batch_codes=1)
+    assert len(statements) == 2
+    with engine.connect() as connection:
+        for statement, parameters in statements:
+            plan = connection.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).fetchall()
+            descriptions = " ".join(str(row[-1]) for row in plan)
+            assert f"USING INDEX {QMT_DATADIR_STAGE_INDEX_NAME}" in descriptions
+            assert "run_id=? AND trade_date=? AND stock_code=?" in descriptions
+            assert "SCAN qmt_datadir_minute_stage" not in descriptions
+        assert connection.execute(text("SELECT COUNT(*) FROM sm_stock_minute WHERE batch_id='new-date'")).scalar() == 2
+        assert connection.execute(text("SELECT price FROM sm_stock_minute WHERE trade_date='2026-10-30'")).scalar() == "3"
+        assert connection.execute(text("SELECT price FROM sm_stock_minute WHERE data_source='old'")).scalar() == "2"
+    engine.dispose()

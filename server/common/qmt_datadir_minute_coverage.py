@@ -15,6 +15,7 @@ from server.common.qmt_attestation_contract import canonical_digest
 from server.common.qmt_datadir_daily_coverage import load_daily_manifest
 from server.common.qmt_index_minute_grid import CORE_GRID
 from server.common.qmt_datadir_progress import MinuteImportProgress
+from server.common.auxiliary_runtime_schema import QMT_DATADIR_STAGE_INDEX_NAME
 
 GRID_HASH = canonical_digest(list(CORE_GRID))
 SCHEMA = "probiga.qmt-datadir-minute-coverage.v1"
@@ -51,7 +52,7 @@ def validate_code_scope(entry: dict, scope: dict) -> None:
 
 
 def validate_matrix(rows, *, day: str, scope: dict, deadline_seconds: float = 180,
-                    progress=None, query_started=None) -> dict:
+                    progress=None, query_started=None, include_business_fingerprint: bool = False) -> dict:
     """Consume ordered rows in bounded memory; hash matches canonical_rows JSON."""
     from server.common.qmt_datadir_result import _normalize
 
@@ -59,6 +60,9 @@ def validate_matrix(rows, *, day: str, scope: dict, deadline_seconds: float = 18
     seen_codes, current_times = set(), set()
     current_code, count = None, 0
     digest = sha256(b"[")
+    business_digest = sha256(b"[") if include_business_fingerprint else None
+    business_fields = ("stock_code", "trade_time", "trade_date", "price", "change",
+                       "change_pct", "volume", "amount", "qmt_code")
     consume_started = time.monotonic()
     deadline = consume_started + deadline_seconds
     for source in rows:
@@ -104,8 +108,17 @@ def validate_matrix(rows, *, day: str, scope: dict, deadline_seconds: float = 18
             raise ValueError("minute matrix closing price differs from exact daily anchor")
         if count:
             digest.update(b",")
-        digest.update(json.dumps({str(key): _normalize(value) for key, value in sorted(row.items())},
+            if business_digest is not None:
+                business_digest.update(b",")
+        normalized = {str(key): _normalize(value) for key, value in sorted(row.items())}
+        digest.update(json.dumps(normalized,
             ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8"))
+        if business_digest is not None:
+            business = {key: _normalize(Decimal(str(row[key]))) if key in {
+                "price", "change", "change_pct", "volume", "amount"} else normalized[key]
+                for key in business_fields}
+            business_digest.update(json.dumps(business,
+                ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8"))
         count += 1
         if progress is not None and count % 50000 == 0:
             progress.emit("consume", completed_units=count, current_unit=code,
@@ -119,15 +132,19 @@ def validate_matrix(rows, *, day: str, scope: dict, deadline_seconds: float = 18
         progress.emit("consume", status="COMPLETE", completed_units=count,
             current_unit=current_code, phase_seconds=round(time.monotonic() - consume_started, 6),
             budget_seconds=deadline_seconds)
-    return dict(row_count=count, code_count=len(seen_codes), row_hash=digest.hexdigest(),
+    fingerprint = dict(row_count=count, code_count=len(seen_codes), row_hash=digest.hexdigest(),
         full_market_manifest_hash=scope["full_market_manifest_hash"],
         expected_traded_code_set_sha256=scope["expected_traded_code_set_sha256"],
         eligible_code_count=len(expected), coverage=1.0,
         minute_grid_count=len(CORE_GRID), minute_grid_sha256=GRID_HASH, bad_grid_codes=0)
+    if business_digest is not None:
+        business_digest.update(b"]")
+        fingerprint["business_row_hash"] = business_digest.hexdigest()
+    return fingerprint
 
 
 def persisted_matrix(engine, day: str, *, scope: dict, run_id: str = "",
-                     operation: str = "matrix_readback") -> dict:
+                     operation: str = "matrix_readback", include_business_fingerprint: bool = False) -> dict:
     progress = MinuteImportProgress(run_id=run_id,
         total_units=len(scope["codes"])*len(CORE_GRID), operation=operation, days=[day])
     progress.emit("provider_probe")
@@ -156,7 +173,7 @@ def persisted_matrix(engine, day: str, *, scope: dict, run_id: str = "",
             raise
         try:
             return validate_matrix(rows, day=day, scope=scope, progress=progress,
-                query_started=query_started)
+                query_started=query_started, include_business_fingerprint=include_business_fingerprint)
         except Exception as exc:
             progress.emit("consume", status="FAILED", error_type=type(exc).__name__,
                 budget_seconds=180)
@@ -173,6 +190,23 @@ def persisted_matrix(engine, day: str, *, scope: dict, run_id: str = "",
             else:
                 progress.emit("close", status="COMPLETE",
                     phase_seconds=round(time.monotonic()-close_started, 6))
+
+
+def staged_matrix(connection, day: str, *, scope: dict, run_id: str) -> dict:
+    """Recheck a retained source landing area before resuming publication."""
+    index_hint = f" FORCE INDEX (`{QMT_DATADIR_STAGE_INDEX_NAME}`)" if connection.dialect.name == "mysql" else ""
+    rows = connection.execution_options(stream_results=True, max_row_buffer=2000).execute(text(
+        "SELECT /*+ MAX_EXECUTION_TIME(120000) */ stock_code,trade_time,trade_date,price,"
+        "`change`,change_pct,volume,amount,qmt_code,'qmt_datadir' AS data_source,"
+        "trade_time AS source_time,:run AS batch_id,'qmt_datadir_v1' AS data_version,"
+        "'VERIFIED' AS quality_status,'SUPPORTED' AS permission_status "
+        f"FROM qmt_datadir_minute_stage{index_hint} WHERE run_id=:run AND trade_date=:day "
+        "ORDER BY stock_code,trade_time"
+    ), {"run": run_id, "day": day}).mappings()
+    try:
+        return validate_matrix(rows, day=day, scope=scope)
+    finally:
+        rows.close()
 
 
 def load_verified_minute_publication(engine, day: str, *, decision_known_at=None) -> dict | None:

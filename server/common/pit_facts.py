@@ -111,6 +111,11 @@ _LOCAL_INGESTION_FIELDS = frozenset(
         "updated_at",
     }
 )
+_REVISION_METADATA_COLUMNS = (
+    "revision_id", "content_hash", "revision_no", "supersedes_revision_id",
+    "publication_time_status", "published_at", "source_published_text",
+    "revision_fingerprint_hash",
+)
 
 
 PIT_FACT_TABLE_DDLS: dict[str, str] = {
@@ -864,6 +869,37 @@ def _latest_revision(
     return _mapping(row)
 
 
+def _latest_finance_revisions(
+    connection: Connection,
+    identity_hashes: Iterable[str],
+) -> dict[str, dict[str, Any] | None]:
+    identities = sorted(set(identity_hashes))
+    latest: dict[str, dict[str, Any] | None] = dict.fromkeys(identities)
+    mysql = connection.dialect.name == "mysql"
+    # Search the identity prefix itself, including absent identities.  On MySQL
+    # this retains the single-row writer's next-key/gap locking under the same
+    # transaction isolation, rather than locking only IDs found by a subquery.
+    index_hint = (
+        " FORCE INDEX (uk_pit_finance_identity_revision)" if mysql else ""
+    )
+    lock = " FOR UPDATE" if mysql else ""
+    statement = text(
+        f"SELECT identity_hash, {', '.join(_REVISION_METADATA_COLUMNS)} "
+        f"FROM {FINANCE_REVISION_TABLE}{index_hint} "
+        "WHERE identity_hash IN :identity_hashes "
+        f"ORDER BY identity_hash, revision_no DESC{lock}"
+    ).bindparams(bindparam("identity_hashes", expanding=True))
+    for offset in range(0, len(identities), 100):
+        rows = connection.execute(
+            statement, {"identity_hashes": identities[offset:offset + 100]}
+        ).mappings()
+        for row in rows:
+            identity_hash = str(row["identity_hash"])
+            if latest[identity_hash] is None:
+                latest[identity_hash] = dict(row)
+    return latest
+
+
 def _existing_fingerprint(
     connection: Connection,
     table_name: str,
@@ -909,6 +945,7 @@ def _append_revision(
     received_at: datetime | str | None,
     source: str,
     batch_id: str,
+    preloaded_latest: dict[str, dict[str, Any] | None] | None = None,
 ) -> PITRevisionReceipt:
     known = normalize_decision_at(known_at)
     received = normalize_decision_at(received_at or known)
@@ -924,7 +961,10 @@ def _append_revision(
     identity_hash = canonical_hash(
         {"schema": f"probiga.pit-{fact_kind}-identity.v1", **identity_payload}
     )
-    latest = _latest_revision(connection, table_name, identity_hash)
+    latest = (
+        _latest_revision(connection, table_name, identity_hash)
+        if preloaded_latest is None else preloaded_latest[identity_hash]
+    )
     latest_published = (
         _dt_text(_row_datetime(latest["published_at"]))
         if latest and latest.get("published_at") is not None
@@ -955,6 +995,14 @@ def _append_revision(
         connection, table_name, identity_hash, fingerprint
     )
     if existing is not None:
+        if preloaded_latest is not None and (
+            int(existing.get("revision_no") or 0)
+            > int((latest or {}).get("revision_no") or 0)
+        ):
+            preloaded_latest[identity_hash] = {
+                **existing, "published_at": published,
+                "source_published_text": source_published_text,
+            }
         return _receipt(existing, idempotent=True)
     revision_id = canonical_hash(
         {
@@ -994,7 +1042,19 @@ def _append_revision(
         )
         if existing is None:
             raise
+        if preloaded_latest is not None and (
+            int(existing.get("revision_no") or 0)
+            > int((latest or {}).get("revision_no") or 0)
+        ):
+            preloaded_latest[identity_hash] = {
+                **existing, "published_at": published,
+                "source_published_text": source_published_text,
+            }
         return _receipt(existing, idempotent=True)
+    if preloaded_latest is not None:
+        preloaded_latest[identity_hash] = {
+            column: values[column] for column in _REVISION_METADATA_COLUMNS
+        }
     return PITRevisionReceipt(
         revision_id=revision_id,
         content_hash=content_hash,
@@ -1003,6 +1063,32 @@ def _append_revision(
         publication_time_status=time_status,
         idempotent=False,
     )
+
+
+def _finance_revision_arguments(
+    row: Mapping[str, Any],
+) -> dict[str, Any]:
+    code = str(row.get("stock_code") or "").strip().zfill(6)
+    if not re.fullmatch(r"\d{6}", code):
+        raise ValueError("finance PIT revision requires a six-digit stock code")
+    report_date = _date_value(row.get("report_date"), required=True)
+    report_type = str(row.get("report_type") or "").strip()[:64]
+    return {
+        "table_name": FINANCE_REVISION_TABLE,
+        "fact_kind": "finance",
+        "identity_payload": {
+            "stock_code": code,
+            "report_date": report_date.isoformat(),
+            "report_type": report_type,
+        },
+        "row_columns": {
+            "stock_code": code,
+            "report_date": report_date,
+            "report_type": report_type,
+        },
+        "payload": _source_payload(row),
+        "published_value": row.get("published_at", row.get("notice_date")),
+    }
 
 
 def append_finance_revision(
@@ -1014,11 +1100,7 @@ def append_finance_revision(
     source: str = "adata.finance.core_index",
     batch_id: str = "",
 ) -> PITRevisionReceipt:
-    code = str(row.get("stock_code") or "").strip().zfill(6)
-    if not re.fullmatch(r"\d{6}", code):
-        raise ValueError("finance PIT revision requires a six-digit stock code")
-    report_date = _date_value(row.get("report_date"), required=True)
-    report_type = str(row.get("report_type") or "").strip()[:64]
+    arguments = _finance_revision_arguments(row)
     connection, close = _connection(target)
     transaction = None
     if close:
@@ -1026,20 +1108,7 @@ def append_finance_revision(
     try:
         receipt = _append_revision(
             connection,
-            table_name=FINANCE_REVISION_TABLE,
-            fact_kind="finance",
-            identity_payload={
-                "stock_code": code,
-                "report_date": report_date.isoformat(),
-                "report_type": report_type,
-            },
-            row_columns={
-                "stock_code": code,
-                "report_date": report_date,
-                "report_type": report_type,
-            },
-            payload=_source_payload(row),
-            published_value=row.get("published_at", row.get("notice_date")),
+            **arguments,
             known_at=known_at,
             received_at=received_at,
             source=source,
@@ -1048,6 +1117,57 @@ def append_finance_revision(
         if transaction is not None:
             transaction.commit()
         return receipt
+    except Exception:
+        if transaction is not None:
+            transaction.rollback()
+        raise
+    finally:
+        if close:
+            connection.close()
+
+
+def append_finance_revisions(
+    target: Engine | Connection,
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    known_at: datetime | str,
+    received_at: datetime | str | None = None,
+    source: str = "adata.finance.core_index",
+    batch_id: str = "",
+) -> list[PITRevisionReceipt]:
+    """Append one issuer's reports atomically with bounded metadata reads."""
+
+    arguments = [_finance_revision_arguments(row) for row in rows]
+    if not arguments:
+        return []
+    if len({item["row_columns"]["stock_code"] for item in arguments}) != 1:
+        raise ValueError("finance PIT revision batch requires one stock code")
+    identities = [
+        canonical_hash({
+            "schema": "probiga.pit-finance-identity.v1",
+            **item["identity_payload"],
+        })
+        for item in arguments
+    ]
+    connection, close = _connection(target)
+    transaction = connection.begin() if close else None
+    try:
+        latest = _latest_finance_revisions(connection, identities)
+        receipts = [
+            _append_revision(
+                connection,
+                **item,
+                known_at=known_at,
+                received_at=received_at,
+                source=source,
+                batch_id=batch_id,
+                preloaded_latest=latest,
+            )
+            for item in arguments
+        ]
+        if transaction is not None:
+            transaction.commit()
+        return receipts
     except Exception:
         if transaction is not None:
             transaction.rollback()
@@ -5707,7 +5827,7 @@ __all__ = [
     "PITCoverageReceipt", "PITFactBatch", "PITRevisionReceipt",
     "TIME_UNVERIFIED", "TIME_VERIFIED", "append_event_revision",
     "append_finance_atomic_batch_seal", "append_finance_expected_unavailable",
-    "append_finance_revision",
+    "append_finance_revision", "append_finance_revisions",
     "append_source_coverage", "canonical_hash",
     "canonical_json", "ensure_pit_fact_schema", "load_event_facts",
     "load_finance_atomic_batch_seal", "load_finance_expected_unavailable",

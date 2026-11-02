@@ -34,6 +34,7 @@ from integrations.qmt.datadir import (
     select_records,
 )
 from server.common.auxiliary_runtime_schema import (
+    QMT_DATADIR_STAGE_INDEX_NAME,
     validate_qmt_datadir_import_runtime_schema,
 )
 from server.common.qmt_index_minute_grid import CORE_GRID
@@ -456,23 +457,47 @@ def publish_session(
     run_id: str,
     batch_id: str,
     replace_sources: Sequence[str],
+    batch_codes: int = 50,
+    deadline_seconds: float = 900,
+    progress=None,
 ) -> None:
-    """Replace one session's rows: remove ours, insert staged, drop superseded."""
-    conn.execute(
-        text(f"DELETE FROM `{TARGET_TABLE}` WHERE trade_date=:d AND data_source=:s"),
-        {"d": session, "s": SOURCE},
-    )
-    conn.execute(
-        text(f"""
+    """Replace bounded stock batches inside the caller's one atomic transaction."""
+    if batch_codes < 1 or deadline_seconds <= 0:
+        raise ValueError("minute publication batch/deadline is invalid")
+    sources = sorted({SOURCE, *replace_sources})
+    stage_index = f" FORCE INDEX (`{QMT_DATADIR_STAGE_INDEX_NAME}`)" if conn.dialect.name == "mysql" else ""
+    codes = {str(row[0]) for row in conn.execute(text(
+        f"SELECT DISTINCT stock_code FROM `{STAGE_TABLE}`{stage_index} WHERE run_id=:r AND trade_date=:d"
+    ), {"r": run_id, "d": session})}
+    current_codes = text(
+        f"SELECT DISTINCT stock_code FROM `{TARGET_TABLE}` "
+        "WHERE trade_date=:d AND data_source IN :sources"
+    ).bindparams(bindparam("sources", expanding=True))
+    codes.update(str(row[0]) for row in conn.execute(current_codes, {"d": session, "sources": sources}))
+    ordered = sorted(codes)
+    deadline = time.monotonic() + deadline_seconds
+    delete = text(
+        f"DELETE FROM `{TARGET_TABLE}` WHERE trade_date=:d "
+        "AND data_source IN :sources AND stock_code IN :codes"
+    ).bindparams(bindparam("sources", expanding=True), bindparam("codes", expanding=True))
+    insert = text(f"""
             INSERT INTO `{TARGET_TABLE}` ({','.join(MINUTE_COLUMNS)})
             SELECT stock_code, trade_time, trade_date, price, `change`, change_pct,
                    volume, amount, NOW(), qmt_code, :source, trade_time, NOW(),
                    :batch_id, :version, :quality, :permission
-            FROM `{STAGE_TABLE}`
-            WHERE run_id=:run_id AND trade_date=:d
+            FROM `{STAGE_TABLE}`{stage_index}
+            WHERE run_id=:run_id AND trade_date=:d AND stock_code IN :codes
             ORDER BY stock_code, trade_time
-        """),
-        {
+        """).bindparams(bindparam("codes", expanding=True))
+    published_rows = 0
+    for offset in range(0, len(ordered), batch_codes):
+        if time.monotonic() >= deadline:
+            raise TimeoutError("minute_publication: total deadline exceeded")
+        batch = ordered[offset:offset + batch_codes]
+        conn.execute(delete, {"d": session, "sources": sources, "codes": batch})
+        if time.monotonic() >= deadline:
+            raise TimeoutError("minute_publication: total deadline exceeded")
+        inserted = conn.execute(insert, {
             "source": SOURCE,
             "batch_id": batch_id,
             "version": DATA_VERSION,
@@ -480,15 +505,16 @@ def publish_session(
             "permission": PERMISSION_STATUS,
             "run_id": run_id,
             "d": session,
-        },
-    )
-    superseded = [source for source in replace_sources if source != SOURCE]
-    if superseded:
-        statement = text(
-            f"DELETE FROM `{TARGET_TABLE}` WHERE trade_date=:d "
-            "AND data_source IN :sources"
-        ).bindparams(bindparam("sources", expanding=True))
-        conn.execute(statement, {"d": session, "sources": superseded})
+            "codes": batch,
+        })
+        published_rows += max(0, int(inserted.rowcount or 0))
+        if progress is not None:
+            progress.emit("server_publication", current_unit=batch[-1], completed_units=published_rows,
+                completed_securities=min(offset + len(batch), len(ordered)),
+                total_securities=len(ordered), budget_seconds=deadline_seconds,
+                budget_remaining_seconds=round(max(0.0, deadline - time.monotonic()), 6))
+    if time.monotonic() >= deadline:
+        raise TimeoutError("minute_publication: total deadline exceeded")
 
 
 def readback_session(conn: Connection, session: dt.date) -> tuple[int, int]:
@@ -503,8 +529,10 @@ def readback_session(conn: Connection, session: dt.date) -> tuple[int, int]:
     return int(row[0]), int(row[1])
 
 
-def drop_staged(conn: Connection, run_id: str) -> None:
-    conn.execute(text(f"DELETE FROM `{STAGE_TABLE}` WHERE run_id=:r"), {"r": run_id})
+def drop_staged(conn: Connection, run_id: str, *, session: dt.date | None = None) -> None:
+    predicate = " AND trade_date=:d" if session is not None else ""
+    conn.execute(text(f"DELETE FROM `{STAGE_TABLE}` WHERE run_id=:r{predicate}"),
+                 {"r": run_id, "d": session})
 
 
 def new_run_id(now: dt.datetime | None = None) -> str:

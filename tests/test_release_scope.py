@@ -130,6 +130,36 @@ def test_python_ddl_is_coordinated_and_code_edits_stay_linux(repo):
     assert result["base_contract_sha256"] == result["contract_sha256"]
 
 
+def test_auxiliary_stage_index_change_is_coordinated_and_body_change_is_linux(repo):
+    path = "server/common/auxiliary_runtime_schema.py"
+    before = (
+        '_QMT_DATADIR_IMPORT_DDL = ("CREATE TABLE IF NOT EXISTS '
+        'qmt_datadir_minute_stage (run_id VARCHAR(64), trade_date DATE, '
+        'stock_code VARCHAR(16), trade_time DATETIME, '
+        'KEY idx_qdms_run_date (run_id, trade_date))",)\n'
+        '\n\ndef validate_qmt_datadir_import_runtime_schema(engine):\n'
+        '    return engine\n'
+    )
+    repo.write(path, before)
+    base = repo.commit()
+    after = before.replace(
+        "KEY idx_qdms_run_date (run_id, trade_date)",
+        "KEY idx_qdms_run_date_code_time (run_id, trade_date, stock_code, trade_time)",
+    )
+    repo.write(path, after)
+    indexed = repo.commit()
+    result = repo.classify(indexed, base=base)
+    assert result["scope"] == "COORDINATED"
+    assert result["reason_codes"] == ["schema_contract_changed"]
+    assert result["base_contract_sha256"] != result["contract_sha256"]
+
+    repo.write(path, after.replace("return engine", "return bool(engine)"))
+    result = repo.classify(repo.commit(), base=indexed)
+    assert result["scope"] == "LINUX"
+    assert result["reason_codes"] == ["code_only_delta"]
+    assert result["base_contract_sha256"] == result["contract_sha256"]
+
+
 def test_sql_file_ddl_is_coordinated(repo):
     repo.write("db/schema.sql", "ALTER TABLE example ADD COLUMN name VARCHAR(20);\n")
     assert repo.classify(repo.commit())["scope"] == "COORDINATED"

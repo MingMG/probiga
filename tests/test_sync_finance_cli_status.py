@@ -836,11 +836,11 @@ def test_finance_upsert_null_dates_remain_null(monkeypatch, field):
     connection = SimpleNamespace(execute=lambda *args: None)
     engine = SimpleNamespace(begin=lambda: nullcontext(connection))
 
-    def append_revision(conn, row, **kwargs):
-        source_rows.append(dict(row))
-        return SimpleNamespace(revision_id="a" * 64, content_hash="b" * 64)
+    def append_revisions(conn, rows, **kwargs):
+        source_rows.extend(dict(row) for row in rows)
+        return [SimpleNamespace(revision_id="a" * 64, content_hash="b" * 64) for row in rows]
 
-    monkeypatch.setattr(sync_finance, "append_finance_revision", append_revision)
+    monkeypatch.setattr(sync_finance, "append_finance_revisions", append_revisions)
     monkeypatch.setattr(
         sync_finance, "append_source_coverage",
         lambda conn, **kwargs: coverages.append(kwargs),
@@ -857,6 +857,90 @@ def test_finance_upsert_null_dates_remain_null(monkeypatch, field):
     guard = coverages[0]["watermark_evidence"]["source_timestamp_guard"]
     key = "maximum_notice_date" if field == "notice_date" else "maximum_update_date"
     assert guard[key] == "2026-09-01"
+
+
+def test_bulk_finance_write_preserves_report_ids_cache_order_and_atomic_coverage():
+    from sqlalchemy import create_engine, event, text
+    from server.common import pit_facts
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    pit_facts.ensure_pit_fact_schema(engine)
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE si_stock_finance (stock_code TEXT, report_date TEXT, "
+            "report_type TEXT,notice_date TEXT,basic_eps REAL,etl_sync_at TEXT, "
+            "UNIQUE(stock_code,report_date))"))
+    statements, display_batches, fail_display = [], [], [False]
+
+    @event.listens_for(engine, "before_cursor_execute", retval=True)
+    def adapt_display_upsert(_conn, _cursor, statement, parameters, _context, many):
+        statements.append(statement)
+        if statement.lstrip().startswith("INSERT INTO si_stock_finance"):
+            if fail_display[0]:
+                raise RuntimeError("display write interrupted")
+            display_batches.append((many, len(parameters)))
+            statement = statement.split("ON DUPLICATE KEY UPDATE")[0] + (
+                "ON CONFLICT(stock_code,report_date) DO UPDATE SET "
+                "report_type=excluded.report_type,notice_date=excluded.notice_date,"
+                "basic_eps=excluded.basic_eps,etl_sync_at=excluded.etl_sync_at"
+            )
+        return statement, parameters
+
+    frame = pd.DataFrame([dict(stock_code="000001", report_date=day.strftime("%Y-%m-%d"),
+        report_type="Q", notice_date="2026-08-31", basic_eps=1.0)
+        for day in pd.date_range(end="2026-06-30", periods=40, freq="QE")])
+    # Distinct PIT report types share the existing display-table identity.
+    # Preserve the original last-row-wins display behavior in executemany.
+    frame = pd.concat([frame, pd.DataFrame([{**frame.iloc[-1].to_dict(),
+                                            "report_type": "ALT", "basic_eps": 2.0}])], ignore_index=True)
+
+    def upsert(value, hour):
+        start = len(statements)
+        assert sync_finance.upsert_finance(engine, value, stock_code="000001",
+            coverage_end=date(2026, 9, 1), observed_at=datetime(2026, 9, 1, hour)) == 41
+        return statements[start:]
+
+    def fact_rows():
+        with engine.connect() as connection:
+            return [dict(row) for row in connection.execute(text(
+                "SELECT * FROM st_pit_finance_revision ORDER BY identity_hash,revision_no"
+            )).mappings()]
+
+    upsert(frame, 20)
+    original = fact_rows()
+    assert len(original) == 41 and display_batches == [(True, 41)]
+    repeated_sql = upsert(frame, 21)
+    assert fact_rows() == original  # No relabelling capture time or batch on immutable facts.
+    assert len(repeated_sql) == 5  # One locked read, one display batch, three coverage statements.
+    assert display_batches == [(True, 41), (True, 41)]
+    changed = frame.copy()
+    changed.loc[40, "basic_eps"] = 2.5
+    upsert(changed, 22)
+    current = fact_rows()
+    assert len(current) == 42
+    first = next(row for row in original if row["report_type"] == "ALT")
+    revision = next(row for row in current if row["report_type"] == "ALT" and row["revision_no"] == 2)
+    assert revision["supersedes_revision_id"] == first["revision_id"]
+    assert first in current and datetime.fromisoformat(revision["known_at"]) == datetime(2026, 9, 1, 22)
+    with engine.connect() as connection:
+        legacy = connection.execute(text("SELECT report_type,basic_eps,etl_sync_at FROM si_stock_finance "
+            "WHERE report_date='2026-06-30'")).one()
+        assert tuple(legacy) == ("ALT", 2.5, "2026-09-01 22:00:00")
+        coverage = connection.execute(text("SELECT payload_json FROM st_pit_source_coverage "
+            "ORDER BY revision_no DESC LIMIT 1")).scalar_one()
+        bindings = json.loads(coverage)["fact_bindings"]
+        assert len(bindings) == 41 and revision["revision_id"] in {item["revision_id"] for item in bindings}
+        coverage_count = connection.execute(text("SELECT COUNT(*) FROM st_pit_source_coverage")).scalar_one()
+    fail_display[0] = True
+    interrupted = changed.copy()
+    interrupted.loc[40, "basic_eps"] = 3.0
+    with pytest.raises(RuntimeError, match="display write interrupted"):
+        upsert(interrupted, 23)
+    assert fact_rows() == current
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT COUNT(*) FROM st_pit_source_coverage")).scalar_one() == coverage_count
+        assert connection.execute(text("SELECT basic_eps FROM si_stock_finance "
+            "WHERE report_date='2026-06-30'")).scalar_one() == 2.5
+    engine.dispose()
 
 
 @pytest.mark.parametrize("field", ["notice_date", "source_update_date"])
