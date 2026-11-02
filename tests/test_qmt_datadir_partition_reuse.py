@@ -34,10 +34,11 @@ def existing_partition(tmp_path, monkeypatch):
         daily_close_by_code={code: "10" for code in CODES}, eligible_code_count=2,
         expected_traded_code_set_sha256=importer.canonical_digest(list(CODES)))
     with engine.begin() as connection:
-        connection.execute(text("CREATE TABLE sm_stock_minute (" + ",".join(key + " " + (
+        connection.execute(text("CREATE TABLE sm_stock_minute (id INTEGER PRIMARY KEY," + ",".join(key + " " + (
             "REAL" if key in {"price", "change", "change_pct", "volume", "amount"} else "TEXT")
             for key in native[0]) + ")"))
-        connection.execute(text("INSERT INTO sm_stock_minute VALUES (" + ",".join(":" + key for key in native[0]) + ")"), native)
+        connection.execute(text("INSERT INTO sm_stock_minute (" + ",".join("`"+key+"`" for key in native[0]) +
+                                ") VALUES (" + ",".join(":" + key for key in native[0]) + ")"), native)
         connection.execute(text("ALTER TABLE sm_stock_minute ADD COLUMN etl_sync_at TEXT"))
         connection.execute(text("ALTER TABLE sm_stock_minute ADD COLUMN received_at TEXT"))
         connection.execute(text("""CREATE TABLE qmt_datadir_import_partition (

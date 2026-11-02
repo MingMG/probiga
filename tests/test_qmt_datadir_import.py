@@ -254,7 +254,7 @@ def _publication_database():
     engine = create_engine("sqlite:///:memory:")
     with engine.begin() as connection:
         connection.connection.driver_connection.create_function("NOW", 0, lambda: "2026-11-03 04:40:00")
-        connection.execute(text("CREATE TABLE sm_stock_minute (" + ",".join(name + " TEXT" for name in MINUTE_COLUMNS) + ")"))
+        connection.execute(text("CREATE TABLE sm_stock_minute (id INTEGER PRIMARY KEY AUTOINCREMENT," + ",".join(name + " TEXT COLLATE NOCASE" for name in MINUTE_COLUMNS) + ")"))
         connection.execute(text("CREATE TABLE qmt_datadir_minute_stage (" + ",".join(name + " TEXT" for name in MINUTE_STAGE_COLUMNS) + ")"))
         for code in ("600000", "600001"):
             connection.execute(text("INSERT INTO sm_stock_minute (stock_code,trade_date,trade_time,price,data_source) VALUES (:code,:day,:stamp,'1','qmt_datadir')"),
@@ -291,6 +291,84 @@ def test_publish_never_touches_a_foreign_source_by_default():
     with engine.connect() as connection:
         assert connection.execute(text("SELECT price FROM sm_stock_minute WHERE data_source='old'")).scalar() == "2"
         assert connection.execute(text("SELECT COUNT(*) FROM sm_stock_minute WHERE batch_id='batch-1'")).scalar() == 2
+    engine.dispose()
+
+
+def test_publish_keeps_an_exact_partition_without_any_row_writes():
+    from integrations.qmt.datadir_import import publish_session
+    from sqlalchemy import text
+
+    engine = _publication_database()
+    params = dict(session=SESSION, run_id="run-1", replace_sources=(), batch_codes=1)
+    with engine.begin() as connection:
+        publish_session(connection, batch_id="original", **params)
+        before = connection.execute(text("SELECT * FROM sm_stock_minute ORDER BY id")).all()
+        for event in ("INSERT", "DELETE", "UPDATE"):
+            connection.execute(text(
+                f"CREATE TRIGGER no_{event.lower()} BEFORE {event} ON sm_stock_minute "
+                "BEGIN SELECT RAISE(ABORT,'identical minute rows must be retained'); END"
+            ))
+        publish_session(connection, batch_id="later", **params)
+        assert connection.execute(text("SELECT * FROM sm_stock_minute ORDER BY id")).all() == before
+    engine.dispose()
+
+
+def test_publish_changes_only_missing_stale_duplicate_or_authorized_provider_rows():
+    from integrations.qmt.datadir_import import MINUTE_COLUMNS, publish_session
+    from sqlalchemy import text
+
+    engine = _publication_database()
+    params = dict(session=SESSION, run_id="run-1", batch_codes=1)
+    moment = str(SESSION) + " 09:15:00"
+    next_minute = str(SESSION) + " 09:16:00"
+    with engine.begin() as connection:
+        publish_session(connection, batch_id="original", replace_sources=(), **params)
+        kept = connection.execute(text(
+            "SELECT * FROM sm_stock_minute WHERE stock_code='600000' AND trade_time=:stamp"
+        ), {"stamp": moment}).one()
+        columns = ",".join(MINUTE_COLUMNS)
+        connection.execute(text(
+            f"INSERT INTO sm_stock_minute ({columns}) SELECT {columns} FROM sm_stock_minute WHERE id=:id"
+        ), {"id": kept.id})
+        connection.execute(text(
+            "UPDATE sm_stock_minute SET quality_status='verified' WHERE stock_code='600001'"
+        ))
+        connection.execute(text(
+            "INSERT INTO sm_stock_minute(stock_code,trade_date,trade_time,data_source) "
+            "VALUES ('600003',:day,:stamp,'qmt_datadir'),('600002',:day,:stamp,'OLD')"
+        ), {"day": SESSION, "stamp": moment})
+        connection.execute(text(
+            "INSERT INTO qmt_datadir_minute_stage VALUES "
+            "('run-1','600000',:stamp,:day,'11','1','10','100','1100','600000.SH')"
+        ), {"day": SESSION, "stamp": next_minute})
+        connection.execute(text("CREATE TABLE writes (operation, id, code, stamp, source)"))
+        for event, alias in (("INSERT", "NEW"), ("DELETE", "OLD")):
+            connection.execute(text(
+                f"CREATE TRIGGER audit_{event.lower()} AFTER {event} ON sm_stock_minute "
+                f"BEGIN INSERT INTO writes VALUES ('{event}',{alias}.id,{alias}.stock_code,"
+                f"{alias}.trade_time,{alias}.data_source); END"
+            ))
+        publish_session(connection, batch_id="later", replace_sources=("old",), **params)
+        writes = connection.execute(text(
+            "SELECT operation,code,stamp,source FROM writes ORDER BY operation,code,stamp"
+        )).all()
+        assert writes == [
+            ("DELETE", "600000", moment, "qmt_datadir"),  # Duplicate
+            ("DELETE", "600001", moment, "qmt_datadir"),  # Wrong quality case
+            ("DELETE", "600002", moment, "old"),         # Explicitly superseded
+            ("DELETE", "600003", moment, "qmt_datadir"),  # No corresponding stage
+            ("INSERT", "600000", next_minute, "qmt_datadir"),
+            ("INSERT", "600001", moment, "qmt_datadir"),
+        ]
+        assert connection.execute(text(
+            "SELECT * FROM sm_stock_minute WHERE stock_code='600000' AND trade_time=:stamp"
+        ), {"stamp": moment}).one() == kept
+        assert connection.execute(text(
+            "SELECT quality_status FROM sm_stock_minute WHERE stock_code='600001'"
+        )).scalar_one() == "VERIFIED"
+        assert connection.execute(text(
+            "SELECT data_source FROM sm_stock_minute WHERE stock_code='600002'"
+        )).scalar_one() == "OLD"
     engine.dispose()
 
 
