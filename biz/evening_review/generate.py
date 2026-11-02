@@ -126,7 +126,9 @@ def published_report(digest: dict, target: str) -> str:
 def main():
     parser = argparse.ArgumentParser(description="A股统一盘后复盘")
     parser.add_argument("date", nargs="?", help="已闭市交易日 YYYY-MM-DD")
-    parser.add_argument("--test", action="store_true", help="预览已保存的正式复盘，不重新生成、不推送")
+    delivery = parser.add_mutually_exclusive_group()
+    delivery.add_argument("--test", action="store_true", help="预览已保存的正式复盘，不重新生成、不推送")
+    delivery.add_argument("--push", action="store_true", help="显式推送企业微信；默认仅发布或核验网站正式报告")
     parser.add_argument("--output", default="")
     args = parser.parse_args()
     engine = get_engine()
@@ -137,7 +139,7 @@ def main():
         Path(args.output).write_text(report, encoding="utf-8")
     if args.test:
         _safe_print(report)
-    else:
+    elif args.push:
         push_to_wecom(report, engine=engine)
     return 0
 
