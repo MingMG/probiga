@@ -133,6 +133,35 @@ def test_native_fallback_compares_nonterminating_percentage_at_actual_mysql_scal
         assert connection.execute(text("SELECT COUNT(*) FROM qmt_datadir_minute_stage")).scalar() == 0
 
 
+@pytest.mark.parametrize(("delta", "stored_pct", "expected_reuse"), [
+    (10, "0.039063", True),
+    (-10, "-0.039063", True),
+    (10, "0.039062", False),
+])
+def test_native_fallback_rounds_dat_midpoints_like_mysql(
+        existing_partition, delta, stored_pct, expected_reuse):
+    item = existing_partition
+    moment = "09:53:00"
+    index = coverage.CORE_GRID.index(moment)
+    code = CODES[0]
+    path = item.root / "SZ" / MINUTE_PERIOD / (code + ".DAT")
+    records = np.frombuffer(path.read_bytes()[len(DAT_HEADER):], dtype="<u4").reshape(-1, 16).copy()
+    records[index, 4] = 25600 + delta
+    records[index, 13] = 25600
+    path.write_bytes(DAT_HEADER + records.tobytes())
+    with item.engine.begin() as connection:
+        connection.execute(text(
+            "UPDATE sm_stock_minute SET price=:price,`change`=:delta,change_pct=:pct "
+            "WHERE stock_code=:code AND trade_time=:stamp"
+        ), dict(price=str((25600 + delta) / 1000), delta=str(delta / 1000),
+                pct=stored_pct, code=code, stamp=f"{DAY} {moment}"))
+    before = _stored_rows(item.engine)
+    outcome = importer._reuse_existing_partition(item.engine, session=DAY, scope=item.scope,
+        datadir_roots=[item.root], universe=item.universe)
+    assert bool(outcome) is expected_reuse
+    assert _stored_rows(item.engine) == before
+
+
 def test_prior_completed_history_preserves_original_identity_after_failed_cursor(existing_partition):
     item = existing_partition
     actual = coverage.persisted_matrix(item.engine, str(DAY), scope=item.scope)
