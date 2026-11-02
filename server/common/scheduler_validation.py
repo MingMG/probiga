@@ -11,6 +11,7 @@ import shlex
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from time import monotonic
 from typing import Any, Mapping
 
 from sqlalchemy import bindparam, text
@@ -5990,6 +5991,44 @@ def _validate_news_sync_receipt(
     )
 
 
+def _read_notice_validation_window(engine, *, codes, window_start, window_end):
+    """Read the frozen universe through the existing stock/date access path.
+
+    The production join selected (stock_code,art_code) and filtered the date
+    after reading years of history, timing out after an otherwise complete
+    collector run. Batches keep both the index range and response bounded.
+    """
+    deadline = monotonic() + 180.0
+    rows = []
+    mysql = getattr(getattr(engine, "dialect", None), "name", None) == "mysql"
+    index_hint = " FORCE INDEX (idx_notice_stock_date)" if mysql else ""
+    for offset in range(0, len(codes), 100):
+        if monotonic() >= deadline:
+            raise RuntimeError("notice_readback: total deadline exceeded")
+        batch = codes[offset:offset + 100]
+        placeholders = ",".join(f":code_{index}" for index in range(len(batch)))
+        params = {f"code_{index}": code for index, code in enumerate(batch)}
+        params.update(request_window_start=window_start, request_window_end=window_end)
+        rows.extend(_read_all(engine, f"""
+            SELECT /*+ MAX_EXECUTION_TIME(15000) */
+                   notice.stock_code, notice.art_code, notice.notice_date,
+                   notice.title, notice.column_name, notice.display_time,
+                   notice.detail_url, notice.association_validated,
+                   notice.etl_sync_at, notice.qmt_code, notice.data_source,
+                   notice.source_time, notice.received_at, notice.batch_id,
+                   notice.data_version, notice.quality_status,
+                   notice.permission_status
+              FROM si_notice_eastmoney AS notice{index_hint}
+             WHERE notice.stock_code IN ({placeholders})
+               AND notice.notice_date >= :request_window_start
+               AND notice.notice_date <= :request_window_end
+             ORDER BY notice.stock_code, notice.art_code
+        """, params))
+        if monotonic() >= deadline:
+            raise RuntimeError("notice_readback: total deadline exceeded")
+    return rows
+
+
 def _validate_notice_eastmoney_receipt(
     engine: Engine,
     *,
@@ -6051,27 +6090,9 @@ def _validate_notice_eastmoney_receipt(
     ):
         return False, "notice_eastmoney: requested universe differs from si_all_code"
 
-    fresh_rows = _read_all(
-        engine,
-        """
-        SELECT notice.stock_code, notice.art_code, notice.notice_date,
-               notice.title, notice.column_name, notice.display_time,
-               notice.detail_url, notice.association_validated,
-               notice.etl_sync_at, notice.qmt_code, notice.data_source,
-               notice.source_time, notice.received_at, notice.batch_id,
-               notice.data_version, notice.quality_status,
-               notice.permission_status
-          FROM si_notice_eastmoney AS notice
-          JOIN si_all_code AS catalog
-            ON catalog.stock_code = notice.stock_code
-         WHERE notice.notice_date >= :request_window_start
-           AND notice.notice_date <= :request_window_end
-         ORDER BY notice.stock_code, notice.art_code
-        """,
-        {
-            "request_window_start": request_window_start,
-            "request_window_end": request_window_end,
-        },
+    fresh_rows = _read_notice_validation_window(
+        engine, codes=expected_codes,
+        window_start=request_window_start, window_end=request_window_end,
     )
     from integrations.qmt.backend import to_qmt_symbol
 
