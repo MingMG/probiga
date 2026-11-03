@@ -412,6 +412,10 @@ def research_input_fingerprint(
     if not _GIT_SHA_RE.fullmatch(build_sha):
         raise ResearchPoolValidationError("publisher build SHA is invalid")
     verified = validate_research_payload(payload)
+    return _verified_research_input_fingerprint(verified, build_sha=build_sha)
+
+
+def _verified_research_input_fingerprint(verified: Mapping[str, Any], *, build_sha: str) -> str:
     artifact = verified["artifact"]
     pit_evidence = _mapping(artifact.get("pit_evidence"), "pit_evidence")
     model_evaluation = _mapping(
@@ -451,10 +455,7 @@ def publish_research_pool(
         payload,
         now=publication_time,
     )
-    input_fingerprint = research_input_fingerprint(
-        payload,
-        publisher_build_sha=build_sha,
-    )
+    input_fingerprint = _verified_research_input_fingerprint(verified, build_sha=build_sha)
     object_bytes, payload_sha256, payload_file_sha256 = _payload_bytes(
         payload,
         source_bytes,
@@ -789,10 +790,7 @@ def _validated_manifest_payload(
     )
     if verified["artifact_sha256"] != artifact_sha256:
         raise ResearchPoolValidationError("research pool artifact hash differs")
-    expected_input_fingerprint = research_input_fingerprint(
-        payload,
-        publisher_build_sha=build_sha,
-    )
+    expected_input_fingerprint = _verified_research_input_fingerprint(verified, build_sha=build_sha)
     manifest_input_fingerprint = str(
         manifest.get("input_fingerprint") or expected_input_fingerprint
     ).lower()
