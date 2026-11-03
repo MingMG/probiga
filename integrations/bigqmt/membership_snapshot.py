@@ -129,6 +129,21 @@ def verify_existing_membership_snapshot(
                 {"snapshot_date": target, "source": source},
             ).mappings().all()
         ]
+        if open_count != 1 or len(runs) != 1:
+            raise RuntimeError("QMT membership exact target snapshot is unavailable")
+        run = runs[0]
+        captured_at = _snapshot_datetime(run.get("captured_at"), field="captured_at")
+        if (
+            str(run.get("snapshot_date"))[:10] != target.isoformat()
+            or run.get("source") != source
+            or run.get("quality_status") != "QMT_VALIDATED"
+            or run.get("capture_mode") != "qmt_close_full_refresh"
+            or captured_at < close_ready_at
+            or captured_at >= knowledge_cutoff
+            or captured_at > known_at
+        ):
+            raise RuntimeError("QMT membership snapshot provenance is not target-date PIT")
+
         concept_rows = [
             dict(row)
             for row in connection.execute(
@@ -154,21 +169,6 @@ def verify_existing_membership_snapshot(
                 {"snapshot_date": target, "source": source},
             ).mappings().all()
         ]
-
-    if open_count != 1 or len(runs) != 1:
-        raise RuntimeError("QMT membership exact target snapshot is unavailable")
-    run = runs[0]
-    captured_at = _snapshot_datetime(run.get("captured_at"), field="captured_at")
-    if (
-        str(run.get("snapshot_date"))[:10] != target.isoformat()
-        or run.get("source") != source
-        or run.get("quality_status") != "QMT_VALIDATED"
-        or run.get("capture_mode") != "qmt_close_full_refresh"
-        or captured_at < close_ready_at
-        or captured_at >= knowledge_cutoff
-        or captured_at > known_at
-    ):
-        raise RuntimeError("QMT membership snapshot provenance is not target-date PIT")
 
     concept_identities: list[tuple[str, ...]] = []
     industry_identities: list[tuple[str, ...]] = []

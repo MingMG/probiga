@@ -913,7 +913,8 @@ def orchestrate_strategy_governance(
                 industry_snapshot=industry,
             )
     if (
-        ensure_build_commit_sha
+        not authoritative_persistent_runner
+        and ensure_build_commit_sha
         and str(result.get("build_commit_sha") or "")
         != str(ensure_build_commit_sha)
     ):

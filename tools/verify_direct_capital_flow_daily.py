@@ -186,12 +186,12 @@ def inspect_partition(engine: object, trade_date: str) -> dict[str, Any]:
             }
         )
 
-    if len(actual_codes) != len(set(actual_codes)):
+    actual_set = set(actual_codes)
+    if len(actual_codes) != len(actual_set):
         raise RuntimeError(
             "DATA_BLOCKED: direct QMT capital-flow partition has duplicate codes"
         )
     expected_set = set(expected_codes)
-    actual_set = set(actual_codes)
     if actual_set != expected_set:
         raise RuntimeError(
             "DATA_BLOCKED: direct QMT capital-flow coverage differs from traded "
@@ -200,12 +200,11 @@ def inspect_partition(engine: object, trade_date: str) -> dict[str, Any]:
         )
 
     canonical_rows.sort(key=lambda item: item["stock_code"])
-    sorted_codes = sorted(actual_set)
     return {
         "trade_date": target,
         "row_count": len(canonical_rows),
         "expected_row_count": len(expected_set),
-        "code_set_sha256": _sha256_json(sorted_codes),
+        "code_set_sha256": _sha256_json([row["stock_code"] for row in canonical_rows]),
         "partition_sha256": _sha256_json(canonical_rows),
         "source_counts": {PROVIDER: len(canonical_rows)},
     }

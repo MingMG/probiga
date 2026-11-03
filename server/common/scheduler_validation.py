@@ -626,21 +626,23 @@ def _validate_target_turnover_scheduler_receipt(
             target_date=target,
             decision_at=max(observed_at, published_at),
         )
-        proofs = [
-            validate_turnover_evidence(item["turnover_evidence_json"])
-            for item in evidence.values()
-        ]
+        if len(evidence) != expected_count:
+            return False, "target turnover persisted proof differs from receipt"
+        expected_identity = (
+            str(payload.get("run_id") or ""),
+            str(payload.get("collector_build_sha") or "").lower(),
+            str(payload.get("semantic_sha256") or ""),
+        )
+        for item in evidence.values():
+            proof = validate_turnover_evidence(item["turnover_evidence_json"])
+            if (
+                str(proof.get("snapshot_run_id") or ""),
+                str(proof.get("collector_build_sha") or "").lower(),
+                str(proof.get("snapshot_semantic_sha256") or ""),
+            ) != expected_identity:
+                return False, "target turnover persisted proof differs from receipt"
     except Exception as exc:
         return False, f"target turnover persisted receipt is invalid: {exc}"
-    if len(evidence) != expected_count or {
-        str(item.get("snapshot_run_id") or "") for item in proofs
-    } != {str(payload.get("run_id") or "")} or {
-        str(item.get("collector_build_sha") or "").lower()
-        for item in proofs
-    } != {str(payload.get("collector_build_sha") or "").lower()} or {
-        str(item.get("snapshot_semantic_sha256") or "") for item in proofs
-    } != {str(payload.get("semantic_sha256") or "")}:
-        return False, "target turnover persisted proof differs from receipt"
     return True, (
         "target turnover exact immutable snapshot verified: "
         f"date={target} rows={expected_count} run_id={payload['run_id']}"
@@ -1997,7 +1999,15 @@ def _notice_eastmoney_output_status(
     *,
     return_code: int | None,
 ) -> str:
-    payload = _notice_eastmoney_payload(output)
+    return _notice_eastmoney_receipt_status(
+        task, _notice_eastmoney_payload(output), return_code=return_code,
+    )
+
+
+def _notice_eastmoney_receipt_status(
+    task: Mapping[str, Any], payload: Mapping[str, Any] | None,
+    *, return_code: int | None,
+) -> str:
     if payload is None or return_code is None:
         return "failed"
     try:
@@ -6177,9 +6187,9 @@ def _validate_notice_eastmoney_receipt(
     payload = _notice_eastmoney_payload(output)
     if (
         payload is None
-        or _notice_eastmoney_output_status(
+        or _notice_eastmoney_receipt_status(
             task or {},
-            output,
+            payload,
             return_code=0,
         )
         != "success"
