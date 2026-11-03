@@ -13447,7 +13447,7 @@
         var tab = routeTabFromLocation() || 'trading';
         var routeDate = normalizedTradingRouteDate(routeDecisionDateFromLocation(), tab);
         if (routeDate && el('datePicker')) el('datePicker').value = routeDate;
-        _restoreTab(tab);
+        window.switchTab(tab, {fromHistory:true});
     });
 
     function linkedStockCodeFromLocation() {
