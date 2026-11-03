@@ -4397,6 +4397,7 @@ def load_finance_atomic_batch_seal(
     decision_at: datetime | str,
     as_of_date: date | str,
     seal_coverage_id: str = "",
+    verify_source_rows: bool = True,
 ) -> dict[str, Any]:
     """Validate and resolve the latest immutable full-catalog finance seal."""
 
@@ -4409,6 +4410,8 @@ def load_finance_atomic_batch_seal(
     target = _date_value(as_of_date, required=True)
     if target is None or not requested:
         return {}
+    if not verify_source_rows and not seal_coverage_id:
+        raise ValueError("finance receipt-only validation requires an exact seal ID")
     selection = {"seal_coverage_id": seal_coverage_id} if seal_coverage_id else {}
     row, evidence, member_map, _ = _load_latest_finance_atomic_seal_evidence(
         engine, decision_at=decision, **selection,
@@ -4497,48 +4500,50 @@ def load_finance_atomic_batch_seal(
     ]
     selected: list[dict[str, Any]] = []
     delta_source_cutoff: datetime | None = None
-    if source_validation_codes:
-        selected, delta_source_cutoff = _select_finance_atomic_batch_members(
-            engine,
-            codes=source_validation_codes,
-            listing_dates=listing_dates,
-            completed_known_at=completed,
-            as_of_date=sealed_as_of,
-            incremental_discovery=incremental_discovery,
-            catalog_binding=catalog_binding,
+    selected_map = {}
+    if verify_source_rows:
+        if source_validation_codes:
+            selected, delta_source_cutoff = _select_finance_atomic_batch_members(
+                engine,
+                codes=source_validation_codes,
+                listing_dates=listing_dates,
+                completed_known_at=completed,
+                as_of_date=sealed_as_of,
+                incremental_discovery=incremental_discovery,
+                catalog_binding=catalog_binding,
+            )
+        selected_map = {
+            str(item.get("stock_code") or "").zfill(6): item
+            for item in selected
+        }
+        rebuilt_members = sorted(
+            [_finance_atomic_member(item) for item in selected_map.values()]
+            + [member_map[code] for code in validation_codes if code in excluded_codes],
+            key=lambda item: item["stock_code"],
         )
-    selected_map = {
-        str(item.get("stock_code") or "").zfill(6): item
-        for item in selected
-    }
-    rebuilt_members = sorted(
-        [_finance_atomic_member(item) for item in selected_map.values()]
-        + [member_map[code] for code in validation_codes if code in excluded_codes],
-        key=lambda item: item["stock_code"],
-    )
-    expected_members = (
-        members
-        if schema == FINANCE_ATOMIC_BATCH_SCHEMA
-        else evidence.get("delta_members")
-    )
-    source_cutoff_matches = True
-    if schema == FINANCE_ATOMIC_BATCH_SCHEMA:
-        source_cutoff_matches = (
-            delta_source_cutoff is not None
-            and _dt_text(delta_source_cutoff) == evidence.get("source_cutoff_at")
+        expected_members = (
+            members
+            if schema == FINANCE_ATOMIC_BATCH_SCHEMA
+            else evidence.get("delta_members")
         )
-    elif delta_source_cutoff is not None:
-        parent_cutoff = _date_time_value(
-            evidence.get("source_cutoff_at"), required=True
-        )
-        source_cutoff_matches = delta_source_cutoff >= parent_cutoff
-    if (
-        rebuilt_members != expected_members
-        or not source_cutoff_matches
-        or finance_disclosure_gate(sealed_as_of).minimum_report_date.isoformat()
-        != evidence.get("minimum_report_date")
-    ):
-        raise ValueError("finance atomic batch member proof differs")
+        source_cutoff_matches = True
+        if schema == FINANCE_ATOMIC_BATCH_SCHEMA:
+            source_cutoff_matches = (
+                delta_source_cutoff is not None
+                and _dt_text(delta_source_cutoff) == evidence.get("source_cutoff_at")
+            )
+        elif delta_source_cutoff is not None:
+            parent_cutoff = _date_time_value(
+                evidence.get("source_cutoff_at"), required=True
+            )
+            source_cutoff_matches = delta_source_cutoff >= parent_cutoff
+        if (
+            rebuilt_members != expected_members
+            or not source_cutoff_matches
+        ):
+            raise ValueError("finance atomic batch member proof differs")
+    if finance_disclosure_gate(sealed_as_of).minimum_report_date.isoformat() != evidence.get("minimum_report_date"):
+        raise ValueError("finance atomic batch disclosure period differs")
     sealed_rows = {
         code: _finance_atomic_row_from_member(member)
         for code, member in member_map.items()

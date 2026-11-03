@@ -7458,6 +7458,7 @@ def _validate_finance_scheduler_coverage(
             engine, codes=sorted(expected_codes), decision_at=now,
             as_of_date=target,
             seal_coverage_id=str(submitted.get("seal_coverage_id") or ""),
+            verify_source_rows=False,
         )
     except Exception as exc:
         return False, f"stock_finance: output atomic seal validation failed: {type(exc).__name__}:{exc}"
