@@ -108,7 +108,6 @@ REQUIRED_DEPLOY_PROTOCOL_V4=probiga-production-deploy-v4
 RETIRED_DEPLOY_PROTOCOL_V2=probiga-production-deploy-v2
 REQUIRED_RECOVERY_PROTOCOL=probiga-database-guard-recovery-v2
 readonly DEPLOY_ENGINE_RELEASE_MODE_CAPABILITY=probiga-release-mode-v1
-readonly QMT_EDGE_DEPLOY_BLOCKING=0
 # Publish verified code independently of missing market/strategy results.
 # Schema, identity, writer fencing and the final activation grant remain hard
 # gates. The exact-build data observer runs after EVERY successful release.
@@ -17098,46 +17097,8 @@ if [ "$RELEASE_SCOPE" = COORDINATED ]; then
   # A deferred release still leaves a terminal grant for the background Windows
   # updater. A blocking release additionally proves the exact new heartbeat and
   # native bootstrap receipt before Linux service activation continues.
-  if [ "$QMT_EDGE_DEPLOY_BLOCKING" -eq 1 ]; then
-CUTOVER_STEP=wait_for_qmt_windows_edge_identity
-QMT_EDGE_WAIT_DEADLINE=$((SECONDS + 900))
-QMT_EDGE_IDENTITY_OUTPUT=""
-while [ "$SECONDS" -lt "$QMT_EDGE_WAIT_DEADLINE" ]; do
-  if QMT_EDGE_IDENTITY_OUTPUT="$(run_prepared_python_tool \
-    "$PREPARED_CODE_ROOT/tools/check_qmt_windows_edge.py" \
-    --identity-only --expected-build-sha "$EXPECTED_SHA" \
-    --expected-poll-seconds 60 --compact)"; then
-    break
-  fi
-  sleep 5
-done
-test -n "$QMT_EDGE_IDENTITY_OUTPUT"
-printf '%s\n' "$QMT_EDGE_IDENTITY_OUTPUT"
-printf '%s' "$QMT_EDGE_IDENTITY_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
-  'import json,sys; p=json.load(sys.stdin); d=p.get("detail") if isinstance(p,dict) else None; c=d.get("current") if isinstance(d,dict) else None; ok=p.get("status")=="AVAILABLE" and p.get("mode")=="identity" and p.get("strategy_eligible") is True and p.get("database_writes") is False and isinstance(c,dict) and c.get("build_sha")==sys.argv[1] and c.get("executor_role")=="qmt_windows_edge" and c.get("instance_id")==f"{c.get('"'"'host_name'"'"')}-{c.get('"'"'pid'"'"')}" and d.get("expected_poll_seconds")==60 and d.get("errors")==[]; raise SystemExit(0 if ok else 2)' \
-  "$EXPECTED_SHA"
-
-CUTOVER_STEP=wait_for_qmt_windows_edge_release_bootstrap
-QMT_EDGE_BOOTSTRAP_DEADLINE=$((SECONDS + 2700))
-QMT_EDGE_BOOTSTRAP_OUTPUT=""
-while [ "$SECONDS" -lt "$QMT_EDGE_BOOTSTRAP_DEADLINE" ]; do
-  if QMT_EDGE_BOOTSTRAP_OUTPUT="$(run_prepared_python_tool \
-    "$PREPARED_CODE_ROOT/tools/check_qmt_windows_edge.py" \
-    --release-bootstrap-only --expected-build-sha "$EXPECTED_SHA" \
-    --expected-poll-seconds 60 --compact)"; then
-    break
-  fi
-  sleep 10
-done
-test -n "$QMT_EDGE_BOOTSTRAP_OUTPUT"
-printf '%s\n' "$QMT_EDGE_BOOTSTRAP_OUTPUT"
-printf '%s' "$QMT_EDGE_BOOTSTRAP_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
-  'import json,re,sys; p=json.load(sys.stdin); d=p.get("detail") if isinstance(p,dict) else None; r=d.get("receipt") if isinstance(d,dict) else None; i=d.get("identity") if isinstance(d,dict) else None; c=i.get("current") if isinstance(i,dict) else None; ok=p.get("status")=="AVAILABLE" and p.get("mode")=="release-bootstrap" and p.get("strategy_eligible") is True and p.get("database_writes") is False and d.get("immutable_reference_verified") is True and d.get("receipt_count")==1 and d.get("errors")==[] and isinstance(r,dict) and r.get("build_sha")==sys.argv[1] and r.get("request_run_uid")==f"qmt-edge-request-{sys.argv[1]}" and r.get("scheduler_instance_id")==c.get("instance_id") and r.get("catalog_batch_id")==r.get("calendar_batch_id") and re.fullmatch(r"[0-9a-f]{64}",str(r.get("receipt_hash") or "")); raise SystemExit(0 if ok else 2)' \
-  "$EXPECTED_SHA"
-else
   CUTOVER_STEP=defer_qmt_windows_edge_release_bootstrap
-  echo "QMT Windows edge bootstrap wait skipped; exact activation remains scheduler-owned" >&2
-  fi
+  echo "QMT Windows edge bootstrap remains scheduler-owned" >&2
 else
   CUTOVER_STEP=preserve_qmt_windows_edge_activation
   echo "QMT Windows edge build preserved for Linux-scope full release" >&2
@@ -17145,41 +17106,7 @@ fi
 # QMT history readiness is checked by the scheduled consumer.
 QMT_HISTORY_TARGET_TRADE_DATE=""
 readonly QMT_HISTORY_TARGET_TRADE_DATE
-if [ "$RELEASE_DATA_VALIDATION_BLOCKING" -eq 1 ]; then
-  CUTOVER_STEP=validate_existing_qmt_announcement_full_market_batch
-  QMT_ANNOUNCEMENT_RUN_OUTPUT=""
-  QMT_ANNOUNCEMENT_RUN_STATUS=0
-  QMT_ANNOUNCEMENT_DISPOSITION=""
-  if QMT_ANNOUNCEMENT_RUN_OUTPUT="$(run_prepared_python_tool \
-    "$PREPARED_CODE_ROOT/tools/sync_qmt_announcement_pit.py" \
-    --validate-existing-complete-batch --window-days 30 \
-    --expected-trade-date "$QMT_HISTORY_TARGET_TRADE_DATE")"; then
-    QMT_ANNOUNCEMENT_RUN_STATUS=0
-  else
-    QMT_ANNOUNCEMENT_RUN_STATUS=$?
-  fi
-  printf '%s\n' "$QMT_ANNOUNCEMENT_RUN_OUTPUT"
-  QMT_ANNOUNCEMENT_DISPOSITION="$(
-    printf '%s' "$QMT_ANNOUNCEMENT_RUN_OUTPUT" | run_prepared_python_tool \
-      "$PREPARED_CODE_ROOT/tools/sync_qmt_announcement_pit.py" \
-      --validate-existing-result-exit "$QMT_ANNOUNCEMENT_RUN_STATUS" \
-      --expected-trade-date "$QMT_HISTORY_TARGET_TRADE_DATE"
-  )"
-  case "$QMT_ANNOUNCEMENT_RUN_STATUS:$QMT_ANNOUNCEMENT_DISPOSITION" in
-    0:complete) ;;
-    2:data_blocked)
-      echo "QMT announcement batch is not ready; deferring data catch-up until after code/service publication" >&2
-      ;;
-    *)
-      printf 'QMT announcement validation invalid_result exit=%s disposition=%q\n' \
-        "$QMT_ANNOUNCEMENT_RUN_STATUS" "$QMT_ANNOUNCEMENT_DISPOSITION" >&2
-      false
-      ;;
-  esac
-else
-  CUTOVER_STEP=skip_qmt_announcement_data_validation
-  echo "QMT announcement data validation skipped for code release" >&2
-fi
+CUTOVER_STEP=skip_qmt_announcement_data_validation
 CUTOVER_STEP=install_runtime_units
 install_prepared_dropins
 CUTOVER_STEP=verify_installed_runtime_units
@@ -17213,54 +17140,7 @@ if ! run_prepared_python_tool \
 fi
 GOVERNANCE_TASK_TOUCHED=1
 CUTOVER_STEP=run_strategy_governance
-GOVERNANCE_RUN_OUTPUT=""
-GOVERNANCE_RUN_STATUS=0
 GOVERNANCE_HEALTH_DISPOSITION=skipped
-GOVERNANCE_RUN_ARGS=(--expected-build-sha "$EXPECTED_SHA")
-if [ "$RELEASE_DATA_VALIDATION_BLOCKING" -eq 0 ]; then
-  echo "Strategy batch execution skipped for code release" >&2
-else
-  GOVERNANCE_HEALTH_DISPOSITION=completed
-  if GOVERNANCE_RUN_OUTPUT="$(run_prepared_python_tool \
-    "$PREPARED_CODE_ROOT/tools/run_strategy_governance_daily.py" \
-    "${GOVERNANCE_RUN_ARGS[@]}")"; then
-    GOVERNANCE_RUN_STATUS=0
-  else
-    GOVERNANCE_RUN_STATUS=$?
-  fi
-  printf '%s\n' "$GOVERNANCE_RUN_OUTPUT"
-  GOVERNANCE_JSON_STATUS=""
-  if ! GOVERNANCE_JSON_STATUS="$(
-    printf '%s' "$GOVERNANCE_RUN_OUTPUT" | run_prepared_python_tool \
-      "$PREPARED_CODE_ROOT/tools/run_strategy_governance_daily.py" \
-      --validate-result-exit "$GOVERNANCE_RUN_STATUS" \
-      "${GOVERNANCE_RUN_ARGS[@]}"
-  )"; then
-    printf 'strategy_governance invalid_result exit=%s\n' \
-      "$GOVERNANCE_RUN_STATUS" >&2
-    false
-  fi
-  case "$GOVERNANCE_RUN_STATUS:$GOVERNANCE_JSON_STATUS" in
-    0:completed|0:not_due) ;;
-    2:not_ready)
-      echo "Strategy governance input is not ready; refusing deployment before code/service publication" >&2
-      false
-      ;;
-    3:integrity_error)
-      echo "Strategy governance integrity check failed; refusing deployment" >&2
-      false
-      ;;
-    4:program_error)
-      echo "Strategy governance program failed; refusing deployment" >&2
-      false
-      ;;
-    *)
-      printf 'strategy_governance invalid_result exit=%s json_status=%q\n' \
-        "$GOVERNANCE_RUN_STATUS" "$GOVERNANCE_JSON_STATUS" >&2
-      false
-      ;;
-  esac
-fi
 CUTOVER_STEP=enable_strategy_governance_task
 run_prepared_python_tool \
   "$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" \
@@ -17541,25 +17421,7 @@ HEALTH_RESPONSE=""
 curl --fail-with-body --silent --show-error --retry "$HEALTH_RETRIES" \
   --retry-all-errors --retry-delay "$HEALTH_INTERVAL" --retry-connrefused \
   http://127.0.0.1/api/health/runtime >/dev/null
-if [ "$RELEASE_DATA_VALIDATION_BLOCKING" -eq 1 ]; then
-  CUTOVER_STEP=verify_strategy_governance_api_and_page_smoke
-  if [ "$GOVERNANCE_HEALTH_DISPOSITION" = completed ]; then
-    verify_strategy_governance_api_and_page_smoke \
-      "$EXPECTED_SHA" "$GOVERNANCE_TRADE_DATE"
-  else
-    test "$GOVERNANCE_HEALTH_DISPOSITION" = input_not_ready
-    echo "Strategy governance canonical API smoke deferred until release catch-up completes" >&2
-  fi
-  CUTOVER_STEP=verify_strategy_pool_api_and_page_smoke
-  verify_strategy_pool_api_and_page_smoke \
-    "$EXPECTED_SHA" "$GOVERNANCE_TRADE_DATE"
-  CUTOVER_STEP=verify_today_strategy_daily_result_smoke
-  verify_today_strategy_daily_result_smoke \
-    "$EXPECTED_SHA" "$GOVERNANCE_TRADE_DATE"
-else
-  CUTOVER_STEP=skip_market_data_api_smokes
-  echo "Strategy batch and pool content smokes skipped for code release" >&2
-fi
+CUTOVER_STEP=skip_market_data_api_smokes
 ACTIVE_INPUT_LOCK_SHA256="$EXPECTED_INPUT_LOCK_SHA256"
 ACTIVE_RESOLVED_FREEZE_SHA256="$EXPECTED_RESOLVED_FREEZE_SHA256"
 ACTIVE_ADATA_SHA="$EXPECTED_ADATA_SHA"

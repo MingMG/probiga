@@ -1497,23 +1497,14 @@ def test_qmt_announcement_checkpoint_state_is_persistent_and_separate_from_code(
     prepare_call = normalized.index(
         "prepare_qmt_announcement_checkpoint_root", service_user
     )
-    first_capture = normalized.index(
-        "CUTOVER_STEP=validate_existing_qmt_announcement_full_market_batch",
-        prepare_call,
-    )
-    assert service_user < prepare_call < first_capture
+    install_runtime = normalized.index("CUTOVER_STEP=install_runtime_units", prepare_call)
+    assert service_user < prepare_call < install_runtime
     assert (
         'QMT_ANNOUNCEMENT_CHECKPOINT_DIR="$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT"'
         in bodies["run_prepared_python_tool"]
     )
     for name in ("write_dropin", "write_scheduler_dropin"):
         assert "QMT_ANNOUNCEMENT_CHECKPOINT_DIR=" in bodies[name]
-    capture = normalized[first_capture:]
-    assert "--validate-existing-complete-batch --window-days 30" in capture
-    assert '--expected-trade-date "$QMT_HISTORY_TARGET_TRADE_DATE"' in capture
-    assert '--checkpoint-dir "$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT"' not in (
-        capture.split("CUTOVER_STEP=install_runtime_units", 1)[0]
-    )
     assert (
         "--checkpoint-dir /var/lib/probiga/qmt-announcement-checkpoints"
         in deploy_script
@@ -1591,100 +1582,17 @@ def test_initial_qmt_history_gate_cannot_be_waived_before_governance() -> None:
     assert "set -Eeuo pipefail" in normalized
 
 
-def test_qmt_history_and_reference_reads_start_only_after_schema_cutover() -> None:
-    deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
-        encoding="utf-8"
+def test_release_preserves_qmt_activation_without_running_data_jobs() -> None:
+    deploy = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    normalized = _normalized_shell(deploy)
+    schema = normalized.index("CUTOVER_STEP=recover_strategy_governance_database_trust")
+    provenance = normalized.index(
+        "CUTOVER_STEP=verify_qmt_local_history_provenance_schema_after_cutover", schema
     )
-    normalized = _normalized_shell(deploy_script)
-    schema_recover = normalized.index(
-        "CUTOVER_STEP=recover_strategy_governance_database_trust"
-    )
-    provenance_check = normalized.index(
-        "CUTOVER_STEP=verify_qmt_local_history_provenance_schema_after_cutover",
-        schema_recover,
-    )
-    release_activation = normalized.index(
-        "CUTOVER_STEP=repair_qmt_windows_edge_activation",
-        provenance_check,
-    )
-    edge_identity = normalized.index(
-        "CUTOVER_STEP=wait_for_qmt_windows_edge_identity", release_activation
-    )
-    edge_bootstrap = normalized.index(
-        "CUTOVER_STEP=wait_for_qmt_windows_edge_release_bootstrap",
-        edge_identity,
-    )
-    readiness = normalized.index(
-        "CUTOVER_STEP=read_strategy_governance_qmt_history_readiness_after_schema",
-        edge_bootstrap,
-    )
-    history_apply = normalized.index(
-        "CUTOVER_STEP=prepare_strategy_governance_qmt_history", readiness
-    )
-    announcement_batch = normalized.index(
-        "CUTOVER_STEP=validate_existing_qmt_announcement_full_market_batch",
-        history_apply,
-    )
-    governance_run = normalized.index(
-        "CUTOVER_STEP=run_strategy_governance", announcement_batch
-    )
-    body = normalized[provenance_check:history_apply]
-
-    assert (
-        schema_recover
-        < provenance_check
-        < release_activation
-        < edge_identity
-        < edge_bootstrap
-        < readiness
-        < history_apply
-        < announcement_batch
-        < governance_run
-    )
-    assert body.count(
-        'run_prepared_python_tool '
-        '"$PREPARED_CODE_ROOT/tools/'
-        'migrate_qmt_local_history_provenance.py" --check-via-primary'
-    ) == 1
-    announcement_body = normalized[announcement_batch:governance_run]
-    assert "--validate-existing-complete-batch --window-days 30" in (
-        announcement_body
-    )
-    assert announcement_body.count(
-        '--expected-trade-date "$QMT_HISTORY_TARGET_TRADE_DATE"'
-    ) == 2
-    assert "--batch-size" not in announcement_body
-    assert "--checkpoint-dir" not in announcement_body
-    assert '--validate-existing-result-exit "$QMT_ANNOUNCEMENT_RUN_STATUS"' in (
-        announcement_body
-    )
-    assert (
-        'case "$QMT_ANNOUNCEMENT_RUN_STATUS:'
-        '$QMT_ANNOUNCEMENT_DISPOSITION" in'
-    ) in announcement_body
-    assert "0:complete)" in announcement_body
-    assert "2:data_blocked)" in announcement_body
-    assert "deferring data catch-up" in announcement_body
-    assert 'test "$QMT_ANNOUNCEMENT_RUN_STATUS" -eq 0' not in announcement_body
-    assert "sync_guojin_qmt_reference_data.py" not in body
-    assert "ensure_qmt_windows_edge_activation" in body
-    activation_helper = _shell_function_bodies(deploy_script)[
-        "ensure_qmt_windows_edge_activation"
-    ]
-    assert "controlled_guard_run_qmt_activation_tool" in activation_helper
-    assert "--repair-activation" in activation_helper
-    assert "--identity-only --expected-build-sha \"$EXPECTED_SHA\"" in body
-    assert "--release-bootstrap-only" in body
-    assert body.count("--expected-poll-seconds 60 --compact") == 2
-    assert 'QMT_HISTORY_PREFLIGHT_OUTPUT="$(run_prepared_python_tool' in body
-    assert "session_window_sha256" in body
-    assert "readonly QMT_HISTORY_TARGET_TRADE_DATE" in body
-    assert "|| true" not in body
-    assert body.count(
-        'run_prepared_python_tool '
-        '"$PREPARED_CODE_ROOT/tools/'
-        'prepare_strategy_governance_qmt_history.py" --readiness-only'
-    ) == 1
+    activation = normalized.index("CUTOVER_STEP=repair_qmt_windows_edge_activation", provenance)
+    assert "ensure_qmt_windows_edge_activation" in normalized[activation:]
+    assert "CUTOVER_STEP=validate_existing_qmt_announcement_full_market_batch" not in deploy
+    assert "CUTOVER_STEP=wait_for_qmt_windows_edge_release_bootstrap" not in deploy
 
 
 def test_linux_release_verifies_inherited_qmt_activation_without_repair(
