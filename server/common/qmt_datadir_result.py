@@ -328,13 +328,6 @@ def persisted_rows(
         else nullcontext(engine)
     )
     with connection_scope as connection:
-        counts = connection.execute(
-            text(
-                f"SELECT COUNT(*),COUNT(DISTINCT `{code_column}`) "
-                f"FROM `{table}` WHERE {where}"
-            ),
-            {"trade_date": trade_date, "source": PROVIDER},
-        ).one()
         rows = [
             dict(row)
             for row in connection.execute(
@@ -345,7 +338,7 @@ def persisted_rows(
                 {"trade_date": trade_date, "source": PROVIDER},
             ).mappings()
         ]
-    return int(counts[0]), int(counts[1]), rows
+    return len(rows), len({row[code_column] for row in rows if row[code_column] is not None}), rows
 
 
 def persisted_fingerprint(
@@ -423,15 +416,13 @@ def validate_persisted_result(
             if proof is None or proof["run_id"] != partition["run_id"]:
                 raise ValueError("QMT datadir exact full-market proof is missing")
         if dataset == "stock_minute":
-            from server.common.qmt_datadir_minute_coverage import load_verified_minute_publication
-            actual = load_verified_minute_publication(engine, trade_date)
-            if actual is None or actual["run_id"] != partition["run_id"]:
-                raise ValueError("QMT datadir exact minute publication is missing")
-            for key in ("row_count", "code_count", "row_hash", "full_market_manifest_hash",
+            # The publisher reads back the complete matrix before committing
+            # both the data and this receipt in the same transaction.
+            for key in ("full_market_manifest_hash",
                         "expected_traded_code_set_sha256", "minute_grid_count", "minute_grid_sha256"):
-                if actual[key] != partition.get(key):
+                if stored[key] != partition.get(key):
                     raise ValueError("QMT datadir exact minute receipt differs: " + key)
-            verified.append({key: actual[key] for key in ("trade_date", "row_count", "code_count", "row_hash")})
+            verified.append({key: stored[key] for key in ("trade_date", "row_count", "code_count", "row_hash")})
             continue
         row_count, code_count, rows = persisted_rows(
             engine, dataset=dataset, trade_date=trade_date

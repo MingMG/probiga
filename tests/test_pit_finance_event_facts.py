@@ -1103,6 +1103,17 @@ def test_finance_incremental_seal_reuses_parent_and_revalidates_only_delta(
     )
 
     assert calls == [["000001"], ["000001"]]
+    receipt = load_finance_atomic_batch_seal(
+        engine,
+        codes=["000001", "002731"],
+        decision_at="2026-08-30 01:31:00",
+        as_of_date="2026-08-30",
+        seal_coverage_id=delta["seal_coverage_id"],
+        verify_source_rows=False,
+    )
+    assert calls == [["000001"], ["000001"]]
+    assert receipt["members"] == loaded["members"]
+    assert receipt["batch_root_sha256"] == loaded["batch_root_sha256"]
     assert delta["parent_batch_root_sha256"] == parent["batch_root_sha256"]
     assert delta["changed_code_count"] == 1
     assert loaded["changed_code_count"] == 1
