@@ -11,7 +11,7 @@
 """
 
 import argparse
-from collections import deque
+from collections import Counter, deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 import hashlib
@@ -2448,7 +2448,9 @@ def main(argv: list[str] | None = None) -> int:
             "failure_sample": failures[:20],
             "atomic_batch": atomic_batch,
             "candidate_input_root_sha256": candidate_input_root_sha256,
-            "candidate_reasons": incremental_plan["refresh_reasons"],
+            # The input root binds the full per-stock plan. Keep the receipt
+            # small enough to replay even when every stock needs refreshing.
+            "candidate_reason_counts": dict(Counter(incremental_plan["refresh_reasons"].values())),
             "report_period_applicable_code_count": len(applicable_latest_periods),
             "new_listing_period_exempt_code_count": len(exempt_new_listing_codes),
             "oldest_latest_report_date": (
