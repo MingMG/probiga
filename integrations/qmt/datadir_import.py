@@ -495,7 +495,11 @@ def publish_session(
         f"SELECT DISTINCT stock_code FROM `{TARGET_TABLE}` "
         "WHERE trade_date=:d AND data_source IN :sources"
     ).bindparams(bindparam("sources", expanding=True))
-    codes.update(str(row[0]) for row in conn.execute(current_codes, {"d": session, "sources": sources}))
+    existing_codes = {
+        str(row[0])
+        for row in conn.execute(current_codes, {"d": session, "sources": sources})
+    }
+    codes.update(existing_codes)
     ordered = sorted(codes)
     deadline = time.monotonic() + deadline_seconds
 
@@ -554,18 +558,24 @@ def publish_session(
     delete = text(
         f"DELETE FROM `{TARGET_TABLE}` WHERE id IN :ids"
     ).bindparams(bindparam("ids", expanding=True))
+    # The caller holds the minute writer lock and one transaction throughout.
+    # An empty target scope needs neither reconciliation nor an anti-join.
+    target_join = f"""
+            LEFT JOIN `{TARGET_TABLE}` AS e{target_index}
+              ON e.data_source=:source AND {identity}
+             AND {indexed_stock_match('e', TARGET_TABLE, 's', STAGE_TABLE)}
+             AND {exact_text('e.data_source')}={exact_text(':source')}
+    """ if existing_codes else ""
+    missing_filter = "AND e.id IS NULL" if existing_codes else ""
     insert = text(f"""
             INSERT INTO `{TARGET_TABLE}` ({','.join(MINUTE_COLUMNS)})
             SELECT s.stock_code, s.trade_time, s.trade_date, s.price, s.`change`, s.change_pct,
                    s.volume, s.amount, NOW(), s.qmt_code, :source, s.trade_time, NOW(),
                    :batch_id, :version, :quality, :permission
             FROM `{STAGE_TABLE}` AS s{stage_index}
-            LEFT JOIN `{TARGET_TABLE}` AS e{target_index}
-              ON e.data_source=:source AND {identity}
-             AND {indexed_stock_match('e', TARGET_TABLE, 's', STAGE_TABLE)}
-             AND {exact_text('e.data_source')}={exact_text(':source')}
+            {target_join}
             WHERE s.run_id=:run_id AND s.trade_date=:d AND s.stock_code IN :codes
-              AND e.id IS NULL
+              {missing_filter}
             ORDER BY s.stock_code, s.trade_time
         """).bindparams(bindparam("codes", expanding=True))
     processed_rows = inserted_rows = deleted_rows = 0
@@ -584,7 +594,7 @@ def publish_session(
             "d": session,
             "codes": batch,
         }
-        ids = conn.execute(victims, params).scalars().all()
+        ids = conn.execute(victims, params).scalars().all() if existing_codes else []
         for start in range(0, len(ids), 500):
             if time.monotonic() >= deadline:
                 raise TimeoutError("minute_publication: total deadline exceeded")
