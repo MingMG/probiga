@@ -283,15 +283,9 @@ def test_code_release_does_not_block_on_qmt_history_rescan() -> None:
         encoding="utf-8"
     )
 
-    assert "readonly QMT_HISTORY_DEPLOY_BLOCKING=0" in deploy
-    assert (
-        "QMT history release scan skipped; data readiness remains "
-        "scheduler-owned"
-    ) in deploy
-    assert (
-        "CUTOVER_STEP=resolve_strategy_governance_trade_date_without_history_scan"
-        in deploy
-    )
+    assert "tools/prepare_strategy_governance_qmt_history.py" not in deploy
+    assert "tools/repair_linux_recent_data_gaps.py" not in deploy
+    assert "tools/run_release_analysis_fast.py" not in deploy
 
 
 class _AdataBoundaryPath:

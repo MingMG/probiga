@@ -109,11 +109,6 @@ RETIRED_DEPLOY_PROTOCOL_V2=probiga-production-deploy-v2
 REQUIRED_RECOVERY_PROTOCOL=probiga-database-guard-recovery-v2
 readonly DEPLOY_ENGINE_RELEASE_MODE_CAPABILITY=probiga-release-mode-v1
 readonly QMT_EDGE_DEPLOY_BLOCKING=0
-# Market-history attestation is a data-readiness concern, not a code-release
-# prerequisite.  Keep the legacy exact-window gate available for controlled
-# maintenance, but production publication must not stop the API/scheduler to
-# rescan 120 sessions before it can install a new immutable release.
-readonly QMT_HISTORY_DEPLOY_BLOCKING=0
 # Publish verified code independently of missing market/strategy results.
 # Schema, identity, writer fencing and the final activation grant remain hard
 # gates. The exact-build data observer runs after EVERY successful release.
@@ -16875,49 +16870,6 @@ if [ "$PREVIOUS_SHA" = "$EXPECTED_SHA" ]; then
   fi
   exit 0
 fi
-if [ "$RELEASE_DATA_VALIDATION_BLOCKING" -eq 1 ]; then
-  CUTOVER_STEP=resolve_release_strategy_target_trade_date
-  RELEASE_STRATEGY_TARGET_TRADE_DATE="$(run_prepared_python_tool -c \
-    'from server.common.authoritative_market_clock import authoritative_closed_trade_date; from server.common.batch_db import create_batch_engine; from tools.env_config import load_project_env; load_project_env(); engine=create_batch_engine(future=True); value=authoritative_closed_trade_date(engine); engine.dispose(); print(value)')"
-  [[ "$RELEASE_STRATEGY_TARGET_TRADE_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]
-  readonly RELEASE_STRATEGY_TARGET_TRADE_DATE
-  CUTOVER_STEP=repair_release_stock_daily_flow
-  RELEASE_FLOW_OUTPUT=""
-  RELEASE_FLOW_STATUS=0
-  if RELEASE_FLOW_OUTPUT="$(run_prepared_scheduler_tool linux_provider \
-    "$PREPARED_CODE_ROOT/tools/repair_linux_recent_data_gaps.py" \
-    --dataset stock_daily_flow --lookback-sessions 1 \
-    --max-repairs-per-run 1 --expected-build-sha "$EXPECTED_SHA" \
-    --state-file /var/lib/probiga/jobs/linux-recent-data-gap-repair-v1.json \
-    --apply --json)"; then
-    RELEASE_FLOW_STATUS=0
-  else
-    RELEASE_FLOW_STATUS=$?
-  fi
-  printf '%s\n' "$RELEASE_FLOW_OUTPUT"
-  printf '%s' "$RELEASE_FLOW_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
-    'import json,sys; p=json.load(sys.stdin); ok=int(sys.argv[1])==0 and p.get("schema")=="probiga.linux-recent-data-gap-repair-result.v1" and p.get("status")=="COMPLETE" and p.get("build_sha")==sys.argv[2] and p.get("datasets")==["stock_daily_flow"] and p.get("sessions")==[sys.argv[3]] and p.get("remaining_count")==0 and p.get("automatic_order_submission") is False; raise SystemExit(0 if ok else 2)' \
-    "$RELEASE_FLOW_STATUS" "$EXPECTED_SHA" "$RELEASE_STRATEGY_TARGET_TRADE_DATE"
-
-  # Keep the old API online until the exact-date core analysis inputs are ready.
-  # Missing native upper-limit evidence remains fail-closed per stock and does
-  # not block publication of the otherwise complete analysis pool.
-  CUTOVER_STEP=wait_release_analysis_native_input
-  run_prepared_python_tool \
-    "$PREPARED_CODE_ROOT/tools/run_release_analysis_fast.py" \
-    --readiness-only --wait-seconds 900 \
-    --target-date "$RELEASE_STRATEGY_TARGET_TRADE_DATE" \
-    --expected-build-sha "$EXPECTED_SHA"
-  CUTOVER_STEP=publish_release_analysis_pool
-  RELEASE_ANALYSIS_OUTPUT="$(run_prepared_scheduler_tool linux_standalone \
-    "$PREPARED_CODE_ROOT/tools/run_release_analysis_fast.py" \
-    --target-date "$RELEASE_STRATEGY_TARGET_TRADE_DATE" \
-    --expected-build-sha "$EXPECTED_SHA")"
-  printf '%s\n' "$RELEASE_ANALYSIS_OUTPUT"
-  printf '%s' "$RELEASE_ANALYSIS_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
-    'import json,re,sys; p=json.load(sys.stdin); ok=p.get("schema")=="probiga.release-analysis-fast-result.v1" and p.get("status")=="COMPLETE" and p.get("task_type")=="analysis_fast" and p.get("target_trade_date")==sys.argv[1] and p.get("build_sha")==sys.argv[2] and p.get("ready") is True and int(p.get("flow_rows") or 0)>=5000 and int(p.get("analysis_count") or 0)>=1000 and int(p.get("recommendation_count") or 0)>=0 and re.fullmatch(r"[0-9a-f]{32}",str(p.get("run_uid") or "")) and re.fullmatch(r"[0-9a-f]{64}",str(p.get("canonical_pool_sha256") or "")) and p.get("automatic_real_order_submission") is False and p.get("real_order_authority") is False; raise SystemExit(0 if ok else 2)' \
-    "$RELEASE_STRATEGY_TARGET_TRADE_DATE" "$EXPECTED_SHA"
-fi
 GOVERNANCE_TASK_OLD_SOURCE="$(mktemp)"
 chown "$SERVICE_USER:$SERVICE_USER" "$GOVERNANCE_TASK_OLD_SOURCE"
 chmod 0600 "$GOVERNANCE_TASK_OLD_SOURCE"
@@ -17190,46 +17142,9 @@ else
   CUTOVER_STEP=preserve_qmt_windows_edge_activation
   echo "QMT Windows edge build preserved for Linux-scope full release" >&2
 fi
-CUTOVER_STEP=read_strategy_governance_qmt_history_readiness_after_schema
-if [ "$QMT_HISTORY_DEPLOY_BLOCKING" -eq 1 ]; then
-QMT_HISTORY_PREFLIGHT_OUTPUT="$(run_prepared_python_tool \
-  "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_qmt_history.py" \
-  --readiness-only)"
-printf '%s\n' "$QMT_HISTORY_PREFLIGHT_OUTPUT"
-QMT_HISTORY_WINDOW="$(
-  printf '%s' "$QMT_HISTORY_PREFLIGHT_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
-    'import json,re,sys; from datetime import date; p=json.load(sys.stdin); keys={"status","mode","target_trade_date","session_count","start_date","end_date","session_window_sha256","target_rows","native_qmt_rows","exact_matched_rows","database_writes","automatic_real_order_submission"}; values=[p.get(k) for k in ("target_trade_date","start_date","end_date")]; canonical=isinstance(p,dict) and all(isinstance(x,str) and date.fromisoformat(x).isoformat()==x for x in values); counts=type(p.get("target_rows")) is int and p["target_rows"]>0 and p.get("native_qmt_rows")==p["target_rows"] and p.get("exact_matched_rows")==p["target_rows"]; ok=set(p)==keys and p.get("status")=="ok" and p.get("mode")=="readiness-only" and p.get("session_count")==120 and canonical and values[0]==values[2] and values[1]<=values[2] and isinstance(p.get("session_window_sha256"),str) and re.fullmatch(r"[0-9a-f]{64}",p["session_window_sha256"]) and counts and p.get("database_writes") is False and p.get("automatic_real_order_submission") is False; print(*values,p.get("session_window_sha256","")) if ok else None; raise SystemExit(0 if ok else 2)'
-)"
-read -r QMT_HISTORY_TARGET_TRADE_DATE QMT_HISTORY_START_DATE \
-  QMT_HISTORY_END_DATE QMT_HISTORY_SESSION_WINDOW_SHA256 \
-  QMT_HISTORY_WINDOW_EXTRA <<< "$QMT_HISTORY_WINDOW"
-test -z "$QMT_HISTORY_WINDOW_EXTRA"
-readonly QMT_HISTORY_TARGET_TRADE_DATE QMT_HISTORY_START_DATE \
-  QMT_HISTORY_END_DATE QMT_HISTORY_SESSION_WINDOW_SHA256
-CUTOVER_STEP=prepare_strategy_governance_qmt_history
-run_prepared_python_tool \
-  "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_qmt_history.py" \
-  --expected-target-trade-date "$QMT_HISTORY_TARGET_TRADE_DATE" \
-  --expected-start-date "$QMT_HISTORY_START_DATE" \
-  --expected-end-date "$QMT_HISTORY_END_DATE" \
-  --expected-session-window-sha256 \
-    "$QMT_HISTORY_SESSION_WINDOW_SHA256"
-else
-  CUTOVER_STEP=resolve_strategy_governance_trade_date_without_history_scan
-  if [ "$RELEASE_DATA_VALIDATION_BLOCKING" -eq 1 ]; then
-    QMT_HISTORY_TARGET_TRADE_DATE="$(run_prepared_python_tool -c \
-      'from server.common.authoritative_market_clock import authoritative_closed_trade_date; from server.common.batch_db import create_batch_engine; from tools.env_config import load_project_env; load_project_env(); engine=create_batch_engine(future=True); value=authoritative_closed_trade_date(engine); engine.dispose(); print(value)')"
-    [[ "$QMT_HISTORY_TARGET_TRADE_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]
-  else
-    QMT_HISTORY_TARGET_TRADE_DATE=""
-  fi
-  QMT_HISTORY_START_DATE=""
-  QMT_HISTORY_END_DATE=""
-  QMT_HISTORY_SESSION_WINDOW_SHA256=""
-  echo "QMT history release scan skipped; data readiness remains scheduler-owned" >&2
-fi
-readonly QMT_HISTORY_TARGET_TRADE_DATE QMT_HISTORY_START_DATE \
-  QMT_HISTORY_END_DATE QMT_HISTORY_SESSION_WINDOW_SHA256
+# QMT history readiness is checked by the scheduled consumer.
+QMT_HISTORY_TARGET_TRADE_DATE=""
+readonly QMT_HISTORY_TARGET_TRADE_DATE
 if [ "$RELEASE_DATA_VALIDATION_BLOCKING" -eq 1 ]; then
   CUTOVER_STEP=validate_existing_qmt_announcement_full_market_batch
   QMT_ANNOUNCEMENT_RUN_OUTPUT=""
@@ -17297,10 +17212,6 @@ if ! run_prepared_python_tool \
   false
 fi
 GOVERNANCE_TASK_TOUCHED=1
-if [ "$RELEASE_DATA_VALIDATION_BLOCKING" -eq 1 ]; then
-  test "$QMT_HISTORY_TARGET_TRADE_DATE" = \
-    "$RELEASE_STRATEGY_TARGET_TRADE_DATE"
-fi
 CUTOVER_STEP=run_strategy_governance
 GOVERNANCE_RUN_OUTPUT=""
 GOVERNANCE_RUN_STATUS=0
