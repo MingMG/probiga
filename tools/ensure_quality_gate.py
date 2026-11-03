@@ -1306,9 +1306,9 @@ def _load_qmt_coverage_bundle(
         if load_receipt(connection, dataset=dataset, trade_date=trade_date) is not None:
             raise RuntimeError("local-cache daily publication lacks exact full-market proof")
     elif dataset == "stock_minute":
-        if load_receipt(connection, dataset=dataset, trade_date=trade_date) is not None:
-            from server.common.qmt_datadir_minute_coverage import load_verified_minute_publication
-            proof = load_verified_minute_publication(connection, trade_date, decision_known_at=current)
+        from server.common.qmt_datadir_minute_coverage import load_verified_minute_publication
+        proof = load_verified_minute_publication(connection, trade_date, decision_known_at=current)
+        if proof is not None:
             return {"manifest": proof}
     rows = connection.execute(text("""
         SELECT manifest_hash, schema_version, dataset, trade_date, status,
