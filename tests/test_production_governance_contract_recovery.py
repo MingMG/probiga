@@ -581,6 +581,46 @@ def _qmt_rollback_payload(
     )
 
 
+@pytest.mark.parametrize("windows_prior,windows_live", [(0, 0), (1, 0), (0, 1)])
+def test_forward_recovery_only_replays_linux_enabled_bits(windows_prior, windows_live):
+    from server.api.scheduler_runtime import (
+        SCHEDULER_OWNER_LINUX,
+        SCHEDULER_OWNER_WINDOWS_QMT,
+        scheduler_task_host_owner,
+    )
+
+    rows = [_old_row(task, index) for index, task in enumerate(
+        (QMT_ANNOUNCEMENT_TASK, *QMT_OPERATION_TASKS), 1
+    )]
+    linux_ids = {row["id"] for row in rows
+                 if scheduler_task_host_owner(row) == SCHEDULER_OWNER_LINUX}
+    windows_ids = {row["id"] for row in rows
+                   if scheduler_task_host_owner(row) == SCHEDULER_OWNER_WINDOWS_QMT}
+    assert len(linux_ids) == 2 and len(windows_ids) == 4
+    for row in rows:
+        row["enabled"] = 1 if row["id"] in linux_ids else windows_prior
+    live = deepcopy(rows)
+    for row in live:
+        row["enabled"] = windows_live if row["id"] in windows_ids else 0
+    payload = _qmt_rollback_payload(rows[1:], announcement_rows=rows[:1])
+    engine = _RollbackEngine(live)
+
+    if windows_prior or windows_live:
+        with pytest.raises(RuntimeError, match="Windows scheduler|enabled policy differs"):
+            recovery.restore_fenced_linux_qmt_enabled_policy(engine, payload)
+        assert engine.rows == live
+        assert not any(sql.startswith("UPDATE ") for sql, _ in engine.executions)
+    else:
+        result = recovery.restore_fenced_linux_qmt_enabled_policy(engine, payload)
+        assert result == {"changed_row_count": 2, "verified": True}
+        assert engine.rows == rows
+        assert {p["restore_id"] for sql, p in engine.executions
+                if sql.startswith("UPDATE ")} == linux_ids
+        assert recovery.restore_fenced_linux_qmt_enabled_policy(engine, payload) == {
+            "changed_row_count": 0, "verified": True,
+        }
+
+
 def test_old_governance_projection_verifies_after_additive_schema_expansion() -> None:
     sealed = _old_row(TASK, 218)
     live = _live_expanded_row(TASK, 218)
@@ -1073,6 +1113,69 @@ def test_forward_qmt_snapshot_reader_accepts_original_sealed_envelope():
     payload=recovery._read_rollback_snapshot(io.StringIO(json.dumps(envelope)),snapshot_kind='forward-qmt')
     assert payload['snapshot_kind']=='forward-qmt'
     assert len(payload['rows'])==6
+
+
+def test_forward_recovery_completes_only_missing_sealed_snapshots(tmp_path):
+    from pathlib import Path
+    import shutil
+    import subprocess
+
+    bash = shutil.which("bash") or str(Path(r"C:\Program Files\Git\bin\bash.exe"))
+    if not Path(bash).is_file():
+        pytest.skip("Bash required")
+    source = (Path(__file__).resolve().parents[1] / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    functions = "\n".join(re.search(rf"(?ms)^{name}\(\) \{{\n.*?^\}}$", source).group(0)
+                          for name in (
+        "activation_snapshot_validate_governance_new", "activation_snapshot_task_seal_valid",
+        "activation_snapshot_task_new_state", "controlled_guard_forward_task_snapshot_state",
+        "controlled_guard_complete_forward_task_snapshots",
+    ))
+    harness = """set -Eeuo pipefail
+cd "$(dirname "$0")"
+ACTIVATION_GOVERNANCE_OLD_SNAPSHOT=old-governance
+ACTIVATION_GOVERNANCE_OLD_SHA=old-governance.sha
+ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT=old-qmt
+ACTIVATION_QMT_ANNOUNCEMENT_OLD_SHA=old-qmt.sha
+ACTIVATION_GOVERNANCE_NEW_SNAPSHOT=governance
+ACTIVATION_GOVERNANCE_NEW_SHA=governance.sha
+ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT=qmt-announcement
+ACTIVATION_QMT_ANNOUNCEMENT_NEW_SHA=qmt-announcement.sha
+controlled_guard_assert_file() { test -f "$1" && test ! -L "$1"; }
+activation_snapshot_validate() { test "$1" = exact; }
+activation_snapshot_phase() { echo "$phase"; }
+seal() { sha256sum "$1" | cut -d' ' -f1 > "$1.sha"; }
+controlled_guard_governance_contract_snapshot() { echo "$1:${4:-}" >> actions; }
+controlled_guard_capture_forward_task_snapshot() {
+  test ! -e "$2"
+  echo "$2" > "$2"
+  seal "$2"
+}
+""" + functions + """
+phase=runtime-units-installed
+echo old > old-governance; seal old-governance
+echo old > old-qmt; seal old-qmt
+test "$(controlled_guard_forward_task_snapshot_state exact)" = missing:missing
+echo unchanged > governance; seal governance
+test "$(controlled_guard_forward_task_snapshot_state exact)" = sealed:missing
+phase=old-set-restored
+if controlled_guard_complete_forward_task_snapshots exact; then exit 3; fi
+test ! -e actions
+phase=runtime-units-installed
+echo bad > governance.sha
+if controlled_guard_complete_forward_task_snapshots exact; then exit 4; fi
+test ! -e actions
+seal governance
+controlled_guard_complete_forward_task_snapshots exact
+test "$(cat governance)" = unchanged
+test "$(cat qmt-announcement)" = qmt-announcement
+test "$(cat actions)" = $'verify:forward-governance\\nrestore-enabled-policy:rollback-qmt'
+controlled_guard_complete_forward_task_snapshots exact
+test "$(wc -l < actions)" -eq 2
+"""
+    script = tmp_path / "missing-forward-task-snapshots.sh"
+    script.write_text(harness, encoding="utf-8", newline="\n")
+    result = subprocess.run([bash, str(script)], capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_new_qmt_snapshot_uses_authenticated_current_tool_instead_of_guarded_full_row_comparator(tmp_path):

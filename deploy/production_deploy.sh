@@ -1622,6 +1622,18 @@ activation_snapshot_validate_governance_new() {
   done
   return 0
 }
+activation_snapshot_task_seal_valid() {
+  controlled_guard_assert_file "$1" 600 && controlled_guard_assert_file "$2" 600 &&
+    test "$(<"$2")" = "$(sha256sum "$1" | cut -d' ' -f1)"
+}
+activation_snapshot_task_new_state() {
+  if [ ! -e "$1" ] && [ ! -L "$1" ] && [ ! -e "$2" ] && [ ! -L "$2" ]; then
+    echo missing
+  else
+    activation_snapshot_task_seal_valid "$1" "$2" || return 1
+    echo sealed
+  fi
+}
 activation_snapshot_install_task_new() {
   local source="$1"
   local target_snapshot="$2"
@@ -5449,19 +5461,24 @@ controlled_guard_governance_snapshot() {
   local release_venv="$RELEASE_VENV_ROOT/$guarded_sha"
   local service_user adata_sha adata_tree_sha adata_source
   local release_tree_sha adapter_registry_seal_sha
-  case "$snapshot" in
-    "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT")
+  local snapshot_input="$snapshot" snapshot_argument=-
+  case "$action:$snapshot" in
+    capture:/tmp/.probiga-forward-task.*/snapshot.json)
+      snapshot_input=/dev/null
+      snapshot_argument="$snapshot"
+      ;;
+    *:"$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT")
       controlled_guard_assert_file "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" 600 || \
         return 1
       test "$(<"$ACTIVATION_GOVERNANCE_OLD_SHA")" = \
         "$(sha256sum "$snapshot" | cut -d' ' -f1)" || return 1
       ;;
-    "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT")
+    *:"$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT")
       activation_snapshot_validate_governance_new || return 1
       ;;
     *) return 1 ;;
   esac
-  case "$action" in restore|verify) ;; *) return 1 ;; esac
+  case "$action" in restore|verify|capture) ;; *) return 1 ;; esac
   test -d "$code_root" || return 1
   test ! -L "$code_root" || return 1
   test -L "$release_venv" || return 1
@@ -5499,7 +5516,7 @@ controlled_guard_governance_snapshot() {
     PYTHONPATH="$adata_source:$code_root" \
     "$release_venv/bin/python" -P \
     "$code_root/tools/add_strategy_governance_task.py" \
-    "--${action}-snapshot" - < "$snapshot" || return 1
+    "--${action}-snapshot" "$snapshot_argument" < "$snapshot_input" || return 1
   return 0
 }
 controlled_guard_qmt_announcement_snapshot() {
@@ -5510,21 +5527,26 @@ controlled_guard_qmt_announcement_snapshot() {
   local release_venv="$RELEASE_VENV_ROOT/$guarded_sha"
   local service_user adata_sha adata_tree_sha adata_source
   local release_tree_sha adapter_registry_seal_sha
-  case "$snapshot" in
-    "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT")
+  local snapshot_input="$snapshot" snapshot_argument=-
+  case "$action:$snapshot" in
+    capture:/tmp/.probiga-forward-task.*/snapshot.json)
+      snapshot_input=/dev/null
+      snapshot_argument="$snapshot"
+      ;;
+    *:"$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT")
       controlled_guard_assert_file \
         "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT" 600 || return 1
       test "$(<"$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SHA")" = \
         "$(sha256sum "$snapshot" | cut -d' ' -f1)" || return 1
       ;;
-    "$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT")
+    *:"$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT")
       activation_snapshot_validate_governance_new || return 1
       controlled_guard_governance_contract_snapshot "$action" "$guarded_sha" "$snapshot" forward-qmt
       return $?
       ;;
     *) return 1 ;;
   esac
-  case "$action" in restore|verify) ;; *) return 1 ;; esac
+  case "$action" in restore|verify|capture) ;; *) return 1 ;; esac
   test -d "$code_root" || return 1
   test ! -L "$code_root" || return 1
   test -L "$release_venv" || return 1
@@ -5562,7 +5584,7 @@ controlled_guard_qmt_announcement_snapshot() {
     PYTHONPATH="$adata_source:$code_root" \
     "$release_venv/bin/python" -P \
     "$code_root/tools/add_qmt_announcement_task.py" \
-    "--${action}-snapshot" - < "$snapshot" || return 1
+    "--${action}-snapshot" "$snapshot_argument" < "$snapshot_input" || return 1
   return 0
 }
 materialize_controlled_governance_contract_tool() {
@@ -5618,6 +5640,7 @@ controlled_guard_governance_contract_snapshot() {
   local guarded_sha="$2"
   local snapshot="$3"
   local snapshot_kind="${4:-forward-governance}"
+  local partial="${5:-}"
   local code_root="$CODE_RELEASE_ROOT/$guarded_sha"
   local release_venv="$RELEASE_VENV_ROOT/$guarded_sha"
   local gate_output=""
@@ -5626,12 +5649,21 @@ controlled_guard_governance_contract_snapshot() {
   GOVERNANCE_CONTRACT_FAILURE_CODE=""
   case "$action" in
     restore|verify) ;;
+    restore-enabled-policy)
+      test "$snapshot_kind" = rollback-qmt || return 1
+      ;;
     *) GOVERNANCE_CONTRACT_FAILURE_CODE=action; return 1 ;;
   esac
   case "$snapshot_kind:$snapshot" in
     "forward-governance:$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT"|\
     "forward-qmt:$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT")
-      if ! activation_snapshot_validate_governance_new; then
+      local snapshot_sha="$ACTIVATION_GOVERNANCE_NEW_SHA"
+      if [ "$snapshot_kind" = forward-qmt ]; then
+        snapshot_sha="$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SHA"
+      fi
+      if [ "$action:$partial" = verify:partial ]; then
+        activation_snapshot_task_seal_valid "$snapshot" "$snapshot_sha" || return 1
+      elif ! activation_snapshot_validate_governance_new; then
         GOVERNANCE_CONTRACT_FAILURE_CODE=snapshot-seal
         return 1
       fi
@@ -5759,7 +5791,7 @@ controlled_guard_governance_contract_snapshot() {
         printf '%s\n' "$ignored_line" >&2
       fi
     done <<< "$gate_output"
-    if [ "$snapshot_kind" = forward-governance ]; then
+    if [ "$snapshot_kind" = forward-governance ] && [ "$partial" != partial ]; then
       if ! controlled_guard_qmt_announcement_snapshot "$action" "$guarded_sha" \
           "$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT"; then
         GOVERNANCE_CONTRACT_FAILURE_CODE=qmt-announcement-task
@@ -9145,18 +9177,99 @@ controlled_guard_certify_database_boundary() {
     "$scheduler_record" "$ai_service_record" "$ai_timer_record" || \
     controlled_guard_fail certify_boundary_final || return 1
 }
+controlled_guard_forward_task_snapshot_state() {
+  local guarded_sha="$1" governance qmt
+  if activation_snapshot_validate_governance_new; then
+    echo complete
+    return 0
+  fi
+  test "$(activation_snapshot_phase)" = runtime-units-installed || return 1
+  activation_snapshot_validate "$guarded_sha" >/dev/null || return 1
+  activation_snapshot_task_seal_valid "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" \
+    "$ACTIVATION_GOVERNANCE_OLD_SHA" || return 1
+  activation_snapshot_task_seal_valid "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT" \
+    "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SHA" || return 1
+  governance="$(activation_snapshot_task_new_state "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" \
+    "$ACTIVATION_GOVERNANCE_NEW_SHA")" || return 1
+  qmt="$(activation_snapshot_task_new_state "$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT" \
+    "$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SHA")" || return 1
+  case "$governance:$qmt" in
+    missing:missing|missing:sealed|sealed:missing) echo "$governance:$qmt" ;;
+    *) return 1 ;;
+  esac
+}
+controlled_guard_capture_forward_task_snapshot() (
+  local EXPECTED_SHA="$1" kind="$2" snapshot sha capture service_user work source
+  case "$kind" in
+    governance)
+      snapshot="$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT"
+      sha="$ACTIVATION_GOVERNANCE_NEW_SHA"
+      capture=controlled_guard_governance_snapshot
+      ;;
+    qmt-announcement)
+      snapshot="$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT"
+      sha="$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SHA"
+      capture=controlled_guard_qmt_announcement_snapshot
+      ;;
+    *) return 1 ;;
+  esac
+  test "$(activation_snapshot_task_new_state "$snapshot" "$sha")" = missing || return 1
+  service_user="$(systemctl show -p User --value probiga)" || return 1
+  test -n "$service_user" && test "$service_user" != root || return 1
+  work="$(mktemp -d /tmp/.probiga-forward-task.XXXXXX)" || return 1
+  source="$work/capture/snapshot.json"
+  trap 'rm -f -- "$source" "$work/sealed-input.json"; rmdir -- "$work/capture" "$work" 2>/dev/null || true' EXIT
+  chmod 0711 "$work" || return 1
+  install -d -o "$service_user" -m 0700 "$work/capture" || return 1
+  "$capture" capture "$EXPECTED_SHA" "$source" || return 1
+  # Open the service-produced file as the service user. The installer reads
+  # only the resulting copy inside this root-owned directory.
+  controlled_guard_run_service_gate_with_deadline "$service_user" \
+    "$CONTROLLED_DATABASE_GATE_TIMEOUT" "$CONTROLLED_DATABASE_GATE_KILL_AFTER" \
+    /usr/bin/head -c 1048577 -- "$source" > "$work/sealed-input.json" || return 1
+  test -s "$work/sealed-input.json" || return 1
+  test "$(stat -c %s "$work/sealed-input.json")" -le 1048576 || return 1
+  test "$(activation_snapshot_task_new_state "$snapshot" "$sha")" = missing || return 1
+  activation_snapshot_install_task_new "$work/sealed-input.json" "$snapshot" "$sha" "$kind"
+)
+controlled_guard_complete_forward_task_snapshots() {
+  local guarded_sha="$1" state
+  state="$(controlled_guard_forward_task_snapshot_state "$guarded_sha")" || return 1
+  case "$state" in
+    complete) return 0 ;;
+    sealed:missing)
+      controlled_guard_governance_contract_snapshot verify "$guarded_sha" \
+        "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" forward-governance partial || return 1
+      ;;
+    missing:sealed)
+      controlled_guard_governance_contract_snapshot verify "$guarded_sha" \
+        "$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT" forward-qmt partial || return 1
+      ;;
+  esac
+  if [[ "$state" = *:missing ]]; then
+    controlled_guard_governance_contract_snapshot restore-enabled-policy "$guarded_sha" \
+      "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT" rollback-qmt || return 1
+  fi
+  if [[ "$state" = missing:* ]]; then
+    controlled_guard_capture_forward_task_snapshot "$guarded_sha" governance || return 1
+  fi
+  if [[ "$state" = *:missing ]]; then
+    controlled_guard_capture_forward_task_snapshot "$guarded_sha" qmt-announcement || return 1
+  fi
+  activation_snapshot_validate_governance_new
+}
 controlled_guard_completed_forward_windows_instance() {
   local guarded_sha="$1"
   local code_root="$CODE_RELEASE_ROOT/$guarded_sha"
   local release_venv="$RELEASE_VENV_ROOT/$guarded_sha"
-  local previous_sha plan adata_sha adata_tree adata_source phase
+  local previous_sha plan adata_sha adata_tree adata_source phase task_snapshots
   phase="$(activation_snapshot_phase)" || return 1
   case "$phase" in
     runtime-units-installed|restoring-old|old-set-restored|restoring-new-no-receipt) ;;
     *) return 1 ;;
   esac
   activation_snapshot_validate_new "$guarded_sha" || return 1
-  activation_snapshot_validate_governance_new || return 1
+  task_snapshots="$(controlled_guard_forward_task_snapshot_state "$guarded_sha")" || return 1
   activation_snapshot_assert_pending_receipt_absent || return 1
   controlled_guard_assert_governance_restore_runtime "$guarded_sha" || return 1
   test "$(controlled_guard_component_sha "$guarded_sha" windows)" = "$guarded_sha" || return 1
@@ -9181,7 +9294,7 @@ controlled_guard_completed_forward_windows_instance() {
       "$release_venv/bin/python" -P -c '
 import json,sys
 from tools.check_schema_expected import _open_read_only_boundary, collect_schema_guard
-from tools.scheduler_task_release import validate_plan, _current
+from tools.scheduler_task_release import validate_plan, validate_applied_plan, _current
 from tools.add_trading_v3_tasks import TASKS
 from server.api.scheduler_runtime import scheduler_task_host_owner
 from server.common.scheduler_tasks import read_fresh_scheduler_writers_on_connection
@@ -9191,7 +9304,7 @@ from server.engine.strategy_governance import validate_prepared_governance_runti
 boundary=None
 stage="plan_scope"
 try:
-    target,plan_path=sys.argv[1:]
+    target,plan_path,task_snapshots=sys.argv[1:]
     with open(plan_path,encoding="utf-8") as stream: plan=validate_plan(json.load(stream))
     assert plan["target_sha"]==target
     _current(plan)
@@ -9201,6 +9314,11 @@ try:
     assert all(scheduler_task_host_owner(task)=="linux_standalone" for task in [*TASKS,*scoped])
     stage="physical_schema"
     boundary=_open_read_only_boundary()
+    if task_snapshots!="complete":
+        stage="applied_empty_task_plan"
+        assert not plan["upsert_task_types"] and not plan["retired_task_types"]
+        assert validate_applied_plan(boundary.runtime_engine,plan)["status"]=="NOOP"
+        stage="physical_schema"
     guard=collect_schema_guard(boundary.migrator_engine)
     assert guard["status"]=="READY" and guard["read_only"] is True and guard["mismatch_count"]==0
     assert guard["check_count"]==len(guard["checks"]) and guard["check_count"]>0
@@ -9245,7 +9363,7 @@ finally:
     if boundary is not None:
         boundary.runtime_engine.dispose()
         if boundary.migrator_engine is not None: boundary.migrator_engine.dispose()
-' "$guarded_sha" "$plan"
+' "$guarded_sha" "$plan" "$task_snapshots"
   )
 }
 controlled_database_guard_recovery() {
@@ -9314,6 +9432,11 @@ controlled_database_guard_recovery() {
     printf '%s\n' "$writer_fence_output"
     printf '%s' "$writer_fence_output" | controlled_guard_validate_writer_fence_json \
       "$RELEASE_VENV_ROOT/$guarded_sha/bin/python" || return 1
+    if ! activation_snapshot_validate_governance_new; then
+      controlled_guard_assert_boundary "$guarded_sha" "$main_record" \
+        "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
+    fi
+    controlled_guard_complete_forward_task_snapshots "$guarded_sha" || return 1
     controlled_guard_governance_contract_snapshot verify "$guarded_sha" \
       "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || return 1
     controlled_v2_forward_preserve_no_receipt_recovery "$forward_windows_instance" || return 1
@@ -10359,6 +10482,18 @@ if { [ "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 ] || \
           restoring-new-no-receipt ] || \
         [ "$(<"$ACTIVATION_UNIT_SNAPSHOT_PHASE")" = \
           new-runtime-preserved-no-receipt ]; }; }; }; then
+  if controlled_guard_assert_storage && \
+    pending_guarded_release="$(activation_snapshot_recorded_release)" && \
+    [ "$pending_guarded_release" != "$EXPECTED_SHA" ] && \
+    git --git-dir="$CODE_GIT_CACHE" merge-base --is-ancestor \
+      "$pending_guarded_release" "$EXPECTED_SHA" && \
+    activation_snapshot_validate_new "$pending_guarded_release" && \
+    pending_task_snapshots="$(controlled_guard_forward_task_snapshot_state "$pending_guarded_release")" && \
+    [ "$pending_task_snapshots" != complete ]; then
+    printf 'Activation requires --recover-database-guard %s before deployment\n' \
+      "$pending_guarded_release" >&2
+    exit 2
+  fi
   CUTOVER_STEP=v2_rollback_only_recovery
   # This bounded recovery owns a durable journal and must converge after the
   # caller disconnects.  Do not let transport signals interrupt it between
