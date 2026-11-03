@@ -7901,41 +7901,21 @@ def _daily_delivery_expected_ticket_pool_identity(
     """Resolve the immutable publisher identity of the active exact-date pool."""
 
     from server.common.daily_delivery_control import load_published_analysis_receipt
-    from server.common.analysis_pool_receipt import publication_is_complete_empty
     publication = load_published_analysis_receipt(connection, target)
-    manifest = read_persisted_pool_manifest(connection, target, score_snapshot=publication["score_snapshot"])
-    try:
-        analysis_count = int(manifest.get("analysis_count") or 0)
-        recommendation_count = int(manifest.get("recommendation_count") or 0)
-        executable_count = int(manifest.get("executable_count") or 0)
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError("daily delivery ticket-pool counters are invalid") from exc
-    publisher_run_uids = manifest.get("publisher_run_uids")
-    publication_statuses = manifest.get("publication_statuses")
+    analysis_count = int(publication["analysis_count"])
+    recommendation_count = int(publication["recommendation_count"])
+    executable_count = int(publication["executable_count"])
+    # The API below checks the active pool. Here we only need the exact
+    # completed publication to pass as its expected identity.
     conditions = [
         "trade_date=:trade_date",
         "build_sha=:build_sha",
+        "run_uid=:run_uid",
         "status='done'",
         "published_at IS NOT NULL",
     ]
-    params: dict[str, object] = {
-        "trade_date": target,
-        "build_sha": build_sha,
-    }
-    if recommendation_count == 0:
-        conditions.append("passed=0")
-        if publisher_run_uids != [publication["run_uid"]] or publication_statuses != [] or not publication_is_complete_empty(manifest):
-            raise RuntimeError("daily delivery empty ticket-pool state differs")
-    else:
-        if (
-            not isinstance(publisher_run_uids, list)
-            or len(publisher_run_uids) != 1
-            or not isinstance(publication_statuses, list)
-            or publication_statuses != ["ACTIVE"]
-        ):
-            raise RuntimeError("daily delivery active ticket-pool identity differs")
-        conditions.append("run_uid=:run_uid")
-        params["run_uid"] = str(publisher_run_uids[0]).strip().lower()
+    params = {"trade_date": target, "build_sha": build_sha,
+              "run_uid": publication["run_uid"]}
     histories = connection.execute(text(
         "SELECT run_uid, trade_date, build_sha, status, total, passed, "
         "executable_count, canonical_pool_sha256, published_at "
@@ -7971,12 +7951,8 @@ def _daily_delivery_expected_ticket_pool_identity(
         or executable_count != history_executable_count
         or executable_count < 0
         or executable_count > recommendation_count
-        or str(manifest.get("canonical_pool_sha256") or "").strip().lower()
+        or str(publication.get("canonical_pool_sha256") or "").strip().lower()
         != pool_sha256
-        or (
-            recommendation_count > 0
-            and publisher_run_uids != [run_uid]
-        )
     ):
         raise RuntimeError("daily delivery ticket-pool publisher differs")
     return {
