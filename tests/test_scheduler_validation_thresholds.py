@@ -1538,7 +1538,7 @@ def test_daily_delivery_runtime_health_binds_both_schedulers_and_empty_api(
     assert "expected_pool_sha256=" + pool_sha256 in api_load.call_args_list[1].args[0]
 
 
-def test_daily_delivery_expected_ticket_pool_identity_binds_active_manifest():
+def test_daily_delivery_expected_ticket_pool_identity_reuses_completed_receipt():
     engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
     target = "2026-08-26"
     run_uid = "a" * 32
@@ -1580,10 +1580,10 @@ def test_daily_delivery_expected_ticket_pool_identity_binds_active_manifest():
         })
     with patch(
         "server.api.scheduler_runtime.read_persisted_pool_manifest",
-        return_value=manifest,
+        side_effect=AssertionError("preflight must not rescan the published pool"),
     ), patch(
         "server.common.daily_delivery_control.load_published_analysis_receipt",
-        return_value={"score_snapshot": {}},
+        return_value={**manifest, "run_uid": run_uid},
     ):
         with engine.connect() as connection:
             result = scheduler_runtime._daily_delivery_expected_ticket_pool_identity(

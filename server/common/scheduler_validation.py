@@ -2536,7 +2536,14 @@ def _sector_heat_east_output_status(
     *,
     return_code: int | None,
 ) -> str:
-    payload = _sector_heat_east_payload(output)
+    return _sector_heat_east_receipt_status(
+        _sector_heat_east_payload(output), return_code=return_code,
+    )
+
+
+def _sector_heat_east_receipt_status(
+    payload: Mapping[str, Any] | None, *, return_code: int | None,
+) -> str:
     if payload is None or return_code is None:
         return "failed"
     try:
@@ -5867,7 +5874,7 @@ def _validate_sector_heat_east_receipt(
     payload = _sector_heat_east_payload(output)
     if (
         payload is None
-        or _sector_heat_east_output_status(output, return_code=0)
+        or _sector_heat_east_receipt_status(payload, return_code=0)
         != "success"
     ):
         return False, "sector_heat_east: exact PASS receipt is missing or invalid"
