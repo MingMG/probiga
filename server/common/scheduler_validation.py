@@ -2613,7 +2613,15 @@ def _news_sync_output_status(
     *,
     return_code: int | None,
 ) -> str:
-    payload = _news_sync_payload(output)
+    return _news_sync_receipt_status(_news_sync_payload(output), return_code=return_code)
+
+
+def _news_sync_receipt_status(
+    payload: Mapping[str, Any] | None,
+    *,
+    return_code: int | None,
+    archive_rows_by_source: dict[str, list] | None = None,
+) -> str:
     if payload is None or return_code is None:
         return "failed"
     required_sources = ["cls", "eastmoney", "federal_reserve", "sina"]
@@ -2675,6 +2683,8 @@ def _news_sync_output_status(
                             != max(row["publish_time"] for row in archive_rows))
                     ):
                         return "failed"
+                    if archive_rows_by_source is not None:
+                        archive_rows_by_source[source] = archive_rows
                 except (ImportError, KeyError, TypeError, ValueError, OSError, OverflowError):
                     return "failed"
             successful.append(source)
@@ -5942,8 +5952,9 @@ def _validate_news_sync_receipt(
 ) -> tuple[bool, str]:
     payload = _news_sync_payload(output)
     process_exit = 1 if payload and payload.get("status") == "PARTIAL" else 0
-    if payload is None or _news_sync_output_status(
-        output, return_code=process_exit,
+    archive_rows_by_source: dict[str, list] = {}
+    if payload is None or _news_sync_receipt_status(
+        payload, return_code=process_exit, archive_rows_by_source=archive_rows_by_source,
     ) not in {"success", "degraded"}:
         return False, "news_sync: exact source-health receipt is missing or invalid"
     synthetic_window = {
@@ -6005,14 +6016,7 @@ def _validate_news_sync_receipt(
             return False, "news_sync: persisted per-source health evidence differs"
     if "federal_reserve" in payload["successful_sources"]:
         try:
-            from server.common.federal_reserve_news_coverage import (
-                validate_federal_reserve_news_coverage,
-            )
-
-            source_fed_rows = validate_federal_reserve_news_coverage(
-                payload["source_results"]["federal_reserve"].get("archive_coverage"),
-                batch_started_at=receipt_started, batch_finished_at=receipt_finished,
-            )
+            source_fed_rows = archive_rows_by_source["federal_reserve"]
             persisted_fed_rows = [row for row in canonical if row["source"] == "federal_reserve"]
             if news_row_hash(persisted_fed_rows) != news_row_hash(source_fed_rows):
                 return False, "news_sync: persisted Federal Reserve rows differ from exact archive coverage"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
+import pandas as pd
 import pytest
 
 from server.trading_v3 import backtest, engine as engine_module
@@ -69,13 +70,13 @@ def test_backtest_bucket_gate_rejects_non_finite_point_estimate(
         }},
     )
 
-    assert backtest._validated_bucket(
+    assert not backtest._scores_in_valid_buckets(
+        pd.Series([0.8]),
         _table(
             profit_factor=profit_factor,
             payoff_ratio=payoff_ratio,
         ),
-        0.8,
-    ) is False
+    ).iloc[0]
 
 
 @pytest.mark.parametrize(

@@ -29,7 +29,7 @@ from server.common.pit_execution_guard import (
     participation_capped_quantity,
 )
 
-from .calibration import CalibrationTable, fit_calibration
+from .calibration import CalibrationBucket, CalibrationTable, fit_calibration
 from .config import load_v3_config
 from .exit_policy import daily_exit_reason
 from .metrics import trade_metrics
@@ -1321,14 +1321,7 @@ def _signal_eligibility_funnel(
     return funnel
 
 
-def _validated_bucket(
-    table: CalibrationTable,
-    score: float,
-) -> bool:
-    bucket = table.bucket_for(score)
-    if not bucket:
-        return False
-    gate = load_v3_config()["profit_gate"]
+def _bucket_passes_profit_gate(bucket: CalibrationBucket, gate: dict[str, Any]) -> bool:
     return (
         bucket.sample_count >= int(gate["minimum_oos_samples"])
         and bucket.expected_return_net_pct > 0
@@ -1340,6 +1333,12 @@ def _validated_bucket(
         and bucket.payoff_ratio >= float(gate["minimum_payoff_ratio"])
     )
 
+
+
+def _scores_in_valid_buckets(scores: pd.Series, table: CalibrationTable) -> pd.Series:
+    gate = load_v3_config()["profit_gate"]
+    valid = {bucket for bucket in table.buckets if _bucket_passes_profit_gate(bucket, gate)}
+    return scores.map(lambda score: table.bucket_for(float(score)) in valid)
 
 def _metrics(values: list[float]) -> dict[str, Any]:
     result = trade_metrics(values)
@@ -1429,12 +1428,7 @@ def _walk_forward_validation(
         ].copy()
         if not month.empty:
             month = month[
-                month["score"].map(
-                    lambda value: _validated_bucket(
-                        table,
-                        float(value),
-                    )
-                )
+                _scores_in_valid_buckets(month["score"], table)
             ]
             if not month.empty:
                 accepted_candidate_parts.append(month)
@@ -1469,12 +1463,7 @@ def _walk_forward_validation(
     )
     if final_calibration.has_valid_score_direction():
         final_train_valid = final_train[
-            final_train["score"].map(
-                lambda value: _validated_bucket(
-                    final_calibration,
-                    float(value),
-                )
-            )
+            _scores_in_valid_buckets(final_train["score"], final_calibration)
         ]
     else:
         final_train_valid = final_train.iloc[0:0].copy()
@@ -2203,7 +2192,7 @@ def run_right_side_walk_forward(
     blocks = list(model_gate_failures(
         validation=validation_metrics,
         portfolio=portfolio_metrics,
-        config=load_v3_config(),
+        config=config,
     ))
     if portfolio_metrics.get("execution_evidence_valid") is not True:
         blocks.append("PORTFOLIO_EXECUTION_EVIDENCE_INVALID")
