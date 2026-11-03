@@ -893,6 +893,59 @@ def reconcile_forward_qmt_snapshot(engine, payload, *, action):
             "ignored_runtime_diff_fields":ignored}
 
 
+def restore_fenced_linux_qmt_enabled_policy(engine, payload):
+    """Replay enabled bits while the exact Windows writer remains online."""
+    from server.api.scheduler_runtime import (
+        SCHEDULER_OWNER_LINUX,
+        SCHEDULER_OWNER_WINDOWS_QMT,
+        scheduler_task_host_owner,
+    )
+
+    if engine.dialect.name != "mysql" or payload.get("snapshot_kind") != "rollback-qmt":
+        raise RuntimeError("invalid sealed rollback scheduler snapshot")
+    columns = ("id", "task_type", "script_path", "script_args", "group_name", "enabled")
+    changes = []
+    with engine.begin() as connection:
+        _require_innodb(connection)
+        live_columns = _require_schema_columns(connection, set(columns))
+        for identity in payload["identities"]:
+            expected = payload["rows"].get(identity)
+            current = _require_rollback_live_identity(_rollback_matching_rows(
+                connection, identity=identity, expected=expected,
+                projection_columns=columns, lock=True,
+            ), identity=identity, expected=expected)
+            if current is None or (current["task_type"], current["script_path"]) != identity:
+                raise RuntimeError("live rollback scheduler task identity differs")
+            prior = expected.get("enabled") if expected is not None else 0
+            actual = current.get("enabled")
+            if type(prior) is not int or type(actual) is not int or prior not in {0, 1} or actual not in {0, prior}:
+                raise RuntimeError("sealed scheduler enabled policy differs")
+            owner = scheduler_task_host_owner(current)
+            if owner == SCHEDULER_OWNER_WINDOWS_QMT:
+                if (expected is None
+                    or (expected["task_type"], expected["script_path"]) != identity
+                    or (prior, actual) != (0, 0)):
+                    raise RuntimeError("Windows scheduler enabled policy requires writer fence")
+            elif owner != SCHEDULER_OWNER_LINUX:
+                raise RuntimeError("scheduler enabled policy owner is unavailable")
+            elif actual != prior:
+                changes.append((identity, current["id"], prior))
+        for identity, task_id, enabled in changes:
+            preserve_updated_at = ",`updated_at`=`updated_at`" if "updated_at" in live_columns else ""
+            params = {**_identity_payload(identity), "restore_id": task_id, "enabled": enabled}
+            result = connection.execute(text(
+                "UPDATE st_scheduled_tasks SET `enabled`=:enabled" + preserve_updated_at
+                + " WHERE id=:restore_id AND task_type=:task_type AND script_path=:script_path"
+            ), params)
+            readback = _require_rollback_live_identity(_rollback_matching_rows(
+                connection, identity=identity, expected=payload["rows"].get(identity),
+                projection_columns=columns, lock=True,
+            ), identity=identity, expected=payload["rows"].get(identity))
+            if result.rowcount != 1 or readback is None or readback["enabled"] != enabled:
+                raise RuntimeError("scheduler enabled policy readback differs")
+    return {"changed_row_count": len(changes), "verified": True}
+
+
 def reconcile_rollback_snapshot(
     engine,
     payload: dict[str, Any],
@@ -1079,7 +1132,7 @@ def main(argv: list[str] | None = None) -> int:
         description="恢复或验证封存的策略治理调度配置投影"
     )
     parser.add_argument(
-        "action", choices=("restore", "verify", "verify-stable")
+        "action", choices=("restore", "verify", "verify-stable", "restore-enabled-policy")
     )
     parser.add_argument(
         "snapshot_kind",
@@ -1103,7 +1156,9 @@ def main(argv: list[str] | None = None) -> int:
         load_project_env()
         engine = create_tool_engine()
         try:
-            if args.snapshot_kind == "forward-governance":
+            if args.action == "restore-enabled-policy":
+                result = restore_fenced_linux_qmt_enabled_policy(engine, expected)
+            elif args.snapshot_kind == "forward-governance":
                 result = reconcile_contract(engine, expected, action=args.action)
             elif args.snapshot_kind == "forward-qmt":
                 result = reconcile_forward_qmt_snapshot(engine, expected, action=args.action)
