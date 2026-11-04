@@ -1855,6 +1855,20 @@ def validate_finance_response(
     return latest
 
 
+def _finance_atomic_batch_receipt(seal: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep the immutable seal reference without copying its catalog into logs."""
+    receipt = dict(seal)
+    binding = receipt.get("incremental_discovery_binding")
+    if isinstance(binding, Mapping):
+        receipt["incremental_discovery_binding"] = {
+            key: value for key, value in binding.items()
+            if key not in {"changed_codes", "changed_dates_by_code"}
+        }
+        if "changed_codes" in binding:
+            receipt["incremental_discovery_binding"]["changed_code_count"] = len(binding["changed_codes"])
+    return receipt
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="同步股票财务核心指标")
     parser.add_argument("--code", type=str, default=None, help="同步单只股票代码")
@@ -2016,7 +2030,7 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 json.dumps(
                     {
-                        **seal,
+                        **_finance_atomic_batch_receipt(seal),
                         "seal_schema": seal.get("schema"),
                         "schema": "probiga.finance-atomic-batch-result.v1",
                         "status": "PASS",
@@ -2446,7 +2460,7 @@ def main(argv: list[str] | None = None) -> int:
             "written_report_count": total_rows,
             "failure_count": len(failures),
             "failure_sample": failures[:20],
-            "atomic_batch": atomic_batch,
+            "atomic_batch": _finance_atomic_batch_receipt(atomic_batch),
             "candidate_input_root_sha256": candidate_input_root_sha256,
             # The input root binds the full per-stock plan. Keep the receipt
             # small enough to replay even when every stock needs refreshing.

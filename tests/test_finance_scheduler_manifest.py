@@ -139,3 +139,35 @@ def test_finance_exact_run_binding_keeps_prior_target_after_midnight(monkeypatch
     )
     assert ok, message
     assert observed[0]["as_of_date"] == date(2026, 9, 7)
+
+
+def test_full_market_nested_discovery_receipt_fits_actual_scheduler_history_budget():
+    from biz.stock_finance import sync_finance
+    from server.api import scheduler_runtime
+
+    report = _receipt()
+    report.update({
+        "requested_code_count": 5578, "provider_fetch_code_count": 1,
+        "reused_immutable_code_count": 5577, "nonempty_code_count": 5577,
+        "nonempty_code_coverage": 5577 / 5578, "resolved_code_count": 5577,
+        "resolution_coverage": 5577 / 5578, "disposition_code_count": 5578,
+    })
+    report["atomic_batch"].update({"eligible_code_count": 5578, "available_code_count": 5577})
+    codes = [f"{i:06d}" for i in range(5337)]
+    binding = {"coverage_id": "d" * 64, "changed_code_set_sha256": "e" * 64,
+               "changed_codes": codes}
+    report["atomic_batch"]["incremental_discovery_binding"] = binding
+    with pytest.raises(RuntimeError, match="machine receipt exceeds"):
+        scheduler_runtime._history_validation_replay_output(json.dumps(report))
+
+    report["atomic_batch"] = sync_finance._finance_atomic_batch_receipt(report["atomic_batch"])
+    replay = scheduler_runtime._history_validation_replay_output(json.dumps(report))
+    restored = json.loads(replay)
+    assert validation.scheduler_output_status({"task_type": "stock_finance"}, replay, return_code=0) == "degraded"
+    assert restored["atomic_batch"]["incremental_discovery_binding"] == {
+        "coverage_id": "d" * 64, "changed_code_set_sha256": "e" * 64,
+        "changed_code_count": 5337,
+    }
+    assert restored["atomic_batch"]["batch_root_sha256"] == report["atomic_batch"]["batch_root_sha256"]
+    assert restored["data_exclusions"] == report["data_exclusions"]
+    assert binding["changed_codes"] == codes

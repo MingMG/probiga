@@ -683,6 +683,7 @@ def _finance_discovery_evidence(
     *,
     changed: bool,
     changed_code: str = "000001",
+    row_content_hash: str = "9" * 64,
 ) -> dict:
     target = "2026-08-31"
     events = []
@@ -696,7 +697,7 @@ def _finance_discovery_evidence(
             "report_type": "Q1",
             "notice_date": "2026-04-25",
             "update_date": target,
-            "row_content_sha256": "9" * 64,
+            "row_content_sha256": row_content_hash,
         })
     events.sort(key=pit_module.canonical_json)
     queries = []
@@ -903,6 +904,48 @@ def test_finance_atomic_seal_reuses_prior_member_only_with_stable_discovery():
     assert loaded["members"]["000001"][
         "incremental_discovery_binding"
     ]["coverage_id"] == discovery.coverage_id
+
+
+@pytest.mark.parametrize("source_content_changed", [False, True])
+def test_finance_same_day_reobservation_reuses_already_incorporated_source_contents(source_content_changed):
+    engine = _engine()
+    _install_finance_test_catalog(engine)
+    _install_prior_finance_coverage(engine)
+    with engine.connect() as c:
+        original = json.loads(c.execute(text(f"SELECT payload_json FROM {SOURCE_COVERAGE_TABLE} "
+                                            "WHERE stock_code='000001'")).scalar_one())
+    append_source_coverage(
+        engine, fact_kind="finance", stock_code="000001", source="adata.finance.core_index",
+        window_start="1900-01-01", window_end="2026-08-31", known_at="2026-08-31 01:05:00",
+        covered_through_at="2026-08-31 01:05:00", watermark_kind="CAPTURED_AT",
+        watermark_evidence={"source_call": "success"}, source_rows=original["source_rows"],
+        fact_bindings=original["fact_bindings"], batch_id="finance-current-day-primary",
+    )
+    receipts = []
+    for index, known in enumerate(("2026-08-31 01:06:00", "2026-08-31 01:12:00")):
+        discovery = append_source_coverage(
+            engine, fact_kind="finance", stock_code=pit_module.FINANCE_INCREMENTAL_DISCOVERY_CODE,
+            source=pit_module.FINANCE_INCREMENTAL_DISCOVERY_SOURCE,
+            window_start="2026-08-31", window_end="2026-08-31", known_at=known,
+            covered_through_at=known, watermark_kind="CAPTURED_AT",
+            watermark_evidence=_finance_discovery_evidence(
+                changed=True, row_content_hash="8" * 64 if index and source_content_changed else "9" * 64),
+            source_rows=[], fact_bindings=[], batch_id=f"finance-discovery-reobservation-{index}",
+        )
+        receipts.append(append_finance_atomic_batch_seal(
+            engine, as_of_date="2026-08-31", completed_known_at=f"2026-08-31 01:{10 + index * 10:02d}:00",
+            incremental_discovery_coverage_id=discovery.coverage_id,
+            changed_codes=[] if index else None,
+        ))
+    # The unavailable issuer is still due for its scheduled retry; only the
+    # already-incorporated available stock can avoid a duplicate recheck.
+    assert receipts[1]["changed_code_count"] == 1 + int(source_content_changed)
+    assert receipts[1]["parent_seal_coverage_id"] == receipts[0]["seal_coverage_id"]
+    loaded = load_finance_atomic_batch_seal(engine, codes=["000001", "002731"],
+        decision_at="2026-08-31 01:21:00", as_of_date="2026-08-31")
+    assert loaded["eligible_code_count"] == 2
+    assert loaded["members"]["000001"]["coverage_status"] == "COMPLETE"
+    engine.dispose()
 
 
 def test_finance_atomic_seal_extends_only_unchanged_member_source_cutoff():
