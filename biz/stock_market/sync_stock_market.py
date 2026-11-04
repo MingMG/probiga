@@ -6390,6 +6390,8 @@ def step_index_kline(
                 source_counts[source_status] = source_counts.get(source_status, 0) + 1
                 if frame is not None and not frame.empty:
                     parts.append(frame)
+                else:
+                    failed_codes.append(code)
         if failed_codes:
             logger.warning(
                 "Retrying %d transient index K-line failures after the first pass: %s",
