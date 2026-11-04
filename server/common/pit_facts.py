@@ -4195,11 +4195,9 @@ def _load_latest_finance_atomic_seal_evidence(
         ).upper() not in {"REPEATABLE READ", "SERIALIZABLE"}:
             raise ValueError("finance seal history requires a repeatable-read snapshot")
 
-        # ``payload_json`` is a multi-megabyte full-catalog seal.  Asking
-        # MySQL to ORDER BY while selecting that LONGTEXT makes it materialize
-        # every candidate payload before applying LIMIT 1.  Locate the small
-        # primary-key tuple through the decision index first, then fetch the
-        # one immutable payload by primary key inside the same snapshot.
+        # Earlier full-catalog payloads are immutable and were checked when
+        # appended. Recheck their links, then load only this snapshot and its
+        # explicit parent. Full-history payload auditing remains a separate job.
         index_hint = (
             " FORCE INDEX (idx_pit_coverage_decision)"
             if connection.dialect.name == "mysql"
@@ -4211,9 +4209,8 @@ def _load_latest_finance_atomic_seal_evidence(
             "WHERE fact_kind='finance' AND stock_code=:seal_code "
             "AND source=:seal_source AND known_at<=:decision_at "
             "AND received_at<=:decision_at "
-            "AND (:has_cursor=0 OR scope_hash>:after_scope "
-            "OR (scope_hash=:after_scope AND revision_no>:after_revision)) "
-            "ORDER BY scope_hash, revision_no LIMIT 1"
+            "AND (:seal_id='' OR coverage_id=:seal_id) "
+            "ORDER BY known_at DESC, revision_no DESC LIMIT 1"
         )
         mysql = connection.dialect.name == "mysql"
         payload_statement = text(
@@ -4221,66 +4218,85 @@ def _load_latest_finance_atomic_seal_evidence(
             "WHERE coverage_id=:coverage_id"
         )
 
-        def history_rows() -> Iterable[dict[str, Any]]:
-            nonlocal latest_row
-            parameters = {
-                "seal_code": FINANCE_ATOMIC_BATCH_CODE,
-                "seal_source": FINANCE_ATOMIC_BATCH_SOURCE,
-                "decision_at": decision,
-                "has_cursor": 0,
-                "after_scope": "",
-                "after_revision": 0,
-            }
-            while True:
-                try:
-                    key_row = connection.execute(
-                        key_statement,
-                        parameters,
-                    ).mappings().first()
-                    raw = (
-                        connection.execute(
-                            payload_statement,
-                            {"coverage_id": key_row["coverage_id"]},
-                        ).mappings().first()
-                        if key_row is not None
-                        else None
-                    )
-                except OperationalError as exc:
-                    exc._pit_read_stage = "finance_seal_history"
-                    raise
-                if key_row is not None and raw is None:
-                    raise ValueError(
-                        "finance seal disappeared inside repeatable-read snapshot"
-                    )
-                if raw is None:
-                    return
-                current = _finance_coverage_payload_row(raw, mysql=mysql)
-                # The consumer validates every original payload and chain link.
-                # Keeping all full-catalog seal JSONs used over 226 MB before
-                # parsing; retain only the latest payload and parent root index.
-                yield current
-                payload = _parse_payload(current)
-                watermark = payload.get("watermark")
-                evidence = watermark.get("evidence") if isinstance(watermark, dict) else None
-                seal_rows.append({
-                    "coverage_id": current.get("coverage_id"),
-                    "batch_root_sha256": (
-                        evidence.get("batch_root_sha256")
-                        if isinstance(evidence, dict) else None
-                    ),
-                })
-                latest_row = current
-                if seal_coverage_id and current.get("coverage_id") == seal_coverage_id:
-                    return
-                parameters.update({
-                    "has_cursor": 1,
-                    "after_scope": current["scope_hash"],
-                    "after_revision": current["revision_no"],
-                })
-                del payload, watermark, evidence, raw, current
-
         with connection.begin():
-            _validate_coverage_chain(history_rows())
+            try:
+                key_row = connection.execute(key_statement, {
+                    "seal_code": FINANCE_ATOMIC_BATCH_CODE,
+                    "seal_source": FINANCE_ATOMIC_BATCH_SOURCE,
+                    "decision_at": decision,
+                    "seal_id": seal_coverage_id,
+                }).mappings().first()
+                if key_row is None:
+                    if seal_coverage_id:
+                        raise ValueError("requested finance atomic seal is unavailable at decision time")
+                    return {}, {}, {}, []
+                raw = connection.execute(payload_statement, {
+                    "coverage_id": key_row["coverage_id"],
+                }).mappings().first()
+                if raw is None:
+                    raise ValueError("finance seal disappeared inside repeatable-read snapshot")
+                latest_row = _finance_coverage_payload_row(raw, mysql=mysql)
+                links = connection.execute(text(
+                    "SELECT coverage_id,scope_hash,coverage_fingerprint_hash,revision_no,"
+                    "supersedes_coverage_id,known_at,received_at,covered_through_at,"
+                    "fact_kind,stock_code,source,coverage_status,result_count "
+                    f"FROM {SOURCE_COVERAGE_TABLE} WHERE scope_hash=:scope_hash "
+                    "AND revision_no<=:revision_no ORDER BY revision_no"
+                ), {"scope_hash": latest_row["scope_hash"],
+                    "revision_no": latest_row["revision_no"]}).mappings()
+                anchors = {}
+                previous_id, previous_known, count = None, None, 0
+                for count, link in enumerate(links, 1):
+                    known = _row_datetime(link["known_at"])
+                    if (int(link["revision_no"]) != count
+                            or (str(link["supersedes_coverage_id"] or "") or None) != previous_id
+                            or _row_datetime(link["received_at"]) > known
+                            or _row_datetime(link["covered_through_at"]) > known
+                            or known > decision
+                            or (previous_known is not None and known < previous_known)
+                            or link["fact_kind"] != "finance"
+                            or link["stock_code"] != FINANCE_ATOMIC_BATCH_CODE
+                            or link["source"] != FINANCE_ATOMIC_BATCH_SOURCE
+                            or link["coverage_status"] != "COMPLETE"
+                            or int(link["result_count"]) != 0
+                            or link["coverage_id"] != canonical_hash({
+                                "schema": "probiga.pit-source-coverage-id.v1",
+                                "scope_hash": str(link["scope_hash"]),
+                                "coverage_fingerprint_hash": str(link["coverage_fingerprint_hash"]),
+                            })):
+                        raise ValueError("finance atomic seal coverage links differ")
+                    ident = str(link["coverage_id"])
+                    anchors[ident] = (count, previous_id, previous_known)
+                    seal_rows.append({"coverage_id": ident, "batch_root_sha256": None})
+                    previous_id, previous_known = ident, known
+                if count != int(latest_row["revision_no"]) or previous_id != latest_row["coverage_id"]:
+                    raise ValueError("finance atomic seal coverage links are incomplete")
+
+                def validate_snapshot(snapshot):
+                    revision, parent_id, parent_known = anchors[str(snapshot["coverage_id"])]
+                    _validate_coverage_chain([snapshot], first_revision=revision,
+                                             previous_id=parent_id, previous_known=parent_known)
+                    payload = _parse_payload(snapshot)
+                    watermark = payload.get("watermark")
+                    evidence = watermark.get("evidence") if isinstance(watermark, dict) else None
+                    if not isinstance(evidence, dict):
+                        raise ValueError("finance atomic batch seal evidence is malformed")
+                    return evidence
+
+                current_evidence = validate_snapshot(latest_row)
+                seal_rows[-1]["batch_root_sha256"] = current_evidence.get("batch_root_sha256")
+                parent_id = str(current_evidence.get("parent_seal_coverage_id") or "")
+                if parent_id:
+                    if parent_id not in anchors or parent_id == latest_row["coverage_id"]:
+                        raise ValueError("finance atomic batch parent is unavailable")
+                    parent = connection.execute(payload_statement, {"coverage_id": parent_id}).mappings().first()
+                    if parent is None:
+                        raise ValueError("finance atomic batch parent is unavailable")
+                    parent_evidence = validate_snapshot(_finance_coverage_payload_row(parent, mysql=mysql))
+                    seal_rows[anchors[parent_id][0] - 1]["batch_root_sha256"] = parent_evidence.get("batch_root_sha256")
+            except OperationalError as exc:
+                exc._pit_read_stage = "finance_seal_history"
+                raise
     if not seal_rows:
         return {}, {}, {}, []
     row = latest_row

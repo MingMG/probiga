@@ -2390,30 +2390,8 @@ def _multi_seal_common_cutoff_case():
 
 def test_finance_seal_pages_preserve_full_reader_result(monkeypatch):
     engine, kwargs = _multi_seal_common_cutoff_case()
-    statements = []
-    payload_statements = []
-
-    def record(_connection, _cursor, statement, parameters, _context, _many):
-        if "stock_code=" in statement and "scope_hash, revision_no LIMIT 1" in statement:
-            statements.append(statement)
-        if (
-            f"SELECT * FROM {SOURCE_COVERAGE_TABLE}" in statement
-            and "WHERE coverage_id=" in statement
-        ):
-            payload_statements.append(statement)
-
-    event.listen(engine, "before_cursor_execute", record)
     paged = resolve_common_fact_cutoff(engine, **kwargs)
-    event.remove(engine, "before_cursor_execute", record)
     assert paged["status"] == PIT_AVAILABLE
-    assert len(statements) == 4  # Three complete payloads plus end-of-chain.
-    assert all("LIMIT 1" in statement for statement in statements)
-    assert all(
-        "SELECT coverage_id, scope_hash, revision_no" in statement
-        for statement in statements
-    )
-    assert len(payload_statements) == 3
-    assert all("ORDER BY" not in statement for statement in payload_statements)
 
     def legacy_full_reader(engine, *, decision_at):
         with engine.connect() as connection:
@@ -2433,6 +2411,45 @@ def test_finance_seal_pages_preserve_full_reader_result(monkeypatch):
 
     monkeypatch.setattr(pit_module, "_load_latest_finance_atomic_seal_evidence", legacy_full_reader)
     assert resolve_common_fact_cutoff(engine, **kwargs) == paged
+    engine.dispose()
+
+
+def test_finance_current_seal_does_not_read_unused_historical_catalog_payloads():
+    engine, kwargs = _multi_seal_common_cutoff_case()
+    expected = resolve_common_fact_cutoff(engine, **kwargs)
+    with engine.begin() as c:
+        old_id = c.execute(text(
+            f"SELECT coverage_id FROM {SOURCE_COVERAGE_TABLE} "
+            "WHERE source='probiga.finance.atomic_batch' AND revision_no=1"
+        )).scalar_one()
+        physical = SOURCE_COVERAGE_TABLE + "_physical"
+        columns = [r[1] for r in c.exec_driver_sql(f"PRAGMA table_info({SOURCE_COVERAGE_TABLE})")]
+        c.exec_driver_sql(f"ALTER TABLE {SOURCE_COVERAGE_TABLE} RENAME TO {physical}")
+
+        def needed_payload_only(coverage_id, payload):
+            if coverage_id == old_id:
+                raise ValueError("unused historical catalog payload must not be read")
+            return payload
+
+        c.connection.driver_connection.create_function("needed_payload_only", 2, needed_payload_only)
+        projected = ["needed_payload_only(coverage_id,payload_json) AS payload_json"
+                     if name == "payload_json" else name for name in columns]
+        c.exec_driver_sql(f"CREATE VIEW {SOURCE_COVERAGE_TABLE} AS SELECT {','.join(projected)} FROM {physical}")
+    assert resolve_common_fact_cutoff(engine, **kwargs) == expected
+    engine.dispose()
+
+
+@pytest.mark.parametrize("revision", [2, 3])
+def test_finance_current_seal_still_rejects_current_or_needed_parent_payload_damage(revision):
+    engine, kwargs = _multi_seal_common_cutoff_case()
+    with engine.begin() as c:
+        c.execute(text("DROP TRIGGER trg_pit_source_coverage_immutable_bu"))
+        c.execute(text(f"UPDATE {SOURCE_COVERAGE_TABLE} SET payload_json='{{}}' "
+                       "WHERE source='probiga.finance.atomic_batch' AND revision_no=:revision"),
+                  {"revision": revision})
+    result = resolve_common_fact_cutoff(engine, **kwargs)
+    assert result["status"] == PIT_DATA_BLOCKED
+    assert result["reason"] == "PIT_FINANCE_ATOMIC_BATCH_INVALID:ValueError"
     engine.dispose()
 
 
@@ -2575,9 +2592,21 @@ def test_finance_compressed_history_still_rejects_oldest_payload_or_chain_damage
         connection.execute(text(f"UPDATE {SOURCE_COVERAGE_TABLE} SET {damage} "
             "WHERE fact_kind='finance' AND stock_code='000000' "
             "AND source='probiga.finance.atomic_batch' AND revision_no=1"))
-    with pytest.raises(ValueError):
-        pit_module._load_latest_finance_atomic_seal_evidence(
-            _mysql_seal_transport(engine), decision_at=kwargs["decision_at"])
+    if damage == "payload_json='{}'":
+        # An unused immutable body belongs to explicit historical auditing;
+        # it does not prevent using the intact current snapshot and parent.
+        assert pit_module._load_latest_finance_atomic_seal_evidence(
+            _mysql_seal_transport(engine), decision_at=kwargs["decision_at"])[0]
+        with engine.connect() as c:
+            history = [dict(row) for row in c.execute(text(
+                f"SELECT * FROM {SOURCE_COVERAGE_TABLE} WHERE source='probiga.finance.atomic_batch' ORDER BY revision_no"
+            )).mappings()]
+        with pytest.raises(ValueError):
+            pit_module._validate_coverage_chain(history)
+    else:
+        with pytest.raises(ValueError):
+            pit_module._load_latest_finance_atomic_seal_evidence(
+                _mysql_seal_transport(engine), decision_at=kwargs["decision_at"])
     engine.dispose()
 
 
@@ -2618,7 +2647,7 @@ def test_finance_seal_read_error_reports_only_stage_and_numeric_errno():
     engine, kwargs = _sealed_common_cutoff_case()
 
     def fail(_connection, _cursor, statement, parameters, _context, _many):
-        if "scope_hash, revision_no LIMIT 1" in statement:
+        if "SELECT coverage_id, scope_hash, revision_no" in statement:
             raise OperationalError(statement, parameters, Exception(2013, "secret connection details"))
 
     event.listen(engine, "before_cursor_execute", fail)
