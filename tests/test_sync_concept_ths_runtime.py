@@ -33,6 +33,36 @@ def test_cli_opens_shared_tls_engine_only_when_run():
         factory.return_value.dispose.assert_called_once()
 
 
+@pytest.mark.parametrize("change", [None, "date", "catalog", "receipt"])
+def test_member_resume_uses_prior_catalog_when_directory_detail_is_unavailable(member_db, monkeypatch, change):
+    module = importlib.import_module("tools.sync_concept_ths")
+    monkeypatch.setattr(module, "authoritative_closed_trade_date", lambda engine: "2026-09-11")
+    receipt = {"schema": members.RESULT_SCHEMA, "provider": "ths_native_members",
+               "status": "PARTIAL", "source_trade_date": "2026-09-11", "catalog_count": 1,
+               "catalog_sha256": members.result_hash([["885001", "300001"]]),
+               "completed_indices": [], "failed_indices": [{"index_code": "885001"}]}
+    receipt["result_sha256"] = members.result_hash(receipt)
+    if change == "receipt":
+        receipt["status"] = "COMPLETE"
+    with member_db.begin() as conn:
+        conn.execute(text("CREATE TABLE si_concept_code_ths (index_code TEXT,concept_code TEXT,name TEXT,etl_sync_at DATETIME)"))
+        conn.execute(text("INSERT INTO si_concept_code_ths VALUES ('885001',:cid,'概念',:stamp)"), {
+            "cid": "300002" if change == "catalog" else "300001",
+            "stamp": "2026-09-10 18:00:00" if change == "date" else "2026-09-11 18:00:00"})
+        conn.execute(text("INSERT INTO st_scheduled_task_history VALUES (1,27,'sync_concept_ths','2026-09-11 18:00:00','2026-09-11 18:10:00','failed',:output)"),
+                     {"output": json.dumps(receipt)})
+    with patch.object(module, "sync_concept_code_ths", side_effect=RuntimeError("THS detail ReadTimeout")) as refresh:
+        with patch.object(module, "sync_member_partitions", return_value={"status": "COMPLETE"}) as collect:
+            if change is None:
+                assert module.run_sync(member_db) == {"status": "COMPLETE"}
+                refresh.assert_not_called()
+                assert collect.call_args.args[1]["index_code"].tolist() == ["885001"]
+            else:
+                with pytest.raises(RuntimeError, match="ReadTimeout"):
+                    module.run_sync(member_db)
+                collect.assert_not_called()
+
+
 @pytest.mark.parametrize("body,match", [
     (response("885002", 1, ["600000"]), "identity differs"),
     (response("885001", 2, ["600000"]), "identity differs"),
