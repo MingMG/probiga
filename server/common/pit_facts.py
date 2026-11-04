@@ -3890,11 +3890,25 @@ def append_finance_atomic_batch_seal(
     effective_changes = set(codes) if not prior_members else set(requested_changes)
     effective_changes.update(set(codes) - set(prior_members))
     effective_changes.update(excluded_members)
-    effective_changes.update(
-        str(code).zfill(6)
-        for code in (incremental_discovery.get("changed_dates_by_code") or {})
-        if str(code).zfill(6) in codes
+    prior_discovery = prior_evidence.get("incremental_discovery_binding") or {}
+    same_discovery_content = bool(
+        prior_members
+        and prior_evidence.get("as_of_date") == target.isoformat()
+        and prior_evidence.get("catalog_member_set_hash") == catalog.member_set_hash
+        and prior_evidence.get("provider_contract_version") == str(provider_contract_version or "")
+        and _HASH_RE.fullmatch(str(incremental_discovery.get("event_set_sha256") or ""))
+        and isinstance(prior_discovery, Mapping)
+        and all(str(prior_discovery.get(field) or "") == str(incremental_discovery.get(field) or "")
+                for field in ("window_start", "window_end", "event_set_sha256", "changed_code_set_sha256"))
     )
+    # A later observation of the same source contents is not another change
+    # to every stock already incorporated into this same-day snapshot.
+    if not same_discovery_content:
+        effective_changes.update(
+            str(code).zfill(6)
+            for code in (incremental_discovery.get("changed_dates_by_code") or {})
+            if str(code).zfill(6) in codes
+        )
     gate = finance_disclosure_gate(target)
     for code in set(codes) & set(prior_members):
         member = prior_members[code]
