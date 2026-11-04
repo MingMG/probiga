@@ -2144,6 +2144,7 @@ def verify_turnover_publication_evidence(
         }).mappings().all()
         if not candidates:
             return {}
+        run = dict(candidates[0])
         replay_roots = {
             (
                 str(item.get("subject_sha256") or ""),
@@ -2152,12 +2153,13 @@ def verify_turnover_publication_evidence(
                 str(item.get("field_value_root_sha256") or ""),
             )
             for item in candidates
+            if (item.get("authority_proof_identity") == run["authority_proof_identity"]
+                and item.get("authority_proof_sha256") == run["authority_proof_sha256"])
         }
         if len(replay_roots) != 1:
             raise _blocked(
                 "completed turnover snapshot replays disagree on exact values"
             )
-        run = dict(candidates[0])
         run_cutoff = _local_datetime(run["decision_at"], field="snapshot decision_at")
         run_started = _local_datetime(
             run.get("request_started_at"), field="snapshot request_started_at"

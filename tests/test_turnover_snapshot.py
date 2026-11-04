@@ -740,6 +740,22 @@ def test_turnover_completed_replays_converge_only_on_exact_value_roots() -> None
         )
 
 
+def test_turnover_readback_uses_latest_qmt_publication_without_comparing_superseded_values():
+    engine = _engine()
+    run = _capture(engine)
+    publish_turnover_snapshot(engine, run, min_expected_count=2,
+                              published_at=datetime(2026, 8, 27, 18, 45))
+    _clone_completed_turnover_run(engine)
+    with engine.begin() as c:
+        c.execute(text(f"UPDATE {TURNOVER_SNAPSHOT_RUN_TABLE} SET decision_at='2026-08-27 18:48:00.000000',authority_proof_identity='superseded-qmt-daily',"
+                       "authority_proof_sha256=:hash,field_value_root_sha256=:old_root WHERE run_id=:id"),
+                  {"hash": "d" * 64, "old_root": "f" * 64, "id": "1" * 32})
+    evidence = verify_turnover_publication_evidence(engine, target_date=TARGET_DATE,
+                                                   decision_at=DECISION_AT, min_expected_count=2)
+    assert {json.loads(row["turnover_evidence_json"])["snapshot_run_id"] for row in evidence.values()} == {"2" * 32}
+    engine.dispose()
+
+
 def test_pinned_curl_transport_keeps_tls_verification_and_exact_raw_body(
     monkeypatch,
 ) -> None:

@@ -2310,10 +2310,12 @@ def _validate_finance_expected_unavailable_row(
         raise ValueError("finance expected-unavailable row hash differs")
 
 
-def _validate_coverage_chain(rows: Iterable[dict[str, Any]]) -> None:
-    previous_id: str | None = None
-    previous_known: datetime | None = None
-    for expected_no, row in enumerate(rows, 1):
+def _validate_coverage_chain(
+    rows: Iterable[dict[str, Any]], *, first_revision: int = 1,
+    previous_id: str | None = None, previous_known: datetime | None = None,
+) -> None:
+    """Validate payloads; a noninitial cursor requires a verified link prefix."""
+    for expected_no, row in enumerate(rows, first_revision):
         if int(row.get("revision_no") or 0) != expected_no:
             raise ValueError("PIT coverage chain has a sequence gap")
         supersedes = str(row.get("supersedes_coverage_id") or "") or None
@@ -3083,32 +3085,47 @@ def load_finance_incremental_discovery(
     })
     if target is None or not normalized_codes:
         raise ValueError("finance incremental discovery scope is empty")
-    statement = text(
-        f"SELECT candidate.* FROM {SOURCE_COVERAGE_TABLE} AS candidate "
-        f"JOIN {SOURCE_COVERAGE_TABLE} AS selected "
-        "ON selected.scope_hash=candidate.scope_hash "
-        "WHERE selected.coverage_id=:coverage_id "
-        "AND candidate.known_at<=:decision_at "
-        "AND candidate.received_at<=:decision_at "
-        "ORDER BY candidate.revision_no"
-    )
     with engine.connect() as connection:
-        rows = [
-            dict(row)
-            for row in connection.execute(
-                statement,
-                {"coverage_id": receipt_id, "decision_at": decision},
-            ).mappings()
-        ]
-    if not rows:
-        raise ValueError("finance incremental discovery receipt is unavailable")
-    _validate_coverage_chain(rows)
-    selected = next(
-        (row for row in rows if str(row.get("coverage_id") or "") == receipt_id),
-        None,
-    )
-    if selected is None:
-        raise ValueError("finance incremental discovery receipt postdates decision")
+        selected = connection.execute(text(
+            f"SELECT * FROM {SOURCE_COVERAGE_TABLE} WHERE coverage_id=:coverage_id "
+            "AND known_at<=:decision_at AND received_at<=:decision_at"
+        ), {"coverage_id": receipt_id, "decision_at": decision}).mappings().first()
+        if selected is None:
+            raise ValueError("finance incremental discovery receipt is unavailable or postdates decision")
+        selected = dict(selected)
+        # Prior payloads were checked when appended and are immutable. Inspect
+        # their links and clocks, not every old source response on each resume.
+        links = connection.execution_options(stream_results=True).execute(text(
+            "SELECT coverage_id,scope_hash,coverage_fingerprint_hash,revision_no,"
+            "supersedes_coverage_id,known_at,received_at,covered_through_at,coverage_status "
+            f"FROM {SOURCE_COVERAGE_TABLE} WHERE scope_hash=:scope_hash "
+            "AND revision_no<=:revision_no AND known_at<=:decision_at "
+            "AND received_at<=:decision_at ORDER BY revision_no"
+        ), {"scope_hash": selected["scope_hash"], "revision_no": selected["revision_no"],
+            "decision_at": decision}).mappings()
+        previous_id, previous_known, count = None, None, 0
+        predecessor_id, predecessor_known = None, None
+        for count, row in enumerate(links, 1):
+            known = _row_datetime(row["known_at"])
+            if (int(row["revision_no"]) != count
+                    or (str(row["supersedes_coverage_id"] or "") or None) != previous_id
+                    or _row_datetime(row["received_at"]) > known
+                    or _row_datetime(row["covered_through_at"]) > known
+                    or (previous_known is not None and known < previous_known)
+                    or str(row["coverage_status"]) != "COMPLETE"
+                    or str(row["coverage_id"]) != canonical_hash({
+                        "schema": "probiga.pit-source-coverage-id.v1",
+                        "scope_hash": str(row["scope_hash"]),
+                        "coverage_fingerprint_hash": str(row["coverage_fingerprint_hash"]),
+                    })):
+                raise ValueError("finance incremental discovery coverage links differ")
+            if str(row["coverage_id"]) == receipt_id:
+                predecessor_id, predecessor_known = previous_id, previous_known
+            previous_id, previous_known = str(row["coverage_id"]), known
+        if count != int(selected["revision_no"]) or previous_id != receipt_id:
+            raise ValueError("finance incremental discovery coverage links are incomplete")
+    _validate_coverage_chain([selected], first_revision=int(selected["revision_no"]),
+                             previous_id=predecessor_id, previous_known=predecessor_known)
     return _validate_finance_incremental_discovery(
         selected,
         codes=normalized_codes,
