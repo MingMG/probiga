@@ -774,6 +774,53 @@ def _finance_discovery_evidence(
     }
 
 
+@pytest.mark.parametrize("problem", [None, "sequence", "parent", "clock", "selected_payload"])
+def test_finance_discovery_reads_current_payload_without_reloading_historical_responses(problem):
+    engine = _engine()
+    receipts = []
+    for minute in (4, 5):
+        receipts.append(append_source_coverage(
+            engine, fact_kind="finance", stock_code=pit_module.FINANCE_INCREMENTAL_DISCOVERY_CODE,
+            window_start="2026-08-31", window_end="2026-08-31",
+            known_at=f"2026-08-31 01:0{minute}:00",
+            covered_through_at=f"2026-08-31 01:0{minute}:00",
+            watermark_kind="CAPTURED_AT", watermark_evidence=_finance_discovery_evidence(changed=False),
+            source_rows=[], fact_bindings=[], source=pit_module.FINANCE_INCREMENTAL_DISCOVERY_SOURCE,
+            batch_id=f"finance-discovery-{minute}",
+        ))
+    selected_id = receipts[-1].coverage_id
+    with engine.begin() as c:
+        # Make old payload reads actually fail at the database boundary. A
+        # SELECT of link columns remains valid; only this receipt may read JSON.
+        physical = SOURCE_COVERAGE_TABLE + "_physical"
+        columns = [r[1] for r in c.exec_driver_sql(f"PRAGMA table_info({SOURCE_COVERAGE_TABLE})")]
+        c.exec_driver_sql(f"ALTER TABLE {SOURCE_COVERAGE_TABLE} RENAME TO {physical}")
+        def current_payload_only(coverage_id, payload):
+            if coverage_id != selected_id:
+                raise ValueError("historical source response must not be reloaded")
+            return "{}" if problem == "selected_payload" else payload
+        c.connection.driver_connection.create_function("current_payload_only", 2, current_payload_only)
+        overrides = {"payload_json": "current_payload_only(coverage_id,payload_json)"}
+        if problem == "sequence":
+            overrides["revision_no"] = f"CASE WHEN coverage_id='{selected_id}' THEN 3 ELSE revision_no END"
+        elif problem == "parent":
+            overrides["supersedes_coverage_id"] = f"CASE WHEN coverage_id='{selected_id}' THEN '{'0' * 64}' ELSE supersedes_coverage_id END"
+        elif problem == "clock":
+            overrides["received_at"] = f"CASE WHEN coverage_id='{receipts[0].coverage_id}' THEN '2026-08-31 01:09:00' ELSE received_at END"
+        projected = [overrides[name] + " AS " + name if name in overrides else name for name in columns]
+        c.exec_driver_sql(f"CREATE VIEW {SOURCE_COVERAGE_TABLE} AS SELECT {','.join(projected)} FROM {physical}")
+    kwargs = dict(coverage_id=selected_id, codes=["000001", "002731"],
+                  decision_at="2026-08-31 01:10:00", as_of_date="2026-08-31")
+    if problem:
+        with pytest.raises(ValueError):
+            pit_module.load_finance_incremental_discovery(engine, **kwargs)
+    else:
+        result = pit_module.load_finance_incremental_discovery(engine, **kwargs)
+        assert result["coverage_id"] == selected_id
+        assert result["changed_codes"] == []
+    engine.dispose()
+
+
 def _install_prior_finance_coverage(engine) -> None:
     finance_row = {
         "stock_code": "000001",

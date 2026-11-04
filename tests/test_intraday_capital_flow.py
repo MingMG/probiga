@@ -802,6 +802,10 @@ def test_database_publication_time_is_not_charged_to_collection_window(
     result["collection_finished_at"] = (
         started + timedelta(minutes=46)
     ).isoformat(sep=" ")
+    assert c.validate_result(c._seal_result(result)) == "success"
+    result["collection_finished_at"] = (
+        datetime.fromisoformat(result["finished_at"]) + timedelta(seconds=1)
+    ).isoformat(sep=" ")
     with pytest.raises(ValueError, match="execution time"):
         c.validate_result(c._seal_result(result))
 
