@@ -105,8 +105,8 @@ BATCH_EVERY = _env_int("MINUTE_BATCH_EVERY", "100")
 BATCH_PAUSE = _env_float("MINUTE_BATCH_PAUSE", "20")
 FETCH_ATTEMPTS = _env_int("MINUTE_FETCH_ATTEMPTS", "3")
 RETRY_DELAY = _env_float("MINUTE_RETRY_DELAY", "1.0")
-# Each lane retains its own request and batch pacing. The full universe must
-# finish within the scheduler's 45-minute collection budget.
+# Each lane retains bounded request retries and its own request/batch pacing.
+# Receipt validity follows actual source times and writes, not elapsed runtime.
 FETCH_WORKERS = 6
 
 FLOW_TABLE = "sm_stock_capital_flow_min"
@@ -983,8 +983,6 @@ def validate_result(result):
         ))
             or not captured <= decision == started <= collection_finished <= finished
             or target > started.date()
-            or (collection_finished - started).total_seconds() > 2700
-            or (finished - collection_finished).total_seconds() > 6 * 60 * 60
             or not isinstance(result.get("catalog_batch_id"), str)
             or not 0 < len(result["catalog_batch_id"]) <= 64):
         raise ValueError("invalid execution time")

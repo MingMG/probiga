@@ -1,6 +1,6 @@
 from contextlib import contextmanager
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 
 import pytest
@@ -112,3 +112,31 @@ def test_mutable_intraday_prefix_never_creates_a_closed_source_checkpoint(monkey
     state["now"] = datetime(2026, 9, 11, 14, 0)
     assert collector._checkpoint_store("flow", DAY, context("14:00:00"), ["000001"]) is None
     assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("collection_minutes,publication_hours", [(46, 0), (1, 7)])
+def test_completed_flow_is_published_after_slow_collection_or_database_work(
+    monkeypatch, tmp_path, collection_minutes, publication_hours,
+):
+    state = harness(monkeypatch, tmp_path)
+    state["interrupted"] = False
+    original_fetch = collector._minute_fetch_workers
+    original_publish = collector._publish_flow_stage
+    @contextmanager
+    def slow_fetch(*args):
+        with original_fetch(*args) as rows:
+            yield rows
+        state["now"] += timedelta(minutes=collection_minutes)
+    def slow_publish(*args):
+        count = original_publish(*args)
+        state["now"] += timedelta(hours=publication_hours)
+        return count
+    monkeypatch.setattr(collector, "_minute_fetch_workers", slow_fetch)
+    monkeypatch.setattr(collector, "_publish_flow_stage", slow_publish)
+    result = collect(context())
+    assert state["published"] == 1
+    assert result["written_rows"] == 480
+    assert collector.validate_result(result) == "success"
+    invalid = dict(result, collection_finished_at=DAY + " 15:59:00")
+    with pytest.raises(ValueError, match="execution time"):
+        collector.validate_result(collector._seal_result(invalid))
