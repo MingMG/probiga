@@ -2503,8 +2503,8 @@ def test_finance_compressed_history_is_byte_exact_and_preserves_all_seal_results
     engine.dispose()
 
 
-@pytest.mark.parametrize("tamper_oldest", [False, True])
-def test_finance_compressed_member_reads_preserve_original_revision_bytes(monkeypatch, tamper_oldest):
+@pytest.mark.parametrize("damage", [None, "old_payload", "current_payload", "parent_revision"])
+def test_finance_compressed_member_reads_preserve_current_revision_and_parent_anchor(monkeypatch, damage):
     engine = _engine()
     _install_prior_finance_coverage(engine)
     with engine.connect() as connection:
@@ -2521,21 +2521,36 @@ def test_finance_compressed_member_reads_preserve_original_revision_bytes(monkey
     )
     with engine.connect() as connection:
         expected_bytes = [value.encode("utf-8") for value in connection.execute(text(
-            f"SELECT payload_json FROM {SOURCE_COVERAGE_TABLE} "
-            "WHERE stock_code IN ('000001','002731') ORDER BY stock_code, scope_hash, revision_no"
+            f"SELECT payload_json FROM {SOURCE_COVERAGE_TABLE} AS selected "
+            "WHERE stock_code IN ('000001','002731') AND NOT EXISTS ("
+            f"SELECT 1 FROM {SOURCE_COVERAGE_TABLE} AS newer WHERE newer.scope_hash=selected.scope_hash "
+            "AND newer.revision_no>selected.revision_no) ORDER BY stock_code,scope_hash"
         )).scalars()]
-    assert len(expected_bytes) == 3
+    assert len(expected_bytes) == 2
     kwargs = dict(codes=["000001", "002731"], listing_dates={},
                   completed_known_at=datetime(2026, 8, 30, 1, 13), as_of_date=date(2026, 8, 30))
     plain = pit_module._select_finance_atomic_batch_members(engine, **kwargs)
     mysql_reader = _mysql_seal_transport(engine)
-    if tamper_oldest:
+    if damage:
         with engine.begin() as connection:
             connection.execute(text("DROP TRIGGER trg_pit_source_coverage_immutable_bu"))
-            connection.execute(text(f"UPDATE {SOURCE_COVERAGE_TABLE} SET payload_json='{{}}' "
-                                    "WHERE stock_code='000001' AND revision_no=1"))
-        with pytest.raises(ValueError, match="coverage payload schema differs"):
-            pit_module._select_finance_atomic_batch_members(mysql_reader, **kwargs)
+            revision = 2 if damage == "current_payload" else 1
+            assignment = "revision_no=9" if damage == "parent_revision" else "payload_json='{}'"
+            connection.execute(text(f"UPDATE {SOURCE_COVERAGE_TABLE} SET {assignment} "
+                                    "WHERE stock_code='000001' AND revision_no=:revision"), {"revision": revision})
+        if damage == "old_payload":
+            # An unused historical body cannot block a current full snapshot.
+            # Explicit history auditing still detects the corruption.
+            assert pit_module._select_finance_atomic_batch_members(mysql_reader, **kwargs) == plain
+            with engine.connect() as c:
+                history = [dict(row) for row in c.execute(text(
+                    f"SELECT * FROM {SOURCE_COVERAGE_TABLE} WHERE stock_code='000001' ORDER BY revision_no"
+                )).mappings()]
+            with pytest.raises(ValueError, match="coverage payload schema differs"):
+                pit_module._validate_coverage_chain(history)
+        else:
+            with pytest.raises(ValueError):
+                pit_module._select_finance_atomic_batch_members(mysql_reader, **kwargs)
     else:
         decoded = []
         original_decode = pit_module._decode_finance_seal_payload

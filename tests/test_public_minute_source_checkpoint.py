@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 import json
 
 import pytest
+from sqlalchemy import create_engine, text
 
 from tools import crawl_minute_kline as collector
 from tests.test_intraday_capital_flow import _context, _replay_database
@@ -140,3 +141,39 @@ def test_completed_flow_is_published_after_slow_collection_or_database_work(
     invalid = dict(result, collection_finished_at=DAY + " 15:59:00")
     with pytest.raises(ValueError, match="execution time"):
         collector.validate_result(collector._seal_result(invalid))
+
+
+@pytest.mark.parametrize("task_type,clock,explicit,expected", [
+    ("stock_minute_flow", "2026-11-05 00:01:00", None, "2026-11-04"),
+    ("stock_minute_flow", "2026-11-05 18:30:00", None, "2026-11-05"),
+    ("stock_minute_flow", "2026-11-07 18:30:00", None, "2026-11-06"),
+    ("stock_minute_flow", "2026-11-05 00:01:00", "2026-11-03", "2026-11-03"),
+    ("intraday_minute_flow", "2026-11-05 10:00:00", None, "2026-11-05"),
+])
+def test_daily_flow_recovery_uses_closed_session_across_midnight_and_weekend(
+    monkeypatch, task_type, clock, explicit, expected,
+):
+    from server.common import minute_acquisition_reuse as reuse
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    with engine.begin() as c:
+        c.execute(text("CREATE TABLE si_trade_calendar (trade_date TEXT,trade_status INTEGER)"))
+        for day in ("2026-11-03", "2026-11-04", "2026-11-05", "2026-11-06"):
+            c.execute(text("INSERT INTO si_trade_calendar VALUES (:day,1)"), {"day": day})
+    monkeypatch.setattr(collector, "create_batch_engine", lambda: engine)
+    monkeypatch.setattr(collector, "get_minute_engine", lambda: engine)
+    monkeypatch.setattr(collector, "_now", lambda: datetime.fromisoformat(clock))
+    monkeypatch.setenv("PROBIGA_SCHEDULER_TASK_TYPE", task_type)
+    monkeypatch.setenv("PROBIGA_SCHEDULER_BUILD_SHA", "a" * 40)
+    observed = []
+    def inspect(*args, **kwargs):
+        observed.append(kwargs["trade_date"])
+        return {"trade_date": kwargs["trade_date"]}
+    monkeypatch.setattr(reuse, "inspect_complete_partition", inspect)
+    monkeypatch.setattr(reuse, "result_for", lambda partitions, **kwargs: {"status": "REUSED", "partitions": partitions})
+    argv = ["crawl_minute_kline.py", "--type", "flow"]
+    if explicit:
+        argv += ["--trade-date", explicit]
+    monkeypatch.setattr("sys.argv", argv)
+    assert collector.main() == 0
+    assert observed == [expected]
+    engine.dispose()

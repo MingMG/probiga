@@ -3253,11 +3253,10 @@ def _select_finance_atomic_batch_members(
 ) -> tuple[list[dict[str, Any]], datetime]:
     """Select one strict finance disposition per catalog member.
 
-    Finance coverage payloads contain the provider's full historical rows.  A
-    full-catalog query currently exceeds 500 MB in production, so materialize
-    and validate one bounded code chunk at a time inside one repeatable-read
-    snapshot.  Only the compact fields consumed by the atomic seal survive a
-    chunk; raw payload JSON is never retained for the full universe.
+    Each immutable coverage already contains a complete provider snapshot.
+    Load the latest visible record per source scope and its predecessor anchor,
+    in bounded code chunks inside one repeatable-read snapshot. Historical
+    payload replay belongs to the full audit reader, not daily batch assembly.
     """
 
     gate = finance_disclosure_gate(as_of_date)
@@ -3276,25 +3275,54 @@ def _select_finance_atomic_batch_members(
                     "finance atomic batch requires a repeatable-read snapshot"
                 )
         statement = text(
-            f"SELECT {_finance_coverage_payload_columns(mysql)} FROM {SOURCE_COVERAGE_TABLE} "
+            f"SELECT {_finance_coverage_payload_columns(mysql, table_alias='selected')},"
+            "parent.coverage_id AS _parent_id,parent.scope_hash AS _parent_scope,"
+            "parent.revision_no AS _parent_revision,parent.known_at AS _parent_known,"
+            "parent.received_at AS _parent_received,parent.covered_through_at AS _parent_covered,"
+            "parent.coverage_status AS _parent_status,parent.coverage_fingerprint_hash AS _parent_fingerprint "
+            f"FROM {SOURCE_COVERAGE_TABLE} AS selected JOIN ("
+            f"SELECT scope_hash,MAX(revision_no) AS revision_no FROM {SOURCE_COVERAGE_TABLE} "
             "WHERE fact_kind='finance' AND stock_code IN :codes "
-            "AND known_at<=:completed_known_at "
-            "AND received_at<=:completed_known_at "
-            "ORDER BY stock_code, scope_hash, revision_no"
+            "AND known_at<=:completed_known_at AND received_at<=:completed_known_at "
+            "GROUP BY scope_hash) AS heads "
+            "ON selected.scope_hash=heads.scope_hash AND selected.revision_no=heads.revision_no "
+            f"LEFT JOIN {SOURCE_COVERAGE_TABLE} AS parent ON parent.coverage_id=selected.supersedes_coverage_id "
+            "ORDER BY selected.stock_code,selected.scope_hash"
         ).bindparams(bindparam("codes", expanding=True))
         with connection.begin():
             for offset in range(0, len(codes), batch_size):
                 code_batch = codes[offset : offset + batch_size]
-                raw_rows = [
-                    _finance_coverage_payload_row(row, mysql=mysql)
-                    for row in connection.execute(
-                        statement,
-                        {
-                            "codes": code_batch,
-                            "completed_known_at": completed_known_at,
-                        },
-                    ).mappings()
-                ]
+                raw_rows, predecessors = [], {}
+                for raw in connection.execute(
+                    statement,
+                    {"codes": code_batch, "completed_known_at": completed_known_at},
+                ).mappings():
+                    row = _finance_coverage_payload_row(raw, mysql=mysql)
+                    parent = {key: row.pop("_parent_" + key) for key in (
+                        "id", "scope", "revision", "known", "received", "covered", "status", "fingerprint",
+                    )}
+                    revision = int(row["revision_no"])
+                    if revision < 1:
+                        raise ValueError("finance coverage revision is invalid")
+                    previous_id, previous_known = None, None
+                    if revision > 1:
+                        previous_id = str(parent["id"] or "")
+                        previous_known = _row_datetime(parent["known"])
+                        if (parent["scope"] != row["scope_hash"]
+                                or int(parent["revision"] or 0) != revision - 1
+                                or previous_known > _row_datetime(row["known_at"])
+                                or _row_datetime(parent["received"]) > previous_known
+                                or _row_datetime(parent["covered"]) > previous_known
+                                or parent["status"] not in {"COMPLETE", FINANCE_EXPECTED_UNAVAILABLE_STATUS}
+                                or not _HASH_RE.fullmatch(str(parent["fingerprint"] or ""))
+                                or previous_id != canonical_hash({
+                                    "schema": "probiga.pit-source-coverage-id.v1",
+                                    "scope_hash": str(parent["scope"]),
+                                    "coverage_fingerprint_hash": str(parent["fingerprint"]),
+                                })):
+                            raise ValueError("finance coverage predecessor differs")
+                    predecessors[str(row["coverage_id"])] = (previous_id, previous_known)
+                    raw_rows.append(row)
                 by_code_scope: dict[
                     str, dict[str, list[dict[str, Any]]]
                 ] = defaultdict(lambda: defaultdict(list))
@@ -3307,8 +3335,10 @@ def _select_finance_atomic_batch_members(
                     complete_candidates: list[dict[str, Any]] = []
                     unavailable_candidates: list[dict[str, Any]] = []
                     for chain in by_code_scope.get(code, {}).values():
-                        _validate_coverage_chain(chain)
                         latest = chain[-1]
+                        previous_id, previous_known = predecessors[str(latest["coverage_id"])]
+                        _validate_coverage_chain(chain, first_revision=int(latest["revision_no"]),
+                                                 previous_id=previous_id, previous_known=previous_known)
                         status = str(latest.get("coverage_status") or "")
                         payload = _parse_payload(latest)
                         if status == FINANCE_EXPECTED_UNAVAILABLE_STATUS:
@@ -4123,13 +4153,15 @@ def _decode_finance_seal_payload(packed: object, *, expected_bytes: int) -> str:
         raise ValueError("finance_seal_history: compressed payload is not UTF-8") from exc
 
 
-def _finance_coverage_payload_columns(mysql: bool) -> str:
+def _finance_coverage_payload_columns(mysql: bool, *, table_alias: str = "") -> str:
+    prefix = table_alias + "." if table_alias else ""
     if not mysql:
-        return "*"
+        return prefix + "*"
     metadata = sorted(_REQUIRED_COLUMNS[SOURCE_COVERAGE_TABLE] - {"payload_json"})
     return (
-        ",".join(metadata) + ",OCTET_LENGTH(payload_json) AS payload_json_bytes,"
-        "COMPRESS(payload_json) AS payload_json_compressed"
+        ",".join(prefix + column for column in metadata)
+        + f",OCTET_LENGTH({prefix}payload_json) AS payload_json_bytes,"
+        + f"COMPRESS({prefix}payload_json) AS payload_json_compressed"
     )
 
 
