@@ -255,6 +255,8 @@ _WINDOWS_RUNTIME_FILES = (
     "tools/import_qmt_datadir_history.py",
     "integrations/qmt/datadir_import.py",
     "server/common/qmt_datadir_minute_coverage.py",
+    # sync_qmt_stock_edge executes this reader and receipt validator on Windows.
+    "server/common/minute_acquisition_reuse.py",
 )
 
 # The export list is packaging, not a runtime contract with the other endpoint.
