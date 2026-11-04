@@ -1195,6 +1195,7 @@ def _collect_minutes(engine, codes, *, kind, table, trade_date, min_coverage,
     store = _checkpoint_store(kind, trade_date, context, expected)
     source_checkpoints, reused_count = {}, 0
     buffer, staged_rows = [], 0
+    last_progress_count, last_progress_unit = -1, None
     is_flow = kind == "flow"
     if is_flow:
         stage, connection = _create_flow_stage(engine)
@@ -1214,14 +1215,18 @@ def _collect_minutes(engine, codes, *, kind, table, trade_date, min_coverage,
         buffer.clear()
 
     def progress(code):
-        if store is not None:
+        nonlocal last_progress_count
+        completed = len(proofs) + len(no_trade)
+        if store is not None and completed != last_progress_count:
             store.save("__progress__", dict(total_units=len(expected),
-                completed_units=len(proofs) + len(no_trade), current_unit=code,
+                completed_units=completed, current_unit=code,
                 last_progress_at=_now().isoformat(sep=" "), run_uid=context["run_uid"],
                 durable_completed_codes_sha256=_digest(sorted(proofs))))
+            last_progress_count = completed
 
     def consume(code, native, captured_at, *, restored=False):
-        nonlocal reused_count
+        nonlocal reused_count, last_progress_unit
+        last_progress_unit = code
         if code not in missing:
             raise RuntimeError("unexpected or duplicate source identity")
         try:
@@ -1255,7 +1260,9 @@ def _collect_minutes(engine, codes, *, kind, table, trade_date, min_coverage,
             reasons[reason] = reasons.get(reason, 0) + 1
         if len(buffer) >= 5000:
             append()
-        progress(code)
+            progress(code)
+        elif last_progress_count < 0 and proofs:
+            progress(code)
 
     try:
         fetcher = partial(fetch_minute_flow if is_flow else fetch_minute_kline, trade_date=trade_date)
@@ -1277,6 +1284,8 @@ def _collect_minutes(engine, codes, *, kind, table, trade_date, min_coverage,
                 if index % 200 == 0:
                     print(f"Minute {kind}: checked={index}/{len(selected)} collected={len(proofs)} missing={len(missing)}", file=sys.stderr, flush=True)
             append()
+        if last_progress_unit is not None:
+            progress(last_progress_unit)
         coverage = (len(proofs) + len(no_trade)) / len(expected)
         collection_finished_at = _now()
         collection_finished_text = collection_finished_at.isoformat(sep=" ")
