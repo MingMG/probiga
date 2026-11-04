@@ -10835,6 +10835,7 @@ prune_release_venvs() {
   done
 
   # Keep the newest successful releases until the rollback retention is full.
+  kept=${#keep_shas[@]}
   for sha in "${release_shas[@]}"; do
     [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || continue
     [ -n "${keep_shas[$sha]:-}" ] && continue

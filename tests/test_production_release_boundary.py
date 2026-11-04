@@ -2127,12 +2127,13 @@ test -d "$with_link/build-$referenced-1"
 
 RELEASE_VENV_ROOT="$without_link"
 RUNTIME_REF=""
+PREVIOUS_WINDOWS_SHA="$stale"
 prune_release_venvs "$active" "$incoming"
 test -L "$without_link/$active"
-test -L "$without_link/$second"
+test ! -e "$without_link/$second"
 test ! -e "$without_link/$incoming"
 test ! -e "$without_link/build-$incoming-1"
-test ! -e "$without_link/$stale"
+test -L "$without_link/$stale"
 '''
     completed = subprocess.run(
         [bash, "-c", harness],
