@@ -1478,6 +1478,20 @@ def test_turnover_new_release_reuses_verified_prior_values_without_rewriting():
     engine.dispose()
 
 
+def test_turnover_recovery_does_not_reuse_superseded_qmt_daily_publication():
+    engine = _engine()
+    run = _capture(engine)
+    publish_turnover_snapshot(engine, run, min_expected_count=2,
+                              published_at=datetime(2026, 8, 27, 18, 45))
+    revised = replace(_authority(), truth_run_id="revised-qmt-daily", truth_sha256="d" * 64)
+    assert recover_completed_turnover_receipt(
+        engine, target_date=TARGET_DATE, decision_at=DECISION_AT,
+        collector_build_sha=BUILD_SHA, collector_binary_sha256=BINARY_SHA,
+        authority=revised, min_expected_count=2,
+    ) is None
+    engine.dispose()
+
+
 def test_turnover_build_identity_rejects_dirty_checkout(monkeypatch) -> None:
     monkeypatch.setattr(turnover_command, "_git_head", lambda: BUILD_SHA)
     monkeypatch.setattr(
