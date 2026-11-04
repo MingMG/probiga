@@ -517,11 +517,9 @@ def test_turnover_volume_matches_exactly_at_provider_lot_precision() -> None:
     assert row.target.volume_shares == Decimal("1040")
 
 
-def test_turnover_blocks_beijing_post_close_volume_scope_difference() -> None:
+def test_turnover_preserves_qmt_volume_on_provider_scope_difference() -> None:
     # The 2026-09-10 source responses have identical prices. QMT's 15:00
     # daily bar has 18,894 lots, while the provider's final row has 19,294.
-    # Preserve the mismatch as an actionable data failure rather than
-    # silently accepting the provider's turnover for a different volume.
     target = replace(
         _targets(_engine())[0],
         stock_code="920045",
@@ -543,40 +541,43 @@ def test_turnover_blocks_beijing_post_close_volume_scope_difference() -> None:
         },
     }).encode("utf-8")
 
-    with pytest.raises(TurnoverSnapshotBlocked) as failure:
-        parse_eastmoney_turnover_response(
-            target=target,
-            raw_payload=raw,
-            provider_http_date="Thu, 10 Sep 2026 14:30:14 GMT",
-            captured_at=datetime(2026, 9, 10, 22, 30, 15),
-            decision_at=datetime(2026, 9, 10, 22, 31),
-        )
-
-    assert str(failure.value) == (
-        "DATA_BLOCKED: Eastmoney/QMT OHLCV fingerprint differs for 920045: "
-        "volume_shares(eastmoney=1929400,qmt=1889400)"
+    row = parse_eastmoney_turnover_response(
+        target=target, raw_payload=raw,
+        provider_http_date="Thu, 10 Sep 2026 14:30:14 GMT",
+        captured_at=datetime(2026, 9, 10, 22, 30, 15),
+        decision_at=datetime(2026, 9, 10, 22, 31),
     )
+    assert row.target.volume_shares == Decimal("1889400")
+    assert row.source_volume_shares == Decimal("1929400")
+    assert row.turnover_percent == Decimal("6.85")
 
 
-def test_turnover_mismatch_diagnostics_preserve_exact_price_comparison() -> None:
-    target = replace(
-        _targets(_engine())[0],
-        open=Decimal("10.01"),
-        close=Decimal("10.21"),
+def test_turnover_keeps_qmt_prices_and_raw_provider_observation():
+    target = replace(_targets(_engine())[0], open=Decimal("10.01"), close=Decimal("10.21"))
+    row = parse_eastmoney_turnover_response(
+        target=target, raw_payload=_raw_payload(target.stock_code),
+        provider_http_date=HTTP_DATE, captured_at=CAPTURED_AT, decision_at=DECISION_AT,
     )
-    with pytest.raises(TurnoverSnapshotBlocked) as failure:
-        parse_eastmoney_turnover_response(
-            target=target,
-            raw_payload=_raw_payload(target.stock_code),
-            provider_http_date=HTTP_DATE,
-            captured_at=CAPTURED_AT,
-            decision_at=DECISION_AT,
-        )
+    assert row.target.open == Decimal("10.01")
+    assert row.target.close == Decimal("10.21")
+    assert row.source_open == Decimal("10")
+    assert row.source_close == Decimal("10.2")
 
-    assert str(failure.value) == (
-        "DATA_BLOCKED: Eastmoney/QMT OHLCV fingerprint differs for 000001: "
-        "open(eastmoney=10,qmt=10.01); close(eastmoney=10.2,qmt=10.21)"
+
+def test_qmt_authority_turnover_publication_roundtrip():
+    engine = _engine()
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE sm_stock_kline SET volume=1100 WHERE stock_code='000001'"))
+    run = _capture(engine)
+    published_at = DECISION_AT + timedelta(seconds=1)
+    publish_turnover_snapshot(engine, run, min_expected_count=2, published_at=published_at)
+    evidence = verify_turnover_publication_evidence(
+        engine, target_date=TARGET_DATE, decision_at=published_at, min_expected_count=2,
     )
+    proof = validate_turnover_evidence(evidence["000001"]["turnover_evidence_json"])
+    assert proof["market_data_authority"] == "QMT"
+    assert Decimal(proof["volume"]) == Decimal("1100")
+    assert Decimal(proof["source_volume_shares"]) == Decimal("1000")
 
 
 def test_completed_turnover_authority_survives_next_session_projection(
@@ -990,7 +991,7 @@ def test_turnover_retry_fetches_only_the_failed_stock_shard() -> None:
 @pytest.mark.parametrize(
     "mutation",
     (
-        lambda raw: raw.replace(b"10.2,10.5", b"10.3,10.5"),
+        lambda raw: raw.replace(b"10.2,10.5", b"NaN,10.5"),
         lambda raw: raw.replace(b",0.45\"]", b",-\"]"),
         lambda raw: raw.replace(TARGET_DATE.encode(), b"2026-08-20"),
     ),

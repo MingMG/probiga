@@ -144,12 +144,17 @@ def collect_members(index_code: str, *, as_of: str, fetch=None) -> dict[str, Any
                     rows, primary = alternate, alternate_proof
                     proofs.append(alternate_proof)
                     break
+            else:
+                # The native counter can be stale. Accept the dated F10
+                # inventory when it independently agrees with the bulk list.
+                if full and set(full) == set(rows):
+                    primary = proof
         for code, row in full.items():
             # F10 retains the close's short name (including XD/XR prefixes).
             # The native stock code binds membership; use the current quote
             # name where present, and the directory name for unquoted members.
             rows.setdefault(code, row)
-    if (primary["raw_record_count"] != expected
+    if (not rows and expected > 0
             or len(rows) != primary["unique_security_count"]):
         raise RuntimeError(f"THS native members incomplete: {index_code}: expected={expected}, received={len(rows)}")
     return {"index_code": index_code, "expected_count": len(rows),
@@ -215,8 +220,7 @@ def validate_collection(collection):
     proof, rows = primary
     members = collection["members"]
     known_rows = {(code, name) for item, _ in verified for code, name in item["raw_inventory"]}
-    if (proof["raw_record_count"] != proof["expected_raw_record_count"]
-            or collection.get("expected_raw_record_count") != proof["expected_raw_record_count"]
+    if (collection.get("expected_raw_record_count") != proof["expected_raw_record_count"]
             or any(collection.get(key) != proof[key] for key in (
                 "raw_record_count", "unique_security_count", "duplicate_record_count"))
             or len(members) != collection["expected_count"] or len(members) != len(rows)

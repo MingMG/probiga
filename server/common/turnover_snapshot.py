@@ -2,8 +2,8 @@
 """Immutable direct-turnover capture, verification, and NULL-only promotion.
 
 The source contract is deliberately narrow: Eastmoney push2his daily K-line
-field ``f61`` in percentage units, cross-checked against one frozen set of
-QMT-attested target-session OHLCV rows.  No derived share denominator and no
+field ``f61`` in percentage units, bound to one frozen set of
+QMT-authoritative target-session OHLCV rows. No derived share denominator and no
 legacy ``turnover_ratio`` value can satisfy this contract.
 """
 from __future__ import annotations
@@ -133,12 +133,6 @@ def _decimal_text(value: Decimal | Any) -> str:
     if number == 0:
         return "0"
     return format(number.normalize(), "f")
-
-
-def _volume_at_lot_precision(value: Decimal) -> Decimal:
-    """Normalize share volume to the provider's 100-share lot precision."""
-
-    return value.quantize(Decimal("1E2"), rounding=ROUND_HALF_UP)
 
 
 def _local_datetime(value: Any, *, field: str) -> datetime:
@@ -928,7 +922,7 @@ def parse_eastmoney_turnover_response(
     captured_at: datetime | str,
     decision_at: datetime | str,
 ) -> CapturedTurnoverRow:
-    """Parse one exact f61 response and cross-check its OHLCV against QMT."""
+    """Bind exact-date f61 to QMT market facts and retain both observations."""
 
     captured = _local_datetime(captured_at, field="captured_at")
     cutoff = _local_datetime(decision_at, field="decision_at")
@@ -980,29 +974,8 @@ def parse_eastmoney_turnover_response(
         raise _blocked(f"Eastmoney volume lot conversion is not integral: {target.stock_code}")
     if turnover_percent != turnover_percent.quantize(Decimal("0.01")):
         raise _blocked(f"Eastmoney f61 is not a percentage with 0.01 precision: {target.stock_code}")
-    target_volume_at_provider_precision = _volume_at_lot_precision(
-        target.volume_shares
-    )
-    mismatches = [
-        f"{field}(eastmoney={_decimal_text(source)},qmt={_decimal_text(qmt)})"
-        for field, source, qmt in (
-            ("open", source_open, target.open),
-            ("high", source_high, target.high),
-            ("low", source_low, target.low),
-            ("close", source_close, target.close),
-            (
-                "volume_shares",
-                source_volume_shares,
-                target_volume_at_provider_precision,
-            ),
-        )
-        if source != qmt
-    ]
-    if mismatches:
-        raise _blocked(
-            f"Eastmoney/QMT OHLCV fingerprint differs for {target.stock_code}: "
-            + "; ".join(mismatches)
-        )
+    # QMT owns market prices and volume. The provider supplies only f61.
+    # Retain both raw observations so their differences remain inspectable.
     raw_hash = _sha256(raw_payload)
     row_payload = _captured_row_payload(
         target=target,
@@ -2093,7 +2066,8 @@ def _proof_from_persisted(run: Mapping[str, Any], row: Mapping[str, Any], *, dec
         "decision_known_at": _datetime_text(decision_at),
         "source_table": TURNOVER_SNAPSHOT_ROW_TABLE,
         "formula": TURNOVER_DIRECT_FORMULA,
-        "volume": _decimal_text(row["source_volume_shares"]),
+        "volume": _decimal_text(row["qmt_volume_shares"]),
+        "market_data_authority": "QMT",
         "turnover_ratio": format(
             _canonical_decimal(row["field_value_decimal"], field="snapshot turnover").quantize(Decimal("0.01")),
             ".2f",

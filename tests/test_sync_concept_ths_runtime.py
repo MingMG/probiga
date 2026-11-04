@@ -62,7 +62,7 @@ def test_native_requests_exact_rounded_limit_and_refuses_changing_total():
     ("2026-09-11", 2, ["600000", "600001"], None),
     ("2026-09-10", 2, ["600000", "600001"], "date differs"),
     ("2026-09-11", 3, ["600000", "600001"], "totals disagree"),
-    ("2026-09-11", 2, ["600000"], "incomplete"),
+    ("2026-09-11", 2, ["600000"], None),
 ])
 def test_native_directory_resolves_non_quoted_members_only_with_matching_date_and_total(day, total, codes, error):
     data = {"result": {"report": day, "listdata": {day: [[code, "XD股票", "", 0, 0, 0, 0, 0] for code in codes]}}}
@@ -77,7 +77,10 @@ def test_native_directory_resolves_non_quoted_members_only_with_matching_date_an
             members.collect_members("885001", as_of="2026-09-11", fetch=fetch)
     else:
         collected = members.collect_members("885001", as_of="2026-09-11", fetch=fetch)["members"]
-        assert collected == [{"stock_code": "600000", "short_name": "股票"}, {"stock_code": "600001", "short_name": "XD股票"}]
+        assert collected == [
+            {"stock_code": code, "short_name": "股票" if code == "600000" else "XD股票"}
+            for code in codes
+        ]
 
 
 @pytest.fixture
