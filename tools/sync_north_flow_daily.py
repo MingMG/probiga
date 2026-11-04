@@ -10,7 +10,7 @@ trade date and stores the completed 15:00 values atomically.
 from __future__ import annotations
 
 import argparse
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, time as datetime_time
 import json
 import math
 import time
@@ -219,7 +219,7 @@ def main(argv: list[str] | None = None) -> int:
     engine = create_tool_engine()
     try:
         target = (
-            authoritative_closed_trade_date(engine)
+            authoritative_closed_trade_date(engine, close_ready_time=datetime_time(15, 30))
             if args.date == "latest"
             else date.fromisoformat(args.date).isoformat()
         )

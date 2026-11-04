@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from datetime import date, datetime
+from datetime import date, datetime, time
 import hashlib
 import json
 import os
@@ -274,7 +274,7 @@ def main(argv: list[str] | None = None) -> int:
         engine = create_batch_engine()
         try:
             target = (
-                authoritative_closed_trade_date(engine)
+                authoritative_closed_trade_date(engine, close_ready_time=time(15, 35))
                 if args.date == "latest"
                 else date.fromisoformat(args.date).isoformat()
             )

@@ -1,10 +1,29 @@
 from __future__ import annotations
 
 import pandas as pd
+from datetime import datetime
 from sqlalchemy import create_engine, text
 
 from biz.stock_market import sync_stock_market
 from tools import sync_free_index_daily as collector
+
+
+def test_scheduled_index_target_is_today_after_1535(monkeypatch):
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE si_trade_calendar (trade_date TEXT, trade_status INTEGER)"))
+        connection.execute(text("INSERT INTO si_trade_calendar VALUES ('2026-11-03',1),('2026-11-04',1)"))
+    from server.common.authoritative_market_clock import authoritative_closed_trade_date
+    monkeypatch.setattr(collector, "load_project_env", lambda: None)
+    monkeypatch.setattr(collector, "create_batch_engine", lambda: engine)
+    monkeypatch.setattr(collector, "authoritative_closed_trade_date",
+        lambda engine, **kwargs: authoritative_closed_trade_date(
+            engine, now=datetime(2026, 11, 4, 17, 10), **kwargs))
+    seen = []
+    monkeypatch.setattr(collector, "publish", lambda target, **kwargs:
+        seen.append(target) or {"status": "COMPLETE"})
+    assert collector.main(["--date", "latest", "--json"]) == 0
+    assert seen == ["2026-11-04"]
 
 
 def test_public_index_sources_map_beijing_index_to_bj_market():
