@@ -2440,6 +2440,11 @@ def recover_completed_turnover_receipt(
     if len(rows) != 1:
         raise _blocked("completed turnover publication recovery is ambiguous")
     run = dict(rows[0])
+    # A later QMT daily publication can revise volume/amount for the same
+    # security set. Its old capture must not retain the superseded authority.
+    if (str(run["authority_proof_identity"]) != authority.truth_run_id
+            or str(run["authority_proof_sha256"]) != authority.truth_sha256):
+        return None
     return {
         "schema": TURNOVER_SNAPSHOT_VERSION,
         "status": "COMPLETED",
