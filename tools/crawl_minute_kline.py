@@ -43,7 +43,7 @@ if str(ROOT) not in sys.path:
 from server.common.batch_db import create_batch_engine, quote_identifier, routed_read_engine, write_frame
 from server.common.kline_data import get_kline_engine
 from server.common.minute_data import get_minute_engine
-from server.common.authoritative_market_clock import PRODUCTION_TIMEZONE
+from server.common.authoritative_market_clock import PRODUCTION_TIMEZONE, authoritative_closed_trade_date
 from server.common.qmt_stock_catalog import load_target_stock_catalog
 from server.common.verified_daily_market_truth import (
     VERIFIED_FREE_DAILY_ROW_SOURCES,
@@ -1447,7 +1447,15 @@ def main():
         if args.skip_closed and args.trade_date is None and not is_trading_time(engine, started):
             print(_result_json({"status": "skipped", "reason": "market_closed", "now": started.isoformat(sep=" ")}))
             return 0
-        target = date.fromisoformat(args.trade_date) if args.trade_date else started.date()
+        if args.trade_date:
+            target = date.fromisoformat(args.trade_date)
+        elif task_type == "stock_minute_flow":
+            closed_day = authoritative_closed_trade_date(engine, now=started, close_ready_time=wall_time(16))
+            if not closed_day:
+                raise ValueError("closed minute-flow trading date unavailable")
+            target = date.fromisoformat(closed_day)
+        else:
+            target = started.date()
         if target > started.date() or not _is_trade_day(engine, target) or args.limit < 0:
             raise ValueError("invalid target trading date")
         build = str(os.environ.get("PROBIGA_SCHEDULER_BUILD_SHA") or os.environ.get("PROBIGA_BUILD_COMMIT_SHA") or "").lower()
