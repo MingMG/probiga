@@ -52,6 +52,19 @@ def receipt(kind="stock", task_type=None):
 
 
 @pytest.mark.parametrize("kind", ["stock", "flow"])
+@pytest.mark.parametrize("elapsed", [timedelta(minutes=46), timedelta(hours=7)])
+def test_valid_completed_partition_reuse_is_not_rejected_for_elapsed_time(kind, elapsed):
+    result = reuse.result_for(
+        [partition(kind)],
+        task_type="qmt_stock_minute_canonical" if kind == "stock" else "stock_minute_flow",
+        build_sha=BUILD,
+        started_at=NOW - elapsed,
+    )
+    reuse.validate_result(result, task_type=result["task_type"])
+    assert result["status"] == "REUSED"
+
+
+@pytest.mark.parametrize("kind", ["stock", "flow"])
 @pytest.mark.parametrize("native", [False, True])
 def test_complete_provider_grid_is_reusable_with_real_source(kind, native):
     row = inventory_row(kind=kind, native=native)

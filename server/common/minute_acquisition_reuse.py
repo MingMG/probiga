@@ -399,7 +399,7 @@ def validate_result(result: Mapping, *, task_type: str) -> None:
         raise ValueError("reused minute dates differ")
     start = datetime.fromisoformat(result["started_at"])
     finish = datetime.fromisoformat(result["finished_at"])
-    if start.tzinfo or finish.tzinfo or not start <= finish or (finish-start).total_seconds() > 2700:
+    if start.tzinfo or finish.tzinfo or not start <= finish:
         raise ValueError("reused minute execution time differs")
     for part in partitions:
         decision = datetime.fromisoformat(part["decision_known_at"])
