@@ -2404,20 +2404,8 @@ def recover_completed_turnover_receipt(
         decision_at=cutoff,
         codes=authority.expected_codes,
     )
-    evidence = verify_turnover_publication_evidence(
-        engine, target_date=target, decision_at=cutoff,
-        min_expected_count=min_expected_count,
-    )
-    if not evidence:
-        return None
-    if set(evidence) != set(authority.expected_codes):
-        raise _blocked("completed turnover publication recovery coverage differs")
-    proof_run_ids = {
-        str(json.loads(item["turnover_evidence_json"])["snapshot_run_id"])
-        for item in evidence.values()
-    }
-    if len(proof_run_ids) != 1:
-        raise _blocked("completed turnover publication recovery identity differs")
+    # Check the current authority before replaying the old publication. A
+    # superseded daily manifest intentionally no longer matches current bars.
     with engine.connect() as connection:
         rows = connection.execute(text(f"""
             SELECT * FROM {TURNOVER_SNAPSHOT_RUN_TABLE}
@@ -2425,14 +2413,13 @@ def recover_completed_turnover_receipt(
               AND decision_at<=:decision_at
               AND status='COMPLETED'
               AND capture_kind=:capture_kind
-              AND run_id=:run_id
               AND authority_proof_kind='QMT_DAILY_MARKET_TRUTH'
               AND authority_set_sha256=:authority_set_sha256
+            ORDER BY published_at DESC,run_id DESC LIMIT 1
         """), {
             "target_date": target.isoformat(),
             "decision_at": _datetime_text(cutoff),
             "capture_kind": TURNOVER_CAPTURE_KIND,
-            "run_id": next(iter(proof_run_ids)),
             "authority_set_sha256": authority.stock_set_sha256,
         }).mappings().all()
     if not rows:
@@ -2445,6 +2432,20 @@ def recover_completed_turnover_receipt(
     if (str(run["authority_proof_identity"]) != authority.truth_run_id
             or str(run["authority_proof_sha256"]) != authority.truth_sha256):
         return None
+    evidence = verify_turnover_publication_evidence(
+        engine, target_date=target, decision_at=cutoff,
+        min_expected_count=min_expected_count,
+    )
+    if not evidence:
+        return None
+    if set(evidence) != set(authority.expected_codes):
+        raise _blocked("completed turnover publication recovery coverage differs")
+    proof_run_ids = {
+        str(json.loads(item["turnover_evidence_json"])["snapshot_run_id"])
+        for item in evidence.values()
+    }
+    if proof_run_ids != {str(run["run_id"])}:
+        raise _blocked("completed turnover publication recovery identity differs")
     return {
         "schema": TURNOVER_SNAPSHOT_VERSION,
         "status": "COMPLETED",

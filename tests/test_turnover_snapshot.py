@@ -1478,12 +1478,15 @@ def test_turnover_new_release_reuses_verified_prior_values_without_rewriting():
     engine.dispose()
 
 
-def test_turnover_recovery_does_not_reuse_superseded_qmt_daily_publication():
+def test_turnover_recovery_does_not_reuse_superseded_qmt_daily_publication(monkeypatch):
     engine = _engine()
     run = _capture(engine)
     publish_turnover_snapshot(engine, run, min_expected_count=2,
                               published_at=datetime(2026, 8, 27, 18, 45))
     revised = replace(_authority(), truth_run_id="revised-qmt-daily", truth_sha256="d" * 64)
+    def old_manifest_no_longer_matches(*args, **kwargs):
+        raise ValueError("daily database bars differ from full-market proof")
+    monkeypatch.setattr(turnover_module, "verify_turnover_publication_evidence", old_manifest_no_longer_matches)
     assert recover_completed_turnover_receipt(
         engine, target_date=TARGET_DATE, decision_at=DECISION_AT,
         collector_build_sha=BUILD_SHA, collector_binary_sha256=BINARY_SHA,
