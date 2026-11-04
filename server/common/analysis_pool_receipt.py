@@ -925,10 +925,20 @@ def validate_turnover_evidence(value: Any) -> dict[str, Any]:
         or not target_provenance_supported
         or not str(payload.get("qmt_batch_id") or "").strip()
         or not str(payload.get("qmt_data_version") or "").strip()
-        or source_values[:-1] != qmt_values[:-1]
-        or source_values[-1] != _volume_at_lot_precision(qmt_values[-1])
-        or volume != source_values[-1]
+        or (
+            payload.get("market_data_authority") == "QMT"
+            and volume != qmt_values[-1]
+        )
+        or (
+            payload.get("market_data_authority") != "QMT"
+            and (
+                source_values[:-1] != qmt_values[:-1]
+                or source_values[-1] != _volume_at_lot_precision(qmt_values[-1])
+                or volume != source_values[-1]
+            )
+        )
         or any(not item.is_finite() or item <= 0 for item in source_values)
+        or any(not item.is_finite() or item <= 0 for item in qmt_values)
         or turnover
         != turnover.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         or re.fullmatch(
