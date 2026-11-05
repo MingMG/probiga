@@ -232,6 +232,15 @@ def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: s
 
     args = script_args_raw.split() if script_args_raw else []
     args.extend(_date_param_args(date_param_raw))
+    if task_type == "daily_review" and (
+        normalized_path == "biz/review/generate.py"
+        or normalized_path.endswith("/biz/review/generate.py")
+    ):
+        # The producer resolves the last closed exchange session. A morning
+        # recovery must not receive today's still-open calendar date.
+        if "--today" not in args and not any(_is_iso_date_arg(item) for item in args):
+            args.append("--today")
+        return args
     if (
         task_type in {"stock_minute", "stock_minute_flow"}
         and normalized_path == "tools/crawl_minute_kline.py"

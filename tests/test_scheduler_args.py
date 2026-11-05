@@ -9,6 +9,17 @@ from server.api import scheduler_runtime
 from server.common.scheduler_args import build_scheduler_task_args
 
 
+@pytest.mark.parametrize("configured,expected", [
+    ("", ["--today"]), ("--force", ["--force", "--today"]),
+    ("2026-11-03", ["2026-11-03"]), ("--today", ["--today"]),
+])
+def test_review_recovery_resolves_closed_session_instead_of_wall_clock(configured, expected):
+    assert build_scheduler_task_args(
+        {"task_type": "daily_review", "script_args": configured},
+        "biz/review/generate.py", "2026-11-05",
+    ) == expected
+
+
 def test_concept_scheduler_args_bind_the_authoritative_closed_session():
     row = {
         "task_type": "eastmoney_concept_current",
