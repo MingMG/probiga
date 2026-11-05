@@ -1,11 +1,11 @@
-"""The briefing CLI publishes canonical research without a template path."""
+"""The briefing CLI publishes website reports and requires opt-in for delivery."""
 import sys
 from unittest.mock import Mock
 
 import pytest
 
 from biz.early_briefing import generate
-from biz.review import research_flow
+from biz.review import daily_reports
 from integrations.wecom.delivery import WeComDeliveryError
 
 TARGET_DATE = "2026-10-30"
@@ -23,7 +23,7 @@ def _bind_target(monkeypatch, *args):
 
 def test_ready_briefing_pushes_and_writes_the_same_artifact(monkeypatch, tmp_path):
     output = tmp_path / "briefing.md"
-    engine, authority = _bind_target(monkeypatch, "--output", str(output))
+    engine, authority = _bind_target(monkeypatch, "--push", "--output", str(output))
     research = Mock(return_value={"content": CONTENT})
     push = Mock(return_value=True)
     monkeypatch.setattr(generate, "generate_briefing", research)
@@ -60,9 +60,9 @@ def test_invalid_frozen_digest_fails_before_research_or_delivery(monkeypatch, st
         "quality_json": {"target_date": date, "source_dates": {"target_bars": date},
                          "errors": [] if stale else ["行情覆盖率不足"]},
     }
-    monkeypatch.setattr(research_flow, "load_digest", Mock(return_value=digest))
+    monkeypatch.setattr(daily_reports, "load_digest", Mock(return_value=digest))
     model = Mock(side_effect=AssertionError("invalid facts must not reach the model"))
-    monkeypatch.setattr("biz.review.market_decision.generate_research", model)
+    monkeypatch.setattr(daily_reports, "_call_codex", model)
     push = Mock(side_effect=AssertionError("invalid facts must not be delivered"))
     monkeypatch.setattr(generate, "push_to_wecom", push)
     with pytest.raises(RuntimeError, match="DATA_BLOCKED stage=research_input"):
@@ -82,7 +82,7 @@ def test_unavailable_authoritative_session_fails_before_research(monkeypatch):
 
 
 def test_delivery_error_propagates_out_of_early_briefing_main(monkeypatch):
-    engine, _ = _bind_target(monkeypatch)
+    engine, _ = _bind_target(monkeypatch, "--push")
     research = Mock(return_value={"content": CONTENT})
     error = WeComDeliveryError("briefing webhook is not configured", delivery_id="delivery-early-test")
     monkeypatch.setattr(generate, "generate_briefing", research)

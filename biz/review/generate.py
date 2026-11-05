@@ -11,9 +11,8 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from biz.evening_review.generate import published_report, resolve_review_trade_date
-from biz.review.quant_digest import generate_quant_digest
-from biz.review.research_flow import load_digest
+from biz.evening_review.generate import resolve_review_trade_date
+from biz.review.daily_reports import publish_review
 from server.common.batch_db import create_batch_engine
 
 
@@ -30,22 +29,11 @@ def main():
     args = parser.parse_args()
     engine = get_engine()
     target = resolve_review_trade_date(engine, args.date or "")
-    existing = load_digest(engine, target, required=False) if not args.force else None
-    if existing is not None:
-        try:
-            content = published_report(existing, target)
-        except RuntimeError:
-            # Only the producer rebuilds outdated or incomplete artifacts from
-            # verified sources. Consumers never substitute or regenerate them.
-            pass
-        else:
-            print(content)
-            return 0
-    result = generate_quant_digest(engine, target, persist=True)
+    result = publish_review(engine, target, force=args.force)
     if result.get("publish_status") != "ready":
         print(json.dumps(result.get("quality_json") or {}, ensure_ascii=False, indent=2))
         return 2
-    print(published_report(result, target))
+    print(result["compact_review"])
     return 0
 
 

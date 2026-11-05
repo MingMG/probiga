@@ -2037,9 +2037,12 @@ def persist_quant_digest(engine: Any, result: Mapping[str, Any]) -> None:
             ), {"review_date": payload["review_date"], "adjust_type": payload["adjust_type"]}).scalar_one_or_none()
             if stored:
                 previous_factors = json.loads(stored) if isinstance(stored, str) else stored
-                if previous_factors.get("early_briefing"):
+                previous_briefing = previous_factors.get("early_briefing") or {}
+                from biz.review.market_decision import source_digest_identity
+                if previous_briefing and (previous_briefing.get("mode") not in {"facts", "codex"}
+                        or previous_briefing.get("source_digest_sha256") == source_digest_identity(result)):
                     factors = json.loads(payload["factor_validation_json"])
-                    factors["early_briefing"] = previous_factors["early_briefing"]
+                    factors["early_briefing"] = previous_briefing
                     payload["factor_validation_json"] = _dump_json(factors)
         connection.execute(text(_DIGEST_UPSERT), payload)
 
@@ -2097,19 +2100,8 @@ def generate_quant_digest(
         key: value for key, value in selection.items() if key != "review_sha256"
     })
     result["factor_validation_json"]["selection_review"] = selection
-    if result.get("publish_status") == PUBLISH_READY:
-        from biz.review.research_flow import attach_review
-        attach_review(engine, result, now=now)
     if persist:
         persist_quant_digest(engine, result)
-        if result.get("publish_status") == PUBLISH_READY:
-            from biz.review.research_flow import load_digest
-            stored = load_digest(engine, date_str)
-            actual = (stored["factor_validation_json"].get("market_decision") or {}).get("research_sha256")
-            expected = result["factor_validation_json"]["market_decision"]["research_sha256"]
-            if stored.get("compact_review") != result["compact_review"] or actual != expected:
-                raise RuntimeError("FAILED stage=review_readback: canonical report differs from generation")
-            return stored
     return result
 
 

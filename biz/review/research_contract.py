@@ -205,7 +205,8 @@ def _span_text(spans, packet):
 
 
 def build_packet(digest: dict, *, report_kind: str, next_trade_date: str, context: dict | None,
-                 previous_research: dict | None, now: datetime, source_digest_sha256: str) -> dict:
+                 previous_research: dict | None, now: datetime, source_digest_sha256: str,
+                 allow_fact_baseline: bool = False) -> dict:
     """Project verified source material, never repair it or mutate the snapshot."""
     if report_kind not in {"review", "briefing", "intraday"}:
         _fail("invalid_report_kind")
@@ -516,7 +517,7 @@ def build_packet(digest: dict, *, report_kind: str, next_trade_date: str, contex
                        parent_report_id=parent_id, parent_unit_id=unit["id"], trade_date=prior_packet["task"]["review_date"])
             baseline["unit_facts"][fid] = unit["id"]
         packet["baseline"] = baseline
-    elif report_kind == "briefing":
+    elif report_kind == "briefing" and not allow_fact_baseline:
         _fail("v3_parent_required_for_briefing")
     else:
         limitation("prior_plan", "没有本合同的事前留存基线，不能声称已经验证研究过程")
