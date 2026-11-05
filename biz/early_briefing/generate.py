@@ -14,7 +14,7 @@ from server.common.batch_db import create_batch_engine
 from server.common.authoritative_market_clock import authoritative_closed_trade_date
 from server.common.config import get_wecom_webhook
 from integrations.wecom.delivery import deliver_markdown
-from biz.review.research_flow import generate_briefing
+from biz.review.daily_reports import publish_briefing as generate_briefing
 log = logging.getLogger("briefing")
 
 

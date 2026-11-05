@@ -98,6 +98,45 @@ def _stored(engine):
     return research_flow.decode_digest(dict(row))
 
 
+def test_scheduled_review_saves_facts_before_codex_and_keeps_them_on_failure(db, monkeypatch):
+    from biz.review import daily_reports
+
+    monkeypatch.setattr(daily_reports, "generate_quant_digest", lambda *args, **kw: _digest())
+    monkeypatch.setattr(daily_reports, "persist_quant_digest", _insert)
+    monkeypatch.setattr(daily_reports, "collect_context", lambda *args, **kw: {})
+
+    def unavailable(*args, **kw):
+        assert _stored(db)["compact_review"].endswith(daily_reports.FACTS_NOTE)
+        raise market_decision.ResearchError("Codex unavailable")
+
+    monkeypatch.setattr(daily_reports, "_call_codex", unavailable)
+    report = daily_reports.publish_review(db, REVIEW)
+    assert report["publish_status"] == "ready"
+    assert report["compact_review"].endswith(daily_reports.FACTS_NOTE)
+    assert "market_decision" not in _stored(db)["factor_validation_json"]
+
+
+def test_scheduled_briefing_publishes_without_ai_parent_or_model(db, monkeypatch):
+    from biz.review import daily_reports
+
+    _insert(db, _digest())
+    monkeypatch.setattr(daily_reports, "render_compact_review", lambda digest: "已保存收盘事实")
+    monkeypatch.setattr(daily_reports, "collect_context", lambda *args, **kw: {
+        "cutoff_at": f"{NEXT}T08:30:00+08:00", "events": {"status": "EMPTY"},
+    })
+
+    def unavailable(*args, **kw):
+        briefing = _stored(db)["factor_validation_json"]["early_briefing"]
+        assert briefing["next_trade_date"] == NEXT and briefing["mode"] == "facts"
+        raise market_decision.ResearchError("Codex unavailable")
+
+    monkeypatch.setattr(daily_reports, "_interpret", unavailable)
+    result = daily_reports.publish_briefing(db, REVIEW)
+    assert result["mode"] == "facts"
+    assert "已采集来源在本窗口没有新增记录" in result["content"]
+    assert _stored(db)["compact_review"] == _digest()["compact_review"]
+
+
 def test_briefing_write_is_one_transaction_and_keeps_review_and_other_factors(db):
     digest = _with_parent()
     _insert(db, digest)

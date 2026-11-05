@@ -87,7 +87,7 @@ def load_digest(engine, review_date: str, *, required: bool = True) -> dict | No
 
 
 def collect_context(engine, review_date: str, *, now: datetime | None = None,
-                    overnight: bool = False) -> dict:
+                    overnight: bool = False, include_research: bool = True) -> dict:
     """Bound all observations to a declared Shanghai cutoff, without DB writes."""
     current = now or datetime.now(TZ)
     current = current.replace(tzinfo=TZ) if current.tzinfo is None else current.astimezone(TZ)
@@ -95,8 +95,12 @@ def collect_context(engine, review_date: str, *, now: datetime | None = None,
         datetime.fromisoformat(review_date).date(), time(23, 59, 59), TZ))
     context: dict[str, Any] = {"cutoff_at": cutoff.isoformat(), "source": "ProBigA",
                                "market_data_asof_at": current.isoformat()}
-    from biz.review.theme_evidence import collect_theme_evidence
-    context["theme_evidence"] = collect_theme_evidence(engine, review_date, asof=current)
+    if include_research:
+        from biz.review.theme_evidence import collect_theme_evidence
+        context["theme_evidence"] = collect_theme_evidence(engine, review_date, asof=current)
+    start = datetime.fromisoformat(review_date)
+    if overnight:
+        start = datetime.combine(start.date(), time(15))
     # Independent optional observations cannot upgrade the gated stock coverage.
     for name, sql, params in (
         ("indices", "SELECT index_code, trade_date, open, close, high, low, amount, change_pct FROM sm_index_kline "
@@ -105,7 +109,7 @@ def collect_context(engine, review_date: str, *, now: datetime | None = None,
         ("events", "SELECT source, title, content, publish_time, first_seen_at FROM st_news_flash "
          "WHERE publish_time>=:start AND publish_time<=:cutoff AND first_seen_at<=:cutoff "
          "ORDER BY publish_time DESC LIMIT 50",
-         {"start": datetime.fromisoformat(review_date), "cutoff": cutoff.replace(tzinfo=None)}),
+             {"start": start, "cutoff": cutoff.replace(tzinfo=None)}),
     ):
         try:
             sql = sql.replace("SELECT ", "SELECT /*+ MAX_EXECUTION_TIME(15000) */ ", 1)
@@ -113,6 +117,8 @@ def collect_context(engine, review_date: str, *, now: datetime | None = None,
             context[name] = {"status": "OBSERVED" if rows else "UNKNOWN",
                              "source": "sm_index_kline" if name == "indices" else "st_news_flash",
                              "rows": rows}
+            if name == "events" and not rows:
+                context[name]["status"] = "EMPTY"
         except Exception as exc:
             context[name] = {"status": "UNKNOWN", "reason": type(exc).__name__}
     # A close bulletin is older than the latest evening headlines. Query its
@@ -172,6 +178,21 @@ def collect_context(engine, review_date: str, *, now: datetime | None = None,
                                           "rows": list(latest.values())}
         except Exception as exc:
             context["external_market"] = {"status": "UNKNOWN", "reason": type(exc).__name__}
+    if not include_research:
+        if overnight:
+            try:
+                notices = read_records(text(
+                    "SELECT /*+ MAX_EXECUTION_TIME(15000) */ stock_code, title, source_time "
+                    "FROM si_notice_eastmoney WHERE notice_date BETWEEN :first_day AND :last_day "
+                    "AND association_validated=1 AND source_time>:start AND source_time<=:cutoff "
+                    "AND received_at<=:cutoff AND title IS NOT NULL AND title<>'' "
+                    "ORDER BY source_time DESC, stock_code, art_code LIMIT 10"
+                ), engine, params={"first_day": start.date(), "last_day": cutoff.date(),
+                                   "start": start, "cutoff": cutoff.replace(tzinfo=None)})
+                context["notices"] = {"status": "OBSERVED" if notices else "EMPTY", "rows": notices}
+            except Exception as exc:
+                context["notices"] = {"status": "UNKNOWN", "reason": type(exc).__name__}
+        return context
     from biz.review.research_inputs import enrich_context
     return enrich_context(engine, {"review_date": review_date}, context,
                           report_kind="briefing" if overnight else "review", now=current)

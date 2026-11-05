@@ -107,6 +107,10 @@ def _safe_print(text_value: str) -> None:
 def published_report(digest: dict, target: str) -> str:
     """Validate a frozen producer artifact before any delivery or reuse."""
     assert_digest(digest, target)
+    from biz.review.daily_reports import published_review_content
+    daily_content = published_review_content(digest)
+    if daily_content is not None:
+        return daily_content
     research = (digest.get("factor_validation_json") or {}).get("market_decision") or {}
     content = str(digest.get("compact_review") or "").strip()
     expected_hash = artifact_hash({key: value for key, value in research.items()
