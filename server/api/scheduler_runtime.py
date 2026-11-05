@@ -279,6 +279,7 @@ CRITICAL_CRON_CATCHUP_TASK_TYPES.update(
         "sync_concept_ths",
         "news_daily",
         "daily_review",
+        "daily_pool",
         "evening_review",
         "trading_v2_premarket_decision",
         "trading_v2_close_decision",
@@ -346,6 +347,7 @@ CRITICAL_CRON_CATCHUP_WINDOWS_SECONDS = {
     "sync_concept_ths": 18 * 60 * 60,
     "news_daily": EARLY_BRIEFING_CRON_CATCHUP_WINDOW_SECONDS,
     "daily_review": USER_DELIVERY_CRON_CATCHUP_WINDOW_SECONDS,
+    "daily_pool": USER_DELIVERY_CRON_CATCHUP_WINDOW_SECONDS,
     "evening_review": USER_DELIVERY_CRON_CATCHUP_WINDOW_SECONDS,
     "trading_v2_premarket_decision": 6 * 60 * 60,
     "trading_v2_close_decision": 4 * 60 * 60,
@@ -378,11 +380,10 @@ CRITICAL_CRON_CATCHUP_WINDOWS_SECONDS = {
     "market_overview_daily": 8 * 60 * 60,
     "news_sync": 8 * 60 * 60,
 }
-# This formal decision runs late enough that its declared recovery window
-# necessarily crosses midnight. Keep the exception explicit so morning
-# briefings and other same-day deliveries are never replayed the next day.
+# Closed-session products may finish after midnight. Morning briefings keep
+# their same-day window: yesterday's briefing must never be sent as today's.
 CROSS_MIDNIGHT_CRITICAL_CRON_TASK_TYPES = frozenset(
-    {"trading_v3_close_decision"}
+    {"trading_v3_close_decision", "daily_review", "daily_pool", "evening_review"}
 )
 DAILY_RESULT_PIPELINE_TASK_TYPE = "strategy_governance_daily"
 
@@ -434,6 +435,7 @@ NON_TRADING_DAY_SKIP_TYPES = {
     "concept_ths_kline",
     "concept_ths_minute",
     "daily_review",
+    "daily_pool",
     "evening_review",
     "hot_concept",
     "hot_rank_ths",
@@ -725,6 +727,7 @@ USER_DELIVERY_LANE_TASK_TYPES = {
     "daily_data_closeout_verify",
     "news_daily",
     "daily_review",
+    "daily_pool",
     "evening_review",
 }
 PROVIDER_MAINTENANCE_LANE_TASK_TYPES = {
@@ -3022,7 +3025,10 @@ def _critical_cron_catchup_allowed(row: dict, *, now: datetime, cron_time: str) 
                 last_triggered.date() == now.date()
                 and (
                     last_triggered >= scheduled_at
-                    or task_type not in PRIOR_SESSION_PUBLIC_MINUTE_TASK_TYPES
+                    or task_type not in (
+                        PRIOR_SESSION_PUBLIC_MINUTE_TASK_TYPES
+                        | CROSS_MIDNIGHT_CRITICAL_CRON_TASK_TYPES
+                    )
                 )
             )
             or (
@@ -3194,6 +3200,12 @@ def _cron_due(row: dict, *, now: datetime) -> bool:
             now - retry_at
         ).total_seconds() >= CRON_RETRY_INTERVAL_MINUTES * 60
     if not last_triggered or last_triggered.date() < now.date():
+        return True
+
+    if (task_type in CROSS_MIDNIGHT_CRITICAL_CRON_TASK_TYPES
+            and last_triggered < datetime.combine(
+                now.date(), datetime_time(cron_min // 60, cron_min % 60))):
+        # A morning recovery belongs to yesterday's occurrence, not tonight's.
         return True
 
     if _bound_daily_target_has_changed(row):
@@ -5020,6 +5032,22 @@ def _recover_interrupted_manual_claim(
             ]
             if not history_rows or len(history_rows) > 100:
                 return False
+            newest_started = _coerce_datetime(history_rows[0].get("run_at"))
+            if newest_started is not None and newest_started < started_at - timedelta(seconds=1):
+                # An older orphan can outlive a later, already finished run.
+                # Prove that the projected claim has its own terminal audit;
+                # missing history is not permission to release an unknown owner.
+                terminal = connection.execute(text(
+                    "SELECT task_type,run_at,finished_at,status FROM st_scheduled_task_history "
+                    "WHERE task_id=:task_id ORDER BY id DESC LIMIT 1 FOR UPDATE"
+                ), {"task_id": task_id}).mappings().first()
+                terminal_finished = _coerce_datetime(terminal.get("finished_at")) if terminal else None
+                if (not terminal
+                        or terminal.get("task_type") != row.get("task_type")
+                        or _coerce_datetime(terminal.get("run_at")) != started_at
+                        or terminal.get("status") not in _PIPELINE_TERMINAL_STATUSES
+                        or terminal_finished is None or terminal_finished < started_at):
+                    return False
             recovered = []
             boot_checked = False
             boot_started_at = None
@@ -5035,7 +5063,6 @@ def _recover_interrupted_manual_claim(
                     or str(history.get("host_name") or "").strip() != host_name
                     or history_started_at is None
                     or history_started_at > started_at + timedelta(seconds=1)
-                    or (index == 0 and abs((history_started_at - started_at).total_seconds()) > 1)
                     or re.fullmatch(r"[0-9a-f]{40}", previous_build) is None
                 ):
                     return False
