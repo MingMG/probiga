@@ -46,11 +46,15 @@ def trade_scope(engine, day: str, *, manifest_hash: str = "", decision_known_at=
         and (Decimal(item["evidence"]["volume"]) > 0 or Decimal(item["evidence"]["amount"]) > 0))
     if not codes:
         raise ValueError("DATA_BLOCKED: exact daily trade scope is empty")
-    return dict(full_market_manifest_hash=proof["manifest_hash"], codes=codes,
+    scope = dict(full_market_manifest_hash=proof["manifest_hash"], codes=codes,
         daily_close_by_code={item["stock_code"]: item["evidence"]["close"]
             for item in proof["entities"] if item["stock_code"] in codes},
         expected_traded_code_set_sha256=canonical_digest(list(codes)),
         eligible_code_count=len(codes))
+    correction = proof.get("native_amount_correction") or {}
+    if correction.get("prior_manifest_hash"):
+        scope["amount_only_prior_manifest_hash"] = correction["prior_manifest_hash"]
+    return scope
 
 
 def validate_code_scope(entry: dict, scope: dict) -> None:
@@ -516,6 +520,12 @@ def load_verified_minute_publication(engine, day: str, *, decision_known_at=None
     # uses the historical closes and traded set sealed in its daily manifest.
     latest_daily = _latest_daily_manifest_hash(engine, day)
     scope = trade_scope(engine, day, decision_known_at=cutoff, verify_rows=latest_daily == daily_hash)
+    if scope.get("amount_only_prior_manifest_hash") == daily_hash:
+        previous = trade_scope(engine, day, decision_known_at=cutoff, manifest_hash=daily_hash, verify_rows=False)
+        if (scope["codes"] != previous["codes"]
+                or scope["daily_close_by_code"] != previous["daily_close_by_code"]):
+            raise ValueError("amount-only repair differs from the immutable minute trade scope")
+        scope = previous
     if scope["full_market_manifest_hash"] != daily_hash:
         raise ValueError("exact minute publication differs from the daily scope at the decision cutoff")
     actual = persisted_matrix(engine, day, scope=scope, run_id=str(receipt["run_id"]),

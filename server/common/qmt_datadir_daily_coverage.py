@@ -27,6 +27,7 @@ PROVIDER = "qmt_datadir"
 CHINA = ZoneInfo("Asia/Shanghai")
 MANIFEST_TABLE = "qmt_history_coverage_manifest"
 ENTITY_TABLE = "qmt_history_coverage_entity"
+NATIVE_AMOUNT_WORD = 2 ** 32
 
 
 def _scope(engine):
@@ -98,6 +99,30 @@ def canonical_bar(row: Mapping[str, Any]) -> dict:
     return result
 
 
+def native_amount_correction(old: Mapping[str, Any], corrected: Mapping[str, Any] | None) -> dict | None:
+    if corrected is None or any(old[key] != corrected[key] for key in old if key != "amount"):
+        return None
+    old_amount, new_amount = Decimal(old["amount"]), Decimal(corrected["amount"])
+    if (not NATIVE_AMOUNT_WORD <= new_amount < NATIVE_AMOUNT_WORD ** 2 or new_amount != int(new_amount)
+            or old_amount != new_amount % NATIVE_AMOUNT_WORD):
+        return None
+    return {"stock_code": old["stock_code"], "previous_amount": old["amount"], "amount": corrected["amount"]}
+
+
+def seal_native_amount_corrections(manifest: dict, *, prior_run_id: str, prior_manifest_hash: str,
+                                   corrections: Sequence[dict]) -> dict:
+    if not corrections:
+        return manifest
+    core = dict(manifest)
+    core.pop("manifest_hash", None)
+    core["native_amount_correction"] = {
+        "kind": "QMT_DATADIR_UINT64_AMOUNT", "prior_run_id": prior_run_id,
+        "prior_manifest_hash": prior_manifest_hash,
+        "rows": sorted(corrections, key=lambda row: row["stock_code"]),
+    }
+    return {**core, "manifest_hash": canonical_digest(core)}
+
+
 def build_manifest(*, catalog, calendar, day: str, rows: Sequence[Mapping[str, Any]],
                    run_id: str, captured_at: datetime, snapshot: Mapping[str, Any] | None = None,
                    listings: Mapping[str, Any] | None = None,
@@ -165,6 +190,7 @@ def validate_manifest(manifest: Mapping[str, Any], *, catalog, calendar) -> dict
     historical = original.get("historical_reconstruction") is True
     public = original.get("historical_public_bars") or {}
     previous_session = original.get("previous_session", "")
+    correction = original.get("native_amount_correction")
     no_trade = [entity for entity in entities if entity.get("classification") == "NO_TRADE"] if not historical else []
     # Each entity binds its own snapshot envelope; validate those separately
     # rather than assigning one generated timestamp to unrelated observations.
@@ -224,6 +250,20 @@ def validate_manifest(manifest: Mapping[str, Any], *, catalog, calendar) -> dict
                 raise ValueError("daily listing evidence differs")
         elif entity["classification"] != "NO_TRADE":
             raise ValueError("unresolved daily entity")
+    if correction is not None:
+        corrected = {item["stock_code"]: item["evidence"] for item in entities
+                     if item["classification"] == "TRADED" and item["stock_code"] not in public}
+        rows = correction.get("rows") or []
+        codes = [row["stock_code"] for row in rows]
+        if (not rows or sorted(set(codes)) != codes or not set(codes) <= corrected.keys()
+                or correction.get("kind") != "QMT_DATADIR_UINT64_AMOUNT" or not correction.get("prior_run_id")
+                or correction["prior_run_id"] == original["run_id"]
+                or (not historical and len(correction.get("prior_manifest_hash") or "") != 64)):
+            raise ValueError("native daily amount correction inventory differs")
+        for row in rows:
+            bar = corrected[row["stock_code"]]
+            if native_amount_correction({**bar, "amount": row["previous_amount"]}, bar) != row:
+                raise ValueError("native daily amount correction evidence differs")
     supplied = original.pop("manifest_hash", None)
     if supplied != canonical_digest(original):
         raise ValueError("daily manifest hash differs")
@@ -288,7 +328,7 @@ def load_daily_manifest(engine, day: str, *, decision_known_at: datetime | str,
                                                start_date=manifest.get("previous_session", day),
                                                end_date=day, decision_known_at=cutoff)
         validate_manifest(manifest, catalog=catalog, calendar=calendar)
-        if manifest.get("historical_reconstruction") is True:
+        if manifest.get("historical_reconstruction") is True or manifest.get("native_amount_correction"):
             from server.common.qmt_datadir_result import load_receipt
             receipt = load_receipt(connection, dataset="stock_daily", trade_date=day)
             traded_count = sum(item["classification"] == "TRADED" for item in manifest["entities"])
@@ -299,11 +339,36 @@ def load_daily_manifest(engine, day: str, *, decision_known_at: datetime | str,
                     or detail.get("coverage") != 1.0
                     or any(value != traded_count for value in (receipt.get("row_count"), receipt.get("code_count"),
                                                                 detail.get("readback_rows"), detail.get("readback_codes")))):
-                raise ValueError("historical daily publication completion receipt differs")
+                raise ValueError("repaired daily publication completion receipt differs")
             if not _stamp(manifest["captured_at"]) <= _stamp(receipt["finished_at"]):
-                raise ValueError("historical daily publication completion time differs")
+                raise ValueError("repaired daily publication completion time differs")
             if _stamp(receipt["finished_at"]) > cutoff:
                 return None
+            correction = manifest.get("native_amount_correction")
+            if correction:
+                prior = detail.get("prior_completion") or {}
+                previous_hash = correction["prior_manifest_hash"]
+                if (prior.get("status") != "COMPLETE" or prior.get("run_id") != correction["prior_run_id"]
+                        or str((prior.get("detail") or {}).get("full_market_manifest_hash") or "") != previous_hash):
+                    raise ValueError("native daily amount correction prior receipt differs")
+                if previous_hash:
+                    previous = load_daily_manifest(connection, day, decision_known_at=cutoff,
+                                                   manifest_hash=previous_hash, verify_rows=False)
+                    if (not previous or previous.get("native_amount_correction") or previous.get("historical_reconstruction")
+                            or previous["run_id"] != correction["prior_run_id"]
+                            or not _stamp(previous["captured_at"]) < _stamp(manifest["captured_at"])
+                            or any(previous[key] != manifest[key] for key in (
+                                "catalog_batch_id", "catalog_manifest_hash", "catalog_member_set_hash",
+                                "calendar_batch_id", "calendar_manifest_hash",
+                            ))):
+                        raise ValueError("native daily amount correction prior publication differs")
+                    changes = {item["stock_code"]: item for item in correction["rows"]}
+                    for old, new in zip(previous["entities"], manifest["entities"], strict=True):
+                        code = old["stock_code"]
+                        if ((code not in changes and old != new) or (code in changes and (
+                                old["classification"] != "TRADED" or new["classification"] != "TRADED"
+                                or native_amount_correction(old["evidence"], new["evidence"]) != changes[code]))):
+                            raise ValueError("native daily amount correction changes unrelated evidence")
         stored = connection.execute(text(f"SELECT stock_code,expected_state,classification,bar_count,time_set_hash,first_time,last_time,source_row_hash,row_hash FROM {ENTITY_TABLE} WHERE manifest_hash=:hash ORDER BY stock_code"), {"hash": row["manifest_hash"]}).mappings().all()
         expected = []
         for item in manifest["entities"]:

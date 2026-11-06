@@ -334,7 +334,7 @@ def load_qmt_daily_market_truth(
         )
         traded = [entity for entity in cache["entities"] if entity["classification"] == "TRADED"]
         available_at = cache["captured_at"]
-        if cache.get("historical_reconstruction") is True:
+        if cache.get("historical_reconstruction") is True or cache.get("native_amount_correction"):
             from server.common.qmt_datadir_result import load_receipt
             receipt = load_receipt(connection, dataset="stock_daily", trade_date=start)
             if receipt is None or receipt.get("run_id") != cache["run_id"]:

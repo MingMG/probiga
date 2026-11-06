@@ -53,11 +53,14 @@ from server.common.qmt_datadir_result import (  # noqa: E402
     persisted_fingerprint,
 )
 from server.common.qmt_datadir_daily_coverage import (  # noqa: E402
+    NATIVE_AMOUNT_WORD,
     build_manifest,
     canonical_bar,
     insert_manifest,
     load_daily_manifest,
+    native_amount_correction,
     retained_listing_evidence,
+    seal_native_amount_corrections,
     suspension_evidence,
 )
 from server.common.qmt_stock_catalog import load_stock_catalog  # noqa: E402
@@ -198,7 +201,7 @@ def _reusable_partition(engine, *, session, harvested):
         catalog = load_stock_catalog(connection, decision_known_at=cutoff)
         calendar = load_trade_calendar_receipt(connection, start_date=day, end_date=day,
                                                decision_known_at=cutoff)
-    if (catalog.member_set_hash != proof["catalog_member_set_hash"]
+    if ((catalog.member_set_hash != proof["catalog_member_set_hash"] and not proof.get("native_amount_correction"))
             or sorted(catalog.eligible_codes(day)) != [item["stock_code"] for item in proof["entities"]]
             or calendar.sessions_between(day, day) != [day]):
         return None
@@ -279,8 +282,10 @@ def _daily_transaction(engine):
 
 
 def _historical_append_plan(connection, *, day, proof):
-    """Reject any repair which would replace previously published business rows."""
-    if proof.get("historical_reconstruction") is not True or proof.get("trade_date") != day:
+    """Accept only additions and native amount-word repairs against the sealed prior rows."""
+    expected_corrections = proof.get("native_amount_correction") or {}
+    expected_prior_hash = expected_corrections.get("prior_manifest_hash") or ""
+    if (proof.get("historical_reconstruction") is not True and not expected_prior_hash) or proof.get("trade_date") != day:
         raise ValueError("historical daily publication identity differs")
     canonical = {item["stock_code"]: item["evidence"] for item in proof["entities"]
                  if item["classification"] == "TRADED"}
@@ -291,22 +296,73 @@ def _historical_append_plan(connection, *, day, proof):
         ORDER BY stock_code
     """), {"day": day}).mappings().all()
     seen = set()
+    corrections = []
     for row in retained:
         code = row["stock_code"]
+        original = canonical_bar(row)
         if (code in seen or row["data_source"] != SOURCE or row["quality_status"] != "VERIFIED"
-                or row["permission_status"] != "SUPPORTED" or canonical.get(code) != canonical_bar(row)):
+                or row["permission_status"] != "SUPPORTED"):
             raise ValueError(f"historical daily retained business row differs for {day} {code}")
+        if canonical.get(code) != original:
+            correction = native_amount_correction(original, canonical.get(code))
+            if not correction or code in (proof.get("historical_public_bars") or {}):
+                raise ValueError(f"historical daily retained business row differs for {day} {code}")
+            corrections.append(correction)
         seen.add(code)
     previous = load_receipt(connection, dataset=DATASET, trade_date=day)
     detail = (previous or {}).get("detail") or {}
     if (not previous or not seen or previous.get("status") != "COMPLETE"
             or previous.get("row_count") != len(seen) or previous.get("code_count") != len(seen)
             or detail.get("readback_rows") != len(seen) or detail.get("readback_codes") != len(seen)
-            or detail.get("full_market_manifest_hash")):
+            or str(detail.get("full_market_manifest_hash") or "") != expected_prior_hash):
         raise ValueError(f"historical daily retained coarse completion differs for {day}")
     if persisted_fingerprint(connection, dataset=DATASET, trade_date=day)["row_hash"] != detail.get("row_hash"):
         raise ValueError(f"historical daily retained completion fingerprint differs for {day}")
-    return set(canonical) - seen, previous
+    missing = set(canonical) - seen
+    if expected_prior_hash and (missing or corrections != expected_corrections["rows"]):
+        raise ValueError(f"native daily amount-only correction changed before publication for {day}")
+    return missing, corrections, previous
+
+
+def _exact_amount_repair_manifest(engine, *, session, harvested, run_id, required=True):
+    """Preserve the originally proved trade scope and every unrelated entity."""
+    cutoff = dt.datetime.now(CST).replace(tzinfo=None, microsecond=0)
+    day = session.isoformat()
+    original = load_daily_manifest(engine, day, decision_known_at=cutoff)
+    if (original is None or original.get("historical_reconstruction")
+            or original.get("native_amount_correction")):
+        if not required:
+            return None
+        raise ValueError("native daily amount-only repair requires the original exact publication")
+    bars = {row["stock_code"]: canonical_bar(row) for row in _harvested_daily_rows(harvested)}
+    expected = {row["stock_code"] for row in original["entities"] if row["classification"] == "TRADED"}
+    if expected != bars.keys() or len(bars) != len(harvested["rows"]):
+        if not required:
+            return None
+        raise ValueError("native daily amount-only repair traded inventory differs")
+    updated = []
+    corrections = []
+    for entity in original["entities"]:
+        code = entity["stock_code"]
+        if code not in bars or bars[code] == entity["evidence"]:
+            updated.append(entity)
+            continue
+        correction = native_amount_correction(entity["evidence"], bars[code])
+        if correction is None:
+            if not required:
+                return None
+            raise ValueError(f"native daily amount-only repair other business fields differ for {day} {code}")
+        corrections.append(correction)
+        core = {"stock_code": code, "classification": "TRADED", "evidence": bars[code]}
+        updated.append({**core, "row_hash": canonical_digest(core)})
+    if not corrections:
+        if not required:
+            return None
+        raise ValueError("native daily exact publication has no truncated amount")
+    return seal_native_amount_corrections(
+        {**original, "captured_at": cutoff.isoformat(" "), "run_id": run_id, "entities": updated},
+        prior_run_id=original["run_id"], prior_manifest_hash=original["manifest_hash"], corrections=corrections,
+    )
 
 
 def _with_public_bars(harvested, public, *, session):
@@ -410,11 +466,16 @@ def _publish(
     row_template = "(" + ",".join(["%s"] * 24) + ")"
     temp_table = f"tmp_qmt_daily_{run_id}"
     historical = coverage_manifest.get("historical_reconstruction") is True
+    repair = historical or bool(coverage_manifest.get("native_amount_correction"))
     with _daily_transaction(engine) as connection:
         previous = None
-        if historical:
-            missing, previous = _historical_append_plan(connection, day=session.isoformat(), proof=coverage_manifest)
-            payload = [row for row in payload if row[0] in missing]
+        if repair:
+            missing, corrections, previous = _historical_append_plan(connection, day=session.isoformat(), proof=coverage_manifest)
+            if historical and corrections:
+                coverage_manifest = seal_native_amount_corrections(coverage_manifest, prior_run_id=previous["run_id"],
+                                                                    prior_manifest_hash="", corrections=corrections)
+            repair_codes = missing | {row["stock_code"] for row in corrections}
+            payload = [row for row in payload if row[0] in repair_codes]
         connection.exec_driver_sql(
             f"""
             CREATE TEMPORARY TABLE `{temp_table}` (
@@ -457,7 +518,20 @@ def _publish(
                 statement,
                 tuple(value for row in chunk for value in row),
             )
-        if not historical:
+        if repair and corrections:
+            updated = connection.execute(text(f"""
+                UPDATE `{TARGET_TABLE}` AS target
+                JOIN `{temp_table}` AS stage
+                  ON stage.stock_code=target.stock_code AND stage.trade_date=target.trade_date
+                 AND stage.k_type=target.k_type AND stage.adjust_type=target.adjust_type
+                SET target.amount=stage.amount, target.received_at=stage.received_at,
+                    target.batch_id=stage.batch_id, target.data_version=stage.data_version
+                WHERE target.trade_date=:day AND target.k_type=1 AND target.adjust_type=0
+                  AND target.data_source=:source AND stage.amount>=:word AND target.amount=MOD(stage.amount,:word)
+            """), {"day": session, "source": SOURCE, "word": NATIVE_AMOUNT_WORD})
+            if updated.rowcount != len(corrections):
+                raise ValueError("native daily amount correction write count differs")
+        if not repair:
             connection.execute(
                 text(
                 f"""
@@ -507,9 +581,9 @@ def _publish(
             WHERE target.id IS NULL
             """
         )
-        if historical and inserted.rowcount != len(missing):
+        if repair and inserted.rowcount != len(missing):
             raise ValueError("historical daily missing row insert count differs")
-        if not historical:
+        if not repair:
             connection.execute(
                 text(
                 f"""
@@ -558,7 +632,7 @@ def _publish(
                   code_count=VALUES(code_count), row_count=VALUES(row_count),
                   content_sha256=VALUES(content_sha256),
                   run_id=VALUES(run_id), finished_at=VALUES(finished_at),
-                  started_at=IF(:historical,VALUES(started_at),started_at),
+                  started_at=IF(:repair,VALUES(started_at),started_at),
                   detail_json=VALUES(detail_json)
                 """
             ),
@@ -570,11 +644,11 @@ def _publish(
                 "rows": len(rows),
                 "sha": content_sha256,
                 "run_id": run_id,
-                "historical": historical,
+                "repair": repair,
                 "detail": json.dumps(detail, ensure_ascii=False, separators=(",", ":"), default=str),
             },
         )
-        readback_at = connection.execute(text("SELECT CURRENT_TIMESTAMP")).scalar_one() if historical else now
+        readback_at = connection.execute(text("SELECT CURRENT_TIMESTAMP")).scalar_one() if repair else now
         if load_daily_manifest(connection, session.isoformat(), decision_known_at=readback_at,
                                manifest_hash=coverage_manifest["manifest_hash"]) is None:
             raise ValueError("daily immutable proof readback failed before completion")
@@ -584,14 +658,15 @@ def _publish(
         "readback_rows": int(fingerprint["row_count"]),
         "readback_codes": int(fingerprint["code_count"]),
     }
-    if historical:
+    if repair:
         receipt = load_receipt(engine, dataset=DATASET, trade_date=session.isoformat())
         if (not receipt or receipt.get("run_id") != run_id or receipt.get("status") != "COMPLETE"
                 or receipt.get("detail", {}).get("full_market_manifest_hash") != coverage_manifest["manifest_hash"]):
             raise ValueError("historical daily committed receipt readback differs")
         result.update(run_id=run_id, manifest_hash=coverage_manifest["manifest_hash"],
                       finished_at=str(receipt["finished_at"]), appended_codes=sorted(missing),
-                      retained_rows=previous["row_count"])
+                      retained_rows=previous["row_count"] - len(corrections),
+                      amount_corrected_codes=[row["stock_code"] for row in corrections])
         if public:
             result["public_fallback_codes"] = sorted(public)
             result["bar_providers"] = {SOURCE: len(rows) - len(public), SINA_PROVIDER: len(public)}
@@ -611,14 +686,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--replace-existing", action="store_true")
     parser.add_argument("--historical-lifecycle", type=Path,
                         help="JSON object of security codes to official CNINFO PDF locators; preserve existing rows")
+    parser.add_argument("--repair-native-amount-only", action="store_true",
+                        help="Correct truncated native amounts for the latest exact closed partition")
     parser.add_argument("--public-fallback-code", action="append", default=[],
                         help="Require corroborated public fallback for a missing code in one explicit historical session")
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
+    repair = bool(args.historical_lifecycle or args.repair_native_amount_only)
     load_project_env()
     engine = (create_batch_engine(connect_args={"connect_timeout": 5, "read_timeout": 30, "write_timeout": 15})
-              if args.historical_lifecycle else create_batch_engine())
+              if repair else create_batch_engine())
     if args.latest_session:
         start = end = dt.date.fromisoformat(
             authoritative_closed_trade_date(engine)
@@ -642,6 +720,11 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("historical lifecycle locator file exceeds 32 KiB")
         deadline = time.monotonic() + 300
         locators = json.loads(raw_locators)
+    if args.repair_native_amount_only:
+        latest = dt.date.fromisoformat(authoritative_closed_trade_date(engine))
+        if args.latest_session or args.replace_existing or args.historical_lifecycle or start != end or end != latest:
+            parser.error("native amount-only repair requires the single explicit latest closed session")
+        deadline = time.monotonic() + 180
     root = Path(args.datadir_root)
     if not root.is_dir():
         parser.error(f"datadir root does not exist: {root}")
@@ -651,10 +734,10 @@ def main(argv: list[str] | None = None) -> int:
     results = []
     failures = 0
     for position, session in enumerate(sessions, 1):
-        if args.historical_lifecycle:
-            print(f"Historical daily {position}/{len(sessions)} {session}: validating DAT and authority", file=sys.stderr)
+        if repair:
+            print(f"Daily repair {position}/{len(sessions)} {session}: validating DAT and authority", file=sys.stderr)
         sources = _existing_sources(engine, session)
-        if sources and not args.replace_existing and not args.historical_lifecycle:
+        if sources and not args.replace_existing and not repair:
             results.append({
                 "session": session.isoformat(),
                 "status": "SKIP_EXISTING",
@@ -688,17 +771,23 @@ def main(argv: list[str] | None = None) -> int:
             harvested = _with_public_bars(harvested, public, session=session)
         eligible = universe.eligible_codes(session)
         run_id = new_run_id()
-        coverage_manifest = _coverage_manifest(
-            engine, session=session, harvested=harvested, run_id=run_id,
-            historical_documents=historical_documents,
-            historical_public_bars=public, previous_session=previous_day,
-        )
+        coverage_manifest = None
+        if args.repair_native_amount_only or (historical_documents is None and sources == [SOURCE]):
+            coverage_manifest = _exact_amount_repair_manifest(engine, session=session, harvested=harvested,
+                                                              run_id=run_id, required=args.repair_native_amount_only)
+        if coverage_manifest is None:
+            coverage_manifest = _coverage_manifest(
+                engine, session=session, harvested=harvested, run_id=run_id,
+                historical_documents=historical_documents,
+                historical_public_bars=public, previous_session=previous_day,
+            )
         if not args.apply:
             append_detail = {}
-            if historical_documents is not None:
+            if repair or coverage_manifest.get("native_amount_correction"):
                 with engine.connect() as connection:
-                    missing, prior = _historical_append_plan(connection, day=session.isoformat(), proof=coverage_manifest)
-                append_detail = {"retained_rows": prior["row_count"], "append_codes": sorted(missing),
+                    missing, corrections, prior = _historical_append_plan(connection, day=session.isoformat(), proof=coverage_manifest)
+                append_detail = {"retained_rows": prior["row_count"] - len(corrections), "append_codes": sorted(missing),
+                                 "amount_corrected_codes": [row["stock_code"] for row in corrections],
                                  "no_bar_codes": {item["stock_code"]: item["classification"]
                                                   for item in coverage_manifest["entities"]
                                                   if item["classification"] != "TRADED"}}
@@ -731,8 +820,8 @@ def main(argv: list[str] | None = None) -> int:
             "status": "COMPLETE",
             **published,
         })
-        if args.historical_lifecycle:
-            print(f"Historical daily {position}/{len(sessions)} {session}: committed {run_id}", file=sys.stderr)
+        if repair:
+            print(f"Daily repair {position}/{len(sessions)} {session}: committed {run_id}", file=sys.stderr)
     payload = {
         "schema": "probiga.qmt-datadir-daily-import.v1",
         "source": SOURCE,
@@ -741,7 +830,7 @@ def main(argv: list[str] | None = None) -> int:
         "failures": failures,
         "results": results,
     }
-    if not args.apply or args.historical_lifecycle:
+    if not args.apply or repair:
         print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
         return 0 if not failures else 1
     task_result = _task_result(engine, sessions=sessions)

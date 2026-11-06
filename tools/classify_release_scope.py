@@ -254,6 +254,7 @@ _CONTRACT_WHOLE_FILE_FILES = (
 _WINDOWS_RUNTIME_FILES = (
     "tools/import_qmt_datadir_daily.py",
     "tools/import_qmt_datadir_history.py",
+    "integrations/qmt/datadir.py",
     "integrations/qmt/datadir_import.py",
     "server/common/historical_daily_bar_evidence.py",
     "server/common/official_historical_daily_evidence.py",
