@@ -554,30 +554,43 @@ assert.deepStrictEqual(calls,[['portfolio',false]]);
 
 def test_navigation_preserves_original_research_and_portfolio_labels():
     script = _script()
-    layout = script.split("var APP_NAV = [", 1)[1].split("var TRADING_MODULE_NAV_ITEMS", 1)[0]
+    layout = script.split("var APP_NAV = [", 1)[1].split("var sidebarRouteByTab", 1)[0]
     for text in ("策略选股结果", "我的持仓", "条件选股（研究）", "策略研究与竞技", "交易与复盘"):
         assert text in layout
     for tab in ("trading-v3-candidates", "screen", "strategy-center", "portfolio"):
         assert "id:'" + tab + "'" in layout
-    assert "PAGE_TITLES['sentiment'] = '🧠 市场趋势与风格'" in script
+    assert "label:'市场情绪与风格'" in layout
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node.js unavailable")
-def test_new_navigation_keeps_original_primary_order_with_quant_workbench():
+def test_navigation_maps_all_prior_ids_and_registers_its_existing_loaders():
     script = _script()
-    layout = "var APP_NAV = [" + script.split("var APP_NAV = [", 1)[1].split("var TRADING_MODULE_NAV_ITEMS", 1)[0]
-    harness = "const assert=require('assert');\n" + layout + r"""
-const ids=APP_NAV.flatMap(group=>group.items.map(item=>item.id));
+    layout = "var LOADERS = {" + script.split("var LOADERS = {", 1)[1].split("var SIDEBAR_GROUP_STATE_KEY", 1)[0]
+    harness = "const assert=require('node:assert/strict'); const PAGE_TITLES={};\n" + layout + r"""
+const items=APP_NAV.flatMap(group=>group.items);
+const ids=items.map(item=>item.id);
 assert.strictEqual(new Set(ids).size,ids.length);
-assert.deepStrictEqual(APP_NAV[0].items.map(item=>item.id),['quant-workbench','portfolio','fused','trading-v3-candidates','recommended','market-outlook','strategy-center','qmt-strategy-results','sentiment','trading','trading-day','daily-pool']);
-assert.ok(!ids.includes('workbench'),'market overview remains a page without changing the restored menu');
-for(const id of ['quant-workbench','fused','trading-v3-candidates','trading-v3-positions','strategy-center','strategy-backtest','screen','datasource','ai-stock']) {
-  assert.ok(ids.includes(id),id+' remains reachable');
+assert.deepStrictEqual(APP_NAV.map(group=>group.group),[
+ '今日工作台','大盘与外围','板块与题材','盘中监控与风险','资金与龙虎榜','个股与自选','资讯公告与事件',
+ '选股与交易计划','策略研究与回测','持仓与模拟执行','复盘、早报与日志','AI 问答','数据中心','调度、权限与部署'
+]);
+assert.deepStrictEqual(APP_NAV[0].items.map(item=>item.id),['trading-day','command','trading']);
+for(const item of items){
+  assert.equal(typeof LOADERS[item.id],'function',item.id+' has a loader');
+  assert.equal(PAGE_TITLES[item.id],item.icon+' '+item.label);
+  for(const alias of item.aliases || []) {
+    assert.equal(typeof LOADERS[alias],'function',alias+' retains its original loader');
+    assert.equal(sidebarRouteByTab[alias],item.id);
+  }
 }
+const prior = 'ai-general ai-stock alist broad-etf-flow capital capital-rt command commentary concept concept3 concept5 daily-pool datasource east fused industry3 industry5 intraday-alert intraday-battle mainforce market-outlook market-radar market-stage monitor multi3 multi5 news notice portfolio qmt-strategy-results quant-workbench recommended research-radar review scheduler screen sector sector-heat sector-movement sector-rotation sentiment sim-trade sina stock-list strategy-backtest strategy-center strong ths trading trading-day trading-v3-candidates trading-v3-hypotheses trading-v3-intraday trading-v3-overview trading-v3-positions xq'.split(' ');
+assert.equal(prior.length,56);
+assert.deepStrictEqual(Object.keys(sidebarRouteByTab).sort(),[...prior,'workbench','hunter','jq-picks'].sort());
+assert.match(items.find(item=>item.id==='sim-trade').label,/可操作/);
 """
-    result = subprocess.run([shutil.which("node"), "-"], input=harness, text=True, encoding="utf-8", capture_output=True)
+    result = subprocess.run([shutil.which("node"), "-"], input=harness, text=True, encoding="utf-8", capture_output=True, timeout=10)
     assert result.returncode == 0, result.stderr
-    assert "var LAYOUT_OLD" in script
+    assert "var LAYOUT_OLD" not in script
 
 
 def test_market_observation_uses_real_trend_and_explicit_style_availability():

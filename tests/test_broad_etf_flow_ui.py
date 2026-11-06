@@ -9,17 +9,16 @@ def _text(relative: str) -> str:
     return (ROOT / relative).read_text(encoding="utf-8")
 
 
-def test_broad_etf_flow_page_is_wired_once_into_each_supported_layout():
+def test_broad_etf_flow_has_one_entry_in_the_funds_group():
     index = _text("server/static/index.html")
     script = _text("server/static/js/app.js")
 
     assert 'id="tab-broad-etf-flow"' in index
     assert "'broad-etf-flow':'🏛 宽基资金监测'" in index
-    assert script.count("{id:'broad-etf-flow'") == 2
-    assert "{id:'broad-etf-flow',icon:'🏛',label:'宽基资金监测'}" in script
-    assert "{id:'broad-etf-flow',icon:'🏛',label:'宽基资金'}" in script
+    assert script.count("{id:'broad-etf-flow'") == 1
+    funds = script.split("{id:'flow', group:'资金与龙虎榜', items:[", 1)[1].split("\n        ]}", 1)[0]
+    assert "{id:'broad-etf-flow', icon:'🏛', label:'宽基 ETF 资金'}" in funds
     assert "'broad-etf-flow': function (d, c)" in script
-    assert "PAGE_TITLES['broad-etf-flow'] = '🏛 宽基资金监测'" in script
 
 
 def test_broad_etf_flow_ui_uses_the_documented_api_and_honest_method_copy():

@@ -83,11 +83,11 @@ const request = url => new Promise(resolve=>calls.push({url,resolve}));
 """)
 
 
-def test_market_stage_is_mounted_in_both_sidebar_layouts():
+def test_market_stage_is_mounted_in_product_navigation():
     html = (ROOT / "server/static/index.html").read_text(encoding="utf-8")
     app = (ROOT / "server/static/js/app.js").read_text(encoding="utf-8")
     assert 'id="tab-market-stage"' in html
     assert "/static/js/market-stage.js" in html
     assert "tradingModuleDateMode(d) === 'DEFAULT' ? '' : d" in app
     assert "window.MarketStage.load(target, c" in app
-    assert app.count("{id:'market-stage',icon:") == 2
+    assert app.count("{id:'market-stage', icon:") == 1

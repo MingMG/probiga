@@ -12,29 +12,21 @@ let journal = {trade_date:day,revision:0,plans:[],review:{text:'',updated_at:nul
 let conflict=false, failSave=false, slowDate=false, writes=0, saveBarrier=null;
 const clone=v=>JSON.parse(JSON.stringify(v));
 const candidates=Array.from({length:5},(_,i)=>({stock_code:'60000'+i,stock_name:'观察股'+(i+1),reason:'测试研究依据 <script>window.injected=true</script>',trigger:'量价条件 '+i,invalidation:'失效条件 '+i}));
-// Visible navigation before the workbench redesign, plus the requested single entry.
-const originalNewNavigation=[
- ['主要入口',[['portfolio','自选股'],['fused','热股排行'],['trading-v3-candidates','策略选股结果'],['strategy-center','策略研究与竞技'],['qmt-strategy-results','QMT每日模拟'],['sentiment','市场观察'],['trading','交易与复盘'],['trading-day','今日看盘']]],
- ['交易详情',[['trading-v3-overview','今日策略'],['trading-v3-positions','我的持仓'],['trading-v3-intraday','盘中应急'],['trading-v3-hypotheses','连续跟踪'],['strategy-backtest','策略回测'],['intraday-battle','盘中作战'],['review','每日复盘']]],
- ['市场工具',[['command','智能决策'],['monitor','市场监控'],['sector','板块分析'],['market-radar','异动雷达']]],
- ['个股热度',[['strong','强势股'],['concept','概念 / 行业'],['alist','龙虎榜']]],
- ['资金流向',[['capital','个股资金'],['broad-etf-flow','宽基资金'],['mainforce','主力行为']]],
- ['研究工具',[['screen','条件选股（研究）']]],
- ['资讯公告',[['news','快讯'],['research-radar','研报雷达'],['notice','个股公告']]],
- ['系统',[['datasource','数据源管理'],['scheduler','调度管理'],['commentary','股评监控'],['stock-list','全市场股票']]],
- ['AI 问答',[['ai-stock','股票问答'],['ai-general','通用问答']]]
-];
-const originalOldNavigation=[
+const navigation=[
+ ['今日工作台',[['trading-day','今日看盘'],['command','智能决策'],['trading','交易与复盘总览']]],
+ ['大盘与外围',[['workbench','市场总览'],['market-stage','大盘走势阶段'],['sentiment','市场情绪与风格'],['market-outlook','明日推演']]],
+ ['板块与题材',[['sector','板块分析'],['concept','概念与行业']]],
+ ['盘中监控与风险',[['monitor','市场监控'],['market-radar','异动雷达'],['intraday-alert','盘中播报'],['trading-v3-intraday','盘中应急'],['intraday-battle','盘中作战'],['hunter','狩猎场']]],
+ ['资金与龙虎榜',[['capital','个股资金'],['broad-etf-flow','宽基 ETF 资金'],['mainforce','主力行为'],['alist','龙虎榜']]],
+ ['个股与自选',[['stock-list','全市场股票'],['portfolio','自选股'],['strong','强势股'],['fused','个股热榜']]],
+ ['资讯公告与事件',[['news','财经快讯'],['notice','个股公告'],['research-radar','研报雷达'],['commentary','股评监控']]],
+ ['选股与交易计划',[['daily-pool','每日研究票池'],['trading-v3-candidates','策略选股结果'],['trading-v3-overview','今日策略'],['recommended','AI 研究建议'],['screen','条件选股（研究）'],['jq-picks','聚宽策略']]],
+ ['策略研究与回测',[['strategy-center','策略研究与竞技'],['strategy-backtest','策略回测'],['trading-v3-hypotheses','连续跟踪'],['quant-workbench','量化工作台']]],
+ ['持仓与模拟执行',[['trading-v3-positions','我的持仓'],['sim-trade','旧模拟盘（可操作）'],['qmt-strategy-results','QMT每日模拟']]],
+ ['复盘、早报与日志',[['review','每日复盘与早报']]],
  ['AI 问答',[['ai-stock','股票问答'],['ai-general','通用问答']]],
- ['自选管理',[['portfolio','自选股']]],
- ['交易决策',[['trading','交易决策总览'],['trading-v3-overview','今日策略'],['trading-v3-positions','我的持仓'],['trading-v3-candidates','策略选股结果'],['trading-v3-intraday','盘中应急'],['trading-v3-hypotheses','连续跟踪'],['trading-day','今日看盘']]],
- ['市场分析',[['command','智能决策'],['intraday-battle','盘中作战'],['monitor','市场监控中心'],['sector-movement','板块异动'],['market-radar','异动雷达'],['fused','融合榜单 TOP100'],['sentiment','市场情绪与风格'],['sector-rotation','板块轮动分析'],['stock-list','全市场股票']]],
- ['复盘数据',[['multi3','近3天强势股'],['multi5','近5天强势股'],['ths','同花顺热股'],['east','东财人气榜'],['xq','雪球热股'],['sina','新浪热股'],['screen','条件选股（研究）'],['strategy-center','策略研究与竞技'],['qmt-strategy-results','QMT每日模拟'],['review','复盘数据'],['sector-heat','板块热度'],['sim-trade','旧模拟交易（归档）'],['strategy-backtest','策略回测']]],
- ['概念 / 行业',[['concept','热门概念 (当日)'],['concept3','近3天热门概念'],['concept5','近5天热门概念'],['industry3','近3天热门行业'],['industry5','近5天热门行业']]],
- ['资金流向',[['capital','个股资金净流入'],['broad-etf-flow','宽基资金监测'],['capital-rt','实时资金'],['mainforce','主力行为分析']]],
- ['新闻公告',[['news','财联社快讯'],['research-radar','研报雷达'],['notice','个股公告']]],
- ['龙虎榜',[['alist','龙虎榜列表']]],
- ['系统管理',[['datasource','数据源管理'],['scheduler','调度管理'],['commentary','股评监控']]]
+ ['数据中心',[['datasource','数据获取监控']]],
+ ['调度、权限与部署',[['scheduler','调度管理']]]
 ];
 async function assertNavigation(page,expected){
  const groups=await page.locator('#sidebar .sidebar-group').evaluateAll(nodes=>nodes.map(group=>({
@@ -150,44 +142,41 @@ const server=http.createServer((req,res)=>{
   slowDate=true;await page.evaluate(()=>{start('2026-09-17');window.lastLoad=start('2026-09-16');});await page.evaluate(()=>lastLoad);
   assert.match(await page.locator('.td-pagehead').innerText(),/2026-09-16/);assert.equal(await page.locator('[data-td-plan]').count(),0);
   await page.evaluate(()=>TradingDayDesk.stop());assert.deepEqual(errors,[]);
-  // Exercise the real app: layout preference and menu changes must not discard page state.
+  // Exercise the real app: group toggles must not discard page state.
   await page.route('https://cdn.jsdelivr.net/**',route=>route.fulfill({body:'window.Chart=function(){};'}));
   clock={...clock,today:day,server_time:day+' 17:30:00',active_trade_date:day,is_intraday:false,phase:'postmarket'};
   await page.evaluate(()=>localStorage.clear());
   await page.goto(base+'/?tab=trading-day&trade_date='+day);await page.waitForSelector('#tab-trading-day .td-hero');
-  await assertNavigation(page,originalNewNavigation);
-  assert.equal(await page.locator('#btnLayoutToggle').innerText(),'🔀 新版');
+  await assertNavigation(page,navigation);
+  assert.equal(await page.locator('#btnLayoutToggle').count(),0);
   assert.equal(await page.locator('.sidebar-item.active').getAttribute('data-tab'),'trading-day');
-  assert.equal(await page.locator('#sidebar [data-tab="workbench"]').count(),0);
+  assert.equal(await page.locator('#sidebar [data-tab="workbench"]').count(),1);
   assert.equal(await page.locator('.sidebar-logo').evaluate(node=>node.tagName),'DIV');
   assert.equal(await page.locator('.sidebar-logo a,.sidebar-logo small').count(),0);
   assert.equal(await page.locator('#sidebar').evaluate(node=>getComputedStyle(node).width),'200px');
   assert.equal(await page.locator('.sidebar-logo').evaluate(node=>getComputedStyle(node).textAlign),'center');
   await page.locator('[data-td-phase=post]').click();
-  await page.locator('#td-review-text').fill('切换布局必须保留这份未保存草稿');
+  await page.locator('#td-review-text').fill('展开或折叠菜单必须保留这份未保存草稿');
   await page.evaluate(()=>window.navigationDraftNode=document.querySelector('#td-review-text'));
   const draftUrl=page.url(),draftWrites=writes;
-  await page.locator('#btnLayoutToggle').click();await assertNavigation(page,originalOldNavigation);
-  assert.equal(await page.locator('#btnLayoutToggle').innerText(),'🔀 老版');
-  assert.equal(await page.evaluate(()=>localStorage.getItem('probiga_layout')),'old');
-  assert.equal(await page.locator('#datePicker').inputValue(),day);
-  assert.equal(page.url(),draftUrl);assert.equal(writes,draftWrites);
-  assert.equal(await page.locator('#td-review-text').inputValue(),'切换布局必须保留这份未保存草稿');
-  assert.equal(await page.evaluate(()=>window.navigationDraftNode===document.querySelector('#td-review-text')),true);
-  const marketGroup=page.locator('.sidebar-group[data-group-key="command"]');
+  const marketGroup=page.locator('.sidebar-group[data-group-key="market"]');
+  assert.equal(await marketGroup.locator('.sidebar-group-toggle').getAttribute('aria-expanded'),'false');
+  await marketGroup.locator('.sidebar-group-toggle').click();
+  assert.equal(await marketGroup.locator('.sidebar-group-toggle').getAttribute('aria-expanded'),'true');
   await marketGroup.locator('.sidebar-group-toggle').click();
   assert.equal(await marketGroup.locator('.sidebar-group-toggle').getAttribute('aria-expanded'),'false');
-  await page.locator('#btnLayoutToggle').click();await assertNavigation(page,originalNewNavigation);
-  await page.locator('#btnLayoutToggle').click();await assertNavigation(page,originalOldNavigation);
-  assert.equal(await marketGroup.locator('.sidebar-group-toggle').getAttribute('aria-expanded'),'false');
-  assert.equal(await page.locator('#td-review-text').inputValue(),'切换布局必须保留这份未保存草稿');
-  await page.locator('#sidebar [data-tab="multi3"]').click();await page.waitForSelector('#tab-multi3.active');
+  await assertNavigation(page,navigation);
+  assert.equal(await page.locator('#datePicker').inputValue(),day);
+  assert.equal(page.url(),draftUrl);assert.equal(writes,draftWrites);
+  assert.equal(await page.locator('#td-review-text').inputValue(),'展开或折叠菜单必须保留这份未保存草稿');
+  assert.equal(await page.evaluate(()=>window.navigationDraftNode===document.querySelector('#td-review-text')),true);
+  await page.goto(base+'/?tab=multi3&trade_date='+day);await page.waitForSelector('#tab-multi3.active');
   assert.equal(await page.evaluate(()=>localStorage.getItem('probiga_current_tab')),'multi3');
-  await page.reload();await page.waitForSelector('#tab-multi3.active');await assertNavigation(page,originalOldNavigation);
+  await page.reload();await page.waitForSelector('#tab-multi3.active');await assertNavigation(page,navigation);
   assert.equal(await marketGroup.locator('.sidebar-group-toggle').getAttribute('aria-expanded'),'false');
   assert.match(await page.locator('#pageTitle').innerText(),/近3天/);
-  await page.locator('#btnLayoutToggle').click();
-  assert.equal(await page.locator('#sidebar .sidebar-item.active').count(),0);
+  assert.equal(await page.locator('#sidebar .sidebar-item.active').getAttribute('data-tab'),'strong');
+  assert.equal(await page.locator('#sidebar .sidebar-item.active').getAttribute('aria-current'),'page');
   const [legacyRefresh]=await Promise.all([
    page.waitForRequest(req=>new URL(req.url()).pathname==='/api/hot-data/multi-day'),
    page.locator('.header .btn-refresh').click()
@@ -195,11 +184,10 @@ const server=http.createServer((req,res)=>{
   assert.equal(new URL(legacyRefresh.url()).searchParams.get('stat_date'),day);
   assert.equal(new URL(legacyRefresh.url()).searchParams.get('days'),'3');
   assert.equal(await page.locator('#tab-multi3').evaluate(node=>node.classList.contains('active')),true);
-  await page.locator('#btnLayoutToggle').click();
-  // Explicit routes take precedence over the saved legacy tab and keep internal-only pages reachable.
+  // Explicit routes take precedence over the saved tab.
   await page.goto(base+'/?tab=trading-day&trade_date='+day);await page.waitForSelector('#tab-trading-day.active .td-hero');
   await page.locator('[data-td-tab="workbench"]').click();await page.waitForSelector('#tab-workbench.active .mw-hero');
-  assert.equal(await page.locator('#sidebar [data-tab="workbench"]').count(),0);
+  assert.equal(await page.locator('#sidebar [data-tab="workbench"]').count(),1);
   const [overviewRefresh]=await Promise.all([
    page.waitForRequest(req=>new URL(req.url()).pathname==='/api/monitor/data'),
    page.locator('.header .btn-refresh').click()
@@ -221,36 +209,31 @@ const server=http.createServer((req,res)=>{
   await page.locator('#datePicker').fill('2026-09-17');await page.locator('#datePicker').dispatchEvent('change');
   await page.waitForFunction(()=>document.querySelector('#tab-trading-day .td-pagehead').textContent.includes('2026-09-17'));
   assert.match(page.url(),/trade_date=2026-09-17/);
-  await page.locator('#btnLayoutToggle').click();await assertNavigation(page,originalNewNavigation);
+  await assertNavigation(page,navigation);
   assert.equal(await page.locator('#datePicker').inputValue(),'2026-09-17');
-  await page.reload();await page.waitForSelector('#tab-trading-day.active .td-hero');await assertNavigation(page,originalNewNavigation);
-  // Existing preferences restore a legacy-only page even if the current menu is the new one.
+  await page.reload();await page.waitForSelector('#tab-trading-day.active .td-hero');await assertNavigation(page,navigation);
+  // A saved legacy route is still restored and its parent item is selected.
   await page.evaluate(()=>{localStorage.setItem('probiga_layout','old');localStorage.setItem('probiga_current_tab','capital-rt');});
-  await page.goto(base+'/');await page.waitForSelector('#tab-capital-rt.active #rtCode');await assertNavigation(page,originalOldNavigation);
-  await page.locator('#rtCode').fill('600000');
-  await page.locator('#btnLayoutToggle').click();assert.equal(await page.locator('#rtCode').inputValue(),'600000');
-  await page.reload();await page.waitForSelector('#tab-capital-rt.active #rtCode');await assertNavigation(page,originalNewNavigation);
-  // A fresh browser keeps the original trading default; adding a page must not replace it.
-  await page.evaluate(()=>localStorage.clear());await page.goto(base+'/');await page.waitForSelector('#tab-trading.active');
-  assert.equal(await page.locator('#btnLayoutToggle').innerText(),'🔀 新版');
-  assert.equal(await page.locator('.sidebar-item.active').getAttribute('data-tab'),'trading');
+  await page.goto(base+'/');await page.waitForSelector('#tab-capital-rt.active #rtCode');await assertNavigation(page,navigation);
+  assert.equal(await page.locator('.sidebar-item.active').getAttribute('data-tab'),'capital');
+  await page.reload();await page.waitForSelector('#tab-capital-rt.active #rtCode');await assertNavigation(page,navigation);
+  // A fresh browser opens the consolidated desk.
+  await page.evaluate(()=>localStorage.clear());await page.goto(base+'/');await page.waitForSelector('#tab-trading-day.active');
+  assert.equal(await page.locator('.sidebar-item.active').getAttribute('data-tab'),'trading-day');
   for(const tab of ['multi3','sector-rotation']){
    await page.goto(base+'/?tab='+tab+'&trade_date='+day);await page.waitForSelector('#tab-'+tab+'.active');
    for(const width of [769,800,900]){
     await page.setViewportSize({width,height:1000});
     assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),tab+' overflow '+width);
-    assert.ok(await page.locator('#btnLayoutToggle').evaluate(node=>node.getBoundingClientRect().right<=innerWidth),tab+' hides layout toggle '+width);
    }
   }
   await page.goto(base+'/?tab=trading-day&trade_date='+day);await page.waitForSelector('#tab-trading-day.active .td-hero');
   for(const width of [1280,1024,900,769]){
    await page.setViewportSize({width,height:1000});
    assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),'desktop app overflow '+width);
-   assert.ok(await page.locator('#btnLayoutToggle').evaluate(node=>node.getBoundingClientRect().right<=innerWidth),'layout toggle outside desktop '+width);
   }
   await page.setViewportSize({width:1280,height:1000});
-  await page.screenshot({path:path.join(out,'navigation-new-desktop.png'),fullPage:true});
-  await page.locator('#btnLayoutToggle').click();await page.screenshot({path:path.join(out,'navigation-old-desktop.png'),fullPage:true});
+  await page.screenshot({path:path.join(out,'navigation-desktop.png'),fullPage:true});
   for(const width of [768,760,736,360,320]){
    await page.setViewportSize({width,height:1000});
    assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),'app overflow '+width);
@@ -262,8 +245,6 @@ const server=http.createServer((req,res)=>{
    await page.locator('#sidebar [data-tab="trading-day"]').click();
    assert.equal(await page.locator('#navigationToggle').getAttribute('aria-expanded'),'false');
    await page.waitForFunction(()=>document.querySelector('#sidebar').getBoundingClientRect().right<=1);
-   await page.locator('#btnLayoutToggle').click();
-   assert.ok(await page.locator('#btnLayoutToggle').evaluate(node=>node.getBoundingClientRect().right<=innerWidth),'layout toggle outside mobile '+width);
   }
   await page.screenshot({path:path.join(out,'navigation-mobile.png'),fullPage:true});
   assert.deepEqual(errors,[]);console.log(JSON.stringify({ok:true,writes,screenshots:out}));

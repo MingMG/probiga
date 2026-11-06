@@ -168,58 +168,149 @@ function errorText(err) { return err.message; }
     )
 
 
-def test_formal_polling_keeps_submission_locked_until_an_explicit_terminal_state():
+def test_job_polling_stops_boundedly_and_refresh_reads_only_the_original_job():
     _run_node(
         r"""
 const assert = require('node:assert/strict');
-const runButton = {disabled: false};
-const state = {activeBacktestJobId: 'job-1', formalBacktestMessage: ''};
+const storage = new Map();
+const window = {sessionStorage: {
+  getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value),
+  removeItem: key => storage.delete(key)
+}};
+const state = {};
 const scheduled = [];
-let response;
-function el(id) { assert.equal(id, 'formalBacktestRun'); return runButton; }
+const requests = [];
+const responses = [];
+let now = 0;
+const performance = {now: () => now};
 function setTimeout(callback, delay) { scheduled.push({callback, delay}); }
-function api2() { return response; }
+function statusRequest(path, timeout) {
+  assert(timeout > 0 && timeout <= 15000);
+  requests.push(path);
+  const response = responses.shift();
+  return response instanceof Error ? Promise.reject(response) : Promise.resolve(response);
+}
+const api2 = statusRequest, api3 = statusRequest;
 function unwrap(payload) { return payload; }
 function renderFormalResearch() {}
+function renderActions() {}
 function errorText(error) { return error.message; }
 function loadFormalResearch() {}
 function fetchFormalBacktest() {}
+function load() {}
 """
+        + _function("storedJobId", "runDailyAction")
         + _function("pollFormalBacktestJob", "runFormalBacktest")
         + r"""
-async function runScheduled() {
-  const item = scheduled.shift();
-  item.callback();
+async function settle() {
   await Promise.resolve();
   await Promise.resolve();
-  return item;
+}
+async function runScheduled(advance = 2000) {
+  now += advance;
+  scheduled.shift().callback();
+  await settle();
 }
 (async function () {
-  response = Promise.resolve({status: 'RUNNING'});
-  pollFormalBacktestJob('job-1', 0, 25);
-  assert.equal((await runScheduled()).delay, 25);
-  assert.equal(state.activeBacktestJobId, 'job-1');
-  assert.equal(runButton.disabled, true);
-  assert.match(state.formalBacktestMessage, /按钮保持禁用/);
-  assert.equal(scheduled[0].delay, 10000);
+  const formalId = 'formal-job-1';
+  rememberJobId('activeBacktestJobId', formalId);
+  pollFormalBacktestJob(formalId, false);
+  await runScheduled(180000);
+  assert.equal(requests.length, 0);
+  assert.equal(scheduled.length, 0);
+  assert.equal(state.activeBacktestJobId, formalId);
+  assert.equal(storedJobId('activeBacktestJobId'), formalId);
+  assert.match(state.formalBacktestMessage, /已到时限.*终态确认前不可重复提交/);
 
-  scheduled.length = 0;
-  runButton.disabled = false;
-  response = Promise.reject(new Error('temporary timeout'));
-  pollFormalBacktestJob('job-1', 10, 30);
-  await runScheduled();
-  assert.equal(state.activeBacktestJobId, 'job-1');
-  assert.equal(runButton.disabled, true);
-  assert.match(state.formalBacktestMessage, /继续低频追踪/);
-  assert.equal(scheduled[0].delay, 10000);
-
-  scheduled.length = 0;
-  response = Promise.resolve({status: 'FAILED', error_message: 'test failure'});
-  pollFormalBacktestJob('job-1', 10, 40);
-  assert.equal((await runScheduled()).delay, 40);
+  responses.push({job_id: formalId, status: 'RUNNING'});
+  pollFormalBacktestJob(formalId, true);
+  await settle();
+  assert.equal(scheduled.length, 0);
+  assert.equal(state.activeBacktestJobId, formalId);
+  assert.match(state.formalBacktestMessage, /终态待确认/);
+  responses.push({job_id: formalId, status: 'FAILED', error_message: 'test failure'});
+  pollFormalBacktestJob(formalId, true);
+  await settle();
+  assert.equal(storedJobId('activeBacktestJobId'), '');
   assert.equal(state.activeBacktestJobId, '');
-  assert.equal(runButton.disabled, false);
   assert.match(state.formalBacktestMessage, /test failure/);
+
+  const dailyId = '0123456789abcdef';
+  rememberJobId('activeJobId', dailyId);
+  responses.push(new Error('temporary timeout'), {job_id: 'wrong-job', state: 'succeeded', terminal: true});
+  pollActionJob(dailyId, false);
+  pollActionJob(dailyId, true); // Refresh does not start a parallel poll.
+  assert.equal(scheduled.length, 1);
+  await runScheduled();
+  assert.equal(scheduled.length, 1);
+  await runScheduled();
+  assert.equal(scheduled.length, 0);
+  assert.equal(state.activeJobId, dailyId);
+  assert.match(state.actionMessage, /未取得匹配任务的明确状态/);
+  assert.doesNotMatch(state.actionMessage, /执行成功|执行失败/);
+
+  responses.push({job_id: dailyId, state: 'cancelled', terminal: true});
+  pollActionJob(dailyId, true);
+  await settle();
+  assert.equal(state.activeJobId, '');
+  assert.equal(storedJobId('activeJobId'), '');
+  assert.match(state.actionMessage, /已取消/);
+  assert.deepEqual(requests, ['/jobs/' + formalId, '/jobs/' + formalId,
+    '/actions/jobs/' + dailyId, '/actions/jobs/' + dailyId, '/actions/jobs/' + dailyId]);
+})().catch(error => { console.error(error); process.exitCode = 1; });
+"""
+    )
+
+
+def test_job_submission_remains_locked_while_the_receipt_is_pending():
+    _run_node(
+        r"""
+const assert = require('node:assert/strict');
+const window = {confirm: () => true};
+const state = {context: {historical_read_only: false}, errors: {}, staleKeys: {}};
+const nodes = {
+  runDaily: {}, formalBacktestRun: {}, formalBacktestForm: {reportValidity: () => true},
+  formalBacktestStart: {value: '2026-01-01'}, formalBacktestEnd: {value: '2026-01-02'},
+  formalBacktestCapital: {value: '200000'}, formalBacktestTop: {value: '5'}, formalBacktestSeed: {value: '1'}
+};
+const posts = [];
+const expected = {strategy_id: 'etf_trend_risk', version: 'v2.0.0'};
+function el(id) { return nodes[id] || (nodes[id] = {}); }
+function storedJobId() { return ''; }
+function truthState() { return {code: 'READY'}; }
+function task() { return {id: 1, enabled: 1}; }
+function localDateKey() { return '2026-11-07'; }
+function selectedFormalStrategy() { return expected; }
+function formalBacktestRunnable() { return true; }
+function renderFormalResearch() {}
+function unwrap(payload) { return payload; }
+function errorText(error) { return error.message; }
+function postJson(path, body) {
+  return new Promise((resolve, reject) => posts.push({path, body, resolve, reject}));
+}
+function submissionRejected() { return false; }
+"""
+        + _function("dailyActionGate", "renderChrome")
+        + _function("runDailyAction", "applyFormalStrategyDefaults")
+        + _function("runFormalBacktest", "resumeTrackedJobs")
+        + r"""
+(async function () {
+  runDailyAction(el('runDaily'));
+  assert.equal(el('runDaily').disabled, true);
+  runDailyAction(el('runDaily'));
+  const event = {preventDefault() {}};
+  runFormalBacktest(event);
+  runFormalBacktest(event);
+  assert.deepEqual(posts.map(row => row.path), ['/api/v3/actions/daily', '/api/v2/research/backtests']);
+  posts[0].reject(new Error('ack lost'));
+  posts[1].reject(new Error('ack lost'));
+  await Promise.resolve();
+  assert.match(state.actionMessage, /提交结果待确认/);
+  assert.match(state.formalBacktestMessage, /提交结果待确认/);
+  assert.equal(el('runDaily').disabled, true);
+  runDailyAction(el('runDaily'));
+  runFormalBacktest(event);
+  assert.equal(posts.length, 2);
 })().catch(error => { console.error(error); process.exitCode = 1; });
 """
     )

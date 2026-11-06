@@ -39,13 +39,15 @@ function receipt(){return {status:'AVAILABLE',trade_date:date,dates:[{trade_date
 """
 
 
-def test_both_navigation_layouts_route_to_the_read_only_qmt_page():
+def test_account_navigation_routes_once_to_the_read_only_qmt_page():
     index = (ROOT / "server/static/index.html").read_text(encoding="utf-8")
     app = (ROOT / "server/static/js/app.js").read_text(encoding="utf-8")
     assert 'id="tab-qmt-strategy-results" class="tab-content"' in index
     assert "/static/js/qmt-strategy-results.js?v=" in index
     assert "/static/css/qmt-strategy-results.css?v=" in index
-    assert app.count("id:'qmt-strategy-results',icon:'◫',label:'QMT每日模拟'") == 2
+    assert app.count("{id:'qmt-strategy-results'") == 1
+    accounts = app.split("{id:'accounts', group:'持仓与模拟执行', items:[", 1)[1].split("\n        ]}", 1)[0]
+    assert "{id:'qmt-strategy-results', icon:'◫', label:'QMT每日模拟'}" in accounts
     assert "'qmt-strategy-results': function (d, c)" in app
     assert "window.QmtStrategyResults.stop()" in app
 
