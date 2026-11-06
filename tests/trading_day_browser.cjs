@@ -13,10 +13,10 @@ let conflict=false, failSave=false, slowDate=false, writes=0, saveBarrier=null;
 const clone=v=>JSON.parse(JSON.stringify(v));
 const candidates=Array.from({length:5},(_,i)=>({stock_code:'60000'+i,stock_name:'观察股'+(i+1),reason:'测试研究依据 <script>window.injected=true</script>',trigger:'量价条件 '+i,invalidation:'失效条件 '+i}));
 const navigation=[
- ['今日工作台',[['trading-day','今日看盘'],['command','智能决策'],['trading','交易与复盘总览']]],
- ['大盘与外围',[['workbench','市场总览'],['market-stage','大盘走势阶段'],['sentiment','市场情绪与风格'],['market-outlook','明日推演']]],
+ ['今日工作台',[['workbench','市场看板'],['trading-day','今日看盘'],['command','智能决策'],['trading','交易与复盘总览']]],
+ ['大盘与外围',[['market-context','市场环境'],['market-stage','大盘走势阶段'],['sentiment','市场情绪与风格'],['market-outlook','明日推演']]],
  ['板块与题材',[['sector','板块分析'],['concept','概念与行业']]],
- ['盘中监控与风险',[['monitor','市场监控'],['market-radar','异动雷达'],['intraday-alert','盘中播报'],['trading-v3-intraday','盘中应急'],['intraday-battle','盘中作战'],['hunter','狩猎场']]],
+ ['盘中监控与风险',[['monitor','盘中监控详情'],['market-radar','异动雷达'],['intraday-alert','盘中播报'],['trading-v3-intraday','盘中应急'],['intraday-battle','盘中作战'],['hunter','狩猎场']]],
  ['资金与龙虎榜',[['capital','个股资金'],['broad-etf-flow','宽基 ETF 资金'],['mainforce','主力行为'],['alist','龙虎榜']]],
  ['个股与自选',[['stock-list','全市场股票'],['portfolio','自选股'],['strong','强势股'],['fused','个股热榜']]],
  ['资讯公告与事件',[['news','财经快讯'],['notice','个股公告'],['research-radar','研报雷达'],['commentary','股评监控']]],
@@ -184,9 +184,9 @@ const server=http.createServer((req,res)=>{
   assert.equal(new URL(legacyRefresh.url()).searchParams.get('stat_date'),day);
   assert.equal(new URL(legacyRefresh.url()).searchParams.get('days'),'3');
   assert.equal(await page.locator('#tab-multi3').evaluate(node=>node.classList.contains('active')),true);
-  // Explicit routes take precedence over the saved tab.
+  // The trading workbench links to the dashboard without losing the date.
   await page.goto(base+'/?tab=trading-day&trade_date='+day);await page.waitForSelector('#tab-trading-day.active .td-hero');
-  await page.locator('[data-td-tab="workbench"]').click();await page.waitForSelector('#tab-workbench.active .mw-hero');
+  await page.locator('[data-td-tab="workbench"]').click();await page.waitForSelector('#tab-workbench.active .market-home');
   assert.equal(await page.locator('#sidebar [data-tab="workbench"]').count(),1);
   const [overviewRefresh]=await Promise.all([
    page.waitForRequest(req=>new URL(req.url()).pathname==='/api/monitor/data'),
@@ -199,12 +199,12 @@ const server=http.createServer((req,res)=>{
    page.locator('#datePicker').dispatchEvent('change')
   ]);
   assert.equal(new URL(overviewDateChange.url()).searchParams.get('date'),'2026-09-17');
-  await page.waitForFunction(()=>document.querySelector('#tab-workbench .mw-eyebrow').textContent.includes('2026-09-17'));
+  await page.waitForFunction(()=>document.querySelector('#tab-workbench .mh-head .mh-meta')?.textContent.includes('2026-09-17'));
   assert.match(page.url(),/trade_date=2026-09-17/);
   await page.goBack();await page.waitForSelector('#tab-trading-day.active .td-hero');
   assert.equal(await page.locator('.sidebar-item.active').getAttribute('data-tab'),'trading-day');
-  await page.goForward();await page.waitForSelector('#tab-workbench.active .mw-hero');
-  await page.reload();await page.waitForSelector('#tab-workbench.active .mw-hero');
+  await page.goForward();await page.waitForSelector('#tab-workbench.active .market-home');
+  await page.reload();await page.waitForSelector('#tab-workbench.active .market-home');
   await page.goBack();await page.waitForSelector('#tab-trading-day.active .td-hero');
   await page.locator('#datePicker').fill('2026-09-17');await page.locator('#datePicker').dispatchEvent('change');
   await page.waitForFunction(()=>document.querySelector('#tab-trading-day .td-pagehead').textContent.includes('2026-09-17'));
@@ -212,14 +212,14 @@ const server=http.createServer((req,res)=>{
   await assertNavigation(page,navigation);
   assert.equal(await page.locator('#datePicker').inputValue(),'2026-09-17');
   await page.reload();await page.waitForSelector('#tab-trading-day.active .td-hero');await assertNavigation(page,navigation);
-  // A saved legacy route is still restored and its parent item is selected.
+  // A direct legacy route still selects its parent; the bare URL is always the dashboard.
   await page.evaluate(()=>{localStorage.setItem('probiga_layout','old');localStorage.setItem('probiga_current_tab','capital-rt');});
-  await page.goto(base+'/');await page.waitForSelector('#tab-capital-rt.active #rtCode');await assertNavigation(page,navigation);
+  await page.goto(base+'/?tab=capital-rt');await page.waitForSelector('#tab-capital-rt.active #rtCode');await assertNavigation(page,navigation);
   assert.equal(await page.locator('.sidebar-item.active').getAttribute('data-tab'),'capital');
   await page.reload();await page.waitForSelector('#tab-capital-rt.active #rtCode');await assertNavigation(page,navigation);
-  // A fresh browser opens the consolidated desk.
-  await page.evaluate(()=>localStorage.clear());await page.goto(base+'/');await page.waitForSelector('#tab-trading-day.active');
-  assert.equal(await page.locator('.sidebar-item.active').getAttribute('data-tab'),'trading-day');
+  await page.goto(base+'/');await page.waitForSelector('#tab-workbench.active .market-home');
+  assert.equal(await page.locator('.sidebar-item.active').getAttribute('data-tab'),'workbench');
+  await page.goto(base+'/?tab=market-context&trade_date='+day);await page.waitForSelector('#tab-market-context.active .mw-hero');
   for(const tab of ['multi3','sector-rotation']){
    await page.goto(base+'/?tab='+tab+'&trade_date='+day);await page.waitForSelector('#tab-'+tab+'.active');
    for(const width of [769,800,900]){

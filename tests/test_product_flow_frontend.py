@@ -574,7 +574,7 @@ assert.deepStrictEqual(APP_NAV.map(group=>group.group),[
  '今日工作台','大盘与外围','板块与题材','盘中监控与风险','资金与龙虎榜','个股与自选','资讯公告与事件',
  '选股与交易计划','策略研究与回测','持仓与模拟执行','复盘、早报与日志','AI 问答','数据中心','调度、权限与部署'
 ]);
-assert.deepStrictEqual(APP_NAV[0].items.map(item=>item.id),['trading-day','command','trading']);
+assert.deepStrictEqual(APP_NAV[0].items.map(item=>item.id),['workbench','trading-day','command','trading']);
 for(const item of items){
   assert.equal(typeof LOADERS[item.id],'function',item.id+' has a loader');
   assert.equal(PAGE_TITLES[item.id],item.icon+' '+item.label);
@@ -585,7 +585,7 @@ for(const item of items){
 }
 const prior = 'ai-general ai-stock alist broad-etf-flow capital capital-rt command commentary concept concept3 concept5 daily-pool datasource east fused industry3 industry5 intraday-alert intraday-battle mainforce market-outlook market-radar market-stage monitor multi3 multi5 news notice portfolio qmt-strategy-results quant-workbench recommended research-radar review scheduler screen sector sector-heat sector-movement sector-rotation sentiment sim-trade sina stock-list strategy-backtest strategy-center strong ths trading trading-day trading-v3-candidates trading-v3-hypotheses trading-v3-intraday trading-v3-overview trading-v3-positions xq'.split(' ');
 assert.equal(prior.length,56);
-assert.deepStrictEqual(Object.keys(sidebarRouteByTab).sort(),[...prior,'workbench','hunter','jq-picks'].sort());
+assert.deepStrictEqual(Object.keys(sidebarRouteByTab).sort(),[...prior,'workbench','market-context','hunter','jq-picks'].sort());
 assert.match(items.find(item=>item.id==='sim-trade').label,/可操作/);
 """
     result = subprocess.run([shutil.which("node"), "-"], input=harness, text=True, encoding="utf-8", capture_output=True, timeout=10)

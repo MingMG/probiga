@@ -4,19 +4,21 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_product_navigation_keeps_trading_views_and_defaults_to_trading_day():
+def test_product_navigation_keeps_trading_views_and_defaults_to_market_board():
     index = (ROOT / "server/static/index.html").read_text(encoding="utf-8")
     app = (ROOT / "server/static/js/app.js").read_text(encoding="utf-8")
     desk = (ROOT / "server/static/trading-v3.html").read_text(encoding="utf-8")
 
     assert 'id="tab-trading" class="tab-content"' in index
-    assert 'id="tab-workbench" class="tab-content"' in index
-    assert 'id="tab-trading-day" class="tab-content active"' in index
+    assert 'id="tab-workbench" class="tab-content active"' in index
+    assert 'id="tab-trading-day" class="tab-content"' in index
+    assert 'id="tab-market-context" class="tab-content"' in index
+    assert '/static/js/market-home.js?v=' in index
     assert 'id="globalStockSearch"' in index
     assert "var APP_NAV = [" in app
     assert 'id="btnLayoutToggle"' not in index
     assert 'id="navigationToggle"' in index
-    assert "isKnownTab(savedTab) ? savedTab : 'trading-day'" in app
+    assert "var initialTab = routeTab || 'workbench';" in app
     for route in ("overview", "positions", "candidates", "intraday", "hypotheses"):
         assert f"id:'trading-v3-{route}'" in app
     for label in ["今日策略", "我的持仓", "盘中应急", "连续跟踪"]:

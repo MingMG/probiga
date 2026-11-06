@@ -47,13 +47,17 @@
         var previousTab = ACTIVE_TAB;
         ACTIVE_TAB = String(tabId || '');
         window._activeTab = ACTIVE_TAB;
-        if (previousTab === 'workbench' && ACTIVE_TAB !== 'workbench' && window.MarketWorkbench) window.MarketWorkbench.stop();
+        if (previousTab === 'workbench' && ACTIVE_TAB !== 'workbench' && window.MarketHome) window.MarketHome.stop();
+        if (previousTab === 'market-context' && ACTIVE_TAB !== 'market-context' && window.MarketWorkbench) window.MarketWorkbench.stop();
         if (previousTab === 'trading-day' && ACTIVE_TAB !== 'trading-day' && window.TradingDayDesk) window.TradingDayDesk.stop();
         if (previousTab === 'qmt-strategy-results' && ACTIVE_TAB !== 'qmt-strategy-results' && window.QmtStrategyResults) window.QmtStrategyResults.stop();
         if (previousTab === 'broad-etf-flow' && ACTIVE_TAB !== 'broad-etf-flow' && typeof window.stopBroadEtfFlow === 'function') {
             window.stopBroadEtfFlow();
         }
-        if (document.body) document.body.classList.toggle('ai-workspace-active', ACTIVE_TAB === 'ai-stock' || ACTIVE_TAB === 'ai-general');
+        if (document.body) {
+            document.body.classList.toggle('ai-workspace-active', ACTIVE_TAB === 'ai-stock' || ACTIVE_TAB === 'ai-general');
+            document.body.classList.toggle('market-home-active', ACTIVE_TAB === 'workbench');
+        }
     }
     function activeTabId() {
         if (ACTIVE_TAB) return ACTIVE_TAB;
@@ -488,7 +492,7 @@
         try {
             var url = new URL(window.location.href);
             url.searchParams.set('tab', tabId);
-            if (tabId === 'workbench' || tabId === 'trading-day' || tabId === 'qmt-strategy-results' || isTradingDecisionTab(tabId)) {
+            if (tabId === 'workbench' || tabId === 'market-context' || tabId === 'trading-day' || tabId === 'qmt-strategy-results' || isTradingDecisionTab(tabId)) {
                 var picker = el('datePicker');
                 if (picker && picker.value) url.searchParams.set('trade_date', picker.value);
             }
@@ -546,7 +550,6 @@
             if (tc) tc.classList.add('active');
             el('pageTitle').textContent = (typeof PAGE_TITLES !== 'undefined' && PAGE_TITLES[tabId]) || tabId;
             if (tabId === 'alist-detail' || tabId === 'concept-detail' || tabId === 'minute-chart') return;
-            try { localStorage.setItem('probiga_current_tab', tabId); } catch (e) {}
             loadTab(tabId);
         } catch (e) {
             console.error('[switchTab error]', e);
@@ -6586,10 +6589,18 @@
             });
         },
         workbench: function (d, c) {
+            return window.MarketHome.load(d, c, {
+                request:fetchRawJsonWithTimeout,
+                clock:function(){return MARKET_CLOCK || {};}, refreshClock:refreshMarketClockSilently,
+                isActive:function(){return activeTabId() === 'workbench';},
+                navigate:window.switchTab, stock:window.openStockDetail, status:setStatus
+            });
+        },
+        'market-context': function (d, c) {
             return window.MarketWorkbench.load(d, c, {
                 request:fetchRawJsonWithTimeout, contextTruth:tradingDecisionTruth,
                 clock:function(){return MARKET_CLOCK || {};}, refreshClock:refreshMarketClockSilently,
-                isActive:function(){return activeTabId() === 'workbench';},
+                isActive:function(){return activeTabId() === 'market-context';},
                 navigate:window.switchTab, stock:window.openStockDetail, status:setStatus
             });
         },
@@ -7969,12 +7980,13 @@
     /* ===== 功能导航 ===== */
     var APP_NAV = [
         {id:'desk', group:'今日工作台', items:[
+            {id:'workbench', icon:'◉', label:'市场看板'},
             {id:'trading-day', icon:'◷', label:'今日看盘'},
             {id:'command', icon:'🧭', label:'智能决策'},
             {id:'trading', icon:'◎', label:'交易与复盘总览'}
         ]},
         {id:'market', group:'大盘与外围', items:[
-            {id:'workbench', icon:'◉', label:'市场总览'},
+            {id:'market-context', icon:'◉', label:'市场环境'},
             {id:'market-stage', icon:'◈', label:'大盘走势阶段'},
             {id:'sentiment', icon:'🧠', label:'市场情绪与风格'},
             {id:'market-outlook', icon:'🔭', label:'明日推演'}
@@ -7984,7 +7996,7 @@
             {id:'concept', icon:'🏷️', label:'概念与行业', aliases:['concept3','concept5','industry3','industry5']}
         ]},
         {id:'tape', group:'盘中监控与风险', items:[
-            {id:'monitor', icon:'📺', label:'市场监控'},
+            {id:'monitor', icon:'📺', label:'盘中监控详情'},
             {id:'market-radar', icon:'📡', label:'异动雷达'},
             {id:'intraday-alert', icon:'🔔', label:'盘中播报'},
             {id:'trading-v3-intraday', icon:'04', label:'盘中应急', tradingView:'intraday', modulePage:'v3'},
@@ -13280,7 +13292,6 @@
             }
             if (tc) tc.classList.add('active');
             el('pageTitle').textContent = (typeof PAGE_TITLES !== 'undefined' && PAGE_TITLES[savedTab]) || savedTab;
-            try { localStorage.setItem('probiga_current_tab', savedTab); } catch (e) {}
             loadTab(savedTab);
             return true;
         }
@@ -13325,7 +13336,7 @@
     }
 
     window.addEventListener('popstate', function() {
-        var tab = routeTabFromLocation() || 'trading-day';
+        var tab = routeTabFromLocation() || 'workbench';
         var routeDate = normalizedTradingRouteDate(routeDecisionDateFromLocation(), tab);
         var picker = el('datePicker');
         if (picker) picker.value = routeDate || (MARKET_CLOCK || {}).ui_trade_date || localDateString(new Date());
@@ -13353,9 +13364,7 @@
         var today = localDateString(new Date());
         el('datePicker').value = today;
         var routeTab = routeTabFromLocation();
-        var savedTab = '';
-        try { savedTab = localStorage.getItem('probiga_current_tab') || ''; } catch (e) {}
-        var initialTab = routeTab || (isKnownTab(savedTab) ? savedTab : 'trading-day');
+        var initialTab = routeTab || 'workbench';
         renderSidebar(APP_NAV, initialTab);
         loadMarketClock().then(function () {
             var routeDate = normalizedTradingRouteDate(routeDecisionDateFromLocation(), initialTab);
