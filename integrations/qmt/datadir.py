@@ -17,7 +17,7 @@ File layout, verified against the production publisher row by row
   0      bar start, Unix seconds in China standard time
   1..4   open, high, low, close, scaled by 1000
   6      minute bars: volume in lots (手); daily bars: volume in lots too
-  8      turnover amount in CNY
+  8..9   turnover amount in CNY, unsigned 64-bit (low word first)
   13     previous bar close (for the first bar of a session, pre-close),
          scaled by 1000
   =====  ==============================================================
@@ -48,6 +48,7 @@ WORD_LOW = 3
 WORD_CLOSE = 4
 WORD_VOLUME = 6
 WORD_AMOUNT = 8
+WORD_AMOUNT_HIGH = 9
 WORD_PREV_CLOSE = 13
 
 PRICE_SCALE = 1000
@@ -141,6 +142,10 @@ def _price(word: int) -> Decimal:
     return Decimal(int(word)).scaleb(-PRICE_SCALE_DIGITS)
 
 
+def _amount(record: np.ndarray) -> Decimal:
+    return Decimal((int(record[WORD_AMOUNT_HIGH]) << 32) | int(record[WORD_AMOUNT]))
+
+
 def _change(close: int, previous: int) -> tuple[Decimal, Decimal]:
     current = _price(close)
     base = _price(previous)
@@ -191,7 +196,7 @@ def iter_minute_rows(
             change,
             change_pct,
             Decimal(int(record[WORD_VOLUME])),
-            Decimal(int(record[WORD_AMOUNT])),
+            _amount(record),
             dat.qmt_code,
         )
 
@@ -221,7 +226,7 @@ def iter_daily_rows(
             _price(record[WORD_HIGH]),
             _price(record[WORD_LOW]),
             Decimal(int(record[WORD_VOLUME]) * LOT_TO_SHARES),
-            Decimal(int(record[WORD_AMOUNT])),
+            _amount(record),
             _price(record[WORD_PREV_CLOSE]),
             change,
             change_pct,
@@ -247,7 +252,7 @@ def iter_index_minute_rows(
             session,
             _price(close),
             Decimal(int(record[WORD_VOLUME])),
-            Decimal(int(record[WORD_AMOUNT])),
+            _amount(record),
             change,
             change_pct,
             dat.qmt_code,
@@ -275,7 +280,7 @@ def iter_index_daily_rows(
             _price(record[WORD_HIGH]),
             _price(record[WORD_LOW]),
             Decimal(int(record[WORD_VOLUME])),
-            Decimal(int(record[WORD_AMOUNT])),
+            _amount(record),
             _price(record[WORD_PREV_CLOSE]),
             change,
             change_pct,
