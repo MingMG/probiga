@@ -762,6 +762,45 @@ def _load_yahoo_fallback_items(
     return items, errors
 
 
+US_CASH_INDICES = ("nasdaq", "sp500", "dow")
+NEW_YORK = ZoneInfo("America/New_York")
+
+
+def fetch_us_cash_close(session: date, *, cutoff: datetime) -> list[dict[str, Any]]:
+    """Read exact US cash closes with the existing public quote adapters."""
+    captured = datetime.now(SHANGHAI).replace(microsecond=0)
+    if captured > cutoff:
+        return []
+    close = datetime.combine(session, datetime.min.time(), NEW_YORK).replace(hour=16)
+
+    def verified(items, *, tencent=False):
+        results = {}
+        for symbol, item in items.items():
+            stamp = _as_datetime(item.get("market_time"))
+            if stamp is None:
+                continue
+            # Tencent's US cash feed stamps its quote in New York time.
+            zone = NEW_YORK if tencent else SHANGHAI
+            stamp = stamp.replace(tzinfo=zone)
+            local = stamp.astimezone(NEW_YORK)
+            if local.date() == session and local >= close and stamp <= captured:
+                results[symbol] = {**item, "market_time": stamp.astimezone(SHANGHAI).isoformat(),
+                                   "captured_at": captured.isoformat(), "session_date": session.isoformat()}
+        return results
+
+    try:
+        tencent, _ = _load_tencent_fallback_items(US_CASH_INDICES, captured_at=captured)
+    except (OSError, ValueError) as exc:
+        logger.warning("US cash close Tencent request failed: %s", type(exc).__name__)
+        tencent = {}
+    accepted = verified(tencent, tencent=True)
+    missing = [symbol for symbol in US_CASH_INDICES if symbol not in accepted]
+    if missing:
+        yahoo, _ = _load_yahoo_fallback_items(missing, captured_at=captured)
+        accepted.update(verified(yahoo))
+    return [accepted[symbol] for symbol in US_CASH_INDICES if symbol in accepted]
+
+
 def _score_snapshot(items: list[dict[str, Any]]) -> tuple[float | None, str, str]:
     values = {item["symbol"]: item for item in items if item.get("availability") == "available"}
     core_symbols = ("nasdaq", "sp500", "dow", "nikkei", "kospi", "hang_seng", "taiwan")

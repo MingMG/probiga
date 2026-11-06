@@ -338,3 +338,25 @@ def test_twse_source_completes_native_batch_without_contacting_unneeded_fallback
     assert snapshot["acquisition_status"] == "COMPLETE"
     assert snapshot["available_count"] == snapshot["expected_count"] == 41
     assert snapshot["source_warnings"] == []
+def test_us_cash_close_normalizes_new_york_timestamp_and_rejects_old_quote(monkeypatch):
+    from datetime import date, datetime
+    from biz.market_context import external_market as market
+
+    now = datetime(2026, 11, 6, 8, 30, tzinfo=market.SHANGHAI)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz)
+
+    monkeypatch.setattr(market, "datetime", Clock)
+    monkeypatch.setattr(market, "_load_tencent_fallback_items", lambda *args, **kwargs: ({
+        "nasdaq": {"symbol": "nasdaq", "market_time": "2026-11-05 17:15:59", "change_pct": -5.52},
+        "sp500": {"symbol": "sp500", "market_time": "2026-11-04 16:51:11", "change_pct": 1.58},
+        "dow": {"symbol": "dow", "market_time": "2026-11-05 15:59:00", "change_pct": -3.44},
+    }, []))
+    monkeypatch.setattr(market, "_load_yahoo_fallback_items", lambda *args, **kwargs: ({}, []))
+    result = market.fetch_us_cash_close(date(2026, 11, 5), cutoff=now)
+    assert [(row["symbol"], row["market_time"], row["change_pct"]) for row in result] == [
+        ("nasdaq", "2026-11-06T06:15:59+08:00", -5.52),
+    ]
