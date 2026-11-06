@@ -6775,6 +6775,9 @@
         'market-outlook': function (d, c) {
             return window.MarketOutlook.load(d || recommendationDateValue() || currentDateValue(), c);
         },
+        'market-stage': function (d, c) {
+            return window.MarketStage.load(d, c, function (url) { return fetchRawJsonWithTimeout(url, 30000); });
+        },
         hunter: function (d, c) {
             loadHunterPage(recommendationDateValue() || d, c);
         },
@@ -7962,6 +7965,7 @@
         ]},
         {group:'市场分析', items:[
             {id:'command',icon:'🧭',label:'智能决策'},
+            {id:'market-stage',icon:'◈',label:'大盘走势阶段'},
             {id:'intraday-battle',icon:'⚡',label:'盘中作战'},
             {id:'intraday-alert',icon:'🔔',label:'盘中播报'},
             {id:'monitor',icon:'📺',label:'市场监控中心'},
@@ -8043,6 +8047,7 @@
         ]},
         {group:'市场工具', items:[
             {id:'command',icon:'🧭',label:'智能决策'},
+            {id:'market-stage',icon:'◈',label:'大盘走势阶段'},
             {id:'monitor',icon:'📺',label:'市场监控'},
             {id:'sector',icon:'🌊',label:'板块分析'},
             {id:'market-radar',icon:'📡',label:'异动雷达'}
