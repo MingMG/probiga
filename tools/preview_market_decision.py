@@ -276,14 +276,14 @@ def _recovery_request(core, packet: dict, rules: str, checkpoint: dict, stage: s
     if stage not in {"codex_final", "codex_arbitration"}:
         raise RuntimeError("BLOCKED stage=recovery: unsupported_recovery_stage")
     reviews = {"deepseek_review": core._parse_review(stages["deepseek_review"]["raw_response"],
-                    core._body_hash(stages["codex_draft"]["raw_response"]), packet),
+                    core._body_hash(stages["codex_draft"]["raw_response"]), packet,rules=rules),
                "codex_review": core._parse_review(stages["codex_review"]["raw_response"],
-                    core._body_hash(stages["deepseek_draft"]["raw_response"]), packet)}
+                    core._body_hash(stages["deepseek_draft"]["raw_response"]), packet,rules=rules)}
     drafts = {"deepseek": stages["deepseek_draft"]["raw_response"], "codex": stages["codex_draft"]["raw_response"]}
     if stage == "codex_arbitration":
         raw=stages["codex_final"]["raw_response"]
-        _,local=core._inspect_first_final(raw,packet,reviews)
-        reviews["deepseek_final_review"]=core._parse_review(stages["deepseek_final_review"]["raw_response"],core._body_hash(raw),packet,final=True,require_pass=False)
+        _,local=core._inspect_first_final(raw,packet,reviews,schema=core._final_request(packet,rules,drafts,reviews)[1])
+        reviews["deepseek_final_review"]=core._parse_review(stages["deepseek_final_review"]["raw_response"],core._body_hash(raw),packet,final=True,require_pass=False,rules=rules)
         if local: reviews["deterministic_contract"]=local
         return core.build_stage_request(stage,packet,rules,reviews=reviews,final_raw=raw)
     return core._final_request(packet, rules, drafts, reviews)
@@ -362,7 +362,7 @@ def inspect_recovery(engine, source_dir: Path, *, stage: str, worker_state_root:
                     "successful_stage_raw_or_provider_receipt_changed")
             if name.startswith("deepseek"):
                 require(receipt.get("source") == "deepseek_api"
-                        and receipt.get("endpoint") == "https://api.deepseek.com/v1/chat/completions"
+                        and receipt.get("endpoint") == core._rules_bundle(rules_hash).get("deepseek_endpoint", "https://api.deepseek.com/v1/chat/completions")
                         and receipt.get("provider_response_id") and receipt.get("model"), "successful_provider_identity_missing")
             else:
                 require(receipt.get("source") == "codex_gpt" and receipt.get("request_id") == item.get("request_id")
@@ -373,7 +373,10 @@ def inspect_recovery(engine, source_dir: Path, *, stage: str, worker_state_root:
     require(payload["request_id"] == request_id and payload["stage"] == stage
             and payload["messages"] == messages and payload["response_schema"] == schema
             and payload["rules_sha256"] == rules_hash, "canonical_failed_input_changed")
-    require(str(row.get("error_message") or "") in {"request_total_deadline_exceeded", "processing_request_deadline_exceeded"}
+    # The worker wraps native process failures; immutable events below must
+    # independently prove a network failure before this candidate can recover.
+    require(str(row.get("error_message") or "") in {"request_total_deadline_exceeded", "processing_request_deadline_exceeded",
+            "RESEARCH_FAILED stage=codex reason=process_or_stdin_failed"}
             or "network" in str(row.get("error_message") or "").lower(), "canonical_failure_is_not_transport")
     worker_dir = worker_state_root / request_id
     local_path, process_path = worker_dir / "receipt.json", worker_dir / "process" / "receipt.json"
@@ -569,10 +572,11 @@ def prepare_continuation(engine, source_dir: Path, *, output_dir: Path) -> Path:
                     and all(receipt.get(key) == value for key, value in result.get("provider_receipt", {}).items()), "codex_completion_receipt_changed")
         else:
             require(receipt.get("source") == "deepseek_api" and receipt.get("transport") == "live_http"
-                    and receipt.get("endpoint") == "https://api.deepseek.com/v1/chat/completions"
+                    and receipt.get("endpoint") == core.DEEPSEEK_ENDPOINT
                     and receipt.get("provider_response_id") and receipt.get("model"), "deepseek_identity_missing")
         if stage.endswith("_review"):
-            core._parse_review(item["raw_response"], schema["properties"]["reviewed_sha256"]["const"], packet)
+            core._parse_review(item["raw_response"], schema["properties"]["reviewed_sha256"]["const"], packet,rules=rules,
+                               final=stage=="deepseek_final_review",require_pass=False)
     if original.get("publish"):
         guard = publication_snapshot(engine, bundle["review_date"])
         require(all(guard.get(key) == original["publication_guard"].get(key) for key in ("row_sha256", "source_digest_sha256")), "publication_source_changed")

@@ -60,7 +60,7 @@ def add_peer_reviews(value):
         previous_research=None, now=NOW, source_digest_sha256=core.source_digest_identity(frozen["facts"]))
     for stage, target in (("deepseek_review", "codex_draft"), ("codex_review", "deepseek_draft")):
         messages, schema = core._peer_request(packet, rules, value["checkpoint"]["stages"][target]["raw_response"])
-        raw = core._json({"schema_version": "probiga.research-review.v3", "reviewed_sha256": schema["properties"]["reviewed_sha256"]["const"], "findings": []})
+        raw = core._json({"schema_version": schema["properties"]["schema_version"]["const"], "reviewed_sha256": schema["properties"]["reviewed_sha256"]["const"], "findings": []})
         payload = {"request_id": str(uuid4()), "stage": stage, "messages": messages, "response_schema": schema,
                    "rules_sha256": rule_hash, "deadline_at": value["payload"]["deadline_at"]}
         payload["input_sha256"] = research.research_input_sha256(payload)
@@ -68,10 +68,15 @@ def add_peer_reviews(value):
             research._enqueue(value["engine"], payload)
             provider = value["completed_codex"](payload, raw)
         else:
-            provider = {"source": "deepseek_api", "transport": "live_http", "endpoint": "https://api.deepseek.com/v1/chat/completions",
+            provider = {"source": "deepseek_api", "transport": "live_http", "endpoint": core.DEEPSEEK_ENDPOINT,
                 "provider_response_id": "unit", "model": core.DEEPSEEK_RESEARCH_POLICY["model"],
                 "request_policy": deepcopy(core.DEEPSEEK_RESEARCH_POLICY),
                 "raw_sha256": core._body_hash(raw), "messages_sha256": core._hash(messages)}
+            wire = core._deepseek_request(messages, schema, core.DEEPSEEK_RESEARCH_POLICY)
+            provider.update(response_schema_sha256=core._hash(schema), response_status="tool_calls",
+                wire_request_sha256=core._hash(wire), wire_schema_sha256=core._hash(wire["tools"][0]["function"]["parameters"]),
+                provider_arguments_sha256=core._body_hash('{"report":' + raw + '}'),
+                provider_arguments_prefix='{"report":', provider_arguments_suffix='}')
         value["save"](stage, payload, raw, provider)
     cli._atomic(value["source"] / "review_checkpoint.json", value["checkpoint"])
 
