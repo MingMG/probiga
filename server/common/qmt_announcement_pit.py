@@ -90,6 +90,7 @@ QMT_ANNOUNCEMENT_TASK_SCHEMA = "probiga.qmt-announcement-task-result.v1"
 CNINFO_PROVIDER_RECEIPT_SCHEMA = (
     "probiga.cninfo-announcement-provider-receipt.v3"
 )
+HISTORICAL_SOURCE_EVENT_CONTRACT = "OFFICIAL_ANNOUNCEMENT_ID_PUBLISHED_AT_RAW_SOURCE_ROW_SHA256_V1"
 CNINFO_MAX_PAGES_PER_STOCK = 200
 CNINFO_DATE_SHARD_MAX_CAPTURE_ROUNDS = 8
 CNINFO_DATE_SHARD_SPLIT_VERSION = "MIDPOINT_INCLUSIVE_V1"
@@ -463,6 +464,7 @@ def _fallback_receipt_valid(
     requested_end_time: str,
     result_count: int,
     catalog_codes: Sequence[str],
+    staged: bool = False,
 ) -> bool:
     """Validate source-specific proof without weakening common PIT checks."""
 
@@ -503,29 +505,10 @@ def _fallback_receipt_valid(
         provider_total = int(receipt.get("provider_total_record_count"))
         reported_pages = int(receipt.get("provider_reported_totalpages"))
         max_pages = int(receipt.get("max_pages_per_stock"))
-        master_count = int(receipt.get("security_master_member_count"))
-        requested_count = int(receipt.get("requested_catalog_member_count"))
-        unrequested_count = int(
-            receipt.get("security_master_unrequested_count")
-        )
-        missing_count = int(
-            receipt.get("security_master_missing_requested_count")
-        )
-        directory_count = int(receipt.get("directory_member_count"))
-        directory_coverage = int(
-            receipt.get("directory_catalog_coverage_count")
-        )
-        directory_missing = int(
-            receipt.get("directory_catalog_missing_count")
-        )
-        directory_extra = int(
-            receipt.get("directory_catalog_extra_count")
-        )
     except (TypeError, ValueError, OverflowError):
         return False
     page_hashes = receipt.get("page_sha256")
     master_start = str(receipt.get("security_master_sha256") or "")
-    master_end = str(receipt.get("security_master_end_sha256") or "")
     first_anchor = str(receipt.get("first_page_anchor_sha256") or "")
     last_anchor = str(receipt.get("last_page_anchor_sha256") or "")
     first_page_recheck = str(
@@ -570,7 +553,6 @@ def _fallback_receipt_valid(
     directory_member_set_hash = str(
         receipt.get("directory_member_set_hash") or ""
     )
-    normalized_catalog = sorted(str(code).zfill(6) for code in catalog_codes)
     pagination_payload = {
         "pagination_mode": pagination_mode,
         "total_record_count": provider_total,
@@ -600,19 +582,6 @@ def _fallback_receipt_valid(
             "date_shard_split_version": split_version,
         })
     expected_pagination_hash = canonical_hash(pagination_payload)
-    expected_directory_attestation = canonical_hash({
-        "directory_raw_sha256": directory_raw_hash,
-        "directory_manifest_hash": directory_manifest_hash,
-        "directory_member_set_hash": directory_member_set_hash,
-        "directory_member_count": directory_count,
-        "security_master_start_sha256": master_start,
-        "security_master_end_sha256": master_end,
-        "requested_catalog_member_count": requested_count,
-        "requested_catalog_member_set_sha256": receipt.get(
-            "requested_catalog_member_set_sha256"
-        ),
-        "directory_catalog_missing_count": directory_missing,
-    })
     common_pagination_valid = bool(
         provider_total == result_count
         and expected_pages == page_count
@@ -806,7 +775,7 @@ def _fallback_receipt_valid(
                 <= max_pages
                 and first_page_recheck == ""
             )
-    return bool(
+    if not (
         str(receipt.get("org_id") or "").strip()
         and receipt.get("query_stock_identity")
         == f"{stock_code},{receipt.get('org_id')}"
@@ -814,13 +783,42 @@ def _fallback_receipt_valid(
         and common_pagination_valid
         and (single_page_proof_valid or shard_proof_valid)
         and _SHA256_RE.fullmatch(master_start)
-        and master_start == master_end
         and _SHA256_RE.fullmatch(directory_raw_hash)
-        and _SHA256_RE.fullmatch(directory_manifest_hash)
         and directory_manifest_hash == master_start
         and _SHA256_RE.fullmatch(directory_member_set_hash)
-        and receipt.get("directory_attestation_sha256")
-        == expected_directory_attestation
+    ):
+        return False
+    if staged:
+        # Reuse still requires a fresh, matching first security-master anchor.
+        # The final second anchor and whole-catalog proof are sealed later.
+        return True
+    try:
+        master_count = int(receipt.get("security_master_member_count"))
+        requested_count = int(receipt.get("requested_catalog_member_count"))
+        unrequested_count = int(receipt.get("security_master_unrequested_count"))
+        missing_count = int(receipt.get("security_master_missing_requested_count"))
+        directory_count = int(receipt.get("directory_member_count"))
+        directory_coverage = int(receipt.get("directory_catalog_coverage_count"))
+        directory_missing = int(receipt.get("directory_catalog_missing_count"))
+        directory_extra = int(receipt.get("directory_catalog_extra_count"))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    master_end = str(receipt.get("security_master_end_sha256") or "")
+    normalized_catalog = sorted(str(code).zfill(6) for code in catalog_codes)
+    expected_directory_attestation = canonical_hash({
+        "directory_raw_sha256": directory_raw_hash,
+        "directory_manifest_hash": directory_manifest_hash,
+        "directory_member_set_hash": directory_member_set_hash,
+        "directory_member_count": directory_count,
+        "security_master_start_sha256": master_start,
+        "security_master_end_sha256": master_end,
+        "requested_catalog_member_count": requested_count,
+        "requested_catalog_member_set_sha256": receipt.get("requested_catalog_member_set_sha256"),
+        "directory_catalog_missing_count": directory_missing,
+    })
+    return bool(
+        master_start == master_end
+        and receipt.get("directory_attestation_sha256") == expected_directory_attestation
         and master_count >= len(normalized_catalog)
         and directory_count == master_count
         and directory_coverage == len(normalized_catalog)
@@ -1247,7 +1245,7 @@ class AnnouncementCheckpoint:
     def _result_path(self, stock_code: str) -> Path:
         return self.root / "results" / f"{stock_code}.json"
 
-    def load(self, stock_code: str) -> list[dict[str, Any]] | None:
+    def _load_result(self, stock_code: str) -> dict[str, Any] | None:
         path = self._result_path(stock_code)
         if not path.exists():
             return None
@@ -1258,6 +1256,8 @@ class AnnouncementCheckpoint:
                 "QMT_ANNOUNCEMENT_CHECKPOINT_RESULT_INVALID",
                 f"{stock_code}:{type(exc).__name__}",
             ) from exc
+        if not isinstance(payload, dict):
+            raise QMTAnnouncementBlocked("QMT_ANNOUNCEMENT_CHECKPOINT_RESULT_INVALID", stock_code)
         unsigned = dict(payload)
         payload_hash = str(unsigned.pop("payload_hash", ""))
         expected = {
@@ -1271,6 +1271,7 @@ class AnnouncementCheckpoint:
         if (
             any(unsigned.get(key) != value for key, value in expected.items())
             or not isinstance(unsigned.get("events"), list)
+            or any(not isinstance(event, dict) for event in unsigned["events"])
             or not _SHA256_RE.fullmatch(payload_hash)
             or canonical_hash(unsigned) != payload_hash
         ):
@@ -1278,7 +1279,11 @@ class AnnouncementCheckpoint:
                 "QMT_ANNOUNCEMENT_CHECKPOINT_RESULT_MIXED_OR_TAMPERED",
                 stock_code,
             )
-        return [dict(item) for item in unsigned["events"]]
+        return unsigned
+
+    def load(self, stock_code: str) -> list[dict[str, Any]] | None:
+        result = self._load_result(stock_code)
+        return None if result is None else [dict(item) for item in result["events"]]
 
     def save(
         self,
@@ -1306,17 +1311,10 @@ class AnnouncementCheckpoint:
     def load_provider_receipt(
         self, stock_code: str
     ) -> dict[str, Any] | None:
-        if self.load(stock_code) is None:
+        result = self._load_result(stock_code)
+        if result is None:
             return None
-        path = self._result_path(stock_code)
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
-            raise QMTAnnouncementBlocked(
-                "QMT_ANNOUNCEMENT_CHECKPOINT_RESULT_INVALID",
-                f"{stock_code}:{type(exc).__name__}",
-            ) from exc
-        receipt = payload.get("provider_receipt")
+        receipt = result.get("provider_receipt")
         if receipt is None:
             return None
         if not isinstance(receipt, Mapping):
@@ -1371,7 +1369,7 @@ class AnnouncementCheckpoint:
         )
 
     def prepare_publish(
-        self, *, batch_root_hash: str, received_at: datetime
+        self, *, batch_root_hash: str, received_at: datetime, publication_batch_id: str = ""
     ) -> None:
         unsigned = {
             "schema": QMT_ANNOUNCEMENT_PREPARED_SCHEMA,
@@ -1380,6 +1378,8 @@ class AnnouncementCheckpoint:
             "received_at": _dt_text(received_at),
             "batch_root_hash": str(batch_root_hash),
         }
+        if publication_batch_id:
+            unsigned["publication_batch_id"] = publication_batch_id
         _atomic_write(
             self.root / "prepared.json",
             {**unsigned, "payload_hash": canonical_hash(unsigned)},
@@ -1420,7 +1420,7 @@ class AnnouncementCheckpoint:
             ) from exc
         return received_at, root_hash
 
-    def mark_complete(self, *, batch_root_hash: str, received_at: datetime) -> None:
+    def mark_complete(self, *, batch_root_hash: str, received_at: datetime, publication_batch_id: str = "") -> None:
         _atomic_write(
             self.root / "complete.json",
             {
@@ -1429,6 +1429,7 @@ class AnnouncementCheckpoint:
                 "fact_cutoff_at": self.manifest["fact_cutoff_at"],
                 "received_at": _dt_text(received_at),
                 "batch_root_hash": batch_root_hash,
+                **({"publication_batch_id": publication_batch_id} if publication_batch_id else {}),
             },
         )
 
@@ -4042,24 +4043,30 @@ def synchronize_historical_cninfo_announcements(
         binder(fact_cutoff_at=started_at, max_capture_delay=capture_deadline - started_at)
     window_start = target - timedelta(days=int(window_days))
     window_end = target
-    seed = {
-        "schema": "probiga.qmt-announcement-reconstruction-batch-id.v2",
+    requested_start = _qmt_time(datetime.combine(window_start, datetime.min.time()))
+    requested_end = _qmt_time(source_cutoff)
+    scope = {
+        "schema": "probiga.cninfo-announcement-query-scope.v1",
         "source": CNINFO_ANNOUNCEMENT_SOURCE,
         "target_trade_date": target.isoformat(),
         "source_query_cutoff_at": _dt_text(source_cutoff),
-        "build_sha": identity["build_sha"],
+        "query_window_start": window_start.isoformat(),
+        "query_window_end": window_end.isoformat(),
         "catalog_batch_id": catalog.batch_id,
         "catalog_manifest_hash": catalog.manifest_hash,
         "catalog_member_set_hash": catalog.member_set_hash,
-        "authority_sha256": canonical_hash(identity["authority"]),
+        "instruments": [[code, catalog.qmt_by_code[code]] for code in catalog.codes],
+        "provider_receipt_schema": CNINFO_PROVIDER_RECEIPT_SCHEMA,
+        "source_event_contract": HISTORICAL_SOURCE_EVENT_CONTRACT,
     }
-    batch_id = (
-        f"cninfo-ann-reconstruction-{target.strftime('%Y%m%d')}-"
-        f"{canonical_hash(seed)[:16]}"
+    query_scope_sha256 = canonical_hash(scope)
+    checkpoint_id = (
+        f"cninfo-ann-reconstruction-scope-{target.strftime('%Y%m%d')}-"
+        f"{query_scope_sha256[:32]}"
     )
     checkpoint = AnnouncementCheckpoint.open(
         Path(checkpoint_root),
-        batch_id=batch_id,
+        batch_id=checkpoint_id,
         fact_cutoff_at=source_cutoff,
         window_start=window_start,
         window_end=window_end,
@@ -4071,21 +4078,44 @@ def synchronize_historical_cninfo_announcements(
         coverage_window_start=window_start,
         manifest_extra={
             "capture_mode": "HISTORICAL_RECONSTRUCTION",
-            # Scheduler attempts have different run UIDs.  Staging is bound
-            # instead to the exact target/build/catalog/authority so a fenced
-            # retry can resume already attested members without mixing data.
-            "reconstruction_build_sha": identity["build_sha"],
-            "reconstruction_authority_sha256": canonical_hash(
-                identity["authority"]
-            ),
+            "source_query_scope_sha256": query_scope_sha256,
         },
     )
     _connect_announcement_transport(adapter, source=CNINFO_ANNOUNCEMENT_SOURCE)
-    staged_receipts = {
-        code: receipt
-        for code in catalog.codes
-        if (receipt := checkpoint.load_provider_receipt(code)) is not None
-    }
+    staged_receipts = {}
+    for code in catalog.codes:
+        check_capture_deadline(f"restore:{code}")
+        result = checkpoint._load_result(code)
+        if result is None:
+            continue
+        receipt = result.get("provider_receipt")
+        if not _fallback_receipt_valid(
+            receipt, source=CNINFO_ANNOUNCEMENT_SOURCE, stock_code=code,
+            qmt_code=catalog.qmt_by_code[code], requested_start_time=requested_start,
+            requested_end_time=requested_end, result_count=len(result["events"]),
+            catalog_codes=catalog.codes, staged=True,
+        ):
+            raise QMTAnnouncementBlocked("QMT_ANNOUNCEMENT_RECONSTRUCTION_STAGED_RECEIPT_INVALID", code)
+        try:
+            master_at = _dt(receipt.get("security_master_started_at"))
+            captured_at = _dt(receipt.get("captured_at"))
+            event_keys = set()
+            for event in result["events"]:
+                event_date = date.fromisoformat(str(event.get("event_date") or ""))
+                published = _dt(event["published_at"]) if event.get("published_at") else None
+                event_key = str(event.get("event_key") or "")
+                if (event.get("stock_code") != code or event.get("qmt_code") != catalog.qmt_by_code[code]
+                        or not event_key.startswith("cninfo:") or event_key in event_keys
+                        or not _SHA256_RE.fullmatch(str(event.get("source_row_hash") or ""))
+                        or not window_start <= event_date <= window_end
+                        or (published is not None and (published.date() != event_date or published > source_cutoff))):
+                    raise ValueError("staged announcement source scope differs")
+                event_keys.add(event_key)
+        except (TypeError, ValueError) as exc:
+            raise QMTAnnouncementBlocked("QMT_ANNOUNCEMENT_RECONSTRUCTION_STAGED_RECEIPT_INVALID", code) from exc
+        if not source_cutoff < master_at <= captured_at <= observed_at:
+            raise QMTAnnouncementBlocked("QMT_ANNOUNCEMENT_RECONSTRUCTION_STAGED_RECEIPT_INVALID", code)
+        staged_receipts[code] = receipt
     if staged_receipts:
         restorer = getattr(adapter, "restore_capture_receipts", None)
         if not callable(restorer):
@@ -4097,8 +4127,8 @@ def synchronize_historical_cninfo_announcements(
     resumed_units = completed_units
     progress_started = last_report = monotonic()
     if progress is not None:
-        progress.checkpoint = {"batch_id": batch_id, "source": CNINFO_ANNOUNCEMENT_SOURCE,
-                               "target_date": target.isoformat()}
+        progress.checkpoint = {"checkpoint_id": checkpoint_id, "source_query_scope_sha256": query_scope_sha256,
+                               "source": CNINFO_ANNOUNCEMENT_SOURCE, "target_date": target.isoformat()}
         progress.emit("source_checkpoint", completed_units=completed_units,
                       resumed_units=resumed_units,
                       capture_deadline_at=_dt_text(capture_deadline), publish_deadline_at=_dt_text(publish_deadline))
@@ -4142,8 +4172,6 @@ def synchronize_historical_cninfo_announcements(
             "QMT_ANNOUNCEMENT_RECONSTRUCTION_RECEIPTS_INCOMPLETE"
         )
     receipts = {str(code): dict(value) for code, value in raw_receipts.items()}
-    requested_start = _qmt_time(datetime.combine(window_start, datetime.min.time()))
-    requested_end = _qmt_time(source_cutoff)
     directory_anchors: set[tuple[Any, ...]] = set()
     captured_times: list[datetime] = []
     for code in catalog.codes:
@@ -4214,6 +4242,7 @@ def synchronize_historical_cninfo_announcements(
         "query_window_start": window_start.isoformat(),
         "query_window_end": window_end.isoformat(),
         "source_query_cutoff_at": _dt_text(source_cutoff),
+        "source_query_scope_sha256": query_scope_sha256,
         "reconstruction_started_at": _dt_text(effective_started_at),
         "reconstructed_at": _dt_text(reconstructed_at),
         "known_at": _dt_text(reconstructed_at),
@@ -4238,9 +4267,7 @@ def synchronize_historical_cninfo_announcements(
             "directory_attestation_sha256": directory_anchor[6],
             "requested_catalog_member_set_sha256": directory_anchor[7],
         },
-        "event_content_contract": (
-            "OFFICIAL_ANNOUNCEMENT_ID_PUBLISHED_AT_RAW_SOURCE_ROW_SHA256_V1"
-        ),
+        "event_content_contract": HISTORICAL_SOURCE_EVENT_CONTRACT,
         "zero_result_receipts_complete": True,
         "automatic_real_order_submission": False,
         "real_order_authority": False,
@@ -4264,6 +4291,13 @@ def synchronize_historical_cninfo_announcements(
             for code in catalog.codes
         ],
     })
+    publication_identity = canonical_hash({
+        "schema": "probiga.cninfo-announcement-publication-id.v1",
+        "source_query_scope_sha256": query_scope_sha256,
+        "reconstruction_sha256": provenance["reconstruction_sha256"],
+        "delta_root_sha256": delta_root,
+    })
+    batch_id = f"cninfo-ann-reconstruction-{target.strftime('%Y%m%d')}-{publication_identity[:32]}"
     batch_root, entries = build_batch_root(
         batch_id=batch_id,
         fact_cutoff_at=source_cutoff,
@@ -4290,7 +4324,7 @@ def synchronize_historical_cninfo_announcements(
     }
     incremental["chain_root_hash"] = canonical_hash(incremental)
     checkpoint.prepare_publish(
-        batch_root_hash=batch_root, received_at=reconstructed_at
+        batch_root_hash=batch_root, received_at=reconstructed_at, publication_batch_id=batch_id
     )
     if progress is not None:
         progress.emit("database_publish", completed_units=completed_units)
@@ -4316,7 +4350,7 @@ def synchronize_historical_cninfo_announcements(
     )
     try:
         checkpoint.mark_complete(
-            batch_root_hash=batch_root, received_at=reconstructed_at
+            batch_root_hash=batch_root, received_at=reconstructed_at, publication_batch_id=batch_id
         )
     except OSError:
         pass
