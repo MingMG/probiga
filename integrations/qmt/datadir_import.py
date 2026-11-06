@@ -24,6 +24,7 @@ from typing import Sequence
 
 from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.exc import OperationalError
 
 from integrations.qmt.datadir import (
     CST,
@@ -59,6 +60,7 @@ STATUS_FAILED = "FAILED"
 
 DEFAULT_CHUNK_ROWS = 5000
 DEFAULT_SESSIONS_PER_BATCH = 20
+STAGE_CLEANUP_BATCH_ROWS = 10_000
 
 MINUTE_COLUMNS = (
     "stock_code",
@@ -663,10 +665,63 @@ def readback_session(conn: Connection, session: dt.date) -> tuple[int, int]:
     return int(row[0]), int(row[1])
 
 
-def drop_staged(conn: Connection, run_id: str, *, session: dt.date | None = None) -> None:
-    predicate = " AND trade_date=:d" if session is not None else ""
-    conn.execute(text(f"DELETE FROM `{STAGE_TABLE}` WHERE run_id=:r{predicate}"),
-                 {"r": run_id, "d": session})
+def drop_staged(
+    engine: Engine, run_id: str, *, session: dt.date, deadline: float,
+    batch_rows: int = STAGE_CLEANUP_BATCH_ROWS,
+) -> dict:
+    """Purge only a committed run; each deleted batch is a durable checkpoint."""
+    if not 1 <= batch_rows <= STAGE_CLEANUP_BATCH_ROWS:
+        raise ValueError("minute stage cleanup batch limit is invalid")
+    mysql = engine.dialect.name == "mysql"
+    lock = " FOR UPDATE" if mysql else ""
+    authorized = text(f"""
+        SELECT 1 FROM `{RECEIPT_TABLE}` AS r
+        WHERE r.dataset=:dataset AND r.trade_date=:day AND r.run_id=:run
+          AND r.status='COMPLETE' AND r.finished_at IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM `{RECEIPT_TABLE}` AS a
+              WHERE a.dataset=:attempt AND a.trade_date=:day AND a.run_id=:run
+                AND a.status IN ('RUNNING','FAILED')
+          ){lock}
+    """)
+    # The production index starts with (run_id,trade_date,stock_code,trade_time).
+    # SQLite's subquery supplies equivalent limits without a DELETE LIMIT build option.
+    scoped = "run_id=:run AND trade_date=:day"
+    statement = text(
+        f"DELETE FROM `{STAGE_TABLE}` WHERE {scoped} ORDER BY stock_code,trade_time LIMIT :batch_rows"
+        if mysql else f"DELETE FROM `{STAGE_TABLE}` WHERE rowid IN (SELECT rowid FROM `{STAGE_TABLE}` "
+        f"WHERE {scoped} ORDER BY stock_code,trade_time LIMIT :batch_rows)"
+    )
+    params = {"dataset": DATASET, "attempt": ATTEMPT_DATASET, "run": run_id,
+              "day": session, "batch_rows": batch_rows}
+    result = {"schema": "probiga.qmt-datadir-minute-stage-cleanup.v1",
+              "run_id": run_id, "trade_date": session.isoformat(),
+              "deleted_rows": 0, "completed_batches": 0}
+    consecutive_failures = 0
+    while time.monotonic() < deadline:
+        try:
+            with engine.begin() as conn:
+                if not conn.execute(authorized, params).scalar():
+                    return {**result, "status": "DEFERRED", "reason": "committed_run_scope_unavailable"}
+                deleted = conn.execute(statement, params).rowcount
+                if not 0 <= deleted <= batch_rows:
+                    raise ValueError("minute stage cleanup returned an invalid row count")
+            consecutive_failures = 0
+        except OperationalError as exc:
+            errno = next(iter(getattr(exc.orig, "args", ())), None)
+            if errno not in {1205, 1213, 2006, 2013}:
+                return {**result, "status": "FAILED", "reason": "stage_delete_database_error"}
+            consecutive_failures += 1
+            if consecutive_failures >= 2:
+                return {**result, "status": "DEFERRED", "reason": f"stage_delete_retry_exhausted:{errno}"}
+            time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+            continue
+        result["deleted_rows"] += deleted
+        if deleted:
+            result["completed_batches"] += 1
+        if deleted < batch_rows:
+            return {**result, "status": "COMPLETE", "reason": ""}
+    return {**result, "status": "DEFERRED", "reason": "stage_cleanup_deadline"}
 
 
 def new_run_id(now: dt.datetime | None = None) -> str:

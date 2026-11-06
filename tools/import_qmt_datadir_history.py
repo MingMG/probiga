@@ -314,8 +314,24 @@ def _task_result(
     )
 
 
-def _finish_run(engine, *, sessions: list[dt.date], emit_json: bool) -> int:
+def _report_stage_cleanup(engine, *, session: dt.date, run_id: str, deadline: float) -> None:
+    try:
+        cleanup = drop_staged(engine, run_id, session=session, deadline=deadline)
+    except Exception as exc:
+        cleanup = {"schema": "probiga.qmt-datadir-minute-stage-cleanup.v1",
+                   "run_id": run_id, "trade_date": session.isoformat(),
+                   "status": "FAILED", "reason": type(exc).__name__}
+    print(json.dumps(cleanup, ensure_ascii=False, separators=(",", ":")), file=sys.stderr, flush=True)
+
+
+def _finish_run(engine, *, sessions: list[dt.date], emit_json: bool, cleanup_existing: bool = False) -> int:
     result = _task_result(engine, sessions=sessions)
+    if cleanup_existing:
+        cleanup_deadline = time.monotonic() + 180
+        for partition in result.get("partitions", ()):
+            if partition.get("status") == STATUS_COMPLETE:
+                _report_stage_cleanup(engine, session=dt.date.fromisoformat(partition["trade_date"]),
+                    run_id=partition["run_id"], deadline=cleanup_deadline)
     if emit_json:
         print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
     return 0 if result["status"] == "PASS" else 1
@@ -404,7 +420,7 @@ def main(argv: list[str] | None = None) -> int:
     todo = [item for item in plans if item.action in ACTIONABLE]
     if not todo:
         print("nothing to import")
-        return _finish_run(engine, sessions=sessions, emit_json=args.json)
+        return _finish_run(engine, sessions=sessions, emit_json=args.json, cleanup_existing=True)
 
     require_schema(engine)
     replace_sources = sorted({
@@ -425,7 +441,10 @@ def main(argv: list[str] | None = None) -> int:
     for item in todo:
         outcome = _reuse_existing_partition(engine, session=item.session, scope=scopes[item.session],
             datadir_roots=datadir_roots, universe=ordered)
-        if outcome is None:
+        if outcome is not None:
+            _report_stage_cleanup(engine, session=item.session, run_id=outcome["run_id"],
+                deadline=time.monotonic() + 180)
+        else:
             outcome = _resume_staged_partition(engine, session=item.session, scope=scopes[item.session],
                 replace=item.action == "REPLACE", replace_sources=replace_sources)
         if outcome is not None:
@@ -493,11 +512,6 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 published[session] = outcome
                 results.append(outcome)
-            with engine.begin() as conn:
-                for item in group:
-                    if published.get(item.session, {}).get("status") == STATUS_COMPLETE:
-                        drop_staged(conn, run_id, session=item.session)
-
     failures = 0
     for item in todo:
         session = item.session
@@ -575,6 +589,7 @@ def _publish_one(
                     "root": str(root), "error": str(exc)}
     progress.emit("canonical_commit", status="COMPLETE", completed_units=outcome["rows"])
     print(f"{session} COMPLETE rows={outcome['rows']} codes={outcome['codes']} root={root}")
+    _report_stage_cleanup(engine, session=session, run_id=run_id, deadline=time.monotonic() + 180)
     return outcome
 
 
