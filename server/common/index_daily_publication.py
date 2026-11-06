@@ -14,8 +14,19 @@ from server.common.qmt_datadir_result import SHA64, row_hash
 
 
 FREE_RECEIPT_SCHEMA = "probiga.free-index-daily-receipt.v1"
+FREE_BAR_RECEIPT_SCHEMA = "probiga.free-index-daily-bar-receipt.v1"
+FREE_BAR_PARTITION_PREFIX = "index_bar:"
+FREE_INDEX_RESULT_SCHEMA = "probiga.free-index-daily-result.v2"
+PUBLIC_INDEX_DAILY_CODES = (
+    "000001", "000016", "000300", "000680", "000688", "000852", "000905",
+    "399001", "399006", "399303", "899050",
+)
 _BATCH_DAYS = 16
 _MAX_ROWS_PER_BATCH = 16_000
+_BAR_FIELDS = (
+    "index_code", "trade_time", "trade_date", "k_type", "open", "close",
+    "high", "low", "volume", "amount", "change", "change_pct",
+)
 
 
 def canonical_free_index_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
@@ -25,6 +36,18 @@ def canonical_free_index_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[st
          **{key: str(row[key]) for key in ("open", "close", "high", "low", "volume", "amount")}}
         for row in rows
     ], key=lambda item: item["index_code"])
+
+
+def free_index_bar_hash(row: Mapping[str, Any]) -> str:
+    return row_hash([{key: row[key] for key in _BAR_FIELDS}])
+
+
+def index_scope_fingerprint(bars: Sequence[Mapping[str, Any]]) -> str:
+    return canonical_digest([
+        {"index_code": bar["index_code"], "row_hash": free_index_bar_hash(bar),
+         "available_at": normalize_decision_at(bar["available_at"]).isoformat(sep=" ")}
+        for bar in sorted(bars, key=lambda row: row["index_code"])
+    ])
 
 
 def _detail(raw: Any) -> dict:
@@ -45,7 +68,7 @@ def _datadir_matches(receipt: Mapping[str, Any], rows: list[dict]) -> bool:
     return (_matches_counts(receipt, count=count)
             and detail.get("readback_rows") == detail.get("readback_codes") == count
             and SHA64.fullmatch(str(receipt.get("content_sha256") or "")) is not None
-            and detail.get("row_hash") == row_hash(rows))
+            and detail.get("row_hash") == row_hash([{key: row[key] for key in _BAR_FIELDS} for row in rows]))
 
 
 def _free_matches(receipt: Mapping[str, Any], rows: list[dict], day: str) -> bool:
@@ -67,16 +90,53 @@ def _free_matches(receipt: Mapping[str, Any], rows: list[dict], day: str) -> boo
             and detail.get("row_hash") == canonical_digest(canonical))
 
 
+def _free_bar_matches(receipt: Mapping[str, Any], row: Mapping[str, Any], day: str) -> bool:
+    detail = _detail(receipt["detail_json"])
+    receipt_id = detail.pop("receipt_id", None)
+    code = row["index_code"]
+    digest = free_index_bar_hash(row)
+    available_at = normalize_decision_at(receipt["available_at"])
+    closed_at = datetime.combine(datetime.fromisoformat(day).date(), time(15))
+    return (
+        detail.get("schema") == FREE_BAR_RECEIPT_SCHEMA
+        and detail.get("provider") == "tencent_east_verified"
+        and detail.get("source_variant") in {"tencent_only", "east_only", "cross_checked", "cnindex_official"}
+        and detail.get("target_date") == day
+        and detail.get("index_code") == code
+        and detail.get("available_at") == available_at.isoformat(sep=" ")
+        and detail.get("row_hash") == digest
+        and receipt["partition_key"] == f"{FREE_BAR_PARTITION_PREFIX}{code}:{digest[:40]}"
+        and receipt["written_rows"] == 1
+        and receipt_id == receipt["request_id"] == canonical_digest(detail)
+        and row["trade_time"] is not None
+        and normalize_decision_at(row["trade_time"]) == closed_at
+        and row["etl_sync_at"] is not None
+        and closed_at <= normalize_decision_at(row["etl_sync_at"]) <= available_at
+    )
+
+
+def _partition_at_receipt(partition: list[dict], receipt: Mapping[str, Any]) -> list[dict]:
+    published_at = normalize_decision_at(receipt["available_at"])
+    return [row for row in partition if row["etl_sync_at"] is None
+            or normalize_decision_at(row["etl_sync_at"]) <= published_at]
+
+
 def load_verified_index_daily_bars(
-    primary: Any, history: Any, *, sessions: Sequence[str], code: str,
+    primary: Any, history: Any, *, sessions: Sequence[str], code: str | None = None,
+    codes: Sequence[str] | None = None,
     as_of: datetime, deadline: float,
 ) -> list[dict]:
     """Read only content still matching a verified post-write proof at the cutoff.
 
-    Existing publishers retain a current receipt, so a superseded version can
-    be absent here. The caller treats such a session as unavailable.
+    A historical partition receipt can still verify its original rows after
+    an additive repair. An added bar requires its own actual availability proof.
     """
     if not sessions:
+        return []
+    if (code is None) == (codes is None):
+        raise ValueError("provide one exact index code scope")
+    selected = {code} if code is not None else set(codes or ())
+    if not selected:
         return []
     if monotonic() >= deadline:
         raise TimeoutError("指数发布回执查询超时")
@@ -100,13 +160,28 @@ def load_verified_index_daily_bars(
               AND partition_key='__index_daily_partition__' AND status='complete'
               AND target_date BETWEEN :start AND :end AND last_success_at<=:cutoff
         """), bounds).mappings()}
+        if monotonic() >= deadline:
+            raise TimeoutError("指数单条补采回执查询超时")
+        repairs: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
+        for row in connection.execute(text("""
+            SELECT /*+ MAX_EXECUTION_TIME(2500) */ target_date AS trade_date, partition_key,
+                   request_id, written_rows, last_success_at AS available_at, detail_json
+            FROM acquisition_partition_state
+            WHERE dataset='index_daily' AND source='tencent_east_verified' AND status='complete'
+              AND target_date BETWEEN :start AND :end AND last_success_at<=:cutoff
+              AND partition_key LIKE 'index!_bar:%' ESCAPE '!'
+              AND SUBSTR(partition_key,11,6) IN :codes
+        """).bindparams(bindparam("codes", expanding=True)), {**bounds, "codes": sorted(selected)}).mappings():
+            key = (str(row["trade_date"])[:10], row["partition_key"][10:16])
+            repairs.setdefault(key, []).append(row)
 
-    eligible = [day for day in sessions if day in datadir or day in free]
+    repair_dates = {day for day, _ in repairs}
+    eligible = [day for day in sessions if day in datadir or day in free or day in repair_dates]
     if not eligible:
         return []
     select = text("""
         SELECT /*+ MAX_EXECUTION_TIME(2500) */ index_code, trade_time, trade_date, k_type,
-               open, close, high, low, volume, amount, `change`, change_pct
+               open, close, high, low, volume, amount, `change`, change_pct, etl_sync_at
         FROM sm_index_kline WHERE k_type=1 AND trade_date IN :dates
         ORDER BY trade_date, index_code, trade_time LIMIT :limit
     """).bindparams(bindparam("dates", expanding=True))
@@ -123,16 +198,33 @@ def load_verified_index_daily_bars(
             for row in rows:
                 grouped.setdefault(str(row["trade_date"])[:10], []).append(dict(row))
             for day, partition in grouped.items():
-                benchmark = next((row for row in partition if row["index_code"] == code), None)
-                if benchmark is None or len({row["index_code"] for row in partition}) != len(partition):
+                if len({row["index_code"] for row in partition}) != len(partition):
                     continue
-                published = []
-                if day in datadir and _datadir_matches(datadir[day], partition):
-                    published.append(normalize_decision_at(datadir[day]["available_at"]))
-                if day in free and _free_matches(free[day], partition, day):
-                    published.append(normalize_decision_at(free[day]["available_at"]))
+                published: dict[str, list[datetime]] = {}
+                if day in datadir:
+                    receipt = datadir[day]
+                    original = _partition_at_receipt(partition, receipt)
+                    if _datadir_matches(receipt, original):
+                        stamp = normalize_decision_at(receipt["available_at"])
+                        for row in original:
+                            published.setdefault(row["index_code"], []).append(stamp)
+                if day in free:
+                    receipt = free[day]
+                    original = _partition_at_receipt(partition, receipt)
+                    if _free_matches(receipt, original, day):
+                        stamp = normalize_decision_at(receipt["available_at"])
+                        for row in original:
+                            published.setdefault(row["index_code"], []).append(stamp)
                 closed_at = datetime.combine(datetime.fromisoformat(day).date(), time(15))
-                available = [stamp for stamp in published if closed_at <= stamp <= cutoff]
-                if available:
-                    result.append({**benchmark, "available_at": min(available)})
+                for bar in partition:
+                    symbol = bar["index_code"]
+                    if symbol not in selected:
+                        continue
+                    evidence = published.get(symbol, [])
+                    evidence.extend(normalize_decision_at(receipt["available_at"])
+                                    for receipt in repairs.get((day, symbol), ())
+                                    if _free_bar_matches(receipt, bar, day))
+                    available = [stamp for stamp in evidence if closed_at <= stamp <= cutoff]
+                    if available:
+                        result.append({**bar, "available_at": min(available)})
     return result

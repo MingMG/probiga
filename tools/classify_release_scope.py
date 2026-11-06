@@ -4,8 +4,8 @@
 Schema transitions live under ``server/db``, in ``.sql`` files, in the guarded
 strategy-schema preparation tools, or in the QMT release controller path.
 Application, UI, deployment, dependency and unrelated tool changes remain normal
-Linux code releases. The minute importer and its proven Windows dependencies
-also compare their own committed content against the actual Windows build.
+Linux code releases. Windows-owned minute and announcement publishers and
+their proven dependencies compare committed content against the Windows build.
 
 The cross-end contract for the policy files below is the set of their
 module-level bindings, not their whole bytes.  A change to a declaration
@@ -247,8 +247,8 @@ _CONTRACT_WHOLE_FILE_FILES = (
     "tools/update_qmt_windows_edge.ps1",
 )
 
-# These are runtime artifacts owned by the Windows minute task, not shared
-# protocol declarations. Their content must reach that owner even when a prior
+# These are runtime artifacts owned by Windows tasks. Their content must
+# reach that owner even when a prior
 # Linux-only release already contains the change. Keep this separate from the
 # contract digest: ordinary implementation changes do not invent schema drift.
 _WINDOWS_RUNTIME_FILES = (
@@ -257,6 +257,9 @@ _WINDOWS_RUNTIME_FILES = (
     "server/common/qmt_datadir_minute_coverage.py",
     # sync_qmt_stock_edge executes this reader and receipt validator on Windows.
     "server/common/minute_acquisition_reuse.py",
+    # The Windows scheduler launches this producer and its full-market validator.
+    "tools/sync_qmt_announcement_pit.py",
+    "server/common/qmt_announcement_pit.py",
 )
 
 # The export list is packaging, not a runtime contract with the other endpoint.

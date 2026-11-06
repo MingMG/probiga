@@ -4,8 +4,9 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ProBigA 数据分析平台</title>
-    <link rel="stylesheet" href="/static/css/style.css?v=56">
+    <link rel="stylesheet" href="/static/css/style.css?v=57">
 <link rel="stylesheet" href="/static/css/market-workbench.css?v=2">
+<link rel="stylesheet" href="/static/css/market-home.css?v=9def0ff31ef85a8a">
 <link rel="stylesheet" href="/static/css/market-stage.css?v=1">
 <link rel="stylesheet" href="/static/css/trading-day.css?v=1">
 <link rel="stylesheet" href="/static/css/data-monitor.css?v=1">
@@ -21,22 +22,22 @@
 <div class="main-content">
   <header class="header">
     <button id="navigationToggle" class="navigation-toggle" onclick="toggleNavigation()" aria-label="展开或收起导航" aria-controls="sidebar" aria-expanded="false">☰</button>
-    <h1 id="pageTitle">◎ 交易与复盘</h1>
+    <h1 id="pageTitle">市场看板</h1>
     <form class="global-stock-search" onsubmit="workbenchSearch(event)"><label class="sr-only" for="globalStockSearch">查看个股详情</label><input id="globalStockSearch" inputmode="numeric" maxlength="6" placeholder="输入6位股票代码" oninput="this.setCustomValidity('')"><button type="submit" aria-label="搜索股票">⌕</button></form>
     <label class="date-control"><span>观察日期</span><input type="date" id="datePicker" class="date-input" onchange="onDecisionDateChange()" aria-label="页面请求日期"></label>
     <button class="btn-refresh" onclick="refreshAll()">刷新</button>
     <span class="status-text" id="statusText" role="status" aria-live="polite">正在核验交易日期</span>
-    <button type="button" class="btn-layout-toggle" id="btnLayoutToggle" onclick="toggleLayout()" title="切换新版/老版菜单">🔀 新版</button>
   </header>
 
   <main class="content" id="contentArea" tabindex="-1">
+    <div id="tab-workbench" class="tab-content active"><div class="loading">正在读取市场看板…</div></div>
     <div id="tab-trading-day" class="tab-content"><div class="loading">正在读取今日观察…</div></div>
-    <div id="tab-workbench" class="tab-content"><div class="loading">正在读取市场证据…</div></div>
+    <div id="tab-market-context" class="tab-content"><div class="loading">正在读取市场证据…</div></div>
     <div id="tab-quant-workbench" class="tab-content"><div class="loading">正在读取量化能力与运行证据…</div></div>
     <div id="tab-daily-pool" class="tab-content"><div class="loading">正在读取每日票池…</div></div>
     <div id="tab-market-outlook" class="tab-content"><div class="loading">正在生成下一交易日推演…</div></div>
     <div id="tab-market-stage" class="tab-content"><div class="loading">正在读取市场阶段…</div></div>
-    <div id="tab-trading" class="tab-content active"><div class="loading">加载中...</div></div>
+    <div id="tab-trading" class="tab-content"><div class="loading">加载中...</div></div>
     <div id="tab-command" class="tab-content"><div class="loading">加载中...</div></div>
     <div id="tab-intraday-battle" class="tab-content"><div class="loading">加载中...</div></div>
     <div id="tab-monitor" class="tab-content"><div class="loading">加载中...</div></div>
@@ -191,7 +192,8 @@
 <script>
 var API_BASE = '/api/hot-data';
 var PAGE_TITLES = {
-  workbench:'市场总览',
+  workbench:'市场看板',
+  'market-context':'市场环境',
   'quant-workbench':'🧪 量化工作台',
   'daily-pool':'📋 今日票池',
   trading:'模拟交易账本',
@@ -228,12 +230,13 @@ var PAGE_TITLES = {
 };
 </script>
     <script src="/static/js/market-workbench.js?v=1"></script>
+    <script src="/static/js/market-home.js?v=85a785ad868eadec"></script>
     <script src="/static/js/trading-day-model.js?v=1"></script>
     <script src="/static/js/trading-day.js?v=1"></script>
     <script src="/static/js/market-outlook.js?v=2"></script>
     <script src="/static/js/market-stage.js?v=2"></script>
     <script src="/static/js/data-monitor.js?v=1"></script>
     <script src="/static/js/qmt-strategy-results.js?v=1"></script>
-    <script src="/static/js/app.js?v=a6f9a4608eba80d"></script>
+    <script src="/static/js/app.js?v=e4a5154e7c9cc302"></script>
 </body>
 </html>

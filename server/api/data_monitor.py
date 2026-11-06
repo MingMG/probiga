@@ -17,6 +17,7 @@ import json
 import logging
 import re
 from threading import Event, Lock
+from time import monotonic
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -103,7 +104,7 @@ DATASETS = (
     Dataset("minute_flow", "分钟资金流", "flow", "sm_stock_capital_flow_min", "minute", scope="全市场 · 公开源 1 分钟", deadline="24:00", task_type="stock_minute_flow"),
     Dataset("alist", "龙虎榜列表", "event", "st_a_list_daily", "business", scope="当日完整披露清单", task_type="alist_daily", empty_allowed=True),
     Dataset("alist_info", "龙虎榜详情", "event", "st_a_list_info", "business", scope="当日席位明细", task_type="alist_info", empty_allowed=True),
-    Dataset("index", "指数行情", "market", "sm_index_kline", "kline", code="index_code", scope="QMT本地缓存 · 价格指数 · 日线", task_type="qmt_index_kline"),
+    Dataset("index", "指数行情", "market", "sm_index_kline", "kline", code="index_code", scope="盘后日线 · 11 个产品消费指数", task_type="free_index_daily_canonical"),
     Dataset("concept", "概念行情", "market", "sm_concept_east_kline", "kline", code="index_code", scope="东财原生概念目录 · 日线", task_type="eastmoney_concept_kline"),
     Dataset("hot", "东财热门榜单", "event", "st_hot_pop_rank_east", "business", date_column="snapshot_date", scope="东财人气榜 · Top 100", deadline="17:14", task_type="hot_pop_east"),
     Dataset("hot_ths", "同花顺热门榜单", "event", "st_hot_rank_ths", "business", date_column="snapshot_date", scope="同花顺热股榜 · Top 100", deadline="17:12", task_type="hot_rank_ths"),
@@ -527,7 +528,6 @@ class Observer:
         from server.common import scheduler_validation as validation
         parsers = {"alist": validation._eastmoney_alist_payload,
                    "alist_info": validation._eastmoney_alist_payload,
-                   "index": validation._qmt_index_edge_payload,
                    "concept": validation._eastmoney_concept_market_payload,
                    "hot_ths": validation._ths_hot_payload}
         history = self.read("business", "SELECT id,run_uid,build_sha,run_at,finished_at,output "
@@ -549,14 +549,6 @@ class Observer:
             if spec.key == "hot":
                 from server.common.hot_rank_source_contract import parse_hot_rank_receipt
                 payload = parse_hot_rank_receipt(output)
-            elif spec.task_type == "free_index_daily_canonical":
-                from server.common.scheduler_validation import (
-                    _single_nested_machine_payload,
-                )
-                payload = _single_nested_machine_payload(
-                    output,
-                    schema="probiga.free-index-daily-result.v1",
-                )
             else:
                 payload = parsers[spec.key](output)
             if not payload:
@@ -577,6 +569,32 @@ class Observer:
                     missing_count=None, coverage_ratio=None, invalid_count=None,
                     missing=[], missing_total=None, source=counts["source"],
                     data_updated_at=iso(counts["updated"]), unit="条")
+        if spec.key == "index":
+            from server.common.index_daily_publication import (
+                PUBLIC_INDEX_DAILY_CODES, load_verified_index_daily_bars,
+            )
+
+            proof = load_verified_index_daily_bars(
+                self.engines["business"], self.engines["kline"],
+                sessions=[day], codes=PUBLIC_INDEX_DAILY_CODES, as_of=current,
+                deadline=monotonic() + 15,
+            )
+            verified = {bar["index_code"] for bar in proof}
+            missing = sorted(set(PUBLIC_INDEX_DAILY_CODES) - verified)
+            expected = len(PUBLIC_INDEX_DAILY_CODES)
+            return dict(
+                base,
+                status="full" if not missing else "partial" if verified or observed else "missing",
+                reason="目标指数日线均有入库证据" if not missing else "部分目标指数缺少已核验的日线证据",
+                actual_count=len(verified), expected_count=expected,
+                missing_count=len(missing), coverage_ratio=len(verified) / expected,
+                missing_total=len(missing),
+                missing=[{"stock_code": code, "missing_count": 1, "reason": "缺少已核验的指数日线"} for code in missing],
+                evidence={
+                    "basis": "指数发布回执与数据库内容一致",
+                    "source_checked_at": max((iso(bar["available_at"]) for bar in proof), default=None),
+                },
+            )
         receipt = self._receipt(spec, day, current)
         if receipt is None:
             return dict(base, status="unknown" if observed or spec.empty_allowed else "missing",
@@ -596,59 +614,6 @@ class Observer:
             expected = payload["database"]
             match = actual == expected
             expected_count = int(expected["row_count"])
-        elif (
-            spec.key == "index"
-            and spec.task_type == "free_index_daily_canonical"
-        ):
-            if (
-                payload.get("status") != "COMPLETE"
-                or payload.get("target_date") != day
-                or payload.get("qmt_attestation_claimed") is not False
-                or payload.get("database_writes") is not True
-                or int(payload.get("expected_count") or 0)
-                != int(payload.get("code_count") or 0)
-                or not payload.get("missing_codes") == []
-            ):
-                return dict(
-                    base,
-                    status="partial",
-                    reason="公开源指数回执不是完整目标日分区",
-                )
-            expected_count = int(payload["expected_count"])
-            match = (
-                observed == int(payload["row_count"])
-                == int(payload["code_count"])
-                and int(counts["codes"] or 0) == expected_count
-            )
-        elif spec.key == "index":
-            from tools import sync_qmt_index_edge as source
-            if source.validate_task_result(payload, 0) != "complete" or payload.get("dataset") != "kline":
-                raise ValueError("invalid index receipt")
-            # Historical evidence remains meaningful across software releases;
-            # compare its source partition, not today's build identity.
-            manifest = payload["manifest"]
-            if manifest.get("sessions") != [day]:
-                return dict(base, status="unknown", reason="源回执跨多个日期，需要逐日独立证据")
-            import pandas as pd
-            catalog = source._load_index_catalog(self.engines["business"])
-            if catalog[0].batch_id != manifest["catalog_batch_id"]:
-                # Live index details are replaced at reference publication.
-                # The old batch must still have its immutable source catalog;
-                # membership for this date is checked against the receipt's
-                # frozen code hashes below, not today's names or list dates.
-                from server.common.qmt_stock_catalog import load_stock_catalog
-                with self.engines["business"].connect() as conn:
-                    load_stock_catalog(conn, batch_id=str(manifest["catalog_batch_id"]),
-                                       decision_known_at=current)
-            expected_by_session = index_codes_for_receipt(catalog, manifest, day)
-            expected_count = sum(len(c) for c in expected_by_session.values())
-            frame = source._read_published(dataset="kline", primary_engine=self.engines["business"],
-                history_engine=self.engines["kline"], catalog=catalog,
-                codes=sorted(set().union(*expected_by_session.values())), sessions=[day])
-            verified = source._normalize_storage_precision(source.validate_kline_frame(frame, catalog=catalog,
-                expected_by_session=expected_by_session, captured_at=datetime.fromisoformat(manifest["captured_at"])))
-            digest = source._digest(verified.astype(object).where(pd.notna(verified), None).to_dict("records"))
-            match = len(verified) == expected_count == int(manifest["expected_row_count"]) and digest == manifest["source_frame_hash"]
         elif spec.key == "concept":
             from tools import sync_eastmoney_concept_market as source
             if not validation_hash(payload, "result_sha256") or "kline" not in payload.get("datasets", []):
@@ -812,24 +777,6 @@ class Observer:
 def validation_hash(payload: dict, key: str) -> bool:
     from server.common.qmt_history_coverage import canonical_digest
     return payload.get(key) == canonical_digest({k: v for k, v in payload.items() if k != key})
-
-
-def index_codes_for_receipt(catalog: list, manifest: dict, day: str) -> dict:
-    """Bind a historical receipt to the exact dated index code inventory."""
-    from tools import sync_qmt_index_edge as source
-
-    if not catalog or not str(manifest.get("catalog_batch_id") or ""):
-        raise ValueError("source index catalog unavailable")
-    if (catalog[0].batch_id == manifest["catalog_batch_id"]
-            and source._digest([asdict(member) for member in catalog]) != manifest.get("catalog_member_hash")):
-        raise ValueError("source index catalog differs")
-    expected = source.expected_codes_by_session(catalog, [day])
-    codes = expected[day]
-    if (len(codes) != int(manifest["requested_code_count"])
-            or source._digest(list(codes)) != manifest["requested_code_set_hash"]
-            or source._digest([[day, code] for code in codes]) != manifest["expected_code_session_hash"]):
-        raise ValueError("source index code inventory differs")
-    return expected
 
 
 def gap_csv(dataset: str, day: str, cell: dict) -> str:

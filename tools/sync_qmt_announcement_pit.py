@@ -54,6 +54,11 @@ from server.common.authoritative_market_clock import (
     authoritative_closed_trade_date,
 )
 from server.common.qmt_stock_catalog import load_stock_catalog
+from server.common.qmt_datadir_daily_coverage import (
+    PROVIDER as QMT_DATADIR_PROVIDER,
+    load_daily_manifest,
+)
+from server.common.qmt_datadir_result import load_receipt, partition_from_receipt
 from server.common.qmt_daily_market_truth import load_qmt_daily_market_truth
 from server.common.qmt_attestation_contract import (
     validated_no_row_exception_contract,
@@ -85,6 +90,11 @@ _ANNOUNCEMENT_RECEIPT_FIELDS = (
 )
 _MAX_ANNOUNCEMENT_BATCH_ROWS = 200000
 _MAX_ANNOUNCEMENT_BATCH_JSON_BYTES = 64 * 1024 * 1024
+_FULL_MARKET_BATCH_PREFIX = {
+    QMT_ANNOUNCEMENT_SOURCE: "qmt-ann-",
+    CNINFO_ANNOUNCEMENT_SOURCE: "cninfo-ann-",
+    EASTMONEY_ANNOUNCEMENT_SOURCE: "em-ann-",
+}
 
 
 class BigQmtAnnouncementAdapter:
@@ -685,6 +695,54 @@ def _build_historical_catalog_reconciliation(
     }
 
 
+def _load_datadir_reconstruction_no_trade_codes(
+    connection, *, target_date: str, decision: datetime, truth,
+) -> list[str]:
+    # The daily truth loader already verified the business rows. Reopen its
+    # exact immutable manifest for the evidence behind each missing bar.
+    manifest = load_daily_manifest(
+        connection, target_date, decision_known_at=decision,
+        manifest_hash=truth.truth_hash, verify_rows=False,
+    )
+    receipt = load_receipt(connection, dataset="stock_daily", trade_date=target_date)
+    if manifest is None or receipt is None:
+        raise QMTAnnouncementBlocked(
+            "QMT_ANNOUNCEMENT_RECONSTRUCTION_ATTESTATION_MISSING"
+        )
+    partition = partition_from_receipt(receipt)
+    captured_at = _exact_datetime(manifest["captured_at"], field="captured_at")
+    started_at = _exact_datetime(receipt["started_at"], field="started_at")
+    finished_at = _exact_datetime(receipt["finished_at"], field="finished_at")
+    if (
+        manifest["run_id"] != truth.run_id
+        or manifest["manifest_hash"] != truth.truth_hash
+        or partition["status"] != "COMPLETE"
+        or partition["trade_date"] != target_date
+        or partition["run_id"] != truth.run_id
+        or partition["full_market_manifest_hash"] != truth.truth_hash
+        or partition["coverage"] != 1.0
+        or any(partition[key] != truth.attested_row_count for key in (
+            "row_count", "code_count", "readback_rows", "readback_codes",
+        ))
+        or not started_at <= finished_at <= decision
+        or not captured_at <= finished_at
+    ):
+        raise QMTAnnouncementBlocked(
+            "QMT_ANNOUNCEMENT_RECONSTRUCTION_DATADIR_PUBLICATION_DIFFERS"
+        )
+    entities = manifest["entities"]
+    if any(entity["classification"] == "NOT_LISTED" for entity in entities):
+        # The v3 reconciliation seal accounts for native no-trade stocks
+        # separately. A listing exclusion cannot be represented as suspension.
+        raise QMTAnnouncementBlocked(
+            "QMT_ANNOUNCEMENT_RECONSTRUCTION_LISTING_SCOPE_UNSUPPORTED"
+        )
+    return [
+        entity["stock_code"] for entity in entities
+        if entity["classification"] == "NO_TRADE"
+    ]
+
+
 def _load_historical_reconstruction_authority(
     engine,
     *,
@@ -719,34 +777,42 @@ def _load_historical_reconstruction_authority(
                     target, datetime.max.time()
                 ),
             )
-            tolerance = connection.execute(
-                text(
-                    "SELECT start_date,end_date,tolerance_json "
-                    "FROM qmt_kline_attestation_run "
-                    "WHERE run_id=:run_id AND status='COMPLETED'"
-                ),
-                {"run_id": truth.run_id},
-            ).mappings().one_or_none()
+            if truth.provider == QMT_DATADIR_PROVIDER:
+                no_trade_codes = _load_datadir_reconstruction_no_trade_codes(
+                    connection, target_date=target.isoformat(), decision=decision,
+                    truth=truth,
+                )
+            else:
+                tolerance = connection.execute(
+                    text(
+                        "SELECT start_date,end_date,tolerance_json "
+                        "FROM qmt_kline_attestation_run "
+                        "WHERE run_id=:run_id AND status='COMPLETED'"
+                    ),
+                    {"run_id": truth.run_id},
+                ).mappings().one_or_none()
+                if tolerance is None:
+                    raise QMTAnnouncementBlocked(
+                        "QMT_ANNOUNCEMENT_RECONSTRUCTION_ATTESTATION_MISSING"
+                    )
+                no_row = validated_no_row_exception_contract(
+                    tolerance["tolerance_json"],
+                    start_date=str(tolerance["start_date"])[:10],
+                    end_date=str(tolerance["end_date"])[:10],
+                )
+                no_trade_codes = [
+                    str(item.get("stock_code") or "").zfill(6)
+                    for item in ((no_row or {}).get("entities") or [])
+                    if isinstance(item, Mapping)
+                    and target.isoformat() in list(item.get("affected_trade_dates") or [])
+                ]
+    except QMTAnnouncementBlocked:
+        raise
     except Exception as exc:
         raise QMTAnnouncementBlocked(
             "QMT_ANNOUNCEMENT_RECONSTRUCTION_AUTHORITY_UNAVAILABLE",
             type(exc).__name__,
         ) from exc
-    if tolerance is None:
-        raise QMTAnnouncementBlocked(
-            "QMT_ANNOUNCEMENT_RECONSTRUCTION_ATTESTATION_MISSING"
-        )
-    no_row = validated_no_row_exception_contract(
-        tolerance["tolerance_json"],
-        start_date=str(tolerance["start_date"])[:10],
-        end_date=str(tolerance["end_date"])[:10],
-    )
-    no_trade_codes = sorted({
-        str(item.get("stock_code") or "").zfill(6)
-        for item in ((no_row or {}).get("entities") or [])
-        if isinstance(item, Mapping)
-        and target.isoformat() in list(item.get("affected_trade_dates") or [])
-    })
     if (
         truth.requested_sessions != (target.isoformat(),)
         or truth.catalog_manifest_hash != authority_catalog.manifest_hash
@@ -897,6 +963,9 @@ def validate_existing_complete_qmt_announcement_batch(
             else None
         )
 
+        # Provider identity is shared with narrower consumers such as the
+        # holdings risk watch. Only full-market producer batches may win this
+        # selection. Historical reconstructions use a separate watermark.
         batch_statement = text(
                     "SELECT batch_id, MIN(stock_code) AS sample_stock_code, "
                     "MIN(known_at) AS min_known_at, "
@@ -921,6 +990,7 @@ def validate_existing_complete_qmt_announcement_batch(
                     "FROM st_pit_source_coverage "
                     "WHERE fact_kind='event' AND source=:source "
                     "AND watermark_kind='QUERY_CUTOFF' "
+                    "AND batch_id LIKE :batch_pattern "
                     "AND known_at<=:decision_at "
                     "AND DATE(known_at)>=:target_trade_date "
                     "AND DATE(known_at)<=:decision_date "
@@ -939,11 +1009,14 @@ def validate_existing_complete_qmt_announcement_batch(
                 for row in connection.execute(
                     batch_statement,
                     {
-                    "source": candidate_source,
-                    "decision_at": decision_at,
-                    "target_trade_date": target.isoformat(),
-                    "decision_date": decision_at.date().isoformat(),
-                    "capture_deadline": capture_deadline,
+                        "source": candidate_source,
+                        "batch_pattern": (
+                            _FULL_MARKET_BATCH_PREFIX[candidate_source] + "%"
+                        ),
+                        "decision_at": decision_at,
+                        "target_trade_date": target.isoformat(),
+                        "decision_date": decision_at.date().isoformat(),
+                        "capture_deadline": capture_deadline,
                     },
                 ).mappings()
             ]
@@ -1567,11 +1640,9 @@ def validate_existing_task_result(
                 payload["calendar_manifest_hash"],
             )
             is None
-            or not payload["batch_id"].startswith({
-                QMT_ANNOUNCEMENT_SOURCE: "qmt-ann-",
-                CNINFO_ANNOUNCEMENT_SOURCE: "cninfo-ann-",
-                EASTMONEY_ANNOUNCEMENT_SOURCE: "em-ann-",
-            }[source_name])
+            or not payload["batch_id"].startswith(
+                _FULL_MARKET_BATCH_PREFIX[source_name]
+            )
             or re.fullmatch(r"[0-9a-f]{64}", payload["batch_root_hash"])
             is None
             or not payload["catalog_batch_id"]

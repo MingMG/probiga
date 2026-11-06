@@ -25,18 +25,21 @@
   function firstNumber(values){for(var i=0;i<values.length;i+=1){var n=metricNumber(values[i]);if(n!=null)return n}return null}
   function pnlClass(value){var n=Number(value);return Number.isFinite(n)?(n>0?'pnl-gain':n<0?'pnl-loss':''):''}
   function unwrap(v){return v&&Object.prototype.hasOwnProperty.call(v,'data')?v.data:v}
-  function responseError(r,path){return r.text().then(function(body){var safeMessage='';try{var parsed=JSON.parse(body);safeMessage=parsed.message||parsed.error||(typeof parsed.detail==='string'?parsed.detail:'')}catch(ignore){}throw new Error('HTTP '+r.status+(safeMessage?' · '+safeMessage:'')+' · '+path)})}
-  function fetchJson(path,timeoutMs){
-    var controller=typeof AbortController==='function'?new AbortController():null,waitMs=Number(timeoutMs||15000),timer=null,options={headers:{Accept:'application/json'},cache:'no-store'};
+  function responseError(r,path){return r.text().then(function(body){var safeMessage='';try{var parsed=JSON.parse(body);safeMessage=parsed.message||parsed.error||(typeof parsed.detail==='string'?parsed.detail:'')}catch(ignore){}var error=new Error('HTTP '+r.status+(safeMessage?' · '+safeMessage:'')+' · '+path);error.httpStatus=r.status;throw error})}
+  function fetchJson(path,timeoutMs,requestOptions){
+    var controller=typeof AbortController==='function'?new AbortController():null,waitMs=Number(timeoutMs||15000),timer=null,options=Object.assign({headers:{Accept:'application/json'},cache:'no-store'},requestOptions);
     if(controller)options.signal=controller.signal;
     if(controller)timer=setTimeout(function(){controller.abort()},waitMs);
     return fetch(path,options).then(function(r){if(!r.ok)return responseError(r,path);return r.json()}).catch(function(err){if(err&&err.name==='AbortError')throw new Error('请求超时（'+waitMs+'ms） · '+path);throw err}).finally(function(){if(timer)clearTimeout(timer)})
   }
-  function postJson(path){return fetch(path,{method:'POST',headers:{Accept:'application/json'}}).then(function(r){if(!r.ok)return responseError(r,path);return r.json()})}
-  function postJsonBody(path,body){return fetch(path,{method:'POST',headers:{Accept:'application/json','Content-Type':'application/json'},body:JSON.stringify(body)}).then(function(r){if(!r.ok)return responseError(r,path);return r.json()})}
+  function postJson(path,body){
+    var options={method:'POST'};
+    if(body!==undefined){options.headers={Accept:'application/json','Content-Type':'application/json'};options.body=JSON.stringify(body)}
+    return fetchJson(path,60000,options)
+  }
   function api3(path,timeoutMs){return fetchJson('/api/v3'+path,timeoutMs)}
   function governanceApi(){return api3('/research/governance')}
-  function api2(path){return fetchJson('/api/v2'+path)}
+  function api2(path,timeoutMs){return fetchJson('/api/v2'+path,timeoutMs)}
   function security(code,name){code=String(code||'').split('.')[0];name=String(name||code||'—');if(!/^\d{6}$/.test(code))return esc(name);var href='/?tab=workbench&stock_code='+encodeURIComponent(code);return '<span class="security"><a class="name" href="'+href+'" data-stock-code="'+esc(code)+'" data-stock-name="'+esc(name)+'">'+esc(name)+'</a><a class="code" href="'+href+'" data-stock-code="'+esc(code)+'" data-stock-name="'+esc(name)+'">'+esc(code)+'</a></span>'}
   function requestStockChart(code,name){
     code=String(code||'').split('.')[0];name=String(name||code||'');
@@ -409,12 +412,14 @@
   }
   function dailyActionGate(){
     var ctx=state.context||{},truth=truthState(),daily=task('trading_v3_close_decision');
+    if(state.dailySubmitting)return {allowed:false,reason:'正在等待日级任务提交回执。'};
+    if(state.dailySubmissionUnconfirmed)return {allowed:false,reason:'日级任务提交结果待确认；请先核对调度记录。'};
     if(state.errors.context||state.staleKeys.context)return {allowed:false,reason:'UNAVAILABLE：统一上下文不可用，无法确认当前决策会话；手动按钮按 fail-closed 禁用。'};
     if(ctx.historical_read_only!==false)return {allowed:false,reason:ctx.historical_read_only===true?'历史上下文只读：手动日级重跑只支持服务端确认的当前会话。':'UNAVAILABLE：服务端未明确 historical_read_only=false，不能安全提交当前日任务。'};
     if(state.errors.tasks)return {allowed:false,reason:'UNAVAILABLE：调度任务状态读取失败，无法确认是否已有任务运行；手动按钮按 fail-closed 禁用。'};
     if(!daily.id)return {allowed:false,reason:'日级任务未注册，无法可靠启动或追踪。'};
     if(daily.enabled===false||daily.enabled===0)return {allowed:false,reason:'日级任务已禁用；请先由运维恢复任务配置。'};
-    if(state.activeJobId)return {allowed:false,reason:'已有日级任务正在跟踪 · job_id '+state.activeJobId+'；完成前不可重复提交。'};
+    if(state.activeJobId)return {allowed:false,reason:'已有日级任务等待终态 · job_id '+state.activeJobId+'；完成前不可重复提交。'};
     if(daily.last_run_status==='running')return {allowed:false,reason:'日级任务正在执行，完成前不可重复提交。'};
     if(truth.code==='STALE'||truth.code==='LOADING')return {allowed:false,reason:truth.code+'：'+truth.reason+' 手动日级任务已禁用。'};
     if(['READY','EMPTY','BLOCKED','UNAVAILABLE'].indexOf(truth.code)<0)return {allowed:false,reason:'当前决策状态无法安全解释，手动日级任务按 fail-closed 禁用。'};
@@ -752,6 +757,7 @@
     ].join('');
   }
   function renderFormalResearch(){
+    el('formalBacktestRun').disabled=Boolean(state.activeBacktestJobId||state.backtestSubmitting||state.backtestSubmissionUnconfirmed);
     if(!el('strategyVersionRows'))return;
     var strategies=state.strategyVersions||[],backtests=((state.researchOperations||{}).backtests)||[],strategyError=state.errors.strategyVersions,historyError=state.errors.backtestHistory,select=el('formalBacktestStrategy'),selectedKey=state.formalStrategyKey||'';
     if(select){
@@ -895,31 +901,91 @@
     if(state.requestedDate&&state.requestedDate!==localDateKey())return;
     holdingStrategyPayload(fetchJson('/api/portfolio/holding-strategy')).then(function(payload){delete state.errors.watchlistStrategy;state.watchlistStrategy=payload||{};renderWatchlistStrategy();renderChrome();notifyParentResize()}).catch(function(err){state.errors.watchlistStrategy=errorText(err);renderWatchlistStrategy();notifyParentResize()})
   }
-  function pollActionJob(jobId,button,remaining,delayMs){
-    setTimeout(function(){
-      api3('/actions/jobs/'+encodeURIComponent(jobId)).then(function(payload){
-        var job=unwrap(payload)||{},jobState=String(job.state||job.status||'unknown').toLowerCase(),pending=job.terminal===false||jobState==='running'||jobState==='queued';
-        if(pending&&remaining>0){state.actionMessage='日级选股 '+jobState+' · job_id '+jobId.slice(0,12)+'…';renderActions();pollActionJob(jobId,button,remaining-1,delayMs);return}
-        if(pending&&remaining<=0){state.actionMessage='前台快速轮询已超时，任务仍在后台运行 · job_id '+jobId+'。按钮保持禁用，已切换低频追踪。';renderActions();pollActionJob(jobId,button,30,10000);return}
-        state.activeJobId='';button.disabled=false;
-        if(jobState==='succeeded'){state.actionMessage='日级选股执行成功 · job_id '+jobId.slice(0,12)+'…，正在读取新批次。';renderActions();load();return}
-        state.actionMessage='日级选股'+(jobState==='cancelled'?'已取消':'执行失败')+' · job_id '+jobId.slice(0,12)+'…'+(job.output?' · '+String(job.output).slice(0,180):'');renderActions();
-      }).catch(function(err){state.actionMessage='精确任务状态暂时不可用 · job_id '+jobId+'：'+errorText(err)+'；按钮保持禁用并继续低频追踪。';renderActions();pollActionJob(jobId,button,30,10000)})
-    },delayMs||2000);
+  function storedJobId(key){
+    try{return window.sessionStorage.getItem('probiga.v3.job.'+key)||''}catch(ignore){return ''}
   }
+  function rememberJobId(key,jobId){
+    state[key]=jobId;
+    try{
+      var storageKey='probiga.v3.job.'+key;
+      if(jobId)window.sessionStorage.setItem(storageKey,jobId);
+      else window.sessionStorage.removeItem(storageKey);
+    }catch(ignore){}
+  }
+  function pollExactJob(jobId,once,callbacks){
+    var deadline=performance.now()+(once?15000:180000),failures=0;
+    function schedule(delay){
+      if(performance.now()+delay>=deadline){callbacks.pause('自动状态查询已到时限');return}
+      setTimeout(check,delay)
+    }
+    function unreadable(err){
+      failures+=1;
+      if(once||failures>=2){callbacks.pause('任务状态读取失败：'+errorText(err));return}
+      schedule(2000)
+    }
+    function check(){
+      var remaining=Math.floor(deadline-performance.now());
+      if(remaining<=0){callbacks.pause('自动状态查询已到时限');return}
+      callbacks.read(Math.min(remaining,15000)).then(function(payload){
+        if(performance.now()>=deadline){callbacks.pause('自动状态查询已到时限');return}
+        var job=unwrap(payload)||{},status=callbacks.classify(job);
+        if(String(job.job_id||'')!==jobId||!status){unreadable(new Error('未取得匹配任务的明确状态'));return}
+        if(status.terminal){callbacks.complete(job,status.name);return}
+        failures=0;
+        callbacks.progress(status.name);
+        if(once)callbacks.pause('任务终态待确认');
+        else schedule(2000);
+      },unreadable)
+    }
+    if(once)check();
+    else schedule(2000);
+  }
+  function pollActionJob(jobId,once){
+    if(state.dailyJobPolling)return;
+    state.dailyJobPolling=true;
+    pollExactJob(jobId,once,{
+      read:function(timeout){return api3('/actions/jobs/'+encodeURIComponent(jobId),timeout)},
+      classify:function(job){
+        var name=String(job.state||'').toLowerCase();
+        if(job.terminal===false&&/^(running|queued)$/.test(name))return {name:name};
+        if(job.terminal===true&&/^(succeeded|failed|cancelled)$/.test(name))return {name:name,terminal:true};
+      },
+      progress:function(name){state.actionMessage='日级选股 '+(name==='running'?'执行中':'排队中')+' · job_id '+jobId;renderActions()},
+      complete:function(job,name){
+        state.dailyJobPolling=false;
+        rememberJobId('activeJobId','');
+        if(name==='succeeded'){state.actionMessage='日级选股任务已结束，正在读取新批次 · job_id '+jobId;renderActions();load();return}
+        state.actionMessage='日级选股'+(name==='cancelled'?'已取消':'执行失败')+' · job_id '+jobId+(job.output?' · '+String(job.output).slice(0,180):'');renderActions();
+      },
+      pause:function(reason){
+        state.dailyJobPolling=false;
+        state.actionMessage=reason+' · job_id '+jobId+'。点「刷新只读结果」核对原任务，终态确认前不可重复提交。';renderActions();
+      }
+    });
+  }
+  function submissionRejected(err){return !!err&&[400,401,403,404,409,422].indexOf(err.httpStatus)>=0}
   function runDailyAction(button){
+    var knownJob=storedJobId('activeJobId');
+    if(knownJob&&!state.activeJobId){state.activeJobId=knownJob;pollActionJob(knownJob,true);renderActions();return}
     var gate=dailyActionGate();
     if(!gate.allowed){state.actionMessage=gate.reason;renderActions();return}
     var requested=(state.context||{}).requested_date||state.requestedDate||localDateKey();
     if(!window.confirm('确认按系统当前时间重跑日级选股？\n\n当前页面请求日期：'+requested+'；调度会自行选择最新可用交易日，不接收历史日期。\n范围：全量研究排序与组合决策；不会开启真实交易。\n运行期间请勿重复提交。'))return;
-    button.disabled=true;state.actionMessage='日级选股已确认，正在启动…';renderActions();
+    state.dailySubmitting=true;button.disabled=true;state.actionMessage='正在等待日级任务提交回执…';renderActions();
     postJson('/api/v3/actions/daily').then(function(payload){
       var result=unwrap(payload)||{};
-      if(result.status==='disabled'){throw new Error('对应任务未启用')}
-      var jobId=String(result.job_id||result.run_id||result.run_uid||'');
-      if(!jobId){button.disabled=false;state.actionMessage=result.status==='already_running'?'任务已经在执行，但本次没有返回可追踪 job_id；请到系统证据核对，勿重复提交。':'任务响应缺少 job_id，无法可靠跟踪；请到系统证据核对。';renderActions();return}
-      state.activeJobId=jobId;state.actionMessage='日级选股已提交 · job_id '+jobId.slice(0,12)+'…';renderActions();pollActionJob(jobId,button,90,2000);
-    }).catch(function(err){button.disabled=false;state.actionMessage='执行失败：'+err.message;renderActions()})
+      var jobId=String(result.job_id||'');
+      state.dailySubmitting=false;
+      if(/^[a-fA-F0-9]{16,64}$/.test(jobId)){
+        rememberJobId('activeJobId',jobId);state.actionMessage='已收到日级任务回执 · job_id '+jobId;renderActions();pollActionJob(jobId,false);return
+      }
+      state.dailySubmissionUnconfirmed=result.accepted!==false||result.status==='already_running';
+      state.actionMessage=state.dailySubmissionUnconfirmed?'未取得可核验的日级任务编号，请先查看调度记录。':'日级任务未受理：'+String(result.status||'原因未返回');renderActions();
+    },function(err){
+      state.dailySubmitting=false;
+      state.dailySubmissionUnconfirmed=!submissionRejected(err);
+      state.actionMessage=(state.dailySubmissionUnconfirmed?'日级任务提交结果待确认，请先查看调度记录：':'日级任务提交被拒绝：')+errorText(err);renderActions();
+    })
   }
   function applyFormalStrategyDefaults(){
     var row=selectedFormalStrategy();renderFormalBacktestBinding();if(!row)return;
@@ -941,24 +1007,60 @@
       state.activeBacktest=result;state.formalBacktestMessage='已读取独立运行 '+requestedUid.slice(0,12)+'… 的结果制品。';renderFormalResearch();notifyParentResize();
     }).catch(function(err){if(!isCurrentRequest())return;state.formalBacktestMessage='结果读取失败：'+errorText(err);renderFormalResearch()})
   }
-  function pollFormalBacktestJob(jobId,remaining,delayMs){
-    setTimeout(function(){
-      api2('/jobs/'+encodeURIComponent(jobId)).then(function(payload){
-        var job=unwrap(payload)||{},jobState=String(job.status||'UNKNOWN').toUpperCase(),pending=/^(PENDING|RUNNING|QUEUED|CREATED)$/.test(jobState),terminal=/^(COMPLETED|FAILED|CANCELLED|CANCELED)$/.test(jobState);
-        if(pending&&remaining>0){state.formalBacktestMessage='正式回测 '+(jobState==='RUNNING'?'运行中':'排队中')+' · job '+jobId.slice(0,12)+'…';renderFormalResearch();pollFormalBacktestJob(jobId,remaining-1,delayMs);return}
-        if(pending||!terminal){state.activeBacktestJobId=jobId;el('formalBacktestRun').disabled=true;state.formalBacktestMessage=(pending?'前台快速轮询已超时，任务仍在后台运行':'任务状态暂时无法确认')+' · job '+jobId+'；按钮保持禁用，已切换低频追踪。';renderFormalResearch();pollFormalBacktestJob(jobId,30,10000);return}
-        state.activeBacktestJobId='';el('formalBacktestRun').disabled=false;
-        if(jobState==='COMPLETED'&&job.result_ref){state.formalBacktestMessage='正式回测已完成，正在读取独立结果…';loadFormalResearch(state.loadSeq);fetchFormalBacktest(String(job.result_ref));return}
-        state.formalBacktestMessage=jobState==='FAILED'?'运行失败：'+(job.error_message||job.error_code||'未返回失败原因'):'任务状态 '+jobState+'；请稍后刷新历史记录';renderFormalResearch();
-      }).catch(function(err){state.activeBacktestJobId=jobId;el('formalBacktestRun').disabled=true;state.formalBacktestMessage='任务状态读取失败：'+errorText(err)+' · job '+jobId+'；按钮保持禁用并继续低频追踪。';renderFormalResearch();pollFormalBacktestJob(jobId,30,10000)})
-    },delayMs||2000)
+  function pollFormalBacktestJob(jobId,once){
+    if(state.backtestJobPolling)return;
+    state.backtestJobPolling=true;
+    pollExactJob(jobId,once,{
+      read:function(timeout){return api2('/jobs/'+encodeURIComponent(jobId),timeout)},
+      classify:function(job){
+        var name=String(job.status||'').toUpperCase();
+        if(/^(PENDING|RUNNING|QUEUED|CREATED)$/.test(name))return {name:name};
+        if(/^(COMPLETED|FAILED|CANCELLED|CANCELED)$/.test(name))return {name:name,terminal:true};
+      },
+      progress:function(name){state.formalBacktestMessage='正式回测 '+(name==='RUNNING'?'运行中':'排队中')+' · job '+jobId;renderFormalResearch()},
+      complete:function(job,name){
+        state.backtestJobPolling=false;
+        rememberJobId('activeBacktestJobId','');
+        if(name==='COMPLETED'&&job.result_ref){loadFormalResearch(state.loadSeq);fetchFormalBacktest(String(job.result_ref));return}
+        var detail=name==='FAILED'?'运行失败：'+(job.error_message||job.error_code||'未返回失败原因'):
+          name==='COMPLETED'?'任务已结束，未取得结果编号，请核对回测历史记录':'正式回测已取消';
+        state.formalBacktestMessage=detail+' · job '+jobId;renderFormalResearch();
+      },
+      pause:function(reason){
+        state.backtestJobPolling=false;
+        state.formalBacktestMessage=reason+' · job '+jobId+'。点「刷新只读结果」核对原任务，终态确认前不可重复提交。';renderFormalResearch();
+      }
+    });
   }
   function runFormalBacktest(event){
-    event.preventDefault();var form=el('formalBacktestForm'),strategyRow=selectedFormalStrategy(),button=el('formalBacktestRun');if(state.activeBacktestJobId){button.disabled=true;state.formalBacktestMessage='已有正式回测任务正在运行或状态待确认 · job '+state.activeBacktestJobId+'；请勿重复提交。';renderFormalResearch();return}if(!form.reportValidity()||!strategyRow)return;if(!formalBacktestRunnable(strategyRow)){state.formalBacktestMessage='该版本的登记 ETF 完整数据或已确认费率覆盖不可用，不能提交正式回测。';renderFormalResearch();return}
+    event.preventDefault();
+    var knownJob=storedJobId('activeBacktestJobId');
+    if(knownJob&&!state.activeBacktestJobId){state.activeBacktestJobId=knownJob;pollFormalBacktestJob(knownJob,true);renderFormalResearch();return}
+    if(state.activeBacktestJobId||state.backtestSubmitting||state.backtestSubmissionUnconfirmed)return;
+    var form=el('formalBacktestForm'),strategyRow=selectedFormalStrategy();
+    if(!form.reportValidity()||!strategyRow)return;
+    if(!formalBacktestRunnable(strategyRow)){state.formalBacktestMessage='该版本的登记 ETF 完整数据或已确认费率覆盖不可用，不能提交正式回测。';renderFormalResearch();return}
     var request={strategy_id:String(strategyRow.strategy_id||''),strategy_version:String(strategyRow.version||''),start_date:el('formalBacktestStart').value,end_date:el('formalBacktestEnd').value,initial_capital:Number(el('formalBacktestCapital').value),top_per_day:Number(el('formalBacktestTop').value),random_seed:Number(el('formalBacktestSeed').value)};
     if(request.end_date<request.start_date){state.formalBacktestMessage='结束日期不能早于开始日期。';renderFormalResearch();return}
-    button.disabled=true;state.formalBacktestMessage='正在创建独立研究回测；不会覆盖旧记录…';renderFormalResearch();
-    postJsonBody('/api/v2/research/backtests',request).then(function(payload){var job=unwrap(payload)||{},jobId=String(job.job_id||'');if(!jobId)throw new Error('服务端未返回 job_id');state.activeBacktestJobId=jobId;state.formalBacktestMessage='已提交独立运行 '+String(job.run_request_uid||'').slice(0,12)+'… · job '+jobId.slice(0,12)+'…';renderFormalResearch();pollFormalBacktestJob(jobId,90,2000)}).catch(function(err){button.disabled=false;state.formalBacktestMessage='创建失败：'+errorText(err);renderFormalResearch()})
+    state.backtestSubmitting=true;state.formalBacktestMessage='正在等待正式回测提交回执…';renderFormalResearch();
+    postJson('/api/v2/research/backtests',request).then(function(payload){
+      var job=unwrap(payload)||{},jobId=String(job.job_id||'');
+      state.backtestSubmitting=false;
+      if(!/^[a-zA-Z0-9-]{8,64}$/.test(jobId)){
+        state.backtestSubmissionUnconfirmed=true;state.formalBacktestMessage='未取得可核验的回测任务编号，请先查看回测历史。';renderFormalResearch();return
+      }
+      rememberJobId('activeBacktestJobId',jobId);state.formalBacktestMessage='已收到正式回测任务回执 · job '+jobId;renderFormalResearch();pollFormalBacktestJob(jobId,false);
+    },function(err){
+      state.backtestSubmitting=false;
+      state.backtestSubmissionUnconfirmed=!submissionRejected(err);
+      state.formalBacktestMessage=(state.backtestSubmissionUnconfirmed?'回测提交结果待确认，请先查看回测历史：':'回测提交被拒绝：')+errorText(err);renderFormalResearch();
+    })
+  }
+  function resumeTrackedJobs(){
+    var dailyId=state.activeJobId||storedJobId('activeJobId');
+    var backtestId=state.activeBacktestJobId||storedJobId('activeBacktestJobId');
+    if(dailyId){state.activeJobId=dailyId;pollActionJob(dailyId,true)}
+    if(backtestId){state.activeBacktestJobId=backtestId;pollFormalBacktestJob(backtestId,true)}
   }
   ['strategyFilter','statusFilter'].forEach(function(id){el(id).addEventListener('change',function(){state.candidatePage=1;state.researchCandidatePage=1;syncFilters();renderCandidates();notifyParentResize()})});
   el('candidateDate').addEventListener('change',reloadCandidates);
@@ -978,5 +1080,5 @@
   el('formalBacktestRows').addEventListener('change',function(event){var checkbox=event.target.closest('[data-compare-backtest]');if(!checkbox)return;var uid=String(checkbox.dataset.compareBacktest||''),selected=state.compareBacktests||[];if(checkbox.checked){if(selected.length>=2&&selected.indexOf(uid)<0){checkbox.checked=false;state.formalBacktestMessage='最多选择两条回测记录进行比较。';renderFormalResearch();return}if(selected.indexOf(uid)<0)selected=selected.concat(uid)}else selected=selected.filter(function(value){return value!==uid});state.compareBacktests=selected;renderFormalResearch();notifyParentResize()});
   el('formalBacktestCompare').addEventListener('click',function(){renderFormalBacktestComparison();var node=el('formalBacktestComparison');if(node&&node.innerHTML)node.scrollIntoView({behavior:'smooth',block:'nearest'});notifyParentResize()});
   el('runDaily').addEventListener('click',function(){runDailyAction(this)});
-  el('refresh').addEventListener('click',load);document.addEventListener('visibilitychange',function(){if(!document.hidden)refreshCandidatePools()});setInterval(refreshWatchlistStrategy,60000);setInterval(refreshCandidatePools,30000);var formalStartDate=new Date();formalStartDate.setFullYear(formalStartDate.getFullYear()-1);el('formalBacktestStart').value=formalStartDate.getFullYear()+'-'+String(formalStartDate.getMonth()+1).padStart(2,'0')+'-'+String(formalStartDate.getDate()).padStart(2,'0');state.requestedDate=requestedFrameDate()||state.requestedDate;state.requestedDateMode=requestedFrameDateMode();activateView(requestedView());load();
+  el('refresh').addEventListener('click',function(){resumeTrackedJobs();load()});document.addEventListener('visibilitychange',function(){if(!document.hidden)refreshCandidatePools()});setInterval(refreshWatchlistStrategy,60000);setInterval(refreshCandidatePools,30000);var formalStartDate=new Date();formalStartDate.setFullYear(formalStartDate.getFullYear()-1);el('formalBacktestStart').value=formalStartDate.getFullYear()+'-'+String(formalStartDate.getMonth()+1).padStart(2,'0')+'-'+String(formalStartDate.getDate()).padStart(2,'0');state.requestedDate=requestedFrameDate()||state.requestedDate;state.requestedDateMode=requestedFrameDateMode();resumeTrackedJobs();activateView(requestedView());load();
 })();

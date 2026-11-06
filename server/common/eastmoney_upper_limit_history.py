@@ -9,6 +9,7 @@ import uuid
 from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
+from time import monotonic
 from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
@@ -97,27 +98,42 @@ def _pool_codes_from_rows(pool: Sequence[Any], target: date) -> list[str]:
     return sorted(rows_by_code)
 
 
-def _fetch_pool(target: date, timeout_seconds: float = 20.0) -> tuple[list[str], str]:
-    session = requests.Session()
-    session.trust_env = False
-    response = session.get(
-        EASTMONEY_HISTORY_URL,
-        params={
+def _fetch_pool(
+    target: date, timeout_seconds: float = 20.0, *, max_payload_bytes: int | None = None,
+) -> tuple[list[str], str]:
+    timeout = max(1.0, float(timeout_seconds))
+    deadline = monotonic() + timeout
+    params = {
             "ut": EASTMONEY_HISTORY_UT,
             "dpt": "wz.ztzt",
             "Pageindex": "0",
             "pagesize": "10000",
             "sort": "fbt:asc",
             "date": target.strftime("%Y%m%d"),
-        },
-        headers={
+    }
+    headers = {
             "User-Agent": "Mozilla/5.0 ProBigA evidence collector",
             "Referer": "https://quote.eastmoney.com/",
-        },
-        timeout=max(1.0, float(timeout_seconds)),
-    )
-    response.raise_for_status()
-    payload = response.json()
+    }
+    with requests.Session() as session:
+        session.trust_env = False
+        if max_payload_bytes is None:
+            response = session.get(EASTMONEY_HISTORY_URL, params=params, headers=headers, timeout=timeout)
+            response.raise_for_status()
+            payload, raw = response.json(), response.text
+        else:
+            with session.get(EASTMONEY_HISTORY_URL, params=params, headers=headers, stream=True,
+                             allow_redirects=False, timeout=(min(3.0, timeout), min(3.0, timeout))) as response:
+                response.raise_for_status()
+                if response.status_code != 200:
+                    raise _blocked(f"Eastmoney limit pool HTTP status differs for {target}")
+                content = bytearray()
+                for chunk in response.iter_content(chunk_size=4096):
+                    if monotonic() >= deadline or len(content) + len(chunk) > max_payload_bytes:
+                        raise _blocked(f"Eastmoney limit pool response exceeded bounds for {target}")
+                    content.extend(chunk)
+                raw = content.decode("utf-8", errors="strict")
+                payload = json.loads(raw)
     if payload.get("rc") != 0 or not isinstance(payload.get("data"), dict):
         raise _blocked(f"Eastmoney limit pool failed for {target}")
     pool = payload["data"].get("pool")
@@ -125,7 +141,7 @@ def _fetch_pool(target: date, timeout_seconds: float = 20.0) -> tuple[list[str],
         pool = []
     if not isinstance(pool, list):
         raise _blocked(f"Eastmoney limit pool payload differs for {target}")
-    return _pool_codes_from_rows(pool, target), response.text
+    return _pool_codes_from_rows(pool, target), raw
 
 
 def _generate_eastmoney_upper_limit_history(

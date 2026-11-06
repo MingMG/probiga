@@ -1772,6 +1772,7 @@ def _attach_release_catchup_history(engine, rows: list[dict]) -> bool:
                  FROM st_scheduled_task_history
                  WHERE ({pair_predicates})
                    AND status IN ('success','degraded','blocked','failed','timeout','stopped')
+                   AND (task_type<>'market_overview_daily' OR COALESCE(trigger_source,'')<>'manual_ladder')
                  GROUP BY task_id, task_type
                ) AS latest
             ON latest.latest_id=history.id
@@ -3201,6 +3202,29 @@ def _cron_due(row: dict, *, now: datetime) -> bool:
         ).total_seconds() >= CRON_RETRY_INTERVAL_MINUTES * 60
     if not last_triggered or last_triggered.date() < now.date():
         return True
+
+    if task_type == "market_overview_daily":
+        from server.common.market_close_ladder import CAPTURE_SCHEMA
+
+        if any(payload.get("schema") == CAPTURE_SCHEMA
+               for payload in _iter_scheduler_output_payloads(row.get("last_run_output"))):
+            return True
+
+    if task_type == "free_index_daily_canonical":
+        from server.common.index_daily_publication import FREE_INDEX_RESULT_SCHEMA, PUBLIC_INDEX_DAILY_CODES
+
+        prior_targets = _scheduler_output_target_dates(row.get("last_run_output"))
+        if len(prior_targets) == 1 and next(iter(prior_targets)) < target.isoformat():
+            # An explicit repair for an older session does not satisfy today's cron.
+            return True
+        if any(
+            payload.get("schema") == FREE_INDEX_RESULT_SCHEMA
+            and isinstance(payload.get("requested_codes"), list)
+            and all(isinstance(code, str) for code in payload["requested_codes"])
+            and set(payload["requested_codes"]) < set(PUBLIC_INDEX_DAILY_CODES)
+            for payload in _iter_scheduler_output_payloads(row.get("last_run_output"))
+        ):
+            return True
 
     if (task_type in CROSS_MIDNIGHT_CRITICAL_CRON_TASK_TYPES
             and last_triggered < datetime.combine(
@@ -5601,6 +5625,8 @@ def _task_dispatch_date(
         if parsed_scheduler_target.isoformat() != scheduler_target:
             raise RuntimeError("scheduler target trade date is invalid")
         return scheduler_target
+    if task_type == "free_index_daily_canonical":
+        return authoritative_closed_trade_date(engine, now=current, close_ready_time=datetime_time(15, 35))
     if task_type in {
         "qmt_stock_minute_canonical",
         "stock_minute",
@@ -5648,6 +5674,8 @@ def _task_argument_row(
     task_type = str(row.get("task_type") or "").strip()
     if task_type in {"analysis_morning_strict", "analysis_premarket_external"}:
         raise RuntimeError("retired analysis task has no publication authority")
+    if task_type == "free_index_daily_canonical":
+        return {**row, "_scheduler_target_trade_date": target_date}
     trigger_source = str(row.get("_trigger_source") or "").strip()
     if task_type == "qmt_announcement_pit" and trigger_source == "release_catchup":
         current = now
@@ -10122,6 +10150,12 @@ def launch_scheduler_task(
     target_trade_date = str(target_trade_date or "").strip()
     if trigger_source not in {"manual", "release_catchup"}:
         raise ValueError("scheduler launch trigger source is invalid")
+    if row.get("_limit_ladder_only") is True and (
+        trigger_source != "manual"
+        or row.get("task_type") != "market_overview_daily"
+        or row.get("script_path") != "tools/refresh_market_overview_daily.py"
+    ):
+        raise ValueError("scheduler close ladder scope requires the registered manual task")
     if trigger_source == "release_catchup":
         try:
             canonical_target = date.fromisoformat(
@@ -10279,7 +10313,7 @@ def launch_scheduler_task(
         }
 
     manual_row = dict(row)
-    manual_row["_trigger_source"] = trigger_source
+    manual_row["_trigger_source"] = "manual_ladder" if row.get("_limit_ladder_only") is True else trigger_source
     if trigger_source == "release_catchup":
         manual_row.update({
             "_scheduler_target_available": True,

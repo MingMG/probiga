@@ -26,7 +26,7 @@ def test_release_checks_actual_dynamic_navigation(tmp_path, variant, valid):
         script = script.replace("renderSidebar(APP_NAV,", "renderSidebar ( APP_NAV ,")
     elif variant == "missing_entry":
         start = script.index("var APP_NAV = [")
-        end = script.index("var TRADING_MODULE_NAV_ITEMS", start)
+        end = script.index("var sidebarRouteByTab", start)
         script = script[:start] + script[start:end].replace("id:'strategy-center'", "id:'missing-page'") + script[end:]
     elif variant == "not_rendered":
         script = script.replace("renderSidebar(APP_NAV,", "renderSidebar(ANOTHER_NAV,")

@@ -9,16 +9,17 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
 }
 .sidebar-logo { padding: 20px 16px 16px; font-size: 20px; font-weight: 800; color: #fff; text-align: center; border-bottom: 1px solid rgba(255,255,255,.08); letter-spacing: 2px; }
 .sidebar-logo span { color: #4ec9b0; }
-.sidebar-group { padding: 6px 0; }
-.sidebar-group-title { padding: 12px 16px 2px; font-size: 10px; color: #636e72; text-transform: uppercase; letter-spacing: 1.5px; font-weight: 700; }
+.sidebar-group { padding: 3px 0; }
+.sidebar-group-title { padding: 8px 15px; font-size: 12px; color: #aebed1; font-weight: 700; }
 .sidebar-group-toggle {
   display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 8px;
   border: 0; background: transparent; text-align: left; cursor: pointer; font-family: inherit;
   transition: color .15s, background .15s;
 }
-.sidebar-group-toggle:hover,
-.sidebar-group-toggle:focus-visible { color: #b2bec3; background: rgba(255,255,255,.035); outline: none; }
-.sidebar-group-chevron { color: #5f7180; font-size: 14px; line-height: 1; transition: transform .18s ease, color .15s; }
+.sidebar-group-toggle[aria-expanded="true"],
+.sidebar-group-toggle:hover { color: #e3edf5; background: rgba(255,255,255,.05); }
+.sidebar-group-toggle:focus-visible { outline: 2px solid #4ec9b0; outline-offset: -2px; }
+.sidebar-group-chevron { color: #a0b3c7; font-size: 14px; line-height: 1; transition: transform .18s ease, color .15s; }
 .sidebar-group-toggle:hover .sidebar-group-chevron { color: #4ec9b0; }
 .sidebar-group-items { overflow: hidden; }
 .sidebar-group.collapsed .sidebar-group-items { display: none; }
@@ -2907,25 +2908,6 @@ tr:hover { background: #f8f9fb; }
   color: #fff;
   border-color: #1a73e8;
   font-weight: 600;
-}
-
-/* ---- 布局切换按钮 ---- */
-.btn-layout-toggle {
-  padding: 5px 14px;
-  border: 1px solid #ddd;
-  border-radius: 8px;
-  background: #fff;
-  color: #666;
-  font-size: 12px;
-  cursor: pointer;
-  transition: all .2s;
-  white-space: nowrap;
-  margin-left: 8px;
-}
-.btn-layout-toggle:hover {
-  border-color: #1a73e8;
-  color: #1a73e8;
-  background: #f0f7ff;
 }
 
 /* ===== 股评监控 ===== */

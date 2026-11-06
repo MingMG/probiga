@@ -29,6 +29,7 @@ from server.common.qmt_announcement_pit import (
     parse_qmt_publication_time,
     synchronize_qmt_announcements,
     validate_complete_announcement_batch,
+    validate_complete_historical_reconstruction_batch,
     validate_complete_qmt_announcement_batch,
 )
 from server.common.qmt_stock_catalog import (
@@ -164,8 +165,11 @@ def test_historical_catalog_reconciliation_rejects_unexplained_addition():
     assert exc.value.detail == "000002"
 
 
+@pytest.mark.parametrize("daily_evidence", [
+    "legacy", "datadir", "mismatched_receipt", "late_receipt", "not_listed",
+])
 def test_historical_authority_loader_emits_v3_without_membership(
-    monkeypatch,
+    monkeypatch, daily_evidence,
 ):
     from server.common.qmt_announcement_pit import (
         HistoricalReconstructionContext,
@@ -203,19 +207,59 @@ def test_historical_authority_loader_emits_v3_without_membership(
         attested_row_count=1,
         requested_sessions=(target.isoformat(),),
         truth_hash="e" * 64,
+        provider="gj_big_qmt_inner" if daily_evidence == "legacy" else "qmt_datadir",
     )
     engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
-    with engine.begin() as connection:
-        connection.execute(text(
-            "CREATE TABLE qmt_kline_attestation_run ("
-            "run_id TEXT,status TEXT,start_date TEXT,end_date TEXT,"
-            "tolerance_json TEXT)"
-        ))
-        connection.execute(text(
-            "INSERT INTO qmt_kline_attestation_run "
-            "(run_id,status,start_date,end_date,tolerance_json) VALUES "
-            "(:run_id,'COMPLETED',:target,:target,'{}')"
-        ), {"run_id": truth.run_id, "target": target.isoformat()})
+    if daily_evidence == "legacy":
+        with engine.begin() as connection:
+            connection.execute(text(
+                "CREATE TABLE qmt_kline_attestation_run ("
+                "run_id TEXT,status TEXT,start_date TEXT,end_date TEXT,"
+                "tolerance_json TEXT)"
+            ))
+            connection.execute(text(
+                "INSERT INTO qmt_kline_attestation_run "
+                "(run_id,status,start_date,end_date,tolerance_json) VALUES "
+                "(:run_id,'COMPLETED',:target,:target,'{}')"
+            ), {"run_id": truth.run_id, "target": target.isoformat()})
+    else:
+        def load_manifest(_connection, day, *, decision_known_at, manifest_hash, verify_rows):
+            assert day == target.isoformat()
+            assert decision_known_at == datetime(2026, 9, 5, 13, 0)
+            assert manifest_hash == truth.truth_hash and verify_rows is False
+            return {
+                "run_id": truth.run_id,
+                "manifest_hash": manifest_hash,
+                "captured_at": "2026-09-05 12:00:00",
+                "entities": [
+                    {"stock_code": "000001", "classification": "TRADED"},
+                    {"stock_code": "000002", "classification": (
+                        "NOT_LISTED" if daily_evidence == "not_listed" else "NO_TRADE"
+                    )},
+                ],
+            }
+
+        monkeypatch.setattr(announcement_tool, "load_daily_manifest", load_manifest)
+        monkeypatch.setattr(announcement_tool, "load_receipt", lambda *_args, **kwargs: {
+            **kwargs,
+            "status": "COMPLETE",
+            "run_id": truth.run_id,
+            "row_count": 1,
+            "code_count": 1,
+            "started_at": "2026-09-05 12:01:00",
+            "finished_at": (
+                "2026-09-05 13:00:01" if daily_evidence == "late_receipt"
+                else "2026-09-05 12:02:00"
+            ),
+            "detail": {
+                "coverage": 1.0,
+                "readback_rows": 1,
+                "readback_codes": 1,
+                "full_market_manifest_hash": (
+                    "f" * 64 if daily_evidence == "mismatched_receipt" else truth.truth_hash
+                ),
+            },
+        })
 
     monkeypatch.setattr(
         announcement_tool,
@@ -238,12 +282,19 @@ def test_historical_authority_loader_emits_v3_without_membership(
         }]},
     )
 
-    catalog, authority = (
-        announcement_tool._load_historical_reconstruction_authority(
-            engine,
-            target_trade_date=target,
-            decision_known_at=datetime(2026, 9, 5, 13, 0),
+    args = {"target_trade_date": target, "decision_known_at": datetime(2026, 9, 5, 13, 0)}
+    if daily_evidence in {"mismatched_receipt", "late_receipt", "not_listed"}:
+        with pytest.raises(QMTAnnouncementBlocked) as exc:
+            announcement_tool._load_historical_reconstruction_authority(engine, **args)
+        assert exc.value.reason_code == (
+            "QMT_ANNOUNCEMENT_RECONSTRUCTION_LISTING_SCOPE_UNSUPPORTED"
+            if daily_evidence == "not_listed" else
+            "QMT_ANNOUNCEMENT_RECONSTRUCTION_DATADIR_PUBLICATION_DIFFERS"
         )
+        return
+
+    catalog, authority = announcement_tool._load_historical_reconstruction_authority(
+        engine, **args,
     )
 
     assert catalog.codes == ("000001", "000002")
@@ -258,6 +309,7 @@ def test_historical_authority_loader_emits_v3_without_membership(
     )
     assert "membership_snapshot" not in authority
     assert "membership_snapshot_sha256" not in authority
+    assert authority["reconciliation"]["native_no_trade_codes"] == ["000002"]
     _validate_reconstruction_context(
         HistoricalReconstructionContext(
             target_trade_date=target,
@@ -2303,7 +2355,10 @@ def test_deploy_read_only_mode_rejects_batch_from_previous_date():
     )
 
 
-def test_latest_closed_target_missing_batch_enters_historical_lookup(monkeypatch):
+@pytest.mark.parametrize("has_exposure_risk_batch", [False, True])
+def test_latest_closed_target_missing_batch_enters_historical_lookup(
+    monkeypatch, has_exposure_risk_batch,
+):
     from tools import sync_qmt_announcement_pit as announcement_tool
 
     engine = _engine()
@@ -2312,6 +2367,18 @@ def test_latest_closed_target_missing_batch_enters_historical_lookup(monkeypatch
         target_date="2026-09-02",
         start_date="2026-08-03",
     )
+    if has_exposure_risk_batch:
+        _insert_existing_coverage_envelope(
+            engine,
+            source=CNINFO_ANNOUNCEMENT_SOURCE,
+            batch_id="exposure-risk-" + "c" * 48,
+            codes=("000001",),
+            fact_cutoff_at=datetime(2026, 9, 3, 1, 30),
+            received_at=datetime(2026, 9, 3, 1, 31),
+            window_start=date(2026, 8, 31),
+            window_end=date(2026, 9, 3),
+            event_count=1,
+        )
     catalog = AnnouncementCatalog(
         batch_id="catalog-20260902",
         manifest_hash="1" * 64,
@@ -2346,6 +2413,41 @@ def test_latest_closed_target_missing_batch_enters_historical_lookup(monkeypatch
         )
     assert exc.value.detail == "no-common-batch"
     assert observed == [date(2026, 9, 2)]
+
+
+def test_missing_historical_batch_skips_unrelated_live_coverage_payloads():
+    engine = _engine()
+    _insert_existing_coverage_envelope(
+        engine,
+        source=CNINFO_ANNOUNCEMENT_SOURCE,
+        batch_id="exposure-risk-" + "c" * 48,
+        codes=("000001", "000002"),
+        fact_cutoff_at=datetime(2026, 11, 7, 1, 30),
+        received_at=datetime(2026, 11, 7, 1, 31),
+        window_start=date(2026, 11, 4),
+        window_end=date(2026, 11, 7),
+        event_count=1,
+    )
+    coverage_reads = []
+
+    def observe(_conn, _cursor, statement, _params, _context, _many):
+        if SOURCE_COVERAGE_TABLE in statement:
+            coverage_reads.append(statement)
+
+    event.listen(engine, "before_cursor_execute", observe)
+    with pytest.raises(QMTAnnouncementBlocked) as exc:
+        validate_complete_historical_reconstruction_batch(
+            engine,
+            codes=("000001", "000002"),
+            decision_at=datetime(2026, 11, 7, 1, 40),
+            window_start=date(2026, 10, 7),
+            window_end=date(2026, 11, 6),
+        )
+
+    assert exc.value.reason_code == "QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND"
+    assert exc.value.detail == "no-common-batch"
+    assert len(coverage_reads) == 1
+    assert "SELECT *" not in coverage_reads[0]
 
 
 def test_atomic_publish_never_reports_false_no_write_after_commit():

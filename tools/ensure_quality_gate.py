@@ -1265,6 +1265,7 @@ def _latest_release_history_row(
               FROM st_scheduled_task_history
              WHERE finished_at IS NOT NULL
                AND (task_type=:task_type OR task_name=:task_name)
+               AND (:task_type<>'market_overview_daily' OR COALESCE(trigger_source,'')<>'manual_ladder')
              ORDER BY run_at DESC, id DESC
              LIMIT 1
         """), {

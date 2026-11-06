@@ -1,11 +1,19 @@
 from datetime import date, datetime, timedelta
 import json
+from time import monotonic
 from types import SimpleNamespace
 
 from sqlalchemy import create_engine, text
 
 from server.api.routers import market_stage
-from server.common.index_daily_publication import FREE_RECEIPT_SCHEMA, canonical_free_index_rows
+from server.common.index_daily_publication import (
+    FREE_BAR_PARTITION_PREFIX,
+    FREE_BAR_RECEIPT_SCHEMA,
+    FREE_RECEIPT_SCHEMA,
+    canonical_free_index_rows,
+    free_index_bar_hash,
+    load_verified_index_daily_bars,
+)
 from server.common.qmt_attestation_contract import canonical_digest
 from server.common.qmt_datadir_result import row_hash
 
@@ -129,6 +137,43 @@ def test_verified_public_index_receipt_is_used_with_its_persisted_fingerprint(mo
     )
     assert result["status"] == "READY"
     assert result["evidence_mode"] == "VERIFIED_PUBLICATION"
+
+
+def test_late_index_repair_preserves_original_receipt_without_backdating(monkeypatch):
+    engine, days = _fixture(monkeypatch)
+    day, later = days[-3], days[-2]
+    published = f"{later} 01:20:00"
+    with engine.begin() as connection:
+        connection.execute(text("""
+            INSERT INTO sm_index_kline VALUES ('000300',1,:day,:close_time,300,310,290,305,NULL,:published,10,5,1.5)
+        """), {"day": day, "close_time": f"{day} 15:00:00", "published": published})
+        bar = connection.execute(text("SELECT * FROM sm_index_kline WHERE index_code='000300'")).mappings().one()
+        digest = free_index_bar_hash(bar)
+        detail = dict(schema=FREE_BAR_RECEIPT_SCHEMA, provider="tencent_east_verified",
+                      source_variant="tencent_only", target_date=day, index_code="000300",
+                      available_at=published, row_hash=digest)
+        receipt_id = canonical_digest(detail)
+        connection.execute(text("""
+            INSERT INTO acquisition_partition_state VALUES
+            ('index_daily','tencent_east_verified',:key,'complete',:day,:receipt,1,:published,:detail)
+        """), {"key": f"{FREE_BAR_PARTITION_PREFIX}000300:{digest[:40]}", "day": day,
+                "receipt": receipt_id, "published": published,
+                "detail": json.dumps({**detail, "receipt_id": receipt_id})})
+
+    def read(code, cutoff):
+        return load_verified_index_daily_bars(
+            engine, engine, sessions=[day], code=code,
+            as_of=datetime.fromisoformat(cutoff), deadline=monotonic() + 5,
+        )
+
+    prior_cutoff = f"{day} 20:00:00"
+    assert read("000001", prior_cutoff)[0]["available_at"] == datetime.fromisoformat(f"{day} 17:00:00")
+    assert read("000300", prior_cutoff) == []
+    assert read("000300", published)[0]["available_at"] == datetime.fromisoformat(published)
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE sm_index_kline SET close=304 WHERE index_code='000300'"))
+    assert read("000300", published) == []
+    assert len(read("000001", published)) == 1
 
 
 def test_latest_null_bar_returns_data_blocked_instead_of_raising(monkeypatch):

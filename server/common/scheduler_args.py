@@ -232,6 +232,21 @@ def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: s
 
     args = script_args_raw.split() if script_args_raw else []
     args.extend(_date_param_args(date_param_raw))
+    if task_type == "free_index_daily_canonical":
+        from server.common.index_daily_publication import PUBLIC_INDEX_DAILY_CODES
+
+        if normalized_path != "tools/sync_free_index_daily.py" or not scheduler_target_bound or date_param_raw:
+            raise ValueError("public index task requires an exact closed session")
+        repair_codes = row.get("_index_repair_codes")
+        if repair_codes:
+            if (str(row.get("_trigger_source") or "").strip() != "manual"
+                    or not isinstance(repair_codes, tuple)
+                    or not set(repair_codes).issubset(PUBLIC_INDEX_DAILY_CODES)):
+                raise ValueError("historical public index task requires exact manual scope")
+            codes = sorted(set(repair_codes))
+        else:
+            codes = list(PUBLIC_INDEX_DAILY_CODES)
+        return ["--date", today, "--codes", ",".join(codes), "--repair-missing", "--json"]
     if task_type == "daily_review" and (
         normalized_path == "biz/review/generate.py"
         or normalized_path.endswith("/biz/review/generate.py")
@@ -593,6 +608,12 @@ def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: s
             args.extend(["--date", today])
         return args
     if task_type == "market_overview_daily":
+        if row.get("_limit_ladder_only") is True:
+            if (normalized_path != "tools/refresh_market_overview_daily.py"
+                    or str(row.get("_trigger_source") or "").strip() != "manual_ladder"
+                    or not scheduler_target_bound or args):
+                raise ValueError("close ladder requires exact manual session")
+            return ["--dates", today, "--limit-ladder-only"]
         if release_catchup:
             if any(
                 _has_option(args, option)
