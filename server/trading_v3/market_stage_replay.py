@@ -9,7 +9,7 @@ from typing import Any
 
 from server.common.pit_facts import normalize_decision_at
 
-from .market_stage import evaluate_market_stage
+from .market_stage import evaluate_market_stage, valid_market_bar
 from .metrics import maximum_drawdown
 
 
@@ -153,16 +153,17 @@ def replay_market_stage(
     positions = {day: index for index, day in enumerate(sessions)}
     bar_by_date: dict[date, Mapping[str, Any]] = {}
     availability: dict[date, datetime] = {}
+    seen: set[date] = set()
     for bar in bars:
         day = _trade_date(bar["trade_date"])
-        if day not in positions or day in bar_by_date:
+        if day not in positions or day in seen:
             raise ValueError("market stage replay found a duplicate or out-of-calendar benchmark bar")
+        seen.add(day)
         available_at = normalize_decision_at(bar["available_at"])
         if available_at < datetime.combine(day, time(15)):
             raise ValueError("market stage replay benchmark bar predates session close")
-        low, high = _number(bar, "low"), _number(bar, "high")
-        if not (low <= _number(bar, "open") <= high and low <= _number(bar, "close") <= high):
-            raise ValueError("market stage replay benchmark OHLC bounds differ")
+        if not valid_market_bar(bar):
+            continue
         bar_by_date[day] = bar
         availability[day] = available_at
     breadth = {_trade_date(day): value for day, value in (breadth_by_date or {}).items()}

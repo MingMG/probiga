@@ -50,15 +50,30 @@ def _closed_by(day: date, cutoff: datetime) -> bool:
 
 
 def _market_bar(day: date, row: Mapping[str, Any]) -> _Bar:
-    prices = {key: float(row[key]) for key in ("open", "high", "low", "close")}
+    try:
+        prices = {key: float(row[key]) for key in ("open", "high", "low", "close")}
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"invalid market stage OHLC for {day}") from exc
     if (not all(math.isfinite(value) and value > 0 for value in prices.values())
             or not prices["low"] <= min(prices["open"], prices["close"])
             or not prices["high"] >= max(prices["open"], prices["close"])):
         raise ValueError(f"invalid market stage OHLC for {day}")
-    amount = float(row["amount"]) if row.get("amount") is not None else None
+    try:
+        amount = float(row["amount"]) if row.get("amount") is not None else None
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"invalid market stage turnover for {day}") from exc
     if amount is not None and (not math.isfinite(amount) or amount < 0):
         raise ValueError(f"invalid market stage turnover for {day}")
     return _Bar(day=day, amount=amount, **prices)
+
+
+def valid_market_bar(row: Mapping[str, Any]) -> bool:
+    """Allow adapters to isolate a bad session before computing coverage."""
+    try:
+        _market_bar(_date(row["trade_date"]), row)
+    except (KeyError, TypeError, ValueError):
+        return False
+    return True
 
 
 def _known_bars(rows: Iterable[Mapping[str, Any]], cutoff: datetime) -> dict[date, _Bar]:
@@ -109,8 +124,10 @@ def _completed_bars(
     for key, sessions in groups.items():
         if key > current:
             break
-        if key == current and (calendar is None or not _closed_by(sessions[-1], cutoff)
-                               or next(reversed(groups)) == key):
+        if calendar is not None and next(reversed(groups)) == key:
+            # The last retained calendar group has no next period to prove closure.
+            break
+        if key == current and (calendar is None or not _closed_by(sessions[-1], cutoff)):
             break
         # The start of a supplied calendar can fall inside the first period.
         # Omit that group unless the calendar itself begins at its boundary.
@@ -241,6 +258,7 @@ def evaluate_market_stage(
     bars: Iterable[Mapping[str, Any]], *, as_of: datetime | str,
     trading_sessions: Sequence[date | str] | None = None,
     breadth: Mapping[str, Any] | None = None,
+    target_session: date | str | None = None,
 ) -> dict[str, Any]:
     """Evaluate one index at a knowledge cutoff with an optional verified exchange calendar.
 
@@ -249,14 +267,17 @@ def evaluate_market_stage(
     are used and no reversal confirmation is issued. Thresholds are research rules.
     """
     cutoff = normalize_decision_at(as_of)
+    period_cutoff = (min(cutoff, datetime.combine(_date(target_session), time.max))
+                     if target_session is not None else cutoff)
     known = _known_bars(bars, cutoff)
+    known = {day: bar for day, bar in known.items() if _closed_by(day, period_cutoff)}
     calendar = tuple(_date(day) for day in trading_sessions) if trading_sessions is not None else None
     if calendar is not None and (not calendar or calendar != tuple(sorted(set(calendar)))):
         raise ValueError("market stage calendar must contain unique increasing sessions")
     if calendar is not None and not set(known).issubset(calendar):
         raise ValueError("market stage bars differ from the supplied exchange calendar")
     daily = list(known.values())
-    expected = [day for day in calendar if _closed_by(day, cutoff)] if calendar is not None else []
+    expected = [day for day in calendar if _closed_by(day, period_cutoff)] if calendar is not None else []
     if calendar is not None:
         daily = []
         for day in reversed(expected):
@@ -266,7 +287,7 @@ def evaluate_market_stage(
         daily.reverse()
     periods = {"daily": _period_state(daily, "daily")}
     for period in ("weekly", "monthly"):
-        periods[period] = _period_state(_completed_bars(known, calendar, period, cutoff), period)
+        periods[period] = _period_state(_completed_bars(known, calendar, period, period_cutoff), period)
     target = expected[-1] if expected else next(reversed(known), None)
     calendar_continues = calendar is not None and target is not None and calendar[-1] > target
     market_breadth = _current_breadth(breadth, target, cutoff)
@@ -317,7 +338,9 @@ def evaluate_market_stage(
     if features:
         support, resistance = features["support"], features["resistance"]
         confirmation.insert(0, f"观察前低 {support:.2f} 能否守住并形成更高低点，突破 {resistance:.2f} 后等待回踩。")
-        invalidation.insert(0, f"跌破支撑 {support:.2f}，或突破后重新收在 {resistance:.2f} 下方。")
+        retest_floor = resistance * (1 - _PERIODS["daily"][2] / 200)
+        invalidation.insert(0, f"跌破支撑 {support:.2f}，或回踩期间收在 {retest_floor:.2f} 下方。"
+                              f"回踩完成时收盘需恢复至 {resistance:.2f} 或以上。")
     scenarios = ["跌破支撑时，反弹或磨底假设失效，应重新识别下跌阶段。",
                  "回踩守住且更多股票同步修复时，再评估中期趋势。"]
     if state in _DOWN_STATES:

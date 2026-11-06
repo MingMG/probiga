@@ -64,7 +64,7 @@ def test_replay_separates_frozen_assessment_and_realized_price_outcomes(history)
     json.dumps(revised, allow_nan=False)
 
 
-@pytest.mark.parametrize("case", ["missing_session", "late_publication", "future_cutoff"])
+@pytest.mark.parametrize("case", ["missing_session", "late_publication", "future_cutoff", "invalid_session"])
 def test_replay_censors_missing_or_unavailable_future_bars(history, case):
     bars, sessions = history
     cutoff = 50
@@ -72,6 +72,8 @@ def test_replay_censors_missing_or_unavailable_future_bars(history, case):
         del bars[28]
     elif case == "late_publication":
         bars[28]["available_at"] = f"{sessions[51]} 16:00:00"
+    elif case == "invalid_session":
+        bars[28]["open"] = None
     else:
         cutoff = 27
     result = run(history, cutoff=cutoff)

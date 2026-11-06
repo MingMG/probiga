@@ -703,6 +703,7 @@ def load_trade_calendar_window_receipt(
     end_date: str,
     required_sessions: int,
     decision_known_at: Any,
+    deadline: float | None = None,
 ) -> QmtTradeCalendarReceipt:
     """Select one known, fully validated receipt proving the requested window.
 
@@ -711,12 +712,16 @@ def load_trade_calendar_window_receipt(
     combine receipts or use sessions known only after the decision cutoff.
     """
 
+    from time import monotonic
+
     end = _iso_date(end_date)
     decision_time = _known_at(decision_known_at)
     if type(required_sessions) is not int or required_sessions < 1:
         raise ValueError("required calendar session count must be positive")
     if end > decision_time[:10]:
         raise ValueError("calendar window ends after the decision date")
+    if deadline is not None and monotonic() >= deadline:
+        raise TimeoutError("QMT calendar window lookup deadline exhausted")
     candidates = connection.execute(text("""
         SELECT batch_id, start_date
         FROM qmt_trade_calendar_batch
@@ -728,6 +733,8 @@ def load_trade_calendar_window_receipt(
         "decision_known_at": decision_time,
     }).mappings().all()
     for candidate in candidates:
+        if deadline is not None and monotonic() >= deadline:
+            raise TimeoutError("QMT calendar window verification deadline exhausted")
         # Validate the entire immutable source before using its session count.
         # A corrupt candidate is an error, not a reason to choose older data.
         receipt = load_trade_calendar_receipt(
@@ -738,6 +745,8 @@ def load_trade_calendar_window_receipt(
             batch_id=str(candidate["batch_id"]),
         )
         sessions = receipt.sessions_between(receipt.start_date, end)
+        if deadline is not None and monotonic() >= deadline:
+            raise TimeoutError("QMT calendar window verification deadline exhausted")
         if not sessions or sessions[-1] != end:
             raise ValueError("calendar window target is not a trading session")
         if len(sessions) >= required_sessions:
