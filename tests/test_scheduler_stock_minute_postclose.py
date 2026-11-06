@@ -138,6 +138,75 @@ def test_prior_session_success_does_not_consume_today_postclose_run(calendar_eng
     assert not runtime._cron_due(row, now=datetime(2026, 9, 21, 18))
 
 
+@pytest.mark.parametrize(("new_proof", "due"), [
+    (("b" * 64, "2026-09-21 18:00:00"), True),
+    (("a" * 64, "2026-09-21 18:00:00"), False),
+    (("b" * 64, "2026-09-21 21:00:00"), False),
+    (None, False),
+])
+def test_successful_stock_minutes_reopen_only_for_a_visible_daily_scope(
+    calendar_engine, new_proof, due,
+):
+    target = "2026-09-21"
+    now = datetime(2026, 9, 21, 20)
+    previous_start = datetime(2026, 9, 21, 15, 55)
+    row = {
+        **QMT_STOCK_MINUTE_CANONICAL_TASK,
+        "last_triggered_at": previous_start,
+        "last_run_at": previous_start,
+        "last_run_status": "success",
+        "last_run_output": json.dumps({
+            "schema": "probiga.qmt-datadir-import-result.v1", "target_trade_date": target,
+        }),
+    }
+    with calendar_engine.begin() as connection:
+        connection.execute(text("""
+            CREATE TABLE qmt_datadir_import_partition (
+                dataset TEXT, trade_date TEXT, source_root TEXT, status TEXT,
+                code_count INTEGER, row_count INTEGER, content_sha256 TEXT,
+                run_id TEXT, detail_json TEXT
+            )
+        """))
+        connection.execute(text("""
+            INSERT INTO qmt_datadir_import_partition
+            VALUES ('stock_minute', :target, 'cache', 'COMPLETE', 2, 482, '', 'old', :detail)
+        """), {"target": target, "detail": json.dumps({"full_market_manifest_hash": "a" * 64})})
+        connection.execute(text("""
+            CREATE TABLE qmt_history_coverage_manifest (
+                manifest_hash TEXT, dataset TEXT, trade_date TEXT, provider TEXT,
+                status TEXT, schema_version TEXT, captured_at TEXT, strategy_eligible INTEGER
+            )
+        """))
+        if new_proof:
+            connection.execute(text("""
+                INSERT INTO qmt_history_coverage_manifest VALUES (
+                    :hash, 'stock_daily', :target, 'qmt_datadir', 'EXACT',
+                    'probiga.qmt-datadir-daily-coverage.v1', :captured, 1
+                )
+            """), {"hash": new_proof[0], "captured": new_proof[1], "target": target})
+
+    def is_due(candidate, now):
+        assert runtime._attach_daily_recovery_targets(calendar_engine, [candidate], now=now)
+        runtime._attach_qmt_minute_scope_recovery(calendar_engine, [candidate], now=now)
+        return runtime._cron_due(candidate, now=now) and runtime._overdue_cron_allowed(
+            candidate, now=now, cron_time=candidate["cron_time"], startup_time=now,
+        )
+
+    assert is_due(row, now) is due
+    if due:
+        assert runtime._build_task_args(row, row["script_path"], target)[-4:] == [
+            "--start", target, "--end", target,
+        ]
+        assert not is_due({**row, "last_run_status": "running", "last_triggered_at": now}, now)
+        with calendar_engine.begin() as connection:
+            connection.execute(text("""
+                UPDATE qmt_datadir_import_partition SET detail_json=:detail
+                WHERE dataset='stock_minute' AND trade_date=:target
+            """), {"target": target, "detail": json.dumps({"full_market_manifest_hash": new_proof[0]})})
+        row.update(last_triggered_at=now, last_run_at=now)
+        assert not is_due(row, datetime(2026, 9, 21, 20, 20))
+
+
 @pytest.mark.parametrize(("now", "invalid_target"), [
     (datetime(2026, 9, 21, 15, 34), "2026-09-21"),
     (datetime(2026, 9, 21, 16), "2026-09-22"),
