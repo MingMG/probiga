@@ -348,12 +348,19 @@ def list_tasks():
 
 
 @router.post("/scheduler/managed-contracts/reconcile")
-def reconcile_managed_contracts():
+def reconcile_managed_contracts(task_type: str = ""):
     """Install and exactly read back the managed Linux scheduler contracts."""
 
     from tools import ensure_quality_gate
 
     engine = get_engine()
+    if task_type:
+        if task_type != "analysis_premarket_external":
+            raise HTTPException(422, "不支持指定的定向迁移任务")
+        try:
+            return ensure_quality_gate.reconcile_premarket_theme_task(engine)
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc)) from exc
     actions = ensure_quality_gate.run(engine)
     disabled = ensure_quality_gate.quarantine_legacy_canonical_market_writers(
         engine
@@ -543,7 +550,7 @@ def update_date_param(task_id: int, date_param: str = Query(default="")):
 
 
 @router.post("/scheduler/tasks/{task_id}/run")
-def run_task_now(task_id: int, trade_date: date | None = None, index_codes: str = ""):
+def run_task_now(task_id: int, trade_date: date | None = None, index_codes: str = "", full_overview: bool = False):
     row = _read_sql("SELECT * FROM st_scheduled_tasks WHERE id = :id", {"id": task_id})
     if not row:
         return {"error": "任务不存在"}
@@ -558,18 +565,18 @@ def run_task_now(task_id: int, trade_date: date | None = None, index_codes: str 
         )
     task = dict(row[0])
     engine = get_engine()
-    if trade_date is not None or index_codes:
+    if trade_date is not None or index_codes or full_overview:
         from server.common.authoritative_market_clock import authoritative_closed_trade_date
         from server.common.index_daily_publication import PUBLIC_INDEX_DAILY_CODES
         from datetime import time as wall_time
 
         codes = sorted({code.strip() for code in index_codes.split(",") if code.strip()})
         exact_index = (task_type == "free_index_daily_canonical"
-                       and codes and set(codes).issubset(PUBLIC_INDEX_DAILY_CODES))
-        exact_ladder = (task_type == "market_overview_daily" and not index_codes
-                        and task.get("script_path") == "tools/refresh_market_overview_daily.py"
-                        and not str(task.get("script_args") or "").strip())
-        if trade_date is None or task.get("date_param") or not (exact_index or exact_ladder):
+                       and not full_overview and codes and set(codes).issubset(PUBLIC_INDEX_DAILY_CODES))
+        exact_overview = (task_type == "market_overview_daily" and not index_codes
+                          and task.get("script_path") == "tools/refresh_market_overview_daily.py"
+                          and not str(task.get("script_args") or "").strip())
+        if trade_date is None or task.get("date_param") or not (exact_index or exact_overview):
             raise HTTPException(422, "该任务不支持指定的交易日和采集范围")
         target = trade_date.isoformat()
         with engine.connect() as connection:
@@ -582,7 +589,7 @@ def run_task_now(task_id: int, trade_date: date | None = None, index_codes: str 
         task["_scheduler_target_trade_date"] = target
         if exact_index:
             task["_index_repair_codes"] = tuple(codes)
-        else:
+        elif not full_overview:
             task["_limit_ladder_only"] = True
     root = Path(__file__).resolve().parents[3]
     return launch_scheduler_task(task, root=root, engine=engine)

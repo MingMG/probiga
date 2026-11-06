@@ -367,10 +367,10 @@ def test_index_api_claims_existing_task_for_exact_closed_scope(index_repair_data
         dispatched.append(row) or {"accepted": True})
     assert is_admin_protected_path("/api/scheduler/tasks/139/run", "POST")
     route = next(route for route in scheduler.router.routes if route.endpoint is scheduler.run_task_now)
-    assert {param.name for param in route.dependant.query_params} == {"trade_date", "index_codes"}
+    assert {param.name for param in route.dependant.query_params} == {"trade_date", "index_codes", "full_overview"}
     params = {"trade_date": date(2026, 10, 9), "index_codes": "399001,000001,399001"}
     assert scheduler.run_task_now(139, **params) == {"accepted": True}
-    for invalid in ({"trade_date": date(2026, 10, 10)}, {"index_codes": "987654"}):
+    for invalid in ({"trade_date": date(2026, 10, 10)}, {"index_codes": "987654"}, {"full_overview": True}):
         with pytest.raises(HTTPException) as rejected:
             scheduler.run_task_now(139, **{**params, **invalid})
         assert rejected.value.status_code == 422

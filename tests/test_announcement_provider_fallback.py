@@ -1617,11 +1617,16 @@ def test_cninfo_failed_stock_resumes_same_cutoff_with_staged_receipt(
     assert second_client.requested_stock_identities == ["600519,org-600519"]
 
 
+@pytest.mark.parametrize("deadline_expires", [False, True])
+@pytest.mark.parametrize("retry_scope", ["same", "changed", "tampered"])
 def test_historical_reconstruction_retry_resumes_same_sealed_checkpoint(
-    tmp_path,
+    tmp_path, monkeypatch, deadline_expires, retry_scope,
 ) -> None:
+    from server.common import qmt_announcement_pit as announcement
+    from server.common.qmt_datadir_progress import MinuteImportProgress
+
     target = date(2026, 9, 1)
-    first_started = datetime.now().replace(microsecond=0)
+    first_started = datetime.now(announcement.SHANGHAI).replace(tzinfo=None, microsecond=0)
     second_started = first_started + timedelta(minutes=1)
     catalog = AnnouncementCatalog(
         batch_id="catalog-historical-resume",
@@ -1631,7 +1636,9 @@ def test_historical_reconstruction_retry_resumes_same_sealed_checkpoint(
         qmt_by_code={"000001": "000001.SZ", "600519": "600519.SH"},
     )
     authority = _historical_authority(catalog, target)
-    master = _master(*catalog.codes)
+    authority["qmt_daily_truth"].update(decision_known_at=first_started.isoformat(), manifest_hash="d" * 64)
+    authority["qmt_daily_truth_sha256"] = pit_canonical_hash(authority["qmt_daily_truth"])
+    master = _master("000001", "000002", "600519")
     first_client = _Client(
         masters=[master],
         rows_by_code={"000001": [_row_on_date("000001", 0, target)]},
@@ -1642,6 +1649,20 @@ def test_historical_reconstruction_retry_resumes_same_sealed_checkpoint(
         minimum_request_interval=0,
         now_fn=lambda: first_started + timedelta(seconds=10),
     )
+    clock = [0.0]
+    monkeypatch.setattr(announcement, "monotonic", lambda: clock[0])
+    if deadline_expires:
+        original_fetch = first_provider.fetch
+
+        def finish_one_after_budget(**kwargs):
+            response = original_fetch(**kwargs)
+            clock[0] = announcement.HISTORICAL_RECONSTRUCTION_BUDGET.total_seconds()
+            return response
+
+        monkeypatch.setattr(first_provider, "fetch", finish_one_after_budget)
+    monkeypatch.setenv("PROBIGA_JOB_LOG_ROOT", str(tmp_path / "jobs"))
+    progress = MinuteImportProgress(run_id="1" * 32, total_units=2, operation="historical_reconstruction",
+                                    days=[target], dataset="qmt_announcement_pit", checkpoint={})
     engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
     ensure_pit_fact_schema(engine)
     with pytest.raises(QMTAnnouncementBlocked) as exc:
@@ -1660,40 +1681,83 @@ def test_historical_reconstruction_retry_resumes_same_sealed_checkpoint(
             ),
             now_fn=lambda: first_started,
             batch_size=2,
+            progress=progress,
         )
-    assert exc.value.reason_code == "ANNOUNCEMENT_FALLBACK_SOURCE_RATE_LIMITED"
+    assert exc.value.reason_code == (announcement.HISTORICAL_CAPTURE_DEADLINE if deadline_expires
+                                     else "ANNOUNCEMENT_FALLBACK_SOURCE_RATE_LIMITED")
     assert first_client.requested_stock_identities == ["000001,org-000001"]
+    events = [json.loads(line) for line in progress.path.read_text(encoding="utf-8").splitlines()]
+    assert events[-1]["status"] == "FAILED"
+    assert events[-1]["completed_units"] == 1
+    assert events[-1]["checkpoint"]["target_date"] == target.isoformat()
+    first_checkpoint = tmp_path / events[-1]["checkpoint"]["checkpoint_id"]
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT COUNT(*) FROM st_pit_source_coverage")).scalar_one() == 0
 
+    if retry_scope == "tampered":
+        path = first_checkpoint / "results" / "000001.json"
+        staged = json.loads(path.read_text(encoding="utf-8"))
+        staged.pop("payload_hash")
+        staged["provider_receipt"]["requested_end_time"] = "20260831235959"
+        path.write_text(json.dumps({**staged, "payload_hash": announcement.canonical_hash(staged)}), encoding="utf-8")
+    second_catalog = catalog
+    if retry_scope == "changed":
+        second_catalog = AnnouncementCatalog(
+            batch_id=catalog.batch_id, manifest_hash=catalog.manifest_hash, member_set_hash=catalog.member_set_hash,
+            codes=("000002", "600519"), qmt_by_code={"000002": "000002.SZ", "600519": "600519.SH"},
+        )
+    second_authority = _historical_authority(second_catalog, target)
+    second_authority["qmt_daily_truth"].update(decision_known_at=second_started.isoformat(), manifest_hash="e" * 64)
+    second_authority["qmt_daily_truth_sha256"] = pit_canonical_hash(second_authority["qmt_daily_truth"])
     second_client = _Client(
         masters=[master, master],
-        rows_by_code={"600519": []},
+        rows_by_code={"000002": [], "600519": []},
     )
     second_provider = CninfoMarketAnnouncementProvider(
         client=second_client,
         minimum_request_interval=0,
         now_fn=lambda: second_started + timedelta(seconds=10),
     )
-    result = synchronize_historical_cninfo_announcements(
-        engine,
+    clock[0] = 0.0
+    options = dict(
         adapter=ProviderBackedAnnouncementAdapter(second_provider, workers=1),
         checkpoint_root=tmp_path,
-        catalog=catalog,
+        catalog=second_catalog,
         context=HistoricalReconstructionContext(
             target_trade_date=target,
             source_query_cutoff_at=datetime.combine(target, datetime.max.time()),
             reconstruction_started_at=second_started,
             scheduler_run_uid="3" * 32,
-            build_sha="2" * 40,
-            authority=authority,
+            build_sha="4" * 40,
+            authority=second_authority,
         ),
         now_fn=lambda: second_started + timedelta(seconds=20),
         batch_size=2,
     )
-
+    if retry_scope == "tampered":
+        with pytest.raises(QMTAnnouncementBlocked, match="RECONSTRUCTION_STAGED_RECEIPT_INVALID"):
+            synchronize_historical_cninfo_announcements(engine, **options)
+        assert second_client.requested_stock_identities == []
+        with engine.connect() as connection:
+            assert connection.execute(text("SELECT COUNT(*) FROM st_pit_source_coverage")).scalar_one() == 0
+        return
+    result = synchronize_historical_cninfo_announcements(engine, **options)
     assert result["status"] == "COMPLETE"
-    assert result["reconstruction_provenance"]["scheduler_run_uid"] == "3" * 32
-    assert result["reconstruction_provenance"]["reconstruction_started_at"] == (
-        first_started + timedelta(seconds=10)
-    ).isoformat(timespec="microseconds")
-    assert second_client.requested_stock_identities == ["600519,org-600519"]
-    assert len(list(tmp_path.glob("cninfo-ann-reconstruction-*"))) == 1
+    provenance = result["reconstruction_provenance"]
+    assert provenance["scheduler_run_uid"] == "3" * 32
+    assert provenance["build_sha"] == "4" * 40
+    assert provenance["authority"] == second_authority
+    changed = retry_scope == "changed"
+    earliest = second_started if changed else first_started + timedelta(seconds=10)
+    assert provenance["reconstruction_started_at"] == earliest.isoformat(timespec="microseconds")
+    assert second_client.requested_stock_identities == (["000002,org-000002", "600519,org-600519"]
+                                                       if changed else ["600519,org-600519"])
+    checkpoints = list(tmp_path.glob("cninfo-ann-reconstruction-scope-*"))
+    assert len(checkpoints) == (2 if changed else 1)
+    finished = next(path for path in checkpoints if (path / "complete.json").exists())
+    assert (finished == first_checkpoint) is not changed
+    manifest = json.loads((finished / "manifest.json").read_text(encoding="utf-8"))
+    assert provenance["source_query_scope_sha256"] == manifest["source_query_scope_sha256"]
+    complete = json.loads((finished / "complete.json").read_text(encoding="utf-8"))
+    assert complete["batch_id"] == finished.name
+    assert complete["publication_batch_id"] == result["batch_id"] != finished.name

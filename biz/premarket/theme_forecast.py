@@ -37,6 +37,8 @@ from biz.market_context.external_market import (
     load_latest_external_market_context,
 )
 from server.common.sql_reader import read_sql_rows
+from server.common.authoritative_market_clock import PRODUCTION_TIMEZONE, authoritative_elapsed_trade_date
+from server.common.qmt_attestation_contract import canonical_digest
 from server.common.runtime_table_schema import (
     RuntimeColumn,
     RuntimeIndex,
@@ -49,6 +51,9 @@ logger = logging.getLogger(__name__)
 
 MODEL_VERSION = "PREMARKET_THEME_V1.3_FLOW_CALIBRATED"
 PREMARKET_STAGE = "PREMARKET_0908"
+PREMARKET_PUBLICATION_SCHEMA = "probiga.premarket-theme-publication.v1"
+PREMARKET_CUTOFF = time(9, 8)
+PREMARKET_DEADLINE = time(9, 30)
 DEFAULT_THEME_LIMIT = 12
 DEFAULT_STOCKS_PER_THEME = 5
 
@@ -245,7 +250,7 @@ def _clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
 
 def _parse_datetime(value: Any) -> datetime | None:
     if isinstance(value, datetime):
-        return value.replace(tzinfo=None) if value.tzinfo else value
+        return value.astimezone(PRODUCTION_TIMEZONE).replace(tzinfo=None) if value.tzinfo else value
     if isinstance(value, date):
         return datetime.combine(value, time.min)
     text_value = str(value or "").strip()
@@ -258,7 +263,7 @@ def _parse_datetime(value: Any) -> datetime | None:
             parsed = datetime.strptime(text_value[:19], "%Y-%m-%d %H:%M:%S")
         except ValueError:
             return None
-    return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+    return parsed.astimezone(PRODUCTION_TIMEZONE).replace(tzinfo=None) if parsed.tzinfo else parsed
 
 
 def _date_text(value: Any) -> str:
@@ -1428,7 +1433,7 @@ def build_theme_forecast_from_records(
         "session_date": str(session_date)[:10],
         "source_trade_date": str(source_trade_date)[:10],
         "cutoff_at": cutoff.strftime("%Y-%m-%d %H:%M:%S"),
-        "generated_at": datetime.now().replace(microsecond=0).strftime("%Y-%m-%d %H:%M:%S"),
+        "generated_at": _shanghai_now().isoformat(sep=" "),
         "data_quality": data_quality,
         "decision_scope": "RESEARCH_DISPLAY_ONLY",
         "actionable_output_allowed": False,
@@ -1456,6 +1461,10 @@ def _safe_rows(engine: Engine, sql: str, params: Mapping[str, Any], context: str
         return []
 
 
+def _shanghai_now() -> datetime:
+    return datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None, microsecond=0)
+
+
 def _load_forecast_inputs(
     engine: Engine,
     *,
@@ -1470,8 +1479,10 @@ def _load_forecast_inputs(
                change_pct, hot_value, hot_tag
         FROM st_hot_concept_ths_daily
         WHERE snapshot_date BETWEEN :history_start AND :source_date
+          AND etl_sync_at <= :cutoff_at
         ORDER BY snapshot_date DESC, `rank` ASC
-    """, {"history_start": history_start, "source_date": source_trade_date}, "premarket.hot_concepts")
+    """, {"history_start": history_start, "source_date": source_trade_date,
+          "cutoff_at": cutoff_at}, "premarket.hot_concepts")
     concept_flow_rows = _safe_rows(engine, """
         SELECT days_type, index_code, index_name, change_pct, main_net_inflow,
                main_net_inflow_rate, snapshot_at
@@ -1487,13 +1498,16 @@ def _load_forecast_inputs(
         LEFT JOIN si_concept_code_east m ON m.index_code = c.index_code
         WHERE c.trade_date <= :source_date
           AND c.trade_date >= :history_start
+          AND c.snapshot_at <= :cutoff_at
         ORDER BY c.trade_date DESC, c.snapshot_at DESC
-    """, {"source_date": source_trade_date, "history_start": history_start}, "premarket.concept_market")
+    """, {"source_date": source_trade_date, "history_start": history_start,
+          "cutoff_at": cutoff_at}, "premarket.concept_market")
     news_rows = _safe_rows(engine, """
         SELECT source, title, content, publish_time, level, is_top, jpush
         FROM st_news_flash
         WHERE publish_time <= :cutoff_at
           AND publish_time >= :news_start
+          AND first_seen_at <= :cutoff_at AND etl_sync_at <= :cutoff_at
         ORDER BY publish_time DESC
         LIMIT 800
     """, {"cutoff_at": cutoff_at, "news_start": cutoff_at - timedelta(hours=60)}, "premarket.news")
@@ -1542,28 +1556,25 @@ def _load_forecast_inputs(
                capital_score, sentiment_score, event_score, event_risk_level,
                recommend_status, chase_risk_status, ordinary_buy_eligible
         FROM stock_analysis_result
-        WHERE analysis_date = :source_date
-    """, {"source_date": source_trade_date}, "premarket.analysis")
+        WHERE analysis_date = :source_date AND updated_at <= :cutoff_at
+    """, {"source_date": source_trade_date, "cutoff_at": cutoff_at}, "premarket.analysis")
     recommendation_rows = _safe_rows(engine, """
         SELECT stock_code, short_name, ai_score, short_term_score, capital_score,
                technical, event_score, final_trade_score, main_wave_score,
                recommend_status, event_risk_level, chase_risk_status,
                ordinary_buy_eligible
         FROM st_recommended_stocks
-        WHERE pick_date = :source_date
-    """, {"source_date": source_trade_date}, "premarket.recommendations")
+        WHERE pick_date = :source_date AND created_at <= :cutoff_at
+    """, {"source_date": source_trade_date, "cutoff_at": cutoff_at}, "premarket.recommendations")
     kline_rows = _safe_rows(engine, """
         SELECT k.stock_code, k.short_name, k.close, k.change_pct,
                k.turnover_ratio, k.amount,
-               k.close * shares.total_shares AS market_cap,
-               '' AS industry_name
+               NULL AS market_cap, '' AS industry_name
         FROM sm_stock_kline k
-        LEFT JOIN (
-            SELECT stock_code, MAX(total_shares) AS total_shares
-            FROM si_stock_shares GROUP BY stock_code
-        ) shares ON shares.stock_code = k.stock_code
         WHERE k.trade_date = :source_date AND k.k_type = 1 AND k.adjust_type = 0
-    """, {"source_date": source_trade_date}, "premarket.kline")
+          AND k.etl_sync_at <= :cutoff_at AND k.data_source = 'qmt_datadir'
+          AND k.quality_status = 'VERIFIED' AND k.permission_status = 'SUPPORTED'
+    """, {"source_date": source_trade_date, "cutoff_at": cutoff_at}, "premarket.kline")
     stock_flow_rows = _safe_rows(engine, """
         SELECT flow.stock_code, flow.trade_date, flow.main_net_inflow,
                flow.max_net_inflow, flow.lg_net_inflow,
@@ -1574,11 +1585,14 @@ def _load_forecast_inputs(
          AND kline.trade_date = flow.trade_date
          AND kline.k_type = 1
          AND kline.adjust_type = 0
+         AND kline.etl_sync_at <= :cutoff_at
         WHERE flow.trade_date BETWEEN :history_start AND :source_date
+          AND flow.etl_sync_at <= :cutoff_at
         ORDER BY flow.stock_code ASC, flow.trade_date DESC
     """, {
         "history_start": history_start,
         "source_date": source_trade_date,
+        "cutoff_at": cutoff_at,
     }, "premarket.stock_flow")
 
     if external_snapshot is not None:
@@ -1781,9 +1795,16 @@ def persist_premarket_theme_forecast(engine: Engine, forecast: Mapping[str, Any]
             }
 
         run_uid = str(forecast.get("run_uid") or uuid.uuid4())
-        now = datetime.now().replace(microsecond=0)
+        now = _shanghai_now()
+        cutoff = _parse_datetime(forecast.get("cutoff_at"))
+        if (cutoff != datetime.combine(now.date(), PREMARKET_CUTOFF)
+                or session_date != now.date().isoformat()
+                or not PREMARKET_CUTOFF <= now.time() < PREMARKET_DEADLINE):
+            raise ValueError("premarket_publication_window: exact same-session 09:08 freeze is closed")
         themes = list(forecast.get("themes") or [])
         candidates = list(forecast.get("stock_candidates") or [])
+        quality_counts = forecast.get("quality_counts") or {}
+        delivery_status = "SUPPRESSED" if quality_counts.get("publication_schema") == PREMARKET_PUBLICATION_SCHEMA else "PENDING"
         connection.execute(text("""
             INSERT INTO st_premarket_theme_forecast_run
                 (run_uid, session_date, source_trade_date, cutoff_at, stage,
@@ -1792,12 +1813,12 @@ def persist_premarket_theme_forecast(engine: Engine, forecast: Mapping[str, Any]
             VALUES
                 (:run_uid, :session_date, :source_trade_date, :cutoff_at, :stage,
                  :model_version, 'COMPLETED', :data_quality, :theme_count, :candidate_count,
-                 :top_theme, :summary, :quality_json, 'PENDING', :created_at, :updated_at)
+                 :top_theme, :summary, :quality_json, :delivery_status, :created_at, :updated_at)
         """), {
             "run_uid": run_uid,
             "session_date": session_date,
             "source_trade_date": str(forecast.get("source_trade_date") or "")[:10],
-            "cutoff_at": _parse_datetime(forecast.get("cutoff_at")),
+            "cutoff_at": cutoff,
             "stage": stage,
             "model_version": str(forecast.get("model_version") or MODEL_VERSION),
             "data_quality": str(forecast.get("data_quality") or "UNKNOWN"),
@@ -1805,7 +1826,8 @@ def persist_premarket_theme_forecast(engine: Engine, forecast: Mapping[str, Any]
             "candidate_count": len(candidates),
             "top_theme": str(themes[0].get("theme_name") or "")[:256] if themes else "",
             "summary": str(forecast.get("summary") or "")[:1000],
-            "quality_json": json.dumps(forecast.get("quality_counts") or {}, ensure_ascii=False, default=str),
+            "quality_json": json.dumps(quality_counts, ensure_ascii=False, default=str),
+            "delivery_status": delivery_status,
             "created_at": now,
             "updated_at": now,
         })
@@ -2066,6 +2088,9 @@ def load_premarket_theme_forecast(
             "model_version": run.get("model_version"),
             "data_quality": run.get("data_quality"),
             "quality_counts": quality_counts,
+            "theme_count": int(run.get("theme_count") or 0),
+            "candidate_count": int(run.get("candidate_count") or 0),
+            "publication_schema": quality_counts.get("publication_schema"),
             "flow_quality": quality_counts.get("flow_quality") or {},
             "summary": run.get("summary") or "",
             "delivery_status": run.get("delivery_status"),
@@ -2200,6 +2225,87 @@ def run_premarket_theme_forecast(
             return frozen
         forecast["run_uid"] = str(persistence.get("run_uid") or forecast["run_uid"])
     return forecast
+
+
+def premarket_theme_publication_receipt(
+    engine: Engine, *, session_date: str, source_trade_date: str, now: datetime,
+) -> dict[str, Any]:
+    """Read back the exact browser publication, never a prior-session fallback."""
+    cutoff = datetime.combine(date.fromisoformat(session_date), PREMARKET_CUTOFF)
+    forecast = load_premarket_theme_forecast(engine, session_date, allow_fallback=False)
+    generated = _parse_datetime(forecast.get("generated_at"))
+    quality = forecast.get("quality_counts") or {}
+    if (forecast.get("error") or not forecast.get("run_uid")
+            or forecast.get("session_date") != session_date
+            or forecast.get("source_trade_date") != source_trade_date
+            or forecast.get("stage") != PREMARKET_STAGE
+            or _parse_datetime(forecast.get("cutoff_at")) != cutoff
+            or generated is None or not cutoff <= generated <= now
+            or generated >= datetime.combine(cutoff.date(), PREMARKET_DEADLINE)
+            or forecast.get("publication_schema") != PREMARKET_PUBLICATION_SCHEMA
+            or forecast.get("delivery_status") != "SUPPRESSED"
+            or not re.fullmatch(r"[0-9a-f]{64}", str(quality.get("source_daily_manifest_hash") or ""))
+            or forecast.get("theme_count") != len(forecast.get("themes") or [])
+            or forecast.get("candidate_count") != len(forecast.get("stock_candidates") or [])):
+        raise ValueError("premarket_readback: exact publication, time or persisted coverage differs")
+    return {
+        "schema": PREMARKET_PUBLICATION_SCHEMA, "status": "COMPLETE",
+        "session_date": session_date, "source_trade_date": source_trade_date,
+        "cutoff_at": cutoff.isoformat(sep=" "), "generated_at": generated.isoformat(sep=" "),
+        "run_uid": forecast["run_uid"], "theme_count": forecast["theme_count"],
+        "candidate_count": forecast["candidate_count"],
+        "source_daily_manifest_hash": quality["source_daily_manifest_hash"],
+        "content_sha256": canonical_digest({
+            "themes": forecast["themes"], "stock_candidates": forecast["stock_candidates"],
+            "quality_counts": quality,
+        }),
+        "notification_allowed": False, "canonical_recommendation_writes": False,
+    }
+
+
+def publish_current_premarket_theme_forecast(engine: Engine, *, session_date: str) -> dict[str, Any]:
+    """Publish research-only 09:08 evidence using the exact prior completed session."""
+    from server.common.qmt_datadir_daily_coverage import load_daily_manifest
+
+    current = _shanghai_now()
+    if (session_date != current.date().isoformat()
+            or not PREMARKET_CUTOFF <= current.time() < PREMARKET_DEADLINE):
+        raise ValueError("premarket_publication_window: only today's 09:08–09:29 session is allowed")
+    cutoff = datetime.combine(current.date(), PREMARKET_CUTOFF)
+    with engine.connect() as connection:
+        open_states = connection.execute(text(
+            "SELECT DISTINCT trade_status FROM si_trade_calendar WHERE trade_date=:day"
+        ), {"day": session_date}).scalars().all()
+        source = authoritative_elapsed_trade_date(connection, now=current)
+    if open_states != [1] or not source:
+        raise ValueError("premarket_calendar: current or previous trading session is unverified")
+    existing = load_premarket_theme_forecast(engine, session_date, allow_fallback=False)
+    if existing.get("run_uid"):
+        return premarket_theme_publication_receipt(engine, session_date=session_date, source_trade_date=source, now=current)
+    manifest = load_daily_manifest(engine, source, decision_known_at=cutoff)
+    if not manifest:
+        raise ValueError("premarket_daily_input: prior session has no exact available daily manifest")
+    inputs = _load_forecast_inputs(engine, source_trade_date=source, cutoff_at=cutoff, external_snapshot=None)
+    expected = {item["stock_code"] for item in manifest["entities"] if item["classification"] == "TRADED"}
+    observed = [row.get("stock_code") for row in inputs["kline_rows"]]
+    if not expected or len(observed) != len(expected) or set(observed) != expected:
+        raise ValueError("premarket_daily_input: available K-line coverage differs from the exact manifest")
+    if not any(inputs.get(key) for key in (
+        "hot_rows", "concept_flow_rows", "concept_market_rows", "theme_signal_rows", "news_rows",
+    )):
+        raise ValueError("premarket_theme_input: no timely observed theme evidence")
+    forecast = build_theme_forecast_from_records(
+        session_date=session_date, source_trade_date=source, cutoff_at=cutoff, **inputs,
+    )
+    forecast["quality_counts"].update(
+        publication_schema=PREMARKET_PUBLICATION_SCHEMA,
+        source_daily_manifest_hash=manifest["manifest_hash"],
+        external_market_captured_at=inputs["external_summary"].get("external_market_captured_at") or "",
+    )
+    persist_premarket_theme_forecast(engine, forecast)
+    return premarket_theme_publication_receipt(
+        engine, session_date=session_date, source_trade_date=source, now=_shanghai_now(),
+    )
 
 
 _AUCTION_CONFIRMATION_DDL = """
@@ -2554,6 +2660,7 @@ def run_auction_confirmation(
     result = build_auction_confirmation_from_records(
         forecast, quote_rows, cutoff_at=cutoff_at
     )
+    result["forecast_publication_schema"] = forecast.get("publication_schema")
     if persist:
         result["persistence"] = persist_auction_confirmation(engine, result)
     return result

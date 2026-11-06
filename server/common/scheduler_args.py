@@ -543,10 +543,12 @@ def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: s
             )
         _bind_analysis_execution_time(args, row)
         return args
-    if task_type in {
-        "analysis_morning_strict",
-        "analysis_premarket_external",
-    }:
+    if task_type == "analysis_premarket_external":
+        if (normalized_path != "tools/run_premarket_theme_forecast.py"
+                or args != ["--json"] or not scheduler_target_bound or release_catchup):
+            raise ValueError("premarket theme publication requires the registered same-session browser task")
+        return ["--session-date", today, "--json"]
+    if task_type == "analysis_morning_strict":
         _bind_analysis_execution_time(args, row)
         return args
     if task_type == "trading_v3_close_decision" and (

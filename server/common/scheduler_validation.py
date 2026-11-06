@@ -2822,6 +2822,12 @@ def scheduler_output_status(
     same-day retries.  ``blocked`` accurately represents both conditions.
     """
     task_type = str(task.get("task_type") or "").strip()
+    if (task_type == "analysis_premarket_external"
+            and task.get("script_path") == "tools/run_premarket_theme_forecast.py"):
+        from biz.premarket.theme_forecast import PREMARKET_PUBLICATION_SCHEMA
+
+        receipt = _single_nested_machine_payload(output, schema=PREMARKET_PUBLICATION_SCHEMA)
+        return "success" if return_code == 0 and receipt and receipt.get("status") == "COMPLETE" else "failed"
     if task_type == "market_overview_daily" and task.get("_limit_ladder_only") is True:
         from server.common.market_close_ladder import CAPTURE_SCHEMA
 
@@ -4420,6 +4426,44 @@ def validate_scheduler_task_result(
     output: str | None = None,
 ) -> SchedulerValidationResult:
     task_type = str(task.get("task_type") or "").strip()
+    if (task_type == "analysis_premarket_external"
+            and task.get("script_path") == "tools/run_premarket_theme_forecast.py"):
+        from biz.premarket.theme_forecast import (
+            PREMARKET_CUTOFF, PREMARKET_DEADLINE, PREMARKET_PUBLICATION_SCHEMA,
+            premarket_theme_publication_receipt,
+        )
+        from server.common.authoritative_market_clock import authoritative_elapsed_trade_date
+        from server.common.qmt_datadir_daily_coverage import load_daily_manifest
+
+        try:
+            current = now or datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None)
+            started = started_at or current
+            if current.tzinfo:
+                current = current.astimezone(PRODUCTION_TIMEZONE).replace(tzinfo=None)
+            if started.tzinfo:
+                started = started.astimezone(PRODUCTION_TIMEZONE).replace(tzinfo=None)
+            session = started.date().isoformat()
+            if (task.get("_scheduler_target_trade_date") != session
+                    or not PREMARKET_CUTOFF <= started.time() < PREMARKET_DEADLINE):
+                raise ValueError("09:08 dispatch clock differs")
+            source = authoritative_elapsed_trade_date(engine, now=started)
+            receipt = _single_nested_machine_payload(output, schema=PREMARKET_PUBLICATION_SCHEMA)
+            persisted = premarket_theme_publication_receipt(
+                engine, session_date=session, source_trade_date=source, now=current,
+            )
+            if receipt != persisted:
+                raise ValueError("09:08 durable forecast receipt differs")
+            manifest = load_daily_manifest(
+                engine, source, decision_known_at=datetime.combine(started.date(), PREMARKET_CUTOFF),
+                manifest_hash=persisted["source_daily_manifest_hash"], verify_rows=False,
+            )
+            if not manifest:
+                raise ValueError("09:08 daily manifest identity is unavailable")
+            return SchedulerValidationResult(checked=True, ok=True,
+                message=f"verified 09:08 browser publication: date={session} themes={persisted['theme_count']}")
+        except Exception as exc:
+            return SchedulerValidationResult(checked=True, ok=False,
+                message=f"09:08 browser publication validation failed: {type(exc).__name__}")
     if task_type == "market_overview_daily" and task.get("_limit_ladder_only") is True:
         from server.common.kline_data import get_kline_engine
         from server.common.market_close_ladder import CAPTURE_SCHEMA, verify_market_close_ladder_capture

@@ -31,6 +31,8 @@ from server.common.qmt_announcement_pit import (
     DEFAULT_BATCH_SIZE,
     DEFAULT_WINDOW_DAYS,
     EASTMONEY_ANNOUNCEMENT_SOURCE,
+    HISTORICAL_CAPTURE_DEADLINE,
+    HISTORICAL_PUBLISH_DEADLINE,
     QMT_ANNOUNCEMENT_MANUAL_RESEARCH_ORIGIN,
     QMT_ANNOUNCEMENT_RECONSTRUCTION_AUTHORITY_V3_SCHEMA,
     QMT_ANNOUNCEMENT_RECONSTRUCTION_STOCK_SCOPE,
@@ -41,6 +43,7 @@ from server.common.qmt_announcement_pit import (
     AnnouncementCatalog,
     HistoricalReconstructionContext,
     _explicit_qmt_unavailability_reason,
+    _reconstruction_authority_matches,
     synchronize_qmt_announcements,
     synchronize_historical_cninfo_announcements,
     canonical_hash,
@@ -57,8 +60,11 @@ from server.common.qmt_stock_catalog import load_stock_catalog
 from server.common.qmt_datadir_daily_coverage import (
     PROVIDER as QMT_DATADIR_PROVIDER,
     load_daily_manifest,
+    retained_listing_evidence,
 )
+from server.common.official_listing_evidence import load_official_listing_evidence, validate_official_listing_evidence
 from server.common.qmt_datadir_result import load_receipt, partition_from_receipt
+from server.common.qmt_datadir_progress import MinuteImportProgress
 from server.common.qmt_daily_market_truth import load_qmt_daily_market_truth
 from server.common.qmt_attestation_contract import (
     validated_no_row_exception_contract,
@@ -622,6 +628,7 @@ def _build_historical_catalog_reconciliation(
     prior_catalog,
     attested_daily_count: int,
     no_trade_codes: list[str],
+    added_evidence: Mapping | None = None,
 ) -> tuple[list[str], dict]:
     """Explain every catalog difference against the target-day authority."""
 
@@ -671,12 +678,17 @@ def _build_historical_catalog_reconciliation(
                 member.get("instrument_batch_id") or ""
             ),
         })
-    additions = sorted(set(authority_codes) - set(prior_codes))
-    if additions:
-        raise QMTAnnouncementBlocked(
-            "QMT_ANNOUNCEMENT_RECONSTRUCTION_CATALOG_DIFF_UNEXPLAINED",
-            additions[0],
-        )
+    additions = []
+    evidence_by_code = added_evidence or {}
+    for code in sorted(set(authority_codes) - set(prior_codes)):
+        member, proof = authority_members.get(code), evidence_by_code.get(code)
+        if (member is None or not isinstance(proof, Mapping) or code in normalized_no_trade
+                or str(member.get("list_date") or "")[:10] != target):
+            raise QMTAnnouncementBlocked("QMT_ANNOUNCEMENT_RECONSTRUCTION_CATALOG_DIFF_UNEXPLAINED", code)
+        additions.append({"stock_code": code, "qmt_code": str(member["qmt_code"]).upper(),
+                          "reason": "OFFICIAL_TARGET_DAY_LISTING_WITH_NATIVE_TRADE",
+                          "list_date": target, "listing_disclosure": proof["listing_disclosure"],
+                          "native_daily_entity": proof["native_daily_entity"]})
     return authority_codes, {
         "schema": "probiga.qmt-announcement-catalog-reconciliation.v2",
         "target_trade_date": target,
@@ -691,13 +703,13 @@ def _build_historical_catalog_reconciliation(
         "native_no_trade_codes": normalized_no_trade,
         "native_no_trade_codes_sha256": canonical_hash(normalized_no_trade),
         "excluded_from_prior": exclusions,
-        "added_to_prior": [],
+        "added_to_prior": additions,
     }
 
 
-def _load_datadir_reconstruction_no_trade_codes(
-    connection, *, target_date: str, decision: datetime, truth,
-) -> list[str]:
+def _load_datadir_reconstruction_scope(
+    connection, *, target_date: str, decision: datetime, truth, added_codes: set[str],
+) -> tuple[list[str], dict]:
     # The daily truth loader already verified the business rows. Reopen its
     # exact immutable manifest for the evidence behind each missing bar.
     manifest = load_daily_manifest(
@@ -731,16 +743,25 @@ def _load_datadir_reconstruction_no_trade_codes(
             "QMT_ANNOUNCEMENT_RECONSTRUCTION_DATADIR_PUBLICATION_DIFFERS"
         )
     entities = manifest["entities"]
+    if manifest.get("historical_reconstruction") is True:
+        # Official lifecycle evidence can prove a missing bar but does not
+        # supply the native suspension observations required by this seal.
+        raise QMTAnnouncementBlocked(
+            "QMT_ANNOUNCEMENT_RECONSTRUCTION_NATIVE_SUSPENSION_SCOPE_UNSUPPORTED"
+        )
     if any(entity["classification"] == "NOT_LISTED" for entity in entities):
         # The v3 reconciliation seal accounts for native no-trade stocks
         # separately. A listing exclusion cannot be represented as suspension.
         raise QMTAnnouncementBlocked(
             "QMT_ANNOUNCEMENT_RECONSTRUCTION_LISTING_SCOPE_UNSUPPORTED"
         )
-    return [
+    no_trade = [
         entity["stock_code"] for entity in entities
         if entity["classification"] == "NO_TRADE"
     ]
+    additions = {entity["stock_code"]: entity for entity in entities
+                 if entity["stock_code"] in added_codes and entity["classification"] == "TRADED"}
+    return no_trade, additions
 
 
 def _load_historical_reconstruction_authority(
@@ -749,6 +770,7 @@ def _load_historical_reconstruction_authority(
     target_trade_date: date,
     decision_known_at: datetime,
     execution_origin: str = QMT_ANNOUNCEMENT_SCHEDULER_RECOVERY_ORIGIN,
+    existing_batch_only: bool = False,
 ) -> tuple[AnnouncementCatalog, dict]:
     """Bind reconstruction to validated daily truth and stock-catalog scope."""
 
@@ -777,10 +799,13 @@ def _load_historical_reconstruction_authority(
                     target, datetime.max.time()
                 ),
             )
+            authority_codes = authority_catalog.eligible_codes(target.isoformat())
+            added_codes = set(authority_codes) - set(prior_catalog.eligible_codes(target.isoformat()))
+            traded_additions = {}
             if truth.provider == QMT_DATADIR_PROVIDER:
-                no_trade_codes = _load_datadir_reconstruction_no_trade_codes(
+                no_trade_codes, traded_additions = _load_datadir_reconstruction_scope(
                     connection, target_date=target.isoformat(), decision=decision,
-                    truth=truth,
+                    truth=truth, added_codes=added_codes,
                 )
             else:
                 tolerance = connection.execute(
@@ -821,12 +846,52 @@ def _load_historical_reconstruction_authority(
         raise QMTAnnouncementBlocked(
             "QMT_ANNOUNCEMENT_RECONSTRUCTION_DAILY_AUTHORITY_DIFFERS"
         )
+    authority_code_set = set(authority_codes)
+    if (truth.attested_row_count + len(set(no_trade_codes)) != len(authority_codes)
+            or set(no_trade_codes) - authority_code_set):
+        raise QMTAnnouncementBlocked("QMT_ANNOUNCEMENT_RECONSTRUCTION_DAILY_AUTHORITY_DIFFERS")
+    qmt_by_code = {
+        str(item["stock_code"]).zfill(6): str(item["qmt_code"]).upper()
+        for item in authority_catalog.members if str(item["stock_code"]).zfill(6) in authority_code_set
+    }
+    if set(qmt_by_code) != set(authority_codes) or not authority_codes:
+        raise QMTAnnouncementBlocked("QMT_ANNOUNCEMENT_RECONSTRUCTION_CATALOG_MAPPING_INCOMPLETE")
+    catalog = AnnouncementCatalog(batch_id=authority_catalog.batch_id, manifest_hash=authority_catalog.manifest_hash,
+                                  member_set_hash=authority_catalog.member_set_hash, codes=tuple(authority_codes),
+                                  qmt_by_code=qmt_by_code)
+    if existing_batch_only:
+        # The retained batch revalidates its own complete authority and must
+        # cover this exact current stock scope. No issuer call occurs here.
+        return catalog, {}
+    added_evidence = {}
+    if added_codes:
+        if len(added_codes) > 8:
+            raise QMTAnnouncementBlocked("QMT_ANNOUNCEMENT_RECONSTRUCTION_CATALOG_DIFF_UNEXPLAINED", "addition_scope_exceeds_bound")
+        if set(traded_additions) != added_codes:
+            raise QMTAnnouncementBlocked("QMT_ANNOUNCEMENT_RECONSTRUCTION_CATALOG_DIFF_UNEXPLAINED",
+                                         sorted(added_codes - set(traded_additions))[0])
+        prelisting = (target - timedelta(days=1)).isoformat()
+        official = retained_listing_evidence(engine, sorted(added_codes), target_date=prelisting, decision_known_at=decision)
+        missing = sorted(added_codes - set(official))
+        if missing:
+            official.update(load_official_listing_evidence(missing, target_date=prelisting))
+        for code in sorted(added_codes):
+            try:
+                document = validate_official_listing_evidence(official[code], stock_code=code, target_date=prelisting)
+                captured = _exact_datetime(document["captured_at"], field="listing_captured_at")
+                if (document["listing_date"] != target.isoformat()
+                        or captured > _shanghai_naive(datetime.now(PRODUCTION_TIMEZONE))):
+                    raise ValueError("target-day listing identity differs")
+            except (KeyError, TypeError, ValueError) as exc:
+                raise QMTAnnouncementBlocked("QMT_ANNOUNCEMENT_RECONSTRUCTION_CATALOG_DIFF_UNEXPLAINED", code) from exc
+            added_evidence[code] = {"listing_disclosure": document, "native_daily_entity": traded_additions[code]}
     authority_codes, reconciled = _build_historical_catalog_reconciliation(
         target_trade_date=target,
         authority_catalog=authority_catalog,
         prior_catalog=prior_catalog,
         attested_daily_count=truth.attested_row_count,
         no_trade_codes=no_trade_codes,
+        added_evidence=added_evidence,
     )
     reconciliation_sha = canonical_hash(reconciled)
     truth_payload = truth.as_dict()
@@ -847,22 +912,12 @@ def _load_historical_reconstruction_authority(
         "reconciliation": reconciled,
         "reconciliation_sha256": reconciliation_sha,
     }
-    qmt_by_code = {
-        str(item["stock_code"]).zfill(6): str(item["qmt_code"]).upper()
-        for item in authority_catalog.members
-        if str(item["stock_code"]).zfill(6) in set(authority_codes)
-    }
-    if set(qmt_by_code) != set(authority_codes):
-        raise QMTAnnouncementBlocked(
-            "QMT_ANNOUNCEMENT_RECONSTRUCTION_CATALOG_MAPPING_INCOMPLETE"
-        )
-    return AnnouncementCatalog(
-        batch_id=authority_catalog.batch_id,
-        manifest_hash=authority_catalog.manifest_hash,
-        member_set_hash=authority_catalog.member_set_hash,
-        codes=tuple(authority_codes),
-        qmt_by_code=qmt_by_code,
-    ), authority
+    if added_codes and not _reconstruction_authority_matches(
+        authority, target_trade_date=target, catalog=catalog,
+        known_at=_shanghai_naive(datetime.now(PRODUCTION_TIMEZONE)),
+    ):
+        raise QMTAnnouncementBlocked("QMT_ANNOUNCEMENT_RECONSTRUCTION_CATALOG_DIFF_UNEXPLAINED", sorted(added_codes)[0])
+    return catalog, authority
 
 
 def validate_existing_complete_qmt_announcement_batch(
@@ -1157,6 +1212,7 @@ def validate_existing_complete_qmt_announcement_batch(
                 engine,
                 target_trade_date=target,
                 decision_known_at=decision_at,
+                existing_batch_only=True,
             )
             historical = validate_complete_historical_reconstruction_batch(
                 engine,
@@ -1804,6 +1860,7 @@ def main(argv: list[str] | None = None) -> int:
 
     load_project_env()
     engine = None
+    progress = None
     manual_research = bool(args.research_recover_date)
     target_text = (
         args.research_recover_date
@@ -1842,7 +1899,10 @@ def main(argv: list[str] | None = None) -> int:
                     "PROBIGA_SCHEDULER_BUILD_SHA", ""
                 ).strip().lower()
                 execution_origin = QMT_ANNOUNCEMENT_SCHEDULER_RECOVERY_ORIGIN
-        engine = create_tool_engine()
+        if args.recover_missing_historical or manual_research:
+            engine = create_tool_engine(connect_args={"connect_timeout": 8, "read_timeout": 45, "write_timeout": 45})
+        else:
+            engine = create_tool_engine()
         if historical_modes:
             try:
                 payload = validate_existing_complete_qmt_announcement_batch(
@@ -1883,6 +1943,11 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 checkpoint_dir = _checkpoint_root(args.checkpoint_dir)
                 fallback = _fallback_announcement_adapter("cninfo")
+                if os.name == "nt" and _is_production() and not manual_research:
+                    progress = MinuteImportProgress(
+                        run_id=validation_run_uid, total_units=len(catalog.codes), operation="historical_reconstruction",
+                        days=[target], dataset="qmt_announcement_pit", checkpoint={},
+                    )
                 try:
                     payload = synchronize_historical_cninfo_announcements(
                         engine,
@@ -1904,6 +1969,7 @@ def main(argv: list[str] | None = None) -> int:
                         ),
                         window_days=args.window_days,
                         batch_size=args.batch_size,
+                        progress=progress,
                     )
                     payload["validation_run_uid"] = validation_run_uid
                     payload["validation_build_sha"] = validation_build_sha
@@ -2028,6 +2094,9 @@ def main(argv: list[str] | None = None) -> int:
                     args.research_recover_date or args.expected_trade_date
                 ),
             })
+            if reason in {HISTORICAL_CAPTURE_DEADLINE, HISTORICAL_PUBLISH_DEADLINE,
+                          "ANNOUNCEMENT_FALLBACK_CAPTURE_DEADLINE_EXPIRED"}:
+                payload["retryable"] = True
             if args.research_recover_date:
                 payload.update({
                     "execution_origin": (
@@ -2049,6 +2118,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         process_exit = 2
         validate_task_result(payload, process_exit)
+    if progress is not None:
+        progress.emit("terminal", status="COMPLETE" if process_exit == 0 else "FAILED",
+                      reason_code=payload.get("reason_code"))
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
     return process_exit
 

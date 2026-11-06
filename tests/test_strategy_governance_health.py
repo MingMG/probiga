@@ -9969,6 +9969,12 @@ def test_incomplete_latest_qmt_announcement_batch_is_data_blocked(
             "qmt.announcement",
             "QMT_ANNOUNCEMENT_TERMINAL_DEPENDENCY_UNAVAILABLE",
         ),
+        (
+            "cninfo.announcement",
+            "QMT_ANNOUNCEMENT_HISTORICAL_RECONSTRUCTION_EXISTING",
+            "qmt.announcement",
+            "QMT_ANNOUNCEMENT_HISTORICAL_RECONSTRUCTION_REQUIRED",
+        ),
     ),
 )
 def test_latest_announcement_health_accepts_only_strict_authoritative_batches(
@@ -10000,6 +10006,8 @@ def test_latest_announcement_health_accepts_only_strict_authoritative_batches(
             "primary_source": primary_source,
             "fallback_reason": fallback_reason,
         })
+    if fallback_reason == "QMT_ANNOUNCEMENT_HISTORICAL_RECONSTRUCTION_REQUIRED":
+        proof["mode"] = "HISTORICAL_RECONSTRUCTION_EXISTING"
 
     def validate_existing(_engine, **kwargs):
         calls.append(kwargs)
@@ -10040,6 +10048,7 @@ def test_latest_announcement_health_accepts_only_strict_authoritative_batches(
         ("cninfo.announcement", "QMT_ANNOUNCEMENT_SDK_UNAVAILABLE"),
         ("qmt.announcement", "LOCAL_DATABASE_ERROR"),
         ("qmt.announcement", "ModuleNotFoundError"),
+        ("qmt.announcement", "QMT_ANNOUNCEMENT_HISTORICAL_RECONSTRUCTION_REQUIRED"),
     ),
 )
 def test_latest_announcement_health_rejects_unfrozen_fallback_evidence(

@@ -23,6 +23,7 @@ import os
 from pathlib import Path
 import re
 import tempfile
+from time import monotonic
 from typing import Any, Callable, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
@@ -89,12 +90,19 @@ QMT_ANNOUNCEMENT_TASK_SCHEMA = "probiga.qmt-announcement-task-result.v1"
 CNINFO_PROVIDER_RECEIPT_SCHEMA = (
     "probiga.cninfo-announcement-provider-receipt.v3"
 )
+HISTORICAL_SOURCE_EVENT_CONTRACT = "OFFICIAL_ANNOUNCEMENT_ID_PUBLISHED_AT_RAW_SOURCE_ROW_SHA256_V1"
 CNINFO_MAX_PAGES_PER_STOCK = 200
 CNINFO_DATE_SHARD_MAX_CAPTURE_ROUNDS = 8
 CNINFO_DATE_SHARD_SPLIT_VERSION = "MIDPOINT_INCLUSIVE_V1"
 DEFAULT_WINDOW_DAYS = 30
 DEFAULT_OVERLAP_DAYS = 3
 DEFAULT_BATCH_SIZE = 100
+# The provider is queried per issuer. Keep a full-market capture resumable and
+# reserve a separate window for the final anchor, validation and atomic write.
+HISTORICAL_RECONSTRUCTION_BUDGET = timedelta(hours=2)
+HISTORICAL_RECONSTRUCTION_PUBLISH_RESERVE = timedelta(minutes=15)
+HISTORICAL_CAPTURE_DEADLINE = "QMT_ANNOUNCEMENT_RECONSTRUCTION_CAPTURE_DEADLINE"
+HISTORICAL_PUBLISH_DEADLINE = "QMT_ANNOUNCEMENT_RECONSTRUCTION_PUBLISH_DEADLINE"
 VALIDATION_READ_BATCH_SIZE = 500
 _CODE_RE = re.compile(r"^(?:0|3|4|6|8|9)\d{5}$")
 _QMT_CODE_RE = re.compile(r"^(?:0|3|4|6|8|9)\d{5}\.(?:SH|SZ|BJ)$")
@@ -236,6 +244,10 @@ def _shanghai_naive(value: datetime) -> datetime:
     return value.astimezone(SHANGHAI).replace(tzinfo=None)
 
 
+def _shanghai_now() -> datetime:
+    return datetime.now(SHANGHAI)
+
+
 def _dt(value: Any) -> datetime:
     if not isinstance(value, datetime):
         raw = str(value or "").strip()
@@ -297,6 +309,7 @@ def _reconstruction_authority_matches(
     *,
     target_trade_date: date,
     catalog: AnnouncementCatalog,
+    known_at: datetime | None = None,
 ) -> bool:
     """Recompute every nested authority seal and cross-bind its catalog."""
 
@@ -315,7 +328,7 @@ def _reconstruction_authority_matches(
     if (
         not isinstance(no_trade_codes, list)
         or not isinstance(exclusions, list)
-        or additions != []
+        or not isinstance(additions, list)
         or no_trade_codes != sorted(set(no_trade_codes))
         or any(_CODE_RE.fullmatch(str(code)) is None for code in no_trade_codes)
         or any(
@@ -340,6 +353,7 @@ def _reconstruction_authority_matches(
             and _reconstruction_stock_scope_matches(
                 authority,
                 target_trade_date=target_trade_date,
+                known_at=known_at,
             )
             and authority.get("reconciliation_sha256")
             == canonical_hash(reconciliation)
@@ -359,7 +373,9 @@ def _reconstruction_authority_matches(
             == catalog.manifest_hash
             and int(reconciliation.get("authority_eligible_count") or -1)
             == len(catalog.codes)
-            and prior_count - len(exclusions) == len(catalog.codes)
+            and prior_count - len(exclusions) + len(additions) == len(catalog.codes)
+            and all(item["stock_code"] in catalog.codes and catalog.qmt_by_code.get(item["stock_code"]) == item["qmt_code"]
+                    for item in additions)
             and attested_count > 0
             and no_trade_count == len(no_trade_codes)
             and attested_count + no_trade_count == len(catalog.codes)
@@ -374,13 +390,15 @@ def _reconstruction_stock_scope_matches(
     authority: Mapping[str, Any],
     *,
     target_trade_date: date,
+    known_at: datetime | None = None,
 ) -> bool:
     """Preserve legacy membership seals while defining the v3 stock scope."""
 
     schema = authority.get("schema")
     if schema == QMT_ANNOUNCEMENT_RECONSTRUCTION_AUTHORITY_V2_SCHEMA:
         membership = authority.get("membership_snapshot")
-        if not isinstance(membership, Mapping):
+        reconciliation = authority.get("reconciliation")
+        if not isinstance(membership, Mapping) or not isinstance(reconciliation, Mapping):
             return False
         membership = dict(membership)
         return bool(
@@ -389,6 +407,7 @@ def _reconstruction_stock_scope_matches(
             and membership.get("snapshot_date")
             == target_trade_date.isoformat()
             and membership.get("quality_status") == "QMT_VALIDATED"
+            and reconciliation.get("added_to_prior") == []
         )
     if schema == QMT_ANNOUNCEMENT_RECONSTRUCTION_AUTHORITY_V3_SCHEMA:
         return bool(
@@ -398,8 +417,53 @@ def _reconstruction_stock_scope_matches(
             in QMT_ANNOUNCEMENT_RECONSTRUCTION_ORIGINS
             and "membership_snapshot" not in authority
             and "membership_snapshot_sha256" not in authority
+            and _reconstruction_additions_valid(authority, target_trade_date=target_trade_date, known_at=known_at)
         )
     return False
+
+
+def _reconstruction_additions_valid(authority, *, target_trade_date: date, known_at: datetime | None) -> bool:
+    """Permit only a proven target-day IPO added to the native traded scope."""
+    reconciliation = authority.get("reconciliation")
+    if not isinstance(reconciliation, Mapping):
+        return False
+    additions = reconciliation.get("added_to_prior")
+    if additions == []:
+        return True
+    from server.common.official_listing_evidence import validate_official_listing_evidence
+    from server.common.qmt_datadir_daily_coverage import canonical_bar
+
+    truth = authority.get("qmt_daily_truth") or {}
+    if (not isinstance(additions, list) or len(additions) > 8 or truth.get("provider") != "qmt_datadir"
+            or not _SHA256_RE.fullmatch(str(truth.get("truth_hash") or ""))):
+        return False
+    target = target_trade_date.isoformat()
+    prelisting = (target_trade_date - timedelta(days=1)).isoformat()
+    codes = []
+    try:
+        for addition in additions:
+            code = addition["stock_code"]
+            qmt_code = addition["qmt_code"]
+            disclosure = validate_official_listing_evidence(addition["listing_disclosure"], stock_code=code, target_date=prelisting)
+            captured = _dt(disclosure["captured_at"])
+            entity = addition["native_daily_entity"]
+            bar = entity["evidence"]
+            if (not _CODE_RE.fullmatch(code) or not _QMT_CODE_RE.fullmatch(qmt_code) or qmt_code[:6] != code
+                    or addition["reason"] != "OFFICIAL_TARGET_DAY_LISTING_WITH_NATIVE_TRADE"
+                    or addition["list_date"] != target or disclosure["listing_date"] != target
+                    or captured.date().isoformat() < disclosure["publication_date"] or (known_at is not None and captured > known_at)
+                    or len(disclosure["source_text"].encode("utf-8")) > 8192
+                    or entity["stock_code"] != code or entity["classification"] != "TRADED"
+                    or entity["row_hash"] != canonical_hash({"stock_code": code, "classification": "TRADED", "evidence": bar})
+                    or bar["stock_code"] != code or bar["trade_date"] != target or canonical_bar(bar) != bar
+                    or not (Decimal(bar["volume"]) > 0 or Decimal(bar["amount"]) > 0)):
+                return False
+            codes.append(code)
+        excluded = {entry["stock_code"] for entry in reconciliation["excluded_from_prior"]}
+        unavailable = set(reconciliation["native_no_trade_codes"])
+    except (KeyError, TypeError, ValueError, ArithmeticError):
+        return False
+    return codes == sorted(set(codes)) and not set(codes) & (excluded | unavailable)
 
 
 def _reconstruction_execution_origin_matches(
@@ -452,6 +516,7 @@ def _fallback_receipt_valid(
     requested_end_time: str,
     result_count: int,
     catalog_codes: Sequence[str],
+    staged: bool = False,
 ) -> bool:
     """Validate source-specific proof without weakening common PIT checks."""
 
@@ -492,29 +557,10 @@ def _fallback_receipt_valid(
         provider_total = int(receipt.get("provider_total_record_count"))
         reported_pages = int(receipt.get("provider_reported_totalpages"))
         max_pages = int(receipt.get("max_pages_per_stock"))
-        master_count = int(receipt.get("security_master_member_count"))
-        requested_count = int(receipt.get("requested_catalog_member_count"))
-        unrequested_count = int(
-            receipt.get("security_master_unrequested_count")
-        )
-        missing_count = int(
-            receipt.get("security_master_missing_requested_count")
-        )
-        directory_count = int(receipt.get("directory_member_count"))
-        directory_coverage = int(
-            receipt.get("directory_catalog_coverage_count")
-        )
-        directory_missing = int(
-            receipt.get("directory_catalog_missing_count")
-        )
-        directory_extra = int(
-            receipt.get("directory_catalog_extra_count")
-        )
     except (TypeError, ValueError, OverflowError):
         return False
     page_hashes = receipt.get("page_sha256")
     master_start = str(receipt.get("security_master_sha256") or "")
-    master_end = str(receipt.get("security_master_end_sha256") or "")
     first_anchor = str(receipt.get("first_page_anchor_sha256") or "")
     last_anchor = str(receipt.get("last_page_anchor_sha256") or "")
     first_page_recheck = str(
@@ -559,7 +605,6 @@ def _fallback_receipt_valid(
     directory_member_set_hash = str(
         receipt.get("directory_member_set_hash") or ""
     )
-    normalized_catalog = sorted(str(code).zfill(6) for code in catalog_codes)
     pagination_payload = {
         "pagination_mode": pagination_mode,
         "total_record_count": provider_total,
@@ -589,19 +634,6 @@ def _fallback_receipt_valid(
             "date_shard_split_version": split_version,
         })
     expected_pagination_hash = canonical_hash(pagination_payload)
-    expected_directory_attestation = canonical_hash({
-        "directory_raw_sha256": directory_raw_hash,
-        "directory_manifest_hash": directory_manifest_hash,
-        "directory_member_set_hash": directory_member_set_hash,
-        "directory_member_count": directory_count,
-        "security_master_start_sha256": master_start,
-        "security_master_end_sha256": master_end,
-        "requested_catalog_member_count": requested_count,
-        "requested_catalog_member_set_sha256": receipt.get(
-            "requested_catalog_member_set_sha256"
-        ),
-        "directory_catalog_missing_count": directory_missing,
-    })
     common_pagination_valid = bool(
         provider_total == result_count
         and expected_pages == page_count
@@ -795,7 +827,7 @@ def _fallback_receipt_valid(
                 <= max_pages
                 and first_page_recheck == ""
             )
-    return bool(
+    if not (
         str(receipt.get("org_id") or "").strip()
         and receipt.get("query_stock_identity")
         == f"{stock_code},{receipt.get('org_id')}"
@@ -803,13 +835,42 @@ def _fallback_receipt_valid(
         and common_pagination_valid
         and (single_page_proof_valid or shard_proof_valid)
         and _SHA256_RE.fullmatch(master_start)
-        and master_start == master_end
         and _SHA256_RE.fullmatch(directory_raw_hash)
-        and _SHA256_RE.fullmatch(directory_manifest_hash)
         and directory_manifest_hash == master_start
         and _SHA256_RE.fullmatch(directory_member_set_hash)
-        and receipt.get("directory_attestation_sha256")
-        == expected_directory_attestation
+    ):
+        return False
+    if staged:
+        # Reuse still requires a fresh, matching first security-master anchor.
+        # The final second anchor and whole-catalog proof are sealed later.
+        return True
+    try:
+        master_count = int(receipt.get("security_master_member_count"))
+        requested_count = int(receipt.get("requested_catalog_member_count"))
+        unrequested_count = int(receipt.get("security_master_unrequested_count"))
+        missing_count = int(receipt.get("security_master_missing_requested_count"))
+        directory_count = int(receipt.get("directory_member_count"))
+        directory_coverage = int(receipt.get("directory_catalog_coverage_count"))
+        directory_missing = int(receipt.get("directory_catalog_missing_count"))
+        directory_extra = int(receipt.get("directory_catalog_extra_count"))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    master_end = str(receipt.get("security_master_end_sha256") or "")
+    normalized_catalog = sorted(str(code).zfill(6) for code in catalog_codes)
+    expected_directory_attestation = canonical_hash({
+        "directory_raw_sha256": directory_raw_hash,
+        "directory_manifest_hash": directory_manifest_hash,
+        "directory_member_set_hash": directory_member_set_hash,
+        "directory_member_count": directory_count,
+        "security_master_start_sha256": master_start,
+        "security_master_end_sha256": master_end,
+        "requested_catalog_member_count": requested_count,
+        "requested_catalog_member_set_sha256": receipt.get("requested_catalog_member_set_sha256"),
+        "directory_catalog_missing_count": directory_missing,
+    })
+    return bool(
+        master_start == master_end
+        and receipt.get("directory_attestation_sha256") == expected_directory_attestation
         and master_count >= len(normalized_catalog)
         and directory_count == master_count
         and directory_coverage == len(normalized_catalog)
@@ -1236,7 +1297,7 @@ class AnnouncementCheckpoint:
     def _result_path(self, stock_code: str) -> Path:
         return self.root / "results" / f"{stock_code}.json"
 
-    def load(self, stock_code: str) -> list[dict[str, Any]] | None:
+    def _load_result(self, stock_code: str) -> dict[str, Any] | None:
         path = self._result_path(stock_code)
         if not path.exists():
             return None
@@ -1247,6 +1308,8 @@ class AnnouncementCheckpoint:
                 "QMT_ANNOUNCEMENT_CHECKPOINT_RESULT_INVALID",
                 f"{stock_code}:{type(exc).__name__}",
             ) from exc
+        if not isinstance(payload, dict):
+            raise QMTAnnouncementBlocked("QMT_ANNOUNCEMENT_CHECKPOINT_RESULT_INVALID", stock_code)
         unsigned = dict(payload)
         payload_hash = str(unsigned.pop("payload_hash", ""))
         expected = {
@@ -1260,6 +1323,7 @@ class AnnouncementCheckpoint:
         if (
             any(unsigned.get(key) != value for key, value in expected.items())
             or not isinstance(unsigned.get("events"), list)
+            or any(not isinstance(event, dict) for event in unsigned["events"])
             or not _SHA256_RE.fullmatch(payload_hash)
             or canonical_hash(unsigned) != payload_hash
         ):
@@ -1267,7 +1331,11 @@ class AnnouncementCheckpoint:
                 "QMT_ANNOUNCEMENT_CHECKPOINT_RESULT_MIXED_OR_TAMPERED",
                 stock_code,
             )
-        return [dict(item) for item in unsigned["events"]]
+        return unsigned
+
+    def load(self, stock_code: str) -> list[dict[str, Any]] | None:
+        result = self._load_result(stock_code)
+        return None if result is None else [dict(item) for item in result["events"]]
 
     def save(
         self,
@@ -1295,17 +1363,10 @@ class AnnouncementCheckpoint:
     def load_provider_receipt(
         self, stock_code: str
     ) -> dict[str, Any] | None:
-        if self.load(stock_code) is None:
+        result = self._load_result(stock_code)
+        if result is None:
             return None
-        path = self._result_path(stock_code)
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
-            raise QMTAnnouncementBlocked(
-                "QMT_ANNOUNCEMENT_CHECKPOINT_RESULT_INVALID",
-                f"{stock_code}:{type(exc).__name__}",
-            ) from exc
-        receipt = payload.get("provider_receipt")
+        receipt = result.get("provider_receipt")
         if receipt is None:
             return None
         if not isinstance(receipt, Mapping):
@@ -1360,7 +1421,7 @@ class AnnouncementCheckpoint:
         )
 
     def prepare_publish(
-        self, *, batch_root_hash: str, received_at: datetime
+        self, *, batch_root_hash: str, received_at: datetime, publication_batch_id: str = ""
     ) -> None:
         unsigned = {
             "schema": QMT_ANNOUNCEMENT_PREPARED_SCHEMA,
@@ -1369,6 +1430,8 @@ class AnnouncementCheckpoint:
             "received_at": _dt_text(received_at),
             "batch_root_hash": str(batch_root_hash),
         }
+        if publication_batch_id:
+            unsigned["publication_batch_id"] = publication_batch_id
         _atomic_write(
             self.root / "prepared.json",
             {**unsigned, "payload_hash": canonical_hash(unsigned)},
@@ -1409,7 +1472,7 @@ class AnnouncementCheckpoint:
             ) from exc
         return received_at, root_hash
 
-    def mark_complete(self, *, batch_root_hash: str, received_at: datetime) -> None:
+    def mark_complete(self, *, batch_root_hash: str, received_at: datetime, publication_batch_id: str = "") -> None:
         _atomic_write(
             self.root / "complete.json",
             {
@@ -1418,6 +1481,7 @@ class AnnouncementCheckpoint:
                 "fact_cutoff_at": self.manifest["fact_cutoff_at"],
                 "received_at": _dt_text(received_at),
                 "batch_root_hash": batch_root_hash,
+                **({"publication_batch_id": publication_batch_id} if publication_batch_id else {}),
             },
         )
 
@@ -1772,6 +1836,8 @@ def _download_and_read(
     window_start: date,
     batch_size: int,
     source: str = QMT_ANNOUNCEMENT_SOURCE,
+    before_fetch: Callable[[str], None] | None = None,
+    after_save: Callable[[str], None] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     downloader = getattr(xtdata, "download_history_data", None)
     reader = getattr(xtdata, "get_market_data_ex", None)
@@ -1796,6 +1862,8 @@ def _download_and_read(
             operation = "download_history_data"
             try:
                 for qmt_code in qmt_chunk:
+                    if before_fetch is not None:
+                        before_fetch(qmt_code)
                     downloader(
                         qmt_code,
                         period=QMT_ANNOUNCEMENT_PERIOD,
@@ -1894,8 +1962,11 @@ def _download_and_read(
                 checkpoint.save(
                     code, events, provider_receipt=provider_receipt
                 )
+                if after_save is not None:
+                    after_save(code)
         except QMTAnnouncementBlocked as exc:
-            if exc.reason_code in ANNOUNCEMENT_FALLBACK_REASON_CODES:
+            if exc.reason_code in ANNOUNCEMENT_FALLBACK_REASON_CODES or (before_fetch is not None
+                    and exc.reason_code in {HISTORICAL_CAPTURE_DEADLINE, "ANNOUNCEMENT_FALLBACK_CAPTURE_DEADLINE_EXPIRED"}):
                 raise
             failed_chunks.append(exc)
             checkpoint.diagnose(exc.reason_code, exc.detail)
@@ -2782,8 +2853,19 @@ def validate_complete_historical_reconstruction_batch(
                         authority,
                         target_trade_date=target,
                         catalog=authority_catalog,
+                        known_at=reconstructed,
                     ):
                         raise ValueError("reconstruction authority differs")
+                    additions = authority["reconciliation"]["added_to_prior"]
+                    if additions:
+                        from server.common.qmt_datadir_daily_coverage import load_daily_manifest
+
+                        truth = authority["qmt_daily_truth"]
+                        native = load_daily_manifest(connection, target.isoformat(), decision_known_at=reconstructed,
+                                                     manifest_hash=truth["truth_hash"], verify_rows=False)
+                        entities = {item["stock_code"]: item for item in (native or {}).get("entities", ())}
+                        if any(entities.get(item["stock_code"]) != item["native_daily_entity"] for item in additions):
+                            raise ValueError("reconstruction added listing native trade proof differs")
                     requested_start = _qmt_time(
                         datetime.combine(batch_start, datetime.min.time())
                     )
@@ -3187,6 +3269,7 @@ def _publish_batch(
     incremental_proof: Mapping[str, Any] | None = None,
     reconstruction_provenance: Mapping[str, Any] | None = None,
     deadline_at: datetime | None = None,
+    deadline_monotonic: float | None = None,
     now_fn: Callable[[], datetime] = datetime.now,
 ) -> tuple[list[str], datetime]:
     from server.common.pit_facts import (
@@ -3286,6 +3369,7 @@ def _publish_batch(
                 reconstruction.get("authority") or {},
                 target_trade_date=reconstruction_target,
                 catalog=catalog,
+                known_at=reconstructed_at,
             )
         ):
             raise QMTAnnouncementBlocked(
@@ -3368,15 +3452,16 @@ def _publish_batch(
 
     def check_deadline(stage: str) -> datetime:
         observed = _dt(now_fn())
-        if deadline_at is not None and observed > _dt(deadline_at):
+        if ((deadline_at is not None and observed > _dt(deadline_at))
+                or (deadline_monotonic is not None and monotonic() >= deadline_monotonic)):
             raise QMTAnnouncementBlocked(
-                "QMT_ANNOUNCEMENT_CAPTURE_CLOCK_REVERSED", stage
+                HISTORICAL_PUBLISH_DEADLINE if reconstruction_mode else "QMT_ANNOUNCEMENT_CAPTURE_CLOCK_REVERSED", stage
             )
         return observed
 
     def write_rows(connection: Any) -> None:
         for index, code in enumerate(catalog.codes):
-            if index % 100 == 0:
+            if deadline_monotonic is not None or index % 100 == 0:
                 check_deadline(f"db-write:{index}")
             source_rows = [dict(item) for item in results[code]]
             provider_receipt = (
@@ -3385,7 +3470,9 @@ def _publish_batch(
                 else None
             )
             bindings: list[dict[str, Any]] = []
-            for item in source_rows:
+            for item_index, item in enumerate(source_rows):
+                if deadline_monotonic is not None and item_index % 25 == 0:
+                    check_deadline(f"db-event:{index}:{item_index}")
                 receipt = append_event_revision(
                     connection,
                     item,
@@ -3978,15 +4065,16 @@ def synchronize_historical_cninfo_announcements(
     checkpoint_root: Path,
     catalog: AnnouncementCatalog,
     context: HistoricalReconstructionContext,
-    now_fn: Callable[[], datetime] = datetime.now,
+    now_fn: Callable[[], datetime] = _shanghai_now,
     window_days: int = DEFAULT_WINDOW_DAYS,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    progress=None,
 ) -> dict[str, Any]:
     """Reconstruct one missing target batch without relabelling its knowledge time.
 
     The provider query is bounded by the target-day cutoff, while every event
     and empty receipt becomes known only at the actual reconstruction time.
-    Validated shards survive retries without an overall elapsed-time limit.
+    Validated shards survive a bounded attempt and are reused on fenced retry.
     """
 
     if not 20 <= int(window_days) <= 3660:
@@ -4003,26 +4091,46 @@ def synchronize_historical_cninfo_announcements(
         raise QMTAnnouncementBlocked(
             "QMT_ANNOUNCEMENT_RECONSTRUCTION_CLOCK_INVALID"
         )
+    publish_deadline = started_at + HISTORICAL_RECONSTRUCTION_BUDGET
+    capture_deadline = publish_deadline - HISTORICAL_RECONSTRUCTION_PUBLISH_RESERVE
+    time_observed = monotonic()
+    publish_monotonic = time_observed + (publish_deadline - observed_at).total_seconds()
+    capture_monotonic = time_observed + (capture_deadline - observed_at).total_seconds()
+
+    def check_capture_deadline(unit: str) -> None:
+        if monotonic() >= capture_monotonic:
+            raise QMTAnnouncementBlocked(HISTORICAL_CAPTURE_DEADLINE, unit)
+
+    check_capture_deadline("checkpoint")
+    binder = getattr(adapter, "bind_capture_deadline", None)
+    if callable(binder):
+        binder(fact_cutoff_at=started_at, max_capture_delay=capture_deadline - started_at)
     window_start = target - timedelta(days=int(window_days))
     window_end = target
-    seed = {
-        "schema": "probiga.qmt-announcement-reconstruction-batch-id.v2",
+    requested_start = _qmt_time(datetime.combine(window_start, datetime.min.time()))
+    requested_end = _qmt_time(source_cutoff)
+    scope = {
+        "schema": "probiga.cninfo-announcement-query-scope.v1",
         "source": CNINFO_ANNOUNCEMENT_SOURCE,
         "target_trade_date": target.isoformat(),
         "source_query_cutoff_at": _dt_text(source_cutoff),
-        "build_sha": identity["build_sha"],
+        "query_window_start": window_start.isoformat(),
+        "query_window_end": window_end.isoformat(),
         "catalog_batch_id": catalog.batch_id,
         "catalog_manifest_hash": catalog.manifest_hash,
         "catalog_member_set_hash": catalog.member_set_hash,
-        "authority_sha256": canonical_hash(identity["authority"]),
+        "instruments": [[code, catalog.qmt_by_code[code]] for code in catalog.codes],
+        "provider_receipt_schema": CNINFO_PROVIDER_RECEIPT_SCHEMA,
+        "source_event_contract": HISTORICAL_SOURCE_EVENT_CONTRACT,
     }
-    batch_id = (
-        f"cninfo-ann-reconstruction-{target.strftime('%Y%m%d')}-"
-        f"{canonical_hash(seed)[:16]}"
+    query_scope_sha256 = canonical_hash(scope)
+    checkpoint_id = (
+        f"cninfo-ann-reconstruction-scope-{target.strftime('%Y%m%d')}-"
+        f"{query_scope_sha256[:32]}"
     )
     checkpoint = AnnouncementCheckpoint.open(
         Path(checkpoint_root),
-        batch_id=batch_id,
+        batch_id=checkpoint_id,
         fact_cutoff_at=source_cutoff,
         window_start=window_start,
         window_end=window_end,
@@ -4034,21 +4142,44 @@ def synchronize_historical_cninfo_announcements(
         coverage_window_start=window_start,
         manifest_extra={
             "capture_mode": "HISTORICAL_RECONSTRUCTION",
-            # Scheduler attempts have different run UIDs.  Staging is bound
-            # instead to the exact target/build/catalog/authority so a fenced
-            # retry can resume already attested members without mixing data.
-            "reconstruction_build_sha": identity["build_sha"],
-            "reconstruction_authority_sha256": canonical_hash(
-                identity["authority"]
-            ),
+            "source_query_scope_sha256": query_scope_sha256,
         },
     )
     _connect_announcement_transport(adapter, source=CNINFO_ANNOUNCEMENT_SOURCE)
-    staged_receipts = {
-        code: receipt
-        for code in catalog.codes
-        if (receipt := checkpoint.load_provider_receipt(code)) is not None
-    }
+    staged_receipts = {}
+    for code in catalog.codes:
+        check_capture_deadline(f"restore:{code}")
+        result = checkpoint._load_result(code)
+        if result is None:
+            continue
+        receipt = result.get("provider_receipt")
+        if not _fallback_receipt_valid(
+            receipt, source=CNINFO_ANNOUNCEMENT_SOURCE, stock_code=code,
+            qmt_code=catalog.qmt_by_code[code], requested_start_time=requested_start,
+            requested_end_time=requested_end, result_count=len(result["events"]),
+            catalog_codes=catalog.codes, staged=True,
+        ):
+            raise QMTAnnouncementBlocked("QMT_ANNOUNCEMENT_RECONSTRUCTION_STAGED_RECEIPT_INVALID", code)
+        try:
+            master_at = _dt(receipt.get("security_master_started_at"))
+            captured_at = _dt(receipt.get("captured_at"))
+            event_keys = set()
+            for event in result["events"]:
+                event_date = date.fromisoformat(str(event.get("event_date") or ""))
+                published = _dt(event["published_at"]) if event.get("published_at") else None
+                event_key = str(event.get("event_key") or "")
+                if (event.get("stock_code") != code or event.get("qmt_code") != catalog.qmt_by_code[code]
+                        or not event_key.startswith("cninfo:") or event_key in event_keys
+                        or not _SHA256_RE.fullmatch(str(event.get("source_row_hash") or ""))
+                        or not window_start <= event_date <= window_end
+                        or (published is not None and (published.date() != event_date or published > source_cutoff))):
+                    raise ValueError("staged announcement source scope differs")
+                event_keys.add(event_key)
+        except (TypeError, ValueError) as exc:
+            raise QMTAnnouncementBlocked("QMT_ANNOUNCEMENT_RECONSTRUCTION_STAGED_RECEIPT_INVALID", code) from exc
+        if not source_cutoff < master_at <= captured_at <= observed_at:
+            raise QMTAnnouncementBlocked("QMT_ANNOUNCEMENT_RECONSTRUCTION_STAGED_RECEIPT_INVALID", code)
+        staged_receipts[code] = receipt
     if staged_receipts:
         restorer = getattr(adapter, "restore_capture_receipts", None)
         if not callable(restorer):
@@ -4056,15 +4187,46 @@ def synchronize_historical_cninfo_announcements(
                 "QMT_ANNOUNCEMENT_RECONSTRUCTION_RESUME_UNSUPPORTED"
             )
         restorer(staged_receipts)
-    results = _download_and_read(
-        adapter,
-        checkpoint=checkpoint,
-        catalog=catalog,
-        fact_cutoff_at=source_cutoff,
-        window_start=window_start,
-        batch_size=int(batch_size),
-        source=CNINFO_ANNOUNCEMENT_SOURCE,
-    )
+    completed_units = len(staged_receipts)
+    resumed_units = completed_units
+    progress_started = last_report = monotonic()
+    if progress is not None:
+        progress.checkpoint = {"checkpoint_id": checkpoint_id, "source_query_scope_sha256": query_scope_sha256,
+                               "source": CNINFO_ANNOUNCEMENT_SOURCE, "target_date": target.isoformat()}
+        progress.emit("source_checkpoint", completed_units=completed_units,
+                      resumed_units=resumed_units,
+                      capture_deadline_at=_dt_text(capture_deadline), publish_deadline_at=_dt_text(publish_deadline))
+
+    def report_saved_stock(code: str) -> None:
+        nonlocal completed_units, last_report
+        completed_units += 1
+        current = monotonic()
+        if (progress is not None and (completed_units % 50 == 0 or completed_units == len(catalog.codes)
+                                      or current - last_report >= 30)):
+            rate = (completed_units - resumed_units) / max(current - progress_started, 0.001)
+            progress.emit("source_checkpoint", completed_units=completed_units, current_unit=code,
+                          committed_units_per_second=round(rate, 3))
+            last_report = current
+
+    try:
+        results = _download_and_read(
+            adapter,
+            checkpoint=checkpoint,
+            catalog=catalog,
+            fact_cutoff_at=source_cutoff,
+            window_start=window_start,
+            batch_size=int(batch_size),
+            source=CNINFO_ANNOUNCEMENT_SOURCE,
+            before_fetch=check_capture_deadline,
+            after_save=report_saved_stock,
+        )
+    except Exception:
+        if progress is not None:
+            progress.emit("source_checkpoint", status="FAILED", completed_units=completed_units)
+        raise
+    check_capture_deadline("security-master-end")
+    if progress is not None:
+        progress.emit("source_checkpoint", status="COMPLETE", completed_units=completed_units)
     receipt_reader = getattr(adapter, "capture_receipts", None)
     raw_receipts = receipt_reader() if callable(receipt_reader) else None
     if not isinstance(raw_receipts, Mapping) or set(raw_receipts) != set(
@@ -4074,8 +4236,6 @@ def synchronize_historical_cninfo_announcements(
             "QMT_ANNOUNCEMENT_RECONSTRUCTION_RECEIPTS_INCOMPLETE"
         )
     receipts = {str(code): dict(value) for code, value in raw_receipts.items()}
-    requested_start = _qmt_time(datetime.combine(window_start, datetime.min.time()))
-    requested_end = _qmt_time(source_cutoff)
     directory_anchors: set[tuple[Any, ...]] = set()
     captured_times: list[datetime] = []
     for code in catalog.codes:
@@ -4137,6 +4297,8 @@ def synchronize_historical_cninfo_announcements(
             "QMT_ANNOUNCEMENT_RECONSTRUCTION_ENVELOPE_INVALID"
         )
     directory_anchor = list(directory_anchors)[0]
+    if progress is not None:
+        progress.emit("source_capture", status="COMPLETE", completed_units=completed_units)
     provenance_core = {
         "schema": QMT_ANNOUNCEMENT_RECONSTRUCTION_SCHEMA,
         "mode": "HISTORICAL_RECONSTRUCTION",
@@ -4144,6 +4306,7 @@ def synchronize_historical_cninfo_announcements(
         "query_window_start": window_start.isoformat(),
         "query_window_end": window_end.isoformat(),
         "source_query_cutoff_at": _dt_text(source_cutoff),
+        "source_query_scope_sha256": query_scope_sha256,
         "reconstruction_started_at": _dt_text(effective_started_at),
         "reconstructed_at": _dt_text(reconstructed_at),
         "known_at": _dt_text(reconstructed_at),
@@ -4168,9 +4331,7 @@ def synchronize_historical_cninfo_announcements(
             "directory_attestation_sha256": directory_anchor[6],
             "requested_catalog_member_set_sha256": directory_anchor[7],
         },
-        "event_content_contract": (
-            "OFFICIAL_ANNOUNCEMENT_ID_PUBLISHED_AT_RAW_SOURCE_ROW_SHA256_V1"
-        ),
+        "event_content_contract": HISTORICAL_SOURCE_EVENT_CONTRACT,
         "zero_result_receipts_complete": True,
         "automatic_real_order_submission": False,
         "real_order_authority": False,
@@ -4194,6 +4355,13 @@ def synchronize_historical_cninfo_announcements(
             for code in catalog.codes
         ],
     })
+    publication_identity = canonical_hash({
+        "schema": "probiga.cninfo-announcement-publication-id.v1",
+        "source_query_scope_sha256": query_scope_sha256,
+        "reconstruction_sha256": provenance["reconstruction_sha256"],
+        "delta_root_sha256": delta_root,
+    })
+    batch_id = f"cninfo-ann-reconstruction-{target.strftime('%Y%m%d')}-{publication_identity[:32]}"
     batch_root, entries = build_batch_root(
         batch_id=batch_id,
         fact_cutoff_at=source_cutoff,
@@ -4220,8 +4388,10 @@ def synchronize_historical_cninfo_announcements(
     }
     incremental["chain_root_hash"] = canonical_hash(incremental)
     checkpoint.prepare_publish(
-        batch_root_hash=batch_root, received_at=reconstructed_at
+        batch_root_hash=batch_root, received_at=reconstructed_at, publication_batch_id=batch_id
     )
+    if progress is not None:
+        progress.emit("database_publish", completed_units=completed_units)
     coverage_ids, completed_at = _publish_batch(
         engine,
         batch_id=batch_id,
@@ -4238,11 +4408,13 @@ def synchronize_historical_cninfo_announcements(
         provider_receipts=receipts,
         incremental_proof=incremental,
         reconstruction_provenance=provenance,
+        deadline_at=publish_deadline,
+        deadline_monotonic=publish_monotonic,
         now_fn=now_fn,
     )
     try:
         checkpoint.mark_complete(
-            batch_root_hash=batch_root, received_at=reconstructed_at
+            batch_root_hash=batch_root, received_at=reconstructed_at, publication_batch_id=batch_id
         )
     except OSError:
         pass
@@ -4364,7 +4536,7 @@ def validate_task_result(payload: Any, process_exit: int) -> str:
             if (
                 not isinstance(no_trade_codes, list)
                 or not isinstance(exclusions, list)
-                or additions != []
+                or not isinstance(additions, list)
                 or no_trade_codes != sorted(set(no_trade_codes))
                 or any(
                     _CODE_RE.fullmatch(str(code)) is None
@@ -4441,6 +4613,7 @@ def validate_task_result(payload: Any, process_exit: int) -> str:
             or not _reconstruction_stock_scope_matches(
                 authority,
                 target_trade_date=target,
+                known_at=received,
             )
             or authority.get("reconciliation_sha256")
             != canonical_hash(reconciliation)
@@ -4477,7 +4650,7 @@ def validate_task_result(payload: Any, process_exit: int) -> str:
             != provenance.get("catalog_manifest_hash")
             or int(reconciliation.get("authority_eligible_count") or -1)
             != int(provenance.get("catalog_member_count") or -2)
-            or prior_count - len(exclusions)
+            or prior_count - len(exclusions) + len(additions)
             != int(provenance.get("catalog_member_count") or -2)
             or attested_count <= 0
             or no_trade_count != len(no_trade_codes)

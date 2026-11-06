@@ -3,11 +3,13 @@ from datetime import date, datetime
 import json
 from pathlib import Path
 import sqlite3
+from time import monotonic
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
+from sqlalchemy.exc import OperationalError
 
 from integrations.qmt.datadir import CST, DAT_HEADER, MINUTE_PERIOD
 from integrations.qmt.datadir_import import ATTEMPT_DATASET, SOURCE, Universe, UniverseMember
@@ -161,6 +163,104 @@ def test_stage_timeout_preserves_old_complete_publication_and_retries_landed_run
     assert results.load_receipt(item.engine, dataset=ATTEMPT_DATASET, trade_date=str(DAY)) is None
     published = results.load_receipt(item.engine, dataset="stock_minute", trade_date=str(DAY))
     assert published["run_id"] == "retry-run" and published["status"] == "COMPLETE"
+
+
+def test_post_commit_cleanup_timeout_keeps_pass_and_retries_without_harvest(
+    existing_partition, monkeypatch, capsys,
+):
+    item = existing_partition
+    day = str(DAY)
+    _publish_original(item)
+    fields = "stock_code,trade_time,trade_date,price,`change`,change_pct,volume,amount,qmt_code"
+    with item.engine.begin() as conn:
+        native = [dict(row) for row in conn.execute(text("SELECT " + fields + " FROM sm_stock_minute")).mappings()]
+        conn.execute(text("DELETE FROM sm_stock_minute WHERE stock_code='600000'"))
+    monkeypatch.setattr(importer, "load_project_env", lambda: None)
+    monkeypatch.setattr(importer, "get_minute_mysql_url", lambda: "sqlite://")
+    monkeypatch.setattr(importer, "create_pooled_engine", lambda *_a, **_k: item.engine)
+    monkeypatch.setattr(importer, "_sessions", lambda *_a: [DAY])
+    monkeypatch.setattr(importer, "load_universe", lambda *_a, **_k: Universe(
+        {member.qmt_code: member for member in item.universe}, {}))
+    monkeypatch.setattr(importer, "require_schema", lambda *_a: None)
+    monkeypatch.setattr(importer, "existing_sources", lambda *_a: {DAY: [SOURCE]})
+    monkeypatch.setattr(importer, "new_run_id", lambda: "qdd_20261103043000_abcdef12")
+
+    def harvest(conn, *, run_id, **_kwargs):
+        params = ",".join(":" + name.strip("`") for name in fields.split(","))
+        conn.execute(text("INSERT INTO qmt_datadir_minute_stage (run_id," + fields + ") VALUES (:run_id," + params + ")"),
+                     [{**row, "run_id": run_id} for row in native])
+        conn.commit()
+        return {DAY: dict(rows=482, codes=list(CODES), code_rows={code: 241 for code in CODES}, digest="c" * 64)}
+
+    monkeypatch.setattr(importer, "harvest", harvest)
+    faults = []
+
+    def cleanup_timeout(_conn, _cursor, sql, parameters, _context, _many):
+        if sql.lstrip().startswith("DELETE FROM `qmt_datadir_minute_stage`"):
+            faults.append(sql)
+            raise OperationalError(sql, parameters, Exception(2013, "minute staging cleanup read timeout"))
+
+    argv = ["--start", day, "--end", day, "--apply", "--json", "--datadir-root", str(item.root)]
+    event.listen(item.engine, "before_cursor_execute", cleanup_timeout)
+    try:
+        assert importer.main(argv) == 0
+    finally:
+        event.remove(item.engine, "before_cursor_execute", cleanup_timeout)
+    first = capsys.readouterr()
+    assert json.loads(first.out.splitlines()[-1])["status"] == "PASS"
+    assert "minute-stage-cleanup" in first.err and faults
+    published = results.load_receipt(item.engine, dataset="stock_minute", trade_date=day)
+    assert published["run_id"] == "qdd_20261103043000_abcdef12" and published["row_count"] == 482
+    with item.engine.connect() as conn:
+        assert conn.execute(text("SELECT COUNT(*) FROM qmt_datadir_minute_stage")).scalar_one() == 482
+
+    monkeypatch.setattr(importer, "harvest", lambda *_a, **_k: pytest.fail("current publication must not reharvest"))
+    assert importer.main(argv) == 0
+    second = capsys.readouterr()
+    assert json.loads(second.out.splitlines()[-1])["status"] == "PASS"
+    assert any(json.loads(line)["status"] == "COMPLETE" for line in second.err.splitlines()
+               if "minute-stage-cleanup" in line)
+    assert results.load_receipt(item.engine, dataset="stock_minute", trade_date=day) == published
+    with item.engine.connect() as conn:
+        assert conn.execute(text("SELECT COUNT(*) FROM qmt_datadir_minute_stage")).scalar_one() == 0
+
+
+def test_cleanup_resumes_committed_batches_and_preserves_other_stage_scope(existing_partition):
+    item = existing_partition
+    _publish_original(item)
+    with item.engine.begin() as conn:
+        fields = "stock_code,trade_time,trade_date,price,`change`,change_pct,volume,amount,qmt_code"
+        conn.execute(text("INSERT INTO qmt_datadir_minute_stage SELECT 'original-minute-run'," + fields +
+                          " FROM sm_stock_minute"))
+        conn.execute(text("INSERT INTO qmt_datadir_minute_stage SELECT 'other-run'," + fields +
+                          " FROM sm_stock_minute LIMIT 1"))
+    delete_attempts = []
+
+    def interrupt_after_first_batch(_conn, _cursor, sql, params, _context, _many):
+        if sql.lstrip().startswith("DELETE FROM `qmt_datadir_minute_stage`"):
+            delete_attempts.append(params)
+            if len(delete_attempts) > 1:
+                raise OperationalError(sql, params, Exception(2013, "read timeout after first committed batch"))
+
+    event.listen(item.engine, "before_cursor_execute", interrupt_after_first_batch)
+    try:
+        partial = importer.drop_staged(item.engine, "original-minute-run", session=DAY,
+                                       deadline=monotonic() + 5, batch_rows=100)
+    finally:
+        event.remove(item.engine, "before_cursor_execute", interrupt_after_first_batch)
+    assert partial["status"] == "DEFERRED" and partial["deleted_rows"] == 100
+    assert len(delete_attempts) == 3
+    with item.engine.connect() as conn:
+        assert dict(conn.execute(text("SELECT run_id,COUNT(*) FROM qmt_datadir_minute_stage GROUP BY run_id")).all()) == {
+            "original-minute-run": 382, "other-run": 1,
+        }
+
+    completed = importer.drop_staged(item.engine, "original-minute-run", session=DAY,
+                                     deadline=monotonic() + 5, batch_rows=100)
+    assert completed["status"] == "COMPLETE"
+    assert completed["deleted_rows"] == 382 and completed["completed_batches"] == 4
+    with item.engine.connect() as conn:
+        assert conn.execute(text("SELECT run_id FROM qmt_datadir_minute_stage")).scalars().all() == ["other-run"]
 
 
 @pytest.mark.parametrize("case", ["current", "revised", "missing", "other_source", "shortfall"])

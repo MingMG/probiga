@@ -77,6 +77,28 @@ def test_official_inventory_plus_document_produces_verified_evidence(monkeypatch
     assert source._load_in_process(["001381"], target_date="2026-11-02") == {}
 
 
+def test_bse_issuer_listing_uses_consolidated_cninfo_directory_and_exact_title(monkeypatch):
+    title = "向不特定合格投资者公开发行股票并在北京证券交易所上市提示性公告"
+    body = title + "\n公司股票将于2026年11月6日在北京证券交易所上市。证券代码：920085"
+
+    def fetch(_session, method, url, **kwargs):
+        if url.endswith("szse_stock.json"):
+            return json.dumps({"stockList":[{"code":"920085", "category":"A股", "orgId":"9900063630"}]}).encode()
+        if url.endswith("query"):
+            assert method == "POST" and kwargs["data"]["column"] == "szse"
+            assert kwargs["data"]["stock"] == "920085,9900063630"
+            assert "searchkey" not in kwargs["data"]
+            return json.dumps({"announcements":[{"secCode":"920085", "orgId":"9900063630", "announcementTitle":title,
+                                                   "adjunctUrl":"finalpage/2026-11-04/1225658087.PDF"}], "hasMore":False}).encode()
+        assert url == "https://static.cninfo.com.cn/finalpage/2026-11-04/1225658087.PDF"
+        return b"%PDF-fixture"
+
+    monkeypatch.setattr(source, "_fetch", fetch)
+    monkeypatch.setattr(source, "extract_document_text", lambda raw: body)
+    found = source._load_in_process(["920085"], target_date="2026-11-05")
+    assert found["920085"]["listing_date"] == "2026-11-06"
+
+
 def test_unknown_issuer_and_unbounded_requests_are_terminal(monkeypatch):
     monkeypatch.setattr(source, "_fetch", lambda *a, **k: b'{"stockList": []}')
     with pytest.raises(source.OfficialListingEvidenceError, match="issuer_directory"):

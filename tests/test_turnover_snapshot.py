@@ -39,6 +39,7 @@ from server.common.turnover_snapshot import (
     parse_eastmoney_turnover_response,
     publish_turnover_snapshot,
     recover_completed_turnover_receipt,
+    recover_retained_turnover_rows,
 )
 from server.common.turnover_snapshot_schema import (
     TURNOVER_SNAPSHOT_ROW_TABLE,
@@ -1508,6 +1509,104 @@ def test_turnover_recovery_does_not_reuse_superseded_qmt_daily_publication(monke
         collector_build_sha=BUILD_SHA, collector_binary_sha256=BINARY_SHA,
         authority=revised, min_expected_count=2,
     ) is None
+    engine.dispose()
+
+
+def _revised_turnover_scope(engine, *, revised_amount=10000.99):
+    with engine.begin() as conn:
+        # The Eastmoney source used 1,000 shares. The original QMT row had an
+        # older volume, while the other stock has a persistent source amount difference.
+        conn.execute(text("UPDATE sm_stock_kline SET volume=1100 WHERE stock_code='000001'"))
+        conn.execute(text("UPDATE sm_stock_kline SET amount=4294987296 WHERE stock_code='600000'"))
+    original = _capture(engine)
+    publish_turnover_snapshot(engine, original, min_expected_count=2,
+                              published_at=datetime(2026, 8, 27, 18, 45))
+    next_cutoff = DECISION_AT + timedelta(hours=8)
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE sm_stock_kline SET volume=1000,amount=:amount WHERE stock_code='000001'"),
+                     {"amount": revised_amount})
+        conn.execute(text("UPDATE sm_stock_kline SET received_at=:at,batch_id='revised'"),
+                     {"at": next_cutoff.isoformat(sep=" ")})
+    authority = replace(_authority(), truth_run_id="revised-qmt", truth_sha256="d" * 64,
+                        decision_at=next_cutoff)
+    with engine.connect() as conn:
+        targets = freeze_qmt_turnover_targets(conn, target_date=TARGET_DATE, decision_at=next_cutoff,
+                                             authority=authority, min_expected_count=2)
+    return original, authority, targets
+
+
+def test_turnover_cli_reseals_verified_raw_under_corrected_qmt_without_refetch(
+    tmp_path, monkeypatch, capsys,
+):
+    engine = _engine()
+    original, authority, targets = _revised_turnover_scope(engine)
+    cutoff = authority.decision_at
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cutoff.replace(tzinfo=tz)
+
+    class LocalTransport:
+        transport_contract = original.transport_contract
+        resolved_endpoint = original.resolved_endpoint
+        now = staticmethod(lambda: cutoff)
+
+        def fetch(self, *args, **kwargs):
+            pytest.fail("full retained source coverage must avoid refetch")
+
+    monkeypatch.setattr(turnover_command, "datetime", Clock)
+    monkeypatch.setattr(turnover_command, "load_project_env", lambda: None)
+    monkeypatch.setattr(turnover_command, "create_tool_engine", lambda: engine)
+    monkeypatch.setattr(turnover_command, "validate_market_field_capture_runtime", lambda *_: None)
+    monkeypatch.setattr(turnover_command, "_require_open_closed_target", lambda *_a, **_k: None)
+    monkeypatch.setattr(turnover_command, "resolve_build_sha", lambda _: "f" * 40)
+    monkeypatch.setattr(turnover_command, "collector_bundle_sha256", lambda: "e" * 64)
+    monkeypatch.setattr(turnover_command, "load_turnover_universe_authority",
+                        lambda *_a, decision_at, **_k: replace(authority, decision_at=decision_at))
+    monkeypatch.setattr(turnover_command, "freeze_qmt_turnover_targets", lambda *_a, **_k: targets)
+    monkeypatch.setattr(turnover_command, "PinnedCurlEastmoneyTurnoverCollector", lambda **_: LocalTransport())
+    publish = turnover_command.publish_turnover_snapshot
+    monkeypatch.setattr(turnover_command, "publish_turnover_snapshot",
+                        lambda engine, run: publish(engine, run, min_expected_count=2, published_at=cutoff))
+
+    checkpoint = tmp_path / "turnover.json"
+    assert turnover_command.main(["--target-date", TARGET_DATE, "--checkpoint-file", str(checkpoint)]) == 0
+    receipt = json.loads(capsys.readouterr().out)
+    assert receipt["status"] == "COMPLETED" and receipt["run_id"] != original.run_id
+    assert receipt["decision_at"] == cutoff.isoformat()
+    assert receipt["authority_proof_identity"] == authority.truth_run_id
+    assert receipt["raw_payload_root_sha256"] == original.raw_payload_root_sha256
+    assert receipt["target_fingerprint_root_sha256"] != original.qmt_fingerprint_root_sha256
+    persisted = turnover_command._read_checkpoint(checkpoint)
+    assert persisted["completed_code_count"] == 2
+    assert persisted["request_started_at"] == original.request_started_at.isoformat(timespec="microseconds")
+    for row in original.rows:
+        shard = persisted["shards"][row.target.stock_code]
+        assert shard["raw_payload_sha256"] == row.raw_payload_sha256
+        assert shard["provider_http_date"] == row.provider_http_date
+        assert datetime.fromisoformat(shard["captured_at"]) == row.captured_at
+        assert datetime.fromisoformat(shard["provider_http_at"]) == row.provider_http_at
+    result = verify_turnover_publication_evidence(
+        engine, target_date=TARGET_DATE, decision_at=cutoff, min_expected_count=2,
+    )
+    assert set(result) == {"000001", "600000"}
+    assert json.loads(result["000001"]["turnover_evidence_json"])["snapshot_run_id"] == receipt["run_id"]
+    engine.dispose()
+
+
+def test_retained_turnover_defers_changed_source_mismatch_and_rejects_broken_old_proof():
+    engine = _engine()
+    original, authority, targets = _revised_turnover_scope(engine, revised_amount=10001.01)
+    options = {"targets": targets, "decision_at": authority.decision_at,
+               "transport_contract": original.transport_contract, "resolved_endpoint": original.resolved_endpoint}
+    started, retained = recover_retained_turnover_rows(engine, **options)
+    assert started == original.request_started_at and set(retained) == {"600000"}
+    assert recover_retained_turnover_rows(engine, **options, completed_codes={"600000"}) == (None, {})
+    with engine.begin() as conn:
+        conn.execute(text(f"UPDATE {TURNOVER_SNAPSHOT_ROW_TABLE} SET raw_payload_sha256=:hash WHERE stock_code='000001'"),
+                     {"hash": "a" * 64})
+    assert recover_retained_turnover_rows(engine, **options) == (None, {})
     engine.dispose()
 
 

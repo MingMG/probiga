@@ -2978,6 +2978,8 @@ def _qmt_daily_finality_recovery_allowed(row: dict, *, now: datetime) -> bool:
 
 def _critical_cron_catchup_allowed(row: dict, *, now: datetime, cron_time: str) -> bool:
     task_type = str(row.get("task_type") or "").strip()
+    if task_type == "analysis_premarket_external" and not datetime_time(9, 8) <= now.time() < datetime_time(9, 30):
+        return False
     if (
         task_type == RESEARCH_POOL_TASK_TYPE
         and row.get("_research_pool_target_complete") is True
@@ -3136,6 +3138,8 @@ def _cron_due(row: dict, *, now: datetime) -> bool:
     if row.get("_research_pool_target_complete") is True:
         return False
     task_type = str(row.get("task_type") or "").strip()
+    if task_type == "analysis_premarket_external" and not datetime_time(9, 8) <= now.time() < datetime_time(9, 30):
+        return False
     cron_min = _parse_hhmm(str(row.get("cron_time") or "17:10"))
     if cron_min is None:
         return False
@@ -4294,6 +4298,10 @@ def _task_timeout_minutes(
     now: datetime | None = None,
 ) -> int | None:
     task_type = str(row.get("task_type") or "").strip()
+    if task_type == "analysis_premarket_external":
+        current = now or _now_shanghai_naive()
+        deadline = datetime.combine(current.date(), datetime_time(9, 30))
+        return max(1, min(5, int((deadline - current.replace(tzinfo=None)).total_seconds() // 60)))
     if task_type in {"notice_eastmoney", "stock_finance"}:
         # These Linux collectors persist resumable checkpoints. A stalled
         # attempt must terminate and release its claim so automatic recovery
@@ -5687,8 +5695,19 @@ def _task_argument_row(
     """Bind formal analysis to one Shanghai execution/decision wall clock."""
 
     task_type = str(row.get("task_type") or "").strip()
-    if task_type in {"analysis_morning_strict", "analysis_premarket_external"}:
+    if task_type == "analysis_morning_strict":
         raise RuntimeError("retired analysis task has no publication authority")
+    if task_type == "analysis_premarket_external":
+        if row.get("script_path") != "tools/run_premarket_theme_forecast.py":
+            raise RuntimeError("retired analysis task has no publication authority")
+        current = now.astimezone(PRODUCTION_TIMEZONE).replace(tzinfo=None) if now.tzinfo else now
+        if (str(row.get("script_args") or "").split() != ["--json"]
+                or str(row.get("date_param") or "").strip()
+                or str(row.get("_trigger_source") or "") not in {"", "scheduled", "manual"}
+                or target_date != current.date().isoformat()
+                or not datetime_time(9, 8) <= current.time() < datetime_time(9, 30)):
+            raise RuntimeError("premarket theme publication requires today's registered 09:08 window")
+        return {**row, "_scheduler_target_trade_date": target_date}
     if task_type == "free_index_daily_canonical":
         return {**row, "_scheduler_target_trade_date": target_date}
     trigger_source = str(row.get("_trigger_source") or "").strip()

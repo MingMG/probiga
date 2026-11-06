@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
+from hashlib import sha256
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -163,6 +165,60 @@ def test_historical_catalog_reconciliation_rejects_unexplained_addition():
         "QMT_ANNOUNCEMENT_RECONSTRUCTION_CATALOG_DIFF_UNEXPLAINED"
     )
     assert exc.value.detail == "000002"
+
+
+def test_historical_catalog_allows_exact_native_traded_bse_listing_with_official_evidence(monkeypatch):
+    from server.common import qmt_announcement_pit as core
+    from server.common.official_listing_evidence import SCHEMA as LISTING_SCHEMA
+    from server.common.qmt_datadir_daily_coverage import canonical_bar
+    from tools import sync_qmt_announcement_pit as tool
+
+    target = date(2026, 11, 6)
+    current = _stock_catalog("current", ("000001", "1991-04-03"), ("920085", target.isoformat()))
+    current.members[-1]["qmt_code"] = "920085.BJ"
+    prior = _stock_catalog("prior", ("000001", "1991-04-03"))
+    truth = {"schema": "probiga.qmt-daily-market-consumer-truth.v1", "provider": "qmt_datadir",
+             "requested_sessions": [target.isoformat()], "catalog_batch_id": current.batch_id,
+             "catalog_manifest_hash": current.manifest_hash, "catalog_member_set_hash": current.member_set_hash,
+             "attested_row_count": 2, "truth_hash": "e" * 64}
+    entity = {"stock_code": "920085", "classification": "TRADED",
+              "evidence": canonical_bar({"stock_code": "920085", "trade_date": target, "open": 26,
+                                         "close": 27, "high": 30, "low": 25, "volume": 100, "amount": 2700,
+                                         "pre_close": "17.79"})}
+    entity["row_hash"] = canonical_digest(entity)
+    document = ("向不特定合格投资者公开发行股票并在北京证券交易所上市提示性公告\n"
+                "本公司股票将于2026年11月6日在北京证券交易所上市。证券代码：920085")
+    official = {"schema": LISTING_SCHEMA, "stock_code": "920085", "listing_date": target.isoformat(),
+                "source_url": "https://static.cninfo.com.cn/finalpage/2026-11-04/1225658087.PDF",
+                "source_text": document, "source_text_sha256": sha256(document.encode()).hexdigest(),
+                "official_document_sha256": "a" * 64, "publication_date": "2026-11-04",
+                "captured_at": "2026-11-07T03:30:00+08:00"}
+    monkeypatch.setattr(tool, "load_qmt_daily_market_truth", lambda *a, **k: SimpleNamespace(
+        **{**truth, "requested_sessions": (target.isoformat(),)}, as_dict=lambda: truth))
+    monkeypatch.setattr(tool, "load_stock_catalog", lambda *a, **k: current if k.get("batch_id") else prior)
+    monkeypatch.setattr(tool, "_load_datadir_reconstruction_scope", lambda *a, **k: ([], {"920085": entity}))
+    monkeypatch.setattr(tool, "retained_listing_evidence", lambda *a, **k: {})
+    calls = []
+
+    def listing(codes, *, target_date):
+        assert codes == ["920085"] and target_date == "2026-11-05"
+        calls.append(codes)
+        return {"920085": official}
+
+    monkeypatch.setattr(tool, "load_official_listing_evidence", listing)
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    decision = datetime(2026, 11, 7, 3, 29)
+    catalog, _ = tool._load_historical_reconstruction_authority(engine, target_trade_date=target,
+                                                                decision_known_at=decision, existing_batch_only=True)
+    assert catalog.codes == ("000001", "920085") and calls == []
+    catalog, authority = tool._load_historical_reconstruction_authority(engine, target_trade_date=target,
+                                                                        decision_known_at=decision)
+    assert calls == [["920085"]]
+    assert authority["reconciliation"]["added_to_prior"][0]["native_daily_entity"] == entity
+    assert core._reconstruction_authority_matches(authority, target_trade_date=target, catalog=catalog,
+                                                  known_at=datetime(2026, 11, 7, 3, 31))
+    assert not core._reconstruction_authority_matches(authority, target_trade_date=target, catalog=catalog,
+                                                      known_at=decision)
 
 
 @pytest.mark.parametrize("daily_evidence", [

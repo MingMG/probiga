@@ -129,6 +129,11 @@ def test_manual_ladder_dispatch_binds_closed_friday_without_overview_write(
     assert args == ["--dates", "2026-11-06", "--limit-ladder-only"]
     with pytest.raises(ValueError, match="exact manual"):
         build_scheduler_task_args({**task, "_trigger_source": "scheduled"}, registered["script_path"], selected)
+    assert scheduler.run_task_now(400, trade_date=DAY, full_overview=True)["accepted"]
+    overview_task = {**claimed[1], "_trigger_source": "manual"}
+    assert "_limit_ladder_only" not in overview_task
+    assert _task_dispatch_date(overview_task, source, now=OBSERVED) == selected
+    assert build_scheduler_task_args(overview_task, registered["script_path"], selected) == [DAY.isoformat()]
 
     monkeypatch.setattr(ladder, "_fetch_pool", lambda *_args, **_kwargs: ([], _raw()))
     monkeypatch.setattr(overview, "load_project_env", lambda: None)

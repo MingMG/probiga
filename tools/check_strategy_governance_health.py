@@ -2446,6 +2446,7 @@ def _latest_qmt_announcement_batch_check(
         from server.common.qmt_announcement_pit import (
             ANNOUNCEMENT_FALLBACK_REASON_CODES,
             AUTHORITATIVE_ANNOUNCEMENT_SOURCES,
+            CNINFO_ANNOUNCEMENT_SOURCE,
             QMTAnnouncementBlocked,
             QMT_ANNOUNCEMENT_SOURCE,
         )
@@ -2466,13 +2467,20 @@ def _latest_qmt_announcement_batch_check(
             raise ValueError("announcement existing-batch disposition differs")
 
         source_name = str(proof.get("source") or "")
+        fallback_reason = str(proof.get("fallback_reason") or "")
         fallback_valid = bool(
             source_name == QMT_ANNOUNCEMENT_SOURCE
             or (
                 source_name in AUTHORITATIVE_ANNOUNCEMENT_SOURCES
                 and proof.get("primary_source") == QMT_ANNOUNCEMENT_SOURCE
-                and str(proof.get("fallback_reason") or "")
-                in ANNOUNCEMENT_FALLBACK_REASON_CODES
+                and (
+                    fallback_reason in ANNOUNCEMENT_FALLBACK_REASON_CODES
+                    or (
+                        source_name == CNINFO_ANNOUNCEMENT_SOURCE
+                        and proof.get("mode") == "HISTORICAL_RECONSTRUCTION_EXISTING"
+                        and fallback_reason == "QMT_ANNOUNCEMENT_HISTORICAL_RECONSTRUCTION_REQUIRED"
+                    )
+                )
             )
         )
         stock_count = _integer(proof.get("stock_count"))

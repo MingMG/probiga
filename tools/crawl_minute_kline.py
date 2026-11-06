@@ -580,7 +580,7 @@ def verified_no_trade_codes(engine, catalog, *, trade_date, decision_known_at):
         if manifest["catalog_member_set_hash"] != catalog.member_set_hash:
             raise ValueError("daily no-trade proof catalog content differs")
         codes = {item["stock_code"] for item in manifest["entities"]
-                 if item["classification"] in {"NO_TRADE", "NOT_LISTED"}
+                 if item["classification"] in {"NO_TRADE", "NOT_LISTED", "DELISTED"}
                  or (item["classification"] == "TRADED"
                      and Decimal(item["evidence"]["volume"]) == 0
                      and Decimal(item["evidence"]["amount"]) == 0)}

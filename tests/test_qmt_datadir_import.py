@@ -19,6 +19,8 @@ from integrations.qmt.datadir import (
     MINUTE_PERIOD,
     DatadirError,
     iter_daily_rows,
+    iter_index_daily_rows,
+    iter_index_minute_rows,
     iter_minute_rows,
     load_dat,
     read_dat,
@@ -148,6 +150,26 @@ def test_daily_rows_convert_lots_to_shares(tmp_path):
     assert row[9] == Decimal("9.640")     # pre-close
     assert row[10] == Decimal("0.090")
     assert row[11] == Decimal("0.090") / Decimal("9.640") * 100
+
+
+@pytest.mark.parametrize("iterator, period, market, code, low, high, amount_column, expected", [
+    (iter_daily_rows, DAILY_PERIOD, "SZ", "300308", 2498621527, 5, 8, 23973458007),
+    (iter_index_daily_rows, DAILY_PERIOD, "SH", "000001", 3835420247, 179, 8, 772634566231),
+    (iter_minute_rows, MINUTE_PERIOD, "SZ", "300308", 0, 1, 7, 4294967296),
+    (iter_index_minute_rows, MINUTE_PERIOD, "SH", "000001", 1406993009, 2, 5, 9996927601),
+])
+def test_turnover_decodes_both_unsigned_words_without_changing_units(
+    tmp_path, iterator, period, market, code, low, high, amount_column, expected,
+):
+    raw = _record("00:00" if period == DAILY_PERIOD else "15:00", 1000, 1000, 1000, 1000, 1, low, 1000)
+    raw[9] = high
+    _write(tmp_path / market / period / f"{code}.DAT", [raw])
+    dat = load_dat(tmp_path, market, period, code)
+    if period == DAILY_PERIOD:
+        (_, row), = iterator(dat, [SESSION])
+    else:
+        (_, row), = iterator(dat, select_records(dat, [SESSION]), GRID)
+    assert row[amount_column] == Decimal(expected)
 
 
 def test_load_dat_returns_none_for_a_missing_instrument(tmp_path):
