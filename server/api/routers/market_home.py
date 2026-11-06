@@ -69,6 +69,7 @@ _EVENT_LIMIT = 20
 _RANK_LIMIT = 10
 _TURNOVER_CORRECTION_LIMIT = 16
 _CACHE_TTL = 10
+_CLOSED_CACHE_TTL = 30
 _CACHE_SIZE = 32
 _LIVE_MAX_AGE = timedelta(seconds=90)
 _cache: OrderedDict[str, tuple[float, dict]] = OrderedDict()
@@ -467,12 +468,12 @@ def _rank(rows: list[dict], key: str, *, descending: bool) -> list[dict]:
 def build_market_board(day: date, *, now: datetime) -> dict:
     """Keep exact dated reads and unavailable data boundaries independent."""
     started_at = monotonic()
-    deadline = started_at + 8
     day_text = day.isoformat()
     same_day = day == now.date()
     live = same_day and _live_session(now)
     lunch = same_day and time(11, 30) < now.time() < time(13)
     close_ready = day < now.date() or (same_day and now.time() >= time(15))
+    deadline = started_at + (12 if close_ready else 8)
     as_of = None
     source = None
     turnover_evidence = None
@@ -552,8 +553,11 @@ def build_market_board(day: date, *, now: datetime) -> dict:
         source = LIMIT_UP_EVENT_TABLE if events[0].get("event_family") == "LIMIT_UP_LIFECYCLE" else "sm_market_radar_event"
     up = [row for row in stocks if row["change_pct"] > 0]
     down = [row for row in stocks if row["change_pct"] < 0]
+    status = "unavailable"
+    if as_of:
+        status = "partial" if unavailable or len(turnover_rows) != len(stocks) else "available"
     return {
-        "status": "partial" if as_of else "unavailable",
+        "status": status,
         "reason": None if as_of else stage,
         "requested_date": day_text, "trade_date": day_text if as_of else None,
         "as_of": _timestamp(as_of) if as_of else None, "source": source,
@@ -595,9 +599,12 @@ def market_board(requested: str = Query(alias="date", pattern=r"^\d{4}-\d{2}-\d{
     now = datetime.now(SHANGHAI).replace(tzinfo=None)
     with _cache_lock:
         cached = _cache.get(key)
-        if cached and monotonic() - cached[0] < _CACHE_TTL:
-            board = cached[1]
-            if board.get("source") != "sm_stock_current" or _fresh_live_stamp(_clock(board.get("as_of")), now):
+        if cached:
+            captured, board = cached
+            is_live = board.get("source") == "sm_stock_current"
+            is_complete_close = board.get("as_of_basis") == "exchange_close" and board.get("status") == "available"
+            ttl = _CLOSED_CACHE_TTL if is_complete_close else _CACHE_TTL
+            if monotonic() - captured < ttl and (not is_live or _fresh_live_stamp(_clock(board.get("as_of")), now)):
                 return board
     result = build_market_board(selected_day, now=now)
     with _cache_lock:

@@ -106,6 +106,39 @@ def test_board_uses_only_verified_exact_session_and_keeps_unsupported_values_unk
     assert result["indices"][0]["source"] == "sm_index_kline"
 
 
+def test_complete_close_survives_slower_quote_read_and_caches_exact_date(market_db, monkeypatch):
+    with market_db.begin() as connection:
+        _stock(connection, "000001", 103, source=sorted(market_home.VERIFIED_FREE_DAILY_ROW_SOURCES)[0],
+               quality="SOURCE_VERIFIED")
+        for code in market_home.INDEX_NAMES:
+            _index(connection, code)
+
+    elapsed = 0.0
+    read_quotes = market_home._day_quotes
+
+    def slow_quotes(*args):
+        nonlocal elapsed
+        rows = read_quotes(*args)
+        elapsed = 8.5
+        return rows
+
+    monkeypatch.setattr(market_home, "monotonic", lambda: elapsed)
+    monkeypatch.setattr(market_home, "_day_quotes", slow_quotes)
+    monkeypatch.setattr(market_home, "load_market_close_ladder", lambda *_, **__: {"count": 1})
+    monkeypatch.setattr(market_home, "_limit_up_events", lambda *_: [{"snapshot_at": "2026-11-06T10:00:00"}])
+
+    result = market_home.build_market_board(DAY, now=datetime(2026, 11, 7))
+    assert result["status"] == "available"
+    assert result["unavailable_fields"] == []
+
+    market_home._cache[DAY_TEXT] = (0.0, result)
+    elapsed = 20.0
+    monkeypatch.setattr(market_home, "build_market_board", lambda *_, **__: {"status": "unavailable"})
+    assert market_home.market_board(DAY_TEXT) == result
+    elapsed = 31.0
+    assert market_home.market_board(DAY_TEXT)["status"] == "unavailable"
+
+
 def test_index_close_requires_exact_marker_and_post_close_ingestion(market_db):
     with market_db.begin() as connection:
         _index(connection, "000001")
