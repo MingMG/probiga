@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
 
+from requests.exceptions import RequestException
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -22,6 +25,7 @@ from server.common.auxiliary_runtime_schema import (
     validate_market_overview_daily_runtime_schema,
 )
 from server.common.kline_data import get_kline_engine
+from server.common.market_close_ladder import MarketCloseLadderBlocked, capture_market_close_ladder
 from tools.env_config import load_project_env
 
 
@@ -182,12 +186,24 @@ def refresh_one(
     }
 
 
+def _publish_limit_ladder(engine, kline_engine, trade_date: str) -> bool:
+    try:
+        receipt = capture_market_close_ladder(engine, kline_engine, datetime.fromisoformat(trade_date).date())
+    except MarketCloseLadderBlocked as exc:
+        receipt = {"status": "BLOCKED", "trade_date": trade_date, "reason": str(exc)}
+    except (OSError, RuntimeError, ValueError, RequestException, SQLAlchemyError) as exc:
+        receipt = {"status": "BLOCKED", "trade_date": trade_date, "reason": type(exc).__name__}
+    print("LIMIT_LADDER=" + json.dumps(receipt, ensure_ascii=False, sort_keys=True), flush=True)
+    return receipt["status"] == "COMPLETE"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Refresh daily market overview summary for monitor page.")
     parser.add_argument("date_arg", nargs="?", default="", help="Trade date, for scheduler positional-date compatibility.")
     parser.add_argument("--dates", default="", help="Comma separated trade dates.")
     parser.add_argument("--start-date", default="")
     parser.add_argument("--end-date", default="")
+    parser.add_argument("--limit-ladder-only", action="store_true", help="Recover the verified pool for one exact trade date.")
     args = parser.parse_args(argv)
 
     try:
@@ -200,11 +216,15 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print(f"[ERROR] 日期格式错误，应为 YYYY-MM-DD: {exc}", file=sys.stderr)
         return 2
+    if args.limit_ladder_only and (len(explicit_dates) != 1 or start_date or end_date):
+        parser.error("--limit-ladder-only requires one explicit trade date")
 
     load_project_env()
     engine = create_batch_engine(future=True)
     kline_engine = get_kline_engine()
     try:
+        if args.limit_ladder_only:
+            return 0 if _publish_limit_ladder(engine, kline_engine, explicit_dates[0]) else 2
         validate_market_overview_daily_runtime_schema(engine)
         with kline_engine.connect() as kline_conn:
             dates = resolve_dates(
@@ -220,6 +240,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 return 2
             blocked: list[dict] = []
+            ladder_day = max(dates)
             for trade_date in dates:
                 try:
                     universe = load_daily_stock_universe(engine, trade_date)
@@ -251,6 +272,8 @@ def main(argv: list[str] | None = None) -> int:
                     flush=True,
                 )
                 print(f"DATE={trade_date}", flush=True)
+                if trade_date == ladder_day and os.environ.get("PROBIGA_DEPLOYMENT_MODE") == "production":
+                    _publish_limit_ladder(engine, kline_engine, trade_date)
             if blocked:
                 print(
                     "[ERROR] DATA_BLOCKED: one or more target dates have "

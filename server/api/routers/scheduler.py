@@ -543,7 +543,7 @@ def update_date_param(task_id: int, date_param: str = Query(default="")):
 
 
 @router.post("/scheduler/tasks/{task_id}/run")
-def run_task_now(task_id: int):
+def run_task_now(task_id: int, trade_date: date | None = None, index_codes: str = ""):
     row = _read_sql("SELECT * FROM st_scheduled_tasks WHERE id = :id", {"id": task_id})
     if not row:
         return {"error": "任务不存在"}
@@ -556,8 +556,28 @@ def run_task_now(task_id: int):
                 "禁止手工运行"
             ),
         )
+    task = dict(row[0])
+    engine = get_engine()
+    if trade_date is not None or index_codes:
+        from server.common.authoritative_market_clock import authoritative_closed_trade_date
+        from server.common.index_daily_publication import PUBLIC_INDEX_DAILY_CODES
+        from datetime import time as wall_time
+
+        codes = sorted({code.strip() for code in index_codes.split(",") if code.strip()})
+        if (task_type != "free_index_daily_canonical" or trade_date is None or not codes
+                or not set(codes).issubset(PUBLIC_INDEX_DAILY_CODES) or task.get("date_param")):
+            raise HTTPException(422, "仅公开源指数任务支持指定交易日和受支持的指数代码")
+        target = trade_date.isoformat()
+        with engine.connect() as connection:
+            latest = authoritative_closed_trade_date(connection, close_ready_time=wall_time(15, 35))
+            open_day = connection.execute(text("""
+                SELECT DISTINCT trade_status FROM si_trade_calendar WHERE trade_date=:target
+            """), {"target": target}).scalars().all()
+        if not latest or target > latest or open_day != [1]:
+            raise HTTPException(422, "补录日期必须是已收盘的交易日")
+        task.update(_scheduler_target_trade_date=target, _index_repair_codes=tuple(codes))
     root = Path(__file__).resolve().parents[3]
-    return launch_scheduler_task(row[0], root=root, engine=get_engine())
+    return launch_scheduler_task(task, root=root, engine=engine)
 
 
 @router.post("/scheduler/release-analysis/recover")

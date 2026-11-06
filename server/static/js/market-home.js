@@ -143,12 +143,13 @@
         const breadth = market?.breadth;
         const strong = snapshot?.strong || {};
         const limits = snapshot?.limit_ladder;
+        const limitMeta = limits ? [limits.scope, limits.source].filter(Boolean).map(escape).join(' · ') : '涨跌停证据待核验';
         const count = breadth ? `<span class="mh-up">${metric(breadth.up, '', 0)}</span><span class="mh-muted"> / ${metric(breadth.flat, '', 0)} / </span><span class="mh-down">${metric(breadth.down, '', 0)}</span>` : '—';
         return '<div class="mh-metrics">' +
             tile('个股涨 / 平 / 跌', count, breadth ? `上涨占比 ${metric(100 * breadth.up / breadth.total, '%', 1)} · ${observationMeta(market)}` : '涨跌家数待核验') +
             tile('强势 / 弱势', pair(strong.up_3pct, strong.down_3pct), number(strong.up_3pct) !== null || number(strong.down_3pct) !== null ? `涨跌幅达到 ±3% · ${snapshotMeta(snapshot)}` : '涨跌幅分布待核验') +
-            tile('涨停 / 跌停', pair(limits?.limit_up_count, limits?.limit_down_count), limits ? snapshotMeta(snapshot) : '涨跌停证据待核验') +
-            tile('最高连板', metric(limits?.max_streak, '板', 0), limits ? snapshotMeta(snapshot) : '连板证据待核验') +
+            tile('涨停 / 跌停', pair(limits?.limit_up_count, limits?.limit_down_count), limitMeta) +
+            tile('最高连板', metric(limits?.max_streak, '板', 0), limits ? limitMeta : '连板证据待核验') +
             tile('成交额', amount(market?.total_amount), observationMeta(market)) +
             tile('换手 / 量比', '— / —', '缺少统一市场换手与量比口径') + '</div>';
     }
@@ -202,14 +203,16 @@
 
     function renderLadder(snapshot) {
         const notes = snapshot?.limit_ladder || {};
-        const ladder = day(notes.trade_date) === day(snapshot?.trade_date) && notes.source
+        const exact = day(notes.trade_date) && day(notes.trade_date) === day(snapshot?.trade_date) && notes.source;
+        const ladder = exact
             ? rows(notes.rows).filter(item => Number.isInteger(item.streak) && item.streak > 0 && Number.isInteger(item.count) && item.count > 0)
             : [];
         const max = Math.max(1, ...ladder.map(item => item.count));
-        const meta = ladder.length ? [notes.trade_date, notes.scope, notes.source].filter(Boolean).map(escape).join(' · ') : snapshotMeta(snapshot);
+        const meta = exact ? [notes.trade_date, notes.scope, notes.source].filter(Boolean).map(escape).join(' · ') : snapshotMeta(snapshot);
+        const captured = exact && notes.available_at ? `证据可用 ${escape(notes.available_at)} · ` : '';
         return panel('涨停梯队', meta, (ladder.length ? '<div class="mh-list">' + ladder.slice(0, 8).map(item =>
             `<div class="mh-row"><b>${item.streak}板</b><span class="mh-breadth-bar" aria-hidden="true"><span class="mh-breadth-part mh-up" style="width:${100 * item.count / max}%"></span></span><span>${item.count}只</span></div>`).join('') + '</div>' :
-            empty('暂无可核验的连续涨停梯队')) + `<p class="mh-meta">封板率 ${metric(ladder.length ? notes.seal_rate_pct : null, '%', 1)} · ${link('intraday-alert', '查看盘中播报')}</p>`);
+            empty(exact && notes.count === 0 ? '东财收录样本为 0 只' : '暂无可核验的连续涨停梯队')) + `<p class="mh-meta">${captured}封板率 ${metric(ladder.length ? notes.seal_rate_pct : null, '%', 1)} · ${link('intraday-alert', '查看盘中播报')}</p>`);
     }
 
     function renderSector(title, values, market) {
@@ -227,15 +230,19 @@
 
     function renderEvents(snapshot, requested) {
         const events = rows(snapshot?.events).filter(item => day(item.snapshot_at) === requested && requested);
-        const heading = events.length ? snapshotMeta(snapshot) : escape(requested || '日期待核验');
+        const heading = escape(requested || '日期待核验');
         if (!events.length) return panel('监控中心', heading, empty('所选交易日的异动事件证据待核验') + link('market-radar', '查看异动雷达'), 'mh-third');
+        const limitLabels = {TOUCH:'触及涨停', SEAL:'涨停封板', RESEAL:'涨停回封', BREAK:'涨停开板'};
         return panel('监控中心', heading, '<div class="mh-list">' + events.slice(0, 8).map(item => {
             const detail = item.detail_json || {};
             const name = item.stock_code ? stock(item.stock_code, detail.short_name) : escape(item.sector_name || '板块异动');
-            const label = item.direction === 'UP' ? '上涨异动' : item.direction === 'DOWN' ? '下跌异动' : '市场异动';
-            return `<div class="mh-row"><span>${name}<small class="mh-meta">${escape(item.data_source || snapshot.source || '来源待核验')}</small></span>` +
-                `<span class="mh-badge ${item.direction === 'UP' ? 'mh-up' : item.direction === 'DOWN' ? 'mh-down' : 'mh-neutral'}">${label}</span>` +
-                `<span class="mh-meta">${escape(item.snapshot_at)}</span></div>`;
+            const limitEvent = item.event_family === 'LIMIT_UP_LIFECYCLE' && Object.hasOwn(limitLabels, item.event_type);
+            const label = limitEvent ? limitLabels[item.event_type] : item.direction === 'UP' ? '上涨异动' : item.direction === 'DOWN' ? '下跌异动' : '市场异动';
+            const tone = limitEvent ? (item.event_type === 'BREAK' ? 'mh-down' : 'mh-up') : item.direction === 'UP' ? 'mh-up' : item.direction === 'DOWN' ? 'mh-down' : 'mh-neutral';
+            const provider = limitEvent ? '国金 QMT 涨停生命周期' : item.data_source || '来源待核验';
+            return `<div class="mh-row"><span>${name}<small class="mh-meta">${escape(provider)}</small></span>` +
+                `<span class="mh-badge ${tone}">${label}</span>` +
+                `<span class="mh-meta">${escape(item.snapshot_at)}${item.available_at ? `<small class="mh-meta">记录 ${escape(item.available_at)}</small>` : ''}</span></div>`;
         }).join('') + '</div>', 'mh-third');
     }
 

@@ -107,7 +107,7 @@ def main() -> int:
     parser.add_argument(
         "--replay-only",
         action="store_true",
-        help="只生成历史决策证据，禁止持仓同步和模拟订单物化",
+        help="只生成历史决策证据，跳过持仓同步、模拟订单和通知",
     )
     parser.add_argument(
         "--retrospective-research",
@@ -210,10 +210,13 @@ def main() -> int:
                         sep=" "
                     ),
                 })
-        if args.retrospective_research:
+        if args.retrospective_research or args.replay_only:
             result["notification"] = {
                 "status": "suppressed",
-                "reason": "RETROSPECTIVE_RESEARCH",
+                "reason": (
+                    "RETROSPECTIVE_RESEARCH" if args.retrospective_research
+                    else "REPLAY_ONLY"
+                ),
             }
         else:
             from biz.analysis.trading_wecom import notify_v3_decision_result

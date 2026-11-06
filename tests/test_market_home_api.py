@@ -1,4 +1,6 @@
+import json
 from datetime import date, datetime
+from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
@@ -6,6 +8,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.pool import StaticPool
 
 from server.api.routers import market_home
+from server.common.turnover_snapshot import _qmt_target_from_row, _row_insert_params, parse_eastmoney_turnover_response
 
 
 DAY = date(2026, 11, 6)
@@ -31,6 +34,9 @@ def market_db(monkeypatch):
             "amount REAL, snapshot_at TEXT, batch_id TEXT, data_source TEXT, quality_status TEXT, permission_status TEXT)",
             "CREATE TABLE sm_market_radar_event (event_id INTEGER, event_type TEXT, direction TEXT, stock_code TEXT, "
             "sector_name TEXT, snapshot_at TEXT, created_at TEXT, data_source TEXT, detail_json TEXT)",
+            "CREATE TABLE sm_limit_up_event (event_id INTEGER, trade_date TEXT, event_type TEXT, stock_code TEXT, "
+            "short_name TEXT, event_at TEXT, source_snapshot_at TEXT, created_at TEXT, source_provider TEXT, "
+            "limit_status_basis TEXT, evidence_json TEXT)",
             "CREATE TABLE st_market_field_capture_run (run_id TEXT, collector_build_sha TEXT, target_date TEXT, "
             "published_at TEXT, decision_at TEXT, capture_kind TEXT, provider TEXT, source_field TEXT, unit TEXT, "
             "status TEXT, expected_count INTEGER, fetched_count INTEGER, valid_count INTEGER, matched_count INTEGER, "
@@ -38,7 +44,11 @@ def market_db(monkeypatch):
             "CREATE TABLE st_market_field_capture_row (run_id TEXT, stock_code TEXT, trade_date TEXT, k_type INTEGER, "
             "adjust_type INTEGER, target_row_id INTEGER, field_value_decimal REAL, qmt_open REAL, qmt_high REAL, qmt_low REAL, qmt_close REAL, "
             "qmt_volume_shares REAL, qmt_amount REAL, qmt_data_source TEXT, qmt_quality_status TEXT, "
-            "qmt_permission_status TEXT, validation_status TEXT, promoted_at TEXT)",
+            "qmt_permission_status TEXT, validation_status TEXT, promoted_at TEXT, "
+            "source_open REAL, source_high REAL, source_low REAL, source_close REAL, source_volume_shares REAL, "
+            "source_amount REAL, raw_row_text TEXT, raw_payload BLOB, raw_payload_sha256 TEXT, snapshot_row_sha256 TEXT, "
+            "captured_at TEXT, provider_observed_at_text TEXT, provider_observed_at TEXT, qmt_received_at TEXT, "
+            "qmt_batch_id TEXT, qmt_data_version TEXT, target_prewrite_sha256 TEXT, target_fact_sha256 TEXT, validation_error TEXT)",
         ):
             connection.execute(text(sql))
         connection.execute(text("INSERT INTO si_trade_calendar VALUES (:day, 1)"), {"day": DAY_TEXT})
@@ -159,7 +169,9 @@ def test_board_native_turnover_requires_complete_evidence_and_exact_quotes(marke
              'eastmoney.push2his.kline','f61','PERCENT','COMPLETED',2,2,2,2,2,'semantic',:root)
         """), {"day": DAY_TEXT, "root": root})
         connection.execute(text("""
-            INSERT INTO st_market_field_capture_row VALUES
+            INSERT INTO st_market_field_capture_row (run_id,stock_code,trade_date,k_type,adjust_type,target_row_id,
+             field_value_decimal,qmt_open,qmt_high,qmt_low,qmt_close,qmt_volume_shares,qmt_amount,qmt_data_source,
+             qmt_quality_status,qmt_permission_status,validation_status,promoted_at) VALUES
             ('capture','000001',:day,1,0,1,2,100,110,90,102,10,100,'qmt_datadir','VERIFIED','SUPPORTED',
              'MATCHED','2026-11-06 16:30:00'),
             ('capture','000002',:day,1,0,2,4.5,100,110,90,:close,10,100,'qmt_datadir','VERIFIED','SUPPORTED',
@@ -199,6 +211,54 @@ def test_board_native_turnover_requires_complete_evidence_and_exact_quotes(marke
         assert {row["turnover_rate_source"] for row in rank} == {"eastmoney.push2his.kline"}
         assert result["turnover_evidence"]["known_at"] == "2026-11-06T16:31:00+08:00"
         assert result["turnover_coverage"]["status"] == "complete"
+
+
+@pytest.mark.parametrize("source_amount, corrupt", [(12690811.41, False), (12690811.51, False), (12690811.41, True)])
+def test_corrected_native_turnover_requires_exact_retained_source(market_db, monkeypatch, source_amount, corrupt):
+    code = "920717"
+    decision_at = datetime(2026, 11, 6, 16, 20)
+    published_at = datetime(2026, 11, 6, 16, 30)
+    target = _qmt_target_from_row({
+        "id": 1, "stock_code": code, "trade_date": DAY, "k_type": 1, "adjust_type": 0,
+        "open": 6.35, "high": 6.43, "low": 6.18, "close": 6.29, "volume": 642900, "amount": 4072608,
+        "received_at": datetime(2026, 11, 6, 15, 44, 47), "data_source": "qmt_datadir",
+        "batch_id": "original", "data_version": "original", "quality_status": "VERIFIED", "permission_status": "SUPPORTED",
+    }, target_date=DAY, decision_at=decision_at)
+    captured = parse_eastmoney_turnover_response(
+        target=target, raw_payload=json.dumps({"rc": 0, "data": {"code": code, "klines": [
+            f"{DAY_TEXT},6.35,6.29,6.43,6.18,20580,{source_amount},3.94,-0.94,-0.06,4.65",
+        ]}}).encode(), provider_http_date="Fri, 06 Nov 2026 08:15:00 GMT",
+        captured_at=datetime(2026, 11, 6, 16, 16), decision_at=decision_at,
+    )
+    params = _row_insert_params(SimpleNamespace(run_id="capture"), captured, published_at=published_at)
+    if corrupt:
+        params["raw_payload"] = params["raw_payload"].replace(b'920717', b'920718')
+    root = market_home.canonical_digest([{"stock_code": code, "trade_date": DAY_TEXT, "turnover_percent": "4.65"}])
+    with market_db.begin() as connection:
+        _stock(connection, code, 6.29, amount=12690811, turnover=4.65)
+        connection.execute(text("UPDATE sm_stock_kline SET open=6.35,high=6.43,low=6.18,volume=2058000"))
+        connection.execute(text("""
+            INSERT INTO st_market_field_capture_run VALUES
+            ('capture','build',:day,:published,:decision,'DAILY_TURNOVER_F61','eastmoney.push2his.kline','f61',
+             'PERCENT','COMPLETED',1,1,1,1,1,'semantic',:root)
+        """), {"day": DAY_TEXT, "published": published_at, "decision": decision_at, "root": root})
+        columns = ",".join(params)
+        values = ",".join(f":{key}" for key in params)
+        connection.execute(text(f"INSERT INTO st_market_field_capture_row ({columns}) VALUES ({values})"), params)
+    monkeypatch.setattr(market_home, "load_completed_market_capture_receipt", lambda *_args, **_kwargs: {
+        "known_at": "2026-11-06 16:31:00", "receipt": {
+            "expected_count": 1, "promoted_count": 1, "semantic_sha256": "semantic", "field_value_root_sha256": root,
+            "decision_at": decision_at, "published_at": published_at,
+        },
+    })
+    result = market_home.build_market_board(DAY, now=datetime(2026, 11, 7))
+    assert result["sample_size"] == 1
+    if corrupt or source_amount > 12690811.50:
+        assert not result["rankings"]["turnover"]
+    else:
+        assert result["rankings"]["turnover"][0]["turnover_rate"] == 4.65
+        assert result["turnover_coverage"]["status"] == "complete"
+        assert result["turnover_evidence"]["corrected_binding_count"] == 1
 
 
 def test_board_invalid_date_is_rejected_and_repeat_uses_bounded_cache(monkeypatch):
@@ -287,3 +347,31 @@ def test_board_event_projection_is_same_date_and_public_only(market_db, now):
                                  "sector_name": None, "snapshot_at": "2026-11-06T10:00:00+08:00",
                                  "data_source": "qmt_full_tick_5level", "detail_json": {"short_name": "样本股"}}]
     assert "events" not in result["unavailable_fields"]
+
+
+def test_board_limit_events_keep_actual_type_and_publication_time(market_db):
+    with market_db.begin() as connection:
+        connection.execute(text("""
+            INSERT INTO sm_limit_up_event VALUES
+            (1,:day,'RESEAL','000001','样本股','2026-11-06 15:00:02','2026-11-06 15:00:04',
+             '2026-11-06 15:00:05','gj_big_qmt_inner',:basis,:evidence),
+            (2,:day,'RESEAL','000002','wrong provider','2026-11-06 15:00:02','2026-11-06 15:00:04',
+             '2026-11-06 15:00:05','other_provider',:basis,:evidence),
+            (3,:day,'QUEUE_SNAPSHOT','000003','queue sample','2026-11-06 15:00:02','2026-11-06 15:00:04',
+             '2026-11-06 15:00:05','gj_big_qmt_inner',:basis,:evidence),
+            (4,:day,'SEAL','000004','future evidence','2026-11-06 15:00:02','2026-11-06 15:00:04',
+             '2026-11-07 15:00:05','gj_big_qmt_inner',:basis,:evidence)
+        """), {"day": DAY_TEXT, "basis": market_home.LIMIT_STATUS_BASIS,
+               "evidence": '{"at_limit":true,"sealed":true,"limit_status_basis":"PRE_CLOSE_BOARD_RULE_ROUND_HALF_UP"}'})
+
+    early = market_home.build_market_board(DAY, now=datetime(2026, 11, 6, 15, 0, 4))
+    assert early["events"] == []
+    result = market_home.build_market_board(DAY, now=datetime(2026, 11, 7))
+    assert result["source"] == "sm_limit_up_event"
+    assert result["limit_ladder"] is None
+    assert result["events"] == [{
+        "event_type": "RESEAL", "event_family": "LIMIT_UP_LIFECYCLE", "stock_code": "000001",
+        "snapshot_at": "2026-11-06T15:00:02+08:00", "source_snapshot_at": "2026-11-06T15:00:04+08:00",
+        "available_at": "2026-11-06T15:00:05+08:00", "data_source": "gj_big_qmt_inner",
+        "detail_json": {"short_name": "样本股"},
+    }]

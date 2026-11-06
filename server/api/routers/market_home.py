@@ -20,9 +20,18 @@ from server.api.routers._engine import get_engine
 from server.common.current_data import get_current_engine
 from server.common.daily_delivery_control import load_completed_market_capture_receipt
 from server.common.kline_data import get_kline_engine
+from server.common.limit_up_events import LIMIT_STATUS_BASIS
+from server.common.limit_up_event_schema import LIMIT_UP_EVENT_TABLE
+from server.common.market_close_ladder import load_market_close_ladder
 from server.common.qmt_attestation_contract import canonical_digest
 from server.common.sql_reader import read_sql_rows
-from server.common.turnover_snapshot import TURNOVER_CAPTURE_KIND, TURNOVER_PROVIDER, TURNOVER_SOURCE_FIELD, TURNOVER_UNIT
+from server.common.turnover_snapshot import (
+    TURNOVER_CAPTURE_KIND,
+    TURNOVER_PROVIDER,
+    TURNOVER_SOURCE_FIELD,
+    TURNOVER_UNIT,
+    _reconstruct_persisted_capture,
+)
 from server.common.turnover_snapshot_schema import TURNOVER_SNAPSHOT_ROW_TABLE, TURNOVER_SNAPSHOT_RUN_TABLE
 from server.common.verified_daily_market_truth import VERIFIED_FREE_DAILY_ROW_SOURCES
 
@@ -58,6 +67,7 @@ _STOCK_LIMIT = 7_000
 _INDEX_LIMIT = 2 * len(INDEX_NAMES)
 _EVENT_LIMIT = 20
 _RANK_LIMIT = 10
+_TURNOVER_CORRECTION_LIMIT = 16
 _CACHE_TTL = 10
 _CACHE_SIZE = 32
 _LIVE_MAX_AGE = timedelta(seconds=90)
@@ -172,14 +182,19 @@ def _verified_turnover(day: str, quotes: list[dict], stocks: list[dict], now: da
         return None
     rows = _read(engine, f"""
         SELECT /*+ MAX_EXECUTION_TIME(2000) */ r.stock_code, CAST(r.field_value_decimal AS CHAR) AS rate,
-               q.id, q.close AS price, q.pre_close, q.amount, q.data_source
+               q.id, q.close AS price, q.pre_close, q.amount, q.data_source,
+               CASE WHEN q.volume<>r.qmt_volume_shares OR q.amount<>r.qmt_amount THEN 1 ELSE 0 END AS corrected
         FROM {TURNOVER_SNAPSHOT_ROW_TABLE} r LEFT JOIN sm_stock_kline q
           ON q.id=r.target_row_id AND q.stock_code=r.stock_code AND q.trade_date=r.trade_date AND q.k_type=r.k_type
           AND q.adjust_type=r.adjust_type AND q.open=r.qmt_open AND q.high=r.qmt_high
-          AND q.low=r.qmt_low AND q.close=r.qmt_close AND q.volume=r.qmt_volume_shares AND q.amount=r.qmt_amount
+          AND q.low=r.qmt_low AND q.close=r.qmt_close
           AND q.data_source=r.qmt_data_source AND q.quality_status=r.qmt_quality_status
           AND q.permission_status=r.qmt_permission_status
-          AND (q.turnover_ratio IS NULL OR q.turnover_ratio=r.field_value_decimal)
+          AND ((q.volume=r.qmt_volume_shares AND q.amount=r.qmt_amount
+                AND (q.turnover_ratio IS NULL OR q.turnover_ratio=r.field_value_decimal))
+            OR (q.data_source='qmt_datadir' AND q.open=r.source_open AND q.high=r.source_high
+                AND q.low=r.source_low AND q.close=r.source_close AND q.volume=r.source_volume_shares
+                AND ABS(q.amount-r.source_amount)<=0.50 AND q.turnover_ratio=r.field_value_decimal))
         WHERE r.run_id=:run_id AND r.trade_date=:day AND r.k_type=1 AND r.adjust_type=0
           AND r.validation_status='MATCHED' AND r.promoted_at<=:now
         ORDER BY r.stock_code LIMIT :limit
@@ -189,7 +204,7 @@ def _verified_turnover(day: str, quotes: list[dict], stocks: list[dict], now: da
     quote_by_code = {row["stock_code"]: row for row in _unique_rows(quotes, "stock_code")}
     stock_by_code = {row["stock_code"]: row for row in stocks}
     fields = ("id", "price", "pre_close", "amount", "data_source")
-    seen, values, root_items = set(), {}, []
+    seen, values, corrected, root_items = set(), {}, {}, []
     for row in rows:
         code = row["stock_code"]
         quote = quote_by_code.get(code)
@@ -200,8 +215,28 @@ def _verified_turnover(day: str, quotes: list[dict], stocks: list[dict], now: da
         root_items.append({"stock_code": code, "trade_date": day,
                            "turnover_percent": format(Decimal(str(row["rate"])).normalize(), "f") if rate else "0"})
         if row["id"] is not None and all(row[field] == quote[field] for field in fields):
-            values[code] = rate
-    if not values or canonical_digest(root_items) != run["field_value_root_sha256"]:
+            (corrected if row["corrected"] else values)[code] = rate
+    if canonical_digest(root_items) != run["field_value_root_sha256"]:
+        return None
+    if 0 < len(corrected) <= _TURNOVER_CORRECTION_LIMIT:
+        keys = {f"code_{index}": code for index, code in enumerate(corrected)}
+        corrected_rows = _read(engine, f"""
+            SELECT /*+ MAX_EXECUTION_TIME(1200) */ * FROM {TURNOVER_SNAPSHOT_ROW_TABLE}
+            WHERE run_id=:run_id AND trade_date=:day AND k_type=1 AND adjust_type=0
+              AND stock_code IN ({', '.join(f':{key}' for key in keys)}) AND length(raw_payload)<=16384
+            LIMIT :limit
+        """, {**keys, "day": day, "run_id": run["run_id"], "limit": len(corrected) + 1}, deadline=deadline)
+        # QMT DAT records traded amount to yuan. The second binding permits that
+        # rounding only after the original source row has been reconstructed.
+        for row in _unique_rows(corrected_rows, "stock_code"):
+            try:
+                captured = _reconstruct_persisted_capture(row, decision_at=decision_at, published_at=published_at)
+            except (RuntimeError, ValueError):
+                continue
+            code = captured.target.stock_code
+            if code in corrected and captured.turnover_percent == Decimal(str(corrected[code])):
+                values[code] = corrected[code]
+    if not values:
         return None
     for stock in stocks:
         rate = values.get(stock["stock_code"])
@@ -212,7 +247,8 @@ def _verified_turnover(day: str, quotes: list[dict], stocks: list[dict], now: da
             "decision_at": decision_at.replace(tzinfo=SHANGHAI).isoformat(),
             "published_at": published_at.replace(tzinfo=SHANGHAI).isoformat(),
             "known_at": _timestamp(known_at), "field_value_root_sha256": run["field_value_root_sha256"],
-            "sample_size": len(stocks), "verified_count": len(values)}
+            "sample_size": len(stocks), "verified_count": len(values),
+            "corrected_binding_count": len(values.keys() & corrected.keys())}
 
 
 def _live_quotes(day: str, now: datetime, deadline: float) -> tuple[list[dict], datetime | None]:
@@ -372,6 +408,43 @@ def _market_events(day: date, now: datetime, deadline: float) -> list[dict]:
     return result
 
 
+def _limit_up_events(day: date, now: datetime, deadline: float) -> list[dict]:
+    rows = _read(get_current_engine(), f"""
+        SELECT /*+ MAX_EXECUTION_TIME(1500) */ event_type, stock_code, short_name,
+               event_at, source_snapshot_at, created_at, source_provider, evidence_json
+        FROM {LIMIT_UP_EVENT_TABLE}
+        WHERE trade_date=:day AND event_at BETWEEN :opening AND :close_window
+          AND event_at<=source_snapshot_at AND source_snapshot_at<=created_at AND created_at<=:now
+          AND source_provider=:provider AND limit_status_basis=:basis
+          AND event_type IN ('TOUCH','SEAL','RESEAL','BREAK')
+        ORDER BY event_at DESC, event_id DESC LIMIT :limit
+    """, {"day": day.isoformat(), "opening": datetime.combine(day, time(9, 30)),
+          "close_window": datetime.combine(day, time(15, 1)), "now": now,
+          "provider": LIVE_SOURCE, "basis": LIMIT_STATUS_BASIS, "limit": _EVENT_LIMIT}, deadline=deadline)
+    result = []
+    for row in rows:
+        event_at, source_at, known_at = (_clock(row.get(key)) for key in ("event_at", "source_snapshot_at", "created_at"))
+        code, kind = row.get("stock_code"), row.get("event_type")
+        if (not event_at or not source_at or not known_at or not event_at <= source_at <= known_at <= now
+                or event_at.date() != day or source_at.date() != day or known_at.date() != day
+                or not isinstance(code, str) or not re.fullmatch(r"[0-9]{6}", code)):
+            continue
+        try:
+            evidence = json.loads(row.get("evidence_json") or "{}")
+        except (TypeError, ValueError):
+            continue
+        if (not isinstance(evidence, dict) or evidence.get("limit_status_basis") != LIMIT_STATUS_BASIS
+                or evidence.get("at_limit") is not (kind != "BREAK")
+                or (kind in {"SEAL", "RESEAL", "BREAK"} and evidence.get("sealed") is not (kind != "BREAK"))):
+            continue
+        result.append({"event_type": kind, "event_family": "LIMIT_UP_LIFECYCLE", "stock_code": code,
+                       "snapshot_at": event_at.replace(tzinfo=SHANGHAI).isoformat(),
+                       "source_snapshot_at": source_at.replace(tzinfo=SHANGHAI).isoformat(),
+                       "available_at": known_at.replace(tzinfo=SHANGHAI).isoformat(),
+                       "data_source": row["source_provider"], "detail_json": {"short_name": str(row.get("short_name") or "")[:128]}})
+    return result
+
+
 def _distribution(rows: list[dict]) -> list[dict]:
     values = [row["change_pct"] for row in rows]
     result = []
@@ -403,6 +476,7 @@ def build_market_board(day: date, *, now: datetime) -> dict:
     as_of = None
     source = None
     turnover_evidence = None
+    limit_ladder = None
     stocks, indices, events = [], [], []
     stage = "not_closed_or_not_trading"
     if close_ready or live or lunch:
@@ -432,19 +506,29 @@ def build_market_board(day: date, *, now: datetime) -> dict:
                     indices = _index_rows(_index_quotes(day_text, close, now, deadline), day_text, close, now)
                 except (SQLAlchemyError, RuntimeError, TimeoutError, ValueError) as exc:
                     logger.warning("market board index data unavailable: %s", type(exc).__name__)
-            try:
-                events = _market_events(day, now, deadline)
-            except (SQLAlchemyError, RuntimeError, TimeoutError, ValueError) as exc:
-                logger.warning("market board events unavailable: %s", type(exc).__name__)
+            if close_ready and stocks:
+                try:
+                    limit_ladder = load_market_close_ladder(day, quotes=quotes, now=now)
+                except (OSError, RuntimeError, ValueError) as exc:
+                    logger.warning("market board close limit ladder unavailable: %s", type(exc).__name__)
             if close_ready and stocks and any(row["turnover_rate"] is None for row in stocks):
                 try:
                     turnover_evidence = _verified_turnover(day_text, quotes, stocks, now, deadline)
                 except (SQLAlchemyError, RuntimeError, TimeoutError, ValueError) as exc:
                     logger.warning("market board turnover evidence unavailable: %s", type(exc).__name__)
+            try:
+                events = _limit_up_events(day, now, deadline)
+            except (SQLAlchemyError, RuntimeError, TimeoutError, ValueError) as exc:
+                logger.warning("market board QMT limit events unavailable: %s", type(exc).__name__)
+            try:
+                radar = _market_events(day, now, deadline)
+                events = sorted([*events, *radar], key=lambda row: _clock(row["snapshot_at"]), reverse=True)[:_EVENT_LIMIT]
+            except (SQLAlchemyError, RuntimeError, TimeoutError, ValueError) as exc:
+                logger.warning("market board radar events unavailable: %s", type(exc).__name__)
     if live and stocks and not _fresh_live_stamp(as_of, now + timedelta(seconds=monotonic() - started_at)):
         stocks = []
         as_of, source, stage = None, None, "live_quote_expired"
-    unavailable = ["limit_ladder"]
+    unavailable = [] if limit_ladder is not None else ["limit_ladder"]
     if not events:
         unavailable.append("events")
     amount_complete = bool(stocks) and all(row["amount"] is not None for row in stocks)
@@ -464,7 +548,8 @@ def build_market_board(day: date, *, now: datetime) -> dict:
     if not stocks and indices:
         as_of, source = datetime.combine(day, time(15)), "sm_index_kline"
     if not as_of and events:
-        as_of, source = _clock(events[0]["snapshot_at"]), "sm_market_radar_event"
+        as_of = _clock(events[0]["snapshot_at"])
+        source = LIMIT_UP_EVENT_TABLE if events[0].get("event_family") == "LIMIT_UP_LIFECYCLE" else "sm_market_radar_event"
     up = [row for row in stocks if row["change_pct"] > 0]
     down = [row for row in stocks if row["change_pct"] < 0]
     return {
@@ -473,7 +558,8 @@ def build_market_board(day: date, *, now: datetime) -> dict:
         "requested_date": day_text, "trade_date": day_text if as_of else None,
         "as_of": _timestamp(as_of) if as_of else None, "source": source,
         "as_of_basis": {"sm_stock_current": "qmt_snapshot", "sm_stock_kline": "exchange_close",
-                        "sm_index_kline": "exchange_close", "sm_market_radar_event": "radar_observation"}.get(source),
+                        "sm_index_kline": "exchange_close", "sm_market_radar_event": "radar_observation",
+                        LIMIT_UP_EVENT_TABLE: "qmt_limit_event"}.get(source),
         "sample_size": len(stocks), "sample_scope": "verified_quotes_with_price_and_change_pct",
         "sample_sources": sorted({row["source"] for row in stocks}),
         "distribution": _distribution(stocks) if stocks else [],
@@ -495,7 +581,7 @@ def build_market_board(day: date, *, now: datetime) -> dict:
                                if turnover_evidence else []),
         },
         "indices": indices, "missing_index_codes": missing_indices,
-        "events": events, "limit_ladder": None, "unavailable_fields": unavailable,
+        "events": events, "limit_ladder": limit_ladder, "unavailable_fields": unavailable,
     }
 
 

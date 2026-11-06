@@ -1,13 +1,11 @@
 """Evidence and freshness tests for the read-only acquisition monitor."""
 import csv
 import io
-from dataclasses import asdict, replace
 from datetime import date, datetime, timedelta
 
 import pytest
 
 from server.api import data_monitor as dm
-from tools import sync_qmt_index_edge as index_source
 
 
 DAY = '2026-09-18'
@@ -155,23 +153,28 @@ def test_ths_hot_rank_is_an_independent_monitored_dataset():
     assert spec.deadline == '17:12'
 
 
-def test_historical_index_receipt_binds_dated_codes_across_catalog_refresh():
-    live = [index_source.IndexCatalogMember(
-        index_code='000001', qmt_code='000001.SH', name='上证指数',
-        list_date=None, expire_date=None, batch_id='new-batch')]
-    historical = [replace(live[0], batch_id='old-batch')]
-    manifest = {
-        'catalog_batch_id': 'old-batch',
-        'catalog_member_hash': index_source._digest([asdict(member) for member in historical]),
-        'requested_code_count': 1,
-        'requested_code_set_hash': index_source._digest(['000001']),
-        'expected_code_session_hash': index_source._digest([[DAY, '000001']]),
-    }
-    assert dm.index_codes_for_receipt([replace(live[0], name='renamed')], manifest, DAY) == {DAY: ('000001',)}
-    with pytest.raises(ValueError, match='code inventory differs'):
-        dm.index_codes_for_receipt([replace(live[0], index_code='000002')], manifest, DAY)
-    with pytest.raises(ValueError, match='catalog differs'):
-        dm.index_codes_for_receipt([replace(live[0], batch_id='old-batch', name='renamed')], manifest, DAY)
+def test_index_monitor_distinguishes_old_five_bar_proof_from_current_scope(monkeypatch):
+    from server.common import index_daily_publication as source
+
+    observer = dm.Observer(business=object(), kline=object(), minute=object())
+    spec = dm.BY_KEY["index"]
+    assert spec.task_type == "free_index_daily_canonical"
+    monkeypatch.setattr(observer, "counts", lambda spec, day: {
+        "n": 595, "codes": 595, "source": None, "updated": CURRENT,
+    })
+    old_codes = {"000001", "000688", "399001", "399006", "899050"}
+
+    def read_proof(primary, history, *, sessions, codes, as_of, deadline):
+        assert sessions == [DAY] and as_of == CURRENT
+        assert set(codes) == set(source.PUBLIC_INDEX_DAILY_CODES)
+        return [{"index_code": code, "available_at": CURRENT} for code in old_codes]
+
+    monkeypatch.setattr(source, "load_verified_index_daily_bars", read_proof)
+    result = observer.source_partition(spec, DAY, CURRENT)
+    assert result["status"] == "partial"
+    assert result["observed_count"] == 595
+    assert (result["actual_count"], result["expected_count"]) == (5, 11)
+    assert {gap["stock_code"] for gap in result["missing"]} == set(source.PUBLIC_INDEX_DAILY_CODES) - old_codes
 
 
 class Queue:

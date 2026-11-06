@@ -2823,9 +2823,24 @@ def scheduler_output_status(
     """
     task_type = str(task.get("task_type") or "").strip()
     if task_type == _FREE_INDEX_DAILY_TASK_TYPE:
+        from server.common.index_daily_publication import FREE_INDEX_RESULT_SCHEMA
+
         payload = _single_nested_machine_payload(
             output,
-            schema=_FREE_INDEX_DAILY_RESULT_SCHEMA,
+            schema=FREE_INDEX_RESULT_SCHEMA,
+        )
+        if payload is not None:
+            return (
+                "success"
+                if return_code == 0
+                and payload.get("status") == "COMPLETE"
+                and payload.get("missing_codes") == []
+                and payload.get("qmt_attestation_claimed") is False
+                and isinstance(payload.get("database_writes"), bool)
+                else "failed"
+            )
+        payload = _single_nested_machine_payload(
+            output, schema=_FREE_INDEX_DAILY_RESULT_SCHEMA,
         )
         return (
             "success"
@@ -4256,6 +4271,56 @@ def _validate_free_index_daily_result(
     output: str | None,
 ) -> SchedulerValidationResult:
     try:
+        from server.common.index_daily_publication import (
+            FREE_INDEX_RESULT_SCHEMA,
+            PUBLIC_INDEX_DAILY_CODES,
+            index_scope_fingerprint,
+            load_verified_index_daily_bars,
+        )
+        from server.common.kline_data import get_kline_engine
+
+        current = _single_nested_machine_payload(output, schema=FREE_INDEX_RESULT_SCHEMA)
+        if current is not None:
+            target = str(current.get("target_date") or "")
+            latest = authoritative_closed_trade_date(
+                engine, now=started_at, close_ready_time=time(15, 35),
+            )
+            expected_target = str(task.get("_scheduler_target_trade_date") or latest or "")
+            repair_codes = task.get("_index_repair_codes")
+            if repair_codes:
+                if (
+                    task.get("_trigger_source") != "manual"
+                    or not set(repair_codes).issubset(PUBLIC_INDEX_DAILY_CODES)
+                    or not latest or target > latest
+                ):
+                    raise ValueError("invalid exact index recovery scope")
+                expected = sorted(set(repair_codes))
+            else:
+                expected = sorted(PUBLIC_INDEX_DAILY_CODES)
+                if expected_target != latest:
+                    raise ValueError("invalid scheduled index target")
+            if (
+                target != expected_target
+                or current.get("status") != "COMPLETE"
+                or current.get("provider") != "tencent_east_verified"
+                or current.get("qmt_attestation_claimed") is not False
+                or not isinstance(current.get("database_writes"), bool)
+                or current.get("missing_codes") != []
+                or current.get("requested_codes") != expected
+                or current.get("verified_codes") != expected
+            ):
+                raise ValueError("index coverage differs from dispatch")
+            bars = load_verified_index_daily_bars(
+                engine, get_kline_engine(), sessions=[target], codes=expected,
+                as_of=now, deadline=monotonic() + 15,
+            )
+            if (sorted(bar["index_code"] for bar in bars) != expected
+                    or index_scope_fingerprint(bars) != current.get("proof_sha256")):
+                raise ValueError("persisted index coverage differs")
+            return SchedulerValidationResult(
+                checked=True, ok=True,
+                message=f"verified index coverage: date={target} codes={len(bars)}",
+            )
         payload = _single_nested_machine_payload(
             output,
             schema=_FREE_INDEX_DAILY_RESULT_SCHEMA,

@@ -3202,6 +3202,22 @@ def _cron_due(row: dict, *, now: datetime) -> bool:
     if not last_triggered or last_triggered.date() < now.date():
         return True
 
+    if task_type == "free_index_daily_canonical":
+        from server.common.index_daily_publication import FREE_INDEX_RESULT_SCHEMA, PUBLIC_INDEX_DAILY_CODES
+
+        prior_targets = _scheduler_output_target_dates(row.get("last_run_output"))
+        if len(prior_targets) == 1 and next(iter(prior_targets)) < target.isoformat():
+            # An explicit repair for an older session does not satisfy today's cron.
+            return True
+        if any(
+            payload.get("schema") == FREE_INDEX_RESULT_SCHEMA
+            and isinstance(payload.get("requested_codes"), list)
+            and all(isinstance(code, str) for code in payload["requested_codes"])
+            and set(payload["requested_codes"]) < set(PUBLIC_INDEX_DAILY_CODES)
+            for payload in _iter_scheduler_output_payloads(row.get("last_run_output"))
+        ):
+            return True
+
     if (task_type in CROSS_MIDNIGHT_CRITICAL_CRON_TASK_TYPES
             and last_triggered < datetime.combine(
                 now.date(), datetime_time(cron_min // 60, cron_min % 60))):
@@ -5601,6 +5617,8 @@ def _task_dispatch_date(
         if parsed_scheduler_target.isoformat() != scheduler_target:
             raise RuntimeError("scheduler target trade date is invalid")
         return scheduler_target
+    if task_type == "free_index_daily_canonical":
+        return authoritative_closed_trade_date(engine, now=current, close_ready_time=datetime_time(15, 35))
     if task_type in {
         "qmt_stock_minute_canonical",
         "stock_minute",
@@ -5648,6 +5666,8 @@ def _task_argument_row(
     task_type = str(row.get("task_type") or "").strip()
     if task_type in {"analysis_morning_strict", "analysis_premarket_external"}:
         raise RuntimeError("retired analysis task has no publication authority")
+    if task_type == "free_index_daily_canonical":
+        return {**row, "_scheduler_target_trade_date": target_date}
     trigger_source = str(row.get("_trigger_source") or "").strip()
     if task_type == "qmt_announcement_pit" and trigger_source == "release_catchup":
         current = now

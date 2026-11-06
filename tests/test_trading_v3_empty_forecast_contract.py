@@ -356,9 +356,10 @@ def test_v3_cli_returns_nonzero_for_empty_forecast_block(
     assert payload["schema"] == SCHEMA
     assert payload["forecast_count"] == 0
     assert payload["status"] == "blocked"
+    assert payload["notification"] == {"status": "skipped"}
 
 
-def test_v3_release_replay_flag_disables_execution_even_for_current_date(
+def test_v3_release_replay_flag_disables_execution_and_notifications(
     monkeypatch,
     capsys,
 ) -> None:
@@ -409,7 +410,7 @@ def test_v3_release_replay_flag_disables_execution_even_for_current_date(
     monkeypatch.setattr(run_trading_v3_decision, "run_daily_decision_v3", run)
     monkeypatch.setattr(
         "biz.analysis.trading_wecom.notify_v3_decision_result",
-        lambda _result: {"status": "skipped"},
+        lambda _result: pytest.fail("release replay must not send notifications"),
     )
 
     assert run_trading_v3_decision.main() == 0
@@ -418,6 +419,10 @@ def test_v3_release_replay_flag_disables_execution_even_for_current_date(
     assert observed["execution_enabled"] is False
     payload = json.loads(capsys.readouterr().out)
     assert payload["paper_order_count"] == 0
+    assert payload["notification"] == {
+        "status": "suppressed",
+        "reason": "REPLAY_ONLY",
+    }
 
 
 def test_v3_cli_retrospective_research_uses_split_clocks_and_never_notifies(
