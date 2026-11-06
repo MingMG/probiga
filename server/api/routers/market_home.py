@@ -157,18 +157,19 @@ def _verified_turnover(day: str, quotes: list[dict], stocks: list[dict], now: da
     params = {"day": day, "now": now, "count": len(stocks), "kind": TURNOVER_CAPTURE_KIND,
               "provider": TURNOVER_PROVIDER, "field": TURNOVER_SOURCE_FIELD, "unit": TURNOVER_UNIT}
     runs = _read(engine, f"""
-        SELECT /*+ MAX_EXECUTION_TIME(1200) */ run_id, collector_build_sha, decision_at, published_at,
+        SELECT /*+ MAX_EXECUTION_TIME(1200) */ run_id, collector_build_sha, decision_at, published_at, expected_count,
                semantic_sha256, field_value_root_sha256
         FROM {TURNOVER_SNAPSHOT_RUN_TABLE}
         WHERE target_date=:day AND published_at<=:now AND decision_at<=:now
           AND capture_kind=:kind AND provider=:provider AND source_field=:field AND unit=:unit
-          AND status='COMPLETED' AND expected_count=:count AND expected_count=fetched_count
+          AND status='COMPLETED' AND expected_count BETWEEN 1 AND :count AND expected_count=fetched_count
           AND expected_count=valid_count AND expected_count=matched_count AND expected_count=promoted_count
-        ORDER BY decision_at DESC, published_at DESC, run_id DESC LIMIT 1
+        ORDER BY expected_count DESC, decision_at DESC, published_at DESC, run_id DESC LIMIT 1
     """, params, deadline=deadline)
     if not runs:
         return None
     run = runs[0]
+    expected_count = run["expected_count"]
     completion = load_completed_market_capture_receipt(
         engine, raw_run_id=run["run_id"], stage_name="target_turnover_snapshot", target_date=day,
         build_sha=run["collector_build_sha"], decision_at=now,
@@ -179,7 +180,7 @@ def _verified_turnover(day: str, quotes: list[dict], stocks: list[dict], now: da
     if (not decision_at or not known_at or not published_at or not decision_at <= published_at <= known_at <= now
             or _clock(receipt.get("decision_at")) != decision_at or _clock(receipt.get("published_at")) != published_at
             or any(receipt.get(key) != run[key] for key in ("semantic_sha256", "field_value_root_sha256"))
-            or receipt.get("expected_count") != len(stocks) or receipt.get("promoted_count") != len(stocks)):
+            or receipt.get("expected_count") != expected_count or receipt.get("promoted_count") != expected_count):
         return None
     rows = _read(engine, f"""
         SELECT /*+ MAX_EXECUTION_TIME(2000) */ r.stock_code, CAST(r.field_value_decimal AS CHAR) AS rate,
@@ -199,8 +200,8 @@ def _verified_turnover(day: str, quotes: list[dict], stocks: list[dict], now: da
         WHERE r.run_id=:run_id AND r.trade_date=:day AND r.k_type=1 AND r.adjust_type=0
           AND r.validation_status='MATCHED' AND r.promoted_at<=:now
         ORDER BY r.stock_code LIMIT :limit
-    """, {"day": day, "now": now, "run_id": run["run_id"], "limit": len(stocks) + 1}, deadline=deadline)
-    if len(rows) != len(stocks):
+    """, {"day": day, "now": now, "run_id": run["run_id"], "limit": expected_count + 1}, deadline=deadline)
+    if len(rows) != expected_count:
         return None
     quote_by_code = {row["stock_code"]: row for row in _unique_rows(quotes, "stock_code")}
     stock_by_code = {row["stock_code"]: row for row in stocks}
@@ -334,8 +335,8 @@ def _stock_rows(rows: list[dict], day: str, *, live: bool) -> list[dict]:
             change = _number(row.get("change_pct"))
         else:
             change = round((price - previous) / previous * 100, 6) if previous and previous > 0 else None
-        if change is None or not math.isfinite(change) or change <= -100:
-            continue
+        if change is not None and (not math.isfinite(change) or change <= -100):
+            change = None
         result.append({
             "stock_code": row["stock_code"], "short_name": row.get("short_name") or row["stock_code"],
             "trade_date": day, "price": price, "change_pct": change,
@@ -536,7 +537,8 @@ def build_market_board(day: date, *, now: datetime) -> dict:
     turnover_rows = [row for row in stocks if row["turnover_rate"] is not None]
     if turnover_evidence is None and len(turnover_rows) != len(stocks):
         turnover_rows = []
-    if not stocks:
+    return_stocks = [row for row in stocks if row["change_pct"] is not None]
+    if not return_stocks:
         unavailable.extend(("distribution", "strong", "rankings.gainers", "rankings.losers"))
     if not amount_complete:
         unavailable.append("rankings.amount")
@@ -551,8 +553,8 @@ def build_market_board(day: date, *, now: datetime) -> dict:
     if not as_of and events:
         as_of = _clock(events[0]["snapshot_at"])
         source = LIMIT_UP_EVENT_TABLE if events[0].get("event_family") == "LIMIT_UP_LIFECYCLE" else "sm_market_radar_event"
-    up = [row for row in stocks if row["change_pct"] > 0]
-    down = [row for row in stocks if row["change_pct"] < 0]
+    up = [row for row in return_stocks if row["change_pct"] > 0]
+    down = [row for row in return_stocks if row["change_pct"] < 0]
     status = "unavailable"
     if as_of:
         status = "partial" if unavailable or len(turnover_rows) != len(stocks) else "available"
@@ -564,11 +566,12 @@ def build_market_board(day: date, *, now: datetime) -> dict:
         "as_of_basis": {"sm_stock_current": "qmt_snapshot", "sm_stock_kline": "exchange_close",
                         "sm_index_kline": "exchange_close", "sm_market_radar_event": "radar_observation",
                         LIMIT_UP_EVENT_TABLE: "qmt_limit_event"}.get(source),
-        "sample_size": len(stocks), "sample_scope": "verified_quotes_with_price_and_change_pct",
+        "sample_size": len(return_stocks), "sample_scope": "verified_quotes_with_price_and_change_pct",
+        "price_sample_size": len(stocks),
         "sample_sources": sorted({row["source"] for row in stocks}),
-        "distribution": _distribution(stocks) if stocks else [],
-        "strong": {"up_3pct": sum(row["change_pct"] >= 3 for row in up) if stocks else None,
-                   "down_3pct": sum(row["change_pct"] <= -3 for row in down) if stocks else None},
+        "distribution": _distribution(return_stocks) if return_stocks else [],
+        "strong": {"up_3pct": sum(row["change_pct"] >= 3 for row in up) if return_stocks else None,
+                   "down_3pct": sum(row["change_pct"] <= -3 for row in down) if return_stocks else None},
         "rankings": {
             "gainers": _rank(up, "change_pct", descending=True),
             "losers": _rank(down, "change_pct", descending=False),

@@ -254,8 +254,12 @@
         const noMatches = !sourceRows.length && ['gainers', 'losers'].includes(key) && number(snapshot?.sample_size) > 0 &&
             Array.isArray(snapshot?.unavailable_fields) && !snapshot.unavailable_fields.includes('rankings.' + key);
         const coverage = key === 'turnover' ? snapshot?.turnover_coverage : null;
-        const scope = Number.isInteger(coverage?.verified_count) && Number.isInteger(coverage?.sample_size)
-            ? ` · 已核验 ${metric(coverage.verified_count, '', 0)}/${metric(coverage.sample_size, '只', 0)}` : '';
+        let scope = '';
+        if (Number.isInteger(coverage?.verified_count) && Number.isInteger(coverage?.sample_size)) {
+            scope = ` · 已核验 ${metric(coverage.verified_count, '', 0)}/${metric(coverage.sample_size, '只', 0)}`;
+        } else if (key === 'amount' && Number.isInteger(snapshot?.price_sample_size)) {
+            scope = ` · 价量样本 ${metric(snapshot.price_sample_size, '只', 0)}`;
+        }
         const meta = display.length ? `TOP ${display.length}${scope} · ${snapshotMeta(snapshot)}` : noMatches ? snapshotMeta(snapshot) : '排名待核验';
         return panel(title, meta, display.length ?
             '<div class="mh-list">' + display.map((item, i) => {

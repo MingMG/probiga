@@ -188,7 +188,7 @@ def test_board_keeps_missing_amount_and_unbound_live_quotes_out(market_db):
     assert daily["rankings"]["turnover"][0]["stock_code"] == "000002"
 
 
-@pytest.mark.parametrize("problem", [None, "stage", "field_root", "missing_capture", "quote_mismatch"])
+@pytest.mark.parametrize("problem", [None, "stage", "field_root", "missing_capture", "quote_mismatch", "ipo", "ipo_prior_subset"])
 def test_board_native_turnover_requires_complete_evidence_and_exact_quotes(market_db, monkeypatch, problem):
     items = [{"stock_code": code, "trade_date": DAY_TEXT, "turnover_percent": rate}
              for code, rate in (("000001", "2"), ("000002", "4.5"))]
@@ -196,6 +196,11 @@ def test_board_native_turnover_requires_complete_evidence_and_exact_quotes(marke
     with market_db.begin() as connection:
         _stock(connection, "000001", 102, turnover=2)
         _stock(connection, "000002", 103, turnover=4.5)
+        if problem == "ipo":
+            connection.execute(text("UPDATE sm_stock_kline SET pre_close=NULL WHERE stock_code='000002'"))
+        if problem == "ipo_prior_subset":
+            _stock(connection, "920085", 39.25, amount=300)
+            connection.execute(text("UPDATE sm_stock_kline SET pre_close=NULL WHERE stock_code='920085'"))
         connection.execute(text("""
             INSERT INTO st_market_field_capture_run VALUES
             ('capture','build',:day,'2026-11-06 16:30:00','2026-11-06 16:20:00','DAILY_TURNOVER_F61',
@@ -225,8 +230,8 @@ def test_board_native_turnover_requires_complete_evidence_and_exact_quotes(marke
 
     monkeypatch.setattr(market_home, "load_completed_market_capture_receipt", completion)
     result = market_home.build_market_board(DAY, now=datetime(2026, 11, 7))
-    assert result["sample_size"] == 2
-    assert len(result["rankings"]["gainers"]) == 2
+    assert result["sample_size"] == len(result["rankings"]["gainers"]) == (1 if problem == "ipo" else 2)
+    assert result["price_sample_size"] == (3 if problem == "ipo_prior_subset" else 2)
     if problem in {"stage", "field_root", "missing_capture"}:
         assert not result["rankings"]["turnover"]
         assert result["turnover_evidence"] is None
@@ -243,7 +248,15 @@ def test_board_native_turnover_requires_complete_evidence_and_exact_quotes(marke
         assert [(row["stock_code"], row["turnover_rate"]) for row in rank] == [("000002", 4.5), ("000001", 2)]
         assert {row["turnover_rate_source"] for row in rank} == {"eastmoney.push2his.kline"}
         assert result["turnover_evidence"]["known_at"] == "2026-11-06T16:31:00+08:00"
-        assert result["turnover_coverage"]["status"] == "complete"
+        if problem == "ipo":
+            assert rank[0]["change_pct"] is None
+            assert result["turnover_coverage"]["status"] == "complete"
+        elif problem == "ipo_prior_subset":
+            assert result["rankings"]["amount"][0]["stock_code"] == "920085"
+            assert result["turnover_coverage"] == {"status": "partial", "verified_count": 2, "sample_size": 3,
+                                                   "excluded_count": 1, "excluded_codes": ["920085"]}
+        else:
+            assert result["turnover_coverage"]["status"] == "complete"
 
 
 @pytest.mark.parametrize("source_amount, corrupt", [(12690811.41, False), (12690811.51, False), (12690811.41, True)])
