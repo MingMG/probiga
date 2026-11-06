@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import logging
 import math
 import re
 import subprocess
@@ -21,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import date, datetime
-from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation
 from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Iterable, Mapping, Sequence
 from urllib.parse import urlencode, urlparse
@@ -86,6 +87,7 @@ _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _CODE = re.compile(r"[0-9]{6}")
 _SHA40 = re.compile(r"[0-9a-f]{40}")
 _SHA64 = re.compile(r"[0-9a-f]{64}")
+logger = logging.getLogger(__name__)
 
 DEFAULT_EASTMONEY_HOSTS = (
     "https://push2his.eastmoney.com",
@@ -1739,6 +1741,32 @@ def _verify_stage_readback(
     if len(run_row) != 1:
         raise _blocked("turnover run readback identity differs")
     persisted = dict(run_row[0])
+    _verify_turnover_run_readback(persisted, run, expected_status=expected_status)
+    rows = connection.execute(
+        text(
+            f"SELECT * FROM {TURNOVER_SNAPSHOT_ROW_TABLE} "
+            "WHERE run_id=:run_id ORDER BY stock_code"
+        ),
+        {"run_id": run.run_id},
+    ).mappings().all()
+    if len(rows) != len(run.rows):
+        raise _blocked("turnover row readback count differs")
+    by_code = {item.target.stock_code: item for item in run.rows}
+    for persisted_row in rows:
+        code = str(persisted_row.get("stock_code") or "")
+        expected = by_code.get(code)
+        reconstructed = _reconstruct_persisted_capture(
+            persisted_row,
+            decision_at=run.decision_at,
+            published_at=_local_datetime(persisted["published_at"], field="published_at"),
+        )
+        if expected is None or reconstructed != expected:
+            raise _blocked(f"turnover row readback differs for {code}")
+
+
+def _verify_turnover_run_readback(
+    persisted: Mapping[str, Any], run: TurnoverCaptureRun, *, expected_status: str,
+) -> None:
     persisted_response = persisted.get("provider_response_payload")
     if isinstance(persisted_response, memoryview):
         persisted_response = persisted_response.tobytes()
@@ -1795,29 +1823,6 @@ def _verify_stage_readback(
         or str(persisted.get("semantic_sha256") or "") != run.semantic_sha256
     ):
         raise _blocked("turnover run readback contract differs")
-    rows = connection.execute(
-        text(
-            f"SELECT * FROM {TURNOVER_SNAPSHOT_ROW_TABLE} "
-            "WHERE run_id=:run_id ORDER BY stock_code"
-        ),
-        {"run_id": run.run_id},
-    ).mappings().all()
-    if len(rows) != count:
-        raise _blocked("turnover row readback count differs")
-    by_code = {item.target.stock_code: item for item in run.rows}
-    for persisted_row in rows:
-        code = str(persisted_row.get("stock_code") or "")
-        expected = by_code.get(code)
-        reconstructed = _reconstruct_persisted_capture(
-            persisted_row,
-            decision_at=run.decision_at,
-            published_at=_local_datetime(persisted["published_at"], field="published_at"),
-        )
-        if (
-            expected is None
-            or reconstructed != expected
-        ):
-            raise _blocked(f"turnover row readback differs for {code}")
 
 
 def _verify_kline_promotion_readback(connection, run: TurnoverCaptureRun) -> None:
@@ -2476,6 +2481,116 @@ def recover_completed_turnover_receipt(
     }
 
 
+def recover_retained_turnover_rows(
+    engine,
+    *,
+    targets: Sequence[QmtTurnoverTarget],
+    decision_at: datetime,
+    transport_contract: str,
+    resolved_endpoint: str,
+    completed_codes: Iterable[str] = (),
+) -> tuple[datetime | None, dict[str, CapturedTurnoverRow]]:
+    """Rebind verified raw observations to corrected targets without changing their clocks."""
+    existing = set(completed_codes)
+    pending = {target.stock_code: target for target in targets if target.stock_code not in existing}
+    if not pending:
+        return None, {}
+    target_date = targets[0].trade_date
+    cutoff = _local_datetime(decision_at, field="retained turnover decision_at")
+    if any(target.trade_date != target_date for target in targets):
+        raise _blocked("retained turnover targets span multiple sessions")
+    with engine.connect() as connection:
+        stored = connection.execute(text(f"""
+            SELECT /*+ MAX_EXECUTION_TIME(3000) */ *
+            FROM {TURNOVER_SNAPSHOT_RUN_TABLE}
+            WHERE target_date=:target_date AND capture_kind=:capture_kind
+              AND provider=:provider AND status='COMPLETED'
+              AND decision_at<=:cutoff AND published_at<=:cutoff
+              AND transport_contract=:transport AND resolved_endpoint=:endpoint
+            ORDER BY published_at DESC,run_id DESC LIMIT 1
+        """), {
+            "target_date": target_date.isoformat(), "capture_kind": TURNOVER_CAPTURE_KIND,
+            "provider": TURNOVER_PROVIDER, "cutoff": _datetime_text(cutoff),
+            "transport": transport_contract, "endpoint": resolved_endpoint,
+        }).mappings().one_or_none()
+        if stored is None:
+            return None, {}
+        try:
+            count = int(stored["expected_count"])
+            if not 0 < count <= 2 * len(targets):
+                raise _blocked("retained turnover scope exceeds the bounded read")
+            rows = connection.execute(text(f"""
+                SELECT /*+ MAX_EXECUTION_TIME(5000) */ *
+                FROM {TURNOVER_SNAPSHOT_ROW_TABLE}
+                WHERE run_id=:run_id AND LENGTH(raw_payload) BETWEEN 1 AND 8192
+                ORDER BY stock_code LIMIT :row_limit
+            """), {"run_id": stored["run_id"], "row_limit": count + 1}).mappings().all()
+            if len(rows) != count:
+                raise _blocked("retained turnover source count differs")
+            recorded_cutoff = _local_datetime(stored["decision_at"], field="retained source cutoff")
+            published = _local_datetime(stored["published_at"], field="retained source publication")
+            started = _local_datetime(stored["request_started_at"], field="retained source request")
+            retained = tuple(
+                _reconstruct_persisted_capture(row, decision_at=recorded_cutoff, published_at=published)
+                for row in rows
+            )
+            if any(item.target.trade_date != target_date or item.captured_at < started for item in retained):
+                raise _blocked("retained turnover source date or request time differs")
+            original = build_capture_run(
+                targets=tuple(item.target for item in retained), rows=retained, target_date=target_date,
+                decision_at=recorded_cutoff, collector_build_sha=stored["collector_build_sha"],
+                collector_binary_sha256=stored["collector_binary_sha256"], request_started_at=started,
+                authority=TurnoverUniverseAuthority(
+                    target_date=target_date, decision_at=recorded_cutoff,
+                    truth_run_id=stored["authority_proof_identity"],
+                    truth_sha256=stored["authority_proof_sha256"],
+                    stock_set_sha256=stored["authority_set_sha256"],
+                    expected_codes=tuple(item.target.stock_code for item in retained),
+                ),
+                transport_contract=transport_contract, resolved_endpoint=resolved_endpoint,
+                run_id=stored["run_id"],
+            )
+            if (
+                original.captured_max_at != _local_datetime(stored["captured_max_at"], field="retained latest capture")
+                or original.provider_http_max_at != _local_datetime(stored["provider_observed_max_at"], field="retained latest source")
+                or max(original.captured_max_at, original.provider_http_max_at) > published
+            ):
+                raise _blocked("retained turnover source clocks differ")
+            _verify_turnover_run_readback(stored, original, expected_status="COMPLETED")
+        except (TurnoverSnapshotBlocked, TypeError, ValueError, KeyError) as exc:
+            logger.warning("Retained turnover source proof rejected for %s: %s", target_date, type(exc).__name__)
+            return None, {}
+    recovered = {}
+    for item in retained:
+        target = pending.get(item.target.stock_code)
+        if target is None:
+            continue
+        unchanged = all(
+            getattr(item.target, field) == getattr(target, field)
+            for field in ("open", "high", "low", "close", "volume_shares", "amount")
+        )
+        # Eastmoney owns f61 and QMT owns market facts. An already verified
+        # source stays valid when those QMT facts are unchanged. A changed
+        # market binding requires agreement with the original source response.
+        reconciled = (
+            (item.source_open, item.source_high, item.source_low, item.source_close)
+            == (target.open, target.high, target.low, target.close)
+            and item.source_volume_shares == target.volume_shares
+            # QMT may truncate the same CNY amount to whole yuan.
+            and abs(item.source_amount - target.amount) <= Decimal("1")
+        )
+        if (
+            not (unchanged or reconciled)
+            or (target.turnover_ratio is not None and item.turnover_percent != target.turnover_ratio)
+        ):
+            continue
+        recovered[target.stock_code] = parse_eastmoney_turnover_response(
+            target=target, raw_payload=item.raw_payload, provider_http_date=item.provider_http_date,
+            captured_at=item.captured_at, decision_at=cutoff,
+        )
+    return (started, recovered) if recovered else (None, {})
+
+
 __all__ = [
     "CapturedTurnoverRow",
     "DEFAULT_EASTMONEY_HOSTS",
@@ -2502,6 +2617,7 @@ __all__ = [
     "publish_turnover_snapshot",
     "qmt_fingerprint_root_sha256",
     "recover_completed_turnover_receipt",
+    "recover_retained_turnover_rows",
     "restore_turnover_checkpoint_row",
     "serialize_turnover_checkpoint_row",
     "turnover_capture_input_sha256",

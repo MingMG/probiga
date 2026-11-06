@@ -33,6 +33,7 @@ from server.common.turnover_snapshot import (
     load_turnover_universe_authority,
     publish_turnover_snapshot,
     recover_completed_turnover_receipt,
+    recover_retained_turnover_rows,
     restore_turnover_checkpoint_row,
     serialize_turnover_checkpoint_row,
     turnover_capture_input_sha256,
@@ -548,6 +549,15 @@ def main(argv: list[str] | None = None) -> int:
                 target=target,
                 decision_at=datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None),
             )
+    retained_started_at, retained = recover_retained_turnover_rows(
+        engine, targets=targets, decision_at=decision_at,
+        transport_contract=collector.transport_contract,
+        resolved_endpoint=collector.resolved_endpoint,
+        completed_codes=completed,
+    )
+    if retained_started_at is not None:
+        request_started_at = min(request_started_at, retained_started_at)
+        completed.update(retained)
     latest_checkpoint_rows = tuple(completed.values())
 
     def persist_checkpoint(rows, *, status="IN_PROGRESS", receipt=None):
