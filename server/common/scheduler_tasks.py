@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from contextlib import nullcontext
 import re
 from typing import Any, Mapping
 
@@ -495,7 +496,7 @@ def update_scheduler_task(
 
 
 def claim_scheduler_task_run(
-    engine: Engine,
+    engine: Engine | Connection,
     task_id: int,
     *,
     expected_last_run_status: object = None,
@@ -504,6 +505,7 @@ def claim_scheduler_task_run(
     require_expected_state: bool = False,
     table_name: str = SCHEDULED_TASK_TABLE,
 ) -> bool:
+    """Claim in the caller's active transaction when a connection is supplied."""
     quoted_table = quote_identifier(table_name)
     expected_clauses: list[str] = []
     params: dict[str, object] = {"id": int(task_id)}
@@ -525,7 +527,13 @@ def claim_scheduler_task_run(
         if expected_clauses
         else ""
     )
-    with engine.begin() as conn:
+    if isinstance(engine, Connection):
+        if not engine.in_transaction():
+            raise ValueError("scheduler claim requires an active transaction")
+        connection_scope = nullcontext(engine)
+    else:
+        connection_scope = engine.begin()
+    with connection_scope as conn:
         result = conn.execute(
             text(
                 f"UPDATE {quoted_table} "
