@@ -31,6 +31,8 @@ from server.common.qmt_announcement_pit import (
     DEFAULT_BATCH_SIZE,
     DEFAULT_WINDOW_DAYS,
     EASTMONEY_ANNOUNCEMENT_SOURCE,
+    HISTORICAL_CAPTURE_DEADLINE,
+    HISTORICAL_PUBLISH_DEADLINE,
     QMT_ANNOUNCEMENT_MANUAL_RESEARCH_ORIGIN,
     QMT_ANNOUNCEMENT_RECONSTRUCTION_AUTHORITY_V3_SCHEMA,
     QMT_ANNOUNCEMENT_RECONSTRUCTION_STOCK_SCOPE,
@@ -59,6 +61,7 @@ from server.common.qmt_datadir_daily_coverage import (
     load_daily_manifest,
 )
 from server.common.qmt_datadir_result import load_receipt, partition_from_receipt
+from server.common.qmt_datadir_progress import MinuteImportProgress
 from server.common.qmt_daily_market_truth import load_qmt_daily_market_truth
 from server.common.qmt_attestation_contract import (
     validated_no_row_exception_contract,
@@ -1810,6 +1813,7 @@ def main(argv: list[str] | None = None) -> int:
 
     load_project_env()
     engine = None
+    progress = None
     manual_research = bool(args.research_recover_date)
     target_text = (
         args.research_recover_date
@@ -1848,7 +1852,10 @@ def main(argv: list[str] | None = None) -> int:
                     "PROBIGA_SCHEDULER_BUILD_SHA", ""
                 ).strip().lower()
                 execution_origin = QMT_ANNOUNCEMENT_SCHEDULER_RECOVERY_ORIGIN
-        engine = create_tool_engine()
+        if args.recover_missing_historical or manual_research:
+            engine = create_tool_engine(connect_args={"connect_timeout": 8, "read_timeout": 45, "write_timeout": 45})
+        else:
+            engine = create_tool_engine()
         if historical_modes:
             try:
                 payload = validate_existing_complete_qmt_announcement_batch(
@@ -1889,6 +1896,11 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 checkpoint_dir = _checkpoint_root(args.checkpoint_dir)
                 fallback = _fallback_announcement_adapter("cninfo")
+                if os.name == "nt" and _is_production() and not manual_research:
+                    progress = MinuteImportProgress(
+                        run_id=validation_run_uid, total_units=len(catalog.codes), operation="historical_reconstruction",
+                        days=[target], dataset="qmt_announcement_pit", checkpoint={},
+                    )
                 try:
                     payload = synchronize_historical_cninfo_announcements(
                         engine,
@@ -1910,6 +1922,7 @@ def main(argv: list[str] | None = None) -> int:
                         ),
                         window_days=args.window_days,
                         batch_size=args.batch_size,
+                        progress=progress,
                     )
                     payload["validation_run_uid"] = validation_run_uid
                     payload["validation_build_sha"] = validation_build_sha
@@ -2034,6 +2047,9 @@ def main(argv: list[str] | None = None) -> int:
                     args.research_recover_date or args.expected_trade_date
                 ),
             })
+            if reason in {HISTORICAL_CAPTURE_DEADLINE, HISTORICAL_PUBLISH_DEADLINE,
+                          "ANNOUNCEMENT_FALLBACK_CAPTURE_DEADLINE_EXPIRED"}:
+                payload["retryable"] = True
             if args.research_recover_date:
                 payload.update({
                     "execution_origin": (
@@ -2055,6 +2071,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         process_exit = 2
         validate_task_result(payload, process_exit)
+    if progress is not None:
+        progress.emit("terminal", status="COMPLETE" if process_exit == 0 else "FAILED",
+                      reason_code=payload.get("reason_code"))
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
     return process_exit
 

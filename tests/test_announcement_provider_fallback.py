@@ -1617,11 +1617,15 @@ def test_cninfo_failed_stock_resumes_same_cutoff_with_staged_receipt(
     assert second_client.requested_stock_identities == ["600519,org-600519"]
 
 
+@pytest.mark.parametrize("deadline_expires", [False, True])
 def test_historical_reconstruction_retry_resumes_same_sealed_checkpoint(
-    tmp_path,
+    tmp_path, monkeypatch, deadline_expires,
 ) -> None:
+    from server.common import qmt_announcement_pit as announcement
+    from server.common.qmt_datadir_progress import MinuteImportProgress
+
     target = date(2026, 9, 1)
-    first_started = datetime.now().replace(microsecond=0)
+    first_started = datetime.now(announcement.SHANGHAI).replace(tzinfo=None, microsecond=0)
     second_started = first_started + timedelta(minutes=1)
     catalog = AnnouncementCatalog(
         batch_id="catalog-historical-resume",
@@ -1642,6 +1646,20 @@ def test_historical_reconstruction_retry_resumes_same_sealed_checkpoint(
         minimum_request_interval=0,
         now_fn=lambda: first_started + timedelta(seconds=10),
     )
+    clock = [0.0]
+    monkeypatch.setattr(announcement, "monotonic", lambda: clock[0])
+    if deadline_expires:
+        original_fetch = first_provider.fetch
+
+        def finish_one_after_budget(**kwargs):
+            response = original_fetch(**kwargs)
+            clock[0] = announcement.HISTORICAL_RECONSTRUCTION_BUDGET.total_seconds()
+            return response
+
+        monkeypatch.setattr(first_provider, "fetch", finish_one_after_budget)
+    monkeypatch.setenv("PROBIGA_JOB_LOG_ROOT", str(tmp_path / "jobs"))
+    progress = MinuteImportProgress(run_id="1" * 32, total_units=2, operation="historical_reconstruction",
+                                    days=[target], dataset="qmt_announcement_pit", checkpoint={})
     engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
     ensure_pit_fact_schema(engine)
     with pytest.raises(QMTAnnouncementBlocked) as exc:
@@ -1660,9 +1678,17 @@ def test_historical_reconstruction_retry_resumes_same_sealed_checkpoint(
             ),
             now_fn=lambda: first_started,
             batch_size=2,
+            progress=progress,
         )
-    assert exc.value.reason_code == "ANNOUNCEMENT_FALLBACK_SOURCE_RATE_LIMITED"
+    assert exc.value.reason_code == (announcement.HISTORICAL_CAPTURE_DEADLINE if deadline_expires
+                                     else "ANNOUNCEMENT_FALLBACK_SOURCE_RATE_LIMITED")
     assert first_client.requested_stock_identities == ["000001,org-000001"]
+    events = [json.loads(line) for line in progress.path.read_text(encoding="utf-8").splitlines()]
+    assert events[-1]["status"] == "FAILED"
+    assert events[-1]["completed_units"] == 1
+    assert events[-1]["checkpoint"]["target_date"] == target.isoformat()
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT COUNT(*) FROM st_pit_source_coverage")).scalar_one() == 0
 
     second_client = _Client(
         masters=[master, master],
@@ -1673,6 +1699,7 @@ def test_historical_reconstruction_retry_resumes_same_sealed_checkpoint(
         minimum_request_interval=0,
         now_fn=lambda: second_started + timedelta(seconds=10),
     )
+    clock[0] = 0.0
     result = synchronize_historical_cninfo_announcements(
         engine,
         adapter=ProviderBackedAnnouncementAdapter(second_provider, workers=1),

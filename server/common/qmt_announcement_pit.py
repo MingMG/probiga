@@ -23,6 +23,7 @@ import os
 from pathlib import Path
 import re
 import tempfile
+from time import monotonic
 from typing import Any, Callable, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
@@ -95,6 +96,12 @@ CNINFO_DATE_SHARD_SPLIT_VERSION = "MIDPOINT_INCLUSIVE_V1"
 DEFAULT_WINDOW_DAYS = 30
 DEFAULT_OVERLAP_DAYS = 3
 DEFAULT_BATCH_SIZE = 100
+# The provider is queried per issuer. Keep a full-market capture resumable and
+# reserve a separate window for the final anchor, validation and atomic write.
+HISTORICAL_RECONSTRUCTION_BUDGET = timedelta(hours=2)
+HISTORICAL_RECONSTRUCTION_PUBLISH_RESERVE = timedelta(minutes=15)
+HISTORICAL_CAPTURE_DEADLINE = "QMT_ANNOUNCEMENT_RECONSTRUCTION_CAPTURE_DEADLINE"
+HISTORICAL_PUBLISH_DEADLINE = "QMT_ANNOUNCEMENT_RECONSTRUCTION_PUBLISH_DEADLINE"
 VALIDATION_READ_BATCH_SIZE = 500
 _CODE_RE = re.compile(r"^(?:0|3|4|6|8|9)\d{5}$")
 _QMT_CODE_RE = re.compile(r"^(?:0|3|4|6|8|9)\d{5}\.(?:SH|SZ|BJ)$")
@@ -234,6 +241,10 @@ def _shanghai_naive(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=None)
     return value.astimezone(SHANGHAI).replace(tzinfo=None)
+
+
+def _shanghai_now() -> datetime:
+    return datetime.now(SHANGHAI)
 
 
 def _dt(value: Any) -> datetime:
@@ -1772,6 +1783,8 @@ def _download_and_read(
     window_start: date,
     batch_size: int,
     source: str = QMT_ANNOUNCEMENT_SOURCE,
+    before_fetch: Callable[[str], None] | None = None,
+    after_save: Callable[[str], None] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     downloader = getattr(xtdata, "download_history_data", None)
     reader = getattr(xtdata, "get_market_data_ex", None)
@@ -1796,6 +1809,8 @@ def _download_and_read(
             operation = "download_history_data"
             try:
                 for qmt_code in qmt_chunk:
+                    if before_fetch is not None:
+                        before_fetch(qmt_code)
                     downloader(
                         qmt_code,
                         period=QMT_ANNOUNCEMENT_PERIOD,
@@ -1894,8 +1909,11 @@ def _download_and_read(
                 checkpoint.save(
                     code, events, provider_receipt=provider_receipt
                 )
+                if after_save is not None:
+                    after_save(code)
         except QMTAnnouncementBlocked as exc:
-            if exc.reason_code in ANNOUNCEMENT_FALLBACK_REASON_CODES:
+            if exc.reason_code in ANNOUNCEMENT_FALLBACK_REASON_CODES or (before_fetch is not None
+                    and exc.reason_code in {HISTORICAL_CAPTURE_DEADLINE, "ANNOUNCEMENT_FALLBACK_CAPTURE_DEADLINE_EXPIRED"}):
                 raise
             failed_chunks.append(exc)
             checkpoint.diagnose(exc.reason_code, exc.detail)
@@ -3187,6 +3205,7 @@ def _publish_batch(
     incremental_proof: Mapping[str, Any] | None = None,
     reconstruction_provenance: Mapping[str, Any] | None = None,
     deadline_at: datetime | None = None,
+    deadline_monotonic: float | None = None,
     now_fn: Callable[[], datetime] = datetime.now,
 ) -> tuple[list[str], datetime]:
     from server.common.pit_facts import (
@@ -3368,15 +3387,16 @@ def _publish_batch(
 
     def check_deadline(stage: str) -> datetime:
         observed = _dt(now_fn())
-        if deadline_at is not None and observed > _dt(deadline_at):
+        if ((deadline_at is not None and observed > _dt(deadline_at))
+                or (deadline_monotonic is not None and monotonic() >= deadline_monotonic)):
             raise QMTAnnouncementBlocked(
-                "QMT_ANNOUNCEMENT_CAPTURE_CLOCK_REVERSED", stage
+                HISTORICAL_PUBLISH_DEADLINE if reconstruction_mode else "QMT_ANNOUNCEMENT_CAPTURE_CLOCK_REVERSED", stage
             )
         return observed
 
     def write_rows(connection: Any) -> None:
         for index, code in enumerate(catalog.codes):
-            if index % 100 == 0:
+            if deadline_monotonic is not None or index % 100 == 0:
                 check_deadline(f"db-write:{index}")
             source_rows = [dict(item) for item in results[code]]
             provider_receipt = (
@@ -3385,7 +3405,9 @@ def _publish_batch(
                 else None
             )
             bindings: list[dict[str, Any]] = []
-            for item in source_rows:
+            for item_index, item in enumerate(source_rows):
+                if deadline_monotonic is not None and item_index % 25 == 0:
+                    check_deadline(f"db-event:{index}:{item_index}")
                 receipt = append_event_revision(
                     connection,
                     item,
@@ -3978,15 +4000,16 @@ def synchronize_historical_cninfo_announcements(
     checkpoint_root: Path,
     catalog: AnnouncementCatalog,
     context: HistoricalReconstructionContext,
-    now_fn: Callable[[], datetime] = datetime.now,
+    now_fn: Callable[[], datetime] = _shanghai_now,
     window_days: int = DEFAULT_WINDOW_DAYS,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    progress=None,
 ) -> dict[str, Any]:
     """Reconstruct one missing target batch without relabelling its knowledge time.
 
     The provider query is bounded by the target-day cutoff, while every event
     and empty receipt becomes known only at the actual reconstruction time.
-    Validated shards survive retries without an overall elapsed-time limit.
+    Validated shards survive a bounded attempt and are reused on fenced retry.
     """
 
     if not 20 <= int(window_days) <= 3660:
@@ -4003,6 +4026,20 @@ def synchronize_historical_cninfo_announcements(
         raise QMTAnnouncementBlocked(
             "QMT_ANNOUNCEMENT_RECONSTRUCTION_CLOCK_INVALID"
         )
+    publish_deadline = started_at + HISTORICAL_RECONSTRUCTION_BUDGET
+    capture_deadline = publish_deadline - HISTORICAL_RECONSTRUCTION_PUBLISH_RESERVE
+    time_observed = monotonic()
+    publish_monotonic = time_observed + (publish_deadline - observed_at).total_seconds()
+    capture_monotonic = time_observed + (capture_deadline - observed_at).total_seconds()
+
+    def check_capture_deadline(unit: str) -> None:
+        if monotonic() >= capture_monotonic:
+            raise QMTAnnouncementBlocked(HISTORICAL_CAPTURE_DEADLINE, unit)
+
+    check_capture_deadline("checkpoint")
+    binder = getattr(adapter, "bind_capture_deadline", None)
+    if callable(binder):
+        binder(fact_cutoff_at=started_at, max_capture_delay=capture_deadline - started_at)
     window_start = target - timedelta(days=int(window_days))
     window_end = target
     seed = {
@@ -4056,15 +4093,46 @@ def synchronize_historical_cninfo_announcements(
                 "QMT_ANNOUNCEMENT_RECONSTRUCTION_RESUME_UNSUPPORTED"
             )
         restorer(staged_receipts)
-    results = _download_and_read(
-        adapter,
-        checkpoint=checkpoint,
-        catalog=catalog,
-        fact_cutoff_at=source_cutoff,
-        window_start=window_start,
-        batch_size=int(batch_size),
-        source=CNINFO_ANNOUNCEMENT_SOURCE,
-    )
+    completed_units = len(staged_receipts)
+    resumed_units = completed_units
+    progress_started = last_report = monotonic()
+    if progress is not None:
+        progress.checkpoint = {"batch_id": batch_id, "source": CNINFO_ANNOUNCEMENT_SOURCE,
+                               "target_date": target.isoformat()}
+        progress.emit("source_checkpoint", completed_units=completed_units,
+                      resumed_units=resumed_units,
+                      capture_deadline_at=_dt_text(capture_deadline), publish_deadline_at=_dt_text(publish_deadline))
+
+    def report_saved_stock(code: str) -> None:
+        nonlocal completed_units, last_report
+        completed_units += 1
+        current = monotonic()
+        if (progress is not None and (completed_units % 50 == 0 or completed_units == len(catalog.codes)
+                                      or current - last_report >= 30)):
+            rate = (completed_units - resumed_units) / max(current - progress_started, 0.001)
+            progress.emit("source_checkpoint", completed_units=completed_units, current_unit=code,
+                          committed_units_per_second=round(rate, 3))
+            last_report = current
+
+    try:
+        results = _download_and_read(
+            adapter,
+            checkpoint=checkpoint,
+            catalog=catalog,
+            fact_cutoff_at=source_cutoff,
+            window_start=window_start,
+            batch_size=int(batch_size),
+            source=CNINFO_ANNOUNCEMENT_SOURCE,
+            before_fetch=check_capture_deadline,
+            after_save=report_saved_stock,
+        )
+    except Exception:
+        if progress is not None:
+            progress.emit("source_checkpoint", status="FAILED", completed_units=completed_units)
+        raise
+    check_capture_deadline("security-master-end")
+    if progress is not None:
+        progress.emit("source_checkpoint", status="COMPLETE", completed_units=completed_units)
     receipt_reader = getattr(adapter, "capture_receipts", None)
     raw_receipts = receipt_reader() if callable(receipt_reader) else None
     if not isinstance(raw_receipts, Mapping) or set(raw_receipts) != set(
@@ -4137,6 +4205,8 @@ def synchronize_historical_cninfo_announcements(
             "QMT_ANNOUNCEMENT_RECONSTRUCTION_ENVELOPE_INVALID"
         )
     directory_anchor = list(directory_anchors)[0]
+    if progress is not None:
+        progress.emit("source_capture", status="COMPLETE", completed_units=completed_units)
     provenance_core = {
         "schema": QMT_ANNOUNCEMENT_RECONSTRUCTION_SCHEMA,
         "mode": "HISTORICAL_RECONSTRUCTION",
@@ -4222,6 +4292,8 @@ def synchronize_historical_cninfo_announcements(
     checkpoint.prepare_publish(
         batch_root_hash=batch_root, received_at=reconstructed_at
     )
+    if progress is not None:
+        progress.emit("database_publish", completed_units=completed_units)
     coverage_ids, completed_at = _publish_batch(
         engine,
         batch_id=batch_id,
@@ -4238,6 +4310,8 @@ def synchronize_historical_cninfo_announcements(
         provider_receipts=receipts,
         incremental_proof=incremental,
         reconstruction_provenance=provenance,
+        deadline_at=publish_deadline,
+        deadline_monotonic=publish_monotonic,
         now_fn=now_fn,
     )
     try:

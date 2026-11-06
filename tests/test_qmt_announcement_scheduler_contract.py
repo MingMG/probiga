@@ -625,7 +625,7 @@ def test_historical_recovery_reuses_exact_existing_batch_without_provider_io(
             observed["disposed"] = True
 
     monkeypatch.setattr(env_config, "load_project_env", lambda: None)
-    monkeypatch.setattr(env_config, "create_tool_engine", Engine)
+    monkeypatch.setattr(env_config, "create_tool_engine", lambda **_kwargs: Engine())
     monkeypatch.setattr(
         announcement_tool,
         "validate_existing_complete_qmt_announcement_batch",
@@ -676,7 +676,7 @@ def test_latest_closed_missing_batch_runs_explicit_historical_reconstruction(
         "status": "COMPLETE",
     }
     monkeypatch.setattr(env_config, "load_project_env", lambda: None)
-    monkeypatch.setattr(env_config, "create_tool_engine", Engine)
+    monkeypatch.setattr(env_config, "create_tool_engine", lambda **_kwargs: Engine())
     monkeypatch.setenv("PROBIGA_SCHEDULER_HISTORY_RUN_UID", "1" * 32)
     monkeypatch.setenv("PROBIGA_SCHEDULER_BUILD_SHA", "2" * 40)
 
@@ -812,7 +812,7 @@ def test_capture_failure_preserves_only_controlled_integrity_detail(
             observed["closed"] = True
 
     monkeypatch.setattr(env_config, "load_project_env", lambda: None)
-    monkeypatch.setattr(env_config, "create_tool_engine", Engine)
+    monkeypatch.setattr(env_config, "create_tool_engine", lambda **_kwargs: Engine())
     monkeypatch.setenv("PROBIGA_SCHEDULER_HISTORY_RUN_UID", "1" * 32)
     monkeypatch.setenv("PROBIGA_SCHEDULER_BUILD_SHA", "2" * 40)
     monkeypatch.setattr(
@@ -944,7 +944,7 @@ def test_historical_recovery_does_not_fallback_on_existing_batch_drift(
             return None
 
     monkeypatch.setattr(env_config, "load_project_env", lambda: None)
-    monkeypatch.setattr(env_config, "create_tool_engine", Engine)
+    monkeypatch.setattr(env_config, "create_tool_engine", lambda **_kwargs: Engine())
 
     def drift(*_args, **_kwargs):
         raise announcement_tool.QMTAnnouncementBlocked(
@@ -984,7 +984,7 @@ def test_manual_research_recovery_uses_distinct_identity(
         hex = "3" * 32
 
     monkeypatch.setattr(env_config, "load_project_env", lambda: None)
-    monkeypatch.setattr(env_config, "create_tool_engine", Engine)
+    monkeypatch.setattr(env_config, "create_tool_engine", lambda **_kwargs: Engine())
     monkeypatch.setenv("PROBIGA_SCHEDULER_HISTORY_RUN_UID", "9" * 32)
     monkeypatch.setenv("PROBIGA_SCHEDULER_BUILD_SHA", "8" * 40)
     monkeypatch.setattr(announcement_tool.uuid, "uuid4", lambda: RunId())
@@ -1082,7 +1082,7 @@ def test_manual_research_retry_reuses_complete_batch_without_writing(
         "validation_build_sha": "2" * 40,
     }
     monkeypatch.setattr(env_config, "load_project_env", lambda: None)
-    monkeypatch.setattr(env_config, "create_tool_engine", Engine)
+    monkeypatch.setattr(env_config, "create_tool_engine", lambda **_kwargs: Engine())
     monkeypatch.setattr(announcement_tool.uuid, "uuid4", lambda: RunId())
     monkeypatch.setattr(
         announcement_tool,
