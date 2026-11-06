@@ -87,7 +87,7 @@ def test_application_and_deployment_changes_are_linux(repo, path):
 
 
 @pytest.mark.parametrize("path", policy._WINDOWS_RUNTIME_FILES)
-def test_windows_minute_runtime_body_change_is_not_a_schema_change(repo, path):
+def test_windows_runtime_body_change_is_not_a_schema_change(repo, path):
     repo.write(path, "REVISION = 1\n\ndef read():\n    return 1\n")
     windows = repo.commit()
     repo.write(path, "REVISION = 1\n\ndef read():\n    return 2\n")
@@ -98,8 +98,9 @@ def test_windows_minute_runtime_body_change_is_not_a_schema_change(repo, path):
     assert result["base_contract_sha256"] == result["contract_sha256"]
 
 
-def _missed_windows_runtime_release(repo):
-    path = "server/common/qmt_datadir_minute_coverage.py"
+def _missed_windows_runtime_release(
+    repo, path="server/common/qmt_datadir_minute_coverage.py",
+):
     repo.write(path, "REVISION = 1\n\ndef persisted_matrix():\n    return 1\n")
     windows = repo.commit()
     repo.write(path, "REVISION = 1\n\ndef persisted_matrix():\n    return 2\n")
@@ -108,8 +109,13 @@ def _missed_windows_runtime_release(repo):
     return windows, linux, repo.commit()
 
 
-def test_deployed_windows_base_catches_a_runtime_change_already_in_linux(repo):
-    windows, linux, target = _missed_windows_runtime_release(repo)
+@pytest.mark.parametrize("path", [
+    "server/common/qmt_datadir_minute_coverage.py",
+    "server/common/qmt_announcement_pit.py",
+    "tools/sync_qmt_announcement_pit.py",
+])
+def test_deployed_windows_base_catches_a_runtime_change_already_in_linux(repo, path):
+    windows, linux, target = _missed_windows_runtime_release(repo, path)
     historical = repo.classify(target, base=linux)
     assert historical["scope"] == "LINUX"
     assert historical["windows_base_sha"] is None
@@ -117,6 +123,7 @@ def test_deployed_windows_base_catches_a_runtime_change_already_in_linux(repo):
     assert result["scope"] == "COORDINATED"
     assert result["reason_codes"] == ["windows_runtime_changed"]
     assert result["windows_base_sha"] == windows
+    assert result["windows_runtime_changed_paths"] == [path]
     assert result["base_contract_sha256"] == result["contract_sha256"]
     # Once the artifact reached Windows, another Linux repository commit does
     # not force that unchanged runtime to reload.
