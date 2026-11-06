@@ -5317,6 +5317,15 @@ def _claim_task_run(row: dict, engine) -> bool:
     )
 
 
+def _claim_task_run_with_audit(row: dict, engine, *, run_uid: str) -> tuple[bool, str | None]:
+    if str(row.get("task_type") or "").strip() == "intraday_market_alert":
+        history_uid = _task_history_start(engine, row, run_uid=run_uid, claim_first=True)
+        return history_uid is not None, history_uid
+    if not _claim_task_run(row, engine):
+        return False, None
+    return True, _task_history_start(engine, row, run_uid=run_uid)
+
+
 def _build_task_args(row: dict, script_path: str, today: str) -> list[str]:
     return build_scheduler_task_args(row, script_path, today)
 
@@ -7538,13 +7547,17 @@ def _try_revalidate_existing_notice_receipt(
     return True
 
 
-def _task_history_start(engine, row: dict, *, run_uid: str | None = None) -> str | None:
-    """Append one claimed run. History failure must not prevent delivery."""
+def _task_history_start(
+    engine, row: dict, *, run_uid: str | None = None, claim_first: bool = False,
+) -> str | None:
+    """Append one leased audit, optionally claiming in the same transaction."""
     task_id = int(row["id"])
     run_uid = str(run_uid or uuid.uuid4().hex)[:64]
     try:
         _ensure_task_history_table(engine)
         with engine.begin() as conn:
+            if claim_first and not _claim_task_run(row, conn):
+                return None
             claim_rows = conn.execute(
                 text(
                     "SELECT last_run_status, last_run_at, last_triggered_at "
@@ -7627,6 +7640,8 @@ def _task_history_start(engine, row: dict, *, run_uid: str | None = None) -> str
         return run_uid
     except Exception as exc:
         logger.warning("Failed to append scheduler history start for task %s: %s", task_id, exc)
+        if claim_first:
+            raise
         return None
 
 
@@ -10283,8 +10298,17 @@ def launch_scheduler_task(
         if _uses_exclusive_lane(row):
             _exclusive_running_task_ids.add(task_id)
 
+    manual_row = dict(row)
+    manual_row["_trigger_source"] = "manual_ladder" if row.get("_limit_ladder_only") is True else trigger_source
+    if trigger_source == "release_catchup":
+        manual_row.update({
+            "_scheduler_target_available": True,
+            "_scheduler_target_trade_date": target_trade_date,
+        })
     try:
-        claimed = _claim_task_run(row, engine)
+        claimed, manual_history_uid = _claim_task_run_with_audit(
+            manual_row, engine, run_uid=requested_history_uid or uuid.uuid4().hex,
+        )
     except Exception:
         with _running_lock:
             _running_task_ids.discard(task_id)
@@ -10296,6 +10320,8 @@ def launch_scheduler_task(
             _alert_lane_running_task_ids.discard(task_id)
             _delivery_lane_running_task_ids.discard(task_id)
             _exclusive_running_task_ids.discard(task_id)
+            if _shutdown_owned_runs is not None and _shutdown_owned_runs.get(task_id) == "":
+                del _shutdown_owned_runs[task_id]
         raise
     if not claimed:
         with _running_lock:
@@ -10318,18 +10344,6 @@ def launch_scheduler_task(
             "task_name": task_name,
         }
 
-    manual_row = dict(row)
-    manual_row["_trigger_source"] = "manual_ladder" if row.get("_limit_ladder_only") is True else trigger_source
-    if trigger_source == "release_catchup":
-        manual_row.update({
-            "_scheduler_target_available": True,
-            "_scheduler_target_trade_date": target_trade_date,
-        })
-    manual_history_uid = _task_history_start(
-        engine,
-        manual_row,
-        run_uid=requested_history_uid or uuid.uuid4().hex,
-    )
     if not manual_history_uid:
         with _running_lock:
             _running_task_ids.discard(task_id)
@@ -10907,7 +10921,9 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                         _exclusive_running_task_ids.add(int(task_id))
 
                 try:
-                    claimed = _claim_task_run(row, engine)
+                    claimed, history_uid = _claim_task_run_with_audit(
+                        row, engine, run_uid=uuid.uuid4().hex,
+                    )
                 except Exception as exc:
                     logger.warning("任务 %s 抢占失败，跳过本次触发: %s", task_name, exc)
                     with _running_lock:
@@ -10920,6 +10936,9 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                         _alert_lane_running_task_ids.discard(int(task_id))
                         _delivery_lane_running_task_ids.discard(int(task_id))
                         _exclusive_running_task_ids.discard(int(task_id))
+                        if (_shutdown_owned_runs is not None
+                                and _shutdown_owned_runs.get(int(task_id)) == ""):
+                            del _shutdown_owned_runs[int(task_id)]
                     continue
                 if not claimed:
                     logger.warning("任务 %s 已被其他调度实例抢占，跳过本次触发", task_name)
@@ -10942,11 +10961,6 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                     continue
 
                 logger.info("执行定时任务: %s (cron=%s, now=%s)", task_name, cron_time, time_str)
-                history_uid = _task_history_start(
-                    engine,
-                    row,
-                    run_uid=uuid.uuid4().hex,
-                )
                 if not history_uid:
                     with _running_lock:
                         _running_task_ids.discard(int(task_id))
