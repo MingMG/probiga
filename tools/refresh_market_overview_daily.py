@@ -25,7 +25,7 @@ from server.common.auxiliary_runtime_schema import (
     validate_market_overview_daily_runtime_schema,
 )
 from server.common.kline_data import get_kline_engine
-from server.common.market_close_ladder import MarketCloseLadderBlocked, capture_market_close_ladder
+from server.common.market_close_ladder import CAPTURE_SCHEMA, MarketCloseLadderBlocked, capture_market_close_ladder
 from tools.env_config import load_project_env
 
 
@@ -186,14 +186,17 @@ def refresh_one(
     }
 
 
-def _publish_limit_ladder(engine, kline_engine, trade_date: str) -> bool:
+def _publish_limit_ladder(engine, kline_engine, trade_date: str, *, exact: bool = False) -> bool:
     try:
         receipt = capture_market_close_ladder(engine, kline_engine, datetime.fromisoformat(trade_date).date())
     except MarketCloseLadderBlocked as exc:
         receipt = {"status": "BLOCKED", "trade_date": trade_date, "reason": str(exc)}
     except (OSError, RuntimeError, ValueError, RequestException, SQLAlchemyError) as exc:
         receipt = {"status": "BLOCKED", "trade_date": trade_date, "reason": type(exc).__name__}
-    print("LIMIT_LADDER=" + json.dumps(receipt, ensure_ascii=False, sort_keys=True), flush=True)
+    if exact:
+        print(json.dumps({"schema": CAPTURE_SCHEMA, **receipt}, ensure_ascii=False, sort_keys=True), flush=True)
+    else:
+        print("LIMIT_LADDER=" + json.dumps(receipt, ensure_ascii=False, sort_keys=True), flush=True)
     return receipt["status"] == "COMPLETE"
 
 
@@ -224,7 +227,7 @@ def main(argv: list[str] | None = None) -> int:
     kline_engine = get_kline_engine()
     try:
         if args.limit_ladder_only:
-            return 0 if _publish_limit_ladder(engine, kline_engine, explicit_dates[0]) else 2
+            return 0 if _publish_limit_ladder(engine, kline_engine, explicit_dates[0], exact=True) else 2
         validate_market_overview_daily_runtime_schema(engine)
         with kline_engine.connect() as kline_conn:
             dates = resolve_dates(

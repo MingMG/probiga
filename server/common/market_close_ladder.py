@@ -20,6 +20,7 @@ from server.common.qmt_attestation_contract import canonical_digest
 
 
 SCHEMA = "probiga.market-close-limit-pool.v1"
+CAPTURE_SCHEMA = "probiga.market-close-ladder-capture.v1"
 SOURCE = "东财收盘涨停池 · QMT 收盘价复核"
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _MAX_RAW = 512 * 1024
@@ -157,6 +158,18 @@ def _load_record(target: date, cutoff: datetime) -> tuple[dict, list[dict]] | No
 
 def _receipt_summary(record: dict) -> dict:
     return {key: record[key] for key in ("trade_date", "sample_count", "observed_at", "published_at", "receipt_sha256")}
+
+
+def verify_market_close_ladder_capture(history, target: date, *, now: datetime) -> dict:
+    """Read back the exact immutable capture and its persisted QMT close evidence."""
+    cutoff = _stamp(now)
+    evidence = _load_record(target, cutoff)
+    if evidence is None:
+        raise MarketCloseLadderBlocked("close-pool durable receipt is missing")
+    record, pool = evidence
+    if _qmt_close_hash(target, pool, _load_qmt_closes(history, target, pool, cutoff)) != record["qmt_close_sha256"]:
+        raise MarketCloseLadderBlocked("close-pool persisted QMT price identity differs")
+    return _receipt_summary(record)
 
 
 def capture_market_close_ladder(primary, history, target: date) -> dict:

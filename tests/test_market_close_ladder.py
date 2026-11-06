@@ -91,3 +91,79 @@ def test_exact_explicit_empty_pool_does_not_create_streaks(source, monkeypatch):
     assert ladder.capture_market_close_ladder(source, source, DAY)["sample_count"] == 0
     result = ladder.load_market_close_ladder(DAY, quotes=[], now=OBSERVED)
     assert result["limit_up_count"] == 0 and result["max_streak"] is None and result["rows"] == []
+
+
+def test_manual_ladder_dispatch_binds_closed_friday_without_overview_write(
+    source, monkeypatch, capsys,
+):
+    from fastapi import HTTPException
+    from server.api.routers import scheduler
+    from server.api.scheduler_runtime import _cron_due, _task_dispatch_date
+    from server.common import authoritative_market_clock, kline_data
+    from server.common.scheduler_args import build_scheduler_task_args
+    from server.common.scheduler_validation import scheduler_output_status, validate_scheduler_task_result
+    from tools import refresh_market_overview_daily as overview
+
+    registered = {"id": 400, "task_type": "market_overview_daily",
+                  "script_path": "tools/refresh_market_overview_daily.py",
+                  "script_args": "", "date_param": "", "cron_time": "18:20"}
+    monkeypatch.setattr(scheduler, "_read_sql", lambda query, params: [registered])
+    monkeypatch.setattr(scheduler, "get_engine", lambda: source)
+    closed_date = authoritative_market_clock.authoritative_closed_trade_date
+    monkeypatch.setattr(authoritative_market_clock, "authoritative_closed_trade_date",
+        lambda engine, **kwargs: closed_date(engine, now=OBSERVED, **kwargs))
+    claimed = []
+    monkeypatch.setattr(scheduler, "launch_scheduler_task", lambda row, **kwargs:
+        claimed.append(row) or {"accepted": True})
+
+    assert scheduler.run_task_now(400, trade_date=DAY)["accepted"]
+    for invalid in ({"trade_date": OBSERVED.date()}, {"trade_date": DAY, "index_codes": "000001"}):
+        with pytest.raises(HTTPException) as rejected:
+            scheduler.run_task_now(400, **invalid)
+        assert rejected.value.status_code == 422
+    assert len(claimed) == 1
+    task = {**claimed[0], "_trigger_source": "manual_ladder"}
+    selected = _task_dispatch_date(task, source, now=OBSERVED)
+    assert selected == DAY.isoformat()
+    args = build_scheduler_task_args(task, registered["script_path"], selected)
+    assert args == ["--dates", "2026-11-06", "--limit-ladder-only"]
+    with pytest.raises(ValueError, match="exact manual"):
+        build_scheduler_task_args({**task, "_trigger_source": "scheduled"}, registered["script_path"], selected)
+
+    monkeypatch.setattr(ladder, "_fetch_pool", lambda *_args, **_kwargs: ([], _raw()))
+    monkeypatch.setattr(overview, "load_project_env", lambda: None)
+    monkeypatch.setattr(overview, "create_batch_engine", lambda **kwargs: source)
+    monkeypatch.setattr(overview, "get_kline_engine", lambda: source)
+    monkeypatch.setattr(kline_data, "get_kline_engine", lambda: source)
+    monkeypatch.setattr(source, "dispose", lambda: None)
+    assert overview.main(args) == 0
+    output = capsys.readouterr().out
+    assert json.loads(output)["trade_date"] == DAY.isoformat()
+    assert scheduler_output_status(task, output, return_code=0) == "success"
+    assert validate_scheduler_task_result(task, engine=source, now=OBSERVED, output=output).ok
+    assert _cron_due({**registered, "last_triggered_at": "2026-11-06 18:21:00",
+                      "last_run_status": "success", "last_run_output": output},
+                     now=datetime(2026, 11, 6, 18, 22))
+    ladder._path(DAY).unlink()
+    assert not validate_scheduler_task_result(task, engine=source, now=OBSERVED, output=output).ok
+
+
+def test_ladder_only_history_does_not_replace_full_overview_release_evidence(source):
+    from server.api.scheduler_runtime import _attach_release_catchup_history
+    from tools.ensure_quality_gate import _latest_release_history_row
+
+    with source.begin() as conn:
+        conn.execute(text("""CREATE TABLE st_scheduled_task_history (
+            id INT, run_uid TEXT, task_id INT, task_type TEXT, task_name TEXT, status TEXT,
+            build_sha TEXT, run_at TEXT, finished_at TEXT, exit_code INT, output TEXT, trigger_source TEXT
+        )"""))
+        conn.execute(text("""INSERT INTO st_scheduled_task_history VALUES
+            (1,'overview',400,'market_overview_daily','overview','success','build',
+             '2026-11-06 18:20','2026-11-06 18:21',0,'overview proof','scheduled'),
+            (2,'ladder',400,'market_overview_daily','overview','success','build',
+             '2026-11-07 02:00','2026-11-07 02:01',0,'ladder proof','manual_ladder')
+        """))
+    task = {"id": 400, "task_type": "market_overview_daily", "task_name": "overview"}
+    assert _attach_release_catchup_history(source, [task])
+    assert task["_release_terminal_run_uid"] == "overview"
+    assert _latest_release_history_row(source, task=task)["run_uid"] == "overview"

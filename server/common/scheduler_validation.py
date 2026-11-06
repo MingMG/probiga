@@ -2822,6 +2822,15 @@ def scheduler_output_status(
     same-day retries.  ``blocked`` accurately represents both conditions.
     """
     task_type = str(task.get("task_type") or "").strip()
+    if task_type == "market_overview_daily" and task.get("_limit_ladder_only") is True:
+        from server.common.market_close_ladder import CAPTURE_SCHEMA
+
+        receipt = _single_nested_machine_payload(output, schema=CAPTURE_SCHEMA)
+        return (
+            "success"
+            if return_code == 0 and receipt is not None and receipt.get("status") == "COMPLETE"
+            else "failed"
+        )
     if task_type == _FREE_INDEX_DAILY_TASK_TYPE:
         from server.common.index_daily_publication import FREE_INDEX_RESULT_SCHEMA
 
@@ -4411,6 +4420,29 @@ def validate_scheduler_task_result(
     output: str | None = None,
 ) -> SchedulerValidationResult:
     task_type = str(task.get("task_type") or "").strip()
+    if task_type == "market_overview_daily" and task.get("_limit_ladder_only") is True:
+        from server.common.kline_data import get_kline_engine
+        from server.common.market_close_ladder import CAPTURE_SCHEMA, verify_market_close_ladder_capture
+
+        try:
+            target = date.fromisoformat(str(task.get("_scheduler_target_trade_date") or ""))
+            current = now or datetime.now(PRODUCTION_TIMEZONE)
+            receipt = _single_nested_machine_payload(output, schema=CAPTURE_SCHEMA)
+            if (task.get("_trigger_source") != "manual_ladder" or not receipt
+                    or receipt.get("status") != "COMPLETE"
+                    or type(receipt.get("reused")) is not bool
+                    or receipt.get("trade_date") != target.isoformat()):
+                raise ValueError("close-pool output does not match exact manual scope")
+            persisted = verify_market_close_ladder_capture(get_kline_engine(), target, now=current)
+            if any(receipt.get(key) != value for key, value in persisted.items()):
+                raise ValueError("close-pool capture differs from durable receipt")
+            return SchedulerValidationResult(
+                checked=True, ok=True,
+                message=f"verified close ladder: date={target} sample_count={persisted['sample_count']}",
+            )
+        except Exception as exc:
+            return SchedulerValidationResult(checked=True, ok=False,
+                message=f"close ladder capture validation failed: {type(exc).__name__}")
     if task_type == _FREE_INDEX_DAILY_TASK_TYPE:
         current = now or datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None)
         return _validate_free_index_daily_result(

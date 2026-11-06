@@ -608,6 +608,12 @@ def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: s
             args.extend(["--date", today])
         return args
     if task_type == "market_overview_daily":
+        if row.get("_limit_ladder_only") is True:
+            if (normalized_path != "tools/refresh_market_overview_daily.py"
+                    or str(row.get("_trigger_source") or "").strip() != "manual_ladder"
+                    or not scheduler_target_bound or args):
+                raise ValueError("close ladder requires exact manual session")
+            return ["--dates", today, "--limit-ladder-only"]
         if release_catchup:
             if any(
                 _has_option(args, option)

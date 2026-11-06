@@ -564,9 +564,13 @@ def run_task_now(task_id: int, trade_date: date | None = None, index_codes: str 
         from datetime import time as wall_time
 
         codes = sorted({code.strip() for code in index_codes.split(",") if code.strip()})
-        if (task_type != "free_index_daily_canonical" or trade_date is None or not codes
-                or not set(codes).issubset(PUBLIC_INDEX_DAILY_CODES) or task.get("date_param")):
-            raise HTTPException(422, "仅公开源指数任务支持指定交易日和受支持的指数代码")
+        exact_index = (task_type == "free_index_daily_canonical"
+                       and codes and set(codes).issubset(PUBLIC_INDEX_DAILY_CODES))
+        exact_ladder = (task_type == "market_overview_daily" and not index_codes
+                        and task.get("script_path") == "tools/refresh_market_overview_daily.py"
+                        and not str(task.get("script_args") or "").strip())
+        if trade_date is None or task.get("date_param") or not (exact_index or exact_ladder):
+            raise HTTPException(422, "该任务不支持指定的交易日和采集范围")
         target = trade_date.isoformat()
         with engine.connect() as connection:
             latest = authoritative_closed_trade_date(connection, close_ready_time=wall_time(15, 35))
@@ -575,7 +579,11 @@ def run_task_now(task_id: int, trade_date: date | None = None, index_codes: str 
             """), {"target": target}).scalars().all()
         if not latest or target > latest or open_day != [1]:
             raise HTTPException(422, "补录日期必须是已收盘的交易日")
-        task.update(_scheduler_target_trade_date=target, _index_repair_codes=tuple(codes))
+        task["_scheduler_target_trade_date"] = target
+        if exact_index:
+            task["_index_repair_codes"] = tuple(codes)
+        else:
+            task["_limit_ladder_only"] = True
     root = Path(__file__).resolve().parents[3]
     return launch_scheduler_task(task, root=root, engine=engine)
 
