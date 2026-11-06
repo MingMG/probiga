@@ -1264,8 +1264,7 @@ def _coverage_receipt(
     )
 
 
-def append_source_coverage(
-    target: Engine | Connection,
+def _prepare_source_coverage(
     *,
     fact_kind: str,
     stock_code: str,
@@ -1280,15 +1279,7 @@ def append_source_coverage(
     fact_bindings: Iterable[Mapping[str, Any]],
     source: str,
     batch_id: str,
-) -> PITCoverageReceipt:
-    """Append a hash-bound successful source-query coverage receipt.
-
-    A receipt is never a generic freshness assertion.  Its immutable source
-    response, fact bindings and high-watermark are bound together, and an
-    empty result covers fact cutoffs at or before that exact watermark, once
-    the receipt is known to the reader. Callers must not invoke this helper
-    after a failed/partial fetch.
-    """
+) -> tuple[dict[str, Any], dict[str, Any]]:
 
     kind = str(fact_kind or "").strip().lower()
     if kind not in {"finance", "event"}:
@@ -1511,115 +1502,216 @@ def append_source_coverage(
             "source": source_name,
         }
     )
-    connection, close = _connection(target)
-    transaction = connection.begin() if close else None
-    try:
-        lock = " FOR UPDATE" if connection.dialect.name == "mysql" else ""
-        latest = _mapping(
-            connection.execute(
-                text(
-                    f"SELECT * FROM {SOURCE_COVERAGE_TABLE} "
-                    "WHERE scope_hash=:scope_hash "
-                    f"ORDER BY revision_no DESC LIMIT 1{lock}"
-                ),
-                {"scope_hash": scope_hash},
-            ).first()
-        )
-        revision_no = int((latest or {}).get("revision_no") or 0) + 1
-        supersedes = str((latest or {}).get("coverage_id") or "") or None
-        payload = {
-            "schema": "probiga.pit-source-coverage-payload.v1",
-            "fact_kind": kind,
-            "stock_code": code,
-            "window_start": start.isoformat(),
-            "window_end": end.isoformat(),
-            "known_at": _dt_text(known),
-            "received_at": _dt_text(received),
-            "covered_through_at": _dt_text(covered),
-            "watermark": watermark_payload,
-            "result_count": len(normalized_rows),
-            "source_response_hash": source_response_hash,
-            "fact_set_hash": fact_set_hash,
-            "source_rows": normalized_rows,
-            "fact_bindings": normalized_bindings,
+    payload = {
+        "schema": "probiga.pit-source-coverage-payload.v1",
+        "fact_kind": kind,
+        "stock_code": code,
+        "window_start": start.isoformat(),
+        "window_end": end.isoformat(),
+        "known_at": _dt_text(known),
+        "received_at": _dt_text(received),
+        "covered_through_at": _dt_text(covered),
+        "watermark": watermark_payload,
+        "result_count": len(normalized_rows),
+        "source_response_hash": source_response_hash,
+        "fact_set_hash": fact_set_hash,
+        "source_rows": normalized_rows,
+        "fact_bindings": normalized_bindings,
+    }
+    return payload, {
+        "scope_hash": scope_hash,
+        "fact_kind": kind,
+        "stock_code": code,
+        "window_start": start,
+        "window_end": end,
+        "known_at": known,
+        "received_at": received,
+        "covered_through_at": covered,
+        "watermark_kind": watermark_type,
+        "watermark_hash": watermark_hash,
+        "coverage_status": "COMPLETE",
+        "result_count": len(normalized_rows),
+        "source_response_hash": source_response_hash,
+        "fact_set_hash": fact_set_hash,
+        "source": source_name,
+        "batch_id": str(batch_id or "")[:128],
+        "payload_json": canonical_json(payload),
+        "created_at": known,
+    }
+
+
+_SOURCE_COVERAGE_BATCH_ROWS = 100
+_SOURCE_COVERAGE_BATCH_BYTES = 480_000
+_SOURCE_COVERAGE_RECEIPT_COLUMNS = (
+    "coverage_id", "scope_hash", "source_response_hash", "fact_set_hash",
+    "revision_no", "supersedes_coverage_id", "covered_through_at",
+)
+
+
+def _write_source_coverage_chunk(
+    connection: Connection,
+    prepared: list[tuple[dict[str, Any], dict[str, Any]]],
+) -> list[PITCoverageReceipt]:
+    by_scope = {row["scope_hash"]: row for _, row in prepared}
+    if len(by_scope) != len(prepared):
+        raise ValueError("coverage batch requires distinct scopes")
+    latest: dict[str, dict[str, Any]] = {}
+    mysql = connection.dialect.name == "mysql"
+    # Lock exact indexed scope prefixes, including missing scopes under
+    # InnoDB's default transaction isolation, as with finance revisions.
+    index = " FORCE INDEX (uk_pit_coverage_scope_revision)" if mysql else ""
+    lock = " FOR UPDATE" if mysql else ""
+    columns = ", ".join(_SOURCE_COVERAGE_RECEIPT_COLUMNS)
+    single = len(prepared) == 1
+    latest_columns = f"{columns}, payload_json" if single else columns
+    limit = " LIMIT 1" if single else ""
+    latest_query = text(
+        f"SELECT {latest_columns} FROM {SOURCE_COVERAGE_TABLE}{index} "
+        "WHERE scope_hash IN :scopes ORDER BY scope_hash, revision_no DESC"
+        f"{limit}{lock}"
+    ).bindparams(bindparam("scopes", expanding=True))
+    with connection.execute(
+        latest_query.execution_options(stream_results=True),
+        {"scopes": sorted(by_scope)},
+    ) as result:
+        for row in result.mappings():
+            latest.setdefault(str(row["scope_hash"]), dict(row))
+
+    matching_scopes: set[str] = set()
+    if single:
+        matching_scopes = {
+            scope for scope, row in latest.items()
+            if str(row["payload_json"] or "") == by_scope[scope]["payload_json"]
         }
-        if latest is not None and str(latest.get("payload_json") or "") == canonical_json(payload):
-            if transaction is not None:
-                transaction.commit()
-            return _coverage_receipt(latest, idempotent=True)
+    elif latest:
+        # Only newest rows can short-circuit by exact payload equality. Avoid
+        # reading payloads from prior revisions during the prefix lock scan.
+        latest_payload_query = text(
+            f"SELECT scope_hash, payload_json FROM {SOURCE_COVERAGE_TABLE} "
+            f"WHERE coverage_id IN :ids{lock}"
+        ).bindparams(bindparam("ids", expanding=True))
+        with connection.execute(
+            latest_payload_query.execution_options(stream_results=True),
+            {"ids": [row["coverage_id"] for row in latest.values()]},
+        ) as result:
+            for row in result.mappings():
+                scope = str(row["scope_hash"])
+                if str(row["payload_json"] or "") == by_scope[scope]["payload_json"]:
+                    matching_scopes.add(scope)
+
+    pending: dict[str, dict[str, Any]] = {}
+    for payload, row in prepared:
+        scope = row["scope_hash"]
+        if scope in matching_scopes:
+            continue
+        previous = latest.get(scope) or {}
+        supersedes = str(previous.get("coverage_id") or "") or None
         fingerprint = canonical_hash(
             {
                 "schema": "probiga.pit-source-coverage-fingerprint.v1",
-                "scope_hash": scope_hash,
+                "scope_hash": scope,
                 "payload": payload,
                 "supersedes_coverage_id": supersedes,
             }
         )
-        existing = _mapping(
+        pending[scope] = {
+            **row,
+            "coverage_id": canonical_hash(
+                {
+                    "schema": "probiga.pit-source-coverage-id.v1",
+                    "scope_hash": scope,
+                    "coverage_fingerprint_hash": fingerprint,
+                }
+            ),
+            "revision_no": int(previous.get("revision_no") or 0) + 1,
+            "supersedes_coverage_id": supersedes,
+            "coverage_fingerprint_hash": fingerprint,
+        }
+
+    existing: dict[str, dict[str, Any]] = {}
+    if pending:
+        predicates = []
+        parameters = {}
+        for index, (scope, row) in enumerate(pending.items()):
+            predicates.append(
+                f"(scope_hash=:scope{index} AND coverage_fingerprint_hash=:fingerprint{index})"
+            )
+            parameters[f"scope{index}"] = scope
+            parameters[f"fingerprint{index}"] = row["coverage_fingerprint_hash"]
+        rows = connection.execute(
+            text(
+                f"SELECT {columns} FROM {SOURCE_COVERAGE_TABLE} WHERE "
+                + " OR ".join(predicates)
+            ),
+            parameters,
+        ).mappings()
+        existing = {str(row["scope_hash"]): dict(row) for row in rows}
+        inserts = [pending[scope] for scope in sorted(pending) if scope not in existing]
+        if inserts:
+            insert_columns = list(inserts[0])
             connection.execute(
                 text(
-                    f"SELECT * FROM {SOURCE_COVERAGE_TABLE} "
-                    "WHERE scope_hash=:scope_hash "
-                    "AND coverage_fingerprint_hash=:fingerprint LIMIT 1"
+                    f"INSERT INTO {SOURCE_COVERAGE_TABLE} "
+                    f"({', '.join(insert_columns)}) VALUES "
+                    f"({', '.join(':' + column for column in insert_columns)})"
                 ),
-                {"scope_hash": scope_hash, "fingerprint": fingerprint},
-            ).first()
-        )
-        if existing is not None:
-            if transaction is not None:
-                transaction.commit()
-            return _coverage_receipt(existing, idempotent=True)
-        coverage_id = canonical_hash(
-            {
-                "schema": "probiga.pit-source-coverage-id.v1",
-                "scope_hash": scope_hash,
-                "coverage_fingerprint_hash": fingerprint,
-            }
-        )
-        values = {
-            "coverage_id": coverage_id,
-            "scope_hash": scope_hash,
-            "fact_kind": kind,
-            "stock_code": code,
-            "window_start": start,
-            "window_end": end,
-            "known_at": known,
-            "received_at": received,
-            "covered_through_at": covered,
-            "watermark_kind": watermark_type,
-            "watermark_hash": watermark_hash,
-            "coverage_status": "COMPLETE",
-            "result_count": len(normalized_rows),
-            "source_response_hash": source_response_hash,
-            "fact_set_hash": fact_set_hash,
-            "revision_no": revision_no,
-            "supersedes_coverage_id": supersedes,
-            "source": source_name,
-            "batch_id": str(batch_id or "")[:128],
-            "coverage_fingerprint_hash": fingerprint,
-            "payload_json": canonical_json(payload),
-            "created_at": known,
-        }
-        columns = list(values)
-        connection.execute(
-            text(
-                f"INSERT INTO {SOURCE_COVERAGE_TABLE} "
-                f"({', '.join(columns)}) VALUES "
-                f"({', '.join(':' + column for column in columns)})"
-            ),
-            values,
-        )
+                inserts,
+            )
+
+    receipts = []
+    for _, row in prepared:
+        scope = row["scope_hash"]
+        if scope in matching_scopes:
+            receipts.append(_coverage_receipt(latest[scope], idempotent=True))
+        elif scope in existing:
+            receipts.append(_coverage_receipt(existing[scope], idempotent=True))
+        else:
+            receipts.append(_coverage_receipt({
+                **pending[scope],
+                "covered_through_at": _dt_text(pending[scope]["covered_through_at"]),
+            }, idempotent=False))
+    return receipts
+
+
+def append_source_coverages(
+    target: Engine | Connection,
+    receipts: Iterable[Mapping[str, Any]],
+) -> list[PITCoverageReceipt]:
+    """Append validated source-query receipts atomically in bounded SQL batches.
+
+    Callers supply one successful source response per scope, including proven
+    empty responses. An existing Connection retains its enclosing transaction.
+    """
+    connection, close = _connection(target)
+    transaction = connection.begin() if close else None
+    output: list[PITCoverageReceipt] = []
+    prepared: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    scopes: set[str] = set()
+    batch_bytes = 0
+    try:
+        for arguments in receipts:
+            payload, row = _prepare_source_coverage(**arguments)
+            scope = row["scope_hash"]
+            if scope in scopes:
+                raise ValueError("coverage batch requires distinct scopes")
+            scopes.add(scope)
+            # PyMySQL bounds the escaped multi-row SQL as well. Keep the
+            # parameter batches small before passing them to the driver.
+            row_bytes = len(row["payload_json"].encode("utf-8")) + 1_024
+            if prepared and (
+                len(prepared) == _SOURCE_COVERAGE_BATCH_ROWS
+                or batch_bytes + row_bytes > _SOURCE_COVERAGE_BATCH_BYTES
+            ):
+                output.extend(_write_source_coverage_chunk(connection, prepared))
+                prepared.clear()
+                batch_bytes = 0
+            prepared.append((payload, row))
+            batch_bytes += row_bytes
+        if prepared:
+            output.extend(_write_source_coverage_chunk(connection, prepared))
         if transaction is not None:
             transaction.commit()
-        return PITCoverageReceipt(
-            coverage_id=coverage_id,
-            source_response_hash=source_response_hash,
-            fact_set_hash=fact_set_hash,
-            revision_no=revision_no,
-            supersedes_coverage_id=supersedes,
-            covered_through_at=_dt_text(covered),
-            idempotent=False,
-        )
+        return output
     except Exception:
         if transaction is not None:
             transaction.rollback()
@@ -1627,6 +1719,41 @@ def append_source_coverage(
     finally:
         if close:
             connection.close()
+
+
+def append_source_coverage(
+    target: Engine | Connection,
+    *,
+    fact_kind: str,
+    stock_code: str,
+    window_start: date | str,
+    window_end: date | str,
+    known_at: datetime | str,
+    received_at: datetime | str | None = None,
+    covered_through_at: datetime | str,
+    watermark_kind: str,
+    watermark_evidence: Mapping[str, Any],
+    source_rows: Iterable[Mapping[str, Any]],
+    fact_bindings: Iterable[Mapping[str, Any]],
+    source: str,
+    batch_id: str,
+) -> PITCoverageReceipt:
+    """Append one immutable successful source-query coverage receipt."""
+    return append_source_coverages(target, ({
+        "fact_kind": fact_kind,
+        "stock_code": stock_code,
+        "window_start": window_start,
+        "window_end": window_end,
+        "known_at": known_at,
+        "received_at": received_at,
+        "covered_through_at": covered_through_at,
+        "watermark_kind": watermark_kind,
+        "watermark_evidence": watermark_evidence,
+        "source_rows": source_rows,
+        "fact_bindings": fact_bindings,
+        "source": source,
+        "batch_id": batch_id,
+    },))[0]
 
 
 def _validate_nonfiling_evidence_version(
@@ -5988,7 +6115,7 @@ __all__ = [
     "TIME_UNVERIFIED", "TIME_VERIFIED", "append_event_revision",
     "append_finance_atomic_batch_seal", "append_finance_expected_unavailable",
     "append_finance_revision", "append_finance_revisions",
-    "append_source_coverage", "canonical_hash",
+    "append_source_coverage", "append_source_coverages", "canonical_hash",
     "canonical_json", "ensure_pit_fact_schema", "load_event_facts",
     "load_finance_atomic_batch_seal", "load_finance_expected_unavailable",
     "load_finance_incremental_discovery",
