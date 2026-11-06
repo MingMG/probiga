@@ -402,6 +402,43 @@ def test_uint64_repair_preserves_original_scope_and_blocks_old_daily_cutoff(monk
     engine.dispose()
 
 
+def test_post_close_block_revision_requires_exact_published_delta_and_prior_minute_grid():
+    from server.common import qmt_post_close_block_evidence as block
+
+    day, code = "2026-11-03", "920006"
+    old = coverage.canonical_bar({**bar(), "stock_code": code, "trade_date": day,
+                                  "close": 18.59, "open": 17.59, "low": 17.59, "high": 19.42,
+                                  "volume": 5420900, "amount": 100775139, "pre_close": 17.84})
+    final = {**old, "volume": "5702200.000000", "amount": "105924680.000000"}
+    cells = [day, code, "晟楠科技", "18.31", "281242", "514.95", "buy seat", "sell seat", "A股"]
+    rows = [block._minute_row(day + " " + slot, 18.59, int(index < 238), int(index < 238))
+            for index, slot in enumerate(block.CORE_GRID)]
+    rows[-1].update(volume="56784.000000", amount="105924330.000000")
+    prior = "a" * 64
+    cutoff = datetime(2026, 11, 7, 10, 0)
+    evidence = {"publication": {"source_url": block._url(code, day), "source_row": cells,
+                                 "raw_response_sha256": "b" * 64, "source_row_sha256": coverage.canonical_digest(cells),
+                                 "observed_at": cutoff.isoformat(" ")},
+                "minute_run_id": "existing-native", "minute_partition_row_hash": "c" * 64,
+                "minute_partition_source_sha256": "d" * 64, "native_minute_dat_sha256": "e" * 64,
+                "minute_finished_at": day + " 19:09:50", "prior_daily_manifest_hash": prior,
+                "minute_rows": rows, "minute_rows_sha256": coverage.canonical_digest(rows)}
+    assert coverage.native_amount_correction(old, final) is None
+    assert block.verify_post_close_revision(old, final, evidence, prior_hash=prior, cutoff=cutoff)["kind"] == block.KIND
+    with pytest.raises(ValueError, match="unrelated"):
+        block.verify_post_close_revision(old, {**final, "close": "18.600000"}, evidence, prior_hash=prior, cutoff=cutoff)
+    with pytest.raises(ValueError, match="source precision"):
+        block.verify_post_close_revision(old, {**final, "amount": "105924681.000000"}, evidence,
+                                         prior_hash=prior, cutoff=cutoff)
+    with pytest.raises(ValueError, match="identity differs"):
+        block.verify_post_close_revision(old, final, evidence, prior_hash=prior, cutoff=cutoff - timedelta(seconds=1))
+    changed = deepcopy(evidence)
+    changed["minute_rows"][-1]["amount"] = "105923930.000000"
+    changed["minute_rows_sha256"] = coverage.canonical_digest(changed["minute_rows"])
+    with pytest.raises(ValueError, match="source precision"):
+        block.verify_post_close_revision(old, final, changed, prior_hash=prior, cutoff=cutoff)
+
+
 @pytest.mark.parametrize("canonical_source", ["free", "native", "corrupt"])
 def test_strategy_daily_window_resolves_retained_free_receipt_against_current_rows(
     monkeypatch, canonical_source,

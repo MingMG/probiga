@@ -258,6 +258,7 @@ _WINDOWS_RUNTIME_FILES = (
     "integrations/qmt/datadir_import.py",
     "server/common/historical_daily_bar_evidence.py",
     "server/common/official_historical_daily_evidence.py",
+    "server/common/qmt_post_close_block_evidence.py",
     "server/common/qmt_daily_market_truth.py",
     "server/common/qmt_datadir_daily_coverage.py",
     "server/common/qmt_datadir_minute_coverage.py",

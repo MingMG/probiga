@@ -62,6 +62,12 @@ from server.common.qmt_datadir_daily_coverage import (  # noqa: E402
     retained_listing_evidence,
     seal_native_amount_corrections,
     suspension_evidence,
+    validate_native_revision,
+)
+from server.common.qmt_post_close_block_evidence import (  # noqa: E402
+    KIND as POST_CLOSE_KIND,
+    load_post_close_evidence,
+    verify_post_close_revision,
 )
 from server.common.qmt_stock_catalog import load_stock_catalog  # noqa: E402
 from tools.env_config import load_project_env  # noqa: E402
@@ -285,6 +291,8 @@ def _historical_append_plan(connection, *, day, proof):
     """Accept only additions and native amount-word repairs against the sealed prior rows."""
     expected_corrections = proof.get("native_amount_correction") or {}
     expected_prior_hash = expected_corrections.get("prior_manifest_hash") or ""
+    post_close = {row["stock_code"]: row for row in expected_corrections.get("rows", [])
+                  if row.get("kind") == POST_CLOSE_KIND}
     if (proof.get("historical_reconstruction") is not True and not expected_prior_hash) or proof.get("trade_date") != day:
         raise ValueError("historical daily publication identity differs")
     canonical = {item["stock_code"]: item["evidence"] for item in proof["entities"]
@@ -305,6 +313,9 @@ def _historical_append_plan(connection, *, day, proof):
             raise ValueError(f"historical daily retained business row differs for {day} {code}")
         if canonical.get(code) != original:
             correction = native_amount_correction(original, canonical.get(code))
+            if code in post_close and validate_native_revision(original, canonical[code], post_close[code],
+                                                               prior_hash=expected_prior_hash, cutoff=proof["captured_at"]):
+                correction = post_close[code]
             if not correction or code in (proof.get("historical_public_bars") or {}):
                 raise ValueError(f"historical daily retained business row differs for {day} {code}")
             corrections.append(correction)
@@ -324,7 +335,8 @@ def _historical_append_plan(connection, *, day, proof):
     return missing, corrections, previous
 
 
-def _exact_amount_repair_manifest(engine, *, session, harvested, run_id, required=True):
+def _exact_amount_repair_manifest(engine, *, session, harvested, run_id, required=True,
+                                  post_close_code="", source_root=None):
     """Preserve the originally proved trade scope and every unrelated entity."""
     cutoff = dt.datetime.now(CST).replace(tzinfo=None, microsecond=0)
     day = session.isoformat()
@@ -348,6 +360,13 @@ def _exact_amount_repair_manifest(engine, *, session, harvested, run_id, require
             updated.append(entity)
             continue
         correction = native_amount_correction(entity["evidence"], bars[code])
+        if code == post_close_code:
+            from server.common.minute_data import get_minute_engine
+            block = load_post_close_evidence(get_minute_engine(), source_root=source_root, session=session,
+                                             code=code, prior=original)
+            cutoff = dt.datetime.now(CST).replace(tzinfo=None, microsecond=0)
+            correction = verify_post_close_revision(entity["evidence"], bars[code], block,
+                                                    prior_hash=original["manifest_hash"], cutoff=cutoff)
         if correction is None:
             if not required:
                 return None
@@ -359,6 +378,8 @@ def _exact_amount_repair_manifest(engine, *, session, harvested, run_id, require
         if not required:
             return None
         raise ValueError("native daily exact publication has no truncated amount")
+    if post_close_code and not any(row.get("kind") == POST_CLOSE_KIND for row in corrections):
+        raise ValueError("requested BSE post-close scope revision is absent")
     return seal_native_amount_corrections(
         {**original, "captured_at": cutoff.isoformat(" "), "run_id": run_id, "entities": updated},
         prior_run_id=original["run_id"], prior_manifest_hash=original["manifest_hash"], corrections=corrections,
@@ -518,7 +539,8 @@ def _publish(
                 statement,
                 tuple(value for row in chunk for value in row),
             )
-        if repair and corrections:
+        amount_repairs = [row for row in corrections if row.get("kind") != POST_CLOSE_KIND] if repair else []
+        if amount_repairs:
             updated = connection.execute(text(f"""
                 UPDATE `{TARGET_TABLE}` AS target
                 JOIN `{temp_table}` AS stage
@@ -529,8 +551,26 @@ def _publish(
                 WHERE target.trade_date=:day AND target.k_type=1 AND target.adjust_type=0
                   AND target.data_source=:source AND stage.amount>=:word AND target.amount=MOD(stage.amount,:word)
             """), {"day": session, "source": SOURCE, "word": NATIVE_AMOUNT_WORD})
-            if updated.rowcount != len(corrections):
+            if updated.rowcount != len(amount_repairs):
                 raise ValueError("native daily amount correction write count differs")
+        close_repairs = [row for row in corrections if row.get("kind") == POST_CLOSE_KIND] if repair else []
+        for revision in close_repairs:
+            updated = connection.execute(text(f"""
+                UPDATE `{TARGET_TABLE}` AS target
+                JOIN `{temp_table}` AS stage
+                  ON stage.stock_code=target.stock_code AND stage.trade_date=target.trade_date
+                 AND stage.k_type=target.k_type AND stage.adjust_type=target.adjust_type
+                SET target.amount=stage.amount, target.volume=stage.volume, target.received_at=stage.received_at,
+                    target.batch_id=stage.batch_id, target.data_version=stage.data_version
+                WHERE target.trade_date=:day AND target.stock_code=:stock_code
+                  AND target.k_type=1 AND target.adjust_type=0 AND target.data_source=:source
+                  AND target.amount=:previous_amount AND target.volume=:previous_volume
+                  AND stage.amount=:amount AND stage.volume=:volume
+            """), {"day": session, "source": SOURCE, **{key: revision[key] for key in (
+                "stock_code", "previous_amount", "previous_volume", "amount", "volume",
+            )}})
+            if updated.rowcount != 1:
+                raise ValueError("BSE post-close revision write count differs")
         if not repair:
             connection.execute(
                 text(
@@ -666,7 +706,9 @@ def _publish(
         result.update(run_id=run_id, manifest_hash=coverage_manifest["manifest_hash"],
                       finished_at=str(receipt["finished_at"]), appended_codes=sorted(missing),
                       retained_rows=previous["row_count"] - len(corrections),
-                      amount_corrected_codes=[row["stock_code"] for row in corrections])
+                      amount_corrected_codes=[row["stock_code"] for row in amount_repairs])
+        if close_repairs:
+            result["post_close_scope_corrected_codes"] = [row["stock_code"] for row in close_repairs]
         if public:
             result["public_fallback_codes"] = sorted(public)
             result["bar_providers"] = {SOURCE: len(rows) - len(public), SINA_PROVIDER: len(public)}
@@ -688,12 +730,15 @@ def main(argv: list[str] | None = None) -> int:
                         help="JSON object of security codes to official CNINFO PDF locators; preserve existing rows")
     parser.add_argument("--repair-native-amount-only", action="store_true",
                         help="Correct truncated native amounts for one exact closed partition")
+    parser.add_argument("--repair-native-post-close-code", default="",
+                        help="Attest one published BSE block trade and correct the same exact closed partition")
     parser.add_argument("--public-fallback-code", action="append", default=[],
                         help="Require corroborated public fallback for a missing code in one explicit historical session")
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
-    repair = bool(args.historical_lifecycle or args.repair_native_amount_only)
+    exact_repair = bool(args.repair_native_amount_only or args.repair_native_post_close_code)
+    repair = bool(args.historical_lifecycle or exact_repair)
     load_project_env()
     engine = (create_batch_engine(connect_args={"connect_timeout": 5, "read_timeout": 30, "write_timeout": 15})
               if repair else create_batch_engine())
@@ -720,10 +765,11 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("historical lifecycle locator file exceeds 32 KiB")
         deadline = time.monotonic() + 300
         locators = json.loads(raw_locators)
-    if args.repair_native_amount_only:
+    if exact_repair:
         latest = dt.date.fromisoformat(authoritative_closed_trade_date(engine))
-        if args.latest_session or args.replace_existing or args.historical_lifecycle or start != end or end > latest:
-            parser.error("native amount-only repair requires one explicit closed session")
+        if (args.latest_session or args.replace_existing or args.historical_lifecycle or start != end or end > latest
+                or (args.repair_native_amount_only and args.repair_native_post_close_code)):
+            parser.error("exact native repair requires one explicit closed session and repair mode")
         deadline = time.monotonic() + 180
     root = Path(args.datadir_root)
     if not root.is_dir():
@@ -772,9 +818,10 @@ def main(argv: list[str] | None = None) -> int:
         eligible = universe.eligible_codes(session)
         run_id = new_run_id()
         coverage_manifest = None
-        if args.repair_native_amount_only or (historical_documents is None and sources == [SOURCE]):
+        if exact_repair or (historical_documents is None and sources == [SOURCE]):
             coverage_manifest = _exact_amount_repair_manifest(engine, session=session, harvested=harvested,
-                                                              run_id=run_id, required=args.repair_native_amount_only)
+                                                              run_id=run_id, required=exact_repair,
+                                                              post_close_code=args.repair_native_post_close_code, source_root=root)
         if coverage_manifest is None:
             coverage_manifest = _coverage_manifest(
                 engine, session=session, harvested=harvested, run_id=run_id,
@@ -787,10 +834,13 @@ def main(argv: list[str] | None = None) -> int:
                 with engine.connect() as connection:
                     missing, corrections, prior = _historical_append_plan(connection, day=session.isoformat(), proof=coverage_manifest)
                 append_detail = {"retained_rows": prior["row_count"] - len(corrections), "append_codes": sorted(missing),
-                                 "amount_corrected_codes": [row["stock_code"] for row in corrections],
+                                 "amount_corrected_codes": [row["stock_code"] for row in corrections if row.get("kind") != POST_CLOSE_KIND],
                                  "no_bar_codes": {item["stock_code"]: item["classification"]
                                                   for item in coverage_manifest["entities"]
                                                   if item["classification"] != "TRADED"}}
+                if args.repair_native_post_close_code:
+                    append_detail["post_close_scope_corrected_codes"] = [row["stock_code"] for row in corrections
+                                                                       if row.get("kind") == POST_CLOSE_KIND]
                 if public:
                     append_detail["public_fallback_codes"] = sorted(public)
                     append_detail["bar_providers"] = {SOURCE: len(harvested["rows"]) - len(public),

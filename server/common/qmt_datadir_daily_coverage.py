@@ -19,6 +19,7 @@ from sqlalchemy import text
 from server.common.qmt_attestation_contract import canonical_digest
 from server.common.official_historical_daily_evidence import historical_daily_evidence
 from server.common.historical_daily_bar_evidence import SINA_PROVIDER, SINA_QUALITY, verify_public_bar
+from server.common.qmt_post_close_block_evidence import KIND as POST_CLOSE_KIND, verify_post_close_revision
 from server.common.qmt_stock_catalog import load_stock_catalog
 from server.common.qmt_trade_calendar import load_trade_calendar_receipt
 
@@ -116,11 +117,19 @@ def seal_native_amount_corrections(manifest: dict, *, prior_run_id: str, prior_m
     core = dict(manifest)
     core.pop("manifest_hash", None)
     core["native_amount_correction"] = {
-        "kind": "QMT_DATADIR_UINT64_AMOUNT", "prior_run_id": prior_run_id,
+        "kind": ("QMT_DATADIR_POST_CLOSE_SCOPE" if any(row.get("kind") == POST_CLOSE_KIND for row in corrections)
+                 else "QMT_DATADIR_UINT64_AMOUNT"), "prior_run_id": prior_run_id,
         "prior_manifest_hash": prior_manifest_hash,
         "rows": sorted(corrections, key=lambda row: row["stock_code"]),
     }
     return {**core, "manifest_hash": canonical_digest(core)}
+
+
+def validate_native_revision(old, new, correction, *, prior_hash, cutoff):
+    if correction.get("kind") == POST_CLOSE_KIND:
+        return verify_post_close_revision(old, new, correction["evidence"], prior_hash=prior_hash,
+                                          cutoff=cutoff) == correction
+    return native_amount_correction(old, new) == correction
 
 
 def build_manifest(*, catalog, calendar, day: str, rows: Sequence[Mapping[str, Any]],
@@ -255,14 +264,19 @@ def validate_manifest(manifest: Mapping[str, Any], *, catalog, calendar) -> dict
                      if item["classification"] == "TRADED" and item["stock_code"] not in public}
         rows = correction.get("rows") or []
         codes = [row["stock_code"] for row in rows]
+        post_close = sum(row.get("kind") == POST_CLOSE_KIND for row in rows)
+        kind = "QMT_DATADIR_POST_CLOSE_SCOPE" if post_close else "QMT_DATADIR_UINT64_AMOUNT"
         if (not rows or sorted(set(codes)) != codes or not set(codes) <= corrected.keys()
-                or correction.get("kind") != "QMT_DATADIR_UINT64_AMOUNT" or not correction.get("prior_run_id")
+                or post_close > 1 or (post_close and (historical or public))
+                or correction.get("kind") != kind or not correction.get("prior_run_id")
                 or correction["prior_run_id"] == original["run_id"]
                 or (not historical and len(correction.get("prior_manifest_hash") or "") != 64)):
             raise ValueError("native daily amount correction inventory differs")
         for row in rows:
             bar = corrected[row["stock_code"]]
-            if native_amount_correction({**bar, "amount": row["previous_amount"]}, bar) != row:
+            old = {**bar, "amount": row["previous_amount"], "volume": row.get("previous_volume", bar["volume"])}
+            if not validate_native_revision(old, bar, row, prior_hash=correction["prior_manifest_hash"],
+                                            cutoff=original["captured_at"]):
                 raise ValueError("native daily amount correction evidence differs")
     supplied = original.pop("manifest_hash", None)
     if supplied != canonical_digest(original):
@@ -365,9 +379,13 @@ def load_daily_manifest(engine, day: str, *, decision_known_at: datetime | str,
                     changes = {item["stock_code"]: item for item in correction["rows"]}
                     for old, new in zip(previous["entities"], manifest["entities"], strict=True):
                         code = old["stock_code"]
-                        if ((code not in changes and old != new) or (code in changes and (
-                                old["classification"] != "TRADED" or new["classification"] != "TRADED"
-                                or native_amount_correction(old["evidence"], new["evidence"]) != changes[code]))):
+                        if code not in changes:
+                            if old != new:
+                                raise ValueError("native daily amount correction changes unrelated evidence")
+                            continue
+                        if (old["classification"] != "TRADED" or new["classification"] != "TRADED"
+                                or not validate_native_revision(old["evidence"], new["evidence"], changes[code],
+                                                                prior_hash=previous_hash, cutoff=manifest["captured_at"])):
                             raise ValueError("native daily amount correction changes unrelated evidence")
         stored = connection.execute(text(f"SELECT stock_code,expected_state,classification,bar_count,time_set_hash,first_time,last_time,source_row_hash,row_hash FROM {ENTITY_TABLE} WHERE manifest_hash=:hash ORDER BY stock_code"), {"hash": row["manifest_hash"]}).mappings().all()
         expected = []
