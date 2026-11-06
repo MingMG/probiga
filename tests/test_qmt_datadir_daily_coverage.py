@@ -151,6 +151,175 @@ def test_real_database_replay_rejects_mutated_bars_and_entity_partitions(monkeyp
     engine.dispose()
 
 
+def historical_document(source_text, *, date="2026-11-02", identifier=1234):
+    return {"source_url": f"https://static.cninfo.com.cn/finalpage/{date}/{identifier}.PDF",
+            "observed_at": "2026-11-07T10:00:00+08:00", "source_text": source_text,
+            "source_text_sha256": hashlib.sha256(source_text.encode()).hexdigest(),
+            "official_document_sha256": "a" * 64}
+
+
+def test_historical_october_daily_append_replays_only_after_durable_completion(monkeypatch):
+    from server.common import qmt_daily_market_truth
+    from tools.crawl_minute_kline import verified_no_trade_codes
+    from tools import import_qmt_datadir_daily as importer
+
+    engine = database(monkeypatch)
+    day = "2026-10-28"
+    new_code, suspended, delisted = "920285", "002827", "301139"
+    catalog, calendar = authorities()
+    catalog.eligible_codes = lambda target: [TRADED, new_code, suspended, delisted]
+    calendar.sessions_between = lambda start, end: [day]
+    monkeypatch.setattr(coverage, "load_stock_catalog", lambda *args, **kwargs: catalog)
+    monkeypatch.setattr(coverage, "load_trade_calendar_receipt", lambda *args, **kwargs: calendar)
+    monkeypatch.setattr(qmt_daily_market_truth, "load_trade_calendar_receipt", lambda *args, **kwargs: calendar)
+    monkeypatch.setattr(importer, "persisted_fingerprint", lambda *args, **kwargs: {"row_hash": "prior"})
+    acquired = datetime(2026, 11, 7, 10, 0)
+    completed = datetime(2026, 11, 7, 10, 1)
+    old = {**bar(), "trade_date": day}
+    new = {**old, "stock_code": new_code}
+    documents = {
+        suspended: [historical_document("证券代码：002827。公司股票停牌情况。公司股票自2026年10月26日开市起开始停牌，"
+                                       "公司股票将于2026年11月2日开市起复牌。")],
+        delisted: [historical_document("证券代码：301139。关于公司股票终止上市暨摘牌的公告。摘牌日期：2026年10月28日。",
+                                       date=day, identifier=2345)],
+    }
+    proof = coverage.build_manifest(catalog=catalog, calendar=calendar, day=day, rows=[old, new],
+                                    run_id="historical", captured_at=acquired, historical_documents=documents)
+    assert {item["stock_code"]: item["classification"] for item in proof["entities"]} == {
+        TRADED: "TRADED", new_code: "TRADED", suspended: "NO_TRADE", delisted: "DELISTED",
+    }
+    with pytest.raises(ValueError, match="historical daily lifecycle inventory"):
+        coverage.build_manifest(catalog=catalog, calendar=calendar, day=day, rows=[old, new], run_id="bad",
+                                captured_at=acquired, historical_documents={})
+    with engine.begin() as connection:
+        connection.execute(text("""CREATE TABLE qmt_datadir_import_partition (
+            dataset TEXT, trade_date TEXT, source_root TEXT, status TEXT, code_count INTEGER, row_count INTEGER,
+            content_sha256 TEXT, run_id TEXT, started_at TEXT, finished_at TEXT, detail_json TEXT)"""))
+        connection.execute(text("""INSERT INTO qmt_datadir_import_partition VALUES (
+            'stock_daily', :day, 'DAT', 'COMPLETE', 1, 1, 'source', 'legacy', :day, :day, :detail)"""),
+                           {"day": day, "detail": json.dumps({"row_hash": "prior", "readback_rows": 1, "readback_codes": 1})})
+        connection.execute(text("INSERT INTO sm_stock_kline VALUES (:stock_code,:trade_date,:open,:close,:high,:low,:volume,:amount,:pre_close,'qmt_datadir',1,0,'VERIFIED','SUPPORTED')"), old)
+        append, receipt = importer._historical_append_plan(connection, day=day, proof=proof)
+        assert append == {new_code} and receipt["run_id"] == "legacy"
+        connection.execute(text("UPDATE sm_stock_kline SET volume=101 WHERE trade_date=:day"), {"day": day})
+        with pytest.raises(ValueError, match="retained business row differs"):
+            importer._historical_append_plan(connection, day=day, proof=proof)
+        connection.execute(text("UPDATE sm_stock_kline SET volume=100 WHERE trade_date=:day"), {"day": day})
+        connection.execute(text("INSERT INTO sm_stock_kline VALUES (:stock_code,:trade_date,:open,:close,:high,:low,:volume,:amount,:pre_close,'qmt_datadir',1,0,'VERIFIED','SUPPORTED')"), new)
+        coverage.insert_manifest(connection, proof)
+        with pytest.raises(ValueError, match="completion receipt differs"):
+            coverage.load_daily_manifest(connection, day, decision_known_at=completed)
+        connection.execute(text("""UPDATE qmt_datadir_import_partition SET
+            code_count=2,row_count=2,run_id='historical',started_at=:acquired,finished_at=:completed,detail_json=:detail"""),
+                           {"acquired": acquired, "completed": completed, "detail": json.dumps({
+                               "full_market_manifest_hash": proof["manifest_hash"], "coverage": 1.0,
+                               "readback_rows": 2, "readback_codes": 2,
+                           })})
+        assert coverage.load_daily_manifest(connection, day, decision_known_at=acquired) is None
+        assert coverage.load_daily_manifest(connection, day, decision_known_at=completed) == proof
+        with pytest.raises(RuntimeError, match="no exact full-market manifest"):
+            qmt_daily_market_truth.load_qmt_daily_market_truth(connection, start_date=day, end_date=day,
+                                                               decision_known_at=acquired)
+        truth = qmt_daily_market_truth.load_qmt_daily_market_truth(connection, start_date=day, end_date=day,
+                                                                  decision_known_at=completed)
+        assert truth.run_finished_at == completed.isoformat(" ") and truth.attested_row_count == 2
+        codes, identity = verified_no_trade_codes(connection, catalog, trade_date=day, decision_known_at=completed)
+        assert codes == {suspended, delisted} and identity["receipt_id"] == proof["manifest_hash"]
+    engine.dispose()
+
+
+def test_official_retirement_hearing_must_bind_authority_and_not_use_future_capture():
+    from server.common.official_historical_daily_evidence import historical_daily_evidence
+
+    day = "2026-10-30"
+    work_letter = historical_document(
+        "证券代码：688121。关于收到监管工作函的公告。你公司股票自2026年10月29日开市起停牌，"
+        "本所将在有关期限届满或者听证程序结束后审议，作出相应的终止上市决定。",
+        date="2026-10-29", identifier=1,
+    )
+    notice = historical_document(
+        "证券代码：688121。公司于2026年10月28日收到了上海证券交易所下发的终止上市的事先告知书。"
+        "应当在收到本通知后5个交易日内提交书面听证申请。",
+        date="2026-10-29", identifier=2,
+    )
+    cutoff = datetime(2026, 11, 7, 10, 0)
+    with pytest.raises(ValueError, match="lifecycle is unproven"):
+        historical_daily_evidence([work_letter], stock_code="688121", day=day, cutoff=cutoff)
+    with pytest.raises(ValueError, match="identity or time"):
+        historical_daily_evidence([work_letter, notice], stock_code="688121", day=day,
+                                  cutoff=datetime(2026, 11, 6, 10, 0))
+    assert historical_daily_evidence([work_letter, notice], stock_code="688121", day=day, cutoff=cutoff)[0] == "NO_TRADE"
+    with pytest.raises(ValueError, match="lifecycle is unproven"):
+        historical_daily_evidence([work_letter, notice], stock_code="688121", day="2026-11-05", cutoff=cutoff)
+
+
+def test_separate_official_halt_and_resumption_close_the_historical_interval():
+    from server.common.official_historical_daily_evidence import historical_daily_evidence
+
+    halt = historical_document("证券代码：600621。关于筹划控股股东变更事项的停牌公告。"
+                               "公司股票于2026年10月26日（星期一）开市起开始停牌。",
+                               date="2026-10-26", identifier=1)
+    resume = historical_document("证券代码：600621。关于公司控股股东拟发生变更暨复牌的提示性公告。"
+                                 "公司股票自2026年10月28日（星期三）开市起复牌。",
+                                 date="2026-10-28", identifier=2)
+    assert historical_daily_evidence([halt, resume], stock_code="600621", day="2026-10-27",
+                                     cutoff=datetime(2026, 11, 7, 10, 0))[0] == "NO_TRADE"
+
+
+def test_delisted_stock_last_trading_day_retains_verified_public_provider(monkeypatch):
+    from server.common import historical_daily_bar_evidence as public
+    from server.common import qmt_daily_market_truth
+
+    day, previous, code = "2026-10-27", "2026-10-26", "301139"
+    capture = datetime(2026, 11, 7, 10, 0)
+    traded = {"stock_code": code, "trade_date": day, "open": 0.66, "close": 0.73, "high": 0.73,
+              "low": 0.64, "volume": 12413976, "amount": 8577375, "pre_close": 0.65}
+    tencent = public._tencent_row({**traded, "volume": 12414000}, day)
+    tencent_prev = public._tencent_row({**traded, "close": 0.65}, previous)
+    evidence = {"schema": public.SCHEMA,
+                "sina": public._identity(public.SINA_PROVIDER, capture.isoformat(" "), coverage.canonical_bar(traded)),
+                "tencent": public._identity(public.TENCENT_PROVIDER, capture.isoformat(" "), tencent),
+                "tencent_previous": public._identity(public.TENCENT_PROVIDER, capture.isoformat(" "), tencent_prev)}
+    mismatch = {**evidence, "tencent": public._identity(public.TENCENT_PROVIDER, capture.isoformat(" "),
+                                                       {**tencent, "volume": "12414100.000000"})}
+    with pytest.raises(ValueError, match="sources disagree"):
+        public.verify_public_bar(mismatch, stock_code=code, day=day, previous_day=previous, cutoff=capture)
+    wrong_close = {**evidence, "tencent_previous": public._identity(public.TENCENT_PROVIDER, capture.isoformat(" "),
+                                                                  {**tencent_prev, "close": "0.660000"})}
+    with pytest.raises(ValueError, match="sources disagree"):
+        public.verify_public_bar(wrong_close, stock_code=code, day=day, previous_day=previous, cutoff=capture)
+    engine = database(monkeypatch)
+    catalog, calendar = authorities()
+    catalog.eligible_codes = lambda target: [code]
+    calendar.sessions_between = lambda start, end: [day] if start == end == day else [previous, day]
+    monkeypatch.setattr(coverage, "load_stock_catalog", lambda *args, **kwargs: catalog)
+    monkeypatch.setattr(coverage, "load_trade_calendar_receipt", lambda *args, **kwargs: calendar)
+    monkeypatch.setattr(qmt_daily_market_truth, "load_trade_calendar_receipt", lambda *args, **kwargs: calendar)
+    proof = coverage.build_manifest(catalog=catalog, calendar=calendar, day=day, rows=[traded],
+                                    run_id="mixed-historical", captured_at=capture, historical_documents={},
+                                    historical_public_bars={code: evidence}, previous_session=previous)
+    with engine.begin() as connection:
+        connection.execute(text("""CREATE TABLE qmt_datadir_import_partition (
+            dataset TEXT, trade_date TEXT, source_root TEXT, status TEXT, code_count INTEGER, row_count INTEGER,
+            content_sha256 TEXT, run_id TEXT, started_at TEXT, finished_at TEXT, detail_json TEXT)"""))
+        connection.execute(text("""INSERT INTO qmt_datadir_import_partition VALUES (
+            'stock_daily', :day, 'DAT', 'COMPLETE', 1, 1, 'source', 'mixed-historical', :captured, :captured, :detail)"""),
+                           {"day": day, "captured": capture, "detail": json.dumps({
+                               "full_market_manifest_hash": proof["manifest_hash"], "coverage": 1.0,
+                               "readback_rows": 1, "readback_codes": 1,
+                           })})
+        coverage.insert_manifest(connection, proof)
+        connection.execute(text("INSERT INTO sm_stock_kline VALUES (:stock_code,:trade_date,:open,:close,:high,:low,:volume,:amount,:pre_close,'qmt_datadir',1,0,'VERIFIED','SUPPORTED')"), traded)
+        with pytest.raises(ValueError, match="provider or quality differs"):
+            coverage.load_daily_manifest(connection, day, decision_known_at=capture)
+        connection.execute(text("UPDATE sm_stock_kline SET data_source='sina_history', quality_status='SOURCE_VERIFIED' WHERE stock_code=:code"), {"code": code})
+        result = qmt_daily_market_truth.load_qmt_daily_market_truth(connection, start_date=day, end_date=day,
+                                                                   decision_known_at=capture)
+        assert result.as_dict()["bar_providers"] == {"qmt_datadir": 0, "sina_history": 1}
+        assert result.as_dict()["public_bar_codes"] == [code]
+    engine.dispose()
+
+
 @pytest.mark.parametrize("canonical_source", ["free", "native", "corrupt"])
 def test_strategy_daily_window_resolves_retained_free_receipt_against_current_rows(
     monkeypatch, canonical_source,

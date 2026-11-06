@@ -731,6 +731,12 @@ def _load_datadir_reconstruction_no_trade_codes(
             "QMT_ANNOUNCEMENT_RECONSTRUCTION_DATADIR_PUBLICATION_DIFFERS"
         )
     entities = manifest["entities"]
+    if manifest.get("historical_reconstruction") is True:
+        # Official lifecycle evidence can prove a missing bar but does not
+        # supply the native suspension observations required by this seal.
+        raise QMTAnnouncementBlocked(
+            "QMT_ANNOUNCEMENT_RECONSTRUCTION_NATIVE_SUSPENSION_SCOPE_UNSUPPORTED"
+        )
     if any(entity["classification"] == "NOT_LISTED" for entity in entities):
         # The v3 reconciliation seal accounts for native no-trade stocks
         # separately. A listing exclusion cannot be represented as suspension.

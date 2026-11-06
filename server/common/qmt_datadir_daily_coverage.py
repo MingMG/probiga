@@ -17,6 +17,8 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import text
 
 from server.common.qmt_attestation_contract import canonical_digest
+from server.common.official_historical_daily_evidence import historical_daily_evidence
+from server.common.historical_daily_bar_evidence import SINA_PROVIDER, SINA_QUALITY, verify_public_bar
 from server.common.qmt_stock_catalog import load_stock_catalog
 from server.common.qmt_trade_calendar import load_trade_calendar_receipt
 
@@ -98,7 +100,10 @@ def canonical_bar(row: Mapping[str, Any]) -> dict:
 
 def build_manifest(*, catalog, calendar, day: str, rows: Sequence[Mapping[str, Any]],
                    run_id: str, captured_at: datetime, snapshot: Mapping[str, Any] | None = None,
-                   listings: Mapping[str, Any] | None = None) -> dict:
+                   listings: Mapping[str, Any] | None = None,
+                   historical_documents: Mapping[str, list[dict]] | None = None,
+                   historical_public_bars: Mapping[str, dict] | None = None,
+                   previous_session: str = "") -> dict:
     captured = _stamp(captured_at).replace(microsecond=0)
     if captured < datetime.combine(datetime.fromisoformat(day).date(), time(15, 35)):
         raise ValueError("daily source is not final")
@@ -111,10 +116,27 @@ def build_manifest(*, catalog, calendar, day: str, rows: Sequence[Mapping[str, A
         raise ValueError("daily rows differ from independent catalog")
     if any(row["trade_date"] != day for row in bars):
         raise ValueError("daily row date differs")
+    if historical_documents is not None:
+        if captured.date().isoformat() <= day or set(historical_documents) != set(expected) - by_code.keys():
+            raise ValueError("historical daily lifecycle inventory differs")
+    public = dict(historical_public_bars or {})
+    if public:
+        if (historical_documents is None or not set(public) <= by_code.keys()
+                or calendar.sessions_between(previous_session, day) != [previous_session, day]):
+            raise ValueError("historical public bar calendar or inventory differs")
+        for code, evidence in public.items():
+            if verify_public_bar(evidence, stock_code=code, day=day, previous_day=previous_session, cutoff=captured) != by_code[code]:
+                raise ValueError("historical public source bar differs from exact publication")
     entities = []
     for code in expected:
         if code in by_code:
             kind, evidence = "TRADED", by_code[code]
+        elif historical_documents is not None:
+            try:
+                kind, evidence = historical_daily_evidence(historical_documents[code], stock_code=code,
+                                                           day=day, cutoff=captured)
+            except ValueError as exc:
+                raise ValueError(f"historical daily lifecycle {day} {code}: {exc}") from exc
         elif code in (listings or {}):
             kind, evidence = "NOT_LISTED", listing_evidence(listings[code], code, day)
         else:
@@ -128,6 +150,10 @@ def build_manifest(*, catalog, calendar, day: str, rows: Sequence[Mapping[str, A
             "catalog_member_set_hash": catalog.member_set_hash,
             "calendar_batch_id": calendar.batch_id, "calendar_manifest_hash": calendar.manifest_hash,
             "entities": entities}
+    if historical_documents is not None:
+        core["historical_reconstruction"] = True
+    if public:
+        core.update(historical_public_bars=public, previous_session=previous_session)
     return {**core, "manifest_hash": canonical_digest(core)}
 
 
@@ -136,7 +162,10 @@ def validate_manifest(manifest: Mapping[str, Any], *, catalog, calendar) -> dict
     entities = original.get("entities") or []
     snapshot = {"source": "gj_big_qmt_inner", "quote_acquisition_protocol": "probiga.qmt-full-tick-poll.v1",
                 "quote_acquisition_mode": "full_tick_poll", "quotes": {}}
-    no_trade = [entity for entity in entities if entity.get("classification") == "NO_TRADE"]
+    historical = original.get("historical_reconstruction") is True
+    public = original.get("historical_public_bars") or {}
+    previous_session = original.get("previous_session", "")
+    no_trade = [entity for entity in entities if entity.get("classification") == "NO_TRADE"] if not historical else []
     # Each entity binds its own snapshot envelope; validate those separately
     # rather than assigning one generated timestamp to unrelated observations.
     for entity in no_trade:
@@ -163,6 +192,12 @@ def validate_manifest(manifest: Mapping[str, Any], *, catalog, calendar) -> dict
         raise ValueError("daily manifest authority roots differ")
     if _stamp(original["captured_at"]) < datetime.combine(datetime.fromisoformat(original["trade_date"]).date(), time(15, 35)):
         raise ValueError("daily manifest precedes final source time")
+    if historical and _stamp(original["captured_at"]).date().isoformat() <= original["trade_date"]:
+        raise ValueError("historical daily manifest was backdated")
+    if public and (not historical or not set(public) <= {item["stock_code"] for item in entities
+                                                           if item["classification"] == "TRADED"}
+                   or calendar.sessions_between(previous_session, original["trade_date"]) != [previous_session, original["trade_date"]]):
+        raise ValueError("historical public bar calendar or inventory differs")
     for entity in entities:
         core = {key: entity[key] for key in ("stock_code", "classification", "evidence")}
         if entity.get("row_hash") != canonical_digest(core):
@@ -171,6 +206,18 @@ def validate_manifest(manifest: Mapping[str, Any], *, catalog, calendar) -> dict
             row = canonical_bar(entity["evidence"])
             if row != entity["evidence"] or row["stock_code"] != entity["stock_code"] or row["trade_date"] != original["trade_date"]:
                 raise ValueError("daily entity bar differs")
+            if entity["stock_code"] in public and verify_public_bar(
+                public[entity["stock_code"]], stock_code=entity["stock_code"], day=original["trade_date"],
+                previous_day=previous_session, cutoff=_stamp(original["captured_at"]),
+            ) != row:
+                raise ValueError("historical public source bar differs from exact publication")
+        elif historical:
+            classification, proof = historical_daily_evidence(
+                entity["evidence"]["documents"], stock_code=entity["stock_code"],
+                day=original["trade_date"], cutoff=_stamp(original["captured_at"]),
+            )
+            if classification != entity["classification"] or proof != entity["evidence"]:
+                raise ValueError("historical daily lifecycle evidence differs")
         elif entity["classification"] == "NOT_LISTED":
             proof = listing_evidence(entity["evidence"], entity["stock_code"], original["trade_date"])
             if proof != entity["evidence"]:
@@ -237,8 +284,26 @@ def load_daily_manifest(engine, day: str, *, decision_known_at: datetime | str,
                     "calendar_batch_id", "calendar_manifest_hash"))):
             raise ValueError("persisted daily manifest authority metadata differs")
         catalog = load_stock_catalog(connection, batch_id=manifest["catalog_batch_id"], decision_known_at=cutoff)
-        calendar = load_trade_calendar_receipt(connection, batch_id=manifest["calendar_batch_id"], start_date=day, end_date=day, decision_known_at=cutoff)
+        calendar = load_trade_calendar_receipt(connection, batch_id=manifest["calendar_batch_id"],
+                                               start_date=manifest.get("previous_session", day),
+                                               end_date=day, decision_known_at=cutoff)
         validate_manifest(manifest, catalog=catalog, calendar=calendar)
+        if manifest.get("historical_reconstruction") is True:
+            from server.common.qmt_datadir_result import load_receipt
+            receipt = load_receipt(connection, dataset="stock_daily", trade_date=day)
+            traded_count = sum(item["classification"] == "TRADED" for item in manifest["entities"])
+            detail = (receipt or {}).get("detail") or {}
+            if (receipt is None or receipt.get("status") != "COMPLETE"
+                    or receipt.get("run_id") != manifest["run_id"]
+                    or detail.get("full_market_manifest_hash") != manifest["manifest_hash"]
+                    or detail.get("coverage") != 1.0
+                    or any(value != traded_count for value in (receipt.get("row_count"), receipt.get("code_count"),
+                                                                detail.get("readback_rows"), detail.get("readback_codes")))):
+                raise ValueError("historical daily publication completion receipt differs")
+            if not _stamp(manifest["captured_at"]) <= _stamp(receipt["finished_at"]):
+                raise ValueError("historical daily publication completion time differs")
+            if _stamp(receipt["finished_at"]) > cutoff:
+                return None
         stored = connection.execute(text(f"SELECT stock_code,expected_state,classification,bar_count,time_set_hash,first_time,last_time,source_row_hash,row_hash FROM {ENTITY_TABLE} WHERE manifest_hash=:hash ORDER BY stock_code"), {"hash": row["manifest_hash"]}).mappings().all()
         expected = []
         for item in manifest["entities"]:
@@ -252,7 +317,9 @@ def load_daily_manifest(engine, day: str, *, decision_known_at: datetime | str,
             raise ValueError("persisted daily entity inventory differs")
         if verify_rows:
             rows = connection.execute(text("SELECT stock_code,trade_date,open,close,high,low,volume,amount,pre_close,data_source,quality_status,permission_status FROM sm_stock_kline WHERE trade_date=:day AND k_type=1 AND adjust_type=0 ORDER BY stock_code"), {"day": day}).mappings().all()
-            if any(item.get("data_source") != PROVIDER or item.get("quality_status") != "VERIFIED"
+            fallback = manifest.get("historical_public_bars") or {}
+            if any((item.get("data_source"), item.get("quality_status")) != (
+                    (SINA_PROVIDER, SINA_QUALITY) if item["stock_code"] in fallback else (PROVIDER, "VERIFIED"))
                    or item.get("permission_status") != "SUPPORTED" for item in rows):
                 raise ValueError("daily database provider or quality differs")
             actual = [canonical_bar(item) for item in rows]

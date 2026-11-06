@@ -8,7 +8,10 @@ import hashlib
 import json
 import os
 import sys
+import time
 import uuid
+from contextlib import contextmanager
+from decimal import Decimal
 from pathlib import Path
 
 from sqlalchemy import text
@@ -32,6 +35,14 @@ from server.common.authoritative_market_clock import (  # noqa: E402
     authoritative_closed_trade_date,
 )
 from server.common.batch_db import create_batch_engine  # noqa: E402
+from server.common.historical_daily_bar_evidence import (  # noqa: E402
+    SINA_PROVIDER,
+    SINA_QUALITY,
+    load_public_bars,
+)
+from server.common.mysql_lock import STOCK_KLINE_FREEZE_LOCK_NAME, mysql_named_lock  # noqa: E402
+from server.common.official_historical_daily_evidence import load_historical_documents  # noqa: E402
+from server.common.qmt_attestation_contract import canonical_digest  # noqa: E402
 from server.common.qmt_trade_calendar import (  # noqa: E402
     load_trade_calendar_receipt,
 )
@@ -127,11 +138,13 @@ def _short_names(engine) -> dict[str, str]:
     }
 
 
-def _harvest(root: Path, universe, session: dt.date) -> dict:
+def _harvest(root: Path, universe, session: dt.date, *, deadline=None) -> dict:
     rows = []
     codes = set()
     digest = hashlib.sha256()
     for member in universe.ordered():
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError(f"historical daily DAT harvest deadline exceeded for {session}")
         dat = load_dat(root, member.market, DAILY_PERIOD, member.code)
         if dat is None:
             continue
@@ -156,6 +169,18 @@ def _harvested_daily_rows(harvested):
     return [dict(zip(fields, row)) for row in harvested["rows"]]
 
 
+def _completion_fingerprint(engine, *, day, proof):
+    native = persisted_fingerprint(engine, dataset=DATASET, trade_date=day)
+    public = proof.get("historical_public_bars") or {}
+    if not public:
+        return native
+    return {
+        "row_count": native["row_count"] + len(public),
+        "code_count": native["code_count"] + len(public),
+        "row_hash": canonical_digest({"native_row_hash": native["row_hash"], "public_bar_evidence": public}),
+    }
+
+
 def _reusable_partition(engine, *, session, harvested):
     """Keep the same immutable publication when source content is unchanged."""
     cutoff = dt.datetime.now(CST).replace(tzinfo=None, microsecond=0)
@@ -165,7 +190,9 @@ def _reusable_partition(engine, *, session, harvested):
         return None
     bars = sorted((canonical_bar(row) for row in _harvested_daily_rows(harvested)),
                   key=lambda row: row["stock_code"])
-    if bars != [item["evidence"] for item in proof["entities"] if item["classification"] == "TRADED"]:
+    traded = [item for item in proof["entities"] if item["classification"] == "TRADED"]
+    public = proof.get("historical_public_bars") or {}
+    if bars != [item["evidence"] for item in traded if item["stock_code"] not in public]:
         return None
     with engine.connect() as connection:
         catalog = load_stock_catalog(connection, decision_known_at=cutoff)
@@ -179,29 +206,37 @@ def _reusable_partition(engine, *, session, harvested):
     if receipt is None:
         return None
     detail = receipt.get("detail") or {}
-    fingerprint = persisted_fingerprint(engine, dataset=DATASET, trade_date=day)
+    fingerprint = _completion_fingerprint(engine, day=day, proof=proof)
     if (receipt.get("status") != "COMPLETE" or receipt.get("run_id") != proof["run_id"]
-            or int(receipt.get("row_count") or 0) != len(bars)
-            or int(receipt.get("code_count") or 0) != len(bars)
+            or int(receipt.get("row_count") or 0) != len(traded)
+            or int(receipt.get("code_count") or 0) != len(traded)
             or detail.get("full_market_manifest_hash") != proof["manifest_hash"]
             or detail.get("coverage") != 1.0
-            or detail.get("readback_rows") != len(bars) or detail.get("readback_codes") != len(bars)
+            or detail.get("readback_rows") != len(traded) or detail.get("readback_codes") != len(traded)
             or detail.get("row_hash") != fingerprint["row_hash"]):
         return None
     return proof
 
 
-def _coverage_manifest(engine, *, session, harvested, run_id):
+def _coverage_manifest(engine, *, session, harvested, run_id, historical_documents=None,
+                       historical_public_bars=None, previous_session=""):
     """Account for every catalog security before touching the live partition."""
     cutoff = dt.datetime.now(CST).replace(tzinfo=None, microsecond=0)
     day = session.isoformat()
     with engine.connect() as connection:
         catalog = load_stock_catalog(connection, decision_known_at=cutoff)
         calendar = load_trade_calendar_receipt(
-            connection, start_date=day, end_date=day, decision_known_at=cutoff,
+            connection, start_date=previous_session or day, end_date=day, decision_known_at=cutoff,
         )
     rows = _harvested_daily_rows(harvested)
     missing = sorted(set(catalog.eligible_codes(day)) - set(harvested["codes"]))
+    if historical_documents is not None:
+        return build_manifest(
+            catalog=catalog, calendar=calendar, day=day, rows=rows, run_id=run_id,
+            captured_at=cutoff, historical_documents={code: historical_documents[code] for code in missing
+                                                      if code in historical_documents},
+            historical_public_bars=historical_public_bars, previous_session=previous_session,
+        )
     snapshot = {}
     unresolved = []
     if missing:
@@ -235,6 +270,60 @@ def _coverage_manifest(engine, *, session, harvested, run_id):
                           run_id=run_id, captured_at=cutoff, snapshot=snapshot, listings=listings)
 
 
+@contextmanager
+def _daily_transaction(engine):
+    with mysql_named_lock(engine, STOCK_KLINE_FREEZE_LOCK_NAME, timeout_seconds=10) as connection:
+        connection.commit()
+        with connection.begin():
+            yield connection
+
+
+def _historical_append_plan(connection, *, day, proof):
+    """Reject any repair which would replace previously published business rows."""
+    if proof.get("historical_reconstruction") is not True or proof.get("trade_date") != day:
+        raise ValueError("historical daily publication identity differs")
+    canonical = {item["stock_code"]: item["evidence"] for item in proof["entities"]
+                 if item["classification"] == "TRADED"}
+    retained = connection.execute(text(f"""
+        SELECT stock_code,trade_date,open,close,high,low,volume,amount,pre_close,
+               data_source,quality_status,permission_status
+        FROM `{TARGET_TABLE}` WHERE trade_date=:day AND k_type=1 AND adjust_type=0
+        ORDER BY stock_code
+    """), {"day": day}).mappings().all()
+    seen = set()
+    for row in retained:
+        code = row["stock_code"]
+        if (code in seen or row["data_source"] != SOURCE or row["quality_status"] != "VERIFIED"
+                or row["permission_status"] != "SUPPORTED" or canonical.get(code) != canonical_bar(row)):
+            raise ValueError(f"historical daily retained business row differs for {day} {code}")
+        seen.add(code)
+    previous = load_receipt(connection, dataset=DATASET, trade_date=day)
+    detail = (previous or {}).get("detail") or {}
+    if (not previous or not seen or previous.get("status") != "COMPLETE"
+            or previous.get("row_count") != len(seen) or previous.get("code_count") != len(seen)
+            or detail.get("readback_rows") != len(seen) or detail.get("readback_codes") != len(seen)
+            or detail.get("full_market_manifest_hash")):
+        raise ValueError(f"historical daily retained coarse completion differs for {day}")
+    if persisted_fingerprint(connection, dataset=DATASET, trade_date=day)["row_hash"] != detail.get("row_hash"):
+        raise ValueError(f"historical daily retained completion fingerprint differs for {day}")
+    return set(canonical) - seen, previous
+
+
+def _with_public_bars(harvested, public, *, session):
+    if set(public) & harvested["codes"]:
+        raise ValueError("historical public source cannot replace an available native bar")
+    rows = list(harvested["rows"])
+    for code, evidence in sorted(public.items()):
+        bar = evidence["sina"]["row"]
+        open_price, close, high, low, volume, amount, previous = (
+            Decimal(bar[key]) for key in ("open", "close", "high", "low", "volume", "amount", "pre_close")
+        )
+        rows.append((code, dt.datetime.combine(session, dt.time(15)), session, open_price, close, high, low,
+                     volume, amount, previous, close - previous, (close - previous) / previous * 100))
+    return {"rows": rows, "codes": harvested["codes"] | set(public),
+            "digest": canonical_digest({"native_dat_sha256": harvested["digest"], "public_bar_evidence": public})}
+
+
 def _publish(
     engine,
     *,
@@ -266,6 +355,7 @@ def _publish(
         "stage.quality_status, stage.permission_status"
     )
     payload: list[tuple] = []
+    public = coverage_manifest.get("historical_public_bars") or {}
     for (
         code,
         _native_time,
@@ -304,7 +394,7 @@ def _publish(
             pre_close,
             now,
             f"{code}.{market}",
-            SOURCE,
+            SINA_PROVIDER if code in public else SOURCE,
             source_time,
             now,
             batch_id,
@@ -314,12 +404,17 @@ def _publish(
                     f"{high}|{low}|{volume}|{amount}|{pre_close}"
                 ).encode("utf-8")
             ).hexdigest()[:32],
-            "VERIFIED",
+            SINA_QUALITY if code in public else "VERIFIED",
             "SUPPORTED",
         ))
     row_template = "(" + ",".join(["%s"] * 24) + ")"
     temp_table = f"tmp_qmt_daily_{run_id}"
-    with engine.begin() as connection:
+    historical = coverage_manifest.get("historical_reconstruction") is True
+    with _daily_transaction(engine) as connection:
+        previous = None
+        if historical:
+            missing, previous = _historical_append_plan(connection, day=session.isoformat(), proof=coverage_manifest)
+            payload = [row for row in payload if row[0] in missing]
         connection.exec_driver_sql(
             f"""
             CREATE TEMPORARY TABLE `{temp_table}` (
@@ -362,43 +457,44 @@ def _publish(
                 statement,
                 tuple(value for row in chunk for value in row),
             )
-        connection.execute(
-            text(
-            f"""
-            UPDATE `{TARGET_TABLE}` AS target
-            JOIN `{temp_table}` AS stage
-              ON stage.stock_code=target.stock_code
-             AND stage.trade_date=target.trade_date
-             AND stage.k_type=target.k_type
-             AND stage.adjust_type=target.adjust_type
-            SET target.short_name=stage.short_name,
-                target.trade_time=stage.trade_time,
-                target.`open`=stage.`open`,
-                target.`close`=stage.`close`,
-                target.high=stage.high,
-                target.low=stage.low,
-                target.volume=stage.volume,
-                target.amount=stage.amount,
-                target.`change`=stage.`change`,
-                target.change_pct=stage.change_pct,
-                target.pre_close=stage.pre_close,
-                target.etl_sync_at=stage.etl_sync_at,
-                target.qmt_code=stage.qmt_code,
-                target.data_source=stage.data_source,
-                target.source_time=stage.source_time,
-                target.received_at=stage.received_at,
-                target.batch_id=stage.batch_id,
-                target.data_version=stage.data_version,
-                target.quality_status=stage.quality_status,
-                target.permission_status=stage.permission_status
-            WHERE target.trade_date=:d
-              AND target.k_type=1
-              AND target.adjust_type=0
-            """
-            ),
-            {"d": session},
-        )
-        connection.exec_driver_sql(
+        if not historical:
+            connection.execute(
+                text(
+                f"""
+                UPDATE `{TARGET_TABLE}` AS target
+                JOIN `{temp_table}` AS stage
+                  ON stage.stock_code=target.stock_code
+                 AND stage.trade_date=target.trade_date
+                 AND stage.k_type=target.k_type
+                 AND stage.adjust_type=target.adjust_type
+                SET target.short_name=stage.short_name,
+                    target.trade_time=stage.trade_time,
+                    target.`open`=stage.`open`,
+                    target.`close`=stage.`close`,
+                    target.high=stage.high,
+                    target.low=stage.low,
+                    target.volume=stage.volume,
+                    target.amount=stage.amount,
+                    target.`change`=stage.`change`,
+                    target.change_pct=stage.change_pct,
+                    target.pre_close=stage.pre_close,
+                    target.etl_sync_at=stage.etl_sync_at,
+                    target.qmt_code=stage.qmt_code,
+                    target.data_source=stage.data_source,
+                    target.source_time=stage.source_time,
+                    target.received_at=stage.received_at,
+                    target.batch_id=stage.batch_id,
+                    target.data_version=stage.data_version,
+                    target.quality_status=stage.quality_status,
+                    target.permission_status=stage.permission_status
+                WHERE target.trade_date=:d
+                  AND target.k_type=1
+                  AND target.adjust_type=0
+                """
+                ),
+                {"d": session},
+            )
+        inserted = connection.exec_driver_sql(
             f"""
             INSERT INTO `{TARGET_TABLE}` ({columns})
             SELECT {stage_columns}
@@ -411,36 +507,42 @@ def _publish(
             WHERE target.id IS NULL
             """
         )
-        connection.execute(
-            text(
-            f"""
-            DELETE target
-            FROM `{TARGET_TABLE}` AS target
-            LEFT JOIN `{temp_table}` AS stage
-              ON stage.stock_code=target.stock_code
-             AND stage.trade_date=target.trade_date
-             AND stage.k_type=target.k_type
-             AND stage.adjust_type=target.adjust_type
-            WHERE target.trade_date=:d
-              AND target.k_type=1
-              AND target.adjust_type=0
-              AND stage.stock_code IS NULL
-            """
-            ),
-            {"d": session},
-        )
-        fingerprint = persisted_fingerprint(
-            connection,
-            dataset=DATASET,
-            trade_date=session.isoformat(),
-        )
+        if historical and inserted.rowcount != len(missing):
+            raise ValueError("historical daily missing row insert count differs")
+        if not historical:
+            connection.execute(
+                text(
+                f"""
+                DELETE target
+                FROM `{TARGET_TABLE}` AS target
+                LEFT JOIN `{temp_table}` AS stage
+                  ON stage.stock_code=target.stock_code
+                 AND stage.trade_date=target.trade_date
+                 AND stage.k_type=target.k_type
+                 AND stage.adjust_type=target.adjust_type
+                WHERE target.trade_date=:d
+                  AND target.k_type=1
+                  AND target.adjust_type=0
+                  AND stage.stock_code IS NULL
+                """
+                ),
+                {"d": session},
+            )
+        fingerprint = _completion_fingerprint(connection, day=session.isoformat(), proof=coverage_manifest)
         if (fingerprint["row_count"] != len(rows)
                 or fingerprint["code_count"] != len(covered_codes)):
             raise ValueError("daily database readback differs before completion")
         insert_manifest(connection, coverage_manifest)
-        if load_daily_manifest(connection, session.isoformat(), decision_known_at=now,
-                               manifest_hash=coverage_manifest["manifest_hash"]) is None:
-            raise ValueError("daily immutable proof readback failed before completion")
+        detail = {
+            "readback_rows": fingerprint["row_count"],
+            "readback_codes": fingerprint["code_count"],
+            "row_hash": fingerprint["row_hash"],
+            "eligible_code_count": int(eligible_code_count),
+            "coverage": 1.0,
+            "full_market_manifest_hash": coverage_manifest["manifest_hash"],
+        }
+        if previous is not None:
+            detail["prior_completion"] = previous
         connection.execute(
             text(
                 f"""
@@ -456,6 +558,7 @@ def _publish(
                   code_count=VALUES(code_count), row_count=VALUES(row_count),
                   content_sha256=VALUES(content_sha256),
                   run_id=VALUES(run_id), finished_at=VALUES(finished_at),
+                  started_at=IF(:historical,VALUES(started_at),started_at),
                   detail_json=VALUES(detail_json)
                 """
             ),
@@ -467,26 +570,32 @@ def _publish(
                 "rows": len(rows),
                 "sha": content_sha256,
                 "run_id": run_id,
-                "detail": json.dumps(
-                    {
-                        "readback_rows": fingerprint["row_count"],
-                        "readback_codes": fingerprint["code_count"],
-                        "row_hash": fingerprint["row_hash"],
-                        "eligible_code_count": int(eligible_code_count),
-                        "coverage": 1.0,
-                        "full_market_manifest_hash": coverage_manifest["manifest_hash"],
-                    },
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                ),
+                "historical": historical,
+                "detail": json.dumps(detail, ensure_ascii=False, separators=(",", ":"), default=str),
             },
         )
-    return {
+        readback_at = connection.execute(text("SELECT CURRENT_TIMESTAMP")).scalar_one() if historical else now
+        if load_daily_manifest(connection, session.isoformat(), decision_known_at=readback_at,
+                               manifest_hash=coverage_manifest["manifest_hash"]) is None:
+            raise ValueError("daily immutable proof readback failed before completion")
+    result = {
         "row_count": len(rows),
         "code_count": len(covered_codes),
         "readback_rows": int(fingerprint["row_count"]),
         "readback_codes": int(fingerprint["code_count"]),
     }
+    if historical:
+        receipt = load_receipt(engine, dataset=DATASET, trade_date=session.isoformat())
+        if (not receipt or receipt.get("run_id") != run_id or receipt.get("status") != "COMPLETE"
+                or receipt.get("detail", {}).get("full_market_manifest_hash") != coverage_manifest["manifest_hash"]):
+            raise ValueError("historical daily committed receipt readback differs")
+        result.update(run_id=run_id, manifest_hash=coverage_manifest["manifest_hash"],
+                      finished_at=str(receipt["finished_at"]), appended_codes=sorted(missing),
+                      retained_rows=previous["row_count"])
+        if public:
+            result["public_fallback_codes"] = sorted(public)
+            result["bar_providers"] = {SOURCE: len(rows) - len(public), SINA_PROVIDER: len(public)}
+    return result
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -500,11 +609,16 @@ def main(argv: list[str] | None = None) -> int:
         default=r"D:\国金证券QMT交易端\datadir",
     )
     parser.add_argument("--replace-existing", action="store_true")
+    parser.add_argument("--historical-lifecycle", type=Path,
+                        help="JSON object of security codes to official CNINFO PDF locators; preserve existing rows")
+    parser.add_argument("--public-fallback-code", action="append", default=[],
+                        help="Require corroborated public fallback for a missing code in one explicit historical session")
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     load_project_env()
-    engine = create_batch_engine()
+    engine = (create_batch_engine(connect_args={"connect_timeout": 5, "read_timeout": 30, "write_timeout": 15})
+              if args.historical_lifecycle else create_batch_engine())
     if args.latest_session:
         start = end = dt.date.fromisoformat(
             authoritative_closed_trade_date(engine)
@@ -514,6 +628,20 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--start and --end are required together")
         start = dt.date.fromisoformat(args.start)
         end = dt.date.fromisoformat(args.end)
+    if args.public_fallback_code and (not args.historical_lifecycle or start != end):
+        parser.error("public fallback requires a single explicit historical lifecycle session")
+    locators = historical_documents = None
+    deadline = None
+    if args.historical_lifecycle:
+        latest = dt.date.fromisoformat(authoritative_closed_trade_date(engine))
+        if args.latest_session or args.replace_existing or not start <= end < latest or (end - start).days > 6:
+            parser.error("historical lifecycle repair requires an explicit prior range of up to seven days")
+        with args.historical_lifecycle.open("rb") as handle:
+            raw_locators = handle.read(32 * 1024 + 1)
+        if len(raw_locators) > 32 * 1024:
+            parser.error("historical lifecycle locator file exceeds 32 KiB")
+        deadline = time.monotonic() + 300
+        locators = json.loads(raw_locators)
     root = Path(args.datadir_root)
     if not root.is_dir():
         parser.error(f"datadir root does not exist: {root}")
@@ -522,32 +650,68 @@ def main(argv: list[str] | None = None) -> int:
     short_names = _short_names(engine)
     results = []
     failures = 0
-    for session in sessions:
+    for position, session in enumerate(sessions, 1):
+        if args.historical_lifecycle:
+            print(f"Historical daily {position}/{len(sessions)} {session}: validating DAT and authority", file=sys.stderr)
         sources = _existing_sources(engine, session)
-        if sources and not args.replace_existing:
+        if sources and not args.replace_existing and not args.historical_lifecycle:
             results.append({
                 "session": session.isoformat(),
                 "status": "SKIP_EXISTING",
                 "sources": sources,
             })
             continue
-        harvested = _harvest(root, universe, session)
+        harvested = _harvest(root, universe, session, deadline=deadline)
         reused = _reusable_partition(engine, session=session, harvested=harvested)
         if reused is not None:
             results.append({"session": session.isoformat(), "status": "REUSED",
                             "run_id": reused["run_id"], "manifest_hash": reused["manifest_hash"]})
             continue
+        if args.historical_lifecycle and historical_documents is None:
+            budget = deadline - time.monotonic()
+            if budget <= 0:
+                raise TimeoutError("historical daily lifecycle deadline exceeded before evidence download")
+            historical_documents = load_historical_documents(locators, timeout_seconds=min(75, budget))
+        public, previous_day = {}, ""
+        if args.public_fallback_code:
+            previous = _sessions(engine, session - dt.timedelta(days=21), session)
+            if len(previous) < 2 or previous[-1] != session:
+                raise ValueError("authoritative public fallback previous session unavailable")
+            previous_day = previous[-2].isoformat()
+            if set(args.public_fallback_code) & harvested["codes"]:
+                raise ValueError("historical public source requested for an existing native bar")
+            budget = deadline - time.monotonic()
+            if budget <= 0:
+                raise TimeoutError("historical daily deadline exceeded before public source acquisition")
+            public = load_public_bars(args.public_fallback_code, day=session.isoformat(), previous_day=previous_day,
+                                      timeout_seconds=min(75, budget))
+            harvested = _with_public_bars(harvested, public, session=session)
         eligible = universe.eligible_codes(session)
         run_id = new_run_id()
         coverage_manifest = _coverage_manifest(
             engine, session=session, harvested=harvested, run_id=run_id,
+            historical_documents=historical_documents,
+            historical_public_bars=public, previous_session=previous_day,
         )
         if not args.apply:
+            append_detail = {}
+            if historical_documents is not None:
+                with engine.connect() as connection:
+                    missing, prior = _historical_append_plan(connection, day=session.isoformat(), proof=coverage_manifest)
+                append_detail = {"retained_rows": prior["row_count"], "append_codes": sorted(missing),
+                                 "no_bar_codes": {item["stock_code"]: item["classification"]
+                                                  for item in coverage_manifest["entities"]
+                                                  if item["classification"] != "TRADED"}}
+                if public:
+                    append_detail["public_fallback_codes"] = sorted(public)
+                    append_detail["bar_providers"] = {SOURCE: len(harvested["rows"]) - len(public),
+                                                      SINA_PROVIDER: len(public)}
             results.append({
                 "session": session.isoformat(),
                 "status": "READY",
                 "rows": len(harvested["rows"]),
                 "codes": len(harvested["codes"]),
+                **append_detail,
             })
             continue
         published = _publish(
@@ -567,6 +731,8 @@ def main(argv: list[str] | None = None) -> int:
             "status": "COMPLETE",
             **published,
         })
+        if args.historical_lifecycle:
+            print(f"Historical daily {position}/{len(sessions)} {session}: committed {run_id}", file=sys.stderr)
     payload = {
         "schema": "probiga.qmt-datadir-daily-import.v1",
         "source": SOURCE,
@@ -575,7 +741,7 @@ def main(argv: list[str] | None = None) -> int:
         "failures": failures,
         "results": results,
     }
-    if not args.apply:
+    if not args.apply or args.historical_lifecycle:
         print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
         return 0 if not failures else 1
     task_result = _task_result(engine, sessions=sessions)

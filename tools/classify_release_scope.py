@@ -252,8 +252,13 @@ _CONTRACT_WHOLE_FILE_FILES = (
 # Linux-only release already contains the change. Keep this separate from the
 # contract digest: ordinary implementation changes do not invent schema drift.
 _WINDOWS_RUNTIME_FILES = (
+    "tools/import_qmt_datadir_daily.py",
     "tools/import_qmt_datadir_history.py",
     "integrations/qmt/datadir_import.py",
+    "server/common/historical_daily_bar_evidence.py",
+    "server/common/official_historical_daily_evidence.py",
+    "server/common/qmt_daily_market_truth.py",
+    "server/common/qmt_datadir_daily_coverage.py",
     "server/common/qmt_datadir_minute_coverage.py",
     # sync_qmt_stock_edge executes this reader and receipt validator on Windows.
     "server/common/minute_acquisition_reuse.py",

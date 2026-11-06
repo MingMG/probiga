@@ -96,6 +96,7 @@ class QmtDailyMarketTruth:
     truth_hash: str
     no_row_exception_proof_sha256: str | None = None
     provider: str = QMT_DAILY_PROVIDER
+    public_bar_codes: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         payload = {
@@ -117,6 +118,11 @@ class QmtDailyMarketTruth:
         }
         if self.provider != QMT_DAILY_PROVIDER:
             payload["provider"] = self.provider
+        if self.public_bar_codes:
+            from server.common.historical_daily_bar_evidence import SINA_PROVIDER
+            payload["bar_providers"] = {"qmt_datadir": self.attested_row_count - len(self.public_bar_codes),
+                                        SINA_PROVIDER: len(self.public_bar_codes)}
+            payload["public_bar_codes"] = list(self.public_bar_codes)
         if self.no_row_exception_proof_sha256 is not None:
             payload["no_row_exception_proof_sha256"] = (
                 self.no_row_exception_proof_sha256
@@ -327,9 +333,18 @@ def load_qmt_daily_market_truth(
             end_date=end, decision_known_at=decision_time,
         )
         traded = [entity for entity in cache["entities"] if entity["classification"] == "TRADED"]
+        available_at = cache["captured_at"]
+        if cache.get("historical_reconstruction") is True:
+            from server.common.qmt_datadir_result import load_receipt
+            receipt = load_receipt(connection, dataset="stock_daily", trade_date=start)
+            if receipt is None or receipt.get("run_id") != cache["run_id"]:
+                raise RuntimeError("historical QMT daily completion receipt differs")
+            available_at = _qmt_datadir_receipt_finished_at(receipt, trade_date=start)
+            if available_at > decision_time:
+                raise QmtDailySourceAfterCutoff("historical QMT daily completion follows the decision cutoff")
         return QmtDailyMarketTruth(
             run_id=cache["run_id"], run_start_date=start, run_end_date=end,
-            run_finished_at=cache["captured_at"], decision_known_at=decision_time,
+            run_finished_at=available_at, decision_known_at=decision_time,
             catalog_batch_id=cache["catalog_batch_id"],
             catalog_manifest_hash=cache["catalog_manifest_hash"],
             catalog_member_set_hash=cache["catalog_member_set_hash"],
@@ -339,6 +354,7 @@ def load_qmt_daily_market_truth(
             attested_row_count=len(traded), requested_sessions=(start,),
             truth_hash=cache["manifest_hash"],
             no_row_exception_proof_sha256=cache["manifest_hash"], provider="qmt_datadir",
+            public_bar_codes=tuple(sorted(cache.get("historical_public_bars") or {})),
         )
     if start == end:
         from server.common.qmt_datadir_result import load_receipt
