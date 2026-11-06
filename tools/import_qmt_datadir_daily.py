@@ -754,7 +754,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.public_fallback_code and (not args.historical_lifecycle or start != end):
         parser.error("public fallback requires a single explicit historical lifecycle session")
     locators = historical_documents = None
-    deadline = None
     if args.historical_lifecycle:
         latest = dt.date.fromisoformat(authoritative_closed_trade_date(engine))
         if args.latest_session or args.replace_existing or not start <= end < latest or (end - start).days > 6:
@@ -763,14 +762,12 @@ def main(argv: list[str] | None = None) -> int:
             raw_locators = handle.read(32 * 1024 + 1)
         if len(raw_locators) > 32 * 1024:
             parser.error("historical lifecycle locator file exceeds 32 KiB")
-        deadline = time.monotonic() + 300
         locators = json.loads(raw_locators)
     if exact_repair:
         latest = dt.date.fromisoformat(authoritative_closed_trade_date(engine))
         if (args.latest_session or args.replace_existing or args.historical_lifecycle or start != end or end > latest
                 or (args.repair_native_amount_only and args.repair_native_post_close_code)):
             parser.error("exact native repair requires one explicit closed session and repair mode")
-        deadline = time.monotonic() + 180
     root = Path(args.datadir_root)
     if not root.is_dir():
         parser.error(f"datadir root does not exist: {root}")
@@ -780,6 +777,7 @@ def main(argv: list[str] | None = None) -> int:
     results = []
     failures = 0
     for position, session in enumerate(sessions, 1):
+        deadline = time.monotonic() + (300 if args.historical_lifecycle else 180) if repair else None
         if repair:
             print(f"Daily repair {position}/{len(sessions)} {session}: validating DAT and authority", file=sys.stderr)
         sources = _existing_sources(engine, session)

@@ -286,6 +286,7 @@ def validate_manifest(manifest: Mapping[str, Any], *, catalog, calendar) -> dict
 
 def insert_manifest(connection, manifest: dict) -> None:
     """Append one immutable proof in the same transaction as its daily rows."""
+    created_at = connection.execute(text("SELECT CURRENT_TIMESTAMP")).scalar_one()
     entities = manifest["entities"]
     traded = [entity["stock_code"] for entity in entities if entity["classification"] == "TRADED"]
     absent = [entity["stock_code"] for entity in entities if entity["classification"] != "TRADED"]
@@ -304,7 +305,8 @@ def insert_manifest(connection, manifest: dict) -> None:
             "expected_traded_count", "actual_traded_count", "no_trade_count", "bar_count", "expected_entity_set_hash",
             "expected_traded_set_hash", "actual_traded_set_hash", "no_trade_set_hash", "entity_root_hash", "reason_count",
             "captured_at", "manifest_json")
-    connection.execute(text(f"INSERT INTO {MANIFEST_TABLE} ({','.join(keys)},created_at) VALUES ({','.join(':'+key for key in keys)},CURRENT_TIMESTAMP)"), params)
+    connection.execute(text(f"INSERT INTO {MANIFEST_TABLE} ({','.join(keys)},created_at) VALUES ({','.join(':'+key for key in keys)},:created_at)"),
+                       {**params, "created_at": created_at})
     persisted_entities = []
     for entity in entities:
         traded_bar = entity["classification"] == "TRADED"
@@ -312,8 +314,10 @@ def insert_manifest(connection, manifest: dict) -> None:
         persisted_entities.append({"manifest_hash": manifest["manifest_hash"], "stock_code": entity["stock_code"],
                             "state": entity["classification"], "bars": int(traded_bar),
                             "times": canonical_digest([day] if traded_bar else []), "day": day,
-                            "source_hash": canonical_digest(entity["evidence"]), "row_hash": entity["row_hash"]})
-    connection.execute(text(f"INSERT INTO {ENTITY_TABLE} (manifest_hash,stock_code,expected_state,classification,bar_count,time_set_hash,first_time,last_time,source_row_hash,row_hash,created_at) VALUES (:manifest_hash,:stock_code,:state,:state,:bars,:times,:day,:day,:source_hash,:row_hash,CURRENT_TIMESTAMP)"), persisted_entities)
+                            "source_hash": canonical_digest(entity["evidence"]), "row_hash": entity["row_hash"],
+                            "created_at": created_at})
+    # PyMySQL batches executemany only when each VALUES term is a bind parameter.
+    connection.execute(text(f"INSERT INTO {ENTITY_TABLE} (manifest_hash,stock_code,expected_state,classification,bar_count,time_set_hash,first_time,last_time,source_row_hash,row_hash,created_at) VALUES (:manifest_hash,:stock_code,:state,:state,:bars,:times,:day,:day,:source_hash,:row_hash,:created_at)"), persisted_entities)
 
 
 def load_daily_manifest(engine, day: str, *, decision_known_at: datetime | str,
