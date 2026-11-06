@@ -5815,6 +5815,69 @@ def latest_portfolio(
     )
 
 
+def _legacy_paper_execution_quality(orders: list[dict[str, Any]], *, limit: int) -> dict[str, Any]:
+    """Describe the bounded event-simulator order sample from its own ledger."""
+    status_counts: dict[str, int] = {}
+    filled_order_count = partial_fill_count = price_sample_count = 0
+    completion_delays: list[float] = []
+    reference_notional = signed_price_delta = 0.0
+    fees: list[float] = []
+    for order in orders:
+        status = str(order.get("status") or "UNKNOWN").upper()
+        status_counts[status] = status_counts.get(status, 0) + 1
+        filled = int(order.get("filled_shares") or 0)
+        if filled <= 0:
+            continue
+        filled_order_count += 1
+        requested = int(order.get("requested_shares") or 0)
+        if 0 < filled < requested:
+            partial_fill_count += 1
+        fee = order.get("fee")
+        if fee is not None and math.isfinite(float(fee)) and float(fee) >= 0:
+            fees.append(float(fee))
+        limit_price = float(order.get("limit_price") or 0)
+        fill_price = float(order.get("filled_price") or 0)
+        side = str(order.get("side") or "").upper()
+        if (side in {"BUY", "SELL"} and all(
+            math.isfinite(price) and price > 0 for price in (limit_price, fill_price)
+        )):
+            sign = 1 if side == "BUY" else -1
+            price_sample_count += 1
+            reference_notional += filled * limit_price
+            signed_price_delta += filled * sign * (fill_price - limit_price)
+        if status == "FILLED" and filled == requested:
+            created = _iso_datetime(order.get("created_at"))
+            completed = _iso_datetime(order.get("filled_at"))
+            if created and completed:
+                try:
+                    delay = (datetime.fromisoformat(completed) - datetime.fromisoformat(created)).total_seconds()
+                except (TypeError, ValueError):
+                    continue
+                if delay >= 0:
+                    completion_delays.append(delay)
+    return {
+        "ledger_source": "LEGACY_EVENT_SIM",
+        "scope": "LATEST_ORDERS_SAMPLE",
+        "sample_limit": limit,
+        "sample_reached_limit": len(orders) >= limit,
+        "sample_order_count": len(orders),
+        "status_counts": status_counts,
+        "orders_with_fills": filled_order_count,
+        "partially_filled_orders": partial_fill_count,
+        "price_sample_count": price_sample_count,
+        "adverse_price_vs_order_limit_bps": (
+            round(signed_price_delta / reference_notional * 10_000, 4)
+            if reference_notional else None
+        ),
+        "completion_latency_sample_count": len(completion_delays),
+        "average_order_completion_seconds": (
+            round(sum(completion_delays) / len(completion_delays), 3) if completion_delays else None
+        ),
+        "fee_sample_count": len(fees),
+        "observed_fee_cny": round(sum(fees), 2) if fees else None,
+    }
+
+
 @router.get("/paper-ledger")
 def paper_ledger(
     account_id: str = Query(default="paper-main-v2", min_length=3, max_length=64),
@@ -5881,7 +5944,7 @@ def paper_ledger(
                 """
                 SELECT id, stock_code, short_name, strategy_type, side,
                        requested_shares, filled_shares, remaining_shares,
-                       limit_price, target_price, filled_price, status, reason,
+                       limit_price, target_price, filled_price, fee, status, reason,
                        reject_reason, last_match_reason, order_date,
                        order_time, filled_at, created_at
                 FROM st_sim_order
@@ -6352,6 +6415,7 @@ def paper_ledger(
         "positions": positions,
         "today_closed_positions": today_closed_positions,
         "orders": orders,
+        "execution_quality": _legacy_paper_execution_quality(legacy_orders, limit=int(limit)),
         "summary": {
             "position_count": len(positions),
             "position_lot_count": len(position_lots),
