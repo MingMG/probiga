@@ -687,7 +687,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--historical-lifecycle", type=Path,
                         help="JSON object of security codes to official CNINFO PDF locators; preserve existing rows")
     parser.add_argument("--repair-native-amount-only", action="store_true",
-                        help="Correct truncated native amounts for the latest exact closed partition")
+                        help="Correct truncated native amounts for one exact closed partition")
     parser.add_argument("--public-fallback-code", action="append", default=[],
                         help="Require corroborated public fallback for a missing code in one explicit historical session")
     parser.add_argument("--apply", action="store_true")
@@ -722,8 +722,8 @@ def main(argv: list[str] | None = None) -> int:
         locators = json.loads(raw_locators)
     if args.repair_native_amount_only:
         latest = dt.date.fromisoformat(authoritative_closed_trade_date(engine))
-        if args.latest_session or args.replace_existing or args.historical_lifecycle or start != end or end != latest:
-            parser.error("native amount-only repair requires the single explicit latest closed session")
+        if args.latest_session or args.replace_existing or args.historical_lifecycle or start != end or end > latest:
+            parser.error("native amount-only repair requires one explicit closed session")
         deadline = time.monotonic() + 180
     root = Path(args.datadir_root)
     if not root.is_dir():
