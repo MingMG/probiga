@@ -288,6 +288,12 @@ def _market_id(code: str) -> int:
     return 1 if code.startswith(("5", "6")) else 0
 
 
+def _usable_price(row: dict[str, Any]) -> bool:
+    return str(row.get("quality_status") or "").upper() in {
+        "VALIDATED", "VERIFIED", "SOURCE_VERIFIED", "PUBLIC_FALLBACK",
+    }
+
+
 def _fetch_eastmoney_price_history(code: str, start_date: str, end_date: str) -> tuple[str, dict[str, dict[str, Any]]]:
     params = {
         "fields1": "f1,f2,f3,f4,f5,f6",
@@ -306,24 +312,28 @@ def _fetch_eastmoney_price_history(code: str, start_date: str, end_date: str) ->
         timeout=(5, 12),
     )
     response.raise_for_status()
-    rows = ((response.json().get("data") or {}).get("klines") or [])
+    data = response.json().get("data") or {}
+    rows = data.get("klines") or []
+    if rows and (str(data.get("code") or "") != code or str(data.get("market")) != str(_market_id(code))):
+        raise ValueError("ETF 行情响应证券身份不符")
     output: dict[str, dict[str, Any]] = {}
-    previous_close: float | None = None
     for raw in rows:
         fields = str(raw).split(",")
         if len(fields) < 11:
             continue
         row_date = _iso_date(fields[0])
         close = _safe_float(fields[2])
+        if not start_date <= row_date <= end_date or close is None or close <= 0:
+            continue
+        if row_date in output:
+            raise ValueError("ETF 行情响应交易日重复")
         output[row_date] = {
             "close": close,
-            "pre_close": previous_close,
             "change_pct": _safe_float(fields[8]),
             "amount": _safe_float(fields[6]),
             "price_source": "东方财富公开日线",
             "quality_status": "public_fallback",
         }
-        previous_close = close
     return code, output
 
 
@@ -340,12 +350,9 @@ def _collect_inputs(trade_dates: list[str]) -> tuple[
     chronological = sorted(trade_dates)
     start_date, end_date = chronological[0], chronological[-1]
     prices = _local_price_history(start_date, end_date)
-    local_codes = {
-        code
-        for date_rows in prices.values()
-        for code in date_rows
-    }
-    missing_price_codes = [code for code in CORE_CODES if code not in local_codes]
+    missing_price_codes = [code for code in CORE_CODES if any(
+        not _usable_price(prices.get(day, {}).get(code, {})) for day in chronological
+    )]
     shares: dict[str, dict[str, dict[str, Any]]] = {}
     warnings: list[str] = []
 
@@ -376,7 +383,9 @@ def _collect_inputs(trade_dates: list[str]) -> tuple[
                 else:
                     code, code_rows = value
                     for row_date, price_row in code_rows.items():
-                        prices.setdefault(row_date, {})[code] = price_row
+                        date_prices = prices.setdefault(row_date, {})
+                        if not _usable_price(date_prices.get(code, {})):
+                            date_prices[code] = price_row
             except Exception as exc:
                 logger.warning("Broad ETF flow source %s %s failed: %s", kind, label, exc)
                 warnings.append(f"{kind}:{label} 数据暂不可用")
@@ -406,9 +415,10 @@ def _build_flow_rows(
             previous_value = _safe_float(previous_share.get("fund_share"))
             if current_value is None or current_value < 0 or previous_value is None or previous_value <= 0:
                 continue
-            multiplier = _safe_float(price.get("pre_close"))
+            usable_price = price if _usable_price(price) else {}
+            multiplier = _safe_float(usable_price.get("pre_close"))
             if multiplier is None or multiplier <= 0:
-                multiplier = _safe_float(previous_price.get("close"))
+                multiplier = _safe_float(previous_price.get("close")) if _usable_price(previous_price) else None
             share_change = current_value - previous_value
             share_change_pct = share_change / previous_value * 100
             quality_status = str(price.get("quality_status") or "public")
@@ -430,9 +440,9 @@ def _build_flow_rows(
                 "share_change": share_change,
                 "share_change_pct": share_change_pct,
                 "fund_share": current_value,
-                "price": _safe_float(price.get("close")),
-                "change_pct": _safe_float(price.get("change_pct")),
-                "amount": _safe_float(price.get("amount")),
+                "price": _safe_float(usable_price.get("close")),
+                "change_pct": _safe_float(usable_price.get("change_pct")),
+                "amount": _safe_float(usable_price.get("amount")),
                 "source": str(current_share.get("source") or "交易所公开份额"),
                 "share_observed_at": max(current_share.get("observed_at") or "",
                                          previous_share.get("observed_at") or "") or None,
@@ -688,11 +698,14 @@ def _build_payload(requested_date: str, days: int) -> dict[str, Any]:
     activity_date = trade_dates[-1]
     activity = []
     for code, price in sorted(prices.get(activity_date, {}).items()):
-        turnover = _safe_float(price.get("amount"))
-        if code in CORE_BY_CODE and turnover is not None and turnover >= 0:
-            activity.append({"etf_code": code, "turnover": turnover,
-                             "change_pct": price.get("change_pct"), "source": price.get("price_source"),
-                             "quality_status": price.get("quality_status")})
+        if code not in CORE_BY_CODE:
+            continue
+        usable = _usable_price(price)
+        turnover = _safe_float(price.get("amount")) if usable else None
+        activity.append({"etf_code": code, "turnover": turnover if turnover is not None and turnover >= 0 else None,
+                         "change_pct": price.get("change_pct") if usable else None,
+                         "source": price.get("price_source"),
+                         "quality_status": price.get("quality_status") or "unverified"})
 
     benchmarks: list[dict[str, Any]] = []
     benchmark_names = sorted({item.benchmark for item in CORE_ETFS})
@@ -760,7 +773,7 @@ def _build_payload(requested_date: str, days: int) -> dict[str, Any]:
 
     if summary["coverage_pct"] < _MIN_RELIABLE_COVERAGE_PCT:
         status = "insufficient"
-    elif any(summary.get(field) is None for field in ("net_3d", "net_5d", "net_20d")) or excluded_rows:
+    elif trade_date != activity_date or any(summary.get(field) is None for field in ("net_3d", "net_5d", "net_20d")) or excluded_rows:
         status = "degraded"
     else:
         status = "ok"

@@ -29,7 +29,7 @@ def _price_row(*, pre_close: float, close: float = 4.30) -> dict[str, Any]:
         "close": close,
         "change_pct": -0.8,
         "amount": 123_000_000.0,
-        "quality_status": "test",
+        "quality_status": "validated",
     }
 
 
@@ -369,6 +369,39 @@ def test_turnover_stays_available_when_share_publication_cannot_be_established(m
     assert payload["market_activity"]["basis"] == "SECONDARY_MARKET_TURNOVER"
     assert payload["market_activity"]["etfs"][0]["turnover"] == pytest.approx(123_000_000)
     assert payload["flow_evidence"]["observed_at"] is None
+
+
+def test_failed_price_is_visible_as_evidence_but_excluded_from_amounts(monkeypatch):
+    module = _router_module()
+    days = ["2026-08-11", "2026-08-12"]
+    code = module.CORE_ETFS[0].code
+    shares = {days[0]: {code: _share_row(100)}, days[1]: {code: _share_row(105)}}
+    failed = {**_price_row(pre_close=4), "quality_status": "FAILED"}
+    monkeypatch.setattr(module, "_trading_dates", lambda *_args: list(reversed(days)))
+    monkeypatch.setattr(module, "_collect_inputs", lambda *_args: (shares, {days[1]: {code: failed}}, []))
+    payload = module.broad_etf_flow(trade_date=days[1], days=5, refresh=True)
+    assert payload["market_activity"]["etfs"][0]["turnover"] is None
+    assert payload["market_activity"]["etfs"][0]["quality_status"] == "FAILED"
+    assert payload["etfs"][0]["share_change"] == 5
+    assert payload["etfs"][0]["net_amount"] is None
+
+
+def test_public_price_does_not_supply_an_older_close_for_a_missing_session(monkeypatch):
+    module = _router_module()
+    code = "510300"
+    dates = ["2026-08-11", "2026-08-12", "2026-08-13"]
+    rows = [f"{day},4,4.2,4.3,3.8,100,400,0,-0.8,0,0" for day in (dates[0], dates[-1])]
+    upstream = {"code": code, "market": 1, "klines": rows}
+    monkeypatch.setattr(module, "_http_get", lambda *_args, **_kwargs: SimpleNamespace(
+        raise_for_status=lambda: None, json=lambda: {"data": upstream},
+    ))
+    _, price_rows = module._fetch_eastmoney_price_history(code, dates[0], dates[-1])
+    shares = {day: {code: _share_row(100 + offset)} for offset, day in enumerate(dates)}
+    flows = module._build_flow_rows(dates, shares, {day: {code: row} for day, row in price_rows.items()})
+    assert flows[-1]["net_amount"] is None
+    upstream["code"] = "510500"
+    with pytest.raises(ValueError, match="证券身份"):
+        module._fetch_eastmoney_price_history(code, dates[0], dates[-1])
 
 
 def test_synchronous_creations_on_rising_day_do_not_become_stabilization_evidence():

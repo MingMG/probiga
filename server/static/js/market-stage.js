@@ -87,9 +87,11 @@
             ['信号失效条件', snapshot.invalidation_conditions], ['风险情景', snapshot.risk_scenarios],
             ['不确定性', snapshot.uncertainties]
         ];
+        const mode = data.evidence_mode === 'CURRENT_OBSERVATION' ? '当前观测' :
+            data.evidence_mode === 'VERIFIED_PUBLICATION' ? '已核验发布时点' : null;
         return '<section class="ms-panel"><h3>综合判断</h3><strong>' + stateChip(snapshot.state) + '</strong>' +
             meta([['数据交易日', snapshot.trade_date || data.trade_date], ['证据截止', snapshot.as_of],
-                ['数据来源', data.source], ['模型版本', snapshot.model_version || data.model_version]]) +
+                ['数据来源', data.source], ['证据口径', mode], ['模型版本', snapshot.model_version || data.model_version]]) +
             (snapshot.candidate_signals ? meta([['技术性反弹信号', yesNo(snapshot.candidate_signals.technical_rebound)],
                 ['日线反转候选信号', yesNo(snapshot.candidate_signals.reversal)]]) : '') +
             (requestedDate && snapshot.trade_date && requestedDate !== snapshot.trade_date

@@ -88,5 +88,6 @@ def test_market_stage_is_mounted_in_both_sidebar_layouts():
     app = (ROOT / "server/static/js/app.js").read_text(encoding="utf-8")
     assert 'id="tab-market-stage"' in html
     assert "/static/js/market-stage.js" in html
-    assert "window.MarketStage.load(d, c" in app
+    assert "tradingModuleDateMode(d) === 'DEFAULT' ? '' : d" in app
+    assert "window.MarketStage.load(target, c" in app
     assert app.count("{id:'market-stage',icon:") == 2

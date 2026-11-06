@@ -6776,7 +6776,8 @@
             return window.MarketOutlook.load(d || recommendationDateValue() || currentDateValue(), c);
         },
         'market-stage': function (d, c) {
-            return window.MarketStage.load(d, c, function (url) { return fetchRawJsonWithTimeout(url, 30000); });
+            var target = tradingModuleDateMode(d) === 'DEFAULT' ? '' : d;
+            return window.MarketStage.load(target, c, function (url) { return fetchRawJsonWithTimeout(url, 30000); });
         },
         hunter: function (d, c) {
             loadHunterPage(recommendationDateValue() || d, c);
@@ -10245,7 +10246,7 @@
         h += '</div>';
 
         h += '<section class="bef-kpis" aria-label="宽基资金关键指标">';
-        h += broadEtfKpi('今日净申购估算', summary.net_1d, '份额变化 × 前一交易日收盘价');
+        h += broadEtfKpi('单日净申购估算', summary.net_1d, (flowEvidence.trade_date || data.trade_date || '日期未知') + ' · 份额变化 × 前一交易日收盘价');
         h += broadEtfKpi('近 3 日累计', summary.net_3d, '连续性观察');
         h += broadEtfKpi('近 5 日累计', summary.net_5d, '短周期方向');
         h += broadEtfKpi('近 20 日累计', summary.net_20d, '中周期方向');
@@ -10253,10 +10254,11 @@
         h += '</section>';
 
         h += '<section class="bef-panel"><div class="bef-panel-head"><div><span>二级市场行情</span><h3>宽基 ETF 成交额</h3></div><p>交易日 ' + escHtml(marketActivity.trade_date || '-') + ' · 独立于份额申赎</p></div>';
-        h += '<div class="bef-table-wrap"><table class="bef-table"><thead><tr><th>代码</th><th>成交额</th><th>涨跌幅</th><th>行情来源</th></tr></thead><tbody>';
-        if (!tradedEtfs.length) h += broadEtfEmptyRow(4, '暂无可用成交额');
+        h += '<div class="bef-table-wrap"><table class="bef-table"><thead><tr><th>代码</th><th>成交额</th><th>涨跌幅</th><th>行情来源</th><th>行情质量</th></tr></thead><tbody>';
+        if (!tradedEtfs.length) h += broadEtfEmptyRow(5, '暂无可用成交额');
         tradedEtfs.forEach(function (row) {
-            h += '<tr><td>' + escHtml(row.etf_code || '-') + '</td><td>' + escHtml(broadEtfSignedMoney(row.turnover).replace(/^\+/, '')) + '</td><td>' + escHtml(broadEtfSignedNumber(row.change_pct, '%', 2)) + '</td><td>' + escHtml(row.source || '-') + '</td></tr>';
+            var quality = row.quality_status || 'unverified';
+            h += '<tr><td>' + escHtml(row.etf_code || '-') + '</td><td>' + escHtml(broadEtfSignedMoney(row.turnover).replace(/^\+/, '')) + '</td><td>' + escHtml(broadEtfSignedNumber(row.change_pct, '%', 2)) + '</td><td>' + escHtml(row.source || '-') + '</td><td><span class="bef-quality bef-quality-' + broadEtfQualityTone(quality) + '">' + escHtml(quality) + '</span></td></tr>';
         });
         h += '</tbody></table></div></section>';
 
