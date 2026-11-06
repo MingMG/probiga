@@ -24,7 +24,7 @@ from pathlib import Path
 import re
 import tempfile
 from time import monotonic
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import bindparam, text
@@ -3274,7 +3274,7 @@ def _publish_batch(
 ) -> tuple[list[str], datetime]:
     from server.common.pit_facts import (
         append_event_revision,
-        append_source_coverage,
+        append_source_coverages,
     )
 
     # Keep the transactional boundary guarded as a defence-in-depth recheck;
@@ -3459,7 +3459,7 @@ def _publish_batch(
             )
         return observed
 
-    def write_rows(connection: Any) -> None:
+    def coverage_arguments(connection: Any) -> Iterator[dict[str, Any]]:
         for index, code in enumerate(catalog.codes):
             if deadline_monotonic is not None or index % 100 == 0:
                 check_deadline(f"db-write:{index}")
@@ -3487,8 +3487,7 @@ def _publish_batch(
                         "content_hash": receipt.content_hash,
                     }
                 )
-            coverage = append_source_coverage(
-                connection,
+            yield dict(
                 fact_kind="event",
                 stock_code=code,
                 window_start=window_start,
@@ -3533,6 +3532,10 @@ def _publish_batch(
                 source=source_name,
                 batch_id=batch_id,
             )
+
+    def write_rows(connection: Any) -> None:
+        coverages = append_source_coverages(connection, coverage_arguments(connection))
+        for code, coverage in zip(catalog.codes, coverages, strict=True):
             if coverage.source_response_hash != response_hashes[code]:
                 raise QMTAnnouncementBlocked(
                     "QMT_ANNOUNCEMENT_RESPONSE_HASH_DRIFT", code
