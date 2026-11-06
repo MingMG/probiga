@@ -2542,6 +2542,33 @@ def validate_complete_historical_reconstruction_batch(
                 raise ValueError(
                     "announcement reconstruction requires a repeatable-read snapshot"
                 )
+            # Every valid candidate must cover this required stock. If its
+            # historical row is absent, reading unrelated payload chains for
+            # the entire universe cannot establish a complete batch.
+            first_code_has_coverage = connection.execute(
+                text(
+                    "SELECT /*+ MAX_EXECUTION_TIME(2500) */ 1 "
+                    "FROM st_pit_source_coverage "
+                    "WHERE fact_kind='event' AND source=:source "
+                    "AND stock_code=:stock_code "
+                    "AND watermark_kind='HISTORICAL_RECONSTRUCTION' "
+                    "AND coverage_status='COMPLETE' "
+                    "AND window_start<=:window_start AND window_end>=:window_end "
+                    "AND known_at<=:decision_at AND received_at<=:decision_at "
+                    "LIMIT 1"
+                ),
+                {
+                    "source": CNINFO_ANNOUNCEMENT_SOURCE,
+                    "stock_code": requested[0],
+                    "window_start": start,
+                    "window_end": end,
+                    "decision_at": decision,
+                },
+            ).scalar_one_or_none()
+            if first_code_has_coverage is None:
+                raise QMTAnnouncementBlocked(
+                    "QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND", "no-common-batch"
+                )
             by_batch: dict[str, dict[str, datetime]] = {}
             for offset in range(0, len(requested), VALIDATION_READ_BATCH_SIZE):
                 code_batch = requested[
