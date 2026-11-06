@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 import hashlib
+from itertools import islice
 import json
 import math
 import os
@@ -3273,7 +3274,7 @@ def _publish_batch(
     now_fn: Callable[[], datetime] = datetime.now,
 ) -> tuple[list[str], datetime]:
     from server.common.pit_facts import (
-        append_event_revision,
+        append_event_revisions,
         append_source_coverages,
     )
 
@@ -3459,34 +3460,39 @@ def _publish_batch(
             )
         return observed
 
-    def coverage_arguments(connection: Any) -> Iterator[dict[str, Any]]:
-        for index, code in enumerate(catalog.codes):
+    def checked_events(codes: Sequence[str], offset: int) -> Iterator[Mapping[str, Any]]:
+        for index, code in enumerate(codes, start=offset):
             if deadline_monotonic is not None or index % 100 == 0:
                 check_deadline(f"db-write:{index}")
-            source_rows = [dict(item) for item in results[code]]
+            for item_index, item in enumerate(results[code]):
+                if deadline_monotonic is not None and item_index % 25 == 0:
+                    check_deadline(f"db-event:{index}:{item_index}")
+                yield item
+
+    def bindings_by_stock(connection: Any) -> Iterator[tuple[str, list[dict[str, str]]]]:
+        for offset in range(0, len(catalog.codes), DEFAULT_BATCH_SIZE):
+            codes = catalog.codes[offset:offset + DEFAULT_BATCH_SIZE]
+            event_receipts = iter(append_event_revisions(
+                connection, checked_events(codes, offset),
+                known_at=received_at, received_at=received_at,
+                source=source_name, batch_id=batch_id,
+            ))
+            for code in codes:
+                yield code, [
+                    {
+                        "revision_id": receipt.revision_id,
+                        "content_hash": receipt.content_hash,
+                    }
+                    for receipt in islice(event_receipts, len(results[code]))
+                ]
+
+    def coverage_arguments(connection: Any) -> Iterator[dict[str, Any]]:
+        for code, bindings in bindings_by_stock(connection):
             provider_receipt = (
                 dict(receipts[code])
                 if source_name != QMT_ANNOUNCEMENT_SOURCE
                 else None
             )
-            bindings: list[dict[str, Any]] = []
-            for item_index, item in enumerate(source_rows):
-                if deadline_monotonic is not None and item_index % 25 == 0:
-                    check_deadline(f"db-event:{index}:{item_index}")
-                receipt = append_event_revision(
-                    connection,
-                    item,
-                    known_at=received_at,
-                    received_at=received_at,
-                    source=source_name,
-                    batch_id=batch_id,
-                )
-                bindings.append(
-                    {
-                        "revision_id": receipt.revision_id,
-                        "content_hash": receipt.content_hash,
-                    }
-                )
             yield dict(
                 fact_kind="event",
                 stock_code=code,
@@ -3527,7 +3533,7 @@ def _publish_batch(
                         if reconstruction_mode else {}
                     ),
                 },
-                source_rows=source_rows,
+                source_rows=results[code],
                 fact_bindings=bindings,
                 source=source_name,
                 batch_id=batch_id,

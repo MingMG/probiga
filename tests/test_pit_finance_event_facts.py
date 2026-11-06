@@ -23,6 +23,7 @@ from server.common.pit_facts import (
     SOURCE_COVERAGE_TABLE,
     TIME_UNVERIFIED,
     append_event_revision,
+    append_event_revisions,
     append_finance_atomic_batch_seal,
     append_finance_expected_unavailable,
     append_finance_revision,
@@ -2224,6 +2225,73 @@ def test_event_exact_publication_and_knowledge_times_prevent_lookahead():
     assert late.revision_id not in {
         row["event_revision_id"] for row in historical.facts["000001"]
     }
+
+
+def test_event_bulk_writer_matches_single_rows_and_bounds_round_trips():
+    engine = _engine()
+    single_engine = _engine()
+    reads = []
+    inserts = []
+
+    @event.listens_for(engine, "before_cursor_execute")
+    def observe(connection, cursor, statement, parameters, context, executemany):
+        if EVENT_REVISION_TABLE in statement:
+            if statement.startswith("SELECT"):
+                reads.append(statement)
+            if statement.startswith("INSERT"):
+                inserts.append(len(parameters) if executemany else 1)
+
+    rows = [
+        {
+            "stock_code": str(600000 + index // 5),
+            "event_key": f"CNINFO-{index % 5}",
+            "published_at": None if index % 5 == 0 else "2026-08-20 09:30:00",
+            "source_published_text": "2026-08-20",
+            "title": f"公司公告 {index}",
+        }
+        for index in range(204, -1, -1)
+    ]
+    source = {"source": "cninfo.announcement", "batch_id": "source-batch"}
+    first_at = "2026-08-21 09:00:00"
+    later_at = "2026-08-22 09:00:00"
+    with engine.begin() as connection:
+        first = append_event_revisions(connection, rows, known_at=first_at, **source)
+    with single_engine.begin() as connection:
+        expected = [
+            append_event_revision(connection, row, known_at=first_at, **source)
+            for row in rows
+        ]
+    assert first == expected
+    assert first[4].publication_time_status == TIME_UNVERIFIED
+    assert len(reads) == 6
+    assert inserts == [100, 100, 5]
+
+    reads.clear()
+    inserts.clear()
+    with engine.begin() as connection:
+        repeated = append_event_revisions(connection, rows, known_at=later_at, **source)
+    assert [receipt.revision_id for receipt in repeated] == [
+        receipt.revision_id for receipt in first
+    ]
+    assert all(receipt.idempotent for receipt in repeated)
+    assert len(reads) == 3
+    assert inserts == []
+
+    amendments = [{**rows[4], "published_at": "2026-08-20 10:05:00"}, rows[0]]
+    with engine.begin() as connection:
+        updated = append_event_revisions(connection, amendments, known_at=later_at, **source)
+    with single_engine.begin() as connection:
+        expected = [
+            append_event_revision(connection, row, known_at=later_at, **source)
+            for row in amendments
+        ]
+    assert updated == expected
+    assert updated[0].revision_no == 2
+    assert updated[0].supersedes_revision_id == first[4].revision_id
+    assert updated[1].idempotent
+    query = text(f"SELECT * FROM {EVENT_REVISION_TABLE} ORDER BY revision_id")
+    with engine.connect() as connection, single_engine.connect() as single:
+        assert connection.execute(query).all() == single.execute(query).all()
 
 
 def test_event_revision_prefix_idempotency_and_unverified_time_blocking():
