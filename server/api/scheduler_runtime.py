@@ -114,6 +114,7 @@ from server.common.scheduler_task_lease import (
     encode as encode_task_owner_lease,
     expired as task_owner_lease_expired,
     read as read_task_owner_lease,
+    supports_trigger_source,
 )
 from server.common.strategy_governance_mode import (
     StrategyGovernanceModeError,
@@ -4888,8 +4889,9 @@ def _reconcile_task_from_terminal_history(
                 or str(history.get("task_type") or "").strip() != task_type
                 or re.fullmatch(r"[0-9a-f]{32,64}", history_run_uid) is None
                 or re.fullmatch(r"[0-9a-f]{40}", history_build) is None
-                or str(history.get("trigger_source") or "").strip()
-                not in {"manual", "scheduled", "release_catchup"}
+                or not supports_trigger_source(
+                    task_type, str(history.get("trigger_source") or "").strip(),
+                )
                 or not str(history.get("host_name") or "").strip()
                 or not str(
                     history.get("scheduler_instance_id") or ""
@@ -5118,10 +5120,12 @@ def _recover_interrupted_manual_claim(
                 previous_build = str(history.get("build_sha") or "").strip().lower()
                 instance_id = str(history.get("scheduler_instance_id") or "").strip()
                 run_uid = str(history.get("run_uid") or "").strip()
+                trigger_source = str(history.get("trigger_source") or "").strip()
                 if (
                     not run_uid or run_uid in {item["run_uid"] for item in recovered}
-                    or str(history.get("trigger_source") or "").strip()
-                    not in {"manual", "scheduled", "release_catchup"}
+                    or not supports_trigger_source(
+                        str(history.get("task_type") or "").strip(), trigger_source,
+                    )
                     or str(history.get("host_name") or "").strip() != host_name
                     or history_started_at is None
                     or history_started_at > started_at + timedelta(seconds=1)
@@ -5129,6 +5133,8 @@ def _recover_interrupted_manual_claim(
                 ):
                     return False
                 owner_lease = read_task_owner_lease(history)
+                if trigger_source == "manual_ladder" and owner_lease is None:
+                    return False
                 owner_evidence = "previous_build"
                 if owner_lease is not None:
                     if not task_owner_lease_expired(history, now=_now_shanghai_naive()):
@@ -5143,7 +5149,7 @@ def _recover_interrupted_manual_claim(
                         return False
                     owner_evidence = "expired_exact_run_lease:" + owner_lease["lease_until"].isoformat()
                 elif previous_build == current_build:
-                    if str(history.get("trigger_source") or "").strip() == "release_catchup":
+                    if trigger_source == "release_catchup":
                         # Release catch-up runs synchronously in a short-lived
                         # helper outside the daemon process registry.  Its
                         # instance id still contains the actual owner PID, so

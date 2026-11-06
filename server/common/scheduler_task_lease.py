@@ -33,13 +33,20 @@ def _datetime(value) -> datetime:
     return result.replace(microsecond=0)
 
 
+def supports_trigger_source(task_type: str, trigger_source: str) -> bool:
+    """A scoped ladder capture shares the overview owner without proving its run."""
+    return trigger_source in ("manual", "scheduled", "release_catchup") or (
+        task_type == "market_overview_daily" and trigger_source == "manual_ladder"
+    )
+
+
 def identity(row: dict) -> dict:
     result = {name: row.get(name) for name in IDENTITY_FIELDS}
     result["run_at"] = _datetime(result["run_at"]).isoformat(sep=" ")
     if (type(result["task_id"]) is not int or result["task_id"] < 1
             or re.fullmatch(r"[0-9a-f]{32,64}", str(result["run_uid"])) is None
             or re.fullmatch(r"[0-9a-f]{40}", str(result["build_sha"])) is None
-            or result["trigger_source"] not in {"manual", "scheduled", "release_catchup"}
+            or not supports_trigger_source(result["task_type"], result["trigger_source"])
             or not all(isinstance(result[name], str) and result[name]
                        for name in ("host_name", "scheduler_instance_id", "task_type"))
             or re.fullmatch(re.escape(result["host_name"]) + r"-[1-9][0-9]*",

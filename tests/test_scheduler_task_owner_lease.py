@@ -89,6 +89,51 @@ def test_terminal_receipt_wins_renew_race_and_is_not_overwritten(case):
     assert _history(engine)["output"] == "business-receipt"
 
 
+def test_exact_market_ladder_claim_inserts_renews_and_recovers_its_audit(case, monkeypatch):
+    engine, clock, _, _ = case
+    target = {"id": 112, "task_name": "market overview", "task_type": "market_overview_daily",
+              "_trigger_source": "manual_ladder"}
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM st_scheduled_task_history"))
+        conn.execute(text("UPDATE st_scheduled_tasks SET task_name=:task_name,task_type=:task_type"), target)
+    monkeypatch.setattr(runtime, "_ensure_task_history_table", lambda engine: None)
+    monkeypatch.setattr(runtime, "gethostname", lambda: "linux-host")
+    monkeypatch.setattr(runtime, "_scheduler_instance_id", "linux-host-58860")
+    monkeypatch.setattr(runtime, "_scheduler_build_commit_sha", lambda: "c" * 40)
+    monkeypatch.setattr(runtime, "_now_shanghai_naive", lambda: clock[0])
+    monkeypatch.setattr(runtime, "_task_owner_leases", {})
+    monkeypatch.setattr(runtime, "_terminal_run_identities", {})
+    monkeypatch.setattr(runtime, "_terminal_stage_identities", {})
+    monkeypatch.setattr(runtime, "_terminal_session_identities", {})
+    monkeypatch.setattr(runtime, "_running_task_ids", set())
+    absent = MagicMock(return_value=True)
+    monkeypatch.setattr(runtime, "_owner_pid_is_absent", absent)
+    started = clock[0]
+    run_uid = "e" * 32
+
+    assert runtime._task_history_start(engine, target, run_uid=run_uid) == run_uid
+    owner = runtime._task_owner_leases[run_uid]
+    clock[0] += timedelta(seconds=30)
+    assert owner.renew() and owner.authorized()
+    with engine.connect() as conn:
+        running = dict(conn.execute(text("SELECT * FROM st_scheduled_task_history")).mappings().one())
+    assert running["trigger_source"] == "manual_ladder"
+    assert lease.read(running)["renewed_at"] == clock[0]
+    with pytest.raises(ValueError, match="identity differs"):
+        lease.encode({**running, "task_type": "qmt_stock_minute_canonical"}, clock[0])
+
+    assert not runtime._recover_interrupted_manual_claim(engine, target, started)
+    absent.assert_not_called()
+    clock[0] += timedelta(seconds=lease.LEASE_SECONDS + 1)
+    assert runtime._recover_interrupted_manual_claim(engine, target, started)
+    absent.assert_called_once_with("linux-host-58860", host_name="linux-host")
+    with engine.connect() as conn:
+        terminal = dict(conn.execute(text("SELECT * FROM st_scheduled_task_history")).mappings().one())
+    assert terminal["status"] == "failed"
+    assert "expired_exact_run_lease" in terminal["output"]
+    assert not owner.renew()
+
+
 @pytest.mark.parametrize("mutation", ["identity", "output", "missing", "expired"])
 def test_renew_cannot_resurrect_changed_or_expired_audit(case, mutation):
     engine, clock, original, marker = case
