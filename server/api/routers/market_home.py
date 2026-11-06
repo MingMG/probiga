@@ -7,6 +7,7 @@ import math
 import re
 from collections import OrderedDict
 from datetime import date, datetime, time, timedelta
+from decimal import Decimal
 from threading import Lock
 from time import monotonic
 from zoneinfo import ZoneInfo
@@ -17,8 +18,12 @@ from sqlalchemy.exc import SQLAlchemyError
 from biz.intraday_alert.core import QualityGateError, validate_qmt_snapshot
 from server.api.routers._engine import get_engine
 from server.common.current_data import get_current_engine
+from server.common.daily_delivery_control import load_completed_market_capture_receipt
 from server.common.kline_data import get_kline_engine
+from server.common.qmt_attestation_contract import canonical_digest
 from server.common.sql_reader import read_sql_rows
+from server.common.turnover_snapshot import TURNOVER_CAPTURE_KIND, TURNOVER_PROVIDER, TURNOVER_SOURCE_FIELD, TURNOVER_UNIT
+from server.common.turnover_snapshot_schema import TURNOVER_SNAPSHOT_ROW_TABLE, TURNOVER_SNAPSHOT_RUN_TABLE
 from server.common.verified_daily_market_truth import VERIFIED_FREE_DAILY_ROW_SOURCES
 
 
@@ -55,6 +60,7 @@ _EVENT_LIMIT = 20
 _RANK_LIMIT = 10
 _CACHE_TTL = 10
 _CACHE_SIZE = 32
+_LIVE_MAX_AGE = timedelta(seconds=90)
 _cache: OrderedDict[str, tuple[float, dict]] = OrderedDict()
 _cache_lock = Lock()
 
@@ -97,6 +103,11 @@ def _live_session(now: datetime) -> bool:
     return time(9, 30) <= now.time() <= time(11, 30) or time(13) <= now.time() < time(15)
 
 
+def _fresh_live_stamp(stamp: datetime | None, now: datetime) -> bool:
+    return bool(stamp and stamp.date() == now.date() and _live_session(stamp) and _live_session(now)
+                and timedelta(0) <= now - stamp <= _LIVE_MAX_AGE)
+
+
 def _trading_day(day: str, deadline: float) -> bool:
     rows = _read(get_engine(), """
         SELECT /*+ MAX_EXECUTION_TIME(1500) */ trade_status
@@ -116,7 +127,7 @@ def _daily_source_valid(row: dict) -> bool:
 
 def _day_quotes(day: str, now: datetime, deadline: float) -> list[dict]:
     rows = _read(get_kline_engine(), """
-        SELECT /*+ MAX_EXECUTION_TIME(2500) */ stock_code, short_name, trade_date,
+        SELECT /*+ MAX_EXECUTION_TIME(2500) */ id, stock_code, short_name, trade_date,
                close AS price, pre_close, amount, turnover_ratio AS turnover_rate,
                data_source, quality_status, permission_status
         FROM sm_stock_kline
@@ -127,6 +138,81 @@ def _day_quotes(day: str, now: datetime, deadline: float) -> list[dict]:
     if len(rows) > _STOCK_LIMIT:
         raise ValueError("market board daily rows exceed bound")
     return [row for row in rows if _daily_source_valid(row)]
+
+
+def _verified_turnover(day: str, quotes: list[dict], stocks: list[dict], now: datetime, deadline: float) -> dict | None:
+    """Reuse the sealed capture stage and match its rates to the board's current quote set."""
+    engine = get_engine()
+    params = {"day": day, "now": now, "count": len(stocks), "kind": TURNOVER_CAPTURE_KIND,
+              "provider": TURNOVER_PROVIDER, "field": TURNOVER_SOURCE_FIELD, "unit": TURNOVER_UNIT}
+    runs = _read(engine, f"""
+        SELECT /*+ MAX_EXECUTION_TIME(1200) */ run_id, collector_build_sha, decision_at, published_at,
+               semantic_sha256, field_value_root_sha256
+        FROM {TURNOVER_SNAPSHOT_RUN_TABLE}
+        WHERE target_date=:day AND published_at<=:now AND decision_at<=:now
+          AND capture_kind=:kind AND provider=:provider AND source_field=:field AND unit=:unit
+          AND status='COMPLETED' AND expected_count=:count AND expected_count=fetched_count
+          AND expected_count=valid_count AND expected_count=matched_count AND expected_count=promoted_count
+        ORDER BY decision_at DESC, published_at DESC, run_id DESC LIMIT 1
+    """, params, deadline=deadline)
+    if not runs:
+        return None
+    run = runs[0]
+    completion = load_completed_market_capture_receipt(
+        engine, raw_run_id=run["run_id"], stage_name="target_turnover_snapshot", target_date=day,
+        build_sha=run["collector_build_sha"], decision_at=now,
+    )
+    receipt = completion["receipt"]
+    known_at, published_at = _clock(completion["known_at"]), _clock(run["published_at"])
+    decision_at = _clock(run["decision_at"])
+    if (not decision_at or not known_at or not published_at or not decision_at <= published_at <= known_at <= now
+            or _clock(receipt.get("decision_at")) != decision_at or _clock(receipt.get("published_at")) != published_at
+            or any(receipt.get(key) != run[key] for key in ("semantic_sha256", "field_value_root_sha256"))
+            or receipt.get("expected_count") != len(stocks) or receipt.get("promoted_count") != len(stocks)):
+        return None
+    rows = _read(engine, f"""
+        SELECT /*+ MAX_EXECUTION_TIME(2000) */ r.stock_code, CAST(r.field_value_decimal AS CHAR) AS rate,
+               q.id, q.close AS price, q.pre_close, q.amount, q.data_source
+        FROM {TURNOVER_SNAPSHOT_ROW_TABLE} r LEFT JOIN sm_stock_kline q
+          ON q.id=r.target_row_id AND q.stock_code=r.stock_code AND q.trade_date=r.trade_date AND q.k_type=r.k_type
+          AND q.adjust_type=r.adjust_type AND q.open=r.qmt_open AND q.high=r.qmt_high
+          AND q.low=r.qmt_low AND q.close=r.qmt_close AND q.volume=r.qmt_volume_shares AND q.amount=r.qmt_amount
+          AND q.data_source=r.qmt_data_source AND q.quality_status=r.qmt_quality_status
+          AND q.permission_status=r.qmt_permission_status
+          AND (q.turnover_ratio IS NULL OR q.turnover_ratio=r.field_value_decimal)
+        WHERE r.run_id=:run_id AND r.trade_date=:day AND r.k_type=1 AND r.adjust_type=0
+          AND r.validation_status='MATCHED' AND r.promoted_at<=:now
+        ORDER BY r.stock_code LIMIT :limit
+    """, {"day": day, "now": now, "run_id": run["run_id"], "limit": len(stocks) + 1}, deadline=deadline)
+    if len(rows) != len(stocks):
+        return None
+    quote_by_code = {row["stock_code"]: row for row in _unique_rows(quotes, "stock_code")}
+    stock_by_code = {row["stock_code"]: row for row in stocks}
+    fields = ("id", "price", "pre_close", "amount", "data_source")
+    seen, values, root_items = set(), {}, []
+    for row in rows:
+        code = row["stock_code"]
+        quote = quote_by_code.get(code)
+        rate = _nonnegative(row["rate"])
+        if code not in stock_by_code or code in seen or quote is None or rate is None:
+            return None
+        seen.add(code)
+        root_items.append({"stock_code": code, "trade_date": day,
+                           "turnover_percent": format(Decimal(str(row["rate"])).normalize(), "f") if rate else "0"})
+        if row["id"] is not None and all(row[field] == quote[field] for field in fields):
+            values[code] = rate
+    if not values or canonical_digest(root_items) != run["field_value_root_sha256"]:
+        return None
+    for stock in stocks:
+        rate = values.get(stock["stock_code"])
+        stock["turnover_rate"] = rate
+        if rate is not None:
+            stock["turnover_rate_source"] = TURNOVER_PROVIDER
+    return {"run_id": run["run_id"], "source": TURNOVER_PROVIDER,
+            "decision_at": decision_at.replace(tzinfo=SHANGHAI).isoformat(),
+            "published_at": published_at.replace(tzinfo=SHANGHAI).isoformat(),
+            "known_at": _timestamp(known_at), "field_value_root_sha256": run["field_value_root_sha256"],
+            "sample_size": len(stocks), "verified_count": len(values)}
 
 
 def _live_quotes(day: str, now: datetime, deadline: float) -> tuple[list[dict], datetime | None]:
@@ -148,10 +234,10 @@ def _live_quotes(day: str, now: datetime, deadline: float) -> tuple[list[dict], 
     generated = _clock(receipt.get("source_generated_at"))
     published = _clock(receipt.get("published_at"))
     expected, observed = _number(receipt.get("expected_count")), _number(receipt.get("observed_count"))
-    earliest = now - timedelta(seconds=90)
+    earliest = now - _LIVE_MAX_AGE
     if (not isinstance(batch_id, str) or not batch_id or not generated or not published
-            or not earliest <= generated <= published <= now
-            or generated.date().isoformat() != day or not _live_session(generated)
+            or not generated <= published <= now
+            or generated.date().isoformat() != day or not _fresh_live_stamp(generated, now)
             or not expected or not observed or not 0.95 <= observed / expected <= 1):
         return [], None
     stocks = _read(engine, """
@@ -172,15 +258,15 @@ def _live_quotes(day: str, now: datetime, deadline: float) -> tuple[list[dict], 
     return [dict(row, trade_date=day) for row in snapshot.rows], generated
 
 
-def _index_quotes(day: str, now: datetime, deadline: float) -> list[dict]:
+def _index_quotes(day: str, close_at: datetime, now: datetime, deadline: float) -> list[dict]:
     params = {f"code_{index}": code for index, code in enumerate(INDEX_NAMES)}
     codes = ", ".join(f":{key}" for key in params)
-    params.update(day=day, now=now, limit=_INDEX_LIMIT + 1)
+    params.update(day=day, close_at=close_at, now=now, limit=_INDEX_LIMIT + 1)
     return _read(get_kline_engine(), f"""
-        SELECT /*+ MAX_EXECUTION_TIME(1500) */ index_code, trade_date, trade_time,
+        SELECT /*+ MAX_EXECUTION_TIME(1500) */ index_code, trade_date, trade_time, etl_sync_at,
                close AS price, change_pct, amount
         FROM sm_index_kline WHERE index_code IN ({codes}) AND trade_date=:day
-          AND k_type=1 AND etl_sync_at<=:now
+          AND k_type=1 AND trade_time=:close_at AND etl_sync_at BETWEEN :close_at AND :now
         LIMIT :limit
     """, params, deadline=deadline)
 
@@ -226,7 +312,7 @@ def _stock_rows(rows: list[dict], day: str, *, live: bool) -> list[dict]:
     return result
 
 
-def _index_rows(rows: list[dict], day: str, as_of: datetime) -> list[dict]:
+def _index_rows(rows: list[dict], day: str, close_at: datetime, now: datetime) -> list[dict]:
     if len(rows) > _INDEX_LIMIT:
         return []
     result = {}
@@ -235,14 +321,17 @@ def _index_rows(rows: list[dict], day: str, as_of: datetime) -> list[dict]:
         price, change = _number(row.get("price")), _number(row.get("change_pct"))
         if code not in INDEX_NAMES or str(row.get("trade_date"))[:10] != day or price is None or price <= 0:
             continue
-        trade_time = _clock(row.get("trade_time"))
-        if row.get("trade_time") is not None and (not trade_time or trade_time.date().isoformat() != day):
+        ingested_at = _clock(row.get("etl_sync_at"))
+        if _clock(row.get("trade_time")) != close_at or not ingested_at or not close_at <= ingested_at <= now:
             continue
+        # Daily publishers use 15:00 as the exchange close marker. A matching
+        # post-close ingestion proves a current store observation, not a PIT receipt.
         result[code] = {
             "index_code": code, "index_name": INDEX_NAMES[code], "trade_date": day, "price": price,
             "change_pct": change if change is not None and change > -100 else None,
             "amount": _nonnegative(row.get("amount")), "source": "sm_index_kline",
-            "as_of": _timestamp(as_of),
+            "as_of": _timestamp(close_at), "ingested_at": _timestamp(ingested_at),
+            "evidence_mode": "CURRENT_OBSERVATION",
         }
     return [result[code] for code in INDEX_NAMES if code in result]
 
@@ -304,53 +393,69 @@ def _rank(rows: list[dict], key: str, *, descending: bool) -> list[dict]:
 
 def build_market_board(day: date, *, now: datetime) -> dict:
     """Keep exact dated reads and unavailable data boundaries independent."""
-    deadline = monotonic() + 8
+    started_at = monotonic()
+    deadline = started_at + 8
     day_text = day.isoformat()
-    live = day == now.date() and _live_session(now)
+    same_day = day == now.date()
+    live = same_day and _live_session(now)
+    lunch = same_day and time(11, 30) < now.time() < time(13)
+    close_ready = day < now.date() or (same_day and now.time() >= time(15))
     as_of = None
     source = None
+    turnover_evidence = None
     stocks, indices, events = [], [], []
     stage = "not_closed_or_not_trading"
-    if day <= now.date() and (day < now.date() or live or now.time() >= time(15)):
+    if close_ready or live or lunch:
         try:
             trading = _trading_day(day_text, deadline)
         except (SQLAlchemyError, RuntimeError, TimeoutError, ValueError) as exc:
             logger.warning("market board calendar unavailable: %s", type(exc).__name__)
             stage, trading = "calendar_unavailable", False
         if trading:
-            stage = "market_data_unavailable"
+            stage = "lunch_pause" if lunch else "market_data_unavailable"
             close = datetime.combine(day, time(15))
-            try:
-                rows, observed_at = _live_quotes(day_text, now, deadline) if live else (
-                    _day_quotes(day_text, now, deadline), close,
-                )
-                stocks = _stock_rows(rows, day_text, live=live)
-                if stocks:
-                    as_of = observed_at
-                    source = "sm_stock_current" if live else "sm_stock_kline"
-            except (SQLAlchemyError, RuntimeError, TimeoutError, ValueError, QualityGateError) as exc:
-                logger.warning("market board stock data unavailable: %s", type(exc).__name__)
+            if live or close_ready:
+                try:
+                    quotes, observed_at = _live_quotes(day_text, now, deadline) if live else (
+                        _day_quotes(day_text, now, deadline), close,
+                    )
+                    stocks = _stock_rows(quotes, day_text, live=live)
+                    if stocks:
+                        as_of = observed_at
+                        source = "sm_stock_current" if live else "sm_stock_kline"
+                except (SQLAlchemyError, RuntimeError, TimeoutError, ValueError, QualityGateError) as exc:
+                    logger.warning("market board stock data unavailable: %s", type(exc).__name__)
             # The current index table is shared by publishers and has no
             # per-row provenance. A fresh timestamp alone cannot attest it.
-            if not live:
+            if close_ready:
                 try:
-                    indices = _index_rows(_index_quotes(day_text, now, deadline), day_text, close)
+                    indices = _index_rows(_index_quotes(day_text, close, now, deadline), day_text, close, now)
                 except (SQLAlchemyError, RuntimeError, TimeoutError, ValueError) as exc:
                     logger.warning("market board index data unavailable: %s", type(exc).__name__)
             try:
                 events = _market_events(day, now, deadline)
             except (SQLAlchemyError, RuntimeError, TimeoutError, ValueError) as exc:
                 logger.warning("market board events unavailable: %s", type(exc).__name__)
+            if close_ready and stocks and any(row["turnover_rate"] is None for row in stocks):
+                try:
+                    turnover_evidence = _verified_turnover(day_text, quotes, stocks, now, deadline)
+                except (SQLAlchemyError, RuntimeError, TimeoutError, ValueError) as exc:
+                    logger.warning("market board turnover evidence unavailable: %s", type(exc).__name__)
+    if live and stocks and not _fresh_live_stamp(as_of, now + timedelta(seconds=monotonic() - started_at)):
+        stocks = []
+        as_of, source, stage = None, None, "live_quote_expired"
     unavailable = ["limit_ladder"]
     if not events:
         unavailable.append("events")
     amount_complete = bool(stocks) and all(row["amount"] is not None for row in stocks)
-    turnover_complete = bool(stocks) and all(row["turnover_rate"] is not None for row in stocks)
+    turnover_rows = [row for row in stocks if row["turnover_rate"] is not None]
+    if turnover_evidence is None and len(turnover_rows) != len(stocks):
+        turnover_rows = []
     if not stocks:
         unavailable.extend(("distribution", "strong", "rankings.gainers", "rankings.losers"))
     if not amount_complete:
         unavailable.append("rankings.amount")
-    if not turnover_complete:
+    if not turnover_rows:
         unavailable.append("rankings.turnover")
     available_indices = {row["index_code"] for row in indices}
     missing_indices = [code for code in INDEX_NAMES if code not in available_indices]
@@ -378,7 +483,16 @@ def build_market_board(day: date, *, now: datetime) -> dict:
             "gainers": _rank(up, "change_pct", descending=True),
             "losers": _rank(down, "change_pct", descending=False),
             "amount": _rank(stocks, "amount", descending=True) if amount_complete else [],
-            "turnover": _rank(stocks, "turnover_rate", descending=True) if turnover_complete else [],
+            "turnover": _rank(turnover_rows, "turnover_rate", descending=True),
+        },
+        "turnover_evidence": turnover_evidence,
+        "turnover_coverage": {
+            "status": ("unavailable" if not turnover_rows else
+                       "complete" if len(turnover_rows) == len(stocks) else "partial"),
+            "verified_count": len(turnover_rows), "sample_size": len(stocks),
+            "excluded_count": len(stocks) - len(turnover_rows),
+            "excluded_codes": (sorted(row["stock_code"] for row in stocks if row["turnover_rate"] is None)[:20]
+                               if turnover_evidence else []),
         },
         "indices": indices, "missing_index_codes": missing_indices,
         "events": events, "limit_ladder": None, "unavailable_fields": unavailable,
@@ -392,11 +506,14 @@ def market_board(requested: str = Query(alias="date", pattern=r"^\d{4}-\d{2}-\d{
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="date must be a valid exchange date") from exc
     key = requested
+    now = datetime.now(SHANGHAI).replace(tzinfo=None)
     with _cache_lock:
         cached = _cache.get(key)
         if cached and monotonic() - cached[0] < _CACHE_TTL:
-            return cached[1]
-    result = build_market_board(selected_day, now=datetime.now(SHANGHAI).replace(tzinfo=None))
+            board = cached[1]
+            if board.get("source") != "sm_stock_current" or _fresh_live_stamp(_clock(board.get("as_of")), now):
+                return board
+    result = build_market_board(selected_day, now=now)
     with _cache_lock:
         _cache[key] = (monotonic(), result)
         _cache.move_to_end(key)

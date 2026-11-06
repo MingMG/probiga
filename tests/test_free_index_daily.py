@@ -1,11 +1,94 @@
 from __future__ import annotations
 
-import pandas as pd
+import json
 from datetime import datetime
+
+import pandas as pd
+import pytest
 from sqlalchemy import create_engine, text
 
 from biz.stock_market import sync_stock_market
 from tools import sync_free_index_daily as collector
+
+
+@pytest.fixture
+def index_repair_database():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    with engine.begin() as connection:
+        connection.execute(text("""CREATE TABLE sm_index_kline (
+            index_code TEXT,trade_time TEXT,trade_date TEXT,k_type INT,
+            `open` REAL,`close` REAL,high REAL,low REAL,volume REAL,amount REAL,
+            `change` REAL,change_pct REAL,etl_sync_at TEXT,
+            PRIMARY KEY(index_code,trade_date,k_type))"""))
+        connection.execute(text("""CREATE TABLE acquisition_partition_state (
+            dataset TEXT,source TEXT,target_date TEXT,partition_key TEXT,status TEXT,
+            request_id TEXT,written_rows INT,last_attempt_at TEXT,last_success_at TEXT,
+            detail_json TEXT,updated_at TEXT,PRIMARY KEY(dataset,source,target_date,partition_key))"""))
+        connection.execute(text("""INSERT INTO sm_index_kline VALUES (
+            '000001','2026-11-06 15:00:00','2026-11-06',1,3640,3650,3660,3630,
+            120,1200,10,0.28,'2026-11-06 18:17:14')"""))
+        connection.execute(text("""INSERT INTO acquisition_partition_state VALUES (
+            'index_daily','tencent_east_verified','2026-11-06','__index_daily_partition__',
+            'complete','original',1,'2026-11-06 18:17:16','2026-11-06 18:17:16',
+            '{}','2026-11-06 18:17:16')"""))
+    yield engine
+    engine.dispose()
+
+
+def test_exact_index_repair_preserves_original_rows_and_scope(index_repair_database, monkeypatch):
+    from server.common.index_daily_publication import FREE_BAR_RECEIPT_SCHEMA, free_index_bar_hash
+
+    class RepairClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 11, 7, 0, 15, tzinfo=tz)
+
+    monkeypatch.setattr(collector, "datetime", RepairClock)
+    target = "2026-11-06"
+    source_row = dict(index_code="000300", trade_time=f"{target} 15:00:00", trade_date=target,
+        k_type=1, open=4010, close=4054.27, high=4060, low=4001, volume=100, amount=float("nan"),
+        change=54.27, change_pct=1.36)
+    monkeypatch.setattr(collector, "_fetch_verified_external_index_kline",
+        lambda code, start, end: (pd.DataFrame([source_row]), "tencent_only"))
+    variant, values = collector._repair_source("000300", target)
+    assert values["amount"] is None
+    candidate = {"000300": (variant, values), "000001": (variant, {**values, "index_code": "000001"})}
+    with index_repair_database.begin() as connection:
+        published, = collector._repair_publish(connection, target, candidate)
+        assert published["index_code"] == "000300"
+    with index_repair_database.begin() as connection:
+        rows = collector._repair_rows(connection, target, ["000001", "000300"])
+        assert rows["000001"]["close"] == 3650
+        assert rows["000300"]["amount"] is None
+        assert free_index_bar_hash(rows["000300"]) == published["row_hash"]
+        assert published["schema"] == FREE_BAR_RECEIPT_SCHEMA
+        assert published["source_variant"] == "tencent_only"
+        assert published["available_at"] > "2026-11-06 18:17:16"
+        assert connection.execute(text("SELECT etl_sync_at FROM sm_index_kline WHERE index_code='000001'")).scalar_one() == "2026-11-06 18:17:14"
+        saved = connection.execute(text("""SELECT request_id,last_success_at,detail_json FROM acquisition_partition_state
+            WHERE partition_key LIKE 'index_bar:000300:%'""")).mappings().one()
+        assert saved["request_id"] == published["receipt_id"]
+        assert saved["last_success_at"] == published["available_at"]
+        assert json.loads(saved["detail_json"]) == published
+        assert connection.execute(text("SELECT request_id FROM acquisition_partition_state WHERE partition_key='__index_daily_partition__'")).scalar_one() == "original"
+        assert collector._repair_publish(connection, target, candidate) == []
+
+
+def test_index_repair_rolls_back_if_receipt_cannot_be_saved(index_repair_database):
+    with index_repair_database.begin() as connection:
+        connection.execute(text("""CREATE TRIGGER reject_repair_receipt BEFORE INSERT ON acquisition_partition_state
+            BEGIN SELECT RAISE(ABORT, 'receipt storage failed'); END"""))
+    target = "2026-11-06"
+    values = dict(index_code="000300", trade_time=f"{target} 15:00:00", trade_date=target,
+        k_type=1, open=4010, close=4054.27, high=4060, low=4001, volume=100, amount=None,
+        change=54.27, change_pct=1.36)
+    from sqlalchemy.exc import IntegrityError
+    with pytest.raises(IntegrityError, match="receipt storage failed"):
+        with index_repair_database.begin() as connection:
+            collector._repair_publish(connection, target, {"000300": ("tencent_only", values)})
+    with index_repair_database.connect() as connection:
+        assert collector._repair_rows(connection, target, ["000300"]) == {}
+        assert connection.execute(text("SELECT COUNT(*) FROM acquisition_partition_state")).scalar_one() == 1
 
 
 def test_scheduled_index_target_is_today_after_1535(monkeypatch):
@@ -21,9 +104,13 @@ def test_scheduled_index_target_is_today_after_1535(monkeypatch):
             engine, now=datetime(2026, 11, 4, 17, 10), **kwargs))
     seen = []
     monkeypatch.setattr(collector, "publish", lambda target, **kwargs:
-        seen.append(target) or {"status": "COMPLETE"})
-    assert collector.main(["--date", "latest", "--json"]) == 0
-    assert seen == ["2026-11-04"]
+        seen.append((target, kwargs)) or {"status": "COMPLETE"})
+    from shlex import split
+    from tools.qmt_host_ownership_contract import FREE_INDEX_DAILY_TASK
+
+    assert collector.main(split(FREE_INDEX_DAILY_TASK["script_args"])) == 0
+    assert seen == [("2026-11-04", {"apply": True,
+                    "codes": ["000001", "399001", "399006", "000688", "899050"]})]
 
 
 def test_public_index_sources_map_beijing_index_to_bj_market():

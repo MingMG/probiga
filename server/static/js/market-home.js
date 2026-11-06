@@ -202,11 +202,14 @@
 
     function renderLadder(snapshot) {
         const notes = snapshot?.limit_ladder || {};
-        const ladder = rows(notes.rows).filter(item => Number.isInteger(item.streak) && item.streak > 0 && Number.isInteger(item.count) && item.count > 0);
+        const ladder = day(notes.trade_date) === day(snapshot?.trade_date) && notes.source
+            ? rows(notes.rows).filter(item => Number.isInteger(item.streak) && item.streak > 0 && Number.isInteger(item.count) && item.count > 0)
+            : [];
         const max = Math.max(1, ...ladder.map(item => item.count));
-        return panel('涨停梯队', snapshotMeta(snapshot), (ladder.length ? '<div class="mh-list">' + ladder.slice(0, 8).map(item =>
+        const meta = ladder.length ? [notes.trade_date, notes.scope, notes.source].filter(Boolean).map(escape).join(' · ') : snapshotMeta(snapshot);
+        return panel('涨停梯队', meta, (ladder.length ? '<div class="mh-list">' + ladder.slice(0, 8).map(item =>
             `<div class="mh-row"><b>${item.streak}板</b><span class="mh-breadth-bar" aria-hidden="true"><span class="mh-breadth-part mh-up" style="width:${100 * item.count / max}%"></span></span><span>${item.count}只</span></div>`).join('') + '</div>' :
-            empty('暂无可核验的连续涨停梯队')) + `<p class="mh-meta">封板率 ${metric(notes.seal_rate_pct, '%', 1)} · ${link('intraday-alert', '查看盘中播报')}</p>`);
+            empty('暂无可核验的连续涨停梯队')) + `<p class="mh-meta">封板率 ${metric(ladder.length ? notes.seal_rate_pct : null, '%', 1)} · ${link('intraday-alert', '查看盘中播报')}</p>`);
     }
 
     function renderSector(title, values, market) {
@@ -243,11 +246,18 @@
         const display = data.slice(0, 8);
         const noMatches = !sourceRows.length && ['gainers', 'losers'].includes(key) && number(snapshot?.sample_size) > 0 &&
             Array.isArray(snapshot?.unavailable_fields) && !snapshot.unavailable_fields.includes('rankings.' + key);
-        const meta = display.length ? `TOP ${display.length} · ${snapshotMeta(snapshot)}` : noMatches ? snapshotMeta(snapshot) : '排名待核验';
+        const coverage = key === 'turnover' ? snapshot?.turnover_coverage : null;
+        const scope = Number.isInteger(coverage?.verified_count) && Number.isInteger(coverage?.sample_size)
+            ? ` · 已核验 ${metric(coverage.verified_count, '', 0)}/${metric(coverage.sample_size, '只', 0)}` : '';
+        const meta = display.length ? `TOP ${display.length}${scope} · ${snapshotMeta(snapshot)}` : noMatches ? snapshotMeta(snapshot) : '排名待核验';
         return panel(title, meta, display.length ?
-            '<div class="mh-list">' + display.map((item, i) => `<div class="mh-row"><span class="mh-muted">${i + 1}</span>` +
-                `<span>${stock(item.stock_code, item.short_name)}<small class="mh-meta">${escape(item.stock_code)}${item.source ? ' · ' + escape(item.source) : ''}</small></span>` +
-                `<span>${field === 'change_pct' ? signed(item[field]) : unit === '亿' ? amount(item[field]) : metric(item[field], unit)}</span></div>`).join('') + '</div>' :
+            '<div class="mh-list">' + display.map((item, i) => {
+                const source = key === 'turnover' ? item.turnover_rate_source || item.source : item.source;
+                const value = field === 'change_pct' ? signed(item[field]) : unit === '亿' ? amount(item[field]) : metric(item[field], unit);
+                return `<div class="mh-row"><span class="mh-muted">${i + 1}</span>` +
+                    `<span>${stock(item.stock_code, item.short_name)}<small class="mh-meta">${escape(item.stock_code)}${source ? ' · ' + escape(source) : ''}</small></span>` +
+                    `<span>${value}</span></div>`;
+            }).join('') + '</div>' :
             empty(noMatches ? (key === 'gainers' ? '当日样本无上涨标的' : '当日样本无下跌标的') : '缺少所选交易日可核验的排名') + link('stock-list', '查看全市场股票'));
     }
 
