@@ -154,6 +154,15 @@ def validate_daily_input_sessions(
         truth_hashes.append(str(qmt_truth.truth_hash))
         attested_rows += int(qmt_truth.attested_row_count)
 
+    def load_native_truth(day: str, *, verify_rows: bool) -> Any:
+        return load_qmt_daily_market_truth(
+            connection,
+            start_date=day,
+            end_date=day,
+            decision_known_at=cutoff,
+            verify_rows=verify_rows,
+        )
+
     def add_free_truth(day: str) -> None:
         nonlocal attested_rows, latest_truth
         free_truth = load_verified_daily_market_truth(
@@ -184,6 +193,21 @@ def validate_daily_input_sessions(
         if day == days[-1]:
             latest_truth = source_truth
 
+    def add_free_or_recovered_native_truth(day: str) -> None:
+        try:
+            add_free_truth(day)
+        except Exception as free_error:
+            # A free receipt can outlive the rows it describes after QMT
+            # restores the partition. Verify current rows before selecting QMT.
+            try:
+                truth = load_native_truth(day, verify_rows=True)
+            except Exception as qmt_error:
+                raise RuntimeError(
+                    f"daily strategy input truth differs for {day}: "
+                    f"qmt={qmt_error}; free={free_error}"
+                ) from qmt_error
+            add_qmt_truth(truth, [day])
+
     def add_retained_truth(day: str) -> None:
         nonlocal attested_rows, latest_truth
         retained_truth = load_retained_qmt_daily_market_truth(
@@ -210,22 +234,16 @@ def validate_daily_input_sessions(
             try:
                 add_retained_truth(day)
             except Exception:
-                add_free_truth(day)
+                add_free_or_recovered_native_truth(day)
         for day in sorted(free_days):
-            add_free_truth(day)
+            add_free_or_recovered_native_truth(day)
     else:
         for day in days:
             if day in free_days:
-                add_free_truth(day)
+                add_free_or_recovered_native_truth(day)
                 continue
             try:
-                truth = load_qmt_daily_market_truth(
-                    connection,
-                    start_date=day,
-                    end_date=day,
-                    decision_known_at=cutoff,
-                    verify_rows=False,
-                )
+                truth = load_native_truth(day, verify_rows=False)
             except Exception as qmt_error:
                 try:
                     add_retained_truth(day)
