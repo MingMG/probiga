@@ -326,6 +326,20 @@ def build_packet(digest: dict, *, report_kind: str, next_trade_date: str, contex
         if intraday and "close" in values:
             values["price"] = values.pop("close")
         card("market_measurement", "index_prices", values, eid, "当时指数快照" if intraday else "同日指数行情", scope="index_quote")
+    if report_kind == "briefing":
+        us_close = context.get("us_market_close") or {}
+        for row in us_close.get("rows", []):
+            eid = entity("index", row["display_name"], row["symbol"])
+            card("market_measurement", "us_cash_close",
+                 {**measurements(row, ("change_pct", "price", "previous_close")),
+                  "observed_at": row["market_time"]}, eid, row["source"],
+                 scope="overnight_us_cash_close", trade_date=us_close["session_date"])
+        for row in us_close.get("headlines", []):
+            card("source_statement", "us_close_headline",
+                 {"quote": row["title"], "published_at": str(row["publish_time"])},
+                 source_name=row["source"], scope="overnight_us_close_news")
+        if len(us_close.get("rows", [])) < 3:
+            limitation("us_cash_close", "隔夜美股三大指数收盘数据尚未全部核实")
     sector_map = {}
     available_sectors = [row for row in theme.get("sectors", []) if isinstance(row, dict)]
     # Keep each observed source category before filling with attention order.

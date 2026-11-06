@@ -9,13 +9,14 @@ from uuid import uuid4
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
+from biz.market_context.external_market import NEW_YORK, US_CASH_INDICES, fetch_us_cash_close
 from biz.review.market_decision import (
     ResearchError, _call_codex, _load_rules, _messages, source_digest_identity,
 )
 from biz.review.quant_digest import generate_quant_digest, persist_quant_digest, render_compact_review
 from biz.review.research_contract import build_packet, draft_json_schema, render_draft, validate_draft
 from biz.review.research_flow import (
-    TZ, artifact_hash, assert_digest, collect_context, decode_digest, load_digest, next_session,
+    TZ, artifact_hash, assert_digest, collect_context, decode_digest, load_digest, next_session, read_records,
 )
 from server.ai_bridge.research import ResearchBridgeError
 
@@ -73,8 +74,11 @@ def _interpret(engine, digest, *, kind, target, context, now):
     if remaining:
         rules = before + remaining + after
     schema = draft_json_schema()
+    instruction = "你是本报告的唯一解读模型。根据提供的量化事实分析，缺失材料如实说明。"
+    if kind == "briefing":
+        instruction += "先处理隔夜美股收盘与已核实的显著外盘风险，再评估A股延续条件。外盘涨跌不能写成A股已发生的走势。"
     messages = _messages(
-        "你是本报告的唯一解读模型。根据提供的量化事实分析，缺失材料如实说明。",
+        instruction,
         {"input": packet}, schema, rules,
     )
     rules_sha256 = artifact_hash({"rules": rules, "schema": schema, "workflow": "codex_daily_report"})
@@ -139,9 +143,24 @@ def publish_review(engine, target, *, force=False):
 
 
 def _briefing_facts(digest, target, context):
+    us = context.get("us_market_close") or {}
+    quotes = us.get("rows") or []
     lines = [f"# A股早报｜{target}", "", f"> 收盘行情日 {digest['review_date']}",
-             f"> 隔夜资料截至 {context['cutoff_at']}（北京时间）", "",
-             render_compact_review(digest), "", "## 隔夜新闻", ""]
+             f"> 隔夜资料截至 {context['cutoff_at']}（北京时间）", "", "## 隔夜风险｜美股收盘", ""]
+    if quotes:
+        lines.append(f"美东 {us['session_date']} 收盘。")
+        for row in quotes:
+            lines.append(f"- {row['display_name']} {row['change_pct']:+.2f}%（{row['source']}）")
+    if len(quotes) < len(US_CASH_INDICES):
+        lines.append("美股三大指数收盘行情尚未全部核实。")
+    for row in us.get("headlines", []):
+        title = " ".join(str(row.get("title") or "").split())[:180]
+        lines.append(f"- 收盘快讯（{row['source']}） {title}")
+    if sum(row["change_pct"] <= -2 for row in quotes) >= 2 or any(
+        row["symbol"] == "nasdaq" and row["change_pct"] <= -3 for row in quotes
+    ):
+        lines.extend(["", "**外盘风险升高。** 开盘先观察 A 股科技方向是否承压，以及上涨家数和前日强势股能否企稳，再评估普涨延续。"])
+    lines.extend(["", render_compact_review(digest), "", "## 隔夜新闻", ""])
     events = context["events"]
     if events["status"] == "OBSERVED":
         seen = set()
@@ -161,7 +180,8 @@ def _briefing_facts(digest, target, context):
     else:
         lines.append("隔夜新闻暂不可用。")
     external = [row for row in (context.get("external_market") or {}).get("rows", [])
-                if row.get("availability") == "available" and row.get("change_pct") is not None]
+                if row.get("symbol") not in US_CASH_INDICES and row.get("availability") == "available"
+                and row.get("change_pct") is not None]
     if external:
         lines.extend(["", "## 隔夜市场", ""])
         for row in external[:10]:
@@ -203,18 +223,57 @@ def published_review_content(digest):
     return content
 
 
+def _briefing_us_close(engine, digest, target, opening, now):
+    session = opening.astimezone(NEW_YORK).date()
+    while session.weekday() >= 5:
+        session -= timedelta(days=1)
+    close = datetime.combine(session, time(16), NEW_YORK).astimezone(TZ)
+    rows = []
+    cutoff = min(now, opening)
+    if cutoff >= close:
+        prior = (digest["factor_validation_json"].get("early_briefing") or {}).get("us_market_close") or {}
+        if prior.get("session_date") == session.isoformat() and all(
+            datetime.fromisoformat(row["captured_at"]) <= cutoff for row in prior.get("rows", [])
+        ):
+            rows = prior.get("rows") or []
+        if now <= opening and len(rows) < len(US_CASH_INDICES):
+            fresh = fetch_us_cash_close(session, cutoff=opening)
+            by_symbol = {row["symbol"]: row for row in [*rows, *fresh]}
+            rows = [by_symbol[symbol] for symbol in US_CASH_INDICES if symbol in by_symbol]
+    cutoff = min(datetime.now(TZ), opening)
+    headlines = []
+    if cutoff >= close and len(rows) < len(US_CASH_INDICES):
+        try:
+            headlines = read_records(text(
+                "SELECT /*+ MAX_EXECUTION_TIME(5000) */ source,title,publish_time,first_seen_at "
+                "FROM st_news_flash WHERE publish_time BETWEEN :close AND :cutoff "
+                "AND first_seen_at<=:cutoff AND (title LIKE '%纳指%收盘%' OR title LIKE '%美股%收盘%' "
+                "OR title LIKE '%标普%收盘%' OR title LIKE '%道指%收盘%') "
+                "ORDER BY publish_time DESC LIMIT 3"
+            ), engine, params={"close": close.replace(tzinfo=None), "cutoff": cutoff.replace(tzinfo=None)})
+            headlines = [{**row, "publish_time": str(row["publish_time"]),
+                          "first_seen_at": str(row["first_seen_at"])} for row in headlines]
+        except SQLAlchemyError as exc:
+            log.warning("US market close news unavailable for %s: %s", target, type(exc).__name__)
+    return {"session_date": session.isoformat(), "rows": rows, "headlines": headlines}, cutoff
+
+
 def publish_briefing(engine, review_date, *, persist=True):
     digest = load_digest(engine, review_date)
     assert_digest(digest, review_date)
     target = next_session(engine, review_date)
     now = datetime.now(TZ)
     # A late recovery still uses information available before the opening.
-    cutoff = min(now, datetime.combine(date.fromisoformat(target), time(9, 30), TZ))
+    opening = datetime.combine(date.fromisoformat(target), time(9, 30), TZ)
+    us_close, cutoff = _briefing_us_close(engine, digest, target, opening, now)
     context = collect_context(engine, review_date, now=cutoff, overnight=True, include_research=False)
+    context["us_market_close"] = us_close
+    now = datetime.now(TZ)
     facts = {
         "mode": "facts", "status": "COMPLETE", "report_kind": "briefing",
         "review_date": review_date, "next_trade_date": target, "generated_at": now.isoformat(),
         "source_digest_sha256": source_digest_identity(digest),
+        "us_market_close": us_close,
         "content": _briefing_facts(digest, target, context),
     }
     if persist:
