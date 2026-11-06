@@ -37,6 +37,12 @@ _LISTING = re.compile(
     r"|上市(?:时间|日期)[:：]?" + _DATE
 )
 _DOCUMENT = re.compile(r"/finalpage/([0-9]{4}-[0-9]{2}-[0-9]{2})/[0-9]+\.PDF", re.I)
+_BSE_IPO = "向不特定合格投资者公开发行股票并在北京证券交易所上市"
+_BSE_LISTING_PROMPT = _BSE_IPO + "提示性公告"
+_LISTING_TITLE = re.compile(
+    r"首次公开发行股票并在.+上市之上市公告书(?:提示性公告)?|"
+    + _BSE_IPO + r"(?:(?:之上市公告书|公告书)(?:提示性公告)?|提示性公告)"
+)
 
 
 class OfficialListingEvidenceError(RuntimeError):
@@ -48,8 +54,10 @@ def listing_date_from_text(source_text: str, *, stock_code: str) -> str:
     if not isinstance(source_text, str) or not source_text or len(source_text.encode("utf-8")) > 256 * 1024:
         raise ValueError("listing document text is invalid")
     compact = re.sub(r"\s+", "", source_text)
+    beijing_ipo = stock_code.startswith(("4", "8", "9")) and _BSE_IPO in compact
     if (set(_CODE.findall(source_text)) != {stock_code}
-            or "首次公开发行" not in compact or "上市公告书" not in compact):
+            or ("首次公开发行" not in compact and not beijing_ipo)
+            or ("上市公告书" not in compact and not (beijing_ipo and _BSE_LISTING_PROMPT in compact))):
         raise ValueError("IPO document security identity differs")
     candidates = set()
     for match in _LISTING.finditer(compact):
@@ -144,31 +152,33 @@ def _load_in_process(codes: list[str], *, target_date: str,
     with requests.Session() as session:
         session.headers.update({"User-Agent": "Mozilla/5.0", "Referer": BASE + "/"})
         for market, market_codes in groups.items():
-            # CNINFO publishes bulk static issuer directories for Shenzhen
-            # and Beijing. Shanghai identities come from the official batched
-            # disclosure inventory itself; no nonexistent static URL is used.
+            # The supported CNINFO exact-issuer query for BSE uses its
+            # consolidated Shenzhen issuer directory and query column.
+            directory_market = "szse" if market == "bj" else market
+            column = "sse" if market == "sh" else "szse"
             identities = None
             securities = ""
             if market != "sh":
                 stage = "issuer_directory"
-                catalog = _json(_fetch(session, "GET", f"{BASE}/new/data/{market}_stock.json",
+                catalog = _json(_fetch(session, "GET", f"{BASE}/new/data/{directory_market}_stock.json",
                                       deadline=deadline, stage=stage, cap=4 * 1024 * 1024), stage)
                 if not isinstance(catalog, dict) or not isinstance(catalog.get("stockList"), list):
                     raise OfficialListingEvidenceError(stage, "directory_shape_differs")
-                identities = {row["code"]: row for row in catalog["stockList"]
-                              if isinstance(row, dict) and row.get("code") in market_codes
-                              and row.get("category") == "A股" and re.fullmatch(r"[0-9]+", str(row.get("orgId") or ""))}
-                if set(identities) != set(market_codes):
+                selected = [row for row in catalog["stockList"] if isinstance(row, dict) and row.get("code") in market_codes]
+                identities = {row["code"]: row for row in selected if row.get("category") == "A股"
+                              and re.fullmatch(r"[0-9]{1,32}", str(row.get("orgId") or ""))}
+                if len(selected) != len(identities) or set(identities) != set(market_codes):
                     raise OfficialListingEvidenceError(stage, "requested_issuer_identity_missing")
                 securities = ";".join(f"{code},{identities[code]['orgId']}" for code in market_codes)
             announcements = []
             for page in range(1, MAX_QUERY_PAGES + 1):
                 stage = "announcement_inventory"
+                fields = {"pageNum": str(page), "pageSize": "30", "column": column, "tabName": "fulltext",
+                          "stock": securities, "seDate": f"{target-timedelta(days=45)}~{target}"}
+                if market != "bj":
+                    fields.update(searchkey="上市公告书", sortName="time", sortType="desc", isHLtitle="false")
                 payload = _json(_fetch(session, "POST", BASE + "/new/hisAnnouncement/query",
-                    deadline=deadline, stage=stage, cap=2 * 1024 * 1024,
-                    data={"pageNum": str(page), "pageSize": "30", "column": {"sz":"szse", "sh":"sse", "bj":"bjse"}[market],
-                          "tabName":"fulltext", "stock": securities, "searchkey":"上市公告书",
-                          "seDate":f"{target-timedelta(days=45)}~{target}", "sortName":"time", "sortType":"desc", "isHLtitle":"false"}), stage)
+                    deadline=deadline, stage=stage, cap=2 * 1024 * 1024, data=fields), stage)
                 if not isinstance(payload, dict) or not isinstance(payload.get("announcements") or [], list):
                     raise OfficialListingEvidenceError(stage, "inventory_shape_differs")
                 announcements.extend(payload.get("announcements") or [])
@@ -181,7 +191,7 @@ def _load_in_process(codes: list[str], *, target_date: str,
                     and row.get("secCode") == code
                     and ((identities is None and re.fullmatch(r"[0-9]+", str(row.get("orgId") or "")))
                          or (identities is not None and str(row.get("orgId")) == str(identities[code]["orgId"])))
-                    and re.fullmatch(r"首次公开发行股票并在.+上市之上市公告书(?:提示性公告)?", str(row.get("announcementTitle") or ""))]
+                    and _LISTING_TITLE.fullmatch(str(row.get("announcementTitle") or ""))]
                 candidates.sort(key=lambda row: ("提示性公告" not in row["announcementTitle"], -int(row.get("announcementTime") or 0)))
                 for row in candidates[:MAX_DOCUMENTS_PER_CODE]:
                     adjunct = str(row.get("adjunctUrl") or "")

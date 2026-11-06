@@ -309,6 +309,7 @@ def _reconstruction_authority_matches(
     *,
     target_trade_date: date,
     catalog: AnnouncementCatalog,
+    known_at: datetime | None = None,
 ) -> bool:
     """Recompute every nested authority seal and cross-bind its catalog."""
 
@@ -327,7 +328,7 @@ def _reconstruction_authority_matches(
     if (
         not isinstance(no_trade_codes, list)
         or not isinstance(exclusions, list)
-        or additions != []
+        or not isinstance(additions, list)
         or no_trade_codes != sorted(set(no_trade_codes))
         or any(_CODE_RE.fullmatch(str(code)) is None for code in no_trade_codes)
         or any(
@@ -352,6 +353,7 @@ def _reconstruction_authority_matches(
             and _reconstruction_stock_scope_matches(
                 authority,
                 target_trade_date=target_trade_date,
+                known_at=known_at,
             )
             and authority.get("reconciliation_sha256")
             == canonical_hash(reconciliation)
@@ -371,7 +373,9 @@ def _reconstruction_authority_matches(
             == catalog.manifest_hash
             and int(reconciliation.get("authority_eligible_count") or -1)
             == len(catalog.codes)
-            and prior_count - len(exclusions) == len(catalog.codes)
+            and prior_count - len(exclusions) + len(additions) == len(catalog.codes)
+            and all(item["stock_code"] in catalog.codes and catalog.qmt_by_code.get(item["stock_code"]) == item["qmt_code"]
+                    for item in additions)
             and attested_count > 0
             and no_trade_count == len(no_trade_codes)
             and attested_count + no_trade_count == len(catalog.codes)
@@ -386,13 +390,15 @@ def _reconstruction_stock_scope_matches(
     authority: Mapping[str, Any],
     *,
     target_trade_date: date,
+    known_at: datetime | None = None,
 ) -> bool:
     """Preserve legacy membership seals while defining the v3 stock scope."""
 
     schema = authority.get("schema")
     if schema == QMT_ANNOUNCEMENT_RECONSTRUCTION_AUTHORITY_V2_SCHEMA:
         membership = authority.get("membership_snapshot")
-        if not isinstance(membership, Mapping):
+        reconciliation = authority.get("reconciliation")
+        if not isinstance(membership, Mapping) or not isinstance(reconciliation, Mapping):
             return False
         membership = dict(membership)
         return bool(
@@ -401,6 +407,7 @@ def _reconstruction_stock_scope_matches(
             and membership.get("snapshot_date")
             == target_trade_date.isoformat()
             and membership.get("quality_status") == "QMT_VALIDATED"
+            and reconciliation.get("added_to_prior") == []
         )
     if schema == QMT_ANNOUNCEMENT_RECONSTRUCTION_AUTHORITY_V3_SCHEMA:
         return bool(
@@ -410,8 +417,53 @@ def _reconstruction_stock_scope_matches(
             in QMT_ANNOUNCEMENT_RECONSTRUCTION_ORIGINS
             and "membership_snapshot" not in authority
             and "membership_snapshot_sha256" not in authority
+            and _reconstruction_additions_valid(authority, target_trade_date=target_trade_date, known_at=known_at)
         )
     return False
+
+
+def _reconstruction_additions_valid(authority, *, target_trade_date: date, known_at: datetime | None) -> bool:
+    """Permit only a proven target-day IPO added to the native traded scope."""
+    reconciliation = authority.get("reconciliation")
+    if not isinstance(reconciliation, Mapping):
+        return False
+    additions = reconciliation.get("added_to_prior")
+    if additions == []:
+        return True
+    from server.common.official_listing_evidence import validate_official_listing_evidence
+    from server.common.qmt_datadir_daily_coverage import canonical_bar
+
+    truth = authority.get("qmt_daily_truth") or {}
+    if (not isinstance(additions, list) or len(additions) > 8 or truth.get("provider") != "qmt_datadir"
+            or not _SHA256_RE.fullmatch(str(truth.get("truth_hash") or ""))):
+        return False
+    target = target_trade_date.isoformat()
+    prelisting = (target_trade_date - timedelta(days=1)).isoformat()
+    codes = []
+    try:
+        for addition in additions:
+            code = addition["stock_code"]
+            qmt_code = addition["qmt_code"]
+            disclosure = validate_official_listing_evidence(addition["listing_disclosure"], stock_code=code, target_date=prelisting)
+            captured = _dt(disclosure["captured_at"])
+            entity = addition["native_daily_entity"]
+            bar = entity["evidence"]
+            if (not _CODE_RE.fullmatch(code) or not _QMT_CODE_RE.fullmatch(qmt_code) or qmt_code[:6] != code
+                    or addition["reason"] != "OFFICIAL_TARGET_DAY_LISTING_WITH_NATIVE_TRADE"
+                    or addition["list_date"] != target or disclosure["listing_date"] != target
+                    or captured.date().isoformat() < disclosure["publication_date"] or (known_at is not None and captured > known_at)
+                    or len(disclosure["source_text"].encode("utf-8")) > 8192
+                    or entity["stock_code"] != code or entity["classification"] != "TRADED"
+                    or entity["row_hash"] != canonical_hash({"stock_code": code, "classification": "TRADED", "evidence": bar})
+                    or bar["stock_code"] != code or bar["trade_date"] != target or canonical_bar(bar) != bar
+                    or not (Decimal(bar["volume"]) > 0 or Decimal(bar["amount"]) > 0)):
+                return False
+            codes.append(code)
+        excluded = {entry["stock_code"] for entry in reconciliation["excluded_from_prior"]}
+        unavailable = set(reconciliation["native_no_trade_codes"])
+    except (KeyError, TypeError, ValueError, ArithmeticError):
+        return False
+    return codes == sorted(set(codes)) and not set(codes) & (excluded | unavailable)
 
 
 def _reconstruction_execution_origin_matches(
@@ -2801,8 +2853,19 @@ def validate_complete_historical_reconstruction_batch(
                         authority,
                         target_trade_date=target,
                         catalog=authority_catalog,
+                        known_at=reconstructed,
                     ):
                         raise ValueError("reconstruction authority differs")
+                    additions = authority["reconciliation"]["added_to_prior"]
+                    if additions:
+                        from server.common.qmt_datadir_daily_coverage import load_daily_manifest
+
+                        truth = authority["qmt_daily_truth"]
+                        native = load_daily_manifest(connection, target.isoformat(), decision_known_at=reconstructed,
+                                                     manifest_hash=truth["truth_hash"], verify_rows=False)
+                        entities = {item["stock_code"]: item for item in (native or {}).get("entities", ())}
+                        if any(entities.get(item["stock_code"]) != item["native_daily_entity"] for item in additions):
+                            raise ValueError("reconstruction added listing native trade proof differs")
                     requested_start = _qmt_time(
                         datetime.combine(batch_start, datetime.min.time())
                     )
@@ -3306,6 +3369,7 @@ def _publish_batch(
                 reconstruction.get("authority") or {},
                 target_trade_date=reconstruction_target,
                 catalog=catalog,
+                known_at=reconstructed_at,
             )
         ):
             raise QMTAnnouncementBlocked(
@@ -4472,7 +4536,7 @@ def validate_task_result(payload: Any, process_exit: int) -> str:
             if (
                 not isinstance(no_trade_codes, list)
                 or not isinstance(exclusions, list)
-                or additions != []
+                or not isinstance(additions, list)
                 or no_trade_codes != sorted(set(no_trade_codes))
                 or any(
                     _CODE_RE.fullmatch(str(code)) is None
@@ -4549,6 +4613,7 @@ def validate_task_result(payload: Any, process_exit: int) -> str:
             or not _reconstruction_stock_scope_matches(
                 authority,
                 target_trade_date=target,
+                known_at=received,
             )
             or authority.get("reconciliation_sha256")
             != canonical_hash(reconciliation)
@@ -4585,7 +4650,7 @@ def validate_task_result(payload: Any, process_exit: int) -> str:
             != provenance.get("catalog_manifest_hash")
             or int(reconciliation.get("authority_eligible_count") or -1)
             != int(provenance.get("catalog_member_count") or -2)
-            or prior_count - len(exclusions)
+            or prior_count - len(exclusions) + len(additions)
             != int(provenance.get("catalog_member_count") or -2)
             or attested_count <= 0
             or no_trade_count != len(no_trade_codes)
