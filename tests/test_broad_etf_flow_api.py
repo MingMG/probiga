@@ -3,9 +3,11 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 import importlib
+from io import BytesIO
 import sys
 from types import SimpleNamespace
 from typing import Any
+from zipfile import ZipFile
 
 import pytest
 import requests
@@ -97,6 +99,31 @@ def test_build_flow_rows_uses_share_delta_times_previous_close():
     assert rows[0]["share_change"] == pytest.approx(12_000_000.0)
     assert rows[0]["net_amount"] == pytest.approx(12_000_000.0 * 4.25)
     assert rows[0]["flow_method"] == "份额变化 × 前一交易日收盘价"
+
+
+def test_szse_workbook_accepts_right_padded_etf_code(monkeypatch):
+    module = _router_module()
+    content = BytesIO()
+    with ZipFile(content, "w") as workbook:
+        workbook.writestr("xl/worksheets/sheet1.xml", """
+            <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+              <sheetData>
+                <row><c><is><t>日期</t></is></c></row>
+                <row>
+                  <c><is><t>2026-11-06</t></is></c>
+                  <c><is><t xml:space="preserve">159915  </t></is></c>
+                  <c><is><t>创业板ETF易方达</t></is></c>
+                  <c><is><t>45372454936.00</t></is></c>
+                </row>
+              </sheetData>
+            </worksheet>
+        """)
+    response = SimpleNamespace(content=content.getvalue(), raise_for_status=lambda: None)
+    monkeypatch.setattr(module, "_http_get", lambda *_args, **_kwargs: response)
+
+    result = module._fetch_szse_share_range("2026-11-06", "2026-11-06")
+
+    assert result["2026-11-06"]["159915"]["fund_share"] == 45_372_454_936
 
 
 def test_large_share_jump_is_excluded_as_suspected_corporate_action():

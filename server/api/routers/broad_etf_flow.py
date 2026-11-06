@@ -233,7 +233,7 @@ def _fetch_szse_share_range(start_date: str, end_date: str) -> dict[str, dict[st
         if len(cells) < 4:
             continue
         trade_date, code, _name, raw_share = cells[:4]
-        code = str(code).zfill(6)
+        code = str(code).strip().zfill(6)
         actual_date = _iso_date(trade_date)
         if (code not in CORE_BY_CODE or CORE_BY_CODE[code].exchange != "sz"
                 or not start_date <= actual_date <= end_date):
