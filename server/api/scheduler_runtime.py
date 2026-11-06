@@ -4059,6 +4059,44 @@ def _attach_daily_dependency_recovery(
         downstream["_dependency_latest_at"] = max(upstream_times)
 
 
+def _attach_qmt_minute_scope_recovery(engine, rows: list[dict], *, now: datetime) -> None:
+    """Reopen a successful stock-minute task when its exact daily scope changes."""
+    candidates = [row for row in rows if row.get("task_type") == "qmt_stock_minute_canonical"]
+    if len(candidates) != 1:
+        return
+    row = candidates[0]
+    if (
+        row.get("_scheduler_target_available") is not True
+        or str(row.get("last_run_status") or "").strip().lower() != "success"
+    ):
+        return
+    target = _row_recovery_target(row, now=now)
+    if (
+        not 0 <= (now.date() - target).days <= DAILY_RESULT_RECOVERY_MAX_AGE_DAYS
+        or not _row_matches_target_trade_date(row, target.isoformat())
+    ):
+        return
+
+    from integrations.qmt.datadir_import import load_minute_partition_receipts
+    from server.common.qmt_datadir_result import SHA64
+
+    try:
+        receipt = load_minute_partition_receipts(engine, [target], decision_known_at=now).get(target)
+    except Exception as exc:
+        logger.warning("QMT minute scope check unavailable for %s: %s", target, type(exc).__name__)
+        return
+    if receipt is None or receipt["status"] != "COMPLETE":
+        return
+    published_hash = str(receipt["detail"].get("full_market_manifest_hash") or "")
+    current_hash = str(receipt["current_daily_manifest_hash"] or "")
+    if (SHA64.fullmatch(published_hash) is None or SHA64.fullmatch(current_hash) is None
+            or published_hash == current_hash):
+        return
+    # A durable hash mismatch is proof of unconsumed input even when the new
+    # capture began before the old minute run. The normal claim and retry rules
+    # still own the attempt after it leaves the successful state.
+    row["_dependency_recovery_due"] = True
+    row.pop("_dependency_latest_at", None)
 
 
 def _strategy_pipeline_dependencies_ready(
@@ -10497,6 +10535,8 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                     continue
 
                 candidates.append(row)
+            if qmt_dispatch_authorized:
+                _attach_qmt_minute_scope_recovery(engine, candidates, now=now)
             candidates.sort(key=lambda row: _scheduler_task_sort_key(row, now=now))
 
             # Keep all rows available as immutable cross-host dependencies,

@@ -37,6 +37,8 @@ from server.common.auxiliary_runtime_schema import (
     QMT_DATADIR_STAGE_INDEX_NAME,
     validate_qmt_datadir_import_runtime_schema,
 )
+from server.common.qmt_datadir_daily_coverage import MANIFEST_TABLE, SCHEMA as DAILY_MANIFEST_SCHEMA
+from server.common.qmt_datadir_minute_coverage import ATTEMPT_DATASET
 from server.common.qmt_index_minute_grid import CORE_GRID
 from server.common.qmt_stock_catalog import load_stock_catalog
 from server.common.qmt_datadir_progress import MinuteImportProgress
@@ -263,37 +265,61 @@ def plan(
     return plans
 
 
-def completed_sessions(engine: Engine) -> set[dt.date]:
-    """Return sessions whose complete receipt proves the current grid contract."""
-    try:
-        with engine.connect() as conn:
-            rows = conn.execute(
-                text(
-                    f"SELECT trade_date, detail_json FROM `{RECEIPT_TABLE}` "
-                    "WHERE dataset=:d AND status=:s"
-                ),
-                {"d": DATASET, "s": STATUS_COMPLETE},
-            ).fetchall()
-    except Exception:  # table is created on first apply
-        return set()
-    complete: set[dt.date] = set()
-    for trade_date, raw_detail in rows:
+def load_minute_partition_receipts(
+    engine: Engine, sessions: Sequence[dt.date],
+    *, decision_known_at: dt.datetime | None = None,
+) -> dict[dt.date, dict]:
+    """Read requested receipts and current daily identities in one database snapshot."""
+    if not sessions:
+        return {}
+    cutoff = decision_known_at or dt.datetime.now(CST)
+    if cutoff.tzinfo is not None:
+        cutoff = cutoff.astimezone(CST).replace(tzinfo=None)
+    query = text(f"""
+        SELECT /*+ MAX_EXECUTION_TIME(3000) */
+               r.dataset,r.trade_date,r.source_root,r.status,r.code_count,r.row_count,
+               r.content_sha256,r.run_id,r.detail_json,
+               (SELECT CASE WHEN m.strategy_eligible=1 THEN m.manifest_hash END
+                FROM {MANIFEST_TABLE} m
+                WHERE m.dataset='stock_daily' AND m.trade_date=r.trade_date
+                  AND m.provider=:provider AND m.status='EXACT'
+                  AND m.schema_version=:daily_schema AND m.captured_at<=:cutoff
+                ORDER BY m.captured_at DESC,m.manifest_hash DESC LIMIT 1
+               ) AS current_daily_manifest_hash
+        FROM `{RECEIPT_TABLE}` r
+        WHERE r.dataset=:dataset AND r.trade_date IN :sessions
+    """).bindparams(bindparam("sessions", expanding=True))
+    with engine.connect() as conn:
+        rows = conn.execute(query, {"dataset": DATASET, "provider": SOURCE,
+            "daily_schema": DAILY_MANIFEST_SCHEMA, "cutoff": cutoff, "sessions": sessions}).mappings().all()
+    receipts = {}
+    for row in rows:
+        receipt = dict(row)
         try:
-            detail = json.loads(raw_detail) if raw_detail else {}
+            detail = json.loads(receipt.pop("detail_json") or "{}")
         except (TypeError, json.JSONDecodeError):
-            continue
-        if (
-            isinstance(detail, dict)
-            and detail.get("minute_grid_count") == len(CORE_GRID)
-            and detail.get("bad_grid_codes") == 0
-            and isinstance(detail.get("row_hash"), str)
-            and len(detail["row_hash"]) == 64
-            and detail.get("coverage") == 1.0
-            and len(str(detail.get("full_market_manifest_hash") or "")) == 64
-            and len(str(detail.get("expected_traded_code_set_sha256") or "")) == 64
-        ):
-            complete.add(trade_date)
-    return complete
+            detail = {}
+        receipt["detail"] = detail if isinstance(detail, dict) else {}
+        receipts[dt.date.fromisoformat(str(receipt["trade_date"]))] = receipt
+    return receipts
+
+
+def is_current_minute_receipt(receipt: dict) -> bool:
+    """Accept sealed minute rows only while their daily authority is current."""
+    detail = receipt["detail"]
+    daily_hash = detail.get("full_market_manifest_hash")
+    return (
+        receipt["status"] == STATUS_COMPLETE
+        and detail.get("minute_grid_count") == len(CORE_GRID)
+        and detail.get("bad_grid_codes") == 0
+        and isinstance(detail.get("row_hash"), str)
+        and len(detail["row_hash"]) == 64
+        and detail.get("coverage") == 1.0
+        and isinstance(daily_hash, str)
+        and len(daily_hash) == 64
+        and daily_hash == receipt["current_daily_manifest_hash"]
+        and len(str(detail.get("expected_traded_code_set_sha256") or "")) == 64
+    )
 
 
 def _insert_stage(conn: Connection, chunk: list[tuple]) -> None:
@@ -422,7 +448,16 @@ def write_receipt(
     content_sha256: str = "",
     detail: dict | None = None,
     finished: bool = False,
+    dataset: str = DATASET,
 ) -> None:
+    update_fields = ("source_root", "status", "code_count", "row_count", "content_sha256",
+                     "run_id", "finished_at", "detail_json")
+    if conn.dialect.name == "sqlite":
+        conflict = "ON CONFLICT(dataset, trade_date) DO UPDATE SET " + ", ".join(
+            f"{field}=excluded.{field}" for field in update_fields)
+    else:
+        conflict = "ON DUPLICATE KEY UPDATE " + ", ".join(
+            f"{field}=VALUES({field})" for field in update_fields)
     conn.execute(
         text(f"""
             INSERT INTO `{RECEIPT_TABLE}`
@@ -430,14 +465,10 @@ def write_receipt(
                content_sha256, run_id, started_at, finished_at, detail_json)
             VALUES (:dataset, :d, :root, :status, :codes, :rows, :sha, :run_id,
                     NOW(), {"NOW()" if finished else "NULL"}, :detail)
-            ON DUPLICATE KEY UPDATE
-              source_root=VALUES(source_root), status=VALUES(status),
-              code_count=VALUES(code_count), row_count=VALUES(row_count),
-              content_sha256=VALUES(content_sha256), run_id=VALUES(run_id),
-              finished_at=VALUES(finished_at), detail_json=VALUES(detail_json)
+            {conflict}
         """),
         {
-            "dataset": DATASET,
+            "dataset": dataset,
             "d": session,
             "root": root,
             "status": status,
@@ -448,6 +479,11 @@ def write_receipt(
             "detail": json.dumps(detail or {}, ensure_ascii=False, default=str),
         },
     )
+
+
+def clear_minute_attempt(conn: Connection, session: dt.date) -> None:
+    conn.execute(text(f"DELETE FROM `{RECEIPT_TABLE}` WHERE dataset=:dataset AND trade_date=:day"),
+                 {"dataset": ATTEMPT_DATASET, "day": session})
 
 
 def publish_session(

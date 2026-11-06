@@ -151,6 +151,72 @@ def test_real_database_replay_rejects_mutated_bars_and_entity_partitions(monkeyp
     engine.dispose()
 
 
+@pytest.mark.parametrize("canonical_source", ["free", "native", "corrupt"])
+def test_strategy_daily_window_resolves_retained_free_receipt_against_current_rows(
+    monkeypatch, canonical_source,
+):
+    from server.common import qmt_daily_market_truth, strategy_daily_input_window
+    from server.common import verified_daily_market_truth as free
+
+    engine = database(monkeypatch)
+    catalog, calendar = authorities()
+    catalog.eligible_codes = lambda day: [TRADED]
+    monkeypatch.setattr(free, "load_stock_catalog", lambda *args, **kwargs: catalog)
+    monkeypatch.setattr(
+        qmt_daily_market_truth, "load_trade_calendar_receipt", lambda *args, **kwargs: calendar,
+    )
+    captured_at = "2026-11-02 18:00:00"
+    receipt = {
+        "schema": free.VERIFIED_DAILY_RECEIPT_SCHEMA,
+        "dataset": free.FREE_DAILY_DATASET,
+        "source": "tencent_qt",
+        "target_date": DAY,
+        "captured_at": captured_at,
+        "row_count": 1,
+        "code_count": 1,
+        "code_set_hash": coverage.canonical_digest([TRADED]),
+        "row_hash": coverage.canonical_digest(free.canonical_daily_rows([bar()])),
+        "coverage_ratio": 1.0,
+        "catalog_batch_id": catalog.batch_id,
+        "catalog_manifest_hash": catalog.manifest_hash,
+        "catalog_member_set_hash": catalog.member_set_hash,
+    }
+    receipt["receipt_id"] = coverage.canonical_digest(receipt)
+    with engine.begin() as connection:
+        connection.execute(text("""
+            CREATE TABLE acquisition_partition_state (
+                dataset TEXT, source TEXT, target_date TEXT, partition_key TEXT,
+                status TEXT, written_rows INTEGER, last_success_at TEXT, detail_json TEXT
+            )
+        """))
+        connection.execute(text("""
+            INSERT INTO acquisition_partition_state
+            VALUES ('stock_daily', 'tencent_qt', :day, '__daily_partition__',
+                    'complete', 1, :captured_at, :detail)
+        """), {"day": DAY, "captured_at": captured_at, "detail": json.dumps(receipt)})
+        if canonical_source == "free":
+            connection.execute(text("""
+                UPDATE sm_stock_kline SET data_source='tencent_qt', quality_status='SOURCE_VERIFIED'
+            """))
+        elif canonical_source == "corrupt":
+            connection.execute(text("UPDATE sm_stock_kline SET volume=101"))
+
+    with engine.connect() as connection:
+        if canonical_source == "corrupt":
+            with pytest.raises(RuntimeError, match="daily database bars differ from full-market proof"):
+                strategy_daily_input_window.validate_daily_input_sessions(
+                    connection, sessions=[DAY], decision_known_at=CUTOFF,
+                )
+        else:
+            proof = strategy_daily_input_window.validate_daily_input_sessions(
+                connection, sessions=[DAY], decision_known_at=CUTOFF,
+            )
+            provider = "tencent_qt" if canonical_source == "free" else "qmt_datadir"
+            assert proof["latest_daily_truth"]["provider"] == provider
+            assert proof["daily_attested_row_count"] == 1
+    engine.dispose()
+
+
 @pytest.mark.parametrize("case", ["same_day", "old_day", "bad_inventory", "changed_bar"])
 def test_turnover_release_catchup_reuses_only_verified_target_daily_content(monkeypatch, case):
     from server.api import scheduler_runtime

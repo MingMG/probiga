@@ -86,13 +86,26 @@ def test_real_database_minute_receipt_replay_rejects_mutation_and_stale_cutoff(m
           dataset TEXT,trade_date TEXT,source_root TEXT,status TEXT,code_count INTEGER,
           row_count INTEGER,content_sha256 TEXT,run_id TEXT,started_at TEXT,
           finished_at TEXT,detail_json TEXT)"""))
+        c.execute(text("""CREATE TABLE qmt_history_coverage_manifest (
+          manifest_hash TEXT,manifest_json TEXT,captured_at TEXT,run_id TEXT,bar_count INTEGER,
+          actual_traded_count INTEGER,dataset TEXT,trade_date TEXT,provider TEXT,status TEXT,
+          strategy_eligible INTEGER,schema_version TEXT,created_at TEXT)"""))
         # Hash is computed over the database's canonical numeric representation.
     actual = coverage.persisted_matrix(engine, DAY, scope=scope())
     detail.update(actual)
     with engine.begin() as c:
         c.execute(text("INSERT INTO qmt_datadir_import_partition VALUES ('stock_minute',:day,'QMT','COMPLETE',2,482,:hash,'minute-run',:at,:at,:detail)"),
             dict(day=DAY, hash="b" * 64, at=DAY+" 20:00:00", detail=json.dumps(detail)))
-    monkeypatch.setattr(coverage, "trade_scope", lambda *a, **kw: scope())
+        c.execute(text("""INSERT INTO qmt_history_coverage_manifest
+            (manifest_hash,captured_at,dataset,trade_date,provider,status,schema_version)
+            VALUES (:daily_hash,:at,'stock_daily',:day,'qmt_datadir','EXACT',:schema)"""),
+            {"daily_hash": scope()["full_market_manifest_hash"], "at": DAY+" 19:00:00",
+             "day": DAY, "schema": coverage.DAILY_SCHEMA})
+    def current_scope(*_args, verify_rows, **_kwargs):
+        assert verify_rows
+        return scope()
+
+    monkeypatch.setattr(coverage, "trade_scope", current_scope)
     proof = coverage.load_verified_minute_publication(engine, DAY, decision_known_at=DAY+" 20:01:00")
     assert proof["status"] == "EXACT" and proof["row_count"] == 482
     with pytest.raises(ValueError, match="decision cutoff"):

@@ -6775,6 +6775,10 @@
         'market-outlook': function (d, c) {
             return window.MarketOutlook.load(d || recommendationDateValue() || currentDateValue(), c);
         },
+        'market-stage': function (d, c) {
+            var target = tradingModuleDateMode(d) === 'DEFAULT' ? '' : d;
+            return window.MarketStage.load(target, c, function (url) { return fetchRawJsonWithTimeout(url, 30000); });
+        },
         hunter: function (d, c) {
             loadHunterPage(recommendationDateValue() || d, c);
         },
@@ -7962,6 +7966,7 @@
         ]},
         {group:'市场分析', items:[
             {id:'command',icon:'🧭',label:'智能决策'},
+            {id:'market-stage',icon:'◈',label:'大盘走势阶段'},
             {id:'intraday-battle',icon:'⚡',label:'盘中作战'},
             {id:'intraday-alert',icon:'🔔',label:'盘中播报'},
             {id:'monitor',icon:'📺',label:'市场监控中心'},
@@ -8043,6 +8048,7 @@
         ]},
         {group:'市场工具', items:[
             {id:'command',icon:'🧭',label:'智能决策'},
+            {id:'market-stage',icon:'◈',label:'大盘走势阶段'},
             {id:'monitor',icon:'📺',label:'市场监控'},
             {id:'sector',icon:'🌊',label:'板块分析'},
             {id:'market-radar',icon:'📡',label:'异动雷达'}
@@ -10209,6 +10215,9 @@
         var evidence = Array.isArray(data.evidence) ? data.evidence : [];
         var caveats = Array.isArray(data.caveats) ? data.caveats : [];
         var sources = Array.isArray(data.sources) ? data.sources : [];
+        var flowEvidence = data.flow_evidence || {};
+        var marketActivity = data.market_activity || {};
+        var tradedEtfs = Array.isArray(marketActivity.etfs) ? marketActivity.etfs : [];
         var coverage = data.coverage || {};
         var signal = summary.signal || '数据不足';
         var signalTone = broadEtfTone(summary.signal_tone, signal);
@@ -10224,7 +10233,7 @@
         h += '<section class="bef-hero">';
         h += '<div class="bef-hero-copy"><span class="bef-eyebrow">BROAD-BASED ETF FLOW PROXY</span><h2>宽基 ETF 资金监测</h2>';
         h += '<p>用公开份额变化估算宽基 ETF 净申购，辅助观察大资金方向；这是代理信号，不能识别最终持有人。</p></div>';
-        h += '<div class="bef-signal bef-tone-' + signalTone + '"><small>国家队动向代理</small><strong>' + escHtml(signal) + '</strong><span>代理信号强度（非胜率） ' + escHtml(confidenceText) + '</span></div>';
+        h += '<div class="bef-signal bef-tone-' + signalTone + '"><small>份额变化线索</small><strong>' + escHtml(signal) + '</strong><span>证据覆盖评分 ' + escHtml(confidenceText) + '</span></div>';
         h += '</section>';
 
         h += '<div class="bef-meta" aria-label="数据口径状态">';
@@ -10232,15 +10241,26 @@
         h += '<span>交易日 <strong>' + escHtml(data.trade_date || '-') + '</strong></span>';
         h += '<span>数据截至 <strong>' + escHtml(data.data_as_of || '-') + '</strong></span>';
         h += '<span>覆盖 <strong>' + (coveragePct == null ? '-' : coveragePct.toFixed(0) + '%') + '</strong></span>';
+        h += '<span>份额观测 <strong>' + escHtml(flowEvidence.observed_at || '-') + '</strong></span>';
+        h += '<span>资金主体 <strong>未知</strong></span>';
         h += '</div>';
 
         h += '<section class="bef-kpis" aria-label="宽基资金关键指标">';
-        h += broadEtfKpi('今日净申购估算', summary.net_1d, '份额变化 × 前一交易日收盘价');
+        h += broadEtfKpi('单日净申购估算', summary.net_1d, (flowEvidence.trade_date || data.trade_date || '日期未知') + ' · 份额变化 × 前一交易日收盘价');
         h += broadEtfKpi('近 3 日累计', summary.net_3d, '连续性观察');
         h += broadEtfKpi('近 5 日累计', summary.net_5d, '短周期方向');
         h += broadEtfKpi('近 20 日累计', summary.net_20d, '中周期方向');
         h += '<article class="bef-kpi bef-coverage"><span>净申购 ETF 数</span><strong>' + (positiveCount == null ? '-' : positiveCount.toFixed(0)) + '<em> / ' + (totalCount == null ? '-' : totalCount.toFixed(0)) + '</em></strong><small>当日估算净申购为正</small></article>';
         h += '</section>';
+
+        h += '<section class="bef-panel"><div class="bef-panel-head"><div><span>二级市场行情</span><h3>宽基 ETF 成交额</h3></div><p>交易日 ' + escHtml(marketActivity.trade_date || '-') + ' · 独立于份额申赎</p></div>';
+        h += '<div class="bef-table-wrap"><table class="bef-table"><thead><tr><th>代码</th><th>成交额</th><th>涨跌幅</th><th>行情来源</th><th>行情质量</th></tr></thead><tbody>';
+        if (!tradedEtfs.length) h += broadEtfEmptyRow(5, '暂无可用成交额');
+        tradedEtfs.forEach(function (row) {
+            var quality = row.quality_status || 'unverified';
+            h += '<tr><td>' + escHtml(row.etf_code || '-') + '</td><td>' + escHtml(broadEtfSignedMoney(row.turnover).replace(/^\+/, '')) + '</td><td>' + escHtml(broadEtfSignedNumber(row.change_pct, '%', 2)) + '</td><td>' + escHtml(row.source || '-') + '</td><td><span class="bef-quality bef-quality-' + broadEtfQualityTone(quality) + '">' + escHtml(quality) + '</span></td></tr>';
+        });
+        h += '</tbody></table></div></section>';
 
         h += '<section class="bef-overview-grid">';
         h += '<article class="bef-panel bef-chart-panel"><div class="bef-panel-head"><div><span>日度趋势</span><h3>净申购估算与区间累计</h3></div><p>最近 ' + escHtml(data.window_days || 20) + ' 个交易日 · 金额单位随刻度显示</p></div>';

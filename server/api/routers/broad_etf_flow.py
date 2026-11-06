@@ -22,9 +22,10 @@ from typing import Any
 from xml.etree import ElementTree
 
 import requests
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 
 from server.api.routers._engine import get_engine
+from server.common.authoritative_market_clock import DAILY_CLOSE_READY_TIME, PRODUCTION_TIMEZONE
 from server.common.sql_reader import read_sql_rows
 
 logger = logging.getLogger(__name__)
@@ -104,9 +105,12 @@ def _iso_date(value: Any) -> str:
 
 def _parse_date(value: str) -> date:
     try:
-        return date.fromisoformat(str(value or "")[:10])
-    except (TypeError, ValueError):
-        return date.today()
+        result = date.fromisoformat(value)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="trade_date 必须为 YYYY-MM-DD") from exc
+    if result.isoformat() != value:
+        raise HTTPException(status_code=422, detail="trade_date 必须为 YYYY-MM-DD")
+    return result
 
 
 def _cache_get(key: str) -> dict[str, Any] | None:
@@ -128,34 +132,23 @@ def _cache_set(key: str, value: dict[str, Any]) -> None:
 
 
 def _trading_dates(requested_date: str, limit: int) -> list[str]:
+    now = datetime.now(PRODUCTION_TIMEZONE)
+    last_elapsed = now.date() if now.time() >= DAILY_CLOSE_READY_TIME else now.date() - timedelta(days=1)
     rows = read_sql_rows(
         get_engine(),
         """
         SELECT DISTINCT trade_date
-        FROM sm_etf_kline
+        FROM si_trade_calendar
         WHERE trade_date <= :trade_date
-          AND k_type = 1
-          AND adjust_type = 0
+          AND trade_status = 1
         ORDER BY trade_date DESC
         LIMIT :row_limit
         """,
-        {"trade_date": requested_date, "row_limit": limit},
+        {"trade_date": min(requested_date, last_elapsed.isoformat()), "row_limit": limit},
         context="broad_etf_flow_trade_dates",
         stringify_datetime=True,
     )
-    dates = [_iso_date(row.get("trade_date")) for row in rows]
-    dates = [item for item in dates if item]
-    if dates:
-        return dates
-
-    # Database-free test/dev fallback.  Exchange calls will discard holidays.
-    cursor = _parse_date(requested_date)
-    fallback: list[str] = []
-    while len(fallback) < limit:
-        if cursor.weekday() < 5:
-            fallback.append(cursor.isoformat())
-        cursor -= timedelta(days=1)
-    return fallback
+    return [_iso_date(row["trade_date"]) for row in rows]
 
 
 def _fetch_sse_share_day(trade_date: str) -> tuple[str, dict[str, dict[str, Any]]]:
@@ -176,20 +169,22 @@ def _fetch_sse_share_day(trade_date: str) -> tuple[str, dict[str, dict[str, Any]
         timeout=(5, 12),
     )
     response.raise_for_status()
+    observed_at = datetime.now(PRODUCTION_TIMEZONE).isoformat(timespec="seconds")
     result: dict[str, dict[str, Any]] = {}
     for row in response.json().get("result") or []:
         code = str(row.get("SEC_CODE") or "").zfill(6)
-        if code not in CORE_BY_CODE:
+        actual_date = _iso_date(row.get("STAT_DATE"))
+        if code not in CORE_BY_CODE or CORE_BY_CODE[code].exchange != "sh" or actual_date != trade_date:
             continue
         shares_10k = _safe_float(row.get("TOT_VOL"))
-        if shares_10k is None:
+        if shares_10k is None or shares_10k < 0:
             continue
-        actual_date = _iso_date(row.get("STAT_DATE")) or trade_date
         result[code] = {
             "trade_date": actual_date,
             "etf_code": code,
             "fund_share": shares_10k * 10_000,
             "source": "上交所 ETF 规模",
+            "observed_at": observed_at,
         }
     return trade_date, result
 
@@ -232,22 +227,26 @@ def _fetch_szse_share_range(start_date: str, end_date: str) -> dict[str, dict[st
         timeout=(5, 30),
     )
     response.raise_for_status()
+    observed_at = datetime.now(PRODUCTION_TIMEZONE).isoformat(timespec="seconds")
     output: dict[str, dict[str, dict[str, Any]]] = {}
     for cells in _xlsx_inline_rows(response.content)[1:]:
         if len(cells) < 4:
             continue
         trade_date, code, _name, raw_share = cells[:4]
         code = str(code).zfill(6)
-        if code not in CORE_BY_CODE:
+        actual_date = _iso_date(trade_date)
+        if (code not in CORE_BY_CODE or CORE_BY_CODE[code].exchange != "sz"
+                or not start_date <= actual_date <= end_date):
             continue
         fund_share = _safe_float(str(raw_share).replace(",", ""))
-        if fund_share is None:
+        if fund_share is None or fund_share < 0:
             continue
-        output.setdefault(_iso_date(trade_date), {})[code] = {
-            "trade_date": _iso_date(trade_date),
+        output.setdefault(actual_date, {})[code] = {
+            "trade_date": actual_date,
             "etf_code": code,
             "fund_share": fund_share,
             "source": "深交所 ETF 基金规模",
+            "observed_at": observed_at,
         }
     return output
 
@@ -289,6 +288,12 @@ def _market_id(code: str) -> int:
     return 1 if code.startswith(("5", "6")) else 0
 
 
+def _usable_price(row: dict[str, Any]) -> bool:
+    return str(row.get("quality_status") or "").upper() in {
+        "VALIDATED", "VERIFIED", "SOURCE_VERIFIED", "PUBLIC_FALLBACK",
+    }
+
+
 def _fetch_eastmoney_price_history(code: str, start_date: str, end_date: str) -> tuple[str, dict[str, dict[str, Any]]]:
     params = {
         "fields1": "f1,f2,f3,f4,f5,f6",
@@ -307,24 +312,28 @@ def _fetch_eastmoney_price_history(code: str, start_date: str, end_date: str) ->
         timeout=(5, 12),
     )
     response.raise_for_status()
-    rows = ((response.json().get("data") or {}).get("klines") or [])
+    data = response.json().get("data") or {}
+    rows = data.get("klines") or []
+    if rows and (str(data.get("code") or "") != code or str(data.get("market")) != str(_market_id(code))):
+        raise ValueError("ETF 行情响应证券身份不符")
     output: dict[str, dict[str, Any]] = {}
-    previous_close: float | None = None
     for raw in rows:
         fields = str(raw).split(",")
         if len(fields) < 11:
             continue
         row_date = _iso_date(fields[0])
         close = _safe_float(fields[2])
+        if not start_date <= row_date <= end_date or close is None or close <= 0:
+            continue
+        if row_date in output:
+            raise ValueError("ETF 行情响应交易日重复")
         output[row_date] = {
             "close": close,
-            "pre_close": previous_close,
             "change_pct": _safe_float(fields[8]),
             "amount": _safe_float(fields[6]),
             "price_source": "东方财富公开日线",
             "quality_status": "public_fallback",
         }
-        previous_close = close
     return code, output
 
 
@@ -341,12 +350,9 @@ def _collect_inputs(trade_dates: list[str]) -> tuple[
     chronological = sorted(trade_dates)
     start_date, end_date = chronological[0], chronological[-1]
     prices = _local_price_history(start_date, end_date)
-    local_codes = {
-        code
-        for date_rows in prices.values()
-        for code in date_rows
-    }
-    missing_price_codes = [code for code in CORE_CODES if code not in local_codes]
+    missing_price_codes = [code for code in CORE_CODES if any(
+        not _usable_price(prices.get(day, {}).get(code, {})) for day in chronological
+    )]
     shares: dict[str, dict[str, dict[str, Any]]] = {}
     warnings: list[str] = []
 
@@ -377,7 +383,9 @@ def _collect_inputs(trade_dates: list[str]) -> tuple[
                 else:
                     code, code_rows = value
                     for row_date, price_row in code_rows.items():
-                        prices.setdefault(row_date, {})[code] = price_row
+                        date_prices = prices.setdefault(row_date, {})
+                        if not _usable_price(date_prices.get(code, {})):
+                            date_prices[code] = price_row
             except Exception as exc:
                 logger.warning("Broad ETF flow source %s %s failed: %s", kind, label, exc)
                 warnings.append(f"{kind}:{label} 数据暂不可用")
@@ -405,13 +413,18 @@ def _build_flow_rows(
                 continue
             current_value = _safe_float(current_share.get("fund_share"))
             previous_value = _safe_float(previous_share.get("fund_share"))
-            multiplier = _safe_float(price.get("pre_close")) or _safe_float(previous_price.get("close"))
-            if current_value is None or previous_value in (None, 0) or multiplier is None:
+            if current_value is None or current_value < 0 or previous_value is None or previous_value <= 0:
                 continue
+            usable_price = price if _usable_price(price) else {}
+            multiplier = _safe_float(usable_price.get("pre_close"))
+            if multiplier is None or multiplier <= 0:
+                multiplier = _safe_float(previous_price.get("close")) if _usable_price(previous_price) else None
             share_change = current_value - previous_value
             share_change_pct = share_change / previous_value * 100
             quality_status = str(price.get("quality_status") or "public")
-            net_amount: float | None = share_change * multiplier
+            net_amount = share_change * multiplier if multiplier is not None and multiplier > 0 else None
+            if net_amount is None:
+                quality_status = "missing_price_reference"
             if abs(share_change_pct) >= 35:
                 # A split/merge can look like a huge subscription.  Keep the
                 # share fact visible but exclude it from monetary aggregation.
@@ -427,10 +440,12 @@ def _build_flow_rows(
                 "share_change": share_change,
                 "share_change_pct": share_change_pct,
                 "fund_share": current_value,
-                "price": _safe_float(price.get("close")),
-                "change_pct": _safe_float(price.get("change_pct")),
-                "amount": _safe_float(price.get("amount")),
+                "price": _safe_float(usable_price.get("close")),
+                "change_pct": _safe_float(usable_price.get("change_pct")),
+                "amount": _safe_float(usable_price.get("amount")),
                 "source": str(current_share.get("source") or "交易所公开份额"),
+                "share_observed_at": max(current_share.get("observed_at") or "",
+                                         previous_share.get("observed_at") or "") or None,
                 "flow_method": "份额变化 × 前一交易日收盘价",
                 "quality_status": quality_status,
             })
@@ -470,12 +485,13 @@ def _signal(
     selected_rows: list[dict[str, Any]],
     expected: int,
 ) -> tuple[dict[str, Any], list[dict[str, str]]]:
-    net_1d = float(history[-1].get("net_amount") or 0) if history else 0.0
     net_3d = _window_sum(history, 3)
     net_5d = _window_sum(history, 5)
     net_20d = _window_sum(history, 20)
     available = len(selected_rows)
     coverage_pct = available / expected * 100 if expected else 0.0
+    net_1d = (_safe_float(history[-1].get("net_amount"))
+              if history and coverage_pct >= _MIN_RELIABLE_COVERAGE_PCT else None)
     prior_values = [
         float(row["net_amount"])
         for row in history[:-1]
@@ -487,7 +503,7 @@ def _signal(
     noise = max(2_000_000_000.0, 0.5 * absolute_base)
     strong = max(20_000_000_000.0, 2.5 * absolute_base)
     material = max(5_000_000_000.0, 1.5 * absolute_base)
-    percentile = _percentile(prior_absolute, abs(net_1d))
+    percentile = _percentile(prior_absolute, abs(net_1d)) if net_1d is not None else None
 
     valid_benchmarks: dict[str, float] = {}
     for row in selected_rows:
@@ -515,16 +531,17 @@ def _signal(
         and net_5d >= max(10_000_000_000.0, 2 * absolute_base)
     )
     broad = positive_benchmarks >= 3 and negative_benchmarks == 0
-    counter_cyclical = median_return is not None and median_return <= -0.5 and net_1d > noise
+    counter_cyclical = (net_1d is not None and net_1d > noise
+                       and median_return is not None and median_return <= -0.5)
 
-    if coverage_pct < 65:
+    if net_1d is None:
         signal = "数据不足，暂不判断"
         tone = "unknown"
     elif net_1d >= strong:
-        signal = "较强护盘型资金线索" if broad or counter_cyclical else "当日强净申购"
+        signal = "较强护盘型资金线索" if counter_cyclical else "当日强净申购"
         tone = "inflow"
-    elif net_1d >= material or persistent:
-        signal = "一定护盘型资金线索" if broad or counter_cyclical else "当日净申购"
+    elif net_1d >= material or (net_1d > noise and persistent):
+        signal = "一定护盘型资金线索" if counter_cyclical else "当日净申购"
         tone = "inflow"
     elif net_1d > noise:
         signal = "资金入场线索较弱"
@@ -545,7 +562,9 @@ def _signal(
         if float(row.get("coverage_pct") or 0) >= _MIN_RELIABLE_COVERAGE_PCT
         and row.get("net_amount") is not None
     )
-    if coverage_pct >= 90 and history_days >= 12:
+    if net_1d is None:
+        confidence_label = "不可用"
+    elif coverage_pct >= 90 and history_days >= 12:
         confidence_label = "较高"
     elif coverage_pct >= 75 and history_days >= 8:
         confidence_label = "中等"
@@ -553,15 +572,19 @@ def _signal(
         confidence_label = "较低"
     else:
         confidence_label = "不可用"
-    confidence = round(min(100.0, coverage_pct * 0.7 + min(history_days, 12) / 12 * 30), 1)
+    confidence = round(min(100.0, coverage_pct * 0.7 + min(history_days, 12) / 12 * 30), 1) if net_1d is not None else 0
 
     evidence: list[dict[str, str]] = []
-    direction = "估算净申购" if net_1d >= 0 else "估算净赎回"
-    evidence.append({
-        "kind": "positive" if net_1d > noise else "negative" if net_1d < -noise else "neutral",
-        "title": f"当日{direction} {abs(net_1d) / 100_000_000:.2f}亿元",
-        "detail": f"核心观察池覆盖 {available}/{expected} 只；金额未按缺失覆盖率放大。",
-    })
+    if net_1d is None:
+        evidence.append({"kind": "warning", "title": "当日净申赎金额不可用",
+                         "detail": f"可估算份额变动的产品仅 {available}/{expected} 只。"})
+    else:
+        direction = "估算净申购" if net_1d >= 0 else "估算净赎回"
+        evidence.append({
+            "kind": "positive" if net_1d > noise else "negative" if net_1d < -noise else "neutral",
+            "title": f"当日{direction} {abs(net_1d) / 100_000_000:.2f}亿元",
+            "detail": f"核心观察池覆盖 {available}/{expected} 只；金额未按缺失覆盖率放大。",
+        })
     if net_5d is None:
         evidence.append({
             "kind": "warning",
@@ -586,7 +609,7 @@ def _signal(
             "title": "下跌日出现逆势承接",
             "detail": f"观察池 ETF 涨跌幅中位数 {median_return:.2f}%，同时份额净增加。",
         })
-    elif median_return is not None and median_return >= 0.5 and net_1d > noise:
+    elif net_1d is not None and net_1d > noise and median_return is not None and median_return >= 0.5:
         evidence.append({
             "kind": "neutral",
             "title": "资金与上涨同向",
@@ -607,6 +630,10 @@ def _signal(
         "confidence": confidence,
         "confidence_label": confidence_label,
         "identity_status": "未确认",
+        "flow_pattern": "COUNTERCYCLICAL_CREATION" if counter_cyclical and tone == "inflow" else {
+            "inflow": "NET_CREATION", "outflow": "NET_REDEMPTION", "neutral": "NO_CLEAR_PATTERN",
+            "unknown": "UNKNOWN",
+        }[tone],
         "net_1d": net_1d,
         "net_3d": net_3d,
         "net_5d": net_5d,
@@ -633,17 +660,14 @@ def _build_payload(requested_date: str, days: int) -> dict[str, Any]:
         by_date.setdefault(str(row["trade_date"]), []).append(row)
 
     history: list[dict[str, Any]] = []
-    for row_date in sorted(by_date):
-        date_rows = [row for row in by_date[row_date] if row.get("net_amount") is not None]
+    for row_date in trade_dates[1:]:
+        date_rows = [row for row in by_date.get(row_date, ()) if row.get("net_amount") is not None]
         history.append({
             "trade_date": row_date,
-            "net_amount": _sum(date_rows),
+            "net_amount": _sum(date_rows) if date_rows else None,
             "coverage_pct": round(len(date_rows) / len(CORE_ETFS) * 100, 1),
             "available": len(date_rows),
         })
-    if not history:
-        raise RuntimeError("交易所 ETF 份额数据暂不可用")
-
     # Prefer the requested/latest date when coverage clears the minimum gate;
     # otherwise fall back to the most recent usable date and expose the lag.
     usable = [
@@ -670,6 +694,18 @@ def _build_payload(requested_date: str, days: int) -> dict[str, Any]:
     selected_rows_all = [row for row in flow_rows if row["trade_date"] == trade_date]
     selected_rows = [row for row in selected_rows_all if row.get("net_amount") is not None]
     summary, evidence = _signal(history, selected_rows, len(CORE_ETFS))
+    observed_at = max((row.get("share_observed_at") or "" for row in selected_rows_all), default="") or None
+    activity_date = trade_dates[-1]
+    activity = []
+    for code, price in sorted(prices.get(activity_date, {}).items()):
+        if code not in CORE_BY_CODE:
+            continue
+        usable = _usable_price(price)
+        turnover = _safe_float(price.get("amount")) if usable else None
+        activity.append({"etf_code": code, "turnover": turnover if turnover is not None and turnover >= 0 else None,
+                         "change_pct": price.get("change_pct") if usable else None,
+                         "source": price.get("price_source"),
+                         "quality_status": price.get("quality_status") or "unverified"})
 
     benchmarks: list[dict[str, Any]] = []
     benchmark_names = sorted({item.benchmark for item in CORE_ETFS})
@@ -721,6 +757,8 @@ def _build_payload(requested_date: str, days: int) -> dict[str, Any]:
         "公开日频份额不能识别申购、赎回主体；国家队身份只有公告或专项持仓披露才能确认。",
         "净申购可能包含申购套利、做市库存调整和普通机构配置，不等于方向性看多。",
         "观察池覆盖主要核心宽基产品，不代表全市场所有同标的 ETF；缺失金额不会按覆盖率放大。",
+        "交易所份额的接口读取时间只证明本次查询所见，缺少原始发布时间时不可用于历史盘中回放。",
+        "数据覆盖评分由可估算产品覆盖和有效历史样本数决定。",
     ]
     if warnings:
         caveats.append("部分数据源读取失败：" + "；".join(warnings[:6]))
@@ -728,12 +766,14 @@ def _build_payload(requested_date: str, days: int) -> dict[str, Any]:
         caveats.append("覆盖低于65%的历史日已留空，不会把缺失 ETF 隐式按0元计入区间累计。")
 
     excluded_rows = [row for row in selected_rows_all if row.get("net_amount") is None]
-    if excluded_rows:
+    if any(row["quality_status"] == "corporate_action_suspected" for row in excluded_rows):
         caveats.append("疑似份额拆分、合并等公司行为的记录保留在明细中，但不计入资金汇总。")
+    if any(row["quality_status"] == "missing_price_reference" for row in excluded_rows):
+        caveats.append("缺少有效前收盘价的产品只显示份额变化，金额不计入资金汇总。")
 
     if summary["coverage_pct"] < _MIN_RELIABLE_COVERAGE_PCT:
         status = "insufficient"
-    elif any(summary.get(field) is None for field in ("net_3d", "net_5d", "net_20d")) or excluded_rows:
+    elif trade_date != activity_date or any(summary.get(field) is None for field in ("net_3d", "net_5d", "net_20d")) or excluded_rows:
         status = "degraded"
     else:
         status = "ok"
@@ -746,6 +786,12 @@ def _build_payload(requested_date: str, days: int) -> dict[str, Any]:
         "window_days": days,
         "scope_label": "4只核心宽基 ETF 观察池",
         "summary": summary,
+        "flow_evidence": {"basis": "EXCHANGE_DAILY_SHARE_CHANGE", "trade_date": trade_date,
+                          "observed_at": observed_at, "publication_time_status": "UNKNOWN",
+                          "historical_pit_eligible": False, "actor_status": "UNKNOWN",
+                          "pattern": summary["flow_pattern"]},
+        "market_activity": {"basis": "SECONDARY_MARKET_TURNOVER", "trade_date": activity_date,
+                            "etfs": activity},
         "history": history,
         "benchmarks": benchmarks,
         "etfs": sorted(
@@ -776,13 +822,13 @@ def _build_payload(requested_date: str, days: int) -> dict[str, Any]:
                 for row in excluded_rows
             ],
         },
-        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "generated_at": datetime.now(PRODUCTION_TIMEZONE).isoformat(timespec="seconds"),
     }
 
 
 @router.get("/hot-data/broad-etf-flow")
 def broad_etf_flow(
-    trade_date: str = Query(default_factory=lambda: date.today().isoformat()),
+    trade_date: str = Query(default_factory=lambda: datetime.now(PRODUCTION_TIMEZONE).date().isoformat()),
     days: int = Query(default=20, ge=5, le=20),
     refresh: bool = Query(default=False),
 ):
@@ -808,6 +854,7 @@ def broad_etf_flow(
                 "confidence": 0,
                 "confidence_label": "不可用",
                 "identity_status": "未确认",
+                "flow_pattern": "UNKNOWN",
                 "net_1d": None,
                 "net_3d": None,
                 "net_5d": None,
@@ -816,6 +863,11 @@ def broad_etf_flow(
                 "total_count": 0,
                 "coverage_pct": 0,
             },
+            "flow_evidence": {"basis": "EXCHANGE_DAILY_SHARE_CHANGE", "trade_date": None,
+                              "observed_at": None, "publication_time_status": "UNKNOWN",
+                              "historical_pit_eligible": False, "actor_status": "UNKNOWN",
+                              "pattern": "UNKNOWN"},
+            "market_activity": {"basis": "SECONDARY_MARKET_TURNOVER", "trade_date": None, "etfs": []},
             "history": [],
             "benchmarks": [],
             "etfs": [],

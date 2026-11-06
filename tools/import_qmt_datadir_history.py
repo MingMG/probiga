@@ -39,6 +39,7 @@ if str(ROOT) not in sys.path:
 
 from integrations.qmt.datadir import CST, MINUTE_PERIOD, load_dat, iter_minute_rows, select_records  # noqa: E402
 from integrations.qmt.datadir_import import (  # noqa: E402
+    ATTEMPT_DATASET,
     DEFAULT_CHUNK_ROWS,
     DEFAULT_SESSIONS_PER_BATCH,
     DATASET,
@@ -46,11 +47,13 @@ from integrations.qmt.datadir_import import (  # noqa: E402
     STATUS_COMPLETE,
     STATUS_FAILED,
     STATUS_RUNNING,
+    clear_minute_attempt,
     require_schema,
-    completed_sessions,
     drop_staged,
     existing_sources,
     harvest,
+    is_current_minute_receipt,
+    load_minute_partition_receipts,
     load_universe,
     new_batch_id,
     new_run_id,
@@ -72,6 +75,7 @@ from server.common.qmt_datadir_result import (  # noqa: E402
     partition_from_receipt,
 )
 from server.common.qmt_datadir_minute_coverage import (  # noqa: E402
+    archive_minute_publication,
     trade_scope, validate_code_scope, validate_matrix, persisted_matrix, staged_matrix,
 )
 from server.common.mysql_lock import mysql_named_lock, STOCK_MINUTE_FREEZE_LOCK_NAME  # noqa: E402
@@ -189,9 +193,9 @@ def _prior_completed_partitions(connection, session, receipt):
 
 def _reuse_existing_partition(engine, *, session, scope, datadir_roots=(), universe=()):
     """Rebind proven existing data to today's valid scope without rewriting rows."""
-    receipt = load_receipt(engine, dataset=DATASET, trade_date=session.isoformat())
     with _minute_write_connection(engine) as connection:
         with connection.begin():
+            receipt = load_receipt(connection, dataset=DATASET, trade_date=session.isoformat())
             candidates = _prior_completed_partitions(connection, session, receipt)
             candidates = [item for item in candidates
                           if item["code_count"] == len(scope["codes"])]
@@ -222,11 +226,13 @@ def _reuse_existing_partition(engine, *, session, scope, datadir_roots=(), unive
             if original is None:
                 return None
             trade_scope(connection, session.isoformat(), manifest_hash=scope["full_market_manifest_hash"])
+            archive_minute_publication(connection, receipt)
             write_receipt(connection, session=session, root=original["source_root"],
                 status=STATUS_COMPLETE, run_id=original["run_id"],
                 row_count=fingerprint["row_count"], code_count=fingerprint["code_count"],
                 content_sha256=original["content_sha256"], finished=True,
                 detail={**_completion_detail(fingerprint), "reused_existing_partition": True})
+            clear_minute_attempt(connection, session)
     print(f"{session} REUSED rows={fingerprint['row_count']} codes={fingerprint['code_count']}", flush=True)
     return {"session": session.isoformat(), "status": STATUS_COMPLETE,
             "rows": fingerprint["row_count"], "codes": fingerprint["code_count"],
@@ -234,7 +240,10 @@ def _reuse_existing_partition(engine, *, session, scope, datadir_roots=(), unive
 
 
 def _resume_staged_partition(engine, *, session, scope, replace, replace_sources):
-    receipt = load_receipt(engine, dataset=DATASET, trade_date=session.isoformat())
+    receipt = load_receipt(engine, dataset=ATTEMPT_DATASET, trade_date=session.isoformat())
+    if receipt is None:
+        # Existing staged runs may predate the separate attempt slot.
+        receipt = load_receipt(engine, dataset=DATASET, trade_date=session.isoformat())
     if (receipt is None or receipt.get("status") not in {STATUS_FAILED, STATUS_RUNNING}
             or not receipt.get("detail", {}).get("staged_rows_retained")
             or int(receipt["code_count"]) != len(scope["codes"])
@@ -292,20 +301,24 @@ def _task_result(
     sessions: list[dt.date],
 ) -> dict:
     partitions = []
-    for session in sessions:
-        receipt = load_receipt(
-            engine,
-            dataset=DATASET,
-            trade_date=session.isoformat(),
-        )
-        if receipt is not None:
-            partitions.append(partition_from_receipt(receipt))
+    for session, receipt in load_minute_partition_receipts(engine, sessions).items():
+        if receipt["status"] == STATUS_COMPLETE and not is_current_minute_receipt(receipt):
+            print(f"{session} minute receipt does not prove the current daily scope", file=sys.stderr)
+            continue
+        partitions.append(partition_from_receipt(receipt))
     return build_result(
         dataset=DATASET,
         sessions=[session.isoformat() for session in sessions],
         partitions=partitions,
         build_sha=_build_sha(),
     )
+
+
+def _finish_run(engine, *, sessions: list[dt.date], emit_json: bool) -> int:
+    result = _task_result(engine, sessions=sessions)
+    if emit_json:
+        print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+    return 0 if result["status"] == "PASS" else 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -358,11 +371,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("the QMT calendar has no session in the requested range")
 
     universe = load_universe(engine, start=start, end=end)
+    receipts = load_minute_partition_receipts(engine, sessions)
     plans = plan(
         existing_sources(engine, sessions),
         sessions,
         replace_existing=args.replace_existing,
-        already_complete=completed_sessions(engine),
+        already_complete={day for day, receipt in receipts.items() if is_current_minute_receipt(receipt)},
     )
     report = {
         "datadir_roots": [str(root) for root in datadir_roots],
@@ -390,13 +404,7 @@ def main(argv: list[str] | None = None) -> int:
     todo = [item for item in plans if item.action in ACTIONABLE]
     if not todo:
         print("nothing to import")
-        if args.json:
-            print(json.dumps(
-                _task_result(engine, sessions=sessions),
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ))
-        return 0
+        return _finish_run(engine, sessions=sessions, emit_json=args.json)
 
     require_schema(engine)
     replace_sources = sorted({
@@ -499,18 +507,21 @@ def main(argv: list[str] | None = None) -> int:
             continue
         failure = shortfalls.get(session, {})
         failures += 1
-        with engine.begin() as conn:
-            write_receipt(
-                conn, session=session, root=failure.get("root", ""),
-                status=STATUS_FAILED, run_id=failure.get("run_id", ""),
-                row_count=failure.get("rows", 0),
-                code_count=failure.get("imported_codes", 0),
-                content_sha256=failure.get("digest", ""), finished=True,
-                detail={"reason": failure.get("reason", "not_attempted"),
-                        "eligible_codes": failure.get("eligible_codes", 0),
-                        "imported_codes": failure.get("imported_codes", 0),
-                        "bad_grid_codes": failure.get("bad_grid_codes", 0)},
-            )
+        with _minute_write_connection(engine) as conn, conn.begin():
+            attempt = load_receipt(conn, dataset=ATTEMPT_DATASET, trade_date=session.isoformat())
+            # A source shortfall has no new resumable stage. Retain an earlier complete landing.
+            if not attempt or not attempt["detail"].get("staged_rows_retained"):
+                write_receipt(
+                    conn, dataset=ATTEMPT_DATASET, session=session, root=failure.get("root", ""),
+                    status=STATUS_FAILED, run_id=failure.get("run_id", ""),
+                    row_count=failure.get("rows", 0),
+                    code_count=failure.get("imported_codes", 0),
+                    content_sha256=failure.get("digest", ""), finished=True,
+                    detail={"reason": failure.get("reason", "not_attempted"),
+                            "eligible_codes": failure.get("eligible_codes", 0),
+                            "imported_codes": failure.get("imported_codes", 0),
+                            "bad_grid_codes": failure.get("bad_grid_codes", 0)},
+                )
         print(f"{session} FAILED {failure.get('reason', 'not_attempted')} "
               f"imported_codes={failure.get('imported_codes', 0)} "
               f"eligible_codes={failure.get('eligible_codes', 0)}")
@@ -522,13 +533,7 @@ def main(argv: list[str] | None = None) -> int:
 
     report["results"] = results
     report["failures"] = failures
-    if args.json:
-        print(json.dumps(
-            _task_result(engine, sessions=sessions),
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ))
-    return 1 if failures else 0
+    return _finish_run(engine, sessions=sessions, emit_json=args.json) or int(bool(failures))
 
 
 def _publish_one(
@@ -545,34 +550,32 @@ def _publish_one(
     """Stage-to-canonical publication of one session, proven by readback."""
     progress = MinuteImportProgress(run_id=run_id, total_units=entry["rows"],
         operation="publication", days=[session])
-    try:
-        with _minute_write_connection(engine) as conn:
-            with conn.begin():
-                write_receipt(
-                    conn, session=session, root=str(root), status=STATUS_RUNNING,
-                    run_id=run_id, row_count=entry["rows"], code_count=len(entry["codes"]),
-                    content_sha256=entry["digest"], detail={"staged_rows_retained": True},
-                )
+    with _minute_write_connection(engine) as conn:
+        with conn.begin():
+            write_receipt(
+                conn, dataset=ATTEMPT_DATASET, session=session, root=str(root), status=STATUS_RUNNING,
+                run_id=run_id, row_count=entry["rows"], code_count=len(entry["codes"]),
+                content_sha256=entry["digest"], detail={"staged_rows_retained": True},
+            )
+        try:
             with conn.begin():
                 outcome = _publish_locked(conn, session=session, entry=entry, run_id=run_id,
-                    root=root, replace=replace, replace_sources=replace_sources,
-                    scope=scope, progress=progress)
-        progress.emit("canonical_commit", status="COMPLETE", completed_units=outcome["rows"])
-        print(f"{session} COMPLETE rows={outcome['rows']} codes={outcome['codes']} root={root}")
-        return outcome
-    except Exception as exc:  # noqa: BLE001 - the receipt records the cause
-        progress.emit("publication", status="FAILED", error_type=type(exc).__name__)
-        with engine.begin() as conn:
-            write_receipt(
-                conn, session=session, root=str(root),
-                status=STATUS_FAILED, run_id=run_id,
-                row_count=entry["rows"], code_count=len(entry["codes"]),
-                content_sha256=entry["digest"], finished=True,
-                detail={"error": f"{type(exc).__name__}: {exc}", "staged_rows_retained": True},
-            )
-        print(f"{session} FAILED {type(exc).__name__}: {exc}")
-        return {"session": session.isoformat(), "status": STATUS_FAILED,
-                "root": str(root), "error": str(exc)}
+                    root=root, replace=replace, replace_sources=replace_sources, scope=scope, progress=progress)
+        except Exception as exc:
+            progress.emit("publication", status="FAILED", error_type=type(exc).__name__)
+            with conn.begin():
+                write_receipt(
+                    conn, dataset=ATTEMPT_DATASET, session=session, root=str(root), status=STATUS_FAILED,
+                    run_id=run_id, row_count=entry["rows"], code_count=len(entry["codes"]),
+                    content_sha256=entry["digest"], finished=True,
+                    detail={"error": f"{type(exc).__name__}: {exc}", "staged_rows_retained": True},
+                )
+            print(f"{session} FAILED {type(exc).__name__}: {exc}")
+            return {"session": session.isoformat(), "status": STATUS_FAILED,
+                    "root": str(root), "error": str(exc)}
+    progress.emit("canonical_commit", status="COMPLETE", completed_units=outcome["rows"])
+    print(f"{session} COMPLETE rows={outcome['rows']} codes={outcome['codes']} root={root}")
+    return outcome
 
 
 def _publish_locked(conn, *, session, entry, run_id, root, replace, replace_sources, scope, progress):
@@ -590,9 +593,11 @@ def _publish_locked(conn, *, session, entry, run_id, root, replace, replace_sour
     rows, codes = fingerprint["row_count"], fingerprint["code_count"]
     if rows != entry["rows"] or codes != len(entry["codes"]):
         raise ValueError("exact minute matrix differs from harvested partition")
+    archive_minute_publication(conn, load_receipt(conn, dataset=DATASET, trade_date=session.isoformat()))
     write_receipt(conn, session=session, root=str(root), status=STATUS_COMPLETE,
         run_id=run_id, row_count=rows, code_count=codes,
         content_sha256=entry["digest"], finished=True, detail=_completion_detail(fingerprint))
+    clear_minute_attempt(conn, session)
     return {"session": session.isoformat(), "status": STATUS_COMPLETE,
             "rows": rows, "codes": codes, "root": str(root)}
 

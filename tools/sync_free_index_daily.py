@@ -21,13 +21,14 @@ if str(ROOT) not in sys.path:
 from biz.stock_market.sync_stock_market import step_index_kline
 from server.common.authoritative_market_clock import authoritative_closed_trade_date
 from server.common.batch_db import create_batch_engine
+from server.common.index_daily_publication import FREE_RECEIPT_SCHEMA, canonical_free_index_rows
 from server.common.kline_data import get_kline_engine
 from server.common.qmt_attestation_contract import canonical_digest
 from tools.env_config import load_project_env
 
 
 RESULT_SCHEMA = "probiga.free-index-daily-result.v1"
-RECEIPT_SCHEMA = "probiga.free-index-daily-receipt.v1"
+RECEIPT_SCHEMA = FREE_RECEIPT_SCHEMA
 DATASET = "index_daily"
 PARTITION_KEY = "__index_daily_partition__"
 PROVIDER = "tencent_east_verified"
@@ -44,24 +45,6 @@ EXCLUDED_UNSUPPORTED_INDEX_CODES = frozenset(
 
 def _now() -> datetime:
     return datetime.now().replace(microsecond=0)
-
-
-def _canonical_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    result = []
-    for row in rows:
-        result.append(
-            {
-                "index_code": str(row["index_code"]).zfill(6),
-                "trade_date": str(row["trade_date"])[:10],
-                "open": str(row["open"]),
-                "close": str(row["close"]),
-                "high": str(row["high"]),
-                "low": str(row["low"]),
-                "volume": str(row["volume"]),
-                "amount": str(row["amount"]),
-            }
-        )
-    return sorted(result, key=lambda item: item["index_code"])
 
 
 def _read_target(engine: Any, target_date: str) -> list[dict[str, Any]]:
@@ -116,7 +99,7 @@ def _write_receipt(
     rows: list[dict[str, Any]],
     captured_at: str,
 ) -> dict[str, Any]:
-    canonical = _canonical_rows(rows)
+    canonical = canonical_free_index_rows(rows)
     codes = sorted({row["index_code"] for row in canonical})
     missing = sorted(set(expected_codes) - set(codes))
     unsigned = {

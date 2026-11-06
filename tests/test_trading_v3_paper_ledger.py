@@ -125,6 +125,43 @@ def test_paper_ledger_uses_real_v2_read_repository(monkeypatch):
     assert result["data"]["positions"][0]["buy_at"] == "2026-08-12 09:31:00"
     assert result["data"]["positions"][0]["lot_details"][0]["quantity"] == 1000
     assert result["data"]["real_trading_enabled"] is False
+    assert result["data"]["execution_quality"]["adverse_price_vs_order_limit_bps"] is None
+    assert result["data"]["execution_quality"]["average_order_completion_seconds"] is None
+
+
+def test_paper_ledger_reports_execution_from_bounded_order_evidence(monkeypatch):
+    class OrdersConnection(_Connection):
+        def execute(self, statement, params):
+            if "FROM st_sim_order" in str(statement):
+                assert params["limit"] == 3
+                return _Rows([
+                    {"id": 1, "side": "BUY", "status": "FILLED", "requested_shares": 100,
+                     "filled_shares": 100, "limit_price": 10, "filled_price": 9.9, "fee": 1.5,
+                     "created_at": "2026-08-12 09:30:01", "filled_at": "2026-08-12 09:30:10"},
+                    {"id": 2, "side": "SELL", "status": "PARTIAL", "requested_shares": 100,
+                     "filled_shares": 50, "limit_price": 20, "filled_price": 20.2, "fee": 2.0,
+                     "created_at": "2026-08-12 09:30:01"},
+                    {"id": 3, "side": "BUY", "status": "CANCELLED", "requested_shares": 100,
+                     "filled_shares": 0},
+                ])
+            return super().execute(statement, params)
+
+    monkeypatch.setattr(trading_v3, "get_engine", lambda: type(
+        "OrdersEngine", (), {"connect": lambda self: OrdersConnection()},
+    )())
+    evidence = trading_v3.paper_ledger(account_id="paper-main-v2", limit=3)["data"]["execution_quality"]
+
+    assert evidence["ledger_source"] == "LEGACY_EVENT_SIM"
+    assert evidence["scope"] == "LATEST_ORDERS_SAMPLE"
+    assert evidence["sample_reached_limit"] is True
+    assert evidence["status_counts"] == {"FILLED": 1, "PARTIAL": 1, "CANCELLED": 1}
+    assert evidence["orders_with_fills"] == 2
+    assert evidence["partially_filled_orders"] == 1
+    assert evidence["price_sample_count"] == 2
+    assert evidence["adverse_price_vs_order_limit_bps"] == -100.0
+    assert evidence["completion_latency_sample_count"] == 1
+    assert evidence["average_order_completion_seconds"] == 9.0
+    assert evidence["observed_fee_cny"] == 3.5
 
 
 def test_paper_ledger_merges_same_stock_with_weighted_cost(monkeypatch):

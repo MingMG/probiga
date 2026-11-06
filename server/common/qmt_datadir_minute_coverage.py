@@ -16,13 +16,17 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import text
 
 from server.common.qmt_attestation_contract import canonical_digest
-from server.common.qmt_datadir_daily_coverage import load_daily_manifest
+from server.common.qmt_datadir_daily_coverage import SCHEMA as DAILY_SCHEMA, load_daily_manifest
 from server.common.qmt_index_minute_grid import CORE_GRID
 from server.common.qmt_datadir_progress import MinuteImportProgress
 from server.common.auxiliary_runtime_schema import QMT_DATADIR_STAGE_INDEX_NAME
+from server.common.qmt_history_coverage import COVERAGE_TABLE
 
 GRID_HASH = canonical_digest(list(CORE_GRID))
 SCHEMA = "probiga.qmt-datadir-minute-coverage.v1"
+ATTEMPT_DATASET = "stock_minute_attempt"
+_ARCHIVE_SCHEMA = "probiga.qmt-datadir-minute-publication.v1"
+_ARCHIVE_DATASET = "stock_minute_publication"
 _MATRIX_FIELDS = ("stock_code", "trade_time", "trade_date", "price", "change", "change_pct",
     "volume", "amount", "qmt_code", "data_source", "source_time", "batch_id", "data_version",
     "quality_status", "permission_status")
@@ -30,10 +34,11 @@ _NUMERIC_FIELDS = ("price", "change", "change_pct", "volume", "amount")
 _MAX_GROUP_JSON_BYTES = 1024 * 1024
 
 
-def trade_scope(engine, day: str, *, manifest_hash: str = "", decision_known_at=None) -> dict:
+def trade_scope(engine, day: str, *, manifest_hash: str = "", decision_known_at=None,
+                verify_rows: bool = True) -> dict:
     cutoff = decision_known_at or datetime.now(ZoneInfo("Asia/Shanghai"))
     proof = load_daily_manifest(engine, day, decision_known_at=cutoff,
-        manifest_hash=manifest_hash)
+        manifest_hash=manifest_hash, verify_rows=verify_rows)
     if proof is None:
         raise ValueError("DATA_BLOCKED: exact daily manifest is required before minute publication")
     codes = tuple(item["stock_code"] for item in proof["entities"]
@@ -407,24 +412,112 @@ def staged_matrix(connection, day: str, *, scope: dict, run_id: str) -> dict:
         rows.close()
 
 
+def _minute_timestamp(value) -> datetime:
+    stamp = datetime.fromisoformat(str(value)) if not isinstance(value, datetime) else value
+    return stamp.astimezone(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None) if stamp.tzinfo else stamp
+
+
+def archive_minute_publication(connection, receipt) -> None:
+    """Seal the old publication before advancing the canonical receipt pointer."""
+    from server.common.qmt_datadir_result import SHA64, partition_from_receipt
+
+    if not receipt or receipt["status"] != "COMPLETE" or not receipt.get("finished_at"):
+        return
+    partition = partition_from_receipt(receipt)
+    detail = receipt["detail"]
+    rows, codes = partition["row_count"], partition["code_count"]
+    hashes = ("row_hash", "content_sha256", "full_market_manifest_hash", "expected_traded_code_set_sha256")
+    if (not partition["run_id"] or not partition["source_root"] or codes <= 0
+            or rows != codes * len(CORE_GRID) or codes != partition["eligible_code_count"]
+            or rows != partition["readback_rows"] or codes != partition["readback_codes"]
+            or partition["coverage"] != 1.0 or detail.get("bad_grid_codes") != 0
+            or partition["minute_grid_count"] != len(CORE_GRID) or partition["minute_grid_sha256"] != GRID_HASH
+            or any(SHA64.fullmatch(partition[key]) is None for key in hashes)):
+        return
+    known_at = _minute_timestamp(receipt["finished_at"]).isoformat(sep=" ")
+    proof = {"schema": _ARCHIVE_SCHEMA, "known_at": known_at, "partition": partition}
+    digest = canonical_digest(proof)
+    code_hash = partition["expected_traded_code_set_sha256"]
+    connection.execute(text(f"""
+        INSERT INTO {COVERAGE_TABLE} (manifest_hash,schema_version,dataset,period,provider,trade_date,
+            status,strategy_eligible,run_id,grid_profile,expected_entity_count,entity_count,
+            expected_traded_count,actual_traded_count,bar_count,expected_entity_set_hash,
+            expected_traded_set_hash,actual_traded_set_hash,no_trade_set_hash,entity_root_hash,
+            captured_at,manifest_json,created_at)
+        SELECT :digest,:schema,:dataset,'1m','qmt_datadir',:day,'EXACT',1,:run_id,:grid_hash,
+            :codes,:codes,:codes,:codes,:rows,:code_hash,:code_hash,:code_hash,:empty_hash,
+            :row_hash,:known_at,:proof,CURRENT_TIMESTAMP
+        WHERE NOT EXISTS (SELECT 1 FROM {COVERAGE_TABLE} WHERE manifest_hash=:digest)
+    """), dict(digest=digest, schema=_ARCHIVE_SCHEMA, dataset=_ARCHIVE_DATASET,
+        day=partition["trade_date"], run_id=partition["run_id"], grid_hash=GRID_HASH,
+        codes=codes, rows=rows, code_hash=code_hash, empty_hash=canonical_digest([]),
+        row_hash=partition["row_hash"], known_at=known_at,
+        proof=json.dumps(proof, ensure_ascii=False, separators=(",", ":"))))
+
+
+def _archived_minute_publication(engine, day: str, cutoff: datetime) -> dict | None:
+    connection_scope = engine.connect() if callable(getattr(engine, "connect", None)) else nullcontext(engine)
+    with connection_scope as connection:
+        row = connection.execute(text(f"""
+            SELECT manifest_hash,manifest_json,captured_at,run_id,bar_count,actual_traded_count
+              FROM {COVERAGE_TABLE}
+             WHERE dataset=:dataset AND trade_date=:day AND provider='qmt_datadir'
+               AND status='EXACT' AND strategy_eligible=1 AND schema_version=:schema AND captured_at<=:cutoff
+             ORDER BY captured_at DESC, created_at DESC, manifest_hash DESC LIMIT 1
+        """), {"dataset": _ARCHIVE_DATASET, "day": day, "schema": _ARCHIVE_SCHEMA,
+                "cutoff": cutoff.isoformat(sep=" ")}).mappings().first()
+    if row is None:
+        return None
+    proof = json.loads(row["manifest_json"])
+    partition = proof["partition"]
+    if (canonical_digest(proof) != row["manifest_hash"] or proof["schema"] != _ARCHIVE_SCHEMA
+            or _minute_timestamp(proof["known_at"]) != _minute_timestamp(row["captured_at"])
+            or partition["trade_date"] != day or partition["status"] != "COMPLETE"
+            or partition["run_id"] != row["run_id"] or partition["row_count"] != row["bar_count"]
+            or partition["code_count"] != row["actual_traded_count"]):
+        raise ValueError("archived minute publication evidence differs")
+    return {**partition, "finished_at": proof["known_at"], "detail": {**partition, "bad_grid_codes": 0}}
+
+
+def _latest_daily_manifest_hash(engine, day: str) -> str | None:
+    connection_scope = engine.connect() if callable(getattr(engine, "connect", None)) else nullcontext(engine)
+    with connection_scope as connection:
+        return connection.execute(text(f"""
+            SELECT /*+ MAX_EXECUTION_TIME(3000) */ manifest_hash
+              FROM {COVERAGE_TABLE}
+             WHERE dataset='stock_daily' AND trade_date=:day AND provider='qmt_datadir'
+               AND status='EXACT' AND schema_version=:schema AND captured_at<=:cutoff
+             ORDER BY captured_at DESC, manifest_hash DESC LIMIT 1
+        """), {"day": day, "schema": DAILY_SCHEMA,
+                "cutoff": datetime.now(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None).isoformat(sep=" ")}).scalar()
+
+
 def load_verified_minute_publication(engine, day: str, *, decision_known_at=None) -> dict | None:
     from server.common.qmt_datadir_result import load_receipt
 
     receipt = load_receipt(engine, dataset="stock_minute", trade_date=day)
     if receipt is None:
-        return None
-    cutoff = decision_known_at or datetime.now(ZoneInfo("Asia/Shanghai"))
-    cutoff = datetime.fromisoformat(str(cutoff)) if not isinstance(cutoff, datetime) else cutoff
-    cutoff = cutoff.astimezone(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None) if cutoff.tzinfo else cutoff
-    finished = receipt.get("finished_at")
-    finished = datetime.fromisoformat(str(finished)) if finished is not None else None
-    if receipt["status"] != "COMPLETE" or finished is None or finished > cutoff:
+        if load_receipt(engine, dataset=ATTEMPT_DATASET, trade_date=day) is None:
+            return None
         raise ValueError("exact minute completion is unavailable at the decision cutoff")
+    cutoff = _minute_timestamp(decision_known_at or datetime.now(ZoneInfo("Asia/Shanghai")))
+    archived = (receipt["status"] != "COMPLETE" or not receipt.get("finished_at")
+                or _minute_timestamp(receipt["finished_at"]) > cutoff)
+    if archived:
+        receipt = _archived_minute_publication(engine, day, cutoff)
+        if receipt is None:
+            raise ValueError("exact minute completion is unavailable at the decision cutoff")
+    finished = _minute_timestamp(receipt["finished_at"])
     detail = receipt.get("detail") or {}
     daily_hash = str(detail.get("full_market_manifest_hash") or "")
     if len(daily_hash) != 64 or detail.get("coverage") != 1.0:
         raise ValueError("exact minute receipt lacks its daily scope proof")
-    scope = trade_scope(engine, day, manifest_hash=daily_hash, decision_known_at=cutoff)
+    # Current coverage still requires the live daily rows. A superseded scope
+    # uses the historical closes and traded set sealed in its daily manifest.
+    latest_daily = _latest_daily_manifest_hash(engine, day)
+    scope = trade_scope(engine, day, decision_known_at=cutoff, verify_rows=latest_daily == daily_hash)
+    if scope["full_market_manifest_hash"] != daily_hash:
+        raise ValueError("exact minute publication differs from the daily scope at the decision cutoff")
     actual = persisted_matrix(engine, day, scope=scope, run_id=str(receipt["run_id"]),
         operation="receipt_readback")
     if (int(receipt["row_count"]) != actual["row_count"]

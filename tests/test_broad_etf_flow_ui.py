@@ -31,6 +31,12 @@ def test_broad_etf_flow_ui_uses_the_documented_api_and_honest_method_copy():
     assert "这是代理信号，不能识别最终持有人" in script
     assert "不能确认申购或赎回方身份" in script
     assert "不能据此断言国家队正在出货" not in script  # API evidence owns this dynamic wording.
+    assert "data.market_activity" in script
+    assert "broadEtfSignedMoney(row.turnover)" in script
+    assert "行情质量</th>" in script
+    assert "单日净申购估算" in script and "今日净申购估算" not in script
+    assert "资金主体 <strong>未知" in script
+    assert "国家队动向代理" not in script
     assert "var netValues = history.map(function (row) { return broadEtfFinite(row.net_amount); });" in script
     assert "['degraded', 'insufficient', 'error']" in script
 

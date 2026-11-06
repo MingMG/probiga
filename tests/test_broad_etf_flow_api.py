@@ -1,12 +1,15 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+from datetime import date, datetime, timedelta
 import importlib
 import sys
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import requests
+from sqlalchemy import create_engine, text
 
 
 MODULE_NAME = "server.api.routers.broad_etf_flow"
@@ -26,7 +29,7 @@ def _price_row(*, pre_close: float, close: float = 4.30) -> dict[str, Any]:
         "close": close,
         "change_pct": -0.8,
         "amount": 123_000_000.0,
-        "quality_status": "test",
+        "quality_status": "validated",
     }
 
 
@@ -154,6 +157,9 @@ def test_api_returns_insufficient_when_core_pool_coverage_is_below_gate(monkeypa
     assert payload["summary"]["signal"] == "数据不足，暂不判断"
     assert payload["summary"]["signal_tone"] == "unknown"
     assert payload["summary"]["confidence_label"] == "不可用"
+    assert payload["summary"]["net_1d"] is None
+    assert payload["flow_evidence"]["actor_status"] == "UNKNOWN"
+    assert payload["flow_evidence"]["historical_pit_eligible"] is False
     assert payload["summary"]["coverage_pct"] == pytest.approx(50.0)
     assert payload["coverage"] == {
         "expected": len(module.CORE_ETFS),
@@ -289,3 +295,119 @@ def test_positive_and_negative_signal_copy_does_not_claim_national_team_identity
     assert identity_warning["kind"] == "warning"
     assert "不披露申购、赎回主体" in identity_warning["detail"]
     assert "不能据此断言国家队正在出货" in identity_warning["detail"]
+
+
+def test_sse_response_must_bind_the_requested_session_and_exchange(monkeypatch):
+    module = _router_module()
+    target = "2026-08-12"
+    upstream = [
+        {"SEC_CODE": "510300", "STAT_DATE": "2026-08-11", "TOT_VOL": 100},
+        {"SEC_CODE": "510500", "TOT_VOL": 100},
+        {"SEC_CODE": "512100", "STAT_DATE": target, "TOT_VOL": 123.45},
+        {"SEC_CODE": "159915", "STAT_DATE": target, "TOT_VOL": 100},
+    ]
+    monkeypatch.setattr(module, "_http_get", lambda *_args, **_kwargs: SimpleNamespace(
+        raise_for_status=lambda: None, json=lambda: {"result": upstream},
+    ))
+    day, rows = module._fetch_sse_share_day(target)
+    assert day == target
+    assert set(rows) == {"512100"}
+    assert rows["512100"]["fund_share"] == pytest.approx(1_234_500)
+    assert rows["512100"]["observed_at"].endswith("+08:00")
+
+
+def test_calendar_gap_stays_in_flow_window_instead_of_using_an_older_observation(monkeypatch):
+    module = _router_module()
+    start = date(2026, 8, 3)
+    dates = [(start + timedelta(days=offset)).isoformat() for offset in range(10)
+             if (start + timedelta(days=offset)).weekday() < 5]
+    gap = dates[-4]
+    prices = {day: {item.code: _price_row(pre_close=4) for item in module.CORE_ETFS} for day in dates}
+    shares = {
+        day: {item.code: _share_row(100_000_000 + offset * 1_000_000) for item in module.CORE_ETFS}
+        for offset, day in enumerate(dates) if day != gap
+    }
+    monkeypatch.setattr(module, "_trading_dates", lambda *_args: list(reversed(dates)))
+    monkeypatch.setattr(module, "_collect_inputs", lambda *_args: (shares, prices, []))
+    payload = module.broad_etf_flow(trade_date=dates[-1], days=5, refresh=True)
+    assert [item["trade_date"] for item in payload["history"]] == dates[-5:]
+    assert next(item for item in payload["history"] if item["trade_date"] == gap)["net_amount"] is None
+    assert payload["summary"]["net_5d"] is None
+    assert payload["summary"]["net_1d"] == pytest.approx(16_000_000)
+
+
+def test_daily_source_date_range_uses_calendar_and_shanghai_close_ready_time(monkeypatch):
+    module = _router_module()
+    engine = create_engine("sqlite:///:memory:")
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE si_trade_calendar (trade_date DATE, trade_status INTEGER)"))
+        connection.execute(text("INSERT INTO si_trade_calendar VALUES "
+                                "('2026-08-10',1),('2026-08-11',0),('2026-08-12',1),('2026-08-13',1)"))
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz):
+            return cls(2026, 8, 12, 14, 59, tzinfo=tz)
+
+    monkeypatch.setattr(module, "get_engine", lambda: engine)
+    monkeypatch.setattr(module, "datetime", Clock)
+    assert module._trading_dates("2026-08-13", 5) == ["2026-08-10"]
+
+
+def test_turnover_stays_available_when_share_publication_cannot_be_established(monkeypatch):
+    module = _router_module()
+    dates = ["2026-08-11", "2026-08-12"]
+    code = module.CORE_ETFS[0].code
+    monkeypatch.setattr(module, "_trading_dates", lambda *_args: list(reversed(dates)))
+    monkeypatch.setattr(module, "_collect_inputs", lambda *_args: (
+        {}, {dates[-1]: {code: _price_row(pre_close=4)}}, [],
+    ))
+    payload = module.broad_etf_flow(trade_date=dates[-1], days=5, refresh=True)
+    assert payload["status"] == "insufficient"
+    assert payload["summary"]["net_1d"] is None
+    assert payload["summary"]["flow_pattern"] == "UNKNOWN"
+    assert payload["market_activity"]["basis"] == "SECONDARY_MARKET_TURNOVER"
+    assert payload["market_activity"]["etfs"][0]["turnover"] == pytest.approx(123_000_000)
+    assert payload["flow_evidence"]["observed_at"] is None
+
+
+def test_failed_price_is_visible_as_evidence_but_excluded_from_amounts(monkeypatch):
+    module = _router_module()
+    days = ["2026-08-11", "2026-08-12"]
+    code = module.CORE_ETFS[0].code
+    shares = {days[0]: {code: _share_row(100)}, days[1]: {code: _share_row(105)}}
+    failed = {**_price_row(pre_close=4), "quality_status": "FAILED"}
+    monkeypatch.setattr(module, "_trading_dates", lambda *_args: list(reversed(days)))
+    monkeypatch.setattr(module, "_collect_inputs", lambda *_args: (shares, {days[1]: {code: failed}}, []))
+    payload = module.broad_etf_flow(trade_date=days[1], days=5, refresh=True)
+    assert payload["market_activity"]["etfs"][0]["turnover"] is None
+    assert payload["market_activity"]["etfs"][0]["quality_status"] == "FAILED"
+    assert payload["etfs"][0]["share_change"] == 5
+    assert payload["etfs"][0]["net_amount"] is None
+
+
+def test_public_price_does_not_supply_an_older_close_for_a_missing_session(monkeypatch):
+    module = _router_module()
+    code = "510300"
+    dates = ["2026-08-11", "2026-08-12", "2026-08-13"]
+    rows = [f"{day},4,4.2,4.3,3.8,100,400,0,-0.8,0,0" for day in (dates[0], dates[-1])]
+    upstream = {"code": code, "market": 1, "klines": rows}
+    monkeypatch.setattr(module, "_http_get", lambda *_args, **_kwargs: SimpleNamespace(
+        raise_for_status=lambda: None, json=lambda: {"data": upstream},
+    ))
+    _, price_rows = module._fetch_eastmoney_price_history(code, dates[0], dates[-1])
+    shares = {day: {code: _share_row(100 + offset)} for offset, day in enumerate(dates)}
+    flows = module._build_flow_rows(dates, shares, {day: {code: row} for day, row in price_rows.items()})
+    assert flows[-1]["net_amount"] is None
+    upstream["code"] = "510500"
+    with pytest.raises(ValueError, match="证券身份"):
+        module._fetch_eastmoney_price_history(code, dates[0], dates[-1])
+
+
+def test_synchronous_creations_on_rising_day_do_not_become_stabilization_evidence():
+    module = _router_module()
+    rows = [{"benchmark": item.benchmark, "net_amount": 6_000_000_000, "change_pct": 2.5}
+            for item in module.CORE_ETFS]
+    summary, _ = module._signal([{"net_amount": 24_000_000_000, "coverage_pct": 100}], rows, expected=4)
+    assert summary["signal"] == "当日强净申购"
+    assert summary["flow_pattern"] == "NET_CREATION"
