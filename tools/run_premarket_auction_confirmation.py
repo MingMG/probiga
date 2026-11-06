@@ -14,9 +14,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from biz.premarket.theme_forecast import (
+    PREMARKET_PUBLICATION_SCHEMA,
     format_auction_confirmation_markdown,
     run_auction_confirmation,
 )
+from server.common.authoritative_market_clock import PRODUCTION_TIMEZONE
 from integrations.wecom.webhook import send_markdown
 from server.common.batch_db import create_batch_engine
 from server.common.config import get_wecom_webhook
@@ -31,7 +33,7 @@ def main() -> int:
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
-    now = datetime.now().replace(microsecond=0)
+    now = datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None, microsecond=0)
     session_date = (args.date or now.date().isoformat())[:10]
     cutoff = datetime.fromisoformat(args.cutoff) if args.cutoff else datetime.combine(
         datetime.fromisoformat(session_date).date(), time(9, 20, 59)
@@ -46,7 +48,9 @@ def main() -> int:
         cutoff_at=cutoff,
         persist=True,
     )
-    if args.push:
+    if args.push and result.get("forecast_publication_schema") == PREMARKET_PUBLICATION_SCHEMA:
+        result["delivery"] = {"status": "suppressed", "reason": "BROWSER_RESEARCH_PUBLICATION"}
+    elif args.push:
         webhook = get_wecom_webhook("briefing", required=False)
         if not str(webhook or "").strip():
             raise RuntimeError("未配置企业微信早报机器人 webhook")

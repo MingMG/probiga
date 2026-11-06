@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timezone
+import json
 
 import pytest
+from sqlalchemy import create_engine, text
 
+from biz.premarket import theme_forecast as model
 from biz.premarket.theme_forecast import (
     PREMARKET_STAGE,
     _flow_dataset_quality,
@@ -30,6 +33,129 @@ def _external(symbol: str, change: float, name: str | None = None) -> dict:
         "price": 100.0,
         "availability": "available",
     }
+
+
+def test_scheduled_forecast_freezes_friday_input_and_serves_monday_without_notification(monkeypatch):
+    from server.api import scheduler_runtime
+    from server.api.routers import hot_data
+    from server.common import qmt_datadir_daily_coverage
+    from server.common.scheduler_args import build_scheduler_task_args
+    from server.common.scheduler_validation import scheduler_output_status, validate_scheduler_task_result
+    from tools import ensure_quality_gate
+
+    engine = create_engine("sqlite://")
+    with engine.begin() as conn:
+        conn.execute(text("CREATE TABLE si_trade_calendar (trade_date TEXT,trade_status INT)"))
+        conn.execute(text("INSERT INTO si_trade_calendar VALUES ('2026-11-06',1),('2026-11-09',1)"))
+        for name, spec in model._PREMARKET_THEME_SCHEMA.items():
+            columns = ", ".join(f"`{column}` TEXT" for column in spec.columns)
+            conn.execute(text(f"CREATE TABLE {name} ({columns})"))
+    utc_dispatch = datetime(2026, 11, 9, 1, 8, 20, tzinfo=timezone.utc)
+    now = [datetime(2026, 11, 9, 9, 8, 20)]
+    cutoff = datetime(2026, 11, 9, 9, 8)
+    session = "2026-11-09"
+    monkeypatch.setattr(model, "_shanghai_now", lambda: now[0])
+    monkeypatch.setattr(model, "validate_premarket_theme_runtime", lambda engine: None)
+    monkeypatch.setattr(hot_data, "get_engine", lambda: engine)
+
+    def manifest(engine, day, *, decision_known_at, **kwargs):
+        assert (day, decision_known_at) == ("2026-11-06", cutoff)
+        assert kwargs.get("manifest_hash", "a" * 64) == "a" * 64
+        return {"manifest_hash": "a" * 64, "entities": [{"stock_code": "300999", "classification": "TRADED"}]}
+
+    def inputs(engine, *, source_trade_date, cutoff_at, external_snapshot):
+        assert (source_trade_date, cutoff_at, external_snapshot) == ("2026-11-06", cutoff, None)
+        return {
+            "hot_rows": [{"snapshot_date": "2026-11-06", "concept_name": "固态电池", "rank": 1, "change_pct": 2}],
+            "membership_rows": [{"stock_code": "300999", "concept_name": "固态电池"}],
+            "kline_rows": [{"stock_code": "300999", "short_name": "测试电池", "change_pct": 1.5}],
+            "external_summary": {"external_market_captured_at": "2026-11-09 08:30:17"},
+        }
+
+    monkeypatch.setattr(qmt_datadir_daily_coverage, "load_daily_manifest", manifest)
+    monkeypatch.setattr(model, "_load_forecast_inputs", inputs)
+    registered = next(item for item in ensure_quality_gate.TASKS if item["task_type"] == "analysis_premarket_external")
+    task = scheduler_runtime._task_argument_row(registered, now=utc_dispatch, target_date=session, engine=engine)
+    assert build_scheduler_task_args(task, registered["script_path"], session) == ["--session-date", session, "--json"]
+    assert scheduler_runtime._cron_due(registered, now=now[0])
+    assert not scheduler_runtime._cron_due(registered, now=datetime(2026, 11, 9, 9, 30))
+    with pytest.raises(RuntimeError, match="no publication authority"):
+        scheduler_runtime._task_argument_row({**registered, "script_path": "tools/run_ai_recommendation_premarket.py"},
+            now=utc_dispatch, target_date=session, engine=engine)
+
+    receipt = model.publish_current_premarket_theme_forecast(engine, session_date=session)
+    assert receipt["status"] == "COMPLETE" and receipt["theme_count"] > 0
+    assert receipt["notification_allowed"] is receipt["canonical_recommendation_writes"] is False
+    assert receipt["cutoff_at"] == "2026-11-09 09:08:00" and receipt["generated_at"] == "2026-11-09 09:08:20"
+    assert model.publish_current_premarket_theme_forecast(engine, session_date=session) == receipt
+    output = json.dumps(receipt)
+    assert scheduler_output_status(task, output, return_code=0) == "success"
+    assert validate_scheduler_task_result(task, engine=engine, started_at=utc_dispatch, now=now[0], output=output).ok
+    browser = hot_data.premarket_theme_forecast(session)
+    assert browser["run_uid"] == receipt["run_uid"] and browser["themes"]
+    assert browser["session_date"] == session and browser["fallback"] is False
+    assert browser["delivery_status"] == "SUPPRESSED" and browser["decision_scope"] == "RESEARCH_DISPLAY_ONLY"
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM st_premarket_theme_forecast_item"))
+    assert not validate_scheduler_task_result(task, engine=engine, started_at=utc_dispatch, now=now[0], output=output).ok
+
+    with pytest.raises(ValueError, match="only today's"):
+        model.publish_current_premarket_theme_forecast(engine, session_date="2026-11-06")
+    now[0] = datetime(2026, 11, 9, 9, 30)
+    with pytest.raises(ValueError, match="only today's"):
+        model.publish_current_premarket_theme_forecast(engine, session_date=session)
+    engine.dispose()
+
+
+def test_auction_never_sends_for_the_browser_research_source(monkeypatch, capsys):
+    import sys
+    from tools import run_premarket_auction_confirmation as cli
+
+    monkeypatch.setattr(sys, "argv", ["auction", "--date", "2026-11-09", "--push", "--json"])
+    monkeypatch.setattr(cli, "create_batch_engine", lambda: object())
+    monkeypatch.setattr(cli, "run_auction_confirmation", lambda *args, **kwargs:
+        {"forecast_publication_schema": model.PREMARKET_PUBLICATION_SCHEMA})
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("browser-only forecast opened an outbound notification path")
+
+    monkeypatch.setattr(cli, "get_wecom_webhook", unexpected)
+    monkeypatch.setattr(cli, "send_markdown", unexpected)
+    assert cli.main() == 0
+    assert json.loads(capsys.readouterr().out)["delivery"] == {
+        "status": "suppressed", "reason": "BROWSER_RESEARCH_PUBLICATION",
+    }
+
+    from tools import run_ai_recommendation_premarket as legacy
+
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+    monkeypatch.setattr(sys, "argv", ["legacy", "--theme-forecast", "--push-theme-forecast"])
+    monkeypatch.setattr(legacy, "create_batch_engine", unexpected)
+    with pytest.raises(RuntimeError, match="dedicated browser publication"):
+        legacy.main()
+
+
+def test_forecast_news_load_excludes_late_arrival_and_mutated_version(monkeypatch):
+    engine = create_engine("sqlite://")
+    with engine.begin() as conn:
+        conn.execute(text("""CREATE TABLE st_news_flash (
+            source TEXT,title TEXT,content TEXT,publish_time TEXT,level TEXT,is_top INT,
+            jpush INT,first_seen_at TEXT,etl_sync_at TEXT)"""))
+        conn.execute(text("""INSERT INTO st_news_flash VALUES
+            ('wire','available','正文','2026-11-09 08:30:00','A',0,0,'2026-11-09 08:31:00','2026-11-09 08:31:00'),
+            ('wire','late','正文','2026-11-09 08:30:00','A',0,0,'2026-11-09 09:08:01','2026-11-09 09:08:01'),
+            ('wire','revised','正文','2026-11-09 08:30:00','A',0,0,'2026-11-09 08:31:00','2026-11-09 09:08:01'),
+            ('wire','unknown','正文','2026-11-09 08:30:00','A',0,0,NULL,'2026-11-09 08:31:00')
+        """))
+    query_rows = model._safe_rows
+    monkeypatch.setattr(model, "_safe_rows", lambda engine, sql, params, context:
+        query_rows(engine, sql, params, context) if context == "premarket.news" else [])
+    inputs = model._load_forecast_inputs(
+        engine, source_trade_date="2026-11-06",
+        cutoff_at=datetime(2026, 11, 9, 9, 8), external_snapshot={},
+    )
+    assert [row["title"] for row in inputs["news_rows"]] == ["available"]
+    engine.dispose()
 
 
 def _forecast(*, news_rows=None):

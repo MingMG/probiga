@@ -119,8 +119,8 @@ DAILY_STRATEGY_PIPELINE_TASK_CONTRACT_TYPES = frozenset(
         "analysis_upper_evidence_prepare",
         "analysis_fast",
         "strategy_external_overlay",
-        # These legacy publishers remain present but disabled. Omitting them
-        # would allow an old deployment row to overwrite the verified pool.
+        # Keep the retired morning publisher disabled and bind the independent
+        # research forecast to its publication-only entry point.
         "analysis_morning_strict",
         "analysis_premarket_external",
     }
@@ -644,14 +644,14 @@ TASKS = [
         "task_name": "AI推荐09:08盘前主线预判",
         "task_type": "analysis_premarket_external",
         "group_name": "AI推荐",
-        "script_path": "tools/run_ai_recommendation_premarket.py",
-        "script_args": "--strict-prev-trade-day --external-market --theme-forecast --push-theme-forecast --theme-top-n 12 --theme-stocks-per-theme 5 --top-n 80 --min-score 62 --min-kline-coverage 0.80 --json",
-        "cron_time": "09:07",
+        "script_path": "tools/run_premarket_theme_forecast.py",
+        "script_args": "--json",
+        "cron_time": "09:08",
         "interval_minutes": 0,
-        "enabled": 0,
+        "enabled": 1,
         "sort_order": 93,
         "date_param": "",
-        "description": "已停用旧的一体化publisher：主题早报需拆为只读交付任务；不得在缺少同cutoff upper证据时覆盖canonical票池。",
+        "description": "按09:08时点冻结盘前主题研究与观察候选，供当日看盘网页读取。",
     },
     {
         "task_name": "盘后数据质量体检",
@@ -792,22 +792,24 @@ def _task_payload(task: dict[str, Any], columns: set[str]) -> dict[str, Any]:
 
 
 def _managed_task_drift(row: Mapping[str, Any], expected: Mapping[str, Any]) -> set[str]:
-    """QMT enabled is user policy; all other definitions remain exact."""
+    """Keep operator-owned policy separate from the managed script contract."""
 
     qmt_policy = expected.get("task_type") in WINDOWS_QMT_EDGE_TASK_TYPES
+    premarket_policy = expected.get("task_type") == "analysis_premarket_external"
+    policy_fields = {"enabled", "cron_time"} if premarket_policy else {"enabled"} if qmt_policy else set()
     drift = {
         key for key, value in expected.items()
-        if not (qmt_policy and key == "enabled") and row.get(key) != value
+        if key not in policy_fields and row.get(key) != value
     }
-    if qmt_policy and (type(row.get("enabled")) is not int
-                       or row["enabled"] not in {0, 1}):
+    if policy_fields and (type(row.get("enabled")) is not int or row["enabled"] not in {0, 1}):
         drift.add("enabled")
     return drift
 
 
 def _managed_task_status(row: Mapping[str, Any]) -> str:
-    return ("paused" if row.get("task_type") in WINDOWS_QMT_EDGE_TASK_TYPES
-            and row.get("enabled") == 0 else "validated")
+    operator_policy = (row.get("task_type") in WINDOWS_QMT_EDGE_TASK_TYPES
+                       or row.get("task_type") == "analysis_premarket_external")
+    return "paused" if operator_policy and row.get("enabled") == 0 else "validated"
 
 
 def _task_definition_for_runtime(
@@ -861,6 +863,9 @@ def upsert_task(engine: Engine, task: dict[str, Any]) -> str:
                         or original["enabled"] not in {0, 1}):
                     raise RuntimeError("QMT scheduler user policy identity or bit is invalid")
                 payload.pop("enabled", None)
+            if task["task_type"] == "analysis_premarket_external":
+                payload.pop("enabled", None)
+                payload.pop("cron_time", None)
             assignments = ", ".join(f"`{key}` = :{key}" for key in payload)
             if "updated_at" in columns:
                 assignments += ", `updated_at` = NOW()"
@@ -882,6 +887,48 @@ def upsert_task(engine: Engine, task: dict[str, Any]) -> str:
         bind_payload = {k: v for k, v in insert_payload.items() if k not in NOW_COLUMNS}
         conn.execute(text(f"INSERT INTO st_scheduled_tasks ({names}) VALUES ({values})"), bind_payload)
         return "inserted"
+
+
+def reconcile_premarket_theme_task(engine: Engine) -> dict[str, Any]:
+    """Migrate only the existing browser publication identity and its argv."""
+    task_type = "analysis_premarket_external"
+    definition = next(task for task in TASKS if task["task_type"] == task_type)
+    update = {key: definition[key] for key in ("script_path", "script_args", "description")}
+    identity = {"task_type": task_type, "task_name": definition["task_name"]}
+    with engine.begin() as connection:
+        lock = " FOR UPDATE" if connection.dialect.name == "mysql" else ""
+        rows = connection.execute(text(
+            "SELECT id,task_name,task_type,script_path,script_args,description,enabled,cron_time,"
+            "date_param,interval_minutes,last_run_status FROM st_scheduled_tasks "
+            "WHERE task_type=:task_type OR task_name=:task_name ORDER BY id LIMIT 2" + lock
+        ), identity).mappings().all()
+        if len(rows) != 1:
+            raise RuntimeError("盘前预测任务的注册身份缺失或不唯一")
+        row = dict(rows[0])
+        if (any(row[key] != value for key, value in identity.items())
+                or row["script_path"] not in {update["script_path"], "tools/run_ai_recommendation_premarket.py"}
+                or row["last_run_status"] == "running" or row["interval_minutes"] != 0
+                or row["date_param"] or type(row["enabled"]) is not int or row["enabled"] not in {0, 1}):
+            raise RuntimeError("盘前预测任务的已注册状态不符合定向迁移要求")
+        changed = any(row[key] != value for key, value in update.items())
+        if changed:
+            result = connection.execute(text("""
+                UPDATE st_scheduled_tasks SET script_path=:script_path,script_args=:script_args,
+                    description=:description
+                WHERE id=:id AND task_type=:task_type AND task_name=:task_name
+                  AND (last_run_status IS NULL OR last_run_status<>'running')
+            """), {**update, **identity, "id": row["id"]})
+            if result.rowcount != 1:
+                raise RuntimeError("盘前预测任务迁移失去原注册身份")
+        saved = connection.execute(text(
+            "SELECT task_name,task_type,script_path,script_args,description,enabled,cron_time "
+            "FROM st_scheduled_tasks WHERE id=:id"
+        ), {"id": row["id"]}).mappings().one()
+        expected = {**identity, **update, "enabled": row["enabled"], "cron_time": row["cron_time"]}
+        if dict(saved) != expected:
+            raise RuntimeError("盘前预测任务迁移回读不一致")
+    return {"status": "PASS", "action": "updated" if changed else "unchanged",
+            "id": row["id"], **expected}
 
 
 def validate_review_delivery(engine: Engine) -> dict[str, str]:

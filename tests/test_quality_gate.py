@@ -5,7 +5,6 @@ from unittest.mock import MagicMock, patch
 import sqlalchemy
 from sqlalchemy import create_engine, text
 
-from server.common.scheduler_validation import TASK_OUTPUT_REQUIREMENTS
 from tools import ensure_quality_gate
 from tools import check_and_fix_scheduled_tasks
 from tools.ensure_quality_gate import _task_payload
@@ -196,24 +195,52 @@ class QualityGateTaskTest(unittest.TestCase):
             },
         )
 
-    def test_legacy_0908_combined_publisher_is_disabled_and_validated(self):
+    def test_0908_publisher_is_registered_for_browser_only(self):
         task = next(
             item for item in ensure_quality_gate.TASKS
             if item.get("task_type") == "analysis_premarket_external"
         )
-        self.assertEqual(task["cron_time"], "09:07")
-        self.assertEqual(task["enabled"], 0)
-        self.assertIn("--theme-forecast", task["script_args"])
-        self.assertIn("--push-theme-forecast", task["script_args"])
+        self.assertEqual(task["cron_time"], "09:08")
+        self.assertEqual(task["enabled"], 1)
+        self.assertEqual(task["script_path"], "tools/run_premarket_theme_forecast.py")
+        self.assertEqual(task["script_args"], "--json")
 
-        requirements = TASK_OUTPUT_REQUIREMENTS["analysis_premarket_external"]
-        forecast = next(
-            item for item in requirements
-            if item.table == "st_premarket_theme_forecast_run"
-        )
-        self.assertEqual(forecast.date_col, "session_date")
-        self.assertEqual(forecast.target, "run_date")
-        self.assertIn("delivery_status = 'SUCCESS'", forecast.where_sql)
+    def test_scoped_premarket_migration_preserves_schedule_and_unrelated_tasks(self):
+        from fastapi import HTTPException
+        from server.api.routers import scheduler
+
+        engine = create_engine("sqlite://")
+        task = next(item for item in ensure_quality_gate.TASKS if item["task_type"] == "analysis_premarket_external")
+        with engine.begin() as conn:
+            conn.execute(text("""CREATE TABLE st_scheduled_tasks (
+                id INT,task_name TEXT,task_type TEXT,script_path TEXT,script_args TEXT,description TEXT,
+                enabled INT,cron_time TEXT,date_param TEXT,interval_minutes INT,last_run_status TEXT
+            )"""))
+            conn.execute(text("""INSERT INTO st_scheduled_tasks VALUES
+                (74,:name,'analysis_premarket_external','tools/run_ai_recommendation_premarket.py',
+                 '--push-theme-forecast','legacy',0,'09:07','',0,'failed'),
+                (140,'异动','intraday_market_alert','tools/run_intraday_market_alert.py',
+                 '--mode live --json','live user policy',1,'09:32','',1,'success')
+            """), {"name": task["task_name"]})
+        with patch.object(scheduler, "get_engine", return_value=engine), patch.object(
+            ensure_quality_gate, "run", side_effect=AssertionError("global reconcile must not run"),
+        ):
+            migrated = scheduler.reconcile_managed_contracts("analysis_premarket_external")
+            self.assertEqual((migrated["status"], migrated["id"], migrated["enabled"], migrated["cron_time"]),
+                             ("PASS", 74, 0, "09:07"))
+            self.assertEqual((migrated["script_path"], migrated["script_args"]), (task["script_path"], "--json"))
+            self.assertEqual(scheduler.reconcile_managed_contracts("analysis_premarket_external")["action"], "unchanged")
+            with self.assertRaises(HTTPException) as rejected:
+                scheduler.reconcile_managed_contracts("intraday_market_alert")
+            self.assertEqual(rejected.exception.status_code, 422)
+            with engine.begin() as conn:
+                unrelated = conn.execute(text("SELECT script_args, enabled FROM st_scheduled_tasks WHERE id=140")).one()
+                self.assertEqual(tuple(unrelated), ("--mode live --json", 1))
+                conn.execute(text("UPDATE st_scheduled_tasks SET last_run_status='running' WHERE id=74"))
+            with self.assertRaises(HTTPException) as rejected:
+                scheduler.reconcile_managed_contracts("analysis_premarket_external")
+            self.assertEqual(rejected.exception.status_code, 409)
+        engine.dispose()
 
     def test_intraday_alert_task_definitions_are_exact_and_consistent(self):
         authoritative = {

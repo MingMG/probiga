@@ -348,12 +348,19 @@ def list_tasks():
 
 
 @router.post("/scheduler/managed-contracts/reconcile")
-def reconcile_managed_contracts():
+def reconcile_managed_contracts(task_type: str = ""):
     """Install and exactly read back the managed Linux scheduler contracts."""
 
     from tools import ensure_quality_gate
 
     engine = get_engine()
+    if task_type:
+        if task_type != "analysis_premarket_external":
+            raise HTTPException(422, "不支持指定的定向迁移任务")
+        try:
+            return ensure_quality_gate.reconcile_premarket_theme_task(engine)
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc)) from exc
     actions = ensure_quality_gate.run(engine)
     disabled = ensure_quality_gate.quarantine_legacy_canonical_market_writers(
         engine

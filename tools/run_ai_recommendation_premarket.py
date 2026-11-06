@@ -339,6 +339,8 @@ def _send_theme_forecast_markdown(webhook_url: str, content: str) -> dict:
 
 def _deliver_theme_forecast(engine, forecast: dict) -> dict:
     run_uid = str(forecast.get("run_uid") or "")
+    if forecast.get("delivery_status") == "SUPPRESSED":
+        return {"success": False, "skipped": True, "reason": "BROWSER_RESEARCH_PUBLICATION"}
     if str(forecast.get("delivery_status") or "").upper() == "SUCCESS":
         return {
             "success": True,
@@ -397,6 +399,8 @@ def main() -> int:
         str(os.environ.get("PROBIGA_DEPLOYMENT_MODE") or "").strip().lower()
         == "production"
     )
+    if production and (args.theme_forecast or args.push_theme_forecast):
+        raise RuntimeError("production 09:08 forecast requires the dedicated browser publication task")
     if production and (
         args.auto_repair_missing_kline or args.auto_repair_missing_data
     ):
