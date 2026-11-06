@@ -2506,6 +2506,56 @@ def test_missing_historical_batch_skips_unrelated_live_coverage_payloads():
     assert "SELECT *" not in coverage_reads[0]
 
 
+def test_full_market_publish_batches_empty_coverage_and_preserves_revision_chain():
+    from server.common.qmt_announcement_pit import _publish_batch, build_batch_root
+
+    engine = _engine()
+    codes = [f"{number:06d}" for number in range(1, 206)]
+    catalog = _catalog(*[(code, f"{code}.SZ") for code in codes])
+    results = {code: [] for code in codes}
+    first_cutoff = datetime(2026, 9, 2, 18, 20)
+    coverage_reads = []
+    coverage_inserts = []
+
+    @event.listens_for(engine, "before_cursor_execute")
+    def observe(connection, cursor, statement, parameters, context, executemany):
+        if "st_pit_source_coverage" in statement:
+            if statement.startswith("SELECT"):
+                coverage_reads.append(statement)
+            if statement.startswith("INSERT"):
+                coverage_inserts.append(len(parameters) if executemany else 1)
+
+    def publish(cutoff):
+        batch_id = f"qmt-ann-{cutoff:%Y%m%dT%H%M%S}-bulk"
+        arguments = dict(
+            batch_id=batch_id, fact_cutoff_at=cutoff,
+            received_at=cutoff + timedelta(minutes=1),
+            window_start=date(2026, 8, 3), window_end=date(2026, 9, 2),
+            catalog=catalog, results=results,
+        )
+        root, entries = build_batch_root(**arguments)
+        return _publish_batch(engine, batch_root_hash=root, entries=entries, **arguments)[0]
+
+    first = publish(first_cutoff)
+    assert len(first) == len(codes)
+    assert coverage_inserts == [100, 100, 5]
+    assert len(coverage_reads) == 6
+    coverage_reads.clear()
+    coverage_inserts.clear()
+    assert publish(first_cutoff) == first
+    assert coverage_inserts == []
+    assert len(coverage_reads) == 6
+
+    second = publish(first_cutoff + timedelta(minutes=5))
+    assert second != first
+    with engine.connect() as connection:
+        rows = connection.execute(text(
+            "SELECT stock_code, coverage_id, supersedes_coverage_id, result_count "
+            "FROM st_pit_source_coverage WHERE revision_no = 2 ORDER BY stock_code"
+        )).all()
+    assert rows == list(zip(codes, second, first, [0] * len(codes), strict=True))
+
+
 def test_atomic_publish_never_reports_false_no_write_after_commit():
     from server.common.qmt_announcement_pit import _publish_batch, build_batch_root
 

@@ -136,6 +136,82 @@ def database(monkeypatch):
     return engine
 
 
+def test_entity_manifest_uses_real_pymysql_wire_batching():
+    from pymysql.connections import Connection
+    from pymysql.cursors import Cursor
+    from sqlalchemy.dialects.mysql.pymysql import dialect
+
+    class RecordingCursor(Cursor):
+        def __init__(self):
+            driver = Connection(defer_connect=True)
+            driver.server_status = 0
+            super().__init__(driver)
+            self.wire_requests = []
+
+        def execute(self, query, args=None):
+            self.wire_requests.append((query, args))
+            return 1
+
+    cursor = RecordingCursor()
+    driver_dialect = dialect(paramstyle="pyformat")
+    entity_rows = []
+
+    def execute(statement, params=None):
+        sql = str(statement.compile(dialect=driver_dialect))
+        if sql == "SELECT CURRENT_TIMESTAMP":
+            return SimpleNamespace(scalar_one=lambda: CUTOFF)
+        if isinstance(params, list):
+            entity_rows.extend(params)
+            cursor.executemany(sql, params)
+        else:
+            assert params["created_at"] == CUTOFF
+
+    coverage.insert_manifest(SimpleNamespace(execute=execute), manifest())
+    assert len(entity_rows) == 8 and all(row["created_at"] == CUTOFF for row in entity_rows)
+    assert len(cursor.wire_requests) == 1
+    query, args = cursor.wire_requests[0]
+    assert args is None and bytes(query).count(b"),(") == len(entity_rows) - 1
+
+
+def test_historical_group_restarts_source_deadline_after_slow_successful_publish(monkeypatch, tmp_path):
+    from tools import import_qmt_datadir_daily as importer
+
+    dates = [date(2026, 10, 28), date(2026, 10, 29)]
+    now = 100
+    harvests, published = [], []
+
+    def harvest(root, universe, day, *, deadline):
+        assert deadline - now == 300
+        harvests.append(day)
+        return {"codes": {TRADED}, "rows": [], "digest": "source"}
+
+    def publish(engine, *, session, **kwargs):
+        nonlocal now
+        now += 301  # The preceding publication exhausted a group-wide budget.
+        published.append(session)
+        return {"row_count": 1}
+
+    monkeypatch.setattr(importer, "load_project_env", lambda: None)
+    monkeypatch.setattr(importer, "create_batch_engine", lambda **kwargs: object())
+    monkeypatch.setattr(importer, "authoritative_closed_trade_date", lambda engine: "2026-11-06")
+    monkeypatch.setattr(importer, "time", SimpleNamespace(monotonic=lambda: now))
+    monkeypatch.setattr(importer, "_sessions", lambda *args: dates)
+    monkeypatch.setattr(importer, "load_universe", lambda *args, **kwargs: SimpleNamespace(eligible_codes=lambda day: 1))
+    monkeypatch.setattr(importer, "_short_names", lambda engine: {})
+    monkeypatch.setattr(importer, "_existing_sources", lambda *args: ["qmt_datadir"])
+    monkeypatch.setattr(importer, "_harvest", harvest)
+    monkeypatch.setattr(importer, "_reusable_partition", lambda *args, **kwargs: None)
+    monkeypatch.setattr(importer, "load_historical_documents", lambda *args, **kwargs: {IPO: []})
+    monkeypatch.setattr(importer, "_coverage_manifest", lambda *args, **kwargs: {})
+    monkeypatch.setattr(importer, "_publish", publish)
+    locators = tmp_path / "lifecycle.json"
+    locators.write_text("{}", encoding="utf-8")
+    assert importer.main(["--start", dates[0].isoformat(), "--end", dates[-1].isoformat(),
+                          "--datadir-root", str(tmp_path), "--historical-lifecycle", str(locators),
+                          "--apply", "--json"]) == 0
+    assert harvests == published == dates
+
+
 def test_real_database_replay_rejects_mutated_bars_and_entity_partitions(monkeypatch):
     engine = database(monkeypatch)
     assert coverage.load_daily_manifest(engine, DAY, decision_known_at=CUTOFF)["status"] == "EXACT"
