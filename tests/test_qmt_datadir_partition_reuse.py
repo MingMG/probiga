@@ -2,6 +2,7 @@
 from datetime import date, datetime
 import json
 from pathlib import Path
+import sqlite3
 from types import SimpleNamespace
 
 import numpy as np
@@ -9,7 +10,7 @@ import pytest
 from sqlalchemy import create_engine, text
 
 from integrations.qmt.datadir import CST, DAT_HEADER, MINUTE_PERIOD
-from integrations.qmt.datadir_import import Universe, UniverseMember
+from integrations.qmt.datadir_import import SOURCE, Universe, UniverseMember
 from server.common import qmt_datadir_minute_coverage as coverage
 from server.common import qmt_datadir_result as results
 from tools import import_qmt_datadir_history as importer
@@ -22,7 +23,7 @@ CODES = ("000001", "600000")
 @pytest.fixture
 def existing_partition(tmp_path, monkeypatch):
     monkeypatch.setenv("PROBIGA_JOB_LOG_ROOT", str(tmp_path / "jobs"))
-    engine = create_engine("sqlite:///:memory:")
+    engine = create_engine("sqlite:///:memory:", connect_args={"detect_types": sqlite3.PARSE_DECLTYPES})
     native = [dict(stock_code=code, trade_time=str(DAY) + " " + moment, trade_date=str(DAY),
         price=10, change=0, change_pct=0, volume=100, amount=1000,
         qmt_code=code + (".SH" if code.startswith("6") else ".SZ"),
@@ -42,7 +43,7 @@ def existing_partition(tmp_path, monkeypatch):
         connection.execute(text("ALTER TABLE sm_stock_minute ADD COLUMN etl_sync_at TEXT"))
         connection.execute(text("ALTER TABLE sm_stock_minute ADD COLUMN received_at TEXT"))
         connection.execute(text("""CREATE TABLE qmt_datadir_import_partition (
-            dataset TEXT,trade_date TEXT,source_root TEXT,status TEXT,code_count INTEGER,
+            dataset TEXT,trade_date DATE,source_root TEXT,status TEXT,code_count INTEGER,
             row_count INTEGER,content_sha256 TEXT,run_id TEXT,started_at TEXT,
             finished_at TEXT,detail_json TEXT)"""))
         connection.execute(text("INSERT INTO qmt_datadir_import_partition VALUES ('stock_minute',:day,:root,'FAILED',2,482,:hash,'failed-new-run',:at,:at,:detail)"),
@@ -76,6 +77,71 @@ def existing_partition(tmp_path, monkeypatch):
 def _stored_rows(engine):
     with engine.connect() as connection:
         return connection.execute(text("SELECT * FROM sm_stock_minute ORDER BY stock_code,trade_time")).fetchall()
+
+
+@pytest.mark.parametrize("case", ["current", "revised", "missing", "other_source", "shortfall"])
+def test_minute_cli_checks_current_daily_authority_before_reusing_complete_receipt(
+        existing_partition, monkeypatch, capsys, case):
+    item = existing_partition
+    day = str(DAY)
+    current_hash = item.scope["full_market_manifest_hash"]
+    receipt_hash = current_hash if case == "current" else "b" * 64
+    actual = coverage.persisted_matrix(item.engine, day, scope=item.scope)
+    detail = {**importer._completion_detail(actual), "full_market_manifest_hash": receipt_hash}
+    with item.engine.begin() as connection:
+        importer.write_receipt(connection, session=DAY, root=str(item.root), status="COMPLETE",
+            run_id="original-minute-run", code_count=2, row_count=482, content_sha256="c" * 64,
+            detail=detail, finished=True)
+        connection.execute(text("""CREATE TABLE qmt_history_coverage_manifest (
+            trade_date TEXT, manifest_hash TEXT, dataset TEXT, provider TEXT,
+            schema_version TEXT, status TEXT, strategy_eligible INTEGER, captured_at TEXT)"""))
+        if case != "missing":
+            connection.execute(text("""INSERT INTO qmt_history_coverage_manifest VALUES
+                (:day,:old,'stock_daily','qmt_datadir','probiga.qmt-datadir-daily-coverage.v1','EXACT',1,:older),
+                (:day,:current,'stock_daily','qmt_datadir','probiga.qmt-datadir-daily-coverage.v1','EXACT',1,:newer),
+                (:day,:future,'stock_daily','qmt_datadir','probiga.qmt-datadir-daily-coverage.v1','EXACT',1,:future_time)"""),
+                {"day": day, "old": "b" * 64, "current": current_hash, "future": "d" * 64,
+                 "older": day + " 16:00:00", "newer": day + " 19:00:00", "future_time": "9999-12-31 00:00:00"})
+    monkeypatch.setattr(importer, "load_project_env", lambda: None)
+    monkeypatch.setattr(importer, "get_minute_mysql_url", lambda: "sqlite://")
+    monkeypatch.setattr(importer, "create_pooled_engine", lambda *_args, **_kwargs: item.engine)
+    monkeypatch.setattr(importer, "_sessions", lambda *_args: [DAY])
+    monkeypatch.setattr(importer, "load_universe", lambda *_args, **_kwargs: Universe(
+        {member.qmt_code: member for member in item.universe}, {}))
+    monkeypatch.setattr(importer, "require_schema", lambda *_args: None)
+    monkeypatch.setattr(importer, "existing_sources", lambda *_args: {
+        DAY: [SOURCE, "other"] if case == "other_source" else [SOURCE]})
+    monkeypatch.setattr(importer, "_source_matrix", lambda *_args, **_kwargs:
+        pytest.fail("revalidation must reuse the existing database proof"))
+    if case == "missing":
+        def no_authority(*_args, **_kwargs):
+            raise ValueError("DATA_BLOCKED: exact daily manifest is required before minute publication")
+        monkeypatch.setattr(importer, "trade_scope", no_authority)
+    if case in {"current", "other_source"}:
+        monkeypatch.setattr(importer, "trade_scope", lambda *_args, **_kwargs:
+            pytest.fail("an unchanged or skipped partition must not reload the full daily scope"))
+    if case == "shortfall":
+        item.scope["daily_close_by_code"][CODES[0]] = "11"
+        for source_file in item.root.rglob("*.DAT"):
+            source_file.unlink()
+    before = _stored_rows(item.engine)
+
+    code = importer.main(["--start", day, "--end", day, "--apply", "--json",
+                          "--datadir-root", str(item.root)])
+
+    payload = json.loads(capsys.readouterr().out.splitlines()[-1])
+    receipt = results.load_receipt(item.engine, dataset="stock_minute", trade_date=day)
+    assert receipt["run_id"] == "original-minute-run"
+    assert receipt["status"] == "COMPLETE"
+    assert _stored_rows(item.engine) == before
+    if case in {"current", "revised"}:
+        assert code == 0 and payload["status"] == "PASS"
+        assert payload["partitions"][0]["full_market_manifest_hash"] == current_hash
+        assert receipt["detail"]["full_market_manifest_hash"] == current_hash
+        assert bool(receipt["detail"].get("reused_existing_partition")) == (case == "revised")
+    else:
+        assert code != 0 and payload["status"] in {"BLOCKED", "FAILED"}
+        assert receipt["detail"]["full_market_manifest_hash"] == receipt_hash
 
 
 def test_failed_cursor_without_any_prior_history_reuses_exact_native_data_without_landing(existing_partition):

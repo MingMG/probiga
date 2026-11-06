@@ -47,10 +47,11 @@ from integrations.qmt.datadir_import import (  # noqa: E402
     STATUS_FAILED,
     STATUS_RUNNING,
     require_schema,
-    completed_sessions,
     drop_staged,
     existing_sources,
     harvest,
+    is_current_minute_receipt,
+    load_minute_partition_receipts,
     load_universe,
     new_batch_id,
     new_run_id,
@@ -292,20 +293,24 @@ def _task_result(
     sessions: list[dt.date],
 ) -> dict:
     partitions = []
-    for session in sessions:
-        receipt = load_receipt(
-            engine,
-            dataset=DATASET,
-            trade_date=session.isoformat(),
-        )
-        if receipt is not None:
-            partitions.append(partition_from_receipt(receipt))
+    for session, receipt in load_minute_partition_receipts(engine, sessions).items():
+        if receipt["status"] == STATUS_COMPLETE and not is_current_minute_receipt(receipt):
+            print(f"{session} minute receipt does not prove the current daily scope", file=sys.stderr)
+            continue
+        partitions.append(partition_from_receipt(receipt))
     return build_result(
         dataset=DATASET,
         sessions=[session.isoformat() for session in sessions],
         partitions=partitions,
         build_sha=_build_sha(),
     )
+
+
+def _finish_run(engine, *, sessions: list[dt.date], emit_json: bool) -> int:
+    result = _task_result(engine, sessions=sessions)
+    if emit_json:
+        print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+    return 0 if result["status"] == "PASS" else 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -358,11 +363,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("the QMT calendar has no session in the requested range")
 
     universe = load_universe(engine, start=start, end=end)
+    receipts = load_minute_partition_receipts(engine, sessions)
     plans = plan(
         existing_sources(engine, sessions),
         sessions,
         replace_existing=args.replace_existing,
-        already_complete=completed_sessions(engine),
+        already_complete={day for day, receipt in receipts.items() if is_current_minute_receipt(receipt)},
     )
     report = {
         "datadir_roots": [str(root) for root in datadir_roots],
@@ -390,13 +396,7 @@ def main(argv: list[str] | None = None) -> int:
     todo = [item for item in plans if item.action in ACTIONABLE]
     if not todo:
         print("nothing to import")
-        if args.json:
-            print(json.dumps(
-                _task_result(engine, sessions=sessions),
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ))
-        return 0
+        return _finish_run(engine, sessions=sessions, emit_json=args.json)
 
     require_schema(engine)
     replace_sources = sorted({
@@ -499,18 +499,21 @@ def main(argv: list[str] | None = None) -> int:
             continue
         failure = shortfalls.get(session, {})
         failures += 1
-        with engine.begin() as conn:
-            write_receipt(
-                conn, session=session, root=failure.get("root", ""),
-                status=STATUS_FAILED, run_id=failure.get("run_id", ""),
-                row_count=failure.get("rows", 0),
-                code_count=failure.get("imported_codes", 0),
-                content_sha256=failure.get("digest", ""), finished=True,
-                detail={"reason": failure.get("reason", "not_attempted"),
-                        "eligible_codes": failure.get("eligible_codes", 0),
-                        "imported_codes": failure.get("imported_codes", 0),
-                        "bad_grid_codes": failure.get("bad_grid_codes", 0)},
-            )
+        with _minute_write_connection(engine) as conn, conn.begin():
+            prior = load_receipt(conn, dataset=DATASET, trade_date=session.isoformat())
+            # A source shortfall cannot replace the last verified historical publication.
+            if prior is None or prior["status"] != STATUS_COMPLETE:
+                write_receipt(
+                    conn, session=session, root=failure.get("root", ""),
+                    status=STATUS_FAILED, run_id=failure.get("run_id", ""),
+                    row_count=failure.get("rows", 0),
+                    code_count=failure.get("imported_codes", 0),
+                    content_sha256=failure.get("digest", ""), finished=True,
+                    detail={"reason": failure.get("reason", "not_attempted"),
+                            "eligible_codes": failure.get("eligible_codes", 0),
+                            "imported_codes": failure.get("imported_codes", 0),
+                            "bad_grid_codes": failure.get("bad_grid_codes", 0)},
+                )
         print(f"{session} FAILED {failure.get('reason', 'not_attempted')} "
               f"imported_codes={failure.get('imported_codes', 0)} "
               f"eligible_codes={failure.get('eligible_codes', 0)}")
@@ -522,13 +525,7 @@ def main(argv: list[str] | None = None) -> int:
 
     report["results"] = results
     report["failures"] = failures
-    if args.json:
-        print(json.dumps(
-            _task_result(engine, sessions=sessions),
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ))
-    return 1 if failures else 0
+    return _finish_run(engine, sessions=sessions, emit_json=args.json) or int(bool(failures))
 
 
 def _publish_one(
