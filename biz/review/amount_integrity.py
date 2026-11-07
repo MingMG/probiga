@@ -29,6 +29,13 @@ def _day(value: Any) -> str | None:
         return None
 
 
+def amount_proof_matches(sample: Mapping[str, Any], proof: Mapping[str, Any], day: str | None) -> bool:
+    """Bind a corroboration receipt to this exact raw dated range exception."""
+    return (proof.get("trade_date") == day and proof.get("stock_code") == str(sample.get("stock_code"))
+            and proof.get("kind") in {"QMT_DAT_LOT_RESOLUTION", "BSE_AUCTION_SCOPE"}
+            and all(_number(proof.get(key)) == _number(sample.get(key)) for key in ("amount", "volume", "low", "high")))
+
+
 def assess_amount_integrity(
     bars: pd.DataFrame | Iterable[Mapping[str, Any]] | None,
     *,
@@ -39,8 +46,9 @@ def assess_amount_integrity(
 
     A zero-volume/zero-amount suspension contributes zero without requiring a
     VWAP.  Positive trades require adjust_type=0 and amount/volume inside low
-    and high.  Adjusted prices cannot validate raw turnover.  Tolerance is only
-    floating-point arithmetic noise (1e-8 of price), never a market-data repair.
+    and high. Adjusted prices cannot validate raw turnover. A review producer
+    may attach corroboration for an exact exceptional DAT row. Other rows get
+    only floating-point arithmetic tolerance (1e-8 of price).
     The receipt proves this input sample only, not completeness of a market.
     """
     if not isinstance(max_samples, int) or max_samples < 0:
@@ -86,7 +94,11 @@ def assess_amount_integrity(
         elif low is None or high is None or low <= 0 or high < low:
             reason, missing = "invalid_or_missing_price_range", True
         elif implied is None or not math.isfinite(implied) or not (low - max(high, 1.0) * 1e-8 <= implied <= high + max(high, 1.0) * 1e-8):
-            reason = "implied_price_outside_daily_range"
+            proof = row.get("_review_amount_proof")
+            if isinstance(proof, Mapping) and amount_proof_matches(row, proof, expected_date or actual_date):
+                receipt.setdefault("corroborated_rows", []).append(dict(proof))
+            else:
+                reason = "implied_price_outside_daily_range"
         if reason:
             reasons.add(reason)
             receipt["missing_count" if missing else "inconsistent_count"] += 1

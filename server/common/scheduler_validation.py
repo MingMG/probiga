@@ -2867,6 +2867,33 @@ def scheduler_output_status(
             and payload.get("database_writes") is True
             else "failed"
         )
+    if task_type == "north_flow_daily":
+        from server.common.northbound_disclosure import (
+            NORTHBOUND_DAILY_NET_DISCLOSURE_END,
+            NORTHBOUND_DAILY_RESULT_SCHEMA,
+            NORTHBOUND_NET_NOT_DISCLOSED,
+        )
+
+        receipt = _collector_machine_payload(output)
+        if return_code != 0 or not receipt:
+            return "failed"
+        target = receipt.get("target_date")
+        expected_target = task.get("_scheduler_target_trade_date")
+        try:
+            closed_date = date.fromisoformat(str(target)).isoformat()
+        except ValueError:
+            return "failed"
+        return (
+            "degraded"
+            if task.get("script_path") == "tools/sync_north_flow_daily.py"
+            and receipt.get("schema") == NORTHBOUND_DAILY_RESULT_SCHEMA
+            and receipt.get("status") == "NOT_DISCLOSED"
+            and receipt.get("reason_code") == NORTHBOUND_NET_NOT_DISCLOSED
+            and receipt.get("database_writes") is False
+            and target == closed_date >= NORTHBOUND_DAILY_NET_DISCLOSURE_END
+            and (not expected_target or target == expected_target)
+            else "failed"
+        )
     if task_type == _FREE_STOCK_DAILY_TASK_TYPE:
         payload = _single_nested_machine_payload(
             output,

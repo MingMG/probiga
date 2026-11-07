@@ -37,6 +37,10 @@ _ROOT_STR = str(ROOT)
 if _ROOT_STR not in sys.path:
     sys.path.insert(0, _ROOT_STR)
 
+from server.common.northbound_disclosure import (
+    NORTHBOUND_DAILY_NET_DISCLOSURE_END,
+    NORTHBOUND_NET_NOT_DISCLOSED,
+)
 from tools.env_config import create_tool_engine, resolve_tool_mysql_url
 
 logger = logging.getLogger(__name__)
@@ -1136,52 +1140,61 @@ def analyze_capital_style(engine, trade_dates: list[str]) -> dict:
         "available_trade_days": 0,
         "missing_trade_dates": requested_dates,
     }
-    try:
-        north_q = text("""
-            SELECT trade_date, net_flow
-            FROM st_north_flow_daily
-            WHERE trade_date >= :d1 AND trade_date <= :d2
-            ORDER BY trade_date
-        """)
-        north_df = pd.read_sql(north_q, engine, params={"d1": d1, "d2": d2})
-        if not north_df.empty and "net_flow" in north_df.columns:
-            north_df = north_df.copy()
-            north_df["_datestr"] = north_df["trade_date"].map(_to_date_str)
-            north_df["net_flow"] = pd.to_numeric(north_df["net_flow"], errors="coerce")
-            north_df = north_df[
-                np.isfinite(north_df["net_flow"])
-                & north_df["_datestr"].isin(requested_dates)
-            ].sort_values("_datestr")
-            north_dates = sorted(set(north_df["_datestr"].tolist()))
-            north_missing_dates = sorted(set(requested_dates) - set(north_dates))
-            north_cutoff = north_dates[-1] if north_dates else None
-            north_coverage = {
-                "requested_trade_days": len(requested_dates),
-                "available_trade_days": len(north_dates),
-                "missing_trade_dates": north_missing_dates,
-            }
-            if north_dates and north_cutoff == d2 and not north_missing_dates:
-                north_status = "available"
-                north_total = float(north_df["net_flow"].sum())
-                if north_total > 1e9:
-                    north_text = "北向资金大幅净流入"
-                elif north_total > 0:
-                    north_text = "北向资金小幅净流入"
-                elif north_total < -1e9:
-                    north_text = "北向资金大幅净流出"
-                elif north_total < 0:
-                    north_text = "北向资金小幅净流出"
-                else:
-                    north_text = "北向资金持平"
-            elif north_dates:
-                north_status = "partial"
-                north_text = "北向资金窗口覆盖不完整，暂不判断方向"
-    except Exception as exc:
-        # 北向资金整体是可选维度，失败时退回"暂不判断"是对的；但静默吞掉
-        # 就藏住了一个恒定的 schema 错误：st_north_flow_daily 没有 net_flow
-        # 这一列，于是每次请求都抛 1054，而调用方只看到"无数据"。
-        # 把失败点名，别让它继续躲。
-        logger.warning("north-flow window unavailable, direction stays unknown: %s", exc)
+    north_disclosed_dates = [
+        value for value in requested_dates if value < NORTHBOUND_DAILY_NET_DISCLOSURE_END
+    ]
+    north_reason = None
+    if len(north_disclosed_dates) < len(requested_dates):
+        north_reason = NORTHBOUND_NET_NOT_DISCLOSED
+        north_text = "北向全市场净买入额自 2024-08-19 起停止公开披露，当前窗口不可判断方向"
+    if north_disclosed_dates:
+        try:
+            north_q = text("""
+                SELECT trade_date, net_tgt AS net_flow
+                FROM st_north_flow_daily
+                WHERE trade_date >= :d1 AND trade_date <= :d2
+                  AND trade_date < :disclosure_end
+                ORDER BY trade_date
+            """)
+            north_df = pd.read_sql(
+                north_q, engine,
+                params={"d1": d1, "d2": d2, "disclosure_end": NORTHBOUND_DAILY_NET_DISCLOSURE_END},
+            )
+            if not north_df.empty and "net_flow" in north_df.columns:
+                north_df = north_df.copy()
+                north_df["_datestr"] = north_df["trade_date"].map(_to_date_str)
+                north_df["net_flow"] = pd.to_numeric(north_df["net_flow"], errors="coerce")
+                north_df = north_df[
+                    np.isfinite(north_df["net_flow"])
+                    & north_df["_datestr"].isin(north_disclosed_dates)
+                ].sort_values("_datestr")
+                north_dates = sorted(set(north_df["_datestr"].tolist()))
+                north_missing_dates = sorted(set(requested_dates) - set(north_dates))
+                north_cutoff = north_dates[-1] if north_dates else None
+                north_coverage = {
+                    "requested_trade_days": len(requested_dates),
+                    "available_trade_days": len(north_dates),
+                    "missing_trade_dates": north_missing_dates,
+                }
+                if north_dates and north_cutoff == d2 and not north_missing_dates:
+                    north_status = "available"
+                    north_total = float(north_df["net_flow"].sum())
+                    if north_total > 1e9:
+                        north_text = "北向资金大幅净流入"
+                    elif north_total > 0:
+                        north_text = "北向资金小幅净流入"
+                    elif north_total < -1e9:
+                        north_text = "北向资金大幅净流出"
+                    elif north_total < 0:
+                        north_text = "北向资金小幅净流出"
+                    else:
+                        north_text = "北向资金持平"
+                elif north_dates:
+                    north_status = "partial"
+                    if not north_reason:
+                        north_text = "北向资金窗口覆盖不完整，暂不判断方向"
+        except Exception as exc:
+            logger.warning("north-flow window unavailable, direction stays unknown: %s", exc)
 
     return {
         "status": status,
@@ -1205,6 +1218,7 @@ def analyze_capital_style(engine, trade_dates: list[str]) -> dict:
         "inflow_ratio": round(inflow_ratio * 100, 1),
         "recent_daily_flows": [round(value, 0) for value in recent_daily_flows],
         "north_flow_status": north_status,
+        "north_flow_reason": north_reason,
         "north_data_cutoff": north_cutoff,
         "north_coverage": north_coverage,
         "north_total_flow": round(north_total, 0) if north_total is not None else None,
@@ -1253,7 +1267,7 @@ def build_style_dimensions(theme: dict, style: dict, capital: dict) -> dict:
             "flow_style": capital.get("flow_style") if capital_status == "available" else None,
             "recent_trend": capital.get("recent_trend") if capital_status == "available" else None,
             "inflow_stock_ratio_pct": capital.get("inflow_ratio") if capital_status == "available" else None,
-            "method": "现有个股主力资金日表按交易日汇总；北向资金仅作独立旁证",
+            "method": "现有个股主力资金日表按交易日汇总",
             "data_cutoff": capital.get("data_cutoff") if capital_status == "available" else None,
             "evidence": (
                 [

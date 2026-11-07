@@ -1099,7 +1099,7 @@ def render_compact_review(result: Mapping[str, Any]) -> str:
     )
     if result.get("data_cutoff_at"):
         cutoff = pd.Timestamp(result["data_cutoff_at"])
-        data_line += f"｜数据入库截至{cutoff.strftime('%Y-%m-%d %H:%M:%S')}"
+        data_line += f"｜数据核验截至{cutoff.strftime('%Y-%m-%d %H:%M:%S')}"
     return "\n\n".join(
         [
             f"北京时间{generated.year}年{generated.month:02d}月{generated.day:02d}日 "
@@ -1123,6 +1123,16 @@ def _max_cutoff(frame: pd.DataFrame) -> str | None:
             value = value.replace(tzinfo=BEIJING_TZ)
         return value.astimezone(BEIJING_TZ).isoformat()
     return None
+
+
+def _available_amount_proof(proof: Any, cutoff: datetime) -> Mapping[str, Any] | None:
+    if not isinstance(proof, Mapping):
+        return None
+    try:
+        available_at = datetime.fromisoformat(proof.get("available_at", ""))
+    except (TypeError, ValueError):
+        return None
+    return proof if _as_beijing(available_at) <= cutoff else None
 
 
 def generate_quant_digest_from_frames(
@@ -1224,6 +1234,11 @@ def generate_quant_digest_from_frames(
         config=config,
         quality=quality,
     )
+    for frame in (target_frame, previous_frame):
+        if "_review_amount_proof" in frame:
+            frame["_review_amount_proof"] = frame["_review_amount_proof"].map(
+                lambda proof: _available_amount_proof(proof, generated)
+            )
     expected = _expected_codes(universe, target)
     quality.gate(
         "universe_present",
@@ -1267,7 +1282,7 @@ def generate_quant_digest_from_frames(
     for label, receipt in (("target", target_amount_quality), ("previous", previous_amount_quality)):
         quality.gate(
             f"{label}_amount_integrity", receipt["status"] == "OBSERVED",
-            actual=receipt, expected="all same-day raw amount/volume prices inside [low, high]",
+            actual=receipt, expected="all same-day amounts match the trading price scope or exact corroboration",
             message=f"{label}成交额未通过量价一致性核验，金额产物降级为未知"
             if receipt["status"] != "OBSERVED" else "", hard=False,
         )
@@ -1592,11 +1607,22 @@ def generate_quant_digest_from_frames(
         "factor_exposure": factor.get("frozen_as_of"),
     }
     quality_json = quality.as_dict(coverage=coverage, source_dates=source_dates)
+    data_cutoff_at = _max_cutoff(target_frame)
+    corroboration_cutoffs = [
+        _as_beijing(datetime.fromisoformat(row["available_at"]))
+        for receipt in (target_amount_quality, previous_amount_quality)
+        if receipt["status"] == "OBSERVED"
+        for row in receipt.get("corroborated_rows", [])
+    ]
+    if corroboration_cutoffs:
+        if data_cutoff_at:
+            corroboration_cutoffs.append(datetime.fromisoformat(data_cutoff_at))
+        data_cutoff_at = max(corroboration_cutoffs).isoformat()
     result: dict[str, Any] = {
         "review_date": target.isoformat(),
         "adjust_type": config.adjust_type,
         "generated_at": generated.isoformat(),
-        "data_cutoff_at": _max_cutoff(target_frame),
+        "data_cutoff_at": data_cutoff_at,
         "publish_status": PUBLISH_BLOCKED if quality.blocked else PUBLISH_READY,
         "quality_json": quality_json,
         "market_structure_json": market,
@@ -1634,7 +1660,7 @@ def load_quant_digest_inputs(
             """
             SELECT stock_code, short_name, trade_date, adjust_type, open, close,
                    high, low, pre_close, amount, volume, turnover_ratio,
-                   etl_sync_at
+                   etl_sync_at, id, data_source, quality_status, permission_status
             FROM sm_stock_kline
             WHERE trade_date = :d AND k_type = 1 AND adjust_type = :adjust_type
             ORDER BY stock_code
@@ -1665,7 +1691,8 @@ def load_quant_digest_inputs(
             text(
                 """
                 SELECT stock_code, trade_date, adjust_type, open, close, high, low,
-                       pre_close, amount, volume, etl_sync_at
+                       pre_close, amount, volume, etl_sync_at, id, data_source,
+                       quality_status, permission_status
                 FROM sm_stock_kline
                 WHERE trade_date = :d AND k_type = 1 AND adjust_type = :adjust_type
                 ORDER BY stock_code
@@ -2072,9 +2099,15 @@ def generate_quant_digest(
         engine, date_str, adjust_type=adjust_type,
         history_sessions=config.factor_history_sessions,
     )
+    from biz.review.amount_source_evidence import attach_review_amount_evidence
+
+    review_inputs = {**inputs, **{
+        key: attach_review_amount_evidence(engine, inputs[key], cutoff=now)
+        for key in ("target_bars", "previous_bars")
+    }}
     result = generate_quant_digest_from_frames(
         date_str,
-        **inputs,
+        **review_inputs,
         config=config,
         now=now,
     )

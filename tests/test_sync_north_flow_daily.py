@@ -1,89 +1,58 @@
 from __future__ import annotations
 
-from datetime import date
 from datetime import datetime
+from functools import partial
+import json
 
-import pytest
+from sqlalchemy import create_engine, text
+from sqlalchemy.pool import StaticPool
 
-from tools.sync_north_flow_daily import parse_ths_day_chart
+from server.api import scheduler_runtime
+from server.common.authoritative_market_clock import authoritative_closed_trade_date
+from server.common.scheduler_validation import scheduler_output_status
+from tools import sync_north_flow_daily
 
 
-def test_scheduled_north_flow_target_is_current_closed_session(monkeypatch):
-    from tools import sync_north_flow_daily as collector
-    from sqlalchemy import create_engine, text
-    from server.common.authoritative_market_clock import authoritative_closed_trade_date
-    engine = create_engine("sqlite+pysqlite:///:memory:")
+def test_north_flow_records_non_disclosure_without_publishing_repeated_ths_values(monkeypatch, capsys):
+    engine = create_engine("sqlite+pysqlite://", poolclass=StaticPool)
     with engine.begin() as connection:
         connection.execute(text("CREATE TABLE si_trade_calendar (trade_date TEXT, trade_status INTEGER)"))
-        connection.execute(text("INSERT INTO si_trade_calendar VALUES ('2026-11-03',1),('2026-11-04',1)"))
-    class Clock(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return cls(2026, 11, 4, 15, 35, tzinfo=tz)
-    monkeypatch.setattr(collector, "datetime", Clock)
-    monkeypatch.setattr(collector, "load_project_env", lambda: None)
-    monkeypatch.setattr(collector, "create_tool_engine", lambda: engine)
-    monkeypatch.setattr(collector, "authoritative_closed_trade_date",
-        lambda engine, **kwargs: authoritative_closed_trade_date(
-            engine, now=Clock.now(), **kwargs))
-    monkeypatch.setattr(collector, "fetch_ths_day_chart",
-        lambda **kwargs: {"time": ["15:00"], "hgt": [1.0], "sgt": [2.0]})
-    seen = []
-    monkeypatch.setattr(collector, "publish_current_day",
-        lambda engine, snapshot, **kwargs: seen.append(snapshot["target_date"]) or {})
-    assert collector.main(["--date", "latest", "--apply"]) == 0
-    assert seen == ["2026-11-04"]
-
-
-def test_north_flow_close_snapshot_uses_final_ths_values():
-    snapshot = parse_ths_day_chart(
-        {
-            "time": ["09:30", "15:00"],
-            "hgt": [1.25, -9.28],
-            "sgt": [-2.5, 379.75],
-        },
-        target_date="2026-10-28",
+        connection.execute(text("INSERT INTO si_trade_calendar VALUES ('2026-11-05',1),('2026-11-06',1)"))
+        connection.execute(text("CREATE TABLE st_north_flow_daily (trade_date TEXT, net_tgt INTEGER)"))
+        connection.execute(text("INSERT INTO st_north_flow_daily VALUES ('2026-11-05',37047000000)"))
+    monkeypatch.setattr(sync_north_flow_daily, "load_project_env", lambda: None)
+    monkeypatch.setattr(sync_north_flow_daily, "create_tool_engine", lambda **kwargs: engine)
+    monkeypatch.setattr(engine, "dispose", lambda: None)
+    now = datetime(2026, 11, 7, 15, 35)
+    monkeypatch.setattr(
+        sync_north_flow_daily, "authoritative_closed_trade_date",
+        partial(authoritative_closed_trade_date, now=now),
     )
-
-    assert snapshot["daily"] == {
-        "trade_date": date(2026, 10, 28),
-        "net_hgt": -928_000_000,
-        "net_sgt": 37_975_000_000,
-        "net_tgt": 37_047_000_000,
+    task = {
+        "task_type": "north_flow_daily",
+        "script_path": "tools/sync_north_flow_daily.py",
+        "script_args": "--date latest --apply --json",
     }
-    assert snapshot["latest"]["trade_time"].strftime("%H:%M") == "15:00"
-    assert len(snapshot["minute_rows"]) == 2
+    dispatch_date = scheduler_runtime._task_dispatch_date(task, engine, now=now)
+    argument_row = scheduler_runtime._task_argument_row(task, now=now, target_date=dispatch_date)
+    args = scheduler_runtime._build_task_args(argument_row, task["script_path"], dispatch_date)
 
-
-def test_north_flow_rejects_unfinished_session():
-    with pytest.raises(ValueError, match="completed 15:00"):
-        parse_ths_day_chart(
-            {
-                "time": ["09:30", "14:59"],
-                "hgt": [1.0, 2.0],
-                "sgt": [-1.0, -2.0],
-            },
-            target_date="2026-10-28",
-        )
-
-
-def test_north_flow_rejects_misaligned_provider_arrays():
-    with pytest.raises(ValueError, match="misaligned"):
-        parse_ths_day_chart(
-            {"time": ["15:00"], "hgt": [], "sgt": [1.0]},
-            target_date="2026-10-28",
-        )
-
-
-def test_north_flow_allows_trailing_shenzhen_window():
-    snapshot = parse_ths_day_chart(
-        {
-            "time": ["09:30", "09:31", "15:00"],
-            "hgt": [1.0, 2.0, -9.28],
-            "sgt": [401.15, 379.75],
-        },
-        target_date="2026-10-28",
-    )
-
-    assert snapshot["daily"]["net_tgt"] == 37_047_000_000
-    assert snapshot["minute_rows"] == []
+    assert dispatch_date == "2026-11-06"
+    assert args == ["--date", "2026-11-06", "--apply", "--json"]
+    assert sync_north_flow_daily.main(args) == 0
+    output = capsys.readouterr().out
+    assert json.loads(output) == {
+        "database_writes": False,
+        "reason_code": "NORTHBOUND_NET_FLOW_NOT_DISCLOSED",
+        "schema": "probiga.north-flow-daily-result.v1",
+        "status": "NOT_DISCLOSED",
+        "target_date": "2026-11-06",
+    }
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT * FROM st_north_flow_daily")).all() == [
+            ("2026-11-05", 37_047_000_000),
+        ]
+    assert scheduler_output_status(argument_row, output, return_code=0) == "degraded"
+    assert scheduler_output_status(argument_row, output.replace("false", "true"), return_code=0) == "failed"
+    assert scheduler_output_status(argument_row, output.replace("2026-11-06", "2026-11-05"), return_code=0) == "failed"
+    assert scheduler_output_status(argument_row, output, return_code=2) == "failed"

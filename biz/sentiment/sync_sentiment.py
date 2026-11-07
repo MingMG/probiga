@@ -89,6 +89,10 @@ from server.common.batch_db import (
     write_frame,
 )
 from server.common.legacy_table_surface import validate_required_table_surface
+from server.common.northbound_disclosure import (
+    NORTHBOUND_DAILY_NET_DISCLOSURE_END,
+    NORTHBOUND_INTRADAY_NET_DISCLOSURE_END,
+)
 
 DDL_PATH = Path(__file__).resolve().parent / "sql" / "01_sentiment_tables.sql"
 HOT_RANK_TOTAL = 100
@@ -449,6 +453,8 @@ def step_margin(engine: Engine, sentiment: Any) -> None:
 def step_north_daily(engine: Engine, sentiment: Any) -> None:
     start = os.environ.get("SE_NORTH_START", "2017-01-01")
     request_date = _request_date()
+    if start >= NORTHBOUND_DAILY_NET_DISCLOSURE_END:
+        return
     df = _validate_requested_date_range(
         retry_remote(sentiment.north.north_flow, start_date=start),
         date_column="trade_date",
@@ -456,6 +462,9 @@ def step_north_daily(engine: Engine, sentiment: Any) -> None:
         requested_end=request_date,
         label="north flow daily",
     )
+    df = df[df["trade_date"] < NORTHBOUND_DAILY_NET_DISCLOSURE_END]
+    if df.empty:
+        return
     _replace_observed_business_keys(
         engine,
         _with_etl(df),
@@ -468,6 +477,8 @@ def step_north_daily(engine: Engine, sentiment: Any) -> None:
 
 def step_north_min(engine: Engine, sentiment: Any) -> None:
     request_date = _request_date()
+    if request_date >= NORTHBOUND_INTRADAY_NET_DISCLOSURE_END:
+        return
     raw = retry_remote(sentiment.north.north_flow_min)
     if isinstance(raw, Exception):
         raise RuntimeError(f"north flow minute provider failed: {raw}")
@@ -488,6 +499,8 @@ def step_north_min(engine: Engine, sentiment: Any) -> None:
 
 def step_north_current(engine: Engine, sentiment: Any) -> None:
     request_date = _request_date()
+    if request_date >= NORTHBOUND_INTRADAY_NET_DISCLOSURE_END:
+        return
     raw = retry_remote(sentiment.north.north_flow_current)
     if isinstance(raw, Exception):
         raise RuntimeError(f"north flow current provider failed: {raw}")

@@ -1805,20 +1805,50 @@ def screener_saved_delete(screen_id: int):
 
 
 @router.get("/screener/candidates")
-def screener_candidates(status: str = Query(default="ACTIVE"), limit: int = Query(default=100, ge=1, le=500)):
+def screener_candidates(
+    status: str = Query(default="ACTIVE"),
+    limit: int = Query(default=100, ge=1, le=500),
+    daily_pool_date: str | None = None,
+):
+    if daily_pool_date not in (None, "latest"):
+        if _clean_date(daily_pool_date) != daily_pool_date or not daily_pool_date:
+            raise HTTPException(status_code=422, detail="daily_pool_date must be latest or YYYY-MM-DD")
     try:
         _ensure_tables()
+        selection = {}
+        where = "(:status = '' OR status = :status)"
+        order_by = "updated_at DESC, score DESC"
+        params = {"status": str(status or ""), "limit": limit}
+        if daily_pool_date is not None:
+            scope = "source = 'daily_pool' AND status = 'PUBLISHED'"
+            dates = _engine_rows(
+                f"""SELECT DISTINCT as_of_date FROM st_screener_candidate_pool
+                    WHERE {scope} AND as_of_date IS NOT NULL
+                    ORDER BY as_of_date DESC LIMIT 7""",
+                context="screener_daily_pool_dates",
+            )
+            available_dates = [_clean_date(row["as_of_date"]) for row in dates]
+            selected_date = daily_pool_date
+            if daily_pool_date == "latest":
+                selected_date = next(iter(available_dates), None)
+            selection = {"available_dates": available_dates, "selected_date": selected_date}
+            where = f"{scope} AND as_of_date = :selected_date"
+            order_by = "score DESC, stock_code"
+            params = {"selected_date": selected_date, "limit": 501}
         rows = _engine_rows(
-            """
+            f"""
             SELECT id, stock_code, stock_name, source, screen_name, score, as_of_date, status, reason, payload_json, created_at, updated_at
             FROM st_screener_candidate_pool
-            WHERE (:status = '' OR status = :status)
-            ORDER BY updated_at DESC, score DESC
+            WHERE {where}
+            ORDER BY {order_by}
             LIMIT :limit
             """,
-            {"status": str(status or ""), "limit": limit},
+            params,
             context="screener_candidates_list",
         )
+        if selection and len(rows) > 500:
+            return {"status": "degraded", "data": [], "total": 0,
+                    "error": "DAILY_POOL_PARTITION_EXCEEDS_LIMIT", **selection}
         for row in rows:
             try:
                 row["payload"] = json.loads(row.pop("payload_json") or "{}")
@@ -1827,7 +1857,7 @@ def screener_candidates(status: str = Query(default="ACTIVE"), limit: int = Quer
             row["decision_scope"] = "RESEARCH_ONLY"
             row["action"] = "WATCH"
             row["actionable"] = False
-        return {"status": "ok", "data": rows, "total": len(rows)}
+        return {"status": "ok", "data": rows, "total": len(rows), **selection}
     except Exception:
         return {
             "status": "degraded",

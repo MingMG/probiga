@@ -230,7 +230,7 @@ def prepare_research_facts(digest: dict, context: dict) -> dict:
     digest = deepcopy(digest)
     amount_quality = (context.get("theme_evidence") or {}).get("amount_quality")
     if amount_quality is not None:
-        from biz.review.amount_integrity import apply_amount_integrity
+        from biz.review.amount_integrity import amount_proof_matches, apply_amount_integrity
         market = digest.get("market_structure_json") or {}
         def receipt(key: str, field: str) -> dict:
             sampled = amount_quality.get(key) or {"status": "UNKNOWN"}
@@ -238,7 +238,15 @@ def prepare_research_facts(digest: dict, context: dict) -> dict:
             # A limited clean sample cannot upgrade unknown market coverage,
             # nor should it erase an existing complete calculation. A sampled
             # inconsistency is a direct contradiction and must quarantine it.
-            if full and not sampled.get("inconsistent_count"):
+            inconsistencies = sampled.get("inconsistent_count") or 0
+            samples = sampled.get("samples") or []
+            corroborated = (full or {}).get("corroborated_rows") or []
+            covered = (inconsistencies == len(samples) and all(
+                sample.get("reason") == "implied_price_outside_daily_range" and any(
+                    amount_proof_matches(sample, proof, sampled.get("trade_date")) for proof in corroborated
+                ) for sample in samples
+            ))
+            if full and (not inconsistencies or covered):
                 return full
             return sampled
         verified = apply_amount_integrity(
