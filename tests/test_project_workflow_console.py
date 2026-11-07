@@ -7,7 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from server.api.main import app
-from server.common.config import get_settings
+from server.common.config import Settings, get_settings
 from server.project_workflow import store
 
 
@@ -21,6 +21,7 @@ def client(monkeypatch):
     monkeypatch.setenv("PROBIGA_ADMIN_AUTH_ENABLED", "true")
     monkeypatch.setenv("PROBIGA_ADMIN_TOKEN", HEADERS["X-ProBigA-Admin-Token"])
     monkeypatch.delenv("PROBIGA_WORKFLOW_DB", raising=False)
+    monkeypatch.setitem(Settings.model_config, "env_file", None)
     get_settings.cache_clear()
     # No application lifespan. The workflow read API has no scheduler or
     # trading runtime dependency.
@@ -38,6 +39,7 @@ def test_workflow_read_api_reuses_operator_auth_and_does_not_initialize_missing_
         assert response.headers["Cache-Control"] == "no-store"
     absent = tmp_path / "workflow.sqlite"
     monkeypatch.setenv("PROBIGA_WORKFLOW_DB", str(absent))
+    get_settings.cache_clear()
     assert client.get(BASE, headers=HEADERS).status_code == 503
     assert not absent.exists()
     assert client.post(BASE, headers=HEADERS, json={}).status_code == 405
@@ -110,3 +112,19 @@ def test_historical_console_keeps_conflicting_checks_and_missing_activation_sepa
     task = response.json()
     assert task["historical"] is True
     assert [(item["stage"], item["state"], item["code"]) for item in task["evidence"]] == outcomes
+
+
+def test_console_loads_ledger_from_protected_app_settings_without_inherited_variable(
+    client, monkeypatch, tmp_path
+):
+    db_path = tmp_path / "workflow.sqlite"
+    store.initialize(db_path)
+    protected_env = tmp_path / "api.env"
+    protected_env.write_text(f'PROBIGA_WORKFLOW_DB="{db_path.as_posix()}"\n', encoding="utf-8")
+    monkeypatch.setitem(Settings.model_config, "env_file", protected_env)
+    get_settings.cache_clear()
+
+    assert client.get(BASE).status_code == 401
+    response = client.get(BASE, headers=HEADERS)
+    assert response.status_code == 200
+    assert response.json() == {"tasks": []}

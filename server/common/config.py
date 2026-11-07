@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     api_cache_max_entries: int = 512
     probiga_admin_auth_enabled: bool = True
     probiga_admin_token: str | None = None
+    probiga_workflow_db: str | None = None
     probiga_briefing_tools_enabled: bool = False
     probiga_briefing_tools_token: str | None = None
     probiga_briefing_tools_timeout_seconds: int = 10

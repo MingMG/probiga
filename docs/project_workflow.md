@@ -23,9 +23,10 @@ python -m server.project_workflow cancel TASK_ID
 ## 安装与权限
 
 - 工程运行时仅部署 Linux。把经合并和测试的准确候选放到独立工程服务目录，按 `deploy/probiga-project-workflow.service` 由专用账号启动。该单元不接管原有业务调度。
-- 先用独立 venv 安装 deploy/project_workflow_requirements.txt，再为工程服务准备隔离的受管工作树目录、可信配置文件，以及独立 Codex App Server 的 Unix socket。监督实例使用独立只读沙箱。服务用户不使用桌面认证缓存。以实际模型能力请求核验服务身份；工作区写入和凭据不可读须通过探测。候选测试命令由运维绑定到隔离的执行环境。
+- 先用独立 venv 安装 deploy/project_workflow_requirements.txt，再为工程服务准备隔离的受管工作树目录、可信配置文件，以及独立 Codex App Server 的 Unix socket。将 socket 放在工程服务与 App Server 共享且受文件权限保护的运行目录（如 /run 下的专用目录）；工程服务启用 PrivateTmp，不能使用另一个服务的 /tmp。监督实例使用独立只读沙箱。服务用户不使用桌面认证缓存。以实际模型能力请求核验服务身份；工作区写入和凭据不可读须通过探测。候选测试命令由运维绑定到隔离的执行环境。
 - 生产发布、补采与回执查询使用原有受保护入口。仅工程控制面可登记授权，CLI 的 `authorize` 记录既有确认引用、精确候选、动作、资源、端点、环境和有效期。收到授权记录前，不派发相应生产变更。没有真实下单动作。
-- 让现有 API 进程只读账本文件并可遍历父目录；工程服务继续独占写权限。给 API 配置绝对路径 `PROBIGA_WORKFLOW_DB`。私有执行证据和配置不授予 API 进程。API 按现有管理员会话提供同源只读接口。
+- 让现有 API 进程只读账本文件并可遍历父目录；工程服务继续独占写权限。生产 API 的启动命令清空继承的环境变量，在现有受保护的 `/opt/ProBigA/.env` 中设置 `PROBIGA_WORKFLOW_DB=/var/lib/probiga-workflow/tasks.sqlite3`。开发环境也可用同名环境变量。API 启动后读取配置；未配置或账本不可读时返回 503。私有执行证据和配置不授予 API 进程。
+- API 沿用项目现有的访问边界。生产单操作员模式关闭应用 token 校验时，先核验站点入口的现有访问限制覆盖 `/api/project-workflow/tasks` 和任务详情。未授权请求须在入口被拒绝，授权操作员须能访问同源路径。没有可核对的访问限制时，保持账本路径未配置。
 
 ## 恢复与验收
 

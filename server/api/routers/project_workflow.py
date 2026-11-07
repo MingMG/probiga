@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import os
 import sqlite3
 from pathlib import Path as FilePath
 from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Path, Query, Response
 
+from server.common.config import get_settings
 from server.project_workflow import store
 
 router = APIRouter(prefix="/project-workflow", tags=["engineering-acceptance"])
@@ -25,7 +25,7 @@ def _ledger_unavailable() -> HTTPException:
 
 
 def _ledger_path() -> FilePath:
-    value = os.environ.get("PROBIGA_WORKFLOW_DB", "").strip()
+    value = (get_settings().probiga_workflow_db or "").strip()
     if not value:
         raise _ledger_unavailable()
     path = FilePath(value)
