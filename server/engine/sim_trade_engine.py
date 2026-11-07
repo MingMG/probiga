@@ -9,14 +9,22 @@
 import hashlib
 import json
 import logging
-from datetime import date, datetime, timedelta
+from contextlib import nullcontext
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
+from functools import lru_cache
+from math import isfinite
 
 import pandas as pd
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 
+from integrations.bigqmt.bridge import NATIVE_EVENT_MAX_AGE_SECONDS
+from integrations.bigqmt.spool import PROVIDER_ID
 from server.api.routers._engine import get_engine
 from server.api.routers.portfolio_math import portfolio_trade_fee
+from server.common.authoritative_market_clock import PRODUCTION_TIMEZONE
+from server.common.config import get_current_mysql_url
+from server.common.engine_factory import create_pooled_engine
 from server.common.minute_data import (
     get_first_stock_minute_price,
     get_max_stock_minute_price,
@@ -109,6 +117,7 @@ STRATEGY_CONFIG = {
 RISK_ORDER = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
 VALID_TRADE_MODES = {"live", "backtest", "forward"}
 SNAPSHOT_FALLBACK_MAX_AGE_MINUTES = 5
+SELL_QUOTE_MAX_AGE = timedelta(seconds=NATIVE_EVENT_MAX_AGE_SECONDS)
 SIM_INITIAL_CAPITAL = 1_000_000.0
 
 SIM_RISK_CONFIG = {
@@ -346,15 +355,13 @@ def _read_sql(sql: str, params: dict = None) -> list[dict]:
     return df.to_dict(orient="records")
 
 
-def _exec_sql(sql: str, params: dict = None):
-    e = get_engine()
-    with e.begin() as c:
+def _exec_sql(sql: str, params: dict = None, *, connection=None):
+    with nullcontext(connection) if connection is not None else get_engine().begin() as c:
         c.execute(text(sql), params)
 
 
-def _exec_insert_get_id(sql: str, params: dict = None) -> int:
-    e = get_engine()
-    with e.begin() as c:
+def _exec_insert_get_id(sql: str, params: dict = None, *, connection=None) -> int:
+    with nullcontext(connection) if connection is not None else get_engine().begin() as c:
         c.execute(text(sql), params or {})
         return int(c.execute(text("SELECT LAST_INSERT_ID()")).scalar() or 0)
 
@@ -471,6 +478,35 @@ def _is_buy_execution_time(now=None) -> bool:
     return (_t(9, 30) <= t <= _t(11, 30)) or (_t(13, 0) <= t <= _t(14, 30))
 
 
+def _sell_execution_session(now: datetime) -> time | None:
+    local_time = now.time()
+    if now.weekday() < 5:
+        if time(9, 30) <= local_time < time(11, 30):
+            return time(9, 30)
+        if time(13) <= local_time < time(14, 57):
+            return time(13)
+    return None
+
+
+def _sell_quote_is_fresh(quote: dict, now: datetime) -> bool:
+    if quote.get("source") not in {PROVIDER_ID, "sina_live_fallback"}:
+        return False
+    price = _safe_float(quote.get("price"))
+    volume = _safe_float(quote.get("volume"))
+    if not (isfinite(price) and price > 0 and isfinite(volume) and volume > 0):
+        return False
+    session_start = _sell_execution_session(now)
+    if session_start is None:
+        return False
+    try:
+        source_time = datetime.fromisoformat(str(quote.get("source_time") or ""))
+    except ValueError:
+        return False
+    if source_time.tzinfo is not None:
+        source_time = source_time.astimezone(PRODUCTION_TIMEZONE).replace(tzinfo=None)
+    return max(now - SELL_QUOTE_MAX_AGE, datetime.combine(now.date(), session_start)) <= source_time <= now
+
+
 def _is_signal_expire_time(now=None) -> bool:
     from datetime import datetime as _dt, time as _t
     now = now or _dt.now()
@@ -550,6 +586,25 @@ def _is_trade_date(trade_date: str) -> bool:
         return False
 
 
+def _sina_quote(fields: list[str], source: str) -> dict | None:
+    if len(fields) < 4:
+        return None
+    last_price = _safe_float(fields[3])
+    pre_close = _safe_float(fields[2])
+    price = last_price if last_price > 0 else pre_close
+    if price <= 0:
+        return None
+    return {
+        "price": price,
+        "source": source,
+        "short_name": fields[0],
+        "change_pct": round((price - pre_close) / pre_close * 100, 2) if pre_close > 0 else 0,
+        "volume": _safe_float(fields[8]) if len(fields) > 8 else 0,
+        "turnover": _safe_float(fields[9]) if len(fields) > 9 else 0,
+        "source_time": f"{fields[30]} {fields[31]}" if last_price > 0 and len(fields) > 31 else None,
+    }
+
+
 def _fetch_live_price_sina(stock_code: str) -> dict | None:
     """通过新浪财经接口获取单只股票实时价格"""
     try:
@@ -565,19 +620,7 @@ def _fetch_live_price_sina(stock_code: str) -> dict | None:
             return None
         _, val_part = text.split("=", 1)
         fields = val_part.strip('";\r ').split(",")
-        if len(fields) < 4:
-            return None
-        price = float(fields[3] or 0)
-        pre_close = float(fields[2] or 0)
-        if price <= 0:
-            price = pre_close
-        if price <= 0:
-            return None
-        return {"price": price, "source": "sina_live",
-                "short_name": fields[0],
-                "change_pct": round((price - pre_close) / pre_close * 100, 2) if pre_close > 0 else 0,
-                "volume": _safe_float(fields[8]) if len(fields) > 8 else 0,
-                "turnover": _safe_float(fields[9]) if len(fields) > 9 else 0}
+        return _sina_quote(fields, "sina_live")
     except Exception as e:
         logger.warning(f"新浪行情获取 {stock_code} 失败: {e}")
         return None
@@ -663,12 +706,12 @@ def _fetch_qmt_snapshot_prices(stock_codes: list[str]) -> dict[str, dict]:
         return {}
 
 
-def _fetch_live_prices_batch(stock_codes: list[str]) -> dict[str, dict]:
-    """Batch quote reader: local QMT snapshot first, external realtime fallback for gaps."""
+def _fetch_live_prices_batch(stock_codes: list[str], *, sell_now: datetime | None = None) -> dict[str, dict]:
+    """Read quote batches, requiring exchange-source timestamps for simulated sells."""
     clean = [str(c).strip().zfill(6) for c in stock_codes if c]
     if not clean:
         return {}
-    result = _fetch_qmt_snapshot_prices(clean)
+    result = _fetch_qmt_snapshot_prices(clean) if sell_now is None else _fetch_native_sell_quotes(clean, sell_now)
     missing = [code for code in clean if code not in result]
     if not missing:
         return result
@@ -686,28 +729,59 @@ def _fetch_live_prices_batch(stock_codes: list[str]) -> dict[str, dict]:
             var_part, val_part = line.split("=", 1)
             code = var_part.split("_")[-1][2:]
             fields = val_part.strip('";\r ').split(",")
-            if len(fields) < 4:
-                continue
-            try:
-                price = float(fields[3] or 0)
-                pre_close = float(fields[2] or 0)
-                if price <= 0:
-                    price = pre_close
-                if price > 0:
-                    result[code] = {
-                        "price": price,
-                        "source": "sina_live_fallback",
-                        "short_name": fields[0],
-                        "change_pct": round((price - pre_close) / pre_close * 100, 2) if pre_close > 0 else 0,
-                        "volume": _safe_float(fields[8]) if len(fields) > 8 else 0,
-                        "turnover": _safe_float(fields[9]) if len(fields) > 9 else 0,
-                    }
-            except (ValueError, IndexError):
-                continue
+            quote = _sina_quote(fields, "sina_live_fallback")
+            if quote and (sell_now is None or _sell_quote_is_fresh(quote, _sell_now())):
+                result[code] = quote
         return result
     except Exception as e:
         logger.warning("Realtime fallback batch quote failed: %s", e)
         return result
+
+
+def _sell_now() -> datetime:
+    return datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None)
+
+
+def _holding_days(buy_date, as_of: date) -> int:
+    try:
+        return (as_of - date.fromisoformat(str(buy_date)[:10])).days
+    except ValueError:
+        return 0
+
+
+@lru_cache(maxsize=1)
+def _sell_quote_engine():
+    return create_pooled_engine(
+        get_current_mysql_url(),
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=2,
+        pool_pre_ping=False,
+        connect_args={"connect_timeout": 3, "read_timeout": 3, "write_timeout": 3},
+    )
+
+
+def _fetch_native_sell_quotes(stock_codes: list[str], now: datetime) -> dict[str, dict]:
+    """Read the current QMT source time, never the archive's ingestion timestamp."""
+    query = text("""
+        SELECT /*+ MAX_EXECUTION_TIME(1500) */ stock_code, short_name, price, volume, change_pct, source_time
+        FROM sm_stock_current
+        WHERE stock_code IN :codes AND data_source = :source
+          AND source_time BETWEEN :oldest AND :now
+    """).bindparams(bindparam("codes", expanding=True))
+    try:
+        with _sell_quote_engine().connect() as connection:
+            rows = connection.execute(query, {
+                "codes": stock_codes,
+                "source": PROVIDER_ID,
+                "oldest": now - SELL_QUOTE_MAX_AGE,
+                "now": now,
+            }).mappings().all()
+    except Exception as exc:
+        logger.warning("QMT simulated sell quote read failed: %s", type(exc).__name__)
+        return {}
+    quotes = ({**row, "source": PROVIDER_ID} for row in rows)
+    return {quote["stock_code"]: quote for quote in quotes if _sell_quote_is_fresh(quote, now)}
 
 
 def _get_current_price(stock_code: str) -> dict | None:
@@ -1111,6 +1185,7 @@ class SimTradeEngine:
         message: str = "",
         payload: dict | None = None,
         event_date: str = "",
+        connection=None,
     ) -> None:
         now = datetime.now()
         payload_text = None
@@ -1139,7 +1214,7 @@ class SimTradeEngine:
             "severity": severity,
             "message": message,
             "payload": payload_text,
-        })
+        }, connection=connection)
 
     def portfolio_state(
         self,
@@ -1439,6 +1514,7 @@ class SimTradeEngine:
         position_id: int | None = None,
         risk_budget: dict | None = None,
         price_source: str = "",
+        connection=None,
     ) -> int:
         now = datetime.now()
         side = str(side or "BUY").upper()
@@ -1472,12 +1548,12 @@ class SimTradeEngine:
             "requested_shares": shares,
             "remaining_shares": shares,
             "position_id": position_id,
-            "source_event": "SIGNAL_BUY" if side == "BUY" else "RISK_SELL",
+            "source_event": signal.get("source_event") or ("SIGNAL_BUY" if side == "BUY" else "RISK_SELL"),
             "price_source": price_source,
             "risk_budget_amount": risk_budget.get("budget_amount", 0),
             "risk_budget_note": risk_budget.get("note", ""),
             "reason": reason,
-        })
+        }, connection=connection)
 
     def _mark_signal_ordered(self, signal_id: int, order_id: int, shares: int, amount: float, budget: dict, reason: str) -> None:
         _exec_sql("""
@@ -1502,7 +1578,10 @@ class SimTradeEngine:
             "reason": reason,
         })
 
-    def _fill_order(self, order_id: int, price: float, shares: int, amount: float, fee: float, position_id: int) -> None:
+    def _fill_order(
+        self, order_id: int, price: float, shares: int, amount: float, fee: float,
+        position_id: int, *, connection=None,
+    ) -> None:
         _exec_sql("""
             UPDATE st_sim_order
             SET status = CASE
@@ -1531,17 +1610,17 @@ class SimTradeEngine:
             "amount": amount,
             "fee": fee,
             "position_id": position_id,
-        })
+        }, connection=connection)
 
-    def _mark_order_waiting(self, order_id: int, reason: str) -> None:
+    def _mark_order_waiting(self, order_id: int, reason: str, *, connection=None) -> None:
         _exec_sql("""
             UPDATE st_sim_order
             SET last_match_reason = :reason, updated_at = NOW()
             WHERE id = :id
               AND status IN ('PENDING', 'PARTIAL')
-        """, {"id": order_id, "reason": reason})
+        """, {"id": order_id, "reason": reason}, connection=connection)
 
-    def _mark_order_closed(self, order_id: int, status: str, reason: str) -> None:
+    def _mark_order_closed(self, order_id: int, status: str, reason: str, *, connection=None) -> None:
         _exec_sql("""
             UPDATE st_sim_order
             SET status = :status,
@@ -1550,7 +1629,7 @@ class SimTradeEngine:
                 last_match_reason = :reason,
                 updated_at = NOW()
             WHERE id = :id
-        """, {"id": order_id, "status": status, "reason": reason})
+        """, {"id": order_id, "status": status, "reason": reason}, connection=connection)
 
     def _expire_open_orders(self, trade_date: str) -> int:
         now = datetime.now()
@@ -1618,49 +1697,59 @@ class SimTradeEngine:
         position_id = int(sell_signal.get("position_id") or 0)
         if position_id <= 0:
             return None
-        existing = _read_sql("""
-            SELECT id, status
-            FROM st_sim_order
-            WHERE trade_mode = :mode
-              AND side = 'SELL'
-              AND position_id = :position_id
-              AND status IN ('PENDING', 'PARTIAL')
-            ORDER BY id DESC
-            LIMIT 1
-        """, {"mode": sell_signal.get("trade_mode") or "live", "position_id": position_id})
-        if existing:
-            return {"status": "exists", "order_id": existing[0]["id"], "position_id": position_id}
-
+        mode = sell_signal.get("trade_mode") or "live"
         order_signal = {
             "id": None,
             "trade_date": trade_date,
             "stock_code": sell_signal["stock_code"],
             "short_name": sell_signal.get("short_name") or sell_signal["stock_code"],
             "strategy_type": sell_signal["strategy_type"],
+            "source_event": sell_signal.get("source_event"),
         }
         reason = sell_signal.get("reason_detail") or sell_signal.get("reason") or "risk_sell"
-        order_id = self._create_order(
-            order_signal,
-            _safe_float(sell_signal.get("sell_price")),
-            int(sell_signal.get("shares") or 0),
-            reason,
-            side="SELL",
-            trade_mode=sell_signal.get("trade_mode") or "live",
-            order_type="SIM_MARKET",
-            position_id=position_id,
-            price_source=sell_signal.get("price_source", ""),
-        )
-        self._log_event(
-            "SELL_ORDER_CREATED",
-            trade_mode=sell_signal.get("trade_mode") or "live",
-            order_id=order_id,
-            position_id=position_id,
-            stock_code=sell_signal["stock_code"],
-            strategy_type=sell_signal["strategy_type"],
-            message=reason,
-            payload=sell_signal,
-            event_date=trade_date,
-        )
+        with get_engine().begin() as connection:
+            # The same position lock serializes manual and scheduled sell order creation.
+            position = connection.execute(text("""
+                SELECT id FROM st_sim_position
+                WHERE id = :id AND status = 'holding' AND COALESCE(trade_mode, 'live') = :mode
+                FOR UPDATE
+            """), {"id": position_id, "mode": mode}).first()
+            if not position:
+                return None
+            existing = connection.execute(text("""
+                SELECT id
+                FROM st_sim_order
+                WHERE trade_mode = :mode AND side = 'SELL' AND position_id = :position_id
+                  AND status IN ('PENDING', 'PARTIAL')
+                ORDER BY id DESC
+                LIMIT 1
+            """), {"mode": mode, "position_id": position_id}).scalar()
+            if existing:
+                return {"status": "exists", "order_id": existing, "position_id": position_id}
+            order_id = self._create_order(
+                order_signal,
+                _safe_float(sell_signal.get("sell_price")),
+                int(sell_signal.get("shares") or 0),
+                reason,
+                side="SELL",
+                trade_mode=mode,
+                order_type="SIM_MARKET",
+                position_id=position_id,
+                price_source=sell_signal.get("price_source", ""),
+                connection=connection,
+            )
+            self._log_event(
+                "SELL_ORDER_CREATED",
+                trade_mode=mode,
+                order_id=order_id,
+                position_id=position_id,
+                stock_code=sell_signal["stock_code"],
+                strategy_type=sell_signal["strategy_type"],
+                message=reason,
+                payload=sell_signal,
+                event_date=trade_date,
+                connection=connection,
+            )
         return {"status": "created", "order_id": order_id, "position_id": position_id}
 
     def _match_buy_order(self, order: dict, price_info: dict, state: dict) -> dict:
@@ -1746,43 +1835,98 @@ class SimTradeEngine:
         )
         return {"order_id": order["id"], "status": "filled", "side": "BUY", **ret}
 
+    def close_live_position(self, position_id: int) -> dict:
+        """Submit a manual simulated market sell to the same matcher as risk sells."""
+        now = _sell_now()
+        trade_date = now.date().isoformat()
+        if _sell_execution_session(now) is None or not _is_trade_date(trade_date):
+            return {"status": "error", "reason": "market_closed", "error": "只在交易日连续竞价时段模拟平仓"}
+        positions = _read_sql("""
+            SELECT id, stock_code, short_name, strategy_type, buy_date, buy_shares
+            FROM st_sim_position
+            WHERE id = :id AND status = 'holding' AND COALESCE(trade_mode, 'live') = 'live'
+        """, {"id": position_id})
+        if not positions:
+            return {"status": "error", "reason": "position_closed", "error": "持仓不存在或已平仓"}
+        position = positions[0]
+        if _holding_days(position["buy_date"], now.date()) < 1:
+            return {"status": "error", "reason": "t_plus_1", "error": "A股T+1约束：无法确认已过买入当日"}
+        code = position["stock_code"]
+        quote = _fetch_live_prices_batch([code], sell_now=now).get(code, {})
+        if not _sell_quote_is_fresh(quote, _sell_now()):
+            return {"status": "error", "reason": "stale_price", "error": "缺少本场连续竞价的有效实时价格"}
+        order = self._create_sell_order_from_signal({
+            **position,
+            "position_id": position_id,
+            "shares": position["buy_shares"],
+            "sell_price": quote["price"],
+            "price_source": quote["source"],
+            "reason_detail": "手动平仓",
+            "source_event": "MANUAL_CLOSE",
+        }, trade_date)
+        if not order:
+            return {"status": "error", "reason": "position_closed", "error": "持仓不存在或已平仓"}
+        result = self._match_sell_order({"id": order["order_id"], "position_id": position_id}, quote)
+        if result["status"] == "filled":
+            return {**result, "status": "ok"}
+        if result["status"] == "waiting":
+            return {**result, "status": "pending"}
+        return {**result, "status": "error", "error": "模拟平仓订单已终止，未成交"}
+
     def _match_sell_order(self, order: dict, price_info: dict) -> dict:
         position_id = int(order.get("position_id") or 0)
-        rows = _read_sql("""
-            SELECT id, stock_code, short_name, strategy_type, trade_mode,
-                   buy_price, buy_shares, buy_date, buy_amount, ai_score
-            FROM st_sim_position
-            WHERE id = :id AND status = 'holding'
-        """, {"id": position_id})
-        if not rows:
-            self._mark_order_closed(order["id"], "CANCELLED", "持仓不存在或已平仓")
-            return {"order_id": order["id"], "status": "cancelled", "reason": "position_closed"}
-        h = rows[0]
-        price = _safe_float(price_info.get("price"))
-        if price <= 0:
-            self._mark_order_waiting(order["id"], "未获取到可用实时价格")
-            return {"order_id": order["id"], "status": "waiting", "reason": "no_price"}
-        if _is_near_limit_down(price_info):
-            self._mark_order_waiting(order["id"], "接近跌停，卖出订单等待")
-            return {"order_id": order["id"], "status": "waiting", "reason": "limit_down"}
+        order_id = order["id"]
+        mode = order.get("trade_mode") or "live"
+        with get_engine().begin() as connection:
+            h = connection.execute(text("""
+                SELECT id, stock_code, short_name, strategy_type, status, profit, profit_rate,
+                       buy_price, buy_shares, buy_date, ai_score
+                FROM st_sim_position
+                WHERE id = :id AND COALESCE(trade_mode, 'live') = :mode
+                FOR UPDATE
+            """), {"id": position_id, "mode": mode}).mappings().first()
+            current_order = connection.execute(text("""
+                SELECT id, position_id, status, trade_mode, requested_shares, remaining_shares,
+                       filled_shares, reason
+                FROM st_sim_order
+                WHERE id = :id AND position_id = :position_id
+                  AND trade_mode = :mode AND side = 'SELL'
+                FOR UPDATE
+            """), {"id": order_id, "position_id": position_id, "mode": mode}).mappings().first()
+            if not current_order:
+                return {"order_id": order_id, "status": "cancelled", "reason": "order_unavailable"}
+            if current_order["status"] == "FILLED" and h and h["status"] == "sold":
+                return {"order_id": order_id, "status": "filled", "side": "SELL",
+                        "profit": _safe_float(h["profit"]), "profit_rate": _safe_float(h["profit_rate"])}
+            if current_order["status"] not in ("PENDING", "PARTIAL"):
+                return {"order_id": order_id, "status": "cancelled", "reason": "order_terminal"}
+            if not h or h["status"] != "holding":
+                self._mark_order_closed(order_id, "CANCELLED", "持仓不存在或已平仓", connection=connection)
+                return {"order_id": order_id, "status": "cancelled", "reason": "position_closed"}
+            return self._match_locked_sell_order(current_order, h, price_info, connection)
 
-        buy_date = h.get("buy_date")
-        if isinstance(buy_date, str):
-            buy_d = datetime.strptime(buy_date[:10], "%Y-%m-%d").date()
-        else:
-            buy_d = buy_date
-        td = date.today()
-        holding_days = (td - buy_d).days if buy_d else 0
+    def _match_locked_sell_order(self, order: dict, h: dict, price_info: dict, connection) -> dict:
+        now = _sell_now()
+        position_id = h["id"]
+        order_id = order["id"]
+
+        def wait(reason: str, message: str) -> dict:
+            self._mark_order_waiting(order_id, message, connection=connection)
+            return {"order_id": order_id, "status": "waiting", "reason": reason, "message": message}
+
+        holding_days = _holding_days(h["buy_date"], now.date())
         if holding_days < 1:
-            self._mark_order_waiting(order["id"], "A股T+1约束：当日买入不能当日卖出")
-            return {"order_id": order["id"], "status": "waiting", "reason": "t_plus_1"}
+            return wait("t_plus_1", "A股T+1约束：无法确认已过买入当日")
+        if not _sell_quote_is_fresh(price_info, now):
+            return wait("stale_price", "缺少本场连续竞价的有效实时价格")
+        if _is_near_limit_down(price_info):
+            return wait("limit_down", "接近跌停，卖出订单等待")
 
+        price = _safe_float(price_info["price"])
         liquidity_shares = self._liquidity_shares(order, price_info)
-        shares = min(int(h.get("buy_shares") or 0), int(order.get("remaining_shares") or 0), liquidity_shares)
-        shares = int(shares / 100) * 100
-        if shares < int(h.get("buy_shares") or 0):
-            self._mark_order_waiting(order["id"], "流动性不足以一次性卖出整笔持仓，等待下一tick")
-            return {"order_id": order["id"], "status": "waiting", "reason": "liquidity"}
+        shares = int(h.get("buy_shares") or 0)
+        if shares <= 0 or min(int(order.get("remaining_shares") or 0), liquidity_shares) < shares:
+            return wait("liquidity", "流动性不足以一次性卖出整笔持仓，等待下一tick")
 
         fill_price = self._slipped_price("SELL", price)
         buy_price = _safe_float(h.get("buy_price"))
@@ -1796,7 +1940,7 @@ class SimTradeEngine:
             "stock_code": h["stock_code"],
             "short_name": h.get("short_name") or h["stock_code"],
             "strategy_type": h["strategy_type"],
-            "trade_mode": h.get("trade_mode") or order.get("trade_mode") or "live",
+            "trade_mode": order["trade_mode"],
             "buy_price": buy_price,
             "sell_price": fill_price,
             "shares": shares,
@@ -1806,29 +1950,29 @@ class SimTradeEngine:
             "holding_days": holding_days,
             "reason": "sim_order_match",
             "reason_detail": (order.get("reason") or "") + f"；撮合成交价{fill_price:.2f}",
-            "sell_date": date.today().isoformat(),
-            "sell_time": datetime.now().strftime("%H:%M:%S"),
+            "sell_date": now.date().isoformat(),
+            "sell_time": now.strftime("%H:%M:%S"),
             "ai_score": _safe_float(h.get("ai_score")),
-            "order_id": order["id"],
+            "order_id": order_id,
         }
-        ret = self.execute_sell(sell_signal)
-        self._fill_order(order["id"], fill_price, shares, round(fill_price * shares, 2), total_fee, position_id)
-        _exec_sql("UPDATE st_sim_position SET exit_order_id = :order_id WHERE id = :position_id", {
-            "order_id": order["id"],
-            "position_id": position_id,
-        })
+        ret = self.execute_sell(sell_signal, connection=connection)
+        self._fill_order(
+            order_id, fill_price, shares, round(fill_price * shares, 2), total_fee, position_id,
+            connection=connection,
+        )
         self._log_event(
             "ORDER_FILLED",
             trade_mode=sell_signal["trade_mode"],
-            order_id=order["id"],
+            order_id=order_id,
             position_id=position_id,
             stock_code=h["stock_code"],
             strategy_type=h["strategy_type"],
             message=f"SELL {shares} @ {fill_price:.2f}",
-            payload={**ret, "price_source": price_info.get("source", "")},
-            event_date=date.today().isoformat(),
+            payload={**ret, "price_source": price_info["source"], "quote_source_time": price_info["source_time"]},
+            event_date=now.date().isoformat(),
+            connection=connection,
         )
-        return {"order_id": order["id"], "status": "filled", "side": "SELL", **ret}
+        return {**ret, "order_id": order_id, "status": "filled", "side": "SELL"}
 
     def match_open_orders(self, trade_date: str = "", trade_mode: str = "live") -> list[dict]:
         _ensure_tables()
@@ -1848,11 +1992,21 @@ class SimTradeEngine:
         """, {"mode": trade_mode, "trade_date": trade_date})
         if not orders:
             return []
-        price_map = _fetch_live_prices_batch([o["stock_code"] for o in orders])
-        state = self.portfolio_state(trade_mode, trade_date, price_map)
+        sell_codes = {o["stock_code"] for o in orders if o["side"] == "SELL"}
+        buy_codes = {o["stock_code"] for o in orders if o["side"] != "SELL"}
+        now = _sell_now()
+        sell_prices = (
+            _fetch_live_prices_batch(sorted(sell_codes), sell_now=now)
+            if _sell_execution_session(now) is not None else {}
+        )
+        price_map = _fetch_live_prices_batch([o["stock_code"] for o in orders]) if buy_codes else {}
+        state = self.portfolio_state(trade_mode, trade_date, price_map) if buy_codes else {}
         matched = []
         for order in orders:
             code = str(order.get("stock_code") or "").zfill(6)
+            if order["side"] == "SELL":
+                matched.append(self._match_sell_order(order, sell_prices.get(code, {})))
+                continue
             price_info = price_map.get(code)
             if not price_info:
                 price_info = _get_current_price(code)
@@ -1860,12 +2014,9 @@ class SimTradeEngine:
                 self._mark_order_waiting(order["id"], "未获取到行情，等待下一tick")
                 matched.append({"order_id": order["id"], "status": "waiting", "reason": "no_quote"})
                 continue
-            if str(order.get("side") or "").upper() == "SELL":
-                ret = self._match_sell_order(order, price_info)
-            else:
-                ret = self._match_buy_order(order, price_info, state)
-                if ret.get("status") == "filled":
-                    state = self.portfolio_state(trade_mode, trade_date, price_map)
+            ret = self._match_buy_order(order, price_info, state)
+            if ret.get("status") == "filled":
+                state = self.portfolio_state(trade_mode, trade_date, price_map)
             matched.append(ret)
         return matched
 
@@ -2552,9 +2703,10 @@ class SimTradeEngine:
                 "shares": shares, "amount": amount, "fee": round(fee, 2),
                 "position_id": position_id, "flow_id": flow_id}
 
-    def execute_sell(self, sell_signal: dict) -> dict:
+    def execute_sell(self, sell_signal: dict, *, connection=None) -> dict:
         """执行模拟卖出"""
-        _ensure_tables()
+        if connection is None:
+            _ensure_tables()
         now = datetime.now()
         trade_mode = sell_signal.get("trade_mode") or "live"
         if trade_mode not in VALID_TRADE_MODES:
@@ -2571,50 +2723,51 @@ class SimTradeEngine:
         reason_detail = sell_signal.get("reason_detail") or self._reason_label(reason)
         sell_time = sell_signal.get("sell_time") or now.strftime("%H:%M:%S")
 
-        # 更新持仓表
-        _exec_sql("""
+        with nullcontext(connection) if connection is not None else get_engine().begin() as connection:
+            _exec_sql("""
             UPDATE st_sim_position
             SET status = 'sold', sell_price = :price, sell_date = :date,
                 sell_time = :time, sell_reason = :reason,
                 profit = :profit, profit_rate = :rate,
                 holding_days = :days, fee_total = :fee,
+                exit_order_id = COALESCE(:order_id, exit_order_id),
                 updated_at = NOW()
             WHERE id = :id
-        """, {
-            "price": price,
-            "date": sell_date,
-            "time": sell_time,
-            "reason": reason_detail,
-            "profit": profit,
-            "rate": profit_rate,
-            "days": sell_signal.get("holding_days", 0),
-            "fee": fee,
-            "id": position_id,
-        })
+            """, {
+                "price": price,
+                "date": sell_date,
+                "time": sell_time,
+                "reason": reason_detail,
+                "profit": profit,
+                "rate": profit_rate,
+                "days": sell_signal.get("holding_days", 0),
+                "fee": fee,
+                "id": position_id,
+                "order_id": sell_signal.get("order_id"),
+            }, connection=connection)
 
-        # 写入流水表
-        _exec_sql("""
+            _exec_sql("""
             INSERT INTO st_trade_flow
             (order_id, stock_code, short_name, flow_type, source, strategy_type, trade_mode, trans_type,
              price, shares, amount, fee, reason, ai_score, trans_date, trans_time)
             VALUES (:order_id, :code, :name, :ft, 'simulation', :st, :mode, 'sell',
                     :price, :shares, :amount, :fee, :reason, :ai, :date, :time)
-        """, {
-            "order_id": sell_signal.get("order_id"),
-            "code": sell_signal["stock_code"],
-            "name": sell_signal.get("short_name", ""),
-            "ft": "sim_sell",
-            "st": sell_signal["strategy_type"],
-            "mode": trade_mode,
-            "price": price,
-            "shares": shares,
-            "amount": amount,
-            "fee": round(fee, 2),
-            "reason": reason_detail,
-            "ai": sell_signal.get("ai_score", 0),
-            "date": sell_date,
-            "time": sell_time,
-        })
+            """, {
+                "order_id": sell_signal.get("order_id"),
+                "code": sell_signal["stock_code"],
+                "name": sell_signal.get("short_name", ""),
+                "ft": "sim_sell",
+                "st": sell_signal["strategy_type"],
+                "mode": trade_mode,
+                "price": price,
+                "shares": shares,
+                "amount": amount,
+                "fee": round(fee, 2),
+                "reason": reason_detail,
+                "ai": sell_signal.get("ai_score", 0),
+                "date": sell_date,
+                "time": sell_time,
+            }, connection=connection)
 
         return {"status": "ok", "stock_code": sell_signal["stock_code"], "profit": profit,
                 "profit_rate": profit_rate, "reason": reason}

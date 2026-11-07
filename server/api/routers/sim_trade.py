@@ -23,7 +23,6 @@ from server.engine.sim_trade_engine import (
     STRATEGY_CONFIG,
     build_buy_decision,
     fetch_recommended_candidates,
-    _get_current_price,
     _ensure_tables,
     _is_trading_time,
 )
@@ -1658,67 +1657,9 @@ RISK_ORDER = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
 
 @router.post("/sim-trade/close/{position_id}")
 def sim_trade_close(position_id: int):
-    """手动平仓指定持仓"""
+    """手动提交模拟平仓，返回撮合结果或待成交订单。"""
     try:
-        _ensure_tables()
-        engine = SimTradeEngine()
-        rows = _read_sql("""
-            SELECT id, stock_code, short_name, strategy_type,
-                   buy_price, buy_shares, buy_date, ai_score
-            FROM st_sim_position
-            WHERE id = :id AND status = 'holding'
-              AND COALESCE(trade_mode, 'live') = 'live'
-        """, {"id": position_id})
-
-        if not rows:
-            return {"status": "error", "error": "持仓不存在或已平仓"}
-
-        h = rows[0]
-        code = h["stock_code"]
-
-        from server.api.routers.portfolio_math import portfolio_trade_fee
-
-        # 获取当前价
-        price_info = _get_current_price(code)
-        if not price_info:
-            return {"status": "error", "error": "无法获取当前价格"}
-
-        current_price = price_info["price"]
-        buy_price = _safe_float(h["buy_price"])
-        shares = _safe_int(h["buy_shares"])
-        profit_rate = ((current_price - buy_price) / buy_price) * 100 if buy_price > 0 else 0
-        sell_fee = portfolio_trade_fee("sell", current_price, shares)
-        buy_fee = portfolio_trade_fee("buy", buy_price, shares)
-        total_fee = round(buy_fee + sell_fee, 2)
-        profit = round((current_price - buy_price) * shares - total_fee, 2)
-
-        bd = h.get("buy_date")
-        if isinstance(bd, str):
-            buy_d = datetime.strptime(bd[:10], "%Y-%m-%d").date()
-        elif hasattr(bd, 'isoformat'):
-            buy_d = bd
-        else:
-            buy_d = date.today()
-        holding_days = (date.today() - buy_d).days
-
-        sig = {
-            "position_id": h["id"],
-            "stock_code": code,
-            "short_name": h.get("short_name") or code,
-            "strategy_type": h["strategy_type"],
-            "buy_price": buy_price,
-            "sell_price": current_price,
-            "shares": shares,
-            "profit_rate": round(profit_rate, 2),
-            "profit": profit,
-            "fee": total_fee,
-            "holding_days": holding_days,
-            "reason": "manual_close",
-            "reason_label": "手动平仓",
-            "ai_score": _safe_float(h.get("ai_score")),
-        }
-
-        ret = engine.execute_sell(sig)
-        return ret
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
+        return SimTradeEngine().close_live_position(position_id)
+    except Exception:
+        logger.exception("Simulated close failed for position %s", position_id)
+        return {"status": "error", "error": "模拟平仓失败，请查看订单状态后重试"}
