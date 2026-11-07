@@ -1,0 +1,119 @@
+from contextlib import contextmanager
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+import pytest
+
+from server.project_workflow import codex_runner
+
+
+def git(cwd, *args):
+    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True,
+                          check=True, timeout=15).stdout.strip()
+
+
+@pytest.fixture
+def owned_context(tmp_path, monkeypatch):
+    checkout = tmp_path / "worktrees" / "isolated"
+    checkout.mkdir(parents=True)
+    git(checkout, "init", "-b", "codex/isolated-rework")
+    (checkout / "value.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (checkout / "check.py").write_text("from value import VALUE\nassert VALUE == 2\n", encoding="utf-8")
+    git(checkout, "add", "-A")
+    git(checkout, "-c", "user.name=Workflow Test", "-c", "user.email=test@example.invalid",
+        "-c", "commit.gpgsign=false", "commit", "-m", "test fixture")
+    canary = tmp_path / "sandbox-canary"
+    canary.write_text("isolated sentinel", encoding="utf-8")
+    endpoint = tmp_path / "dedicated-app-server.sock"
+    settings = {"codex_worktrees_root": str(checkout.parent)}
+    monkeypatch.setattr(codex_runner, "_settings", lambda _op, _ctx: codex_runner.WorkerConfig(settings, endpoint, canary, False))
+    return {"operation_id": "rework-1", "fence": 1, "deadline": time.time() + 60,
+            "task_id": "workflow-test", "goal": "Fix VALUE to 2", "acceptance": ["check.py passes"],
+            "session": {"worktree": str(checkout), "branch": "codex/isolated-rework",
+                        "candidate": git(checkout, "rev-parse", "HEAD")},
+            "evidence_dir": tmp_path / "evidence",
+            "settings": settings}
+
+
+def test_recovery_after_lost_turn_start_response_checks_external_turn_once(monkeypatch, owned_context):
+    context = owned_context
+    checkout = Path(context["session"]["worktree"])
+    failed = subprocess.run([sys.executable, "-B", "check.py"], cwd=checkout, capture_output=True, text=True, timeout=10)
+    assert failed.returncode == 1
+    context["failure"] = {"tail": failed.stderr}
+    operations = []
+    received_prompt = []
+    turn_state = ["inProgress"]
+
+    class Server:
+        def request(self, method, params):
+            operations.append(method)
+            if method == "command/exec":
+                return {"exitCode": 0}
+            if method == "thread/start":
+                return {"thread": {"id": "managed-thread"}}
+            if method == "turn/start":
+                received_prompt.append(params["input"][0])
+                raise codex_runner.RunnerError("CONNECTION_LOST", "Receipt lost", status="unknown")
+            if method == "thread/turns/list":
+                return {"data": [{"id": "older", "status": "completed"},
+                                 {"id": "own-turn", "status": turn_state[0]}]}
+            if method == "thread/items/list":
+                content = received_prompt if params["turnId"] == "own-turn" else [{"text": "unrelated turn"}]
+                return {"data": [{"type": "userMessage", "content": content}]}
+            pytest.fail(f"Unexpected App Server method {method}")
+
+    @contextmanager
+    def connect(*_args):
+        yield Server()
+
+    monkeypatch.setattr(codex_runner, "_connect", connect)
+    operation = {"kind": "rework"}
+    unknown = codex_runner.execute(operation, context)
+    assert unknown["status"] == "unknown"
+    assert "AssertionError" in received_prompt[0]["text"]
+    active = codex_runner.reconcile(operation, context)
+    assert active["status"] == "unknown"
+    assert active["external_id"] == "own-turn"
+    (checkout / "value.py").write_text("VALUE = 2\n", encoding="utf-8")
+    turn_state[0] = "completed"
+    completed = codex_runner.reconcile(operation, context)
+    assert completed["status"] == "success"
+    assert completed["evidence"]["candidate"] == git(checkout, "rev-parse", "HEAD")
+    assert git(checkout, "rev-list", "--count", "HEAD") == "2"
+    assert subprocess.run([sys.executable, "-B", "check.py"], cwd=checkout, timeout=10).returncode == 0
+    assert codex_runner.reconcile(operation, context) == completed
+    assert operations.count("turn/start") == 1
+
+
+def test_credentials_probe_blocks_before_thread_creation(monkeypatch, owned_context):
+    class ExposedCredentialServer:
+        def request(self, method, _params):
+            assert method == "command/exec"
+            return {"exitCode": 91}
+
+    @contextmanager
+    def connect(*_args):
+        yield ExposedCredentialServer()
+
+    monkeypatch.setattr(codex_runner, "_connect", connect)
+    response = codex_runner.execute({"kind": "codex"}, owned_context)
+    assert response["status"] == "failure"
+    assert response["code"] == "CODEX_SANDBOX_NOT_VERIFIED"
+    assert not list(owned_context["evidence_dir"].glob("*.json"))
+
+
+def test_no_coding_outside_owned_worktree_root(owned_context):
+    owned_context["settings"]["codex_worktrees_root"] = owned_context["evidence_dir"].parent / "different-root"
+    response = codex_runner.execute({"kind": "codex"}, owned_context)
+    assert response["status"] == "failure"
+    assert response["code"] == "CODEX_WORKTREE_UNOWNED"
+
+
+def test_unprovisioned_socket_blocks_before_opening_worktree():
+    context = {"settings": {"codex_ws_url": "ws://127.0.0.1:9999"}}
+    response = codex_runner.execute({"kind": "codex"}, context)
+    assert response["status"] == "waiting"
+    assert response["code"] == "CODEX_ENDPOINT_NOT_PROVISIONED"

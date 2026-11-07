@@ -1,0 +1,24 @@
+[Unit]
+Description=ProBigA engineering workflow service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=probiga-workflow
+Group=probiga-workflow
+WorkingDirectory=/opt/probiga-engineering/current
+Environment=PROBIGA_WORKFLOW_DB=/var/lib/probiga-workflow/tasks.sqlite3
+Environment=PROBIGA_WORKFLOW_SETTINGS=/etc/probiga-workflow/settings.json
+Environment=PYTHONUNBUFFERED=1
+UMask=0027
+StateDirectory=probiga-workflow
+StateDirectoryMode=0750
+ExecStart=/opt/probiga-engineering/venv/bin/python -m server.project_workflow serve
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

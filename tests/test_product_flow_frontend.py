@@ -585,7 +585,7 @@ for(const item of items){
 }
 const prior = 'ai-general ai-stock alist broad-etf-flow capital capital-rt command commentary concept concept3 concept5 daily-pool datasource east fused industry3 industry5 intraday-alert intraday-battle mainforce market-outlook market-radar market-stage monitor multi3 multi5 news notice portfolio qmt-strategy-results quant-workbench recommended research-radar review scheduler screen sector sector-heat sector-movement sector-rotation sentiment sim-trade sina stock-list strategy-backtest strategy-center strong ths trading trading-day trading-v3-candidates trading-v3-hypotheses trading-v3-intraday trading-v3-overview trading-v3-positions xq'.split(' ');
 assert.equal(prior.length,56);
-assert.deepStrictEqual(Object.keys(sidebarRouteByTab).sort(),[...prior,'workbench','market-context','hunter','jq-picks'].sort());
+assert.deepStrictEqual(Object.keys(sidebarRouteByTab).sort(),[...prior,'workbench','market-context','hunter','jq-picks','engineering-acceptance'].sort());
 assert.match(items.find(item=>item.id==='sim-trade').label,/可操作/);
 """
     result = subprocess.run([shutil.which("node"), "-"], input=harness, text=True, encoding="utf-8", capture_output=True, timeout=10)
