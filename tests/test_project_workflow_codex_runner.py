@@ -1,5 +1,7 @@
 from contextlib import contextmanager
+import errno
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import time
@@ -7,6 +9,37 @@ import time
 import pytest
 
 from server.project_workflow import codex_runner
+
+
+@pytest.mark.parametrize(("mode", "write_error", "exit_code"), [
+    ("read", errno.EROFS, 0),
+    ("write", errno.EROFS, 94),
+    ("read", errno.EIO, None),
+])
+def test_probe_distinguishes_linux_read_only_mount_from_other_write_errors(monkeypatch, mode, write_error, exit_code):
+    def sandbox_open(path, access):
+        if (path, access) == ("hidden", "rb"):
+            raise FileNotFoundError(path)
+        assert (path, access) == ("write-canary", "x")
+        raise OSError(write_error, "sandbox write denied")
+
+    def blocked_network(*args, **kwargs):
+        raise PermissionError(errno.EACCES, "sandbox network denied")
+
+    monkeypatch.setattr(sys, "argv", ["probe", "hidden", "endpoint.sock", "12345", "write-canary", mode])
+    for name in ("OPENAI_API_KEY", "GH_TOKEN", "GITHUB_TOKEN", "SSH_AUTH_SOCK"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(socket, "create_connection", blocked_network)
+    monkeypatch.setattr(socket, "AF_UNIX", 1, raising=False)
+    monkeypatch.setattr(socket, "socket", blocked_network)
+    if exit_code is None:
+        with pytest.raises(OSError) as error:
+            exec(codex_runner._PROBE, {"open": sandbox_open})
+        assert error.value.errno == write_error
+    else:
+        with pytest.raises(SystemExit) as result:
+            exec(codex_runner._PROBE, {"open": sandbox_open})
+        assert result.value.code == exit_code
 
 
 def git(cwd, *args):
