@@ -232,6 +232,20 @@ def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: s
 
     args = script_args_raw.split() if script_args_raw else []
     args.extend(_date_param_args(date_param_raw))
+    if task_type == "north_flow_daily":
+        if normalized_path != "tools/sync_north_flow_daily.py" or not scheduler_target_bound:
+            raise ValueError("Northbound disclosure task requires an exact closed session")
+        configured_dates = _option_values(args, "--date")
+        if configured_dates == ["latest"]:
+            if "--date" in args:
+                args[args.index("--date") + 1] = today
+            else:
+                args[args.index("--date=latest")] = f"--date={today}"
+        elif not configured_dates:
+            args.extend(["--date", today])
+        elif configured_dates != [today]:
+            raise ValueError("Northbound disclosure date differs from scheduler target")
+        return args
     if task_type == "free_index_daily_canonical":
         from server.common.index_daily_publication import PUBLIC_INDEX_DAILY_CODES
 

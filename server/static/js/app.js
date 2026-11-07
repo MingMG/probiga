@@ -2404,6 +2404,8 @@
             h += '<div style="background:#fff;border-radius:10px;padding:20px;margin-bottom:16px;box-shadow:0 1px 6px rgba(0,0,0,.05)"><h3 style="margin:0 0 12px;color:#2d3436;font-size:15px">资金风格明细</h3>';
             h += '<div class="stats-bar">' + card('总体风格', capitalDimension.status === 'available' ? (capitalDimension.flow_style || '-') : '不可用', 'blue') + card('近期趋势', capitalDimension.status === 'available' ? (capitalDimension.recent_trend || '-') : '不可用', 'blue') + '</div>';
             if (capitalDimension.status !== 'available') h += '<p style="margin:12px 0;color:#888;font-size:13px">' + escHtml(capitalDimension.reason || '资金数据暂不可用') + '</p>';
+            var northFlowNote = (res.capital_analysis || {}).north_flow_note;
+            if (northFlowNote) h += '<p style="margin:12px 0;color:#64748b;font-size:13px">' + escHtml(northFlowNote) + '</p>';
             h += '</div><div style="color:#999;font-size:11px;text-align:center;padding:8px">📅 分析日期: ' + escHtml(res.analysis_date || d) + '</div>';
             c.innerHTML = h;
         }).catch(function (e) {

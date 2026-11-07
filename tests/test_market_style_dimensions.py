@@ -568,7 +568,7 @@ def test_capital_style_does_not_self_validate_against_incomplete_kline(monkeypat
 
 
 def test_capital_style_only_calls_flow_sustained_when_each_recent_day_agrees(monkeypatch):
-    trade_dates = ["2026-09-01", "2026-09-02", "2026-09-03", "2026-09-04"]
+    trade_dates = ["2024-08-13", "2024-08-14", "2024-08-15", "2024-08-16"]
     flows = [2_000_000_000, 2_000_000_000, -1_000_000_000, 3_000_000_000]
     flow_rows = pd.DataFrame(
         [
@@ -606,6 +606,45 @@ def test_capital_style_only_calls_flow_sustained_when_each_recent_day_agrees(mon
     assert "持续" not in result["recent_trend"]
     assert result["north_flow_status"] == "available"
     assert result["north_flow_note"] == "北向资金持平"
+
+
+def test_market_style_excludes_post_disclosure_northbound_rows_but_retains_old_data():
+    from sqlalchemy import create_engine, text
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    dates = ["2024-08-16", "2024-08-19", "2026-11-05", "2026-11-06"]
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE si_all_code (stock_code TEXT)"))
+        connection.execute(text("INSERT INTO si_all_code VALUES ('600519')"))
+        connection.execute(text(
+            "CREATE TABLE sm_stock_capital_flow_daily "
+            "(trade_date TEXT, stock_code TEXT, main_net_inflow INTEGER)"
+        ))
+        connection.execute(text(
+            "INSERT INTO sm_stock_capital_flow_daily VALUES (:trade_date, '600519', 2000000000)"
+        ), [{"trade_date": value} for value in dates])
+        connection.execute(text("CREATE TABLE st_north_flow_daily (trade_date TEXT, net_tgt INTEGER)"))
+        connection.execute(text(
+            "INSERT INTO st_north_flow_daily VALUES "
+            "('2024-08-16', -2000000000), ('2024-08-19', 37047000000), "
+            "('2026-11-05', 37047000000), ('2026-11-06', 37047000000)"
+        ))
+
+    actual = market_sentiment.analyze_capital_style(engine, dates[-2:])
+    assert actual["status"] == "ok"
+    assert actual["north_flow_status"] == "unavailable"
+    assert actual["north_flow_reason"] == "NORTHBOUND_NET_FLOW_NOT_DISCLOSED"
+    assert actual["north_total_flow"] is None
+    assert actual["north_coverage"]["missing_trade_dates"] == dates[-2:]
+
+    mixed = market_sentiment.analyze_capital_style(engine, dates[:2])
+    assert mixed["north_flow_status"] == "partial"
+    assert mixed["north_total_flow"] is None
+    assert mixed["north_coverage"]["missing_trade_dates"] == [dates[1]]
+
+    historical = market_sentiment.analyze_capital_style(engine, dates[:1])
+    assert historical["north_flow_status"] == "available"
+    assert historical["north_total_flow"] == -2_000_000_000
 
 
 def test_style_switch_is_unavailable_when_every_evidence_stream_is_empty():
