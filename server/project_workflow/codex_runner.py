@@ -154,7 +154,7 @@ def _identity(context, config):
 
 
 _PROBE = """
-import os, socket, sys
+import errno, os, socket, sys
 secret, endpoint, port, local_file, mode = sys.argv[1:]
 try:
     with open(secret, 'rb') as file:
@@ -182,7 +182,9 @@ except OSError:
 try:
     with open(local_file, 'x') as file:
         file.write('workflow sandbox probe')
-except PermissionError:
+except OSError as error:
+    if not isinstance(error, PermissionError) and error.errno != errno.EROFS:
+        raise
     sys.exit(0 if mode == 'read' else 94)
 else:
     os.unlink(local_file)
