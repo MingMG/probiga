@@ -4,6 +4,8 @@ import re
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, text
+from sqlalchemy.pool import StaticPool
 
 from server.api.routers import screener
 
@@ -12,6 +14,51 @@ def _client() -> TestClient:
     app = FastAPI()
     app.include_router(screener.router, prefix="/api")
     return TestClient(app)
+
+
+def test_daily_pool_date_returns_complete_partition_outside_generic_row_cap(monkeypatch):
+    engine = create_engine("sqlite+pysqlite://", poolclass=StaticPool,
+                           connect_args={"check_same_thread": False})
+    dates = [f"2026-10-{day}" for day in range(19, 26)]
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE st_screener_candidate_pool (
+                id INTEGER PRIMARY KEY, stock_code TEXT, stock_name TEXT, source TEXT,
+                screen_name TEXT, score REAL, as_of_date TEXT, status TEXT, reason TEXT,
+                payload_json TEXT, created_at TEXT, updated_at TEXT
+            )
+        """))
+        conn.execute(text("""
+            INSERT INTO st_screener_candidate_pool (
+                stock_code, source, as_of_date, status, score, payload_json, updated_at
+            ) VALUES (:code, 'daily_pool', :day, 'PUBLISHED', :score, :payload, :day)
+        """), [{"code": f"{rank:06d}", "day": day, "score": 100 - rank,
+                "payload": f'{{"rank_no":{rank}}}'}
+               for day in dates for rank in range(1, 31)])
+
+    def query(sql, params=None, context=""):
+        with engine.connect() as conn:
+            return [dict(row) for row in conn.execute(text(sql), params or {}).mappings()]
+
+    monkeypatch.setattr(screener, "_ensure_tables", lambda: None)
+    monkeypatch.setattr(screener, "_engine_rows", query)
+    with _client() as client:
+        capped = client.get("/api/screener/candidates", params={"status": "PUBLISHED", "limit": 200}).json()
+        assert sum(row["as_of_date"] == dates[0] for row in capped["data"]) == 20
+
+        exact = client.get("/api/screener/candidates", params={"daily_pool_date": dates[0]}).json()
+        assert exact["status"] == "ok"
+        assert exact["selected_date"] == dates[0]
+        assert exact["available_dates"] == dates[::-1]
+        assert exact["total"] == 30
+        assert {row["as_of_date"] for row in exact["data"]} == {dates[0]}
+        assert {row["payload"]["rank_no"] for row in exact["data"]} == set(range(1, 31))
+
+        latest = client.get("/api/screener/candidates", params={"daily_pool_date": "latest"}).json()
+        assert latest["selected_date"] == dates[-1]
+        assert latest["total"] == 30
+        assert client.get("/api/screener/candidates", params={"daily_pool_date": "2026-02-30"}).status_code == 422
+    engine.dispose()
 
 
 def test_screener_catalog_exposes_unified_presets():
@@ -116,7 +163,7 @@ def test_screener_ui_loads_status_and_labels_production_ensemble():
     assert "screenerVersionScores" in script
     assert "row.action || 'WATCH'" in script
     assert int(re.search(r'style\.css\?v=(\d+)', index).group(1)) >= 48
-    assert int(re.search(r'app\.js\?v=(\d+)', index).group(1)) >= 129
+    assert re.search(r'app\.js\?v=[0-9a-f]{16}"', index)
     # Both navigation layouts are rendered dynamically; index does not duplicate them.
     assert 'id="sidebar"' in index
     assert 'data-tab="trading-v3-ledger"' not in index

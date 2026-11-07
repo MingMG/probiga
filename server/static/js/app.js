@@ -6511,49 +6511,53 @@
     }
 
     function loadDailyPoolPage(d, c) {
+        var requested = window._dailyPoolDate || 'latest';
+        var requestSeq = Number(window._dailyPoolRequestSeq || 0) + 1;
+        window._dailyPoolRequestSeq = requestSeq;
         c.innerHTML = '<div class="loading">正在读取每日票池…</div>';
-        fetchRawJsonWithTimeout(
-            '/api/screener/candidates?status=PUBLISHED&limit=200', 20000
+        return fetchRawJsonWithTimeout(
+            '/api/screener/candidates?daily_pool_date=' + encodeURIComponent(requested), 20000
         ).then(function (res) {
-            var rows = (res && res.data) || [];
-            if (!rows.length) {
-                c.innerHTML = '<div class="sc-panel"><div class="sc-panel-title"><strong>📋 每日研究票池</strong><span>暂无已发布研究候选</span></div>'
-                    + '<div class="sc-table-note">每日 18:30 的「每日票池」任务写入后，这里会显示当天的候选股票。</div></div>';
-                return;
-            }
-            var dates = [];
-            rows.forEach(function (r) {
-                var day = String(r.as_of_date || '').slice(0, 10);
-                if (day && dates.indexOf(day) < 0) dates.push(day);
-            });
-            dates.sort();
-            dates.reverse();
-            var selected = window._dailyPoolDate && dates.indexOf(window._dailyPoolDate) >= 0
-                ? window._dailyPoolDate : dates[0];
-            window._dailyPoolDate = selected;
-            var view = rows.filter(function (r) {
-                return String(r.as_of_date || '').slice(0, 10) === selected;
+            if (requestSeq !== window._dailyPoolRequestSeq) return;
+            if (!res || res.status !== 'ok') throw new Error((res && res.error) || '票池数据暂不可用');
+            var dates = res.available_dates || [];
+            var selected = res.selected_date || '';
+            var view = (res.data || []).filter(function (r) {
+                return selected && r.source === 'daily_pool' && String(r.as_of_date || '').slice(0, 10) === selected;
             });
             view.sort(function (a, b) {
+                var aRank = Number((a.payload || {}).rank_no);
+                var bRank = Number((b.payload || {}).rank_no);
+                var aRanked = Number.isInteger(aRank) && aRank > 0;
+                var bRanked = Number.isInteger(bRank) && bRank > 0;
+                if (aRanked && bRanked) return aRank - bRank;
+                if (aRanked !== bRanked) return aRanked ? -1 : 1;
                 return (Number(b.score) || 0) - (Number(a.score) || 0);
             });
             var head = view[0] || {};
             var h = '<div class="sc-panel">';
-            h += '<div class="sc-panel-title"><strong>📋 每日研究票池（' + escHtml(selected) + '）</strong>'
-                + '<span>共 ' + view.length + ' 只 · 来源 ' + escHtml(String(head.source || '-'))
-                + ' · 模型 ' + escHtml(String(head.screen_name || '-')) + '</span></div>';
+            h += '<div class="sc-panel-title"><strong>📋 每日研究票池' + (selected ? '（' + escHtml(selected) + '）' : '') + '</strong>';
+            h += view.length
+                ? '<span>共 ' + view.length + ' 只 · 来源 ' + escHtml(String(head.source || '-'))
+                    + ' · 模型 ' + escHtml(String(head.screen_name || '-')) + '</span></div>'
+                : '<span>暂无已发布研究候选</span></div>';
             h += '<div class="sc-table-note">研究用候选池：按收盘强度、流动性与主力资金排序，不构成交易指令，也不授予任何下单权限。</div>';
             h += '<div class="search-bar paged-table-toolbar">';
-            if (dates.length > 1) {
+            if (dates.length) {
                 h += '<label style="margin-right:8px">数据日 <select onchange="window.selectDailyPoolDate(this.value)">';
+                h += '<option value=""' + (requested === 'latest' ? ' selected' : '') + '>最近发布</option>';
                 dates.forEach(function (day) {
                     h += '<option value="' + escAttr(day) + '"'
-                        + (day === selected ? ' selected' : '') + '>' + escHtml(day) + '</option>';
+                        + (requested !== 'latest' && day === selected ? ' selected' : '') + '>' + escHtml(day) + '</option>';
                 });
                 h += '</select></label>';
             }
             h += '<button class="sc-btn" onclick="loadTab(\'daily-pool\')">刷新</button>';
             h += '<span class="sc-hint">点击代码可打开个股详情</span></div>';
+            if (!view.length) {
+                c.innerHTML = h + '<div class="sc-table-note">该日期暂无已发布票池，可切换到其他已发布日期。</div></div>';
+                return;
+            }
             h += '<div class="sc-table-wrap"><table class="sc-table"><thead><tr>'
                 + '<th>#</th><th>代码</th><th>名称</th><th>评分</th><th>数据日</th><th>入选理由</th>'
                 + '</tr></thead><tbody>';
@@ -6570,6 +6574,7 @@
             h += '</tbody></table></div></div>';
             c.innerHTML = h;
         }).catch(function (err) {
+            if (requestSeq !== window._dailyPoolRequestSeq) return;
             c.innerHTML = '<div class="loading">票池读取失败：'
                 + escHtml(String((err && err.message) || err)) + '</div>';
         });

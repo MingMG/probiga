@@ -241,6 +241,6 @@ def test_strategy_pool_javascript_cache_versions_are_advanced():
     index = (ROOT / "server/static/index.html").read_text(encoding="utf-8")
     trading = (ROOT / "server/static/trading-v3.html").read_text(encoding="utf-8")
     assert int(re.search(r'style\.css\?v=(\d+)', index).group(1)) >= 48
-    assert int(re.search(r'app\.js\?v=(\d+)', index).group(1)) >= 129
+    assert re.search(r'app\.js\?v=[0-9a-f]{16}"', index)
     assert int(re.search(r'trading-v3\.js\?v=(\d+)', trading).group(1)) >= 43
     assert "旧日期、未验证、DEFERRED 或 RESEARCH_ONLY" in trading

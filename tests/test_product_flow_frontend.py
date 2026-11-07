@@ -740,3 +740,57 @@ def test_backtest_page_reuses_the_single_versioned_trading_v3_validation_view():
     assert "/api/sim-trade/backtest" not in script
     assert "window.simTradeBacktest = function()" in script
     assert "switchTab('strategy-backtest')" in script
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js unavailable")
+def test_daily_pool_page_uses_persisted_rank_when_public_scores_are_rounded():
+    page = "function loadDailyPoolPage" + _script().split("function loadDailyPoolPage", 1)[1].split(
+        "window.selectDailyPoolDate =", 1
+    )[0]
+    harness = r"""
+const assert = require('node:assert/strict');
+const window = {};
+const escHtml = String;
+const escAttr = String;
+const rows = [
+    {stock_code:'600644', source:'daily_pool', as_of_date:'2026-11-06', score:0.54, payload:{rank_no:26}},
+    {stock_code:'600406', source:'daily_pool', as_of_date:'2026-11-06', score:0.54, payload:{rank_no:25}},
+    {stock_code:'600410', source:'daily_pool', as_of_date:'2026-11-06', score:0.68, payload:{rank_no:5}},
+    {stock_code:'600941', source:'daily_pool', as_of_date:'2026-11-06', score:0.68, payload:{rank_no:4}},
+    {stock_code:'600000', source:'daily_pool', as_of_date:'2026-10-19', score:0.50, payload:{}},
+    {stock_code:'600001', source:'daily_pool', as_of_date:'2026-10-19', score:0.80, payload:{}},
+    {stock_code:'600002', source:'screener', as_of_date:'2026-11-06', score:0.99, payload:{rank_no:1}},
+];
+const calls = [];
+const availableDates = ['2026-11-06', '2026-10-20', '2026-10-19'];
+const fetchRawJsonWithTimeout = async path => {
+    calls.push(path);
+    const requested = new URL(path, 'http://localhost').searchParams.get('daily_pool_date');
+    if (requested === '2026-11-05') return {status:'degraded', error:'pool query failed'};
+    return {status:'ok', data:rows, selected_date:requested === 'latest' ? '2026-11-06' : requested, available_dates:availableDates};
+};
+""" + page + r"""
+const codes = html => [...html.matchAll(/>(\d{6})<\/a>/g)].map(match => match[1]);
+(async () => {
+    const container = {};
+    await loadDailyPoolPage(null, container);
+    assert.deepEqual(codes(container.innerHTML), ['600941','600410','600406','600644']);
+    assert.match(container.innerHTML, /2026-10-20/);
+    window._dailyPoolDate = '2026-10-19';
+    await loadDailyPoolPage(null, container);
+    assert.deepEqual(codes(container.innerHTML), ['600001','600000']);
+    window._dailyPoolDate = '2026-11-05';
+    await loadDailyPoolPage(null, container);
+    assert.match(container.innerHTML, /pool query failed/);
+    assert.deepEqual(calls, [
+        '/api/screener/candidates?daily_pool_date=latest',
+        '/api/screener/candidates?daily_pool_date=2026-10-19',
+        '/api/screener/candidates?daily_pool_date=2026-11-05',
+    ]);
+})().catch(error => { console.error(error); process.exitCode = 1; });
+"""
+    result = subprocess.run(
+        [shutil.which("node") or "node", "-"], input=harness, text=True,
+        encoding="utf-8", capture_output=True, timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
