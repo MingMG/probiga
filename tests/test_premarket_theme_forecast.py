@@ -95,6 +95,14 @@ def test_scheduled_forecast_freezes_friday_input_and_serves_monday_without_notif
     assert browser["run_uid"] == receipt["run_uid"] and browser["themes"]
     assert browser["session_date"] == session and browser["fallback"] is False
     assert browser["delivery_status"] == "SUPPRESSED" and browser["decision_scope"] == "RESEARCH_DISPLAY_ONLY"
+    missing_session = "2026-11-10"
+    missing = hot_data.premarket_theme_forecast(missing_session)
+    assert missing["requested_date"] == missing["session_date"] == missing_session
+    assert missing["fallback"] is False and not missing.get("run_uid")
+    assert missing["themes"] == missing["stock_candidates"] == []
+    previous = model.load_premarket_theme_forecast(engine, missing_session, allow_fallback=True)
+    assert previous["session_date"] == session and previous["fallback"] is True
+    assert hot_data.premarket_theme_forecast(None)["run_uid"] == receipt["run_uid"]
     with engine.begin() as conn:
         conn.execute(text("DELETE FROM st_premarket_theme_forecast_item"))
     assert not validate_scheduler_task_result(task, engine=engine, started_at=utc_dispatch, now=now[0], output=output).ok

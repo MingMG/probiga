@@ -5493,14 +5493,14 @@ def research_radar(trade_date: str = Query(default=None)):
 
 @router.get("/hot-data/premarket-theme-forecast")
 def premarket_theme_forecast(session_date: str = Query(default=None)):
-    """读取已冻结的09:08盘前主题预判，不混用盘中或收盘后结论。"""
+    """读取已冻结的09:08盘前主题预判，指定日期时仅返回当日批次。"""
     try:
         from biz.premarket.theme_forecast import load_premarket_theme_forecast
 
         return load_premarket_theme_forecast(
             get_engine(),
             session_date,
-            allow_fallback=True,
+            allow_fallback=False,
         )
     except Exception as e:
         return {

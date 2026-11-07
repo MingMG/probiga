@@ -9551,7 +9551,7 @@
     }
 
     function premarketForecastIsFresh(forecast, day) {
-        if (!forecast || forecast._load_error || forecast.fallback === true) return false;
+        if (!forecast || forecast._load_error || forecast.fallback === true || !forecast.run_uid) return false;
         var sessionDate = String(forecast.session_date || forecast.requested_date || '').slice(0, 10);
         return !!sessionDate && sessionDate === String(day || '').slice(0, 10);
     }
@@ -13189,6 +13189,9 @@
             .then(function(res) {
                 if (res.status === 'ok') {
                     alert('平仓成功: 盈亏 ' + (res.profit||0).toFixed(2) + '元');
+                    loadSimTradePage(el('tab-sim-trade'));
+                } else if (res.status === 'pending') {
+                    alert('模拟平仓订单 #' + res.order_id + ' 待成交。' + (res.message||''));
                     loadSimTradePage(el('tab-sim-trade'));
                 } else {
                     alert('平仓失败: ' + (res.error||'未知错误'));
