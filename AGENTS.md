@@ -11,6 +11,14 @@ For every new Codex conversation that changes this project:
 
 Read-only investigation does not require a branch until a file change is needed.
 
+# GitHub 需求登记与工程验收
+
+1. 用户明确要求实施新需求或修复问题时，开工前按仓库和需求查找 GitHub Issue。已有对应 Issue 就复用，找不到才新建。咨询、讨论和方案比较无需登记。
+2. Issue 仅用「需求摘要」「验收条件」「影响范围」「当前进展」「当前阻塞」「下一步」小节记录实施所需信息。完整聊天、凭证、账户信息和生产配置不得写入 Issue。
+3. 在每个相关 PR 的描述中用独立一行 `Refs #<Issue 编号>` 关联同仓库 Issue，允许同一个 Issue 对应多个 PR。登记或关联重试前先查已有记录，避免重复建单。
+4. GitHub 不可用或缺少权限时，标记「待同步」，保留脱敏后的待登记信息及已知 Issue、PR 标识。继续独立可做的工作，恢复后先查重再补登记。
+5. 工程验收分别核对 GitHub 合并、适用提交和环境的测试、实际发布及生产读回。Issue 关闭或 PR 合并只能作为对应阶段的证据，缺失的验收证据应显示为「未知」「未验证」或「数据阻断」。
+
 # Deployment scope policy
 
 For every task, scan the planned and actual change scope before implementation

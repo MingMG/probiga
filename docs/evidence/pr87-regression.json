@@ -1,0 +1,26 @@
+{
+  "pull_request": 87,
+  "kind": "regression",
+  "commit": "94d1b4c939d42f506c3c019a6e358f2cb9fead45",
+  "environment": "pr87-isolated-loopback-sqlite",
+  "run_id": "pr87-20261108-utc8-6ed850bc",
+  "candidate_archive_sha256": "545b8018922fc0f036764fd5606f64bd34d17d6c8c7c9e3e1a2e3463d3cc49bc",
+  "python": "3.14.3",
+  "pytest": "9.1.0",
+  "uvicorn": "0.47.0",
+  "started_at": "2026-11-07T16:09:00+00:00",
+  "finished_at": "2026-11-07T16:09:02+00:00",
+  "result": "passed",
+  "broker_order_stub_calls": 0,
+  "pytest_arguments": [
+    "-q",
+    "tests/test_sim_trade_manual_close.py",
+    "tests/test_premarket_theme_forecast.py"
+  ],
+  "counts": {
+    "tests": 27,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  }
+}

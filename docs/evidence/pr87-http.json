@@ -1,0 +1,37 @@
+{
+  "pull_request": 87,
+  "kind": "http",
+  "commit": "94d1b4c939d42f506c3c019a6e358f2cb9fead45",
+  "environment": "pr87-isolated-loopback-sqlite",
+  "run_id": "pr87-20261108-utc8-6ed850bc",
+  "candidate_archive_sha256": "545b8018922fc0f036764fd5606f64bd34d17d6c8c7c9e3e1a2e3463d3cc49bc",
+  "python": "3.14.3",
+  "pytest": "9.1.0",
+  "uvicorn": "0.47.0",
+  "started_at": "2026-11-07T16:09:00+00:00",
+  "finished_at": "2026-11-07T16:09:01+00:00",
+  "result": "failed",
+  "broker_order_stub_calls": 0,
+  "route": "POST /api/sim-trade/close/{position_id}",
+  "simulated_sell": {
+    "http": 200,
+    "result": "ok",
+    "filled": true
+  },
+  "real_account_request": {
+    "body_account_type": "real",
+    "account_id_is_synthetic": true,
+    "http": 200,
+    "result": "ok",
+    "rejected": false
+  },
+  "ledger_unchanged_after_real_account_request": false,
+  "ledger_changed_tables": [
+    "st_sim_position",
+    "st_sim_order",
+    "st_trade_flow",
+    "st_sim_event"
+  ],
+  "simulated_order_row_delta": 1,
+  "simulated_flow_row_delta": 1
+}

@@ -1,10 +1,11 @@
-/* Run: node tests/trading_day_browser.cjs [absolute path to playwright module]. */
+/* Run: node tests/trading_day_browser.cjs [absolute path to playwright module] [--engineering-acceptance-only]. */
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const http = require('node:http');
 const os = require('node:os');
-const {chromium} = require(process.argv[2] || 'playwright');
+const flags = process.argv.slice(2);
+const {chromium} = require(flags.find(arg=>!arg.startsWith('--')) || 'playwright');
 const root = path.resolve(__dirname, '..');
 const day = '2026-09-18';
 let clock = {server_time:day+' 10:30:00',today:day,active_trade_date:day,ui_trade_date:day,expected_trade_date:day,is_trade_day:true,is_intraday:true,phase:'intraday'};
@@ -31,7 +32,7 @@ const navigation=[
 async function assertNavigation(page,expected){
  const groups=await page.locator('#sidebar .sidebar-group').evaluateAll(nodes=>nodes.map(group=>({
   title:group.querySelector('.sidebar-group-title span').textContent.trim(),
-  items:Array.from(group.querySelectorAll('.sidebar-item')).map(item=>({id:item.dataset.tab,text:item.textContent.trim()}))
+  items:Array.from(group.querySelectorAll('.sidebar-item[data-tab]')).map(item=>({id:item.dataset.tab,text:item.textContent.trim()}))
  })));
  assert.deepEqual(groups.map(group=>group.title),expected.map(group=>group[0]));
  for(let i=0;i<expected.length;i++){
@@ -148,6 +149,21 @@ const server=http.createServer((req,res)=>{
   await page.evaluate(()=>localStorage.clear());
   await page.goto(base+'/?tab=trading-day&trade_date='+day);await page.waitForSelector('#tab-trading-day .td-hero');
   await assertNavigation(page,navigation);
+  const ops = page.locator('#sidebar .sidebar-group[data-group-key="ops"]');
+  await ops.locator('.sidebar-group-toggle').click();
+  const acceptance = ops.getByRole('link', {name:'工程验收', exact:true});
+  const consoleUrl = 'https://probiga-evidence-console.babeiming0.chatgpt.site/';
+  await page.context().route(consoleUrl, route=>route.fulfill({body:'Isolated console fixture'}));
+  const [consolePage] = await Promise.all([page.waitForEvent('popup'), acceptance.click()]);
+  await consolePage.waitForLoadState('domcontentloaded');
+  assert.equal(consolePage.url(),consoleUrl);
+  assert.equal(await consolePage.evaluate(()=>window.opener===null),true);
+  await consolePage.close();
+  if (flags.includes('--engineering-acceptance-only')) {
+   assert.deepEqual(errors,[]);
+   console.log(JSON.stringify({ok:true,engineeringAcceptanceUrl:consoleUrl}));
+   return;
+  }
   assert.equal(await page.locator('#btnLayoutToggle').count(),0);
   assert.equal(await page.locator('.sidebar-item.active').getAttribute('data-tab'),'trading-day');
   assert.equal(await page.locator('#sidebar [data-tab="workbench"]').count(),1);

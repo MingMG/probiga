@@ -8051,12 +8051,14 @@
             {id:'datasource', icon:'🔌', label:'数据获取监控'}
         ]},
         {id:'ops', group:'调度、权限与部署', items:[
-            {id:'scheduler', icon:'⚙️', label:'调度管理'}
+            {id:'scheduler', icon:'⚙️', label:'调度管理'},
+            {id:'engineering-acceptance', label:'工程验收', href:'https://probiga-evidence-console.babeiming0.chatgpt.site'}
         ]}
     ];
     var sidebarRouteByTab = Object.create(null);
     APP_NAV.forEach(function(group) {
         group.items.forEach(function(item) {
+            if (item.href) return;
             sidebarRouteByTab[item.id] = item.id;
             (item.aliases || []).forEach(function(alias) { sidebarRouteByTab[alias] = item.id; });
             if (item.tradingView) {
@@ -8139,6 +8141,10 @@
             h += '<button type="button" class="sidebar-group-title sidebar-group-toggle" data-group-key="' + escAttr(groupKey) + '" aria-expanded="' + (collapsed ? 'false' : 'true') + '" aria-controls="' + escAttr(itemsId) + '" onclick="toggleSidebarGroup(this)"><span>' + escHtml(g.group) + '</span><span class="sidebar-group-chevron" aria-hidden="true">⌄</span></button>';
             h += '<div class="sidebar-group-items" id="' + escAttr(itemsId) + '">';
             g.items.forEach(function (it) {
+                if (it.href) {
+                    h += '<a class="sidebar-item" href="' + escAttr(it.href) + '" target="_blank" rel="noopener noreferrer">' + escHtml(it.label) + '</a>';
+                    return;
+                }
                 var current = it.id === activeItemId;
                 var attrs = ' type="button" class="sidebar-item' + (current ? ' active" aria-current="page"' : '"') +
                     ' data-tab="' + it.id + '"';

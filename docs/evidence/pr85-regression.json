@@ -1,0 +1,34 @@
+{
+  "pull_request": 85,
+  "kind": "regression",
+  "commit": "093638612589652420b623b779ef67371ee3dfee",
+  "environment": "pr85-isolated-git-archive-sqlite-no-network",
+  "run_id": "pr85-07059d8bb1a8462ab47f9f9b2d5b7ce7",
+  "python": "3.13.14",
+  "pytest": "9.1.1",
+  "sqlalchemy": "2.0.52",
+  "verified_at": "2026-11-07T16:06:16.948Z",
+  "result": "passed",
+  "launcher": "python -E -B -",
+  "pytest_arguments": [
+    "-q",
+    "tests/test_pit_finance_event_facts.py",
+    "tests/test_qmt_announcement_pit.py",
+    "tests/test_qmt_datadir_daily_coverage.py",
+    "-o",
+    "cache_dir=.pytest_cache"
+  ],
+  "counts": {
+    "tests": 236,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "warnings": 12359
+  },
+  "isolation": "Exact candidate Git archive, pytest plugins disabled, runtime credentials removed from the process environment, network calls and subprocesses denied by a Python audit hook.",
+  "coverage": [
+    "QMT daily evidence writes use a deferred PyMySQL driver connection and record batched wire statements without connecting to a database.",
+    "Daily history source deadlines reset per session.",
+    "PIT event and announcement batches preserve revision chains and durable rows on replay in SQLite."
+  ]
+}

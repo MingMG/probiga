@@ -576,6 +576,13 @@ assert.deepStrictEqual(APP_NAV.map(group=>group.group),[
 ]);
 assert.deepStrictEqual(APP_NAV[0].items.map(item=>item.id),['workbench','trading-day','command','trading']);
 for(const item of items){
+  if(item.href){
+    assert.equal(item.id,'engineering-acceptance');
+    assert.equal(item.href,'https://probiga-evidence-console.babeiming0.chatgpt.site');
+    assert.equal(LOADERS[item.id],undefined);
+    assert.equal(PAGE_TITLES[item.id],undefined);
+    continue;
+  }
   assert.equal(typeof LOADERS[item.id],'function',item.id+' has a loader');
   assert.equal(PAGE_TITLES[item.id],item.icon+' '+item.label);
   for(const alias of item.aliases || []) {
