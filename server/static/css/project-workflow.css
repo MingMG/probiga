@@ -1,0 +1,58 @@
+.pw-layout {
+    display: grid;
+    grid-template-columns: minmax(14rem, 1fr) minmax(0, 2.5fr);
+    gap: 16px;
+    margin-top: 16px;
+}
+.pw-panel {
+    background: #fff;
+    border: 1px solid #dce5ed;
+    border-radius: 8px;
+    padding: 16px;
+    overflow-wrap: anywhere;
+}
+.pw-panel h2 { font-size: 17px; margin: 0 0 12px; }
+.pw-panel h3 { font-size: 14px; margin: 16px 0 8px; }
+.pw-panel p, .pw-panel li, .pw-notice { font-size: 13px; line-height: 1.6; }
+.pw-panel ul { margin: 0; padding-left: 20px; }
+.pw-task-list { display: grid; gap: 8px; }
+.pw-task {
+    text-align: left;
+    padding: 10px;
+    border: 1px solid #dce5ed;
+    border-radius: 6px;
+    background: #f7f9fb;
+    color: #172739;
+    cursor: pointer;
+    overflow-wrap: anywhere;
+}
+.pw-task[aria-pressed="true"] { border-color: #3268ac; background: #edf4ff; }
+.pw-task strong { display: block; margin-bottom: 5px; }
+.pw-state {
+    display: inline-block;
+    border-radius: 6px;
+    padding: 3px 6px;
+    font-size: 12px;
+    background: #edf2f7;
+    color: #38465b;
+}
+.pw-state[data-state="COMPLETE"], .pw-state[data-state="VERIFIED"] { background: #e0f2e8; color: #14513b; }
+.pw-state[data-state="RUNNING"] { background: #e4efff; color: #214f8a; }
+.pw-state[data-state="BLOCKED"], .pw-state[data-state="RECONCILING"] { background: #fff1d7; color: #74420a; }
+.pw-state[data-state="FAILED"] { background: #ffe9e9; color: #8d2525; }
+.pw-table-wrap { overflow-x: auto; }
+.pw-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.pw-table th, .pw-table td {
+    text-align: left;
+    vertical-align: top;
+    padding: 8px;
+    border-bottom: 1px solid #e7edf3;
+    min-width: 5rem;
+}
+.pw-table th { background: #f7f9fb; color: #354356; }
+.pw-notice, .pw-muted { color: #526275; }
+.pw-facts { display: flex; flex-wrap: wrap; gap: 6px 16px; }
+.pw-facts > div { font-size: 13px; line-height: 1.6; }
+.pw-facts dt { color: #526275; }
+.pw-facts dd { margin: 0; }
+@media (max-width: 840px) { .pw-layout { grid-template-columns: minmax(0, 1fr); } }

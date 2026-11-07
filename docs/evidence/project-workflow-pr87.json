@@ -1,0 +1,66 @@
+{
+  "id": "historical-pr87",
+  "title": "PR #87 模拟卖出安全历史验收",
+  "pull_request": 87,
+  "evidence": [
+    {
+      "stage": "merged",
+      "state": "COMPLETE",
+      "candidate": "94d1b4c939d42f506c3c019a6e358f2cb9fead45",
+      "environment": "github-main",
+      "endpoint": null,
+      "code": "merged_main_commit",
+      "at": 1794058694.0,
+      "source": "https://github.com/MingMG/probiga/pull/87",
+      "merged": true
+    },
+    {
+      "stage": "tested",
+      "state": "COMPLETE",
+      "candidate": "94d1b4c939d42f506c3c019a6e358f2cb9fead45",
+      "environment": "pr87-isolated-loopback-sqlite",
+      "endpoint": null,
+      "code": "isolated_regression_passed",
+      "at": 1794067742.0,
+      "source": "714b180c:docs/evidence/pr87-regression.json",
+      "run_id": "pr87-20261108-utc8-6ed850bc",
+      "archive_sha256": "545b8018922fc0f036764fd5606f64bd34d17d6c8c7c9e3e1a2e3463d3cc49bc",
+      "passed": 27,
+      "failures": 0,
+      "real_order_stub_calls": 0
+    },
+    {
+      "stage": "tested",
+      "state": "FAILED",
+      "candidate": "94d1b4c939d42f506c3c019a6e358f2cb9fead45",
+      "environment": "pr87-isolated-loopback-sqlite",
+      "endpoint": null,
+      "code": "isolated_http_real_account_guard_failed",
+      "at": 1794067741.0,
+      "source": "714b180c:docs/evidence/pr87-http.json",
+      "run_id": "pr87-20261108-utc8-6ed850bc",
+      "archive_sha256": "545b8018922fc0f036764fd5606f64bd34d17d6c8c7c9e3e1a2e3463d3cc49bc",
+      "http_status": 200,
+      "simulated_ledger_changed": true,
+      "real_order_stub_calls": 0
+    },
+    {
+      "stage": "released",
+      "state": "UNKNOWN",
+      "candidate": "94d1b4c939d42f506c3c019a6e358f2cb9fead45",
+      "environment": "production",
+      "endpoint": "linux",
+      "code": "release_receipt_unavailable",
+      "at": 1794069257.0
+    },
+    {
+      "stage": "active",
+      "state": "UNKNOWN",
+      "candidate": "94d1b4c939d42f506c3c019a6e358f2cb9fead45",
+      "environment": "production",
+      "endpoint": "linux",
+      "code": "production_candidate_business_readback_unverified",
+      "at": 1794069257.0
+    }
+  ]
+}

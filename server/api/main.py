@@ -26,7 +26,7 @@ from server.api.routers._engine import (
     dispose_engine as dispose_api_engine,
     get_engine as get_api_engine,
 )
-from server.api.routers import ai_bridge, auth, broad_etf_flow, commentary, datasource, deploy, health, hot_data, jq_minute, notify, qmt_ingest, qmt_strategy_results, quant_workbench, scheduler, sim_trade, strategy_center, screener, trading_v2, trading_v3
+from server.api.routers import ai_bridge, auth, broad_etf_flow, commentary, datasource, deploy, health, hot_data, jq_minute, notify, project_workflow, qmt_ingest, qmt_strategy_results, quant_workbench, scheduler, sim_trade, strategy_center, screener, trading_v2, trading_v3
 from server.api.routers import market_home, market_outlook, market_radar, market_stage, trading_day
 from server.briefing_tools.router import router as briefing_tools_router
 from server.api.scheduler_runtime import (
@@ -264,6 +264,7 @@ app.include_router(screener.router, prefix="/api")
 app.include_router(datasource.router, prefix="/api")
 app.include_router(commentary.router, prefix="/api")
 app.include_router(deploy.router, prefix="/api")
+app.include_router(project_workflow.router, prefix="/api")
 app.include_router(market_radar.router, prefix="/api")
 app.include_router(market_outlook.router, prefix="/api")
 app.include_router(market_home.router, prefix="/api")

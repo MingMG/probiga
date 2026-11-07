@@ -6580,6 +6580,13 @@
 
     /* ===== Tabs ===== */
     var LOADERS = {
+        'engineering-acceptance': function (d, c) {
+            return window.ProjectWorkflow.load(c, {
+                request:fetchRawJsonWithTimeout,
+                isActive:function(){return activeTabId() === 'engineering-acceptance';},
+                status:setStatus
+            });
+        },
         'trading-day': function (d, c) {
             return window.TradingDayDesk.load(d, c, {
                 request:fetchRawJsonWithTimeout,
@@ -8051,7 +8058,8 @@
             {id:'datasource', icon:'🔌', label:'数据获取监控'}
         ]},
         {id:'ops', group:'调度、权限与部署', items:[
-            {id:'scheduler', icon:'⚙️', label:'调度管理'}
+            {id:'scheduler', icon:'⚙️', label:'调度管理'},
+            {id:'engineering-acceptance', icon:'✓', label:'工程验收'}
         ]}
     ];
     var sidebarRouteByTab = Object.create(null);
