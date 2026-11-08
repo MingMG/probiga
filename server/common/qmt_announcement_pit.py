@@ -13,6 +13,7 @@ DDL/triggers; a runtime run refuses an absent or drifted schema.
 from __future__ import annotations
 
 from contextlib import nullcontext
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -26,6 +27,7 @@ from pathlib import Path
 import re
 import tempfile
 from time import monotonic
+from types import MappingProxyType
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
@@ -163,6 +165,18 @@ class QMTAnnouncementBlocked(RuntimeError):
         if self.detail:
             message += f":{self.detail}"
         super().__init__(message)
+
+
+@dataclass(frozen=True)
+class HistoricalAnnouncementSelection:
+    """Validated historical batch rows and their scope-head status at the decision time."""
+
+    engine: Engine
+    decision_at: datetime
+    window_start: date
+    window_end: date
+    batch: Mapping[str, Any]
+    members: Mapping[str, tuple[Mapping[str, Any], bool]]
 
 
 @dataclass(frozen=True)
@@ -2578,6 +2592,7 @@ def validate_complete_historical_reconstruction_batch(
     window_start: date | str,
     window_end: date | str,
     expected_trade_date: date | str | None = None,
+    capture_historical_selection: Callable[[HistoricalAnnouncementSelection], None] | None = None,
 ) -> dict[str, Any]:
     """Validate one exact post-hoc CNINFO batch and its actual knowledge time."""
 
@@ -2652,6 +2667,8 @@ def validate_complete_historical_reconstruction_batch(
                     "QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND", "no-common-batch"
                 )
             by_batch: dict[str, dict[str, datetime]] = {}
+            scope_heads: dict[str, str] = {}
+            candidate_links: dict[str, dict[str, tuple[str, str]]] = {}
             for offset in range(0, len(requested), VALIDATION_READ_BATCH_SIZE):
                 code_batch = requested[
                     offset : offset + VALIDATION_READ_BATCH_SIZE
@@ -2673,6 +2690,9 @@ def validate_complete_historical_reconstruction_batch(
                             for row in scope_rows
                         ]
                         _validate_coverage_chain(chain)
+                        if capture_historical_selection is not None:
+                            head = chain[-1]
+                            scope_heads[str(head["stock_code"]).zfill(6)] = str(head["coverage_id"])
                         # A later live/query-cutoff revision must not hide an
                         # earlier immutable reconstruction for this exact target.
                         for candidate in chain:
@@ -2693,6 +2713,11 @@ def validate_complete_historical_reconstruction_batch(
                                 by_batch.setdefault(batch_id, {})[code] = _dt(
                                     candidate.get("known_at")
                                 )
+                                if capture_historical_selection is not None:
+                                    candidate_links.setdefault(batch_id, {})[code] = (
+                                        str(candidate["coverage_id"]),
+                                        str(candidate["scope_hash"]),
+                                    )
             candidates = [
                 batch_id for batch_id, batch_codes in by_batch.items()
                 if set(batch_codes) == set(requested)
@@ -2884,6 +2909,7 @@ def validate_complete_historical_reconstruction_batch(
                     incremental_hashes: set[str] = set()
                     shared_incremental: dict[str, Any] | None = None
                     payload_row_count = 0
+                    members: dict[str, tuple[Mapping[str, Any], bool]] = {}
                     security_master = provenance.get("security_master")
                     if not isinstance(security_master, dict):
                         raise ValueError("security master proof is absent")
@@ -3003,6 +3029,19 @@ def validate_complete_historical_reconstruction_batch(
                                 "result_count": int(row.get("result_count") or 0),
                                 "provider_receipt_hash": receipt_hash,
                             })
+                            if code in scope_heads:
+                                coverage_id = str(row["coverage_id"])
+                                if candidate_links[batch_id].get(code) != (
+                                    coverage_id, str(row["scope_hash"]),
+                                ):
+                                    raise ValueError("reconstruction selection coverage identity differs")
+                                members[code] = (
+                                    MappingProxyType({
+                                        key: value for key, value in row.items()
+                                        if key != "payload_json"
+                                    }),
+                                    coverage_id == scope_heads[code],
+                                )
                             payload_row_count += 1
                     if (
                         payload_row_count != len(batch_rows)
@@ -3046,7 +3085,9 @@ def validate_complete_historical_reconstruction_batch(
                         }) != incremental.get("chain_root_hash")
                     ):
                         raise ValueError("reconstruction batch root differs")
-                    return {
+                    if capture_historical_selection is not None and len(members) != len(requested):
+                        raise ValueError("reconstruction selection does not cover requested stocks")
+                    batch = {
                         "schema": QMT_ANNOUNCEMENT_RECONSTRUCTION_BATCH_SCHEMA,
                         "status": "COMPLETE",
                         "mode": "HISTORICAL_RECONSTRUCTION",
@@ -3091,6 +3132,17 @@ def validate_complete_historical_reconstruction_batch(
                     raise
                 except Exception as exc:
                     failure_codes.append(type(exc).__name__)
+                else:
+                    if capture_historical_selection is not None:
+                        capture_historical_selection(HistoricalAnnouncementSelection(
+                            engine=engine,
+                            decision_at=decision,
+                            window_start=start,
+                            window_end=end,
+                            batch=MappingProxyType(deepcopy(batch)),
+                            members=MappingProxyType(members),
+                        ))
+                    return batch
             raise QMTAnnouncementBlocked(
                 "QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND",
                 ",".join(failure_codes[:10]) or "no-common-batch",
@@ -3105,6 +3157,8 @@ def validate_complete_historical_reconstruction_batch(
 
 def validate_complete_announcement_batch(
     engine: Engine,
+    *,
+    capture_historical_selection: Callable[[HistoricalAnnouncementSelection], None] | None = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
     """Prefer QMT and use a fully proven fallback batch only when absent.
@@ -3131,6 +3185,10 @@ def validate_complete_announcement_batch(
         )
         if not (qmt_absent or legacy_all_empty):
             raise
+        if legacy_all_empty:
+            # The downstream cutoff can reject a legacy QMT candidate before
+            # the all-empty check. Keep that case on the explicit T validation.
+            capture_historical_selection = None
     for fallback_source in (
         CNINFO_ANNOUNCEMENT_SOURCE,
         EASTMONEY_ANNOUNCEMENT_SOURCE,
@@ -3155,6 +3213,7 @@ def validate_complete_announcement_batch(
                         window_start=kwargs.get("window_start"),
                         window_end=kwargs.get("window_end"),
                         expected_trade_date=kwargs.get("window_end"),
+                        capture_historical_selection=capture_historical_selection,
                     )
                 except QMTAnnouncementBlocked as historical_exc:
                     if not (
@@ -4849,7 +4908,7 @@ __all__ = [
     "parse_qmt_announcement_frame", "parse_qmt_publication_time",
     "synchronize_qmt_announcements", "validate_complete_announcement_batch",
     "synchronize_historical_cninfo_announcements",
-    "validate_complete_historical_reconstruction_batch",
+    "HistoricalAnnouncementSelection", "validate_complete_historical_reconstruction_batch",
     "validate_complete_qmt_announcement_batch",
     "validate_task_result",
 ]

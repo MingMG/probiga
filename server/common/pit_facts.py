@@ -21,7 +21,7 @@ import json
 import math
 import re
 import zlib
-from typing import Any, Callable, Iterable, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import bindparam, inspect, text
@@ -36,6 +36,9 @@ from server.common.finance_nonfiling_evidence import (
     EVIDENCE_SCHEMA as FINANCE_NONFILING_BODY_SCHEMA,
     validate_document_body_evidence,
 )
+
+if TYPE_CHECKING:
+    from server.common.qmt_announcement_pit import HistoricalAnnouncementSelection
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -54,6 +57,7 @@ FINANCE_ATOMIC_BATCH_INCREMENTAL_SCHEMA = (
 FINANCE_ATOMIC_BATCH_HISTORY_LIMIT = 20
 FINANCE_ATOMIC_BATCH_QUERY_CODE_LIMIT = 100
 COMMON_FACT_CUTOFF_QUERY_CODE_LIMIT = 500
+EMPTY_COVERAGE_MYSQL_CODE_LIMIT = 40
 FINANCE_INCREMENTAL_DISCOVERY_SOURCE = "eastmoney.finance.global_discovery"
 FINANCE_INCREMENTAL_DISCOVERY_CODE = "000000"
 FINANCE_INCREMENTAL_DISCOVERY_SCHEMA = (
@@ -2807,6 +2811,26 @@ def _validate_coverage_chain(
         previous_known = known
 
 
+def _empty_coverage_receipt(
+    row: Mapping[str, Any],
+    *,
+    fact_cutoff_at: datetime,
+    decision_at: datetime,
+) -> dict[str, Any]:
+    return {
+        "coverage_id": str(row.get("coverage_id") or ""),
+        "coverage_source": str(row.get("source") or ""),
+        "coverage_response_hash": str(row.get("source_response_hash") or ""),
+        "coverage_watermark_hash": str(row.get("watermark_hash") or ""),
+        "covered_through_at": _dt_text(_row_datetime(row.get("covered_through_at"))),
+        "coverage_known_at": _dt_text(_row_datetime(row.get("known_at"))),
+        "coverage_received_at": _dt_text(_row_datetime(row.get("received_at"))),
+        "coverage_batch_id": str(row.get("batch_id") or ""),
+        "fact_cutoff_at": _dt_text(fact_cutoff_at),
+        "decision_at": _dt_text(decision_at),
+    }
+
+
 def _authoritative_empty_coverage(
     engine: Engine,
     *,
@@ -2833,43 +2857,59 @@ def _authoritative_empty_coverage(
     # Coverage-chain validation needs every prior revision in the source
     # scope.  The requested completed batch is checked after the full chain is
     # validated; SQL-filtering it here would manufacture a revision gap.
-    statement = text(
-        f"SELECT * FROM {SOURCE_COVERAGE_TABLE} "
-        "WHERE fact_kind=:fact_kind AND stock_code IN :codes "
-        "AND known_at<=:decision_at AND received_at<=:decision_at "
-        f"{source_filter} "
-        "ORDER BY stock_code, scope_hash, revision_no"
-    ).bindparams(bindparam("codes", expanding=True))
+
     def code_chains():
-        batch_size = max(1, int(COMMON_FACT_CUTOFF_QUERY_CODE_LIMIT))
         with engine.connect() as connection:
-            if connection.dialect.name == "mysql" and str(
+            mysql = connection.dialect.name == "mysql"
+            if mysql and str(
                 connection.get_isolation_level() or ""
             ).upper() not in {"REPEATABLE READ", "SERIALIZABLE"}:
                 raise ValueError("empty coverage requires a repeatable-read snapshot")
+            # Keep each code's full chain in one chunk and limit the number of
+            # codes transferred together on the remote MySQL connection.
+            batch_size = max(1, int(COMMON_FACT_CUTOFF_QUERY_CODE_LIMIT))
+            if mysql:
+                batch_size = min(batch_size, EMPTY_COVERAGE_MYSQL_CODE_LIMIT)
+            statement = text(
+                f"SELECT {_coverage_payload_columns(mysql)} FROM {SOURCE_COVERAGE_TABLE} "
+                "WHERE fact_kind=:fact_kind AND stock_code IN :codes "
+                "AND known_at<=:decision_at AND received_at<=:decision_at "
+                f"{source_filter} "
+                "ORDER BY stock_code, scope_hash, revision_no"
+            ).bindparams(bindparam("codes", expanding=True)).execution_options(
+                stream_results=True,
+            )
             with connection.begin():
                 for offset in range(0, len(codes), batch_size):
                     code_batch = codes[offset:offset + batch_size]
                     by_code_scope: dict[
                         str, dict[str, list[dict[str, Any]]]
                     ] = defaultdict(lambda: defaultdict(list))
-                    for raw in connection.execute(
+                    with connection.execute(
                         statement, {**params, "codes": code_batch}
-                    ).mappings():
-                        row = dict(raw)
-                        by_code_scope[str(row.get("stock_code") or "").zfill(6)][
-                            str(row.get("scope_hash") or "")
-                        ].append(row)
+                    ) as rows:
+                        for raw in rows.mappings():
+                            row = dict(raw)
+                            by_code_scope[str(row.get("stock_code") or "").zfill(6)][
+                                str(row.get("scope_hash") or "")
+                            ].append(row)
                     for code in code_batch:
-                        yield code, by_code_scope.get(code, {})
+                        yield code, by_code_scope.get(code, {}), mysql
                     by_code_scope.clear()
 
     available: dict[str, dict[str, Any]] = {}
     invalid: dict[str, str] = {}
-    for code, scopes in code_chains():
+    for code, scopes, mysql in code_chains():
         candidates: list[dict[str, Any]] = []
         for chain in scopes.values():
             try:
+                if mysql:
+                    chain = [
+                        _coverage_payload_row(
+                            row, mysql=True, stage=f"{fact_kind}_empty_coverage",
+                        )
+                        for row in chain
+                    ]
                 _validate_coverage_chain(chain)
             except ValueError as exc:
                 invalid[code] = f"PIT_{fact_kind.upper()}_BAD_COVERAGE_CHAIN:{exc}"
@@ -2913,29 +2953,11 @@ def _authoritative_empty_coverage(
                     int(row.get("revision_no") or 0),
                 )
             )
-            selected = candidates[-1]
-            available[code] = {
-                "coverage_id": str(selected.get("coverage_id") or ""),
-                "coverage_source": str(selected.get("source") or ""),
-                "coverage_response_hash": str(
-                    selected.get("source_response_hash") or ""
-                ),
-                "coverage_watermark_hash": str(
-                    selected.get("watermark_hash") or ""
-                ),
-                "covered_through_at": _dt_text(
-                    _row_datetime(selected.get("covered_through_at"))
-                ),
-                "coverage_known_at": _dt_text(
-                    _row_datetime(selected.get("known_at"))
-                ),
-                "coverage_received_at": _dt_text(
-                    _row_datetime(selected.get("received_at"))
-                ),
-                "coverage_batch_id": str(selected.get("batch_id") or ""),
-                "fact_cutoff_at": _dt_text(fact_cutoff_at),
-                "decision_at": _dt_text(decision_at),
-            }
+            available[code] = _empty_coverage_receipt(
+                candidates[-1],
+                fact_cutoff_at=fact_cutoff_at,
+                decision_at=decision_at,
+            )
     return available, invalid
 
 
@@ -4906,6 +4928,12 @@ def load_finance_atomic_batch_seal(
     }
 
 
+@dataclass(frozen=True)
+class HistoricalEventRead:
+    selection: HistoricalAnnouncementSelection
+    fact_cutoff_at: datetime
+
+
 def resolve_common_fact_cutoff(
     engine: Engine,
     *,
@@ -4917,6 +4945,7 @@ def resolve_common_fact_cutoff(
     event_end_date: date | str,
     require_qmt_event_batch: bool = False,
     include_event_facts: bool = True,
+    capture_historical_selection: Callable[[HistoricalEventRead], None] | None = None,
 ) -> dict[str, Any]:
     """Resolve one immutable COMPLETE-coverage cutoff (T) for a live batch (E)."""
 
@@ -4968,6 +4997,7 @@ def resolve_common_fact_cutoff(
             f"{diagnostic}",
         }
     event_batch: dict[str, Any] = {}
+    historical_selections: list[HistoricalAnnouncementSelection] = []
     if require_qmt_event_batch and include_event_facts:
         try:
             from server.common.qmt_announcement_pit import (
@@ -4980,6 +5010,9 @@ def resolve_common_fact_cutoff(
                 decision_at=decision,
                 window_start=windows["event"][0],
                 window_end=windows["event"][1],
+                capture_historical_selection=(
+                    historical_selections.append if capture_historical_selection else None
+                ),
             )
         except Exception as exc:
             reason_code = str(getattr(exc, "reason_code", "") or "")
@@ -4988,12 +5021,14 @@ def resolve_common_fact_cutoff(
                 "reason": reason_code
                 or f"PIT_QMT_EVENT_BATCH_UNAVAILABLE:{type(exc).__name__}",
             }
+    historical_selection = next(iter(historical_selections), None)
+    scan_event = include_event_facts and historical_selection is None
     event_filter = ""
     query_params: dict[str, Any] = {
         "codes": normalized_codes,
         "decision_at": decision,
     }
-    if event_batch:
+    if event_batch and scan_event:
         event_filter = (
             "AND (fact_kind='finance' OR "
             "source=:event_source) "
@@ -5008,7 +5043,7 @@ def resolve_common_fact_cutoff(
     # candidates are never used below. Unsealed finance still needs this scan.
     fact_kind_filter = (
         "fact_kind='finance'"
-        if not include_event_facts
+        if not scan_event
         else (
             "fact_kind='event'"
             if finance_batch
@@ -5056,11 +5091,17 @@ def resolve_common_fact_cutoff(
             read_errors.append(type(exc).__name__)
 
     candidates: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    if historical_selection is not None:
+        # These exact batch members have already passed the full scope-chain,
+        # catalog and batch-root checks at this decision time.
+        for code, (row, _) in historical_selection.members.items():
+            candidates[("event", code)].append(dict(row))
     bad: set[tuple[str, str]] = set()
     required_finance_report = finance_disclosure_gate(
         windows["finance"][1]
     ).minimum_report_date
-    for (kind, code, _scope), chain in coverage_chains():
+    chains = () if historical_selection is not None and finance_batch else coverage_chains()
+    for (kind, code, _scope), chain in chains:
         try:
             _validate_coverage_chain(chain)
         except ValueError:
@@ -5263,6 +5304,8 @@ def resolve_common_fact_cutoff(
                 "data_excluded_codes", "data_excluded_reasons", "data_exclusions",
             )
         })
+    if historical_selection is not None and capture_historical_selection is not None:
+        capture_historical_selection(HistoricalEventRead(historical_selection, fact_cutoff))
     return result
 
 
@@ -5847,6 +5890,7 @@ def load_event_facts(
     start_date: date | str | None = None,
     end_date: date | str | None = None,
     require_qmt_complete_batch: bool = False,
+    historical_selection: HistoricalEventRead | None = None,
 ) -> PITFactBatch:
     normalized_codes = sorted({str(code).strip().zfill(6) for code in codes if str(code).strip()})
     fact_cutoff, decision = _fact_and_decision_times(
@@ -5854,7 +5898,12 @@ def load_event_facts(
     )
     start = _date_value(start_date, required=False)
     end = _date_value(end_date, required=False) or fact_cutoff.date()
-    if not normalized_codes:
+    selection = (
+        historical_selection.selection
+        if require_qmt_complete_batch and historical_selection is not None
+        else None
+    )
+    if not normalized_codes and selection is None:
         return PITFactBatch(
             facts={}, manifest_hash=canonical_hash([]),
             decision_at=_dt_text(decision),
@@ -5868,14 +5917,35 @@ def load_event_facts(
                 validate_complete_announcement_batch,
             )
 
-            event_batch = validate_complete_announcement_batch(
-                engine,
-                codes=normalized_codes,
-                decision_at=decision,
-                fact_cutoff_at=fact_cutoff,
-                window_start=start or date(1900, 1, 1),
-                window_end=end,
-            )
+            if selection is None:
+                event_batch = validate_complete_announcement_batch(
+                    engine,
+                    codes=normalized_codes,
+                    decision_at=decision,
+                    fact_cutoff_at=fact_cutoff,
+                    window_start=start or date(1900, 1, 1),
+                    window_end=end,
+                )
+            elif (
+                normalized_codes
+                and selection.engine is engine
+                and selection.decision_at == decision
+                and selection.window_start == (start or date(1900, 1, 1))
+                and selection.window_end == end
+                and set(selection.members) == set(normalized_codes)
+                and historical_selection.fact_cutoff_at == fact_cutoff
+                and fact_cutoff <= _row_datetime(selection.batch["fact_cutoff_at"])
+            ):
+                event_batch = dict(selection.batch)
+            else:
+                return _blocked_batch(
+                    table_name=EVENT_REVISION_TABLE,
+                    codes=normalized_codes,
+                    decision_at=decision,
+                    fact_cutoff_at=fact_cutoff,
+                    reason="PIT_EVENT_VALIDATED_HISTORY_SCOPE_MISMATCH",
+                    status=PIT_DATA_BLOCKED,
+                )
         except Exception as exc:
             reason = str(getattr(exc, "reason_code", "") or "") or (
                 f"PIT_QMT_EVENT_BATCH_UNAVAILABLE:{type(exc).__name__}"
@@ -5912,17 +5982,27 @@ def load_event_facts(
         ].append(row)
     coverage_start = start or date(1900, 1, 1)
     try:
-        empty_coverage, coverage_errors = _authoritative_empty_coverage(
-            engine,
-            fact_kind="event",
-            codes=normalized_codes,
-            fact_cutoff_at=fact_cutoff,
-            decision_at=decision,
-            start_date=coverage_start,
-            end_date=end,
-            source=(str(event_batch.get("source") or "") if event_batch else ""),
-            batch_id=str(event_batch.get("batch_id") or ""),
-        )
+        if selection is None:
+            empty_coverage, coverage_errors = _authoritative_empty_coverage(
+                engine,
+                fact_kind="event",
+                codes=normalized_codes,
+                fact_cutoff_at=fact_cutoff,
+                decision_at=decision,
+                start_date=coverage_start,
+                end_date=end,
+                source=(str(event_batch.get("source") or "") if event_batch else ""),
+                batch_id=str(event_batch.get("batch_id") or ""),
+            )
+        else:
+            coverage_errors = {}
+            empty_coverage = {
+                code: _empty_coverage_receipt(
+                    row, fact_cutoff_at=fact_cutoff, decision_at=decision,
+                )
+                for code, (row, is_scope_head) in selection.members.items()
+                if is_scope_head and int(row["result_count"]) == 0
+            }
     except Exception as exc:
         empty_coverage = {}
         coverage_errors = {
