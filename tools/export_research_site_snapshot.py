@@ -219,7 +219,7 @@ def publish(snapshot):
     except RuntimeError:
         # A timed-out write may have reached D1. Reconcile this exact capture once.
         deadline = monotonic() + 10
-    returned = request_json(path + "?" + urlencode({"trade_date": snapshot["trade_date"]}),
+    returned = request_json(path + "?" + urlencode({"trade_date": snapshot["trade_date"], "captured_at": snapshot["captured_at"]}),
                             stage="site_readback", deadline=deadline, token=token)
     recorded_at = _time(returned.get("recorded_at"), datetime.now(timezone.utc))
     if (returned.get("snapshot") != snapshot or not recorded_at

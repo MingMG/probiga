@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -48,6 +49,9 @@ def test_uncertain_site_write_reconciles_exactly_once(monkeypatch):
         assert token == "site-scoped-test-token"
         if body:
             raise RuntimeError("site_write: timeout")
+        assert parse_qs(urlsplit(url).query) == {
+            "trade_date": [capture["trade_date"]], "captured_at": [capture["captured_at"]],
+        }
         return response
 
     monkeypatch.setenv("PROBIGA_RESEARCH_SITE_ORIGIN", "https://research.example.chatgpt.site")
