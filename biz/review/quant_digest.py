@@ -2021,7 +2021,9 @@ FOR UPDATE
 """
 
 
-def persist_quant_digest(engine: Any, result: Mapping[str, Any]) -> None:
+def persist_quant_digest(
+    engine: Any, result: Mapping[str, Any], *, protect_successor_briefing: bool = False,
+) -> None:
     """Idempotently persist one ready or blocked generation receipt."""
 
     validate_quant_digest_runtime(engine)
@@ -2065,6 +2067,8 @@ def persist_quant_digest(engine: Any, result: Mapping[str, Any]) -> None:
             if stored:
                 previous_factors = json.loads(stored) if isinstance(stored, str) else stored
                 previous_briefing = previous_factors.get("early_briefing") or {}
+                if protect_successor_briefing and previous_briefing:
+                    raise RuntimeError("DATA_BLOCKED stage=review_write: successor briefing already published")
                 from biz.review.market_decision import source_digest_identity
                 if previous_briefing and (previous_briefing.get("mode") not in {"facts", "codex"}
                         or previous_briefing.get("source_digest_sha256") == source_digest_identity(result)):

@@ -13,7 +13,7 @@ from socket import gethostname
 from statistics import median
 
 import pandas as pd
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import HTMLResponse, Response
 from sqlalchemy import text
 
@@ -5540,13 +5540,32 @@ def daily_review_dates():
 
 
 @router.post("/hot-data/daily-review/generate")
-def generate_daily_review(review_date: str = Query(default_factory=lambda: date.today().isoformat())):
+def generate_daily_review(
+    review_date: str = Query(default_factory=lambda: date.today().isoformat()),
+    force: bool = False,
+):
     """通过生产调度器异步生成复盘数据。"""
+    launch_options = {}
+    if force:
+        from biz.review.research_flow import load_digest
+        from server.common.authoritative_market_clock import authoritative_closed_trade_date
+
+        engine = get_engine()
+        latest = authoritative_closed_trade_date(engine)
+        if not latest:
+            raise HTTPException(status_code=503, detail="无法核实最近已收盘交易日")
+        if review_date != latest:
+            raise HTTPException(status_code=409, detail="强制重算仅限最近已收盘交易日")
+        existing = load_digest(engine, review_date, required=False)
+        if existing and existing["factor_validation_json"].get("early_briefing"):
+            raise HTTPException(status_code=409, detail="后续早报已发布，已保留原复盘及早报")
+        launch_options["script_args_override"] = "--force"
     try:
         result = _launch_registered_scheduler_task(
             task_type="daily_review",
             expected_script_path="biz/review/generate.py",
             run_date=review_date,
+            **launch_options,
         )
         launch_status = str(result.get("status") or "error")
         accepted = bool(result.get("accepted"))

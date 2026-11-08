@@ -269,6 +269,40 @@ def test_late_review_rerun_preserves_durable_briefing_snapshot(db, monkeypatch):
     assert stored["factor_validation_json"]["early_briefing"] == morning
 
 
+def test_forced_review_rejects_a_briefing_published_while_facts_are_rebuilt(db, monkeypatch):
+    from biz.review import daily_reports
+
+    original = _with_parent()
+    _insert(db, original)
+    briefing = {
+        **_briefing(original["factor_validation_json"]["market_decision"]),
+        "mode": "facts",
+        "source_digest_sha256": market_decision.source_digest_identity(original),
+    }
+    regenerated = _digest()
+    regenerated["market_structure_json"]["sample_count"] = 5201
+    assert market_decision.source_digest_identity(regenerated) != briefing["source_digest_sha256"]
+
+    def rebuild(*args, **kwargs):
+        daily_reports._update_report(db, original, briefing=briefing)
+        return regenerated
+
+    monkeypatch.setattr(daily_reports, "generate_quant_digest", rebuild)
+    monkeypatch.setattr(quant_digest, "validate_quant_digest_runtime", lambda engine: None)
+    monkeypatch.setattr(quant_digest, "_DIGEST_EXISTING_STATUS",
+                        quant_digest._DIGEST_EXISTING_STATUS.replace("FOR UPDATE", ""))
+    monkeypatch.setattr(quant_digest, "_DIGEST_UPSERT", """
+        UPDATE st_quant_review_digest
+        SET compact_review=:compact_review, factor_validation_json=:factor_validation_json
+        WHERE review_date=:review_date AND adjust_type=:adjust_type
+    """)
+    with pytest.raises(RuntimeError, match="review_write: successor briefing already published"):
+        daily_reports.publish_review(db, REVIEW, force=True)
+
+    original["factor_validation_json"]["early_briefing"] = briefing
+    assert _stored(db) == original
+
+
 def test_source_digest_identity_survives_database_datetime_round_trip():
     digest = _with_parent()
     identity = market_decision.source_digest_identity(digest)
