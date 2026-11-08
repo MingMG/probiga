@@ -1388,6 +1388,11 @@ def _validated_daily_recovery_session(raw_row: dict) -> dict[str, object]:
     stored_hash = str(row.get("stored_receipt_sha256") or "").strip().lower()
     receipt_status = str(receipt.get("status") or "").strip().upper()
     retryable = receipt.get("retryable")
+    # A retry changes the live session state while the last signed receipt
+    # still describes the preceding failed attempt.
+    status_matches_receipt = status == receipt_status or (
+        status == "RUNNING" and receipt_status == "BLOCKED" and retryable is True
+    )
     try:
         generation = int(receipt.get("generation"))
         stored_generation = int(row.get("receipt_generation"))
@@ -1442,7 +1447,7 @@ def _validated_daily_recovery_session(raw_row: dict) -> dict[str, object]:
         or receipt_status not in {"PASS", "DEGRADED", "BLOCKED"}
         or str(row.get("stored_receipt_status") or "").strip().upper()
         != receipt_status
-        or status != receipt_status
+        or not status_matches_receipt
         or type(retryable) is not bool
         or stored_retryable not in {0, 1}
         or bool(stored_retryable) is not retryable

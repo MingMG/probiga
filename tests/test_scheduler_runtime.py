@@ -6356,6 +6356,108 @@ def test_latest_delivery_allows_new_build_or_retryable_recovery(blocked_build, r
     ) == "2026-09-03"
 
 
+def test_daily_recovery_retains_retryable_receipt_after_actual_stage_retry(monkeypatch):
+    from server.common import daily_delivery_control as control
+
+    target = "2026-11-06"
+    now = datetime(2026, 11, 9, 8, 20)
+    first_uid = "1" * 32
+    retry_uid = "2" * 32
+    first_build = "a" * 40
+    next_build = "b" * 40
+    strategy_release_id = "c" * 64
+    stage_name = "analysis_upper_evidence_prepare"
+    session_args = {
+        "trade_date": target,
+        "release_id": first_build,
+        "strategy_release_id": strategy_release_id,
+    }
+    attempt_args = {
+        **session_args,
+        "stage_name": stage_name,
+        "lease_owner": "windows-edge",
+    }
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "development")
+    for name in ("PROBIGA_BUILD_COMMIT_SHA", "PROBIGA_EXPECTED_GIT_SHA", "EXPECTED_GIT_SHA"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(control, "_control_now", lambda: now)
+    monkeypatch.setattr(scheduler_runtime, "authoritative_closed_trade_date", lambda *_a, **_kw: target)
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    control.privileged_migrate_daily_delivery_schema(engine)
+    with engine.begin() as connection:
+        connection.execute(sql_text(
+            "CREATE TABLE si_trade_calendar (trade_date TEXT PRIMARY KEY, trade_status INTEGER NOT NULL)"
+        ))
+        connection.execute(sql_text(
+            "INSERT INTO si_trade_calendar VALUES (:target, 1)"
+        ), {"target": target})
+
+    first = control.start_daily_stage_attempt(
+        engine, scheduler_run_uid=first_uid, **attempt_args,
+    )
+    assert first["attempt_no"] == 1
+    with engine.begin() as connection:
+        blocked = control.finish_daily_stage_attempt(
+            connection, scheduler_run_uid=first_uid, status="blocked",
+            error_code="INPUT_NOT_READY", now=now,
+        )
+        assert blocked["status"] == "BLOCKED"
+        session = control.ensure_daily_delivery_session(connection, **session_args)
+        receipt = control.persist_terminal_delivery_receipt(
+            connection, now=now, receipt=control.build_terminal_delivery_receipt(
+                session=session,
+                scheduler_run_uid=first_uid,
+                stage_name=stage_name,
+                status="BLOCKED",
+                strategy_release_id=strategy_release_id,
+                retryable=True,
+                error_code="INPUT_NOT_READY",
+            ),
+        )
+    assert receipt["generation"] == 1
+
+    retry = control.start_daily_stage_attempt(
+        engine, scheduler_run_uid=retry_uid, **attempt_args,
+    )
+    assert retry["attempt_no"] == 2
+    assert retry["status"] == "RUNNING"
+
+    def assert_retry_target():
+        for build in (first_build, next_build):
+            with patch.object(scheduler_runtime, "_scheduler_build_commit_sha", return_value=build):
+                assert scheduler_runtime._daily_result_recovery_target(engine, now=now) == target
+
+    assert_retry_target()
+    with engine.begin() as connection:
+        finished = control.finish_daily_stage_attempt(
+            connection, scheduler_run_uid=retry_uid, status="success", now=now,
+        )
+        assert finished["status"] == "SUCCESS"
+        persisted = connection.execute(sql_text(
+            "SELECT status, latest_generation, canonical_receipt_uid "
+            "FROM st_daily_delivery_session WHERE session_uid=:session_uid"
+        ), {"session_uid": first["session_uid"]}).one()
+        assert tuple(persisted) == ("RUNNING", 1, receipt["receipt_uid"])
+        stored_json = connection.execute(sql_text(
+            "SELECT receipt_json FROM st_daily_delivery_receipt WHERE receipt_uid=:receipt_uid"
+        ), {"receipt_uid": receipt["receipt_uid"]}).scalar_one()
+        assert json.loads(stored_json) == receipt
+    assert_retry_target()
+
+    with engine.begin() as connection:
+        connection.execute(sql_text(
+            "UPDATE st_daily_delivery_receipt SET receipt_json=:payload WHERE receipt_uid=:uid"
+        ), {
+            "payload": json.dumps({**receipt, "error_code": "TAMPERED"}),
+            "uid": receipt["receipt_uid"],
+        })
+    for build in (first_build, next_build):
+        with patch.object(scheduler_runtime, "_scheduler_build_commit_sha", return_value=build):
+            with pytest.raises(RuntimeError, match="receipt seal"):
+                scheduler_runtime._daily_result_recovery_target(engine, now=now)
+    engine.dispose()
+
+
 def test_latest_delivery_rejects_duplicate_current_build_sessions():
     row = _blocked_daily_session_row("2026-09-03", "b" * 40)
     with pytest.raises(RuntimeError, match="current build session is ambiguous"):
@@ -6394,7 +6496,7 @@ def test_daily_recovery_receipt_seal_drift_fails_closed():
         )
 
 
-def test_daily_recovery_terminal_receipt_rejects_running_session_status():
+def test_daily_recovery_nonretryable_receipt_rejects_running_session_status():
     drifted = _blocked_daily_session_row("2026-09-03", "b" * 40)
     drifted["status"] = "RUNNING"
 
