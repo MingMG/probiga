@@ -1188,7 +1188,7 @@ def test_historical_reconstruction_uses_target_cutoff_and_actual_known_time(
     # Exercise both candidate-chain discovery and immutable payload validation
     # across multiple bounded chunks while preserving the same proof result.
     monkeypatch.setattr(
-        "server.common.qmt_announcement_pit.DEFAULT_BATCH_SIZE", 1
+        "server.common.qmt_announcement_pit.VALIDATION_READ_BATCH_SIZE", 1
     )
     with pytest.raises(Exception, match="COMPLETE_BATCH_NOT_FOUND"):
         validate_complete_historical_reconstruction_batch(
@@ -1211,6 +1211,29 @@ def test_historical_reconstruction_uses_target_cutoff_and_actual_known_time(
     assert proof["reconstruction_sha256"] == result[
         "reconstruction_sha256"
     ]
+    import zlib
+
+    def mysql_compress(value):
+        raw = value.encode("utf-8")
+        frame = len(raw).to_bytes(4, "little") + zlib.compress(raw)
+        return frame + b"." if frame.endswith(b" ") else frame
+
+    with engine.connect() as fixture_connection:
+        sqlite = fixture_connection.connection.driver_connection
+        sqlite.create_function("COMPRESS", 1, mysql_compress)
+        sqlite.create_function("OCTET_LENGTH", 1, lambda value: len(value.encode("utf-8")))
+    with monkeypatch.context() as mysql_reader:
+        mysql_reader.setattr(engine.dialect, "name", "mysql")
+        compressed_proof = validate_complete_historical_reconstruction_batch(
+            engine,
+            codes=catalog.codes,
+            decision_at=reconstructed + timedelta(seconds=1),
+            window_start=target - timedelta(days=30),
+            window_end=target,
+            expected_trade_date=target,
+        )
+    assert compressed_proof == proof
+
     subset_proof = validate_complete_historical_reconstruction_batch(
         engine,
         codes=catalog.codes,
