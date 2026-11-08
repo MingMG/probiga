@@ -8,6 +8,7 @@ from contextlib import redirect_stdout
 from datetime import date, datetime, timedelta
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -20,6 +21,7 @@ import uuid
 from sqlalchemy import text
 
 
+logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -33,6 +35,7 @@ from server.common.qmt_announcement_pit import (
     EASTMONEY_ANNOUNCEMENT_SOURCE,
     HISTORICAL_CAPTURE_DEADLINE,
     HISTORICAL_PUBLISH_DEADLINE,
+    PUBLISH_COMMIT_UNKNOWN,
     QMT_ANNOUNCEMENT_MANUAL_RESEARCH_ORIGIN,
     QMT_ANNOUNCEMENT_RECONSTRUCTION_AUTHORITY_V3_SCHEMA,
     QMT_ANNOUNCEMENT_RECONSTRUCTION_STOCK_SCOPE,
@@ -1484,7 +1487,7 @@ def validate_existing_task_result(
     expected_scheduler_run_uid: str = "",
     expected_build_sha: str = "",
 ) -> str:
-    """Strict deploy-only envelope for a read-only existing-batch proof."""
+    """Validate an exact release target's lookup or historical recovery result."""
 
     expected = _iso_date(expected_trade_date).isoformat()
     disposition = validate_task_result(payload, process_exit)
@@ -1493,8 +1496,10 @@ def validate_existing_task_result(
         and payload.get("status") == "DATA_BLOCKED"
         and payload.get("mode") == "HISTORICAL_RECONSTRUCTION_RECOVERY"
         and payload.get("trade_date") == expected
-        and payload.get("database_writes") is False
     ):
+        expected_writes = None if payload.get("reason_code") == PUBLISH_COMMIT_UNKNOWN else False
+        if "database_writes" not in payload or payload["database_writes"] is not expected_writes:
+            raise ValueError("QMT announcement historical recovery write outcome differs")
         return disposition
     if isinstance(payload, dict) and payload.get("mode") in {
         "HISTORICAL_RECONSTRUCTION",
@@ -1565,7 +1570,7 @@ def validate_existing_task_result(
             or provenance.get("automatic_real_order_submission") is not False
             or provenance.get("real_order_authority") is not False
             or payload.get("database_writes")
-            != (payload.get("mode") == "HISTORICAL_RECONSTRUCTION")
+            is not (payload.get("mode") == "HISTORICAL_RECONSTRUCTION")
             or payload.get("stock_count") != payload.get("coverage_count")
             or int(payload.get("stock_count") or 0) <= 0
             or not 0 <= int(payload.get("empty_stock_count") or -1) <= int(
@@ -1583,6 +1588,7 @@ def validate_existing_task_result(
         not isinstance(payload, dict)
         or payload.get("mode") != "validate-existing-complete-batch"
         or payload.get("database_writes") is not False
+        or payload.get("reason_code") == PUBLISH_COMMIT_UNKNOWN
     ):
         raise ValueError("QMT announcement read-only result mode differs")
     if payload.get("status") == "COMPLETE":
@@ -1719,6 +1725,15 @@ def validate_existing_task_result(
     return disposition
 
 
+def _close_announcement_fallback(fallback) -> None:
+    try:
+        closer = getattr(fallback, "close", None)
+        if callable(closer):
+            closer()
+    except Exception as exc:
+        logger.warning("Announcement provider cleanup failed: %s", type(exc).__name__)
+
+
 def _blocked(reason_code: str, detail: str = "") -> dict:
     now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%f")
     return {
@@ -1726,6 +1741,7 @@ def _blocked(reason_code: str, detail: str = "") -> dict:
         "status": "DATA_BLOCKED",
         "reason_code": str(reason_code or "QMT_ANNOUNCEMENT_DATA_BLOCKED"),
         "detail": str(detail or "")[:1000],
+        **({"database_writes": None} if reason_code == PUBLISH_COMMIT_UNKNOWN else {}),
         "batch_id": "",
         "batch_root_hash": "",
         "catalog_batch_id": "",
@@ -1977,7 +1993,7 @@ def main(argv: list[str] | None = None) -> int:
                     if manual_research:
                         payload["research_run_uid"] = validation_run_uid
                 finally:
-                    fallback.close()
+                    _close_announcement_fallback(fallback)
         else:
             if args.expected_trade_date:
                 raise QMTAnnouncementBlocked(
@@ -2063,9 +2079,7 @@ def main(argv: list[str] | None = None) -> int:
                             "primary_attempt_reason_code": primary_reason,
                         })
                     finally:
-                        closer = getattr(fallback, "close", None)
-                        if callable(closer):
-                            closer()
+                        _close_announcement_fallback(fallback)
     except Exception as exc:
         reason = str(getattr(exc, "reason_code", "") or "")
         if not reason:
@@ -2089,11 +2103,11 @@ def main(argv: list[str] | None = None) -> int:
                     or args.research_recover_date
                     else "validate-existing-complete-batch"
                 ),
-                "database_writes": False,
                 "trade_date": (
                     args.research_recover_date or args.expected_trade_date
                 ),
             })
+            payload.setdefault("database_writes", False)
             if reason in {HISTORICAL_CAPTURE_DEADLINE, HISTORICAL_PUBLISH_DEADLINE,
                           "ANNOUNCEMENT_FALLBACK_CAPTURE_DEADLINE_EXPIRED"}:
                 payload["retryable"] = True

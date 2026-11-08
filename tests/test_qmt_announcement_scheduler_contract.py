@@ -1673,6 +1673,39 @@ def test_release_capture_rejects_historical_execution_and_future_receipts(
     assert "capture target or time differs" in result.message
 
 
+def test_historical_scheduler_keeps_exact_unknown_commit_blocked():
+    target = "2026-11-06"
+    task = {**TASK, "_trigger_source": "release_catchup", "_release_target_date": target}
+    payload = {
+        **announcement_tool._blocked(
+            announcement_tool.PUBLISH_COMMIT_UNKNOWN,
+            "db_phase=commit;error_type=OperationalError;mysql_errno=2013;"
+            "connection_invalidated=true;commit_state=unknown",
+        ),
+        "mode": "HISTORICAL_RECONSTRUCTION_RECOVERY",
+        "trade_date": target,
+    }
+    assert payload["database_writes"] is None
+    assert scheduler_output_status(task, json.dumps(payload), return_code=2) == "blocked"
+    assert scheduler_output_status(task, json.dumps(payload), return_code=0) == "failed"
+    for altered in (
+        {**payload, "trade_date": "2026-11-05"},
+        {**payload, "mode": "validate-existing-complete-batch"},
+        {**payload, "database_writes": False},
+        {**payload, "database_writes": True},
+        {**payload, "reason_code": "QMT_ANNOUNCEMENT_PUBLISH_DATABASE_ERROR"},
+        {key: value for key, value in payload.items() if key != "database_writes"},
+    ):
+        assert scheduler_output_status(task, json.dumps(altered), return_code=2) == "failed"
+
+    rolled_back = {
+        **payload,
+        "reason_code": "QMT_ANNOUNCEMENT_PUBLISH_DATABASE_ERROR",
+        "database_writes": False,
+    }
+    assert scheduler_output_status(task, json.dumps(rolled_back), return_code=2) == "blocked"
+
+
 def test_same_day_release_capture_does_not_promote_data_blocked():
     payload = {**_result("DATA_BLOCKED"), "window_start": "", "window_end": ""}
     task = {**TASK, "_trigger_source": "release_catchup",
