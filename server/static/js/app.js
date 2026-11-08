@@ -5318,7 +5318,7 @@
             html += '<tr><td>#' + (row.rank || '-') + '</td><td><strong>' + escHtml(row.stock_code || '-') + '</strong><small>' + escHtml(row.stock_name || '-') + allocationNote + '</small></td><td>' + escHtml(row.industry_name || '未分类') + '</td><td>' + escHtml(ownerLabel) + '</td><td>' + strategyGovernanceMetric(row.opportunity_score, '', 1) + '</td><td>' + strategyGovernanceMetric(row.execution_score, '', 1) + '</td><td>' + strategyGovernanceMetric(row.risk_reward_ratio, '', 2) + '</td><td>' + escHtml(strategyCenterStatus(row.final_status)) + '</td><td class="sc-wrap">' + escHtml(row.reason || (row.blocking_reasons || []).join('；') || '-') + '</td><td>' + escHtml((row.evidence || {}).data_date || '-') + '</td><td><span class="sc-gate-result ' + (level === 'tradable' ? 'pass' : 'pending') + '">' + escHtml(permission) + '</span><small>真实下单固定关闭</small></td></tr>';
         });
         if (!rows.length) html += '<tr><td colspan="11" class="sc-empty-cell">' + escHtml(poolTruth.ready ? '本层票池为空。这是当前 VERIFIED COMPLETED 批次的有效结果，不会为了凑数量强制生成买入候选。' : '正式票池不可用：' + poolTruth.reason + '。旧候选已隔离到研究只读区，不能解释为当前0只。') + '</td></tr>';
-        target.innerHTML = html + '</tbody></table></div><div class="sc-table-note">' + (poolTruth.ready ? '规范票池完整展示 ' + rows.length + ' 条；请求日与 canonical 日期一致。' + (rejectedMalformedCount ? '另有 ' + rejectedMalformedCount + ' 条未通过模拟池逐行校验，已拒绝展示。' : '') : '正式票池 0 条；阻断代码 ' + escHtml(poolTruth.reasonCode) + '，研究只读记录不会获得资金或执行权限。') + '</div>';
+        target.innerHTML = html + '</tbody></table></div><div class="sc-table-note">' + (poolTruth.ready ? '规范票池完整展示 ' + rows.length + ' 条；请求日与 canonical 日期一致。' + (rejectedMalformedCount ? '另有 ' + rejectedMalformedCount + ' 条未通过模拟池逐行校验，已拒绝展示。' : '') : '未取得已验证的正式票池；阻断代码 ' + escHtml(poolTruth.reasonCode) + '，研究只读记录不会获得资金或执行权限。') + '</div>';
     };
 
     window._strategyRegistrationToggle = function () {
@@ -6280,7 +6280,10 @@
         var view = item.tradingView;
         var modulePage = item.modulePage === 'v2' ? 'v2' : 'v3';
         var moduleRequestedDate = requestedDate || currentDateValue();
-        var moduleDateMode = tradingModuleDateMode(moduleRequestedDate);
+        var routeDate = routeDecisionDateFromLocation();
+        var explicitlyDatedPool = view === 'candidates' && routeDate && routeDate === moduleRequestedDate &&
+            routeDate !== ((window.history || {}).state || {}).autoTradeDate;
+        var moduleDateMode = explicitlyDatedPool ? 'EXPLICIT_HISTORICAL' : tradingModuleDateMode(moduleRequestedDate);
         if (moduleDateMode === 'DEFAULT') moduleRequestedDate = recommendationDateValue();
         var frameId = 'tradeModuleFrame-' + item.id.replace(/[^a-z0-9_-]/gi, '-');
         var moduleLabel = modulePage === 'v3' ? '统一决策、研究验证与模拟账本' : '共享运行证据';
@@ -8054,7 +8057,7 @@
         ]},
         {id:'picks', group:'选股与交易计划', items:[
             {id:'daily-pool', icon:'📋', label:'每日研究票池'},
-            {id:'trading-v3-candidates', icon:'03', label:'策略选股结果', tradingView:'candidates', modulePage:'v3'},
+            {id:'trading-v3-candidates', icon:'03', label:'正式策略票池', tradingView:'candidates', modulePage:'v3'},
             {id:'trading-v3-overview', icon:'01', label:'今日策略', tradingView:'overview', modulePage:'v3'},
             {id:'recommended', icon:'💎', label:'AI 研究建议'},
             {id:'screen', icon:'🎯', label:'条件选股（研究）'},
@@ -10148,7 +10151,8 @@
         h += '<span>请求日 <strong>' + escHtml(data.requested_date || '-') + '</strong></span>';
         h += '<span>交易日 <strong>' + escHtml(data.trade_date || '-') + '</strong></span>';
         h += '<span>数据截至 <strong>' + escHtml(data.data_as_of || '-') + '</strong></span>';
-        h += '<span>覆盖 <strong>' + (coveragePct == null ? '-' : coveragePct.toFixed(0) + '%') + '</strong></span>';
+        if (data.scope_label) h += '<span>跟踪范围 <strong>' + escHtml(data.scope_label) + '</strong></span>';
+        h += '<span>金额估算覆盖 <strong>' + (coveragePct == null ? '-' : coveragePct.toFixed(0) + '%') + '</strong></span>';
         h += '<span>份额观测 <strong>' + escHtml(flowEvidence.observed_at || '-') + '</strong></span>';
         h += '<span>资金主体 <strong>未知</strong></span>';
         h += '</div>';
@@ -10185,15 +10189,19 @@
         }
         h += '</div></aside></section>';
 
-        h += '<section class="bef-panel"><div class="bef-panel-head"><div><span>基准拆解</span><h3>各宽基贡献汇总</h3></div><p>正数为净申购，负数为净赎回</p></div><div class="bef-table-wrap"><table class="bef-table bef-benchmark-table"><thead><tr><th>跟踪基准</th><th>今日估算</th><th>近3日</th><th>近5日</th><th>近20日</th><th>份额变化</th><th>净申购数</th></tr></thead><tbody>';
+        h += '<section class="bef-panel"><div class="bef-panel-head"><div><span>基准拆解</span><h3>各宽基贡献汇总</h3></div><p>同基准按跟踪产品汇总；任一产品缺数据，对应区间金额留空。</p></div><div class="bef-table-wrap"><table class="bef-table bef-benchmark-table"><thead><tr><th>跟踪基准</th><th>单日估算</th><th>近3日</th><th>近5日</th><th>近20日</th><th>产品覆盖</th><th>净申购数</th></tr></thead><tbody>';
         if (!benchmarks.length) h += broadEtfEmptyRow(7, '暂无基准汇总数据');
         benchmarks.forEach(function (row) {
+            var expected = Array.isArray(row.expected_etf_codes) ? row.expected_etf_codes.length : null;
+            var covered = Array.isArray(row.available_etf_codes) ? row.available_etf_codes.length : null;
+            var missingCodes = Array.isArray(row.missing_etf_codes) ? row.missing_etf_codes.join('、') : '';
             h += '<tr><td><strong>' + escHtml(row.benchmark || '-') + '</strong></td>' +
                 '<td class="bef-number bef-tone-' + broadEtfAmountTone(row.net_1d) + '">' + escHtml(broadEtfSignedMoney(row.net_1d)) + '</td>' +
                 '<td class="bef-number bef-tone-' + broadEtfAmountTone(row.net_3d) + '">' + escHtml(broadEtfSignedMoney(row.net_3d)) + '</td>' +
                 '<td class="bef-number bef-tone-' + broadEtfAmountTone(row.net_5d) + '">' + escHtml(broadEtfSignedMoney(row.net_5d)) + '</td>' +
                 '<td class="bef-number bef-tone-' + broadEtfAmountTone(row.net_20d) + '">' + escHtml(broadEtfSignedMoney(row.net_20d)) + '</td>' +
-                '<td class="bef-number bef-tone-' + broadEtfAmountTone(row.share_change) + '">' + escHtml(broadEtfShareNumber(row.share_change)) + '</td>' +
+                '<td>' + (covered == null || expected == null ? '—' : escHtml(covered + ' / ' + expected)) +
+                (missingCodes ? '<small>缺 ' + escHtml(missingCodes) + '</small>' : '') + '</td>' +
                 '<td>' + escHtml(row.positive_count == null ? '-' : row.positive_count) + ' / ' + escHtml(row.total_count == null ? '-' : row.total_count) + '</td></tr>';
         });
         h += '</tbody></table></div></section>';
@@ -13356,6 +13364,10 @@
 
     function normalizedTradingRouteDate(routeDate, tabId) {
         if (!routeDate || (tabId !== 'trading' && String(tabId || '').indexOf('trading-v3-') !== 0)) return routeDate;
+        if (tabId === 'trading-v3-candidates' && routeDate !== ((window.history || {}).state || {}).autoTradeDate) {
+            // Exact pool links must show the requested day's result or its absence.
+            return routeDate;
+        }
         var clock = MARKET_CLOCK || {};
         var fallback = String(clock.recommendation_trade_date || clock.latest_data_date || '').slice(0, 10);
         var localToday = localDateString(new Date());

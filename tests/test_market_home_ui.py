@@ -53,7 +53,8 @@ for (const expected of ['<section class="market-home"', '盘中快照', '延迟 
     '沪深300 · 2026-11-05', '4,600.25', '3,999.01', '指数日行情', '&lt;b&gt;可核验主题&lt;/b&gt;',
     '当日股票', 'data-mh-stock="600001"', '12.34%', '已核验 9/10只', '5板', '东财收录样本',
     '<details class="mh-ladder-tier">', 'aria-label="5板个股"', '梯队股票甲', '梯队股票&lt;乙&gt;',
-    'data-mh-tab="market-context"']) assert.ok(html.includes(expected), expected);
+    'data-mh-tab="market-context"', 'href="/?tab=trading-v3-candidates&amp;trade_date=2026-11-06">正式策略票池',
+    'href="/static/market-event-timeline.html?date=2026-11-06">查看当日事件时间线']) assert.ok(html.includes(expected), expected);
 assert.doesNotMatch(html, /12,345\.67|未来主题|错日排名|<b>可核验主题|NaN|undefined/);
 assert.doesNotMatch(page.render({market,snapshot:{...snapshot,limit_ladder:{...snapshot.limit_ladder,trade_date:'2026-11-05'}}}, date), /5板|梯队股票/);
 assert.doesNotMatch(page.render({market}, date), /延迟/);

@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+from concurrent.futures import Future
+from contextlib import nullcontext
 from datetime import date, datetime, timedelta
 import importlib
+import json
 from io import BytesIO
 import sys
 from types import SimpleNamespace
@@ -118,8 +121,7 @@ def test_szse_workbook_accepts_right_padded_etf_code(monkeypatch):
               </sheetData>
             </worksheet>
         """)
-    response = SimpleNamespace(content=content.getvalue(), raise_for_status=lambda: None)
-    monkeypatch.setattr(module, "_http_get", lambda *_args, **_kwargs: response)
+    monkeypatch.setattr(module, "_http_get", lambda *_args, **_kwargs: content.getvalue())
 
     result = module._fetch_szse_share_range("2026-11-06", "2026-11-06")
 
@@ -147,8 +149,8 @@ def test_api_returns_insufficient_when_core_pool_coverage_is_below_gate(monkeypa
     module = _router_module()
     previous_date = "2026-08-11"
     current_date = "2026-08-12"
-    # Two of four funds is 50%, below the router's 65% minimum gate.
-    covered = module.CORE_ETFS[:2]
+    # Half of the tracked funds falls below the 65% minimum gate.
+    covered = module.CORE_ETFS[:len(module.CORE_ETFS) // 2]
     shares = {
         previous_date: {
             item.code: _share_row(100_000_000.0) for item in covered
@@ -171,7 +173,7 @@ def test_api_returns_insufficient_when_core_pool_coverage_is_below_gate(monkeypa
     monkeypatch.setattr(
         module,
         "_collect_inputs",
-        lambda _trade_dates: (shares, prices, []),
+        lambda _trade_dates, **_kwargs: (shares, prices, [], "FINISHED"),
     )
 
     payload = module.broad_etf_flow(
@@ -200,15 +202,16 @@ def test_low_coverage_history_is_not_silently_counted_as_zero():
     module = _router_module()
     selected_rows = [
         {"benchmark": item.benchmark, "net_amount": 2_000_000_000.0, "change_pct": -0.4}
-        for item in module.CORE_ETFS
+        for item in module.CORE_ETFS[:4]
     ]
+    codes = [item.code for item in module.CORE_ETFS[:4]]
     history = [
-        {"trade_date": "2026-08-08", "net_amount": 6_000_000_000.0, "coverage_pct": 100.0},
-        {"trade_date": "2026-08-11", "net_amount": 1_000_000_000.0, "coverage_pct": 50.0},
-        {"trade_date": "2026-08-12", "net_amount": 8_000_000_000.0, "coverage_pct": 100.0},
+        {"trade_date": "2026-08-08", "net_amount": 6_000_000_000.0, "coverage_pct": 100.0, "etf_codes": codes},
+        {"trade_date": "2026-08-11", "net_amount": 1_000_000_000.0, "coverage_pct": 50.0, "etf_codes": codes[:2]},
+        {"trade_date": "2026-08-12", "net_amount": 8_000_000_000.0, "coverage_pct": 100.0, "etf_codes": codes},
     ]
 
-    summary, evidence = module._signal(history, selected_rows, expected=4)
+    summary, evidence = module._signal(history, selected_rows, expected=4, benchmark_amounts={})
 
     assert summary["net_1d"] == pytest.approx(8_000_000_000.0)
     assert summary["net_3d"] is None
@@ -221,13 +224,15 @@ def test_low_coverage_history_is_not_silently_counted_as_zero():
 def test_window_sum_requires_the_full_number_of_trading_days():
     module = _router_module()
     history = [
-        {"trade_date": "2026-08-11", "net_amount": 1.0, "coverage_pct": 100.0},
-        {"trade_date": "2026-08-12", "net_amount": 2.0, "coverage_pct": 100.0},
+        {"trade_date": "2026-08-11", "net_amount": 1.0, "coverage_pct": 100.0, "etf_codes": ["510300"]},
+        {"trade_date": "2026-08-12", "net_amount": 2.0, "coverage_pct": 100.0, "etf_codes": ["510300"]},
     ]
 
     assert module._window_sum(history, 2) == pytest.approx(3.0)
     assert module._window_sum(history, 3) is None
     assert module._window_sum(history, 5) is None
+    history[1]["etf_codes"] = ["510310"]
+    assert module._window_sum(history, 2) is None
 
 
 def test_corporate_action_row_remains_visible_but_is_excluded_from_totals(monkeypatch):
@@ -251,7 +256,7 @@ def test_corporate_action_row_remains_visible_but_is_excluded_from_totals(monkey
     monkeypatch.setattr(
         module,
         "_collect_inputs",
-        lambda _trade_dates: (shares, prices, []),
+        lambda _trade_dates, **_kwargs: (shares, prices, [], "FINISHED"),
     )
 
     payload = module.broad_etf_flow(trade_date=current_date, days=5, refresh=True)
@@ -290,11 +295,13 @@ def test_positive_and_negative_signal_copy_does_not_claim_national_team_identity
         }
         for benchmark in benchmarks
     ]
+    codes = [item.code for item in module.CORE_ETFS[:4]]
     history = [
         {
             "trade_date": f"2026-08-{day:02d}",
             "net_amount": 1_000_000_000.0 if day % 2 else -1_000_000_000.0,
             "coverage_pct": 100.0,
+            "etf_codes": codes,
         }
         for day in range(1, 9)
     ]
@@ -302,12 +309,14 @@ def test_positive_and_negative_signal_copy_does_not_claim_national_team_identity
         "trade_date": "2026-08-09",
         "net_amount": daily_flow,
         "coverage_pct": 100.0,
+        "etf_codes": codes,
     })
 
     summary, evidence = module._signal(
         history,
         selected_rows,
         expected=len(selected_rows),
+        benchmark_amounts={row["benchmark"]: row["net_amount"] for row in selected_rows},
     )
 
     assert summary["signal_tone"] == expected_tone
@@ -333,9 +342,7 @@ def test_sse_response_must_bind_the_requested_session_and_exchange(monkeypatch):
         {"SEC_CODE": "512100", "STAT_DATE": target, "TOT_VOL": 123.45},
         {"SEC_CODE": "159915", "STAT_DATE": target, "TOT_VOL": 100},
     ]
-    monkeypatch.setattr(module, "_http_get", lambda *_args, **_kwargs: SimpleNamespace(
-        raise_for_status=lambda: None, json=lambda: {"result": upstream},
-    ))
+    monkeypatch.setattr(module, "_http_get", lambda *_args, **_kwargs: json.dumps({"result": upstream}).encode())
     day, rows = module._fetch_sse_share_day(target)
     assert day == target
     assert set(rows) == {"512100"}
@@ -355,12 +362,12 @@ def test_calendar_gap_stays_in_flow_window_instead_of_using_an_older_observation
         for offset, day in enumerate(dates) if day != gap
     }
     monkeypatch.setattr(module, "_trading_dates", lambda *_args: list(reversed(dates)))
-    monkeypatch.setattr(module, "_collect_inputs", lambda *_args: (shares, prices, []))
+    monkeypatch.setattr(module, "_collect_inputs", lambda *_args, **_kwargs: (shares, prices, [], "FINISHED"))
     payload = module.broad_etf_flow(trade_date=dates[-1], days=5, refresh=True)
     assert [item["trade_date"] for item in payload["history"]] == dates[-5:]
     assert next(item for item in payload["history"] if item["trade_date"] == gap)["net_amount"] is None
     assert payload["summary"]["net_5d"] is None
-    assert payload["summary"]["net_1d"] == pytest.approx(16_000_000)
+    assert payload["summary"]["net_1d"] == pytest.approx(4_000_000 * len(module.CORE_ETFS))
 
 
 def test_daily_source_date_range_uses_calendar_and_shanghai_close_ready_time(monkeypatch):
@@ -386,8 +393,8 @@ def test_turnover_stays_available_when_share_publication_cannot_be_established(m
     dates = ["2026-08-11", "2026-08-12"]
     code = module.CORE_ETFS[0].code
     monkeypatch.setattr(module, "_trading_dates", lambda *_args: list(reversed(dates)))
-    monkeypatch.setattr(module, "_collect_inputs", lambda *_args: (
-        {}, {dates[-1]: {code: _price_row(pre_close=4)}}, [],
+    monkeypatch.setattr(module, "_collect_inputs", lambda *_args, **_kwargs: (
+        {}, {dates[-1]: {code: _price_row(pre_close=4)}}, [], "FINISHED",
     ))
     payload = module.broad_etf_flow(trade_date=dates[-1], days=5, refresh=True)
     assert payload["status"] == "insufficient"
@@ -405,7 +412,7 @@ def test_failed_price_is_visible_as_evidence_but_excluded_from_amounts(monkeypat
     shares = {days[0]: {code: _share_row(100)}, days[1]: {code: _share_row(105)}}
     failed = {**_price_row(pre_close=4), "quality_status": "FAILED"}
     monkeypatch.setattr(module, "_trading_dates", lambda *_args: list(reversed(days)))
-    monkeypatch.setattr(module, "_collect_inputs", lambda *_args: (shares, {days[1]: {code: failed}}, []))
+    monkeypatch.setattr(module, "_collect_inputs", lambda *_args, **_kwargs: (shares, {days[1]: {code: failed}}, [], "FINISHED"))
     payload = module.broad_etf_flow(trade_date=days[1], days=5, refresh=True)
     assert payload["market_activity"]["etfs"][0]["turnover"] is None
     assert payload["market_activity"]["etfs"][0]["quality_status"] == "FAILED"
@@ -419,9 +426,7 @@ def test_public_price_does_not_supply_an_older_close_for_a_missing_session(monke
     dates = ["2026-08-11", "2026-08-12", "2026-08-13"]
     rows = [f"{day},4,4.2,4.3,3.8,100,400,0,-0.8,0,0" for day in (dates[0], dates[-1])]
     upstream = {"code": code, "market": 1, "klines": rows}
-    monkeypatch.setattr(module, "_http_get", lambda *_args, **_kwargs: SimpleNamespace(
-        raise_for_status=lambda: None, json=lambda: {"data": upstream},
-    ))
+    monkeypatch.setattr(module, "_http_get", lambda *_args, **_kwargs: json.dumps({"data": upstream}).encode())
     _, price_rows = module._fetch_eastmoney_price_history(code, dates[0], dates[-1])
     shares = {day: {code: _share_row(100 + offset)} for offset, day in enumerate(dates)}
     flows = module._build_flow_rows(dates, shares, {day: {code: row} for day, row in price_rows.items()})
@@ -434,7 +439,169 @@ def test_public_price_does_not_supply_an_older_close_for_a_missing_session(monke
 def test_synchronous_creations_on_rising_day_do_not_become_stabilization_evidence():
     module = _router_module()
     rows = [{"benchmark": item.benchmark, "net_amount": 6_000_000_000, "change_pct": 2.5}
-            for item in module.CORE_ETFS]
-    summary, _ = module._signal([{"net_amount": 24_000_000_000, "coverage_pct": 100}], rows, expected=4)
+            for item in module.CORE_ETFS[:4]]
+    history = [{"net_amount": 24_000_000_000, "coverage_pct": 100,
+                "etf_codes": [item.code for item in module.CORE_ETFS[:4]]}]
+    summary, _ = module._signal(
+        history, rows, expected=4,
+        benchmark_amounts={row["benchmark"]: row["net_amount"] for row in rows},
+    )
     assert summary["signal"] == "当日强净申购"
     assert summary["flow_pattern"] == "NET_CREATION"
+
+
+
+def test_benchmark_aggregates_only_complete_product_cohorts(monkeypatch):
+    module = _router_module()
+    expected = {
+        "上证50": ["510050", "510100"],
+        "沪深300": ["510300", "510310"],
+        "中证500": ["510500", "510510"],
+        "中证1000": ["512100", "560010"],
+        "中证2000": ["563200", "563300"],
+        "科创50": ["588000", "588080"],
+        "中证A500": ["563360", "563800"],
+        "创业板": ["159915", "159952"],
+    }
+    start = date(2026, 10, 9)
+    dates = [(start + timedelta(days=offset)).isoformat() for offset in range(29)
+             if (start + timedelta(days=offset)).weekday() < 5]
+    prices = {
+        day: {item.code: _price_row(pre_close=7 if item.code == "510100" else 4)
+              for item in module.CORE_ETFS}
+        for day in dates
+    }
+    shares = {
+        day: {item.code: _share_row(100_000_000 + offset * 1_000_000)
+              for item in module.CORE_ETFS}
+        for offset, day in enumerate(dates)
+    }
+    # A single missing member breaks both affected daily differences and
+    # overlapping windows without hiding complete unrelated benchmarks.
+    del shares[dates[-3]]["510100"]
+    del shares[dates[-1]]["588080"]
+    monkeypatch.setattr(module, "_trading_dates", lambda *_args: list(reversed(dates)))
+    monkeypatch.setattr(module, "_collect_inputs", lambda *_args, **_kwargs: (shares, prices, [], "FINISHED"))
+
+    payload = module.broad_etf_flow(trade_date=dates[-1], days=20, refresh=True)
+    benchmarks = {row["benchmark"]: row for row in payload["benchmarks"]}
+
+    assert payload["scope_label"] == "8个基准 · 16只跟踪宽基 ETF"
+    assert payload["status"] == "degraded"
+    assert {name: row["expected_etf_codes"] for name, row in benchmarks.items()} == expected
+    assert benchmarks["上证50"]["net_1d"] == pytest.approx(11_000_000)
+    assert benchmarks["上证50"]["net_3d"] is None
+    assert benchmarks["上证50"]["net_20d"] is None
+    assert benchmarks["科创50"]["net_1d"] is None
+    assert benchmarks["科创50"]["missing_etf_codes"] == ["588080"]
+    assert benchmarks["科创50"]["available_etf_codes"] == ["588000"]
+    assert benchmarks["中证500"]["net_20d"] == pytest.approx(160_000_000)
+    assert all(row["share_change"] is None for row in benchmarks.values())
+    assert payload["summary"]["net_3d"] is None
+    assert payload["history"][-1]["cumulative_amount"] is None
+    assert payload["coverage"]["available"] == 15
+    assert payload["flow_evidence"]["actor_status"] == "UNKNOWN"
+
+
+def test_exact_session_does_not_fall_back_to_earlier_covered_data(monkeypatch):
+    module = _router_module()
+    dates = ["2026-11-04", "2026-11-05", "2026-11-06"]
+    shares = {day: {item.code: _share_row(100 + i) for item in module.CORE_ETFS}
+              for i, day in enumerate(dates[:-1])}
+    prices = {day: {item.code: _price_row(pre_close=4) for item in module.CORE_ETFS}
+              for day in dates}
+    monkeypatch.setattr(module, "_trading_dates", lambda *_args: list(reversed(dates)))
+    monkeypatch.setattr(module, "_collect_inputs", lambda *_args, **_kwargs: (shares, prices, [], "FINISHED"))
+
+    exact = module.broad_etf_flow(trade_date=dates[-1], days=5, refresh=True)
+    assert exact["trade_date"] == dates[-1]
+    assert exact["summary"]["net_1d"] is None
+    assert exact["history"][0]["net_amount"] == pytest.approx(64)
+    assert exact["market_activity"]["trade_date"] == dates[-1]
+    assert exact["coverage"]["available"] == 0
+
+    weekend = module.broad_etf_flow(trade_date="2026-11-07", days=5, refresh=True)
+    assert weekend["trade_date"] == dates[-1]
+    assert weekend["requested_date"] == "2026-11-07"
+    assert any("2026-11-07" in note and dates[-1] in note for note in weekend["caveats"])
+
+
+
+def test_source_batch_retains_completed_evidence_and_cancels_its_own_queue(monkeypatch):
+    module = _router_module()
+    dates = ["2026-11-05", "2026-11-06"]
+    submitted = []
+
+    def submit(_fn, *_args):
+        future = Future()
+        submitted.append(future)
+        if len(submitted) == 1:
+            future.set_result({dates[-1]: {"159952": _share_row(10)}})
+        return future
+
+    def expire(futures, *, timeout):
+        assert 0 < timeout <= 5
+        yield next(iter(futures))
+        raise TimeoutError
+
+    monkeypatch.setattr(module, "_SOURCE_EXECUTOR", SimpleNamespace(submit=submit))
+    monkeypatch.setattr(module, "_local_price_history", lambda *_args: {})
+    monkeypatch.setattr(module, "as_completed", expire)
+
+    shares, prices, warnings, status = module._collect_inputs(dates, deadline=module.time.monotonic() + 5)
+
+    assert shares == {dates[-1]: {"159952": _share_row(10)}}
+    assert prices == {}
+    assert "ETF 数据源批次达到读取时限" in warnings
+    assert status == "DEADLINE"
+    assert len(submitted) == 1 + len(dates) + len(module.CORE_CODES)
+    assert all(future.cancelled() for future in submitted[1:])
+
+
+def test_source_body_limit_and_content_encoding_are_enforced(monkeypatch):
+    module = _router_module()
+    response = SimpleNamespace(is_redirect=False, headers={}, raw=BytesIO(b"1234"),
+                               raise_for_status=lambda: None)
+
+    def get(_url, **options):
+        assert options["stream"] is True
+        assert options["allow_redirects"] is False
+        assert options["headers"]["Accept-Encoding"] == "identity"
+        return nullcontext(response)
+
+    monkeypatch.setattr(module.requests, "get", get)
+    args = dict(params={}, headers=module.HTTP_HEADERS, timeout=(1, 1), max_bytes=4)
+    assert module._http_get(module.SSE_SHARE_URL, **args) == b"1234"
+
+    response.raw = BytesIO(b"12345")
+    with pytest.raises(ValueError, match="body exceeds limit"):
+        module._http_get(module.SSE_SHARE_URL, **args)
+
+    response.headers = {"Content-Encoding": "gzip"}
+    with pytest.raises(ValueError, match="transport differs"):
+        module._http_get(module.SSE_SHARE_URL, **args)
+
+
+
+@pytest.mark.parametrize("transient", ["BUSY", "DEADLINE", "PARTIAL_SOURCE_FAILURE"])
+def test_transient_source_batch_is_not_cached(monkeypatch, transient):
+    module = _router_module()
+    dates = ["2026-11-05", "2026-11-06"]
+    shares = {day: {item.code: _share_row(100 + i) for item in module.CORE_ETFS}
+              for i, day in enumerate(dates)}
+    prices = {dates[-1]: {item.code: _price_row(pre_close=4) for item in module.CORE_ETFS}}
+    results = iter([({}, prices, [], transient), (shares, prices, [], "FINISHED")])
+    monkeypatch.setattr(module, "_cache", {})
+    monkeypatch.setattr(module, "_trading_dates", lambda *_args: list(reversed(dates)))
+    monkeypatch.setattr(module, "_collect_inputs", lambda *_args, **_kwargs: next(results))
+
+    pending = module.broad_etf_flow(trade_date=dates[-1], days=5, refresh=False)
+    assert pending["status"] == "insufficient"
+    assert pending["source_batch_status"] == transient
+    assert not module._cache
+
+    recovered = module.broad_etf_flow(trade_date=dates[-1], days=5, refresh=False)
+    assert recovered["status"] == "degraded"
+    assert recovered["source_batch_status"] == "FINISHED"
+    assert recovered["coverage"]["available"] == len(module.CORE_ETFS)
+    assert module.broad_etf_flow(trade_date=dates[-1], days=5, refresh=False) is recovered

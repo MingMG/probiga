@@ -9,6 +9,7 @@ module deliberately keeps the fund-flow fact separate from the inferred
 from __future__ import annotations
 
 import io
+import json
 import logging
 import math
 import statistics
@@ -18,7 +19,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 from xml.etree import ElementTree
 
 import requests
@@ -41,6 +42,7 @@ HUJIN_SOURCE_URL = "https://www.huijin-inv.cn/huijin-inv/SC20252/2025-04/1002841
 
 HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 ProBigA ETF Flow Monitor",
+    "Accept-Encoding": "identity",
 }
 SSE_HEADERS = {**HTTP_HEADERS, "Referer": "https://www.sse.com.cn/"}
 SZSE_HEADERS = {
@@ -57,21 +59,46 @@ class CoreETF:
     exchange: str
 
 
-# A deliberately explicit observation pool.  These four products have complete
-# locally validated price history in this deployment, so the page does not
-# silently substitute a flaky third-party quote for the monetary estimate.
-# It is an observation pool, not a claim to cover the whole ETF market.
+# Exchange-listed tracker pairs, verified against the SSE fund directory and
+# SZSE's 创 series index guide. Each benchmark has a fixed comparison cohort.
 CORE_ETFS: tuple[CoreETF, ...] = (
     CoreETF("510300", "沪深300ETF华泰柏瑞", "沪深300", "sh"),
     CoreETF("510500", "中证500ETF南方", "中证500", "sh"),
     CoreETF("512100", "中证1000ETF南方", "中证1000", "sh"),
     CoreETF("159915", "创业板ETF易方达", "创业板", "sz"),
+    CoreETF("510310", "沪深300ETF易方达", "沪深300", "sh"),
+    CoreETF("510510", "中证500ETF广发", "中证500", "sh"),
+    CoreETF("560010", "中证1000ETF广发", "中证1000", "sh"),
+    CoreETF("159952", "创业板ETF广发", "创业板", "sz"),
+    CoreETF("510050", "上证50ETF华夏", "上证50", "sh"),
+    CoreETF("510100", "上证50ETF易方达", "上证50", "sh"),
+    CoreETF("563300", "中证2000ETF华泰柏瑞", "中证2000", "sh"),
+    CoreETF("563200", "中证2000ETF富国", "中证2000", "sh"),
+    CoreETF("588000", "科创50ETF华夏", "科创50", "sh"),
+    CoreETF("588080", "科创50ETF易方达", "科创50", "sh"),
+    CoreETF("563360", "中证A500ETF华泰柏瑞", "中证A500", "sh"),
+    CoreETF("563800", "中证A500ETF广发", "中证A500", "sh"),
 )
 
 CORE_BY_CODE = {item.code: item for item in CORE_ETFS}
 CORE_CODES = tuple(CORE_BY_CODE)
 CORE_CODE_PARAMS = {f"code_{index}": code for index, code in enumerate(CORE_CODES)}
 CORE_CODE_BINDINGS = ", ".join(f":code_{index}" for index in range(len(CORE_CODES)))
+BENCHMARK_CODES = {
+    benchmark: tuple(sorted(item.code for item in CORE_ETFS if item.benchmark == benchmark))
+    for benchmark in sorted({item.benchmark for item in CORE_ETFS})
+}
+SCOPE_LABEL = f"{len(BENCHMARK_CODES)}个基准 · {len(CORE_ETFS)}只跟踪宽基 ETF"
+# Up to 21 share dates and 16 quote histories fit in three waves at the
+# existing 16-worker cap. Leave the longer SZSE range request its own budget.
+_FAST_SOURCE_TIMEOUT = (4, 8)
+_SOURCE_BATCH_SECONDS = 40.0
+_SSE_BODY_LIMIT = 512 * 1024
+_SZSE_BODY_LIMIT = 1024 * 1024
+_SZSE_SHEET_LIMIT = 8 * 1024 * 1024
+_PRICE_BODY_LIMIT = 64 * 1024
+_SOURCE_EXECUTOR = ThreadPoolExecutor(max_workers=16, thread_name_prefix="broad-etf-flow")
+_SOURCE_BATCH_SLOTS = threading.BoundedSemaphore(2)
 
 _CACHE_TTL_SECONDS = 15 * 60
 _MIN_RELIABLE_COVERAGE_PCT = 65.0
@@ -84,9 +111,30 @@ def _http_get(
     *,
     params: dict[str, str],
     headers: dict[str, str],
-    timeout: int | tuple[int, int],
-):
-    return requests.get(url, params=params, headers=headers, timeout=timeout)
+    timeout: tuple[int, int],
+    max_bytes: int,
+) -> bytes:
+    deadline = time.monotonic() + sum(timeout)
+    with requests.get(
+        url, params=params, headers=headers, timeout=timeout,
+        stream=True, allow_redirects=False,
+    ) as response:
+        response.raise_for_status()
+        if response.is_redirect or response.headers.get("Content-Encoding", "identity").lower() != "identity":
+            raise ValueError("ETF source response transport differs")
+        if int(response.headers.get("Content-Length") or 0) > max_bytes:
+            raise ValueError("ETF source body exceeds limit")
+        body = bytearray()
+        while time.monotonic() < deadline:
+            chunk = response.raw.read1(min(16 * 1024, max_bytes + 1 - len(body)))
+            if time.monotonic() >= deadline:
+                break
+            if not chunk:
+                return bytes(body)
+            body.extend(chunk)
+            if len(body) > max_bytes:
+                raise ValueError("ETF source body exceeds limit")
+    raise TimeoutError("ETF source body deadline exceeded")
 
 
 def _safe_float(value: Any) -> float | None:
@@ -162,16 +210,16 @@ def _fetch_sse_share_day(trade_date: str) -> tuple[str, dict[str, dict[str, Any]
         "sqlId": "COMMON_SSE_ZQPZ_ETFZL_XXPL_ETFGM_SEARCH_L",
         "STAT_DATE": trade_date,
     }
-    response = _http_get(
+    body = _http_get(
         SSE_SHARE_URL,
         params=params,
         headers=SSE_HEADERS,
-        timeout=(5, 12),
+        timeout=_FAST_SOURCE_TIMEOUT,
+        max_bytes=_SSE_BODY_LIMIT,
     )
-    response.raise_for_status()
     observed_at = datetime.now(PRODUCTION_TIMEZONE).isoformat(timespec="seconds")
     result: dict[str, dict[str, Any]] = {}
-    for row in response.json().get("result") or []:
+    for row in json.loads(body).get("result") or []:
         code = str(row.get("SEC_CODE") or "").zfill(6)
         actual_date = _iso_date(row.get("STAT_DATE"))
         if code not in CORE_BY_CODE or CORE_BY_CODE[code].exchange != "sh" or actual_date != trade_date:
@@ -198,6 +246,8 @@ def _xlsx_inline_rows(content: bytes) -> list[list[str]]:
             for name in workbook.namelist()
             if name.startswith("xl/worksheets/sheet") and name.endswith(".xml")
         )
+        if workbook.getinfo(sheet_name).file_size > _SZSE_SHEET_LIMIT:
+            raise ValueError("ETF share workbook sheet exceeds limit")
         root = ElementTree.fromstring(workbook.read(sheet_name))
 
     result: list[list[str]] = []
@@ -220,16 +270,16 @@ def _fetch_szse_share_range(start_date: str, end_date: str) -> dict[str, dict[st
         "txtEnd": end_date,
         "jjlb": "ETF",
     }
-    response = _http_get(
+    body = _http_get(
         SZSE_SHARE_URL,
         params=params,
         headers=SZSE_HEADERS,
         timeout=(5, 30),
+        max_bytes=_SZSE_BODY_LIMIT,
     )
-    response.raise_for_status()
     observed_at = datetime.now(PRODUCTION_TIMEZONE).isoformat(timespec="seconds")
     output: dict[str, dict[str, dict[str, Any]]] = {}
-    for cells in _xlsx_inline_rows(response.content)[1:]:
+    for cells in _xlsx_inline_rows(body)[1:]:
         if len(cells) < 4:
             continue
         trade_date, code, _name, raw_share = cells[:4]
@@ -305,14 +355,14 @@ def _fetch_eastmoney_price_history(code: str, start_date: str, end_date: str) ->
         "end": end_date.replace("-", ""),
         "secid": f"{_market_id(code)}.{code}",
     }
-    response = _http_get(
+    body = _http_get(
         EASTMONEY_KLINE_URL,
         params=params,
         headers=HTTP_HEADERS,
-        timeout=(5, 12),
+        timeout=_FAST_SOURCE_TIMEOUT,
+        max_bytes=_PRICE_BODY_LIMIT,
     )
-    response.raise_for_status()
-    data = response.json().get("data") or {}
+    data = json.loads(body).get("data") or {}
     rows = data.get("klines") or []
     if rows and (str(data.get("code") or "") != code or str(data.get("market")) != str(_market_id(code))):
         raise ValueError("ETF 行情响应证券身份不符")
@@ -342,10 +392,11 @@ def _merge_nested(target: dict[str, dict[str, dict[str, Any]]], source: dict[str
         target.setdefault(row_date, {}).update(code_rows)
 
 
-def _collect_inputs(trade_dates: list[str]) -> tuple[
+def _collect_inputs(trade_dates: list[str], *, deadline: float) -> tuple[
     dict[str, dict[str, dict[str, Any]]],
     dict[str, dict[str, dict[str, Any]]],
     list[str],
+    Literal["FINISHED", "BUSY", "DEADLINE", "PARTIAL_SOURCE_FAILURE"],
 ]:
     chronological = sorted(trade_dates)
     start_date, end_date = chronological[0], chronological[-1]
@@ -355,23 +406,27 @@ def _collect_inputs(trade_dates: list[str]) -> tuple[
     )]
     shares: dict[str, dict[str, dict[str, Any]]] = {}
     warnings: list[str] = []
+    source_status: Literal["FINISHED", "DEADLINE", "PARTIAL_SOURCE_FAILURE"] = "FINISHED"
 
-    worker_count = min(16, max(2, len(trade_dates) + len(missing_price_codes) + 1))
-    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="broad-etf-flow") as pool:
-        futures: dict[Any, tuple[str, str]] = {}
+    if time.monotonic() >= deadline:
+        return shares, prices, ["ETF 数据源批次达到读取时限"], "DEADLINE"
+    if not _SOURCE_BATCH_SLOTS.acquire(blocking=False):
+        return shares, prices, ["ETF 数据源并发读取已满"], "BUSY"
+    futures: dict[Any, tuple[str, str]] = {}
+    try:
         # Start the slower range request first so it is never queued behind a
         # full batch of per-day SSE requests.  This keeps the first page load
         # inside the frontend's 45 second timeout even when SZSE is sluggish.
-        szse_future = pool.submit(_fetch_szse_share_range, start_date, end_date)
+        szse_future = _SOURCE_EXECUTOR.submit(_fetch_szse_share_range, start_date, end_date)
         futures[szse_future] = ("szse", "range")
         for row_date in trade_dates:
-            future = pool.submit(_fetch_sse_share_day, row_date)
+            future = _SOURCE_EXECUTOR.submit(_fetch_sse_share_day, row_date)
             futures[future] = ("sse", row_date)
         for code in missing_price_codes:
-            future = pool.submit(_fetch_eastmoney_price_history, code, start_date, end_date)
+            future = _SOURCE_EXECUTOR.submit(_fetch_eastmoney_price_history, code, start_date, end_date)
             futures[future] = ("price", code)
 
-        for future in as_completed(futures):
+        for future in as_completed(futures, timeout=max(0.0, deadline - time.monotonic())):
             kind, label = futures[future]
             try:
                 value = future.result()
@@ -389,8 +444,18 @@ def _collect_inputs(trade_dates: list[str]) -> tuple[
             except Exception as exc:
                 logger.warning("Broad ETF flow source %s %s failed: %s", kind, label, exc)
                 warnings.append(f"{kind}:{label} 数据暂不可用")
+                source_status = "PARTIAL_SOURCE_FAILURE"
+    except TimeoutError:
+        warnings.append("ETF 数据源批次达到读取时限")
+        source_status = "DEADLINE"
+    finally:
+        # Cancel this batch's queued work. Running calls keep their own
+        # deadlines and stay within the shared executor's fixed worker cap.
+        for future in futures:
+            future.cancel()
+        _SOURCE_BATCH_SLOTS.release()
 
-    return shares, prices, warnings
+    return shares, prices, warnings, source_status
 
 
 def _build_flow_rows(
@@ -463,6 +528,7 @@ def _window_sum(history: list[dict[str, Any]], count: int) -> float | None:
     if any(
         float(row.get("coverage_pct") or 0) < _MIN_RELIABLE_COVERAGE_PCT
         or row.get("net_amount") is None
+        or row["etf_codes"] != window[-1]["etf_codes"]
         for row in window
     ):
         return None
@@ -484,6 +550,7 @@ def _signal(
     history: list[dict[str, Any]],
     selected_rows: list[dict[str, Any]],
     expected: int,
+    benchmark_amounts: dict[str, float],
 ) -> tuple[dict[str, Any], list[dict[str, str]]]:
     net_3d = _window_sum(history, 3)
     net_5d = _window_sum(history, 5)
@@ -497,6 +564,7 @@ def _signal(
         for row in history[:-1]
         if float(row.get("coverage_pct") or 0) >= _MIN_RELIABLE_COVERAGE_PCT
         and row.get("net_amount") is not None
+        and row["etf_codes"] == history[-1]["etf_codes"]
     ]
     prior_absolute = [abs(item) for item in prior_values]
     absolute_base = statistics.median(prior_absolute) if prior_absolute else 0.0
@@ -505,14 +573,8 @@ def _signal(
     material = max(5_000_000_000.0, 1.5 * absolute_base)
     percentile = _percentile(prior_absolute, abs(net_1d)) if net_1d is not None else None
 
-    valid_benchmarks: dict[str, float] = {}
-    for row in selected_rows:
-        if row.get("net_amount") is None:
-            continue
-        key = str(row.get("benchmark") or "其他")
-        valid_benchmarks[key] = valid_benchmarks.get(key, 0.0) + float(row["net_amount"])
-    positive_benchmarks = sum(1 for value in valid_benchmarks.values() if value > 500_000_000)
-    negative_benchmarks = sum(1 for value in valid_benchmarks.values() if value < -500_000_000)
+    positive_benchmarks = sum(1 for value in benchmark_amounts.values() if value > 500_000_000)
+    negative_benchmarks = sum(1 for value in benchmark_amounts.values() if value < -500_000_000)
 
     valid_returns = [float(row["change_pct"]) for row in selected_rows if row.get("change_pct") is not None]
     median_return = statistics.median(valid_returns) if valid_returns else None
@@ -521,6 +583,7 @@ def _signal(
         for row in history[-5:]
         if float(row.get("coverage_pct") or 0) >= _MIN_RELIABLE_COVERAGE_PCT
         and row.get("net_amount") is not None
+        and row["etf_codes"] == history[-1]["etf_codes"]
     ]
     positive_days_5 = sum(1 for row in reliable_recent_5 if float(row["net_amount"]) > noise)
     persistent = (
@@ -556,12 +619,7 @@ def _signal(
         signal = "资金大致平衡，线索不足"
         tone = "neutral"
 
-    history_days = sum(
-        1
-        for row in history[:-1]
-        if float(row.get("coverage_pct") or 0) >= _MIN_RELIABLE_COVERAGE_PCT
-        and row.get("net_amount") is not None
-    )
+    history_days = len(prior_values)
     if net_1d is None:
         confidence_label = "不可用"
     elif coverage_pct >= 90 and history_days >= 12:
@@ -589,7 +647,7 @@ def _signal(
         evidence.append({
             "kind": "warning",
             "title": "近5日累计暂不计算",
-            "detail": "窗口内存在覆盖低于65%的交易日，缺失 ETF 不会按0元计入累计。",
+            "detail": "区间累计要求交易日完整、覆盖至少65%、产品样本一致。缺失 ETF 不会按0元计入累计。",
         })
     else:
         evidence.append({
@@ -597,10 +655,10 @@ def _signal(
             "title": f"近5日累计 {_money_text(net_5d)}",
             "detail": f"其中 {positive_days_5}/{min(5, len(history))} 日出现实质净申购。",
         })
-    if valid_benchmarks:
+    if benchmark_amounts:
         evidence.append({
             "kind": "positive" if broad else "neutral",
-            "title": f"{positive_benchmarks}/{len(valid_benchmarks)} 类宽基同步流入",
+            "title": f"{positive_benchmarks}/{len(benchmark_amounts)} 类宽基同步流入",
             "detail": "同步性越高，稳定型配置线索越强；单一指数集中流入的解释力较弱。",
         })
     if counter_cyclical:
@@ -647,53 +705,47 @@ def _signal(
 
 
 def _build_payload(requested_date: str, days: int) -> dict[str, Any]:
+    deadline = time.monotonic() + _SOURCE_BATCH_SECONDS
     # One extra date is required to calculate the first daily share change.
     trade_dates_desc = _trading_dates(requested_date, days + 1)
     if len(trade_dates_desc) < 2:
         raise RuntimeError("没有足够交易日计算 ETF 份额变化")
     trade_dates = sorted(trade_dates_desc)
-    shares, prices, warnings = _collect_inputs(trade_dates)
+    shares, prices, warnings, source_status = _collect_inputs(trade_dates, deadline=deadline)
     flow_rows = _build_flow_rows(trade_dates, shares, prices)
 
-    by_date: dict[str, list[dict[str, Any]]] = {}
+    by_date: dict[str, dict[str, dict[str, Any]]] = {}
     for row in flow_rows:
-        by_date.setdefault(str(row["trade_date"]), []).append(row)
+        by_date.setdefault(row["trade_date"], {})[row["etf_code"]] = row
 
     history: list[dict[str, Any]] = []
     for row_date in trade_dates[1:]:
-        date_rows = [row for row in by_date.get(row_date, ()) if row.get("net_amount") is not None]
+        date_rows = [row for row in by_date.get(row_date, {}).values() if row.get("net_amount") is not None]
         history.append({
             "trade_date": row_date,
             "net_amount": _sum(date_rows) if date_rows else None,
             "coverage_pct": round(len(date_rows) / len(CORE_ETFS) * 100, 1),
             "available": len(date_rows),
+            "etf_codes": sorted(row["etf_code"] for row in date_rows),
         })
-    # Prefer the requested/latest date when coverage clears the minimum gate;
-    # otherwise fall back to the most recent usable date and expose the lag.
-    usable = [
-        row
-        for row in history
-        if float(row.get("coverage_pct") or 0) >= _MIN_RELIABLE_COVERAGE_PCT
-    ]
-    selected_history = (usable or history)[-1]
-    trade_date = str(selected_history["trade_date"])
-    history = [row for row in history if str(row["trade_date"]) <= trade_date][-days:]
+    # The exchange calendar maps non-trading dates to the previous session.
+    # Keep that exact session even when a source has not published its inputs.
+    trade_date = trade_dates[-1]
+    history = history[-days:]
     cumulative = 0.0
     cumulative_reliable = True
     for row in history:
-        if float(row.get("coverage_pct") or 0) < _MIN_RELIABLE_COVERAGE_PCT:
+        if float(row["coverage_pct"]) < _MIN_RELIABLE_COVERAGE_PCT:
             row["observed_net_amount"] = row.get("net_amount")
             row["net_amount"] = None
+        if row["net_amount"] is None or row["etf_codes"] != history[0]["etf_codes"]:
             cumulative_reliable = False
-        if row.get("net_amount") is not None and cumulative_reliable:
+        if cumulative_reliable:
             cumulative += float(row["net_amount"])
-            row["cumulative_amount"] = cumulative
-        else:
-            row["cumulative_amount"] = None
+        row["cumulative_amount"] = cumulative if cumulative_reliable else None
 
-    selected_rows_all = [row for row in flow_rows if row["trade_date"] == trade_date]
+    selected_rows_all = list(by_date.get(trade_date, {}).values())
     selected_rows = [row for row in selected_rows_all if row.get("net_amount") is not None]
-    summary, evidence = _signal(history, selected_rows, len(CORE_ETFS))
     observed_at = max((row.get("share_observed_at") or "" for row in selected_rows_all), default="") or None
     activity_date = trade_dates[-1]
     activity = []
@@ -708,34 +760,32 @@ def _build_payload(requested_date: str, days: int) -> dict[str, Any]:
                          "quality_status": price.get("quality_status") or "unverified"})
 
     benchmarks: list[dict[str, Any]] = []
-    benchmark_names = sorted({item.benchmark for item in CORE_ETFS})
-    for benchmark in benchmark_names:
-        benchmark_history: list[tuple[str, list[dict[str, Any]]]] = []
-        for item in history:
-            row_date = str(item["trade_date"])
-            rows = [
-                row for row in flow_rows
-                if row["trade_date"] == row_date
-                and row["benchmark"] == benchmark
-                and row.get("net_amount") is not None
-            ]
-            benchmark_history.append((row_date, rows))
-        latest_rows = benchmark_history[-1][1] if benchmark_history else []
+    for benchmark, expected_codes in BENCHMARK_CODES.items():
+        covered = [
+            {code: row["net_amount"] for code, row in by_date.get(day["trade_date"], {}).items()
+             if code in expected_codes and row["net_amount"] is not None}
+            for day in history
+        ]
+        latest = covered[-1]
+
         def benchmark_window_sum(count: int) -> float | None:
-            window = benchmark_history[-count:]
-            if len(window) < count or any(not rows for _, rows in window):
+            window = covered[-count:]
+            if len(window) != count or any(len(day) != len(expected_codes) for day in window):
                 return None
-            return _sum([row for _, rows in window for row in rows])
+            return sum(sum(day.values()) for day in window)
 
         benchmarks.append({
             "benchmark": benchmark,
-            "net_1d": _sum(latest_rows) if latest_rows else None,
+            "net_1d": benchmark_window_sum(1),
             "net_3d": benchmark_window_sum(3),
             "net_5d": benchmark_window_sum(5),
             "net_20d": benchmark_window_sum(20),
-            "share_change": _sum(latest_rows, "share_change") if latest_rows else None,
-            "positive_count": sum(1 for row in latest_rows if (row.get("net_amount") or 0) > 0),
-            "total_count": len(latest_rows),
+            "share_change": None,
+            "positive_count": sum(1 for amount in latest.values() if amount > 0),
+            "total_count": len(latest),
+            "expected_etf_codes": list(expected_codes),
+            "available_etf_codes": sorted(latest),
+            "missing_etf_codes": [code for code in expected_codes if code not in latest],
         })
     benchmarks.sort(
         key=lambda item: (
@@ -743,6 +793,10 @@ def _build_payload(requested_date: str, days: int) -> dict[str, Any]:
             float(item.get("net_1d") or 0),
         ),
         reverse=True,
+    )
+    summary, evidence = _signal(
+        history, selected_rows, len(CORE_ETFS),
+        {row["benchmark"]: row["net_1d"] for row in benchmarks if row["net_1d"] is not None},
     )
 
     selected_codes = {str(row["etf_code"]) for row in selected_rows_all}
@@ -756,10 +810,13 @@ def _build_payload(requested_date: str, days: int) -> dict[str, Any]:
         "净申购估算 = ETF 总份额变化 × 前一交易日收盘价；它不是二级市场成交额。",
         "公开日频份额不能识别申购、赎回主体；国家队身份只有公告或专项持仓披露才能确认。",
         "净申购可能包含申购套利、做市库存调整和普通机构配置，不等于方向性看多。",
-        "观察池覆盖主要核心宽基产品，不代表全市场所有同标的 ETF；缺失金额不会按覆盖率放大。",
+        "按固定跟踪产品范围展示。基准估算要求窗口内每个交易日的跟踪产品齐全，份额变化见各产品明细。",
+        "整体区间累计使用相同的产品样本，日度估算金额按实际覆盖展示。",
         "交易所份额的接口读取时间只证明本次查询所见，缺少原始发布时间时不可用于历史盘中回放。",
         "数据覆盖评分由可估算产品覆盖和有效历史样本数决定。",
     ]
+    if trade_date != requested_date:
+        caveats.append(f"请求日期 {requested_date} 对应最近已结束交易日 {trade_date}。")
     if warnings:
         caveats.append("部分数据源读取失败：" + "；".join(warnings[:6]))
     if any(row.get("observed_net_amount") is not None for row in history):
@@ -773,18 +830,21 @@ def _build_payload(requested_date: str, days: int) -> dict[str, Any]:
 
     if summary["coverage_pct"] < _MIN_RELIABLE_COVERAGE_PCT:
         status = "insufficient"
-    elif trade_date != activity_date or any(summary.get(field) is None for field in ("net_3d", "net_5d", "net_20d")) or excluded_rows:
+    elif len(selected_rows) != len(CORE_ETFS) or any(
+        summary[field] is None for field in ("net_3d", "net_5d", "net_20d")
+    ):
         status = "degraded"
     else:
         status = "ok"
 
     return {
         "status": status,
+        "source_batch_status": source_status,
         "requested_date": requested_date,
         "trade_date": trade_date,
         "data_as_of": trade_date,
         "window_days": days,
-        "scope_label": "4只核心宽基 ETF 观察池",
+        "scope_label": SCOPE_LABEL,
         "summary": summary,
         "flow_evidence": {"basis": "EXCHANGE_DAILY_SHARE_CHANGE", "trade_date": trade_date,
                           "observed_at": observed_at, "publication_time_status": "UNKNOWN",
@@ -844,10 +904,12 @@ def broad_etf_flow(
         logger.exception("Broad ETF flow payload failed for %s", requested)
         return {
             "status": "error",
+            "source_batch_status": "UNAVAILABLE",
             "requested_date": requested,
             "trade_date": "",
             "data_as_of": "",
             "window_days": days,
+            "scope_label": SCOPE_LABEL,
             "summary": {
                 "signal": "数据暂不可用",
                 "signal_tone": "unknown",
@@ -880,7 +942,8 @@ def broad_etf_flow(
             "sources": [],
             "coverage": {"expected": len(CORE_ETFS), "available": 0, "missing": []},
         }
-    _cache_set(key, payload)
+    if payload["source_batch_status"] == "FINISHED":
+        _cache_set(key, payload)
     return payload
 
 
