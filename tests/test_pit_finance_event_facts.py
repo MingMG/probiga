@@ -2944,20 +2944,53 @@ def test_empty_coverage_chunks_keep_complete_evidence_and_invalid_metadata(monke
     expected = pit_module._authoritative_empty_coverage(engine, **kwargs)
     assert set(expected[0]) == {"000001", "002731"}
     assert expected[1] == {}
-    monkeypatch.setattr(pit_module, "COMMON_FACT_CUTOFF_QUERY_CODE_LIMIT", 1)
-    scopes = []
+    mysql_reader = _mysql_seal_transport(engine)
+    queries = []
 
     def record(_connection, _cursor, sql, _parameters, context, _many):
         if "ORDER BY stock_code, scope_hash, revision_no" in sql:
-            scopes.append([
+            codes = [
                 value for key, value in context.compiled_parameters[0].items()
                 if key.startswith("codes_")
-            ])
+            ]
+            queries.append((sql, codes, context.execution_options.get("stream_results")))
 
     event.listen(engine, "before_cursor_execute", record)
-    assert pit_module._authoritative_empty_coverage(engine, **kwargs) == expected
-    event.remove(engine, "before_cursor_execute", record)
-    assert scopes == [["000001"], ["002731"]]
+    try:
+        with monkeypatch.context() as smaller_chunks:
+            smaller_chunks.setattr(pit_module, "COMMON_FACT_CUTOFF_QUERY_CODE_LIMIT", 1)
+            assert pit_module._authoritative_empty_coverage(engine, **kwargs) == expected
+            assert [codes for _, codes, _ in queries] == [["000001"], ["002731"]]
+            queries.clear()
+            assert pit_module._authoritative_empty_coverage(mysql_reader, **kwargs) == expected
+            assert [codes for _, codes, _ in queries] == [["000001"], ["002731"]]
+        assert all(
+            "COMPRESS(payload_json)" in sql and "OCTET_LENGTH(payload_json)" in sql
+            and streaming is True
+            for sql, _, streaming in queries
+        )
+        queries.clear()
+        wider_codes = kwargs["codes"] + [f"300{index:03d}" for index in range(39)]
+        wider_scope = {**kwargs, "codes": wider_codes}
+        assert pit_module._authoritative_empty_coverage(mysql_reader, **wider_scope) == expected
+        assert [codes for _, codes, _ in queries] == [wider_codes[:40], wider_codes[40:]]
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+
+    with engine.connect() as connection:
+        predecessor_payload = connection.execute(text(
+            f"SELECT payload_json FROM {SOURCE_COVERAGE_TABLE} "
+            "WHERE stock_code='000001' AND revision_no=1"
+        )).scalar_one()
+    predecessor_frame = _mysql_compress_frame(predecessor_payload.encode("utf-8"))
+    damaged_reader = _mysql_seal_transport(
+        engine, corrupt=lambda frame: frame[:-1] if frame == predecessor_frame else frame,
+    )
+    available, invalid = pit_module._authoritative_empty_coverage(damaged_reader, **kwargs)
+    assert available == {"002731": expected[0]["002731"]}
+    assert set(invalid) == {"000001"}
+    assert invalid["000001"].startswith(f"PIT_{kind.upper()}_BAD_COVERAGE_CHAIN:")
+
     with engine.begin() as connection:
         connection.execute(text("DROP TRIGGER trg_pit_source_coverage_immutable_bu"))
         connection.execute(text(
@@ -2968,6 +3001,8 @@ def test_empty_coverage_chunks_keep_complete_evidence_and_invalid_metadata(monke
     assert set(available) == {"002731"}
     assert set(invalid) == {"000001"}
     assert invalid["000001"].startswith(f"PIT_{kind.upper()}_BAD_COVERAGE_CHAIN:")
+    mysql_reader = _mysql_seal_transport(engine)
+    assert pit_module._authoritative_empty_coverage(mysql_reader, **kwargs) == (available, invalid)
     engine.dispose()
 
 

@@ -57,6 +57,7 @@ FINANCE_ATOMIC_BATCH_INCREMENTAL_SCHEMA = (
 FINANCE_ATOMIC_BATCH_HISTORY_LIMIT = 20
 FINANCE_ATOMIC_BATCH_QUERY_CODE_LIMIT = 100
 COMMON_FACT_CUTOFF_QUERY_CODE_LIMIT = 500
+EMPTY_COVERAGE_MYSQL_CODE_LIMIT = 40
 FINANCE_INCREMENTAL_DISCOVERY_SOURCE = "eastmoney.finance.global_discovery"
 FINANCE_INCREMENTAL_DISCOVERY_CODE = "000000"
 FINANCE_INCREMENTAL_DISCOVERY_SCHEMA = (
@@ -2856,43 +2857,59 @@ def _authoritative_empty_coverage(
     # Coverage-chain validation needs every prior revision in the source
     # scope.  The requested completed batch is checked after the full chain is
     # validated; SQL-filtering it here would manufacture a revision gap.
-    statement = text(
-        f"SELECT * FROM {SOURCE_COVERAGE_TABLE} "
-        "WHERE fact_kind=:fact_kind AND stock_code IN :codes "
-        "AND known_at<=:decision_at AND received_at<=:decision_at "
-        f"{source_filter} "
-        "ORDER BY stock_code, scope_hash, revision_no"
-    ).bindparams(bindparam("codes", expanding=True))
+
     def code_chains():
-        batch_size = max(1, int(COMMON_FACT_CUTOFF_QUERY_CODE_LIMIT))
         with engine.connect() as connection:
-            if connection.dialect.name == "mysql" and str(
+            mysql = connection.dialect.name == "mysql"
+            if mysql and str(
                 connection.get_isolation_level() or ""
             ).upper() not in {"REPEATABLE READ", "SERIALIZABLE"}:
                 raise ValueError("empty coverage requires a repeatable-read snapshot")
+            # Keep each code's full chain in one chunk and limit the number of
+            # codes transferred together on the remote MySQL connection.
+            batch_size = max(1, int(COMMON_FACT_CUTOFF_QUERY_CODE_LIMIT))
+            if mysql:
+                batch_size = min(batch_size, EMPTY_COVERAGE_MYSQL_CODE_LIMIT)
+            statement = text(
+                f"SELECT {_coverage_payload_columns(mysql)} FROM {SOURCE_COVERAGE_TABLE} "
+                "WHERE fact_kind=:fact_kind AND stock_code IN :codes "
+                "AND known_at<=:decision_at AND received_at<=:decision_at "
+                f"{source_filter} "
+                "ORDER BY stock_code, scope_hash, revision_no"
+            ).bindparams(bindparam("codes", expanding=True)).execution_options(
+                stream_results=True,
+            )
             with connection.begin():
                 for offset in range(0, len(codes), batch_size):
                     code_batch = codes[offset:offset + batch_size]
                     by_code_scope: dict[
                         str, dict[str, list[dict[str, Any]]]
                     ] = defaultdict(lambda: defaultdict(list))
-                    for raw in connection.execute(
+                    with connection.execute(
                         statement, {**params, "codes": code_batch}
-                    ).mappings():
-                        row = dict(raw)
-                        by_code_scope[str(row.get("stock_code") or "").zfill(6)][
-                            str(row.get("scope_hash") or "")
-                        ].append(row)
+                    ) as rows:
+                        for raw in rows.mappings():
+                            row = dict(raw)
+                            by_code_scope[str(row.get("stock_code") or "").zfill(6)][
+                                str(row.get("scope_hash") or "")
+                            ].append(row)
                     for code in code_batch:
-                        yield code, by_code_scope.get(code, {})
+                        yield code, by_code_scope.get(code, {}), mysql
                     by_code_scope.clear()
 
     available: dict[str, dict[str, Any]] = {}
     invalid: dict[str, str] = {}
-    for code, scopes in code_chains():
+    for code, scopes, mysql in code_chains():
         candidates: list[dict[str, Any]] = []
         for chain in scopes.values():
             try:
+                if mysql:
+                    chain = [
+                        _coverage_payload_row(
+                            row, mysql=True, stage=f"{fact_kind}_empty_coverage",
+                        )
+                        for row in chain
+                    ]
                 _validate_coverage_chain(chain)
             except ValueError as exc:
                 invalid[code] = f"PIT_{fact_kind.upper()}_BAD_COVERAGE_CHAIN:{exc}"
