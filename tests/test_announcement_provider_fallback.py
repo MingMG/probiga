@@ -1352,6 +1352,18 @@ def test_historical_reconstruction_uses_target_cutoff_and_actual_known_time(
         expected_scheduler_run_uid="1" * 32,
         expected_build_sha="2" * 40,
     ) == "complete"
+    # A complete market batch can have an announcement for every issuer.
+    full_nonempty = {
+        **fresh, "empty_stock_count": 0,
+        "event_count": max(fresh["event_count"], fresh["stock_count"]),
+    }
+    assert validate_existing_task_result(
+        full_nonempty,
+        0,
+        expected_trade_date=target.isoformat(),
+        expected_scheduler_run_uid="1" * 32,
+        expected_build_sha="2" * 40,
+    ) == "complete"
     drifted_fresh = json.loads(json.dumps(fresh))
     drifted_provenance = drifted_fresh["reconstruction_provenance"]
     drifted_provenance["scheduler_run_uid"] = "3" * 32
