@@ -7,7 +7,7 @@ import threading
 from zoneinfo import ZoneInfo
 
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 
 from server.common.announcement_provider import (
     AnnouncementProviderError,
@@ -34,6 +34,9 @@ from server.common.qmt_announcement_pit import (
     validate_task_result,
 )
 from server.common.pit_facts import (
+    PIT_AVAILABLE,
+    PIT_DATA_BLOCKED,
+    PIT_NO_ROWS,
     _fallback_event_receipt_valid,
     append_source_coverage,
     canonical_hash as pit_canonical_hash,
@@ -1067,6 +1070,114 @@ def test_cninfo_exact_receipts_publish_one_atomic_catalog_batch(
         ), {"batch_id": result["batch_id"]}).scalar_one() == 1
 
 
+def _assert_historical_selection_reuse(
+    engine, *, catalog, target, decision, expected_batch_id, expected_empty_status,
+) -> None:
+    window_start = target - timedelta(days=30)
+    cutoff_args = {
+        "codes": catalog.codes,
+        "decision_at": decision,
+        "finance_start_date": "1900-01-01",
+        "finance_end_date": target,
+        "event_start_date": window_start,
+        "event_end_date": target,
+        "require_qmt_event_batch": True,
+    }
+    baseline_cutoff = resolve_common_fact_cutoff(engine, **cutoff_args)
+    assert baseline_cutoff["status"] == PIT_AVAILABLE, baseline_cutoff.get("reason")
+    selections = []
+    coverage_queries = []
+
+    def record_coverage_query(_connection, _cursor, statement, *_args):
+        if "st_pit_source_coverage" in statement:
+            coverage_queries.append(statement)
+
+    event.listen(engine, "before_cursor_execute", record_coverage_query)
+    try:
+        cutoff = resolve_common_fact_cutoff(
+            engine, **cutoff_args, capture_historical_selection=selections.append,
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", record_coverage_query)
+    cutoff_chain_queries = [
+        statement for statement in coverage_queries
+        if "ORDER BY fact_kind, stock_code, scope_hash, revision_no" in statement
+    ]
+    assert cutoff_chain_queries
+    assert all("WHERE fact_kind='finance'" in query for query in cutoff_chain_queries)
+    assert cutoff["status"] == PIT_AVAILABLE, cutoff.get("reason")
+    assert cutoff["receipt_root_hash"] == baseline_cutoff["receipt_root_hash"]
+    assert cutoff == baseline_cutoff
+    assert cutoff["qmt_event_batch"]["batch_id"] == expected_batch_id
+    assert {
+        receipt["batch_id"]
+        for receipt in cutoff["receipts"]
+        if receipt["fact_kind"] == "event"
+    } == {expected_batch_id}
+    assert len(selections) == 1
+    if expected_empty_status == PIT_AVAILABLE:
+        early_selections = []
+        early_cutoff = resolve_common_fact_cutoff(
+            engine,
+            **{**cutoff_args, "decision_at": decision - timedelta(seconds=2)},
+            capture_historical_selection=early_selections.append,
+        )
+        assert early_cutoff["status"] == PIT_DATA_BLOCKED
+        assert early_selections == []
+
+    read_args = {
+        "codes": tuple(reversed(catalog.codes)),
+        "decision_at": decision,
+        "fact_cutoff_at": cutoff["fact_cutoff_at"],
+        "start_date": window_start,
+        "end_date": target,
+        "require_qmt_complete_batch": True,
+    }
+    baseline = load_event_facts(engine, **read_args)
+    coverage_queries.clear()
+    event.listen(engine, "before_cursor_execute", record_coverage_query)
+    try:
+        reused = load_event_facts(
+            engine, **read_args, historical_selection=selections[0],
+        )
+        if expected_empty_status == PIT_AVAILABLE:
+            for mismatch in (
+                {"decision_at": decision + timedelta(seconds=1)},
+                {"fact_cutoff_at": datetime.fromisoformat(
+                    cutoff["fact_cutoff_at"],
+                ) - timedelta(seconds=1)},
+                {"start_date": window_start + timedelta(days=1)},
+                {"codes": (catalog.codes[0],)},
+                {"codes": ()},
+            ):
+                blocked = load_event_facts(
+                    engine, **{**read_args, **mismatch},
+                    historical_selection=selections[0],
+                )
+                assert blocked.global_status == PIT_DATA_BLOCKED
+                assert blocked.facts == {}
+                assert blocked.reason_by_code == {
+                    code: "PIT_EVENT_VALIDATED_HISTORY_SCOPE_MISMATCH"
+                    for code in mismatch.get("codes", catalog.codes)
+                }
+    finally:
+        event.remove(engine, "before_cursor_execute", record_coverage_query)
+    assert coverage_queries == []
+    assert reused.manifest_hash == baseline.manifest_hash
+    assert reused == baseline
+    assert reused.status_for("000001") == PIT_AVAILABLE
+    assert len(reused.facts["000001"]) == 1
+    assert reused.status_for("600519") == expected_empty_status
+    assert reused.facts["600519"] == []
+    if expected_empty_status == PIT_AVAILABLE:
+        assert reused.reason_for("600519") == "PIT_EVENT_AUTHORITATIVE_EMPTY"
+        assert reused.coverage_by_code["600519"]["coverage_batch_id"] == (
+            expected_batch_id
+        )
+    else:
+        assert "600519" not in reused.coverage_by_code
+
+
 def test_historical_reconstruction_uses_target_cutoff_and_actual_known_time(
     monkeypatch, tmp_path,
 ) -> None:
@@ -1234,6 +1345,35 @@ def test_historical_reconstruction_uses_target_cutoff_and_actual_known_time(
         )
     assert compressed_proof == proof
 
+    from server.common import qmt_announcement_pit as announcement
+
+    validate_live_batch = announcement.validate_complete_qmt_announcement_batch
+
+    def legacy_empty_qmt(engine, *, source, **kwargs):
+        if source == announcement.QMT_ANNOUNCEMENT_SOURCE:
+            raise QMTAnnouncementBlocked(
+                "QMT_ANNOUNCEMENT_FULL_MARKET_ALL_EMPTY_UNPROVEN",
+                "legacy-complete-batch",
+            )
+        return validate_live_batch(engine, source=source, **kwargs)
+
+    legacy_selections = []
+    with monkeypatch.context() as legacy_qmt:
+        legacy_qmt.setattr(
+            announcement, "validate_complete_qmt_announcement_batch",
+            legacy_empty_qmt,
+        )
+        legacy_proof = announcement.validate_complete_announcement_batch(
+            engine,
+            codes=catalog.codes,
+            decision_at=reconstructed + timedelta(seconds=1),
+            window_start=target - timedelta(days=30),
+            window_end=target,
+            capture_historical_selection=legacy_selections.append,
+        )
+    assert legacy_proof == proof
+    assert legacy_selections == []
+
     subset_proof = validate_complete_historical_reconstruction_batch(
         engine,
         codes=catalog.codes,
@@ -1276,8 +1416,13 @@ def test_historical_reconstruction_uses_target_cutoff_and_actual_known_time(
         ]
     from server.common.qmt_announcement_pit import _publish_batch, build_batch_root
     live_received = reconstructed + timedelta(minutes=1)
+    live_window_start = target - timedelta(days=29)
+    live_start_time = datetime.combine(
+        live_window_start, datetime.min.time(),
+    ).strftime("%Y%m%d%H%M%S")
     live_end_time = live_received.strftime("%Y%m%d%H%M%S")
     for receipt in later_receipts.values():
+        receipt["requested_start_time"] = live_start_time
         receipt["requested_end_time"] = live_end_time
         receipt["captured_at"] = live_received.isoformat(
             sep=" ", timespec="microseconds"
@@ -1289,7 +1434,7 @@ def test_historical_reconstruction_uses_target_cutoff_and_actual_known_time(
         batch_id=live_batch_id,
         fact_cutoff_at=live_received,
         received_at=live_received,
-        window_start=target - timedelta(days=30),
+        window_start=live_window_start,
         window_end=target,
         catalog=catalog,
         results=later_results,
@@ -1303,7 +1448,7 @@ def test_historical_reconstruction_uses_target_cutoff_and_actual_known_time(
         entries=live_entries,
         fact_cutoff_at=live_received,
         received_at=live_received,
-        window_start=target - timedelta(days=30),
+        window_start=live_window_start,
         window_end=target,
         catalog=catalog,
         results=later_results,
@@ -1321,6 +1466,7 @@ def test_historical_reconstruction_uses_target_cutoff_and_actual_known_time(
         expected_trade_date=target,
     )
     assert reused["batch_id"] == result["batch_id"]
+    fact_cutoff = datetime.combine(target, datetime.max.time())
     for code in catalog.codes:
         append_source_coverage(
             engine,
@@ -1328,8 +1474,8 @@ def test_historical_reconstruction_uses_target_cutoff_and_actual_known_time(
             stock_code=code,
             window_start="1900-01-01",
             window_end=target,
-            known_at=live_received,
-            covered_through_at=live_received,
+            known_at=fact_cutoff,
+            covered_through_at=fact_cutoff,
             watermark_kind="CAPTURED_AT",
             watermark_evidence={"provider": "test.finance"},
             source_rows=[],
@@ -1337,31 +1483,15 @@ def test_historical_reconstruction_uses_target_cutoff_and_actual_known_time(
             source="test.finance",
             batch_id="finance-20260903-live",
         )
-    with monkeypatch.context() as cutoff_patch:
-        cutoff_patch.setattr(
-            "server.common.qmt_announcement_pit.validate_complete_announcement_batch",
-            lambda *_args, **_kwargs: proof,
+    for decision, expected_empty_status in (
+        (reconstructed + timedelta(seconds=1), PIT_AVAILABLE),
+        (live_received + timedelta(seconds=1), PIT_NO_ROWS),
+    ):
+        _assert_historical_selection_reuse(
+            engine, catalog=catalog, target=target, decision=decision,
+            expected_batch_id=result["batch_id"],
+            expected_empty_status=expected_empty_status,
         )
-        cutoff_patch.setattr(
-            "server.common.pit_facts._live_capture_allowed",
-            lambda **_kwargs: True,
-        )
-        common = resolve_common_fact_cutoff(
-            engine,
-            codes=catalog.codes,
-            decision_at=live_received + timedelta(seconds=1),
-            finance_start_date="1900-01-01",
-            finance_end_date=target,
-            event_start_date=target - timedelta(days=30),
-            event_end_date=target,
-            require_qmt_event_batch=True,
-        )
-    assert common["status"] == "AVAILABLE", common.get("reason")
-    assert {
-        receipt["batch_id"]
-        for receipt in common["receipts"]
-        if receipt["fact_kind"] == "event"
-    } == {result["batch_id"]}
 
     from tools.sync_qmt_announcement_pit import validate_existing_task_result
 

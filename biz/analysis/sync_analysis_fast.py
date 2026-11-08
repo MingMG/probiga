@@ -59,6 +59,7 @@ from server.common.daily_stock_universe import (
     validate_daily_stock_coverage,
 )
 from server.common.pit_facts import (
+    HistoricalEventRead,
     PIT_AVAILABLE,
     PIT_DATA_BLOCKED,
     load_event_facts,
@@ -2479,6 +2480,7 @@ def load_notice_features(
     decision_at: datetime | str | None,
     fact_cutoff_at: datetime | str | None = None,
     stock_codes: list[str],
+    historical_selection: HistoricalEventRead | None = None,
 ) -> pd.DataFrame:
     codes = _normalize_stock_codes(stock_codes) or []
     if not codes:
@@ -2514,6 +2516,7 @@ def load_notice_features(
         start_date=date.fromisoformat(trade_date) - timedelta(days=lookback_days),
         end_date=trade_date,
         require_qmt_complete_batch=True,
+        historical_selection=historical_selection,
     )
     records: dict[str, dict[str, Any]] = {}
     for code in codes:
@@ -5402,6 +5405,7 @@ def _prepare_batch_outputs(
             trade_date=trade_date,
             progress_callback=progress_callback,
         )
+    historical_event_reads: list[HistoricalEventRead] = []
     common_cutoff: dict[str, Any] = {
         "status": PIT_DATA_BLOCKED,
         "reason": "PIT_COMMON_CUTOFF_EXACT_DECISION_TIME_REQUIRED",
@@ -5436,6 +5440,7 @@ def _prepare_batch_outputs(
             ),
             event_end_date=trade_date,
             require_qmt_event_batch=True,
+            capture_historical_selection=historical_event_reads.append,
         )
     fact_cutoff_at: datetime | str | None = (
         common_cutoff.get("fact_cutoff_at")
@@ -5518,6 +5523,7 @@ def _prepare_batch_outputs(
             decision_at=reader_decision_at,
             fact_cutoff_at=fact_cutoff_at,
             stock_codes=feature_codes,
+            historical_selection=next(iter(historical_event_reads), None),
         ),
         scoped_codes,
     )
