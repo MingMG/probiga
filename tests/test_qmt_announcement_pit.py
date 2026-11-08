@@ -2506,7 +2506,8 @@ def test_missing_historical_batch_skips_unrelated_live_coverage_payloads():
     assert "SELECT *" not in coverage_reads[0]
 
 
-def test_full_market_publish_batches_empty_coverage_and_preserves_revision_chain():
+def test_full_market_publish_batches_empty_coverage_and_preserves_revision_chain(monkeypatch):
+    from server.common import qmt_announcement_pit
     from server.common.qmt_announcement_pit import _publish_batch, build_batch_root
 
     engine = _engine()
@@ -2516,6 +2517,12 @@ def test_full_market_publish_batches_empty_coverage_and_preserves_revision_chain
     first_cutoff = datetime(2026, 9, 2, 18, 20)
     coverage_reads = []
     coverage_inserts = []
+    # A fixed remote round-trip budget is enough for these batches, but not for
+    # one SELECT and one INSERT per security as in the former publisher.
+    def clock():
+        return len(coverage_reads) + len(coverage_inserts)
+
+    monkeypatch.setattr(qmt_announcement_pit, "monotonic", clock)
 
     @event.listens_for(engine, "before_cursor_execute")
     def observe(connection, cursor, statement, parameters, context, executemany):
@@ -2525,7 +2532,7 @@ def test_full_market_publish_batches_empty_coverage_and_preserves_revision_chain
             if statement.startswith("INSERT"):
                 coverage_inserts.append(len(parameters) if executemany else 1)
 
-    def publish(cutoff):
+    def publish(cutoff, *, round_trip_budget=24):
         batch_id = f"qmt-ann-{cutoff:%Y%m%dT%H%M%S}-bulk"
         arguments = dict(
             batch_id=batch_id, fact_cutoff_at=cutoff,
@@ -2534,8 +2541,18 @@ def test_full_market_publish_batches_empty_coverage_and_preserves_revision_chain
             catalog=catalog, results=results,
         )
         root, entries = build_batch_root(**arguments)
-        return _publish_batch(engine, batch_root_hash=root, entries=entries, **arguments)[0]
+        return _publish_batch(
+            engine, batch_root_hash=root, entries=entries,
+            deadline_monotonic=clock() + round_trip_budget, **arguments,
+        )[0]
 
+    with pytest.raises(QMTAnnouncementBlocked, match="db-"):
+        publish(first_cutoff, round_trip_budget=4)
+    assert coverage_inserts, "the deadline must interrupt a partially written transaction"
+    with engine.connect() as connection:
+        assert connection.execute(text(f"SELECT COUNT(*) FROM {SOURCE_COVERAGE_TABLE}")).scalar_one() == 0
+    coverage_reads.clear()
+    coverage_inserts.clear()
     first = publish(first_cutoff)
     assert len(first) == len(codes)
     assert coverage_inserts == [100, 100, 5]
