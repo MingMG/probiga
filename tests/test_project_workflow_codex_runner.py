@@ -1,5 +1,6 @@
 from contextlib import contextmanager
 import errno
+import json
 from pathlib import Path
 import socket
 import subprocess
@@ -95,7 +96,10 @@ def test_recovery_after_lost_turn_start_response_checks_external_turn_once(monke
                                  {"id": "own-turn", "status": turn_state[0]}]}
             if method == "thread/items/list":
                 content = received_prompt if params["turnId"] == "own-turn" else [{"text": "unrelated turn"}]
-                return {"data": [{"type": "userMessage", "content": content}]}
+                return {"data": [
+                    {"turnId": "another-turn", "item": {"type": "userMessage", "content": received_prompt}},
+                    {"turnId": params["turnId"], "item": {"type": "userMessage", "content": content}},
+                ]}
             pytest.fail(f"Unexpected App Server method {method}")
 
     @contextmanager
@@ -119,6 +123,38 @@ def test_recovery_after_lost_turn_start_response_checks_external_turn_once(monke
     assert subprocess.run([sys.executable, "-B", "check.py"], cwd=checkout, timeout=10).returncode == 0
     assert codex_runner.reconcile(operation, context) == completed
     assert operations.count("turn/start") == 1
+    assert operations.count("thread/items/list") == 2
+
+
+@pytest.mark.parametrize("has_matching_entry", [True, False])
+def test_supervisor_reads_diagnosis_from_its_own_wrapped_turn_item(has_matching_entry):
+    report = {
+        "root_cause_hypothesis": "Read-only filesystem",
+        "evidence": "The write returned EROFS",
+        "recommended_action": "Check the selected profile",
+        "verification": "Confirm write mode rejects the read-only mount",
+    }
+
+    class Server:
+        def request(self, method, params):
+            assert method == "thread/items/list"
+            assert params["turnId"] == "supervisor-turn"
+            entries = [{"turnId": "another-turn", "item": {
+                "type": "agentMessage", "text": json.dumps({**report, "evidence": "Unrelated failure"}),
+            }}]
+            if has_matching_entry:
+                entries.append({"turnId": "supervisor-turn", "item": {
+                    "type": "agentMessage", "text": json.dumps(report),
+                }})
+            return {"data": entries}
+
+    evidence = {"thread_id": "managed-thread", "turn_id": "supervisor-turn"}
+    if has_matching_entry:
+        assert codex_runner._diagnosis(Server(), evidence) == report
+    else:
+        with pytest.raises(codex_runner.RunnerError) as error:
+            codex_runner._diagnosis(Server(), evidence)
+        assert error.value.code == "CODEX_DIAGNOSIS_MISSING"
 
 
 def test_credentials_probe_blocks_before_thread_creation(monkeypatch, owned_context):
