@@ -310,6 +310,62 @@ def test_hot_data_write_routes_preserve_fail_closed_launcher_decision(
     assert result["job_id"] == ""
 
 
+def test_review_force_binds_http_request_to_exact_registered_child_args(monkeypatch):
+    from datetime import datetime
+    from functools import partial
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.pool import StaticPool
+
+    from biz.review import research_flow
+    from server.common import authoritative_market_clock
+    from server.common.scheduler_args import build_scheduler_task_args
+
+    engine = create_engine("sqlite+pysqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE si_trade_calendar (trade_date TEXT, trade_status INTEGER)"))
+        connection.execute(text(
+            "INSERT INTO si_trade_calendar VALUES ('2026-11-05',1),('2026-11-06',1),('2026-11-09',1)"
+        ))
+    latest = "2026-11-06"
+    persisted = _registered_task("daily_review")
+    monkeypatch.setattr(hot_data, "get_engine", lambda: engine)
+    monkeypatch.setattr(hot_data, "_read_sql", lambda *args: [persisted])
+    monkeypatch.setattr(authoritative_market_clock, "authoritative_closed_trade_date", partial(
+        authoritative_market_clock.authoritative_closed_trade_date, now=datetime(2026, 11, 8, 12),
+    ))
+    digest = {"factor_validation_json": {}}
+    monkeypatch.setattr(research_flow, "load_digest", lambda *args, **kwargs: digest)
+    launches = []
+
+    def launch(row, *, root, engine):
+        assert row is not persisted
+        launches.append(build_scheduler_task_args(row, row["script_path"], "2026-11-08"))
+        return {"accepted": True, "status": "running", "job_id": "registered-review-run"}
+
+    monkeypatch.setattr(hot_data, "launch_scheduler_task", launch)
+    app = FastAPI()
+    app.include_router(hot_data.router, prefix="/api")
+    path = "/api/hot-data/daily-review/generate"
+    with TestClient(app) as client:
+        accepted = client.post(path, params={"review_date": latest, "force": "true"})
+        assert accepted.status_code == 200 and accepted.json()["job_id"] == "registered-review-run"
+        default = client.post(path, params={"review_date": "2026-11-05"})
+        assert default.status_code == 200 and default.json()["accepted"] is True
+        for unavailable in ("2026-11-05", "2026-11-09", f"{latest} --push"):
+            rejected = client.post(path, params={"review_date": unavailable, "force": "true"})
+            assert rejected.status_code == 409
+        assert client.post(path, params={"review_date": latest, "force": "--push"}).status_code == 422
+        digest["factor_validation_json"]["early_briefing"] = {"mode": "facts", "status": "COMPLETE"}
+        protected = client.post(path, params={"review_date": latest, "force": "true"})
+        assert protected.status_code == 409 and "早报" in protected.json()["detail"]
+    assert launches == [["--force", latest], ["2026-11-05"]]
+    assert persisted["script_args"] == "" and persisted["date_param"] == "persisted-value"
+    engine.dispose()
+
+
 def test_hot_data_write_routes_do_not_start_subprocesses_directly():
     for route in (
         hot_data.generate_daily_review,

@@ -118,7 +118,10 @@ def publish_review(engine, target, *, force=False):
         result = generate_quant_digest(engine, target, persist=False)
         if result["publish_status"] == "ready":
             result["compact_review"] += "\n\n" + FACTS_NOTE
-        persist_quant_digest(engine, result)
+        if force:
+            persist_quant_digest(engine, result, protect_successor_briefing=True)
+        else:
+            persist_quant_digest(engine, result)
         if result["publish_status"] != "ready":
             return result
         existing = load_digest(engine, target)
