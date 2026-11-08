@@ -1505,6 +1505,7 @@ def validate_existing_task_result(
         "HISTORICAL_RECONSTRUCTION",
         "HISTORICAL_RECONSTRUCTION_EXISTING",
     }:
+        empty_stock_count = payload.get("empty_stock_count")
         provenance = payload.get("reconstruction_provenance")
         if not isinstance(provenance, dict):
             raise ValueError("QMT announcement reconstruction proof is absent")
@@ -1573,9 +1574,8 @@ def validate_existing_task_result(
             is not (payload.get("mode") == "HISTORICAL_RECONSTRUCTION")
             or payload.get("stock_count") != payload.get("coverage_count")
             or int(payload.get("stock_count") or 0) <= 0
-            or not 0 <= int(payload.get("empty_stock_count") or -1) <= int(
-                payload.get("stock_count") or 0
-            )
+            or type(empty_stock_count) is not int
+            or not 0 <= empty_stock_count <= int(payload.get("stock_count") or 0)
             or _iso_date(payload.get("window_end")) != _iso_date(expected)
             or _iso_date(payload.get("window_start"))
             != _iso_date(expected) - timedelta(days=DEFAULT_WINDOW_DAYS)
