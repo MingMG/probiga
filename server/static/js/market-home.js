@@ -213,8 +213,12 @@
         const max = Math.max(1, ...ladder.map(item => item.count));
         const meta = exact ? [notes.trade_date, notes.scope, notes.source].filter(Boolean).map(escape).join(' · ') : snapshotMeta(snapshot);
         const captured = exact && notes.available_at ? `证据可用 ${escape(notes.available_at)} · ` : '';
-        return panel('涨停梯队', meta, (ladder.length ? '<div class="mh-list">' + ladder.slice(0, 8).map(item =>
-            `<div class="mh-row"><b>${item.streak}板</b><span class="mh-breadth-bar" aria-hidden="true"><span class="mh-breadth-part mh-up" style="width:${100 * item.count / max}%"></span></span><span>${item.count}只</span></div>`).join('') + '</div>' :
+        return panel('涨停梯队', meta, (ladder.length ? '<div class="mh-list">' + ladder.map(item => {
+            const names = rows(item.stocks).filter(name => typeof name === 'string' && name.trim());
+            const tier = `<b>${item.streak}板</b><span class="mh-breadth-bar" aria-hidden="true"><span class="mh-breadth-part mh-up" style="width:${100 * item.count / max}%"></span></span><span>${item.count}只</span>`;
+            return names.length ? `<details class="mh-ladder-tier"><summary class="mh-row">${tier}<span class="mh-ladder-toggle" aria-hidden="true"></span></summary><ul aria-label="${item.streak}板个股">${names.map(name => `<li>${escape(name)}</li>`).join('')}</ul></details>` :
+                `<div class="mh-row">${tier}</div>`;
+        }).join('') + '</div>' :
             empty(exact && notes.count === 0 ? '东财收录样本为 0 只' : '暂无可核验的连续涨停梯队')) + `<p class="mh-meta">${captured}封板率 ${metric(ladder.length ? notes.seal_rate_pct : null, '%', 1)} · ${link('intraday-alert', '查看盘中播报')}</p>`);
     }
 

@@ -491,15 +491,25 @@
         if (!window.history || !window.URL) return;
         try {
             var url = new URL(window.location.href);
+            var previousDate = routeDecisionDateFromLocation();
+            // Keep the clock's default distinct from a date the user chose or linked.
+            var autoDate = previousDate === (window.history.state || {}).autoTradeDate ? previousDate : '';
             url.searchParams.set('tab', tabId);
             if (tabId === 'workbench' || tabId === 'market-context' || tabId === 'trading-day' || tabId === 'qmt-strategy-results' || isTradingDecisionTab(tabId)) {
                 var picker = el('datePicker');
-                if (picker && picker.value) url.searchParams.set('trade_date', picker.value);
+                if (picker && picker.value) {
+                    if (picker.value !== previousDate) autoDate = tradingModuleDateMode(picker.value) === 'DEFAULT' ? picker.value : '';
+                    url.searchParams.set('trade_date', picker.value);
+                }
+            }
+            if (tabId === 'market-stage' && autoDate) {
+                url.searchParams.delete('trade_date');
+                autoDate = '';
             }
             var next = url.pathname + url.search + url.hash;
             var current = window.location.pathname + window.location.search + window.location.hash;
             if (next === current) return;
-            window.history[mode === 'replace' ? 'replaceState' : 'pushState']({ tab:tabId }, '', next);
+            window.history[mode === 'replace' ? 'replaceState' : 'pushState']({ tab:tabId, autoTradeDate:autoDate }, '', next);
         } catch (e) { console.warn('[route sync]', e); }
     }
     window.updateTradingRouteFilters = function(filters) {
@@ -510,7 +520,8 @@
                 var value = values[key];
                 if (value == null || value === '') url.searchParams.delete(key); else url.searchParams.set(key, String(value));
             });
-            window.history.replaceState({ tab:activeTabId() }, '', url.pathname + url.search + url.hash);
+            var autoDate = Object.prototype.hasOwnProperty.call(values, 'trade_date') ? '' : (window.history.state || {}).autoTradeDate;
+            window.history.replaceState({ tab:activeTabId(), autoTradeDate:autoDate || '' }, '', url.pathname + url.search + url.hash);
         } catch (e) { console.warn('[trading filter route]', e); }
     };
     window.onDecisionDateChange = function() {
@@ -6811,8 +6822,14 @@
             return window.MarketOutlook.load(d || recommendationDateValue() || currentDateValue(), c);
         },
         'market-stage': function (d, c) {
-            var target = tradingModuleDateMode(d) === 'DEFAULT' ? '' : d;
-            return window.MarketStage.load(target, c, function (url) { return fetchRawJsonWithTimeout(url, 30000); });
+            var target = routeDecisionDateFromLocation() || (tradingModuleDateMode(d) === 'DEFAULT' ? '' : d);
+            return window.MarketStage.load(target, c, function (url) {
+                return fetchRawJsonWithTimeout(url, 30000);
+            }, function () {
+                var picker = el('datePicker');
+                if (picker) picker.value = (MARKET_CLOCK || {}).ui_trade_date || localDateString(new Date());
+                window.updateTradingRouteFilters({trade_date:''});
+            });
         },
         hunter: function (d, c) {
             loadHunterPage(recommendationDateValue() || d, c);
