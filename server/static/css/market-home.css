@@ -235,15 +235,10 @@ body.market-home-active .main-content > .content {
     height: .78em;
 }
 
-.market-home .mh-stat-grid,
-.market-home .mh-split {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 7px;
-}
-
 .market-home .mh-stat-grid {
+    display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 7px;
 }
 
 .market-home .mh-stat-grid > * {
@@ -268,6 +263,99 @@ body.market-home-active .main-content > .content {
 .market-home .mh-stat-grid :is(dd, strong):not(:where(.mh-up, .mh-down, .mh-neutral)) {
     color: var(--mh-blue);
 }
+
+.market-home .mh-heat-modes {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 4px;
+    margin: 0 0 7px;
+}
+
+.market-home .mh-heat-modes button {
+    min-width: 0;
+    padding: 5px 3px;
+    border: 1px solid var(--mh-line);
+    border-radius: 5px;
+    background: var(--mh-subtle);
+    color: var(--mh-muted);
+    font: inherit;
+    font-size: .75rem;
+    cursor: pointer;
+}
+
+.market-home .mh-heat-modes button:is(:hover, [aria-pressed="true"]) {
+    border-color: #4e76af;
+    color: var(--mh-ink);
+    background: #223451;
+}
+
+.market-home .mh-heat-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 5.75rem), 1fr));
+    gap: 4px;
+    margin: 0 0 5px;
+    padding: 0;
+    list-style: none;
+}
+
+.market-home .mh-heat-cell {
+    display: grid;
+    align-content: start;
+    grid-template-rows: auto auto minmax(11px, auto) auto;
+    min-width: 0;
+    gap: 2px;
+    padding: 6px;
+    border: 1px solid var(--mh-line);
+    border-radius: 4px;
+    background: var(--mh-subtle);
+    background: color-mix(in srgb, currentColor var(--mh-heat-fill), var(--mh-subtle));
+    line-height: 1.3;
+}
+
+.market-home .mh-heat-name {
+    color: var(--mh-ink);
+    font-weight: 650;
+    overflow-wrap: anywhere;
+}
+
+.market-home .mh-heat-cell strong {
+    color: var(--mh-ink);
+    font-size: .875rem;
+    overflow-wrap: anywhere;
+}
+
+.market-home .mh-heat-source {
+    grid-row: 4;
+    color: #c3cee0;
+    font-size: .625rem;
+    overflow-wrap: anywhere;
+}
+
+.market-home .mh-heat-trend {
+    display: grid;
+    min-width: 0;
+    gap: 1px;
+}
+
+.market-home .mh-heat-trend small {
+    color: #c3cee0;
+    font-size: .625rem;
+    overflow-wrap: anywhere;
+}
+
+.market-home .mh-heat-series {
+    width: 100%;
+    height: 11px;
+}
+
+.market-home .mh-heat-series polyline {
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.5;
+    vector-effect: non-scaling-stroke;
+}
+
+.market-home .mh-heat-note { margin: 3px 0 4px; }
 
 .market-home .mh-breadth-bar {
     display: flex;
@@ -452,8 +540,4 @@ body.market-home-active .main-content > .content {
     .market-home .mh-tape,
     .market-home .mh-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .market-home .mh-grid > :is(.mh-half, .mh-third, .mh-quarter) { grid-column: span 12; }
-}
-
-@media (max-width: 370px) {
-    .market-home .mh-split { grid-template-columns: minmax(0, 1fr); }
 }

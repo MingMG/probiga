@@ -10,6 +10,9 @@
         ['gainers', '涨幅榜', 'change_pct', '%'], ['losers', '跌幅榜', 'change_pct', '%'],
         ['amount', '成交额榜', 'amount', '亿'], ['turnover', '活跃换手', 'turnover_rate', '%']
     ];
+    const heatModes = [
+        ['change', '行情'], ['net_inflow', '资金净流入'], ['five_day_return', '5日涨幅榜']
+    ];
     let active = null;
 
     function escape(value) {
@@ -215,17 +218,52 @@
             empty(exact && notes.count === 0 ? '东财收录样本为 0 只' : '暂无可核验的连续涨停梯队')) + `<p class="mh-meta">${captured}封板率 ${metric(ladder.length ? notes.seal_rate_pct : null, '%', 1)} · ${link('intraday-alert', '查看盘中播报')}</p>`);
     }
 
-    function renderSector(title, values, market) {
-        const sample = rows(values).filter(item => item.name && day(item.trade_date) === market?.trade_date && number(item.change) !== null);
-        const halves = [[true, '上涨'], [false, '下跌']].map(([up, label]) => {
-            const sorted = sample.filter(item => up ? number(item.change) > 0 : number(item.change) < 0)
-                .sort((a, b) => up ? number(b.change) - number(a.change) : number(a.change) - number(b.change)).slice(0, 5);
-            return `<div><div class="mh-section-label ${up ? 'mh-up' : 'mh-down'}">${label}</div>` + (sorted.length ? '<div class="mh-list">' + sorted.map((item, i) =>
-                `<div class="mh-row"><span class="mh-muted">${i + 1}</span><span>${escape(item.name)}<small class="mh-meta">${escape(item.data_source || '来源待核验')}</small></span>${signed(item.change)}</div>`).join('') + '</div>' : empty('当前样本暂无')) + '</div>';
-        });
-        const body = sample.length ? `<div class="mh-split">${halves.join('')}</div>` : empty('暂无同日板块证据');
-        return panel(title, `${observationMeta(market)} · 监控样本`, body +
-            link(title === '概念热度' ? 'concept' : 'sector', '查看板块详情'), 'mh-third');
+    function heatValue(value, mode) {
+        const sign = value > 0 ? '+' : '';
+        if (mode !== 'net_inflow') return sign + metric(value, '%');
+        const magnitude = Math.abs(value);
+        if (magnitude >= 100000000) return sign + metric(value / 100000000, '亿');
+        if (magnitude >= 10000) return sign + metric(value / 10000, '万');
+        return sign + metric(value, '元');
+    }
+
+    function heatSeries(values, label) {
+        const samples = rows(values);
+        if (samples.length < 2 || samples.length > 60) return '';
+        const series = samples.map(number);
+        if (series.some(value => value === null)) return '';
+        const min = Math.min(...series);
+        const span = Math.max(...series) - min;
+        if (!Number.isFinite(span)) return '';
+        const points = series.map((value, i) =>
+            `${(i * 100 / (series.length - 1)).toFixed(2)},${(span ? 19 - 18 * (value - min) / span : 10).toFixed(2)}`
+        ).join(' ');
+        const caption = typeof label === 'string' && label.trim() ? `<small>${escape(label)}</small>` : '';
+        return `<div class="mh-heat-trend">${caption}<svg class="mh-heat-series" viewBox="0 0 100 20" preserveAspectRatio="none" aria-hidden="true" focusable="false"><polyline points="${points}"></polyline></svg></div>`;
+    }
+
+    function renderSector(kind, title, payload, requested, mode) {
+        const label = heatModes.find(([key]) => key === mode)[1];
+        const exact = requested && payload?.requested_date === requested && payload.trade_date === requested;
+        const metricResult = exact ? payload[kind]?.[mode] : null;
+        const sample = metricResult?.status === 'available'
+            ? rows(metricResult.rows).filter(item => typeof item?.name === 'string' && item.name.trim() && number(item.value) !== null).slice(0, 24)
+            : [];
+        const max = Math.max(0, ...sample.map(item => Math.abs(number(item.value))));
+        const controls = `<div class="mh-heat-modes" role="group" aria-label="${title}指标">` + heatModes.map(([key, text]) =>
+            `<button type="button" aria-pressed="${mode === key}" aria-controls="mh-heatmap-${kind}" data-mh-heat-mode="${kind}:${key}">${text}</button>`
+        ).join('') + '</div>';
+        const plot = sample.length ? `<ul class="mh-heat-grid" aria-label="${title}${label}热力图">` + sample.map(item => {
+            const value = number(item.value) || 0;
+            const fill = max && value !== 0 ? Math.round(12 + 26 * (Math.abs(value) / max)) : 0;
+            const source = escape(item.source || '来源待核验');
+            return `<li class="mh-heat-cell ${tone(value)}" style="--mh-heat-fill:${fill}%"><span class="mh-heat-name">${escape(item.name)}</span>` +
+                `<strong>${heatValue(value, mode)}</strong>${heatSeries(item.series, item.series_label)}<small class="mh-heat-source">${source}</small></li>`;
+        }).join('') + '</ul>' : empty(payload === undefined && requested ? '正在加载板块热力图…' : `所选交易日暂无可核验的${label}数据`);
+        const note = metricResult?.note ? `<p class="mh-meta mh-heat-note">${escape(metricResult.note)}</p>` : '';
+        return panel(title, escape(exact ? requested : '证据待核验'), controls +
+            `<div id="mh-heatmap-${kind}">${plot}${note}</div>` +
+            link(kind === 'concept' ? 'concept' : 'sector', '查看板块详情'), 'mh-third');
     }
 
     function renderEvents(snapshot, requested) {
@@ -272,7 +310,7 @@
             empty(noMatches ? (key === 'gainers' ? '当日样本无上涨标的' : '当日样本无下跌标的') : '缺少所选交易日可核验的排名') + link('stock-list', '查看全市场股票'));
     }
 
-    function render(state, requested, clock) {
+    function render(state, requested, clock, modes = {}) {
         const market = marketObservation(state.market, requested);
         const snapshot = snapshotObservation(state.snapshot, requested);
         const labels = {realtime: '盘中快照', close: '收盘观察', paused: '午间快照', stale: '行情已过期'};
@@ -285,7 +323,9 @@
             '<button type="button" class="mh-retry" data-mh-refresh>重载</button></div></header>';
         return markup + renderIndexStrip(requested, market, state.trend, snapshot) + renderMetrics(market, snapshot) +
             '<div class="mh-grid">' + renderBreadth(market, snapshot) + renderEmotion(market) + renderTrend(state.trend, market, snapshot, requested) +
-            renderLadder(snapshot) + renderSector('概念热度', market?.concept_rows, market) + renderSector('行业热度', market?.top_industries, market) +
+            renderLadder(snapshot) +
+            renderSector('concept', '概念热度', state.heatmap, requested, modes.concept || 'change') +
+            renderSector('industry', '行业热度', state.heatmap, requested, modes.industry || 'change') +
             renderEvents(snapshot, requested) + rankings.map(([key, title, field, unit]) => renderRanking(snapshot, key, title, field, unit)).join('') +
             '</div></section>';
     }
@@ -300,22 +340,24 @@
     function load(date, container, options = {}) {
         const requested = day(date) || day(options.clock?.()?.ui_trade_date);
         const retained = active?.container === container && active.requested === requested ? active.state : {};
+        const modes = active?.container === container ? active.modes : {concept: 'change', industry: 'change'};
         stop();
-        const session = {container, requested, state: retained, timer: null, pending: null, click: null};
+        const session = {container, requested, state: retained, modes, timer: null, pending: null, click: null};
         active = session;
         const query = encodeURIComponent(requested);
         const paths = {market: '/api/monitor/data?date=' + query,
             trend: '/api/hot-data/market-trend?date=' + query,
-            snapshot: '/api/monitor/board?date=' + query};
+            snapshot: '/api/monitor/board?date=' + query,
+            heatmap: '/api/monitor/sector-heatmap?date=' + query};
         const current = () => active === session;
 
         function paint() {
             if (!current()) return;
             const focused = document.activeElement;
-            const attributes = ['data-mh-refresh', 'data-mh-stock', 'data-mh-tab'];
+            const attributes = ['data-mh-refresh', 'data-mh-stock', 'data-mh-tab', 'data-mh-heat-mode'];
             const action = container.contains(focused) ? attributes.find(name => focused.hasAttribute(name)) : null;
             const value = action && focused.getAttribute(action);
-            container.innerHTML = render(session.state, requested, options.clock?.());
+            container.innerHTML = render(session.state, requested, options.clock?.(), session.modes);
             if (action) Array.from(container.querySelectorAll(`[${action}]`))
                 .find(button => button.getAttribute(action) === value)?.focus({preventScroll: true});
         }
@@ -362,7 +404,13 @@
             if (!button || !container.contains(button)) return;
             if (button.dataset.mhTab) options.navigate?.(button.dataset.mhTab);
             else if (button.dataset.mhStock) options.stock?.(button.dataset.mhStock);
-            else if (button.hasAttribute('data-mh-refresh') && !session.pending) {
+            else if (button.dataset.mhHeatMode) {
+                const [kind, mode] = button.dataset.mhHeatMode.split(':');
+                if (Object.hasOwn(session.modes, kind) && heatModes.some(([key]) => mode === key)) {
+                    session.modes[kind] = mode;
+                    paint();
+                }
+            } else if (button.hasAttribute('data-mh-refresh') && !session.pending) {
                 options.status?.('正在重载市场看板…');
                 refresh(Object.keys(paths)).then(outcome => {
                     if (current()) options.status?.(outcome.loadError || '市场看板已重载', Boolean(outcome.loadError));

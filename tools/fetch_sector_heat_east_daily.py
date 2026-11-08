@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-同步东方财富行业板块热度到 st_hot_concept_ths_daily。
+同步东方财富行业板块热度，并单独保留带交易日证据的原生行业资金流。
 
 plate_type 说明：
   3 = 东财一级行业（由二级行业按 EAST_INDUSTRY_MAP 聚合）
@@ -13,9 +13,12 @@ import ast
 import hashlib
 import json
 import math
+import re
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, time as datetime_time
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import parse_qsl, urlencode, urlsplit
@@ -26,13 +29,37 @@ if _ROOT_STR not in sys.path:
     sys.path.insert(0, _ROOT_STR)
 
 from tools.env_config import create_tool_engine, resolve_tool_mysql_url
-from server.common.authoritative_market_clock import authoritative_closed_trade_date
+from server.common.authoritative_market_clock import (
+    PRODUCTION_TIMEZONE,
+    authoritative_closed_trade_date,
+)
 
 CACHE_FILE = ROOT / "runtime" / "cache" / "east_sector_heat_cache.json"
 FORMAL_RESULT_SCHEMA = "probiga.sector-heat-east-result.v1"
 FORMAL_SOURCE = "eastmoney.push2.industry"
 SECTOR_HEAT_CLOSE_READY_TIME = datetime_time(15, 10)
+INDUSTRY_FLOW_SCHEMA = "probiga.eastmoney-industry-flow-result.v1"
+_INDUSTRY_FLOW_FIELDS = {
+    "main_net_inflow": "f62",
+    "max_net_inflow": "f66",
+    "lg_net_inflow": "f72",
+    "mid_net_inflow": "f78",
+    "sm_net_inflow": "f84",
+}
+_INDUSTRY_PAGE_SIZE = 100
+_INDUSTRY_MAX_PAGES = 20
+_INDUSTRY_CAPTURE_DEADLINE_SECONDS = 90
+_NATIVE_CODE = re.compile(r"BK[0-9]{4}")
+_YUAN_PRECISION = Decimal("0.01")
 
+
+@dataclass(frozen=True)
+class IndustryCapture:
+    heat_rows: list[dict]
+    provider_rows: list[dict]
+    provider_count: int | None
+    page_count: int
+    pagination_complete: bool
 
 
 class SectorHeatContractError(RuntimeError):
@@ -398,33 +425,62 @@ def _match_primary(name: str, mapping: dict[str, list[str]]) -> str:
     return name
 
 
-def _fetch_eastmoney_industries() -> list[dict]:
-    rows: list[dict] = []
-    seen_codes: set[str] = set()
-    page = 1
-    page_size = 100
+def _shanghai_now(now: datetime | None = None) -> datetime:
+    current = now or datetime.now(PRODUCTION_TIMEZONE)
+    if current.tzinfo is not None:
+        current = current.astimezone(PRODUCTION_TIMEZONE)
+    return current.replace(tzinfo=None, microsecond=0)
 
-    while page <= 20:
+
+def _source_timestamp(value: Any) -> datetime | None:
+    try:
+        if type(value) is not int and (not isinstance(value, str) or not value.isdecimal()):
+            return None
+        epoch = int(value)
+        if epoch > 0:
+            return datetime.fromtimestamp(epoch, tz=PRODUCTION_TIMEZONE).replace(tzinfo=None)
+    except (TypeError, ValueError, OSError, OverflowError):
+        pass
+    return None
+
+
+def _fetch_eastmoney_industries() -> IndustryCapture:
+    rows: list[dict] = []
+    provider_rows: list[dict] = []
+    page_counts: list[int] = []
+    declared_counts: list[int | None] = []
+    successful = True
+    seen_codes: set[str] = set()
+    deadline = time.monotonic() + _INDUSTRY_CAPTURE_DEADLINE_SECONDS
+    for page in range(1, _INDUSTRY_MAX_PAGES + 1):
+        remaining = deadline - time.monotonic()
+        if remaining < 1:
+            raise SectorHeatContractError("industry_source: bulk capture deadline exceeded")
         params = {
             "pn": page,
-            "pz": page_size,
+            "pz": _INDUSTRY_PAGE_SIZE,
             "po": "1",
             "np": "1",
             "fltt": "2",
             "invt": "2",
             "fid": "f6",
             "fs": "m:90+t:2",
-            "fields": "f12,f14,f3,f6,f62,f124",
+            "fields": "f12,f14,f3,f6,f124," + ",".join(_INDUSTRY_FLOW_FIELDS.values()),
             "ut": "bd1d9ddb04089700cf9c27f6f7426281",
         }
         url = EASTMONEY_CLIST_URL + "?" + urlencode(params)
-        payload = _fetch_json(url)
-        data = (payload.get("data") or {})
+        payload = _fetch_json(url, timeout=min(20, int(remaining)))
+        data = payload.get("data") or {}
         diff = data.get("diff") or []
-        if not diff:
-            break
-
+        if isinstance(diff, dict):
+            diff = list(diff.values())
+        successful = successful and payload.get("rc") == 0 and all(isinstance(item, dict) for item in diff)
+        declared_counts.append(data.get("total"))
+        page_counts.append(len(diff))
         for item in diff:
+            if not isinstance(item, dict):
+                continue
+            provider_rows.append(item)
             code = str(item.get("f12") or "").strip()
             name = str(item.get("f14") or "").strip()
             if not code or not name or code in seen_codes:
@@ -433,33 +489,33 @@ def _fetch_eastmoney_industries() -> list[dict]:
             if amount is None or amount <= 0:
                 continue
             seen_codes.add(code)
-            trade_date_hint = ""
-            ts = _to_float(item.get("f124"))
-            if ts and ts > 0:
-                try:
-                    trade_date_hint = datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d")
-                except (OSError, OverflowError, ValueError):
-                    trade_date_hint = ""
-            rows.append(
-                {
-                    "rank": len(rows) + 1,
-                    "concept_code": code[:32],
-                    "concept_name": name[:64],
-                    "change_pct": _to_float(item.get("f3")),
-                    "hot_value": float(amount),
-                    "hot_tag": "东财成交额",
-                    "_trade_date_hint": trade_date_hint,
-                }
-            )
-
-        if len(diff) < page_size:
+            stamp = _source_timestamp(item.get("f124"))
+            rows.append({
+                "rank": len(rows) + 1,
+                "concept_code": code[:32],
+                "concept_name": name[:64],
+                "change_pct": _to_float(item.get("f3")),
+                "hot_value": float(amount),
+                "hot_tag": "东财成交额",
+                "_trade_date_hint": stamp.date().isoformat() if stamp else "",
+            })
+        if len(diff) < _INDUSTRY_PAGE_SIZE or data.get("total") == len(provider_rows):
             break
-        page += 1
 
+    total = declared_counts[0]
+    complete = (
+        successful and type(total) is int and total > 0
+        and all(value == total for value in declared_counts)
+        and total == len(provider_rows)
+        and page_counts == [
+            min(_INDUSTRY_PAGE_SIZE, total - offset)
+            for offset in range(0, total, _INDUSTRY_PAGE_SIZE)
+        ]
+    )
     rows.sort(key=lambda r: float(r.get("hot_value") or 0), reverse=True)
     for idx, row in enumerate(rows, start=1):
         row["rank"] = idx
-    return rows
+    return IndustryCapture(rows, provider_rows, total if type(total) is int else None, len(page_counts), complete)
 
 
 def _fetch_industry_kline(code: str, end_date: str, limit: int = 120) -> list[dict]:
@@ -519,14 +575,14 @@ def _apply_historical_values(rows_l2: list[dict], snapshot_date: str) -> list[di
             klines = []
         matched = None
         for kline in reversed(klines):
-            if kline.get("trade_date") and kline["trade_date"] <= snapshot_date:
+            if kline.get("trade_date") == snapshot_date:
                 matched = kline
                 break
-        if not matched:
+        if not matched or matched.get("change_pct") is None or matched.get("amount") is None:
             continue
         item = dict(row)
-        item["change_pct"] = matched.get("change_pct")
-        item["hot_value"] = float(matched.get("amount") or matched.get("volume") or row.get("hot_value") or 0)
+        item["change_pct"] = matched["change_pct"]
+        item["hot_value"] = float(matched["amount"])
         updated.append(item)
 
     if failures:
@@ -736,6 +792,100 @@ def resolve_formal_sector_target_date(engine: Any, *, now: datetime | None = Non
     return target
 
 
+def _yuan(value: Any) -> Decimal:
+    try:
+        amount = Decimal(str(value))
+        if amount.is_finite() and abs(amount) < Decimal("1e22"):
+            fixed = amount.quantize(_YUAN_PRECISION)
+            if fixed == amount:
+                return fixed if fixed else Decimal("0.00")
+    except (InvalidOperation, ValueError):
+        pass
+    raise SectorHeatContractError("industry_flow: invalid signed yuan value")
+
+
+def _industry_flow_rows(
+    capture: IndustryCapture, target: str, captured_at: datetime,
+) -> tuple[list[dict], str | None]:
+    if (not capture.pagination_complete or not capture.provider_rows
+            or capture.provider_count != len(capture.provider_rows)):
+        return [], "NATIVE_PAGINATION_INCOMPLETE"
+    rows = []
+    codes = set()
+    for item in capture.provider_rows:
+        code = str(item.get("f12") or "").strip()
+        name = str(item.get("f14") or "").strip()
+        if not _NATIVE_CODE.fullmatch(code) or code in codes or not name or len(name) > 128:
+            return [], "NATIVE_INDUSTRY_IDENTITY_INVALID"
+        stamp = _source_timestamp(item.get("f124"))
+        if stamp is None or stamp.date().isoformat() != target:
+            return [], "NATIVE_EXACT_DATE_UNAVAILABLE"
+        if stamp.time() < SECTOR_HEAT_CLOSE_READY_TIME or stamp > captured_at:
+            return [], "NATIVE_CLOSE_TIME_UNPROVEN"
+        try:
+            amounts = {name: _yuan(item.get(field)) for name, field in _INDUSTRY_FLOW_FIELDS.items()}
+        except SectorHeatContractError:
+            return [], "NATIVE_FLOW_VALUE_INVALID"
+        if amounts["main_net_inflow"] != amounts["max_net_inflow"] + amounts["lg_net_inflow"]:
+            return [], "NATIVE_MAIN_FLOW_LEGS_DIFFER"
+        rows.append({
+            "trade_date": target,
+            "index_code": code,
+            "index_name": name,
+            "source_snapshot_at": stamp,
+            "etl_sync_at": captured_at,
+            **{name: str(value) for name, value in amounts.items()},
+        })
+        codes.add(code)
+    return rows, None
+
+
+def _industry_flow_result(
+    capture: IndustryCapture, target: str, captured_at: datetime, *,
+    engine: Any | None = None, dry_run: bool = False,
+) -> dict[str, Any]:
+    payload = {
+        "schema": INDUSTRY_FLOW_SCHEMA,
+        "source": FORMAL_SOURCE,
+        "trade_date": target,
+        "provider_row_count": capture.provider_count,
+        "page_count": capture.page_count,
+        "published": False,
+        "database_writes": False,
+    }
+    rows, reason = _industry_flow_rows(capture, target, captured_at)
+    if reason:
+        return _with_receipt_id({**payload, "status": "UNAVAILABLE", "reason_code": reason})
+    source_times = [row["source_snapshot_at"].isoformat() for row in rows]
+    evidence = {
+        "row_count": len(rows),
+        "code_count": len(rows),
+        "code_set_sha256": _canonical_hash(sorted(row["index_code"] for row in rows)),
+        "first_source_snapshot_at": min(source_times),
+        "last_source_snapshot_at": max(source_times),
+    }
+    if dry_run:
+        return _with_receipt_id({**payload, "status": "VALIDATED", **evidence})
+    try:
+        if resolve_formal_sector_target_date(engine, now=captured_at) != target:
+            return _with_receipt_id({**payload, "status": "UNAVAILABLE", "reason_code": "NOT_LATEST_CLOSED_SESSION"})
+        from server.common.sector_heatmap_store import publish_industry_flow
+
+        persisted = publish_industry_flow(target, rows)
+        writes = persisted.get("database_writes")
+        if (any(persisted.get(name) != evidence[name] for name in ("row_count", "code_count", "code_set_sha256"))
+                or not re.fullmatch(r"[a-f0-9]{64}", str(persisted.get("row_sha256") or ""))
+                or type(writes) not in (int, bool) or writes not in (0, 1)):
+            raise SectorHeatContractError("industry_flow: persisted partition proof differs from native scope")
+    except Exception as exc:
+        return _with_receipt_id({**payload, "status": "FAILED", "reason_code": "INDUSTRY_FLOW_PUBLICATION_FAILED",
+                                 "error_type": type(exc).__name__})
+    return _with_receipt_id({
+        **payload, **evidence, "status": "PASS", "published": True,
+        "row_sha256": persisted["row_sha256"], "database_writes": bool(writes),
+    })
+
+
 def _formal_sector_receipt(
     *,
     status: str,
@@ -746,6 +896,7 @@ def _formal_sector_receipt(
     published: bool,
     evidence: Mapping[str, Any] | None = None,
     error: BaseException | None = None,
+    industry_flow: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "schema": FORMAL_RESULT_SCHEMA,
@@ -758,6 +909,8 @@ def _formal_sector_receipt(
         "finished_at": finished_at.isoformat(timespec="seconds"),
         "evidence": dict(evidence or {}),
     }
+    if industry_flow is not None:
+        payload["industry_flow"] = dict(industry_flow)
     if error is not None:
         payload["error_type"] = type(error).__name__
         payload["error"] = str(error)[:1000]
@@ -777,7 +930,7 @@ def fetch_sector_heat_east_daily(
     engine: Any | None = None,
     now: datetime | None = None,
 ) -> dict:
-    started_at = (now or datetime.now()).replace(microsecond=0)
+    started_at = _shanghai_now(now)
     requested_date = snapshot_date
     raw_count = 0
     if diagnostic_cache and (formal or not dry_run):
@@ -795,7 +948,8 @@ def fetch_sector_heat_east_daily(
 
     _progress(f"开始同步东财板块热度，请求日期: {requested_date}", formal=formal)
     try:
-        raw_rows = _fetch_eastmoney_industries()
+        capture = _fetch_eastmoney_industries()
+        raw_rows = capture.heat_rows
         raw_count = len(raw_rows)
         if not raw_rows:
             raise RuntimeError("未获取到东财行业板块数据")
@@ -813,9 +967,11 @@ def fetch_sector_heat_east_daily(
             if len(historical_rows) < min_required:
                 raise RuntimeError(f"历史日期 {snapshot_date} 仅补到 {len(historical_rows)} 条，低于最低要求 {min_required}")
             raw_rows = historical_rows
+        elif formal:
+            raw_rows = [row for row in raw_rows if row.get("_trade_date_hint") == snapshot_date]
 
         rows_l1, rows_l2 = _build_fixed_industry_rows(raw_rows)
-        captured_at = (now or datetime.now()).replace(microsecond=0)
+        captured_at = _shanghai_now(now)
         db_rows = []
         for plate_type, rows in ((3, rows_l1), (4, rows_l2)):
             for row in rows:
@@ -852,7 +1008,7 @@ def fetch_sector_heat_east_daily(
             requested_date=requested_date,
             data_date=snapshot_date,
             started_at=started_at,
-            finished_at=(now or datetime.now()).replace(microsecond=0),
+            finished_at=_shanghai_now(now),
             published=False,
             evidence=evidence,
             error=exc,
@@ -890,9 +1046,10 @@ def fetch_sector_heat_east_daily(
                 requested_date=requested_date,
                 data_date=snapshot_date,
                 started_at=started_at,
-                finished_at=(now or datetime.now()).replace(microsecond=0),
+                finished_at=_shanghai_now(now),
                 published=False,
                 evidence=evidence,
+                industry_flow=_industry_flow_result(capture, snapshot_date, captured_at, dry_run=True),
             )
         print(f"RAW={raw_count}")
         print(f"DATE={snapshot_date}")
@@ -934,14 +1091,16 @@ def fetch_sector_heat_east_daily(
     if formal:
         if persisted_evidence is None:  # pragma: no cover - defensive contract guard
             raise SectorHeatContractError("formal sector readback evidence is missing")
+        industry_flow = _industry_flow_result(capture, snapshot_date, captured_at, engine=engine)
         return _formal_sector_receipt(
             status="PASS",
             requested_date=requested_date,
             data_date=snapshot_date,
             started_at=started_at,
-            finished_at=(now or datetime.now()).replace(microsecond=0),
+            finished_at=_shanghai_now(now),
             published=True,
             evidence=persisted_evidence,
+            industry_flow=industry_flow,
         )
 
     print(f"写入完成: 快照日期 {snapshot_date}, 东财一级行业 {len(rows_l1)} 条, 东财二级行业 {len(rows_l2)} 条")
@@ -964,7 +1123,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", help="输出唯一机器结果 JSON")
     args = parser.parse_args(argv)
 
-    started_at = datetime.now().replace(microsecond=0)
+    started_at = _shanghai_now()
     engine = None
     requested_date = str(args.date or "").strip()
     try:
@@ -979,7 +1138,6 @@ def main(argv: list[str] | None = None) -> int:
             formal=args.formal,
             diagnostic_cache=args.diagnostic_cache,
             engine=engine,
-            now=started_at,
         )
     except Exception as exc:
         result = _formal_sector_receipt(
@@ -987,7 +1145,7 @@ def main(argv: list[str] | None = None) -> int:
             requested_date=requested_date,
             data_date="",
             started_at=started_at,
-            finished_at=datetime.now().replace(microsecond=0),
+            finished_at=_shanghai_now(),
             published=False,
             error=exc,
         )
