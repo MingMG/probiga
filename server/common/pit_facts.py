@@ -1684,22 +1684,36 @@ def _write_source_coverage_chunk(
         raise ValueError("coverage batch requires distinct scopes")
     latest: dict[str, dict[str, Any]] = {}
     mysql = connection.dialect.name == "mysql"
-    # Lock exact indexed scope prefixes, including missing scopes under
-    # InnoDB's default transaction isolation, as with finance revisions.
-    index = " FORCE INDEX (uk_pit_coverage_scope_revision)" if mysql else ""
     lock = " FOR UPDATE" if mysql else ""
     columns = ", ".join(_SOURCE_COVERAGE_RECEIPT_COLUMNS)
     single = len(prepared) == 1
     latest_columns = f"{columns}, payload_json" if single else columns
-    limit = " LIMIT 1" if single else ""
-    latest_query = text(
-        f"SELECT {latest_columns} FROM {SOURCE_COVERAGE_TABLE}{index} "
-        "WHERE scope_hash IN :scopes ORDER BY scope_hash, revision_no DESC"
-        f"{limit}{lock}"
-    ).bindparams(bindparam("scopes", expanding=True))
+    scopes = sorted(by_scope)
+    if mysql and not single:
+        # Lock each scope's newest revision (or the missing prefix) without
+        # scanning old revisions or sorting a mixed-direction index range.
+        # Both ORDER BY columns must use the backward index scan.
+        latest_query = text(
+            f"SELECT latest.* FROM JSON_TABLE(:scope_json, '$[*]' "
+            "COLUMNS (scope_hash CHAR(64) PATH '$')) AS requested "
+            f"JOIN LATERAL (SELECT {latest_columns} FROM {SOURCE_COVERAGE_TABLE} "
+            "FORCE INDEX (uk_pit_coverage_scope_revision) "
+            "WHERE scope_hash = requested.scope_hash COLLATE utf8mb4_bin "
+            "ORDER BY scope_hash DESC, revision_no DESC LIMIT 1 FOR UPDATE"
+            ") AS latest ON TRUE"
+        )
+        latest_parameters = {"scope_json": json.dumps(scopes)}
+    else:
+        index = " FORCE INDEX (uk_pit_coverage_scope_revision)" if mysql else ""
+        limit = " LIMIT 1" if single else ""
+        latest_query = text(
+            f"SELECT {latest_columns} FROM {SOURCE_COVERAGE_TABLE}{index} "
+            "WHERE scope_hash IN :scopes ORDER BY scope_hash, revision_no DESC"
+            f"{limit}{lock}"
+        ).bindparams(bindparam("scopes", expanding=True))
+        latest_parameters = {"scopes": scopes}
     with connection.execute(
-        latest_query.execution_options(stream_results=True),
-        {"scopes": sorted(by_scope)},
+        latest_query.execution_options(stream_results=True), latest_parameters,
     ) as result:
         for row in result.mappings():
             latest.setdefault(str(row["scope_hash"]), dict(row))

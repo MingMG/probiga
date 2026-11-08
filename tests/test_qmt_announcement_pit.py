@@ -2617,6 +2617,133 @@ def test_atomic_publish_never_reports_false_no_write_after_commit():
     assert publish_checked_at == received
 
 
+@pytest.mark.parametrize("failure_phase", ["coverage_write", "commit", None])
+def test_publisher_cleanup_preserves_write_failure_and_commit_outcome(
+    monkeypatch, failure_phase,
+):
+    from sqlalchemy.exc import OperationalError
+
+    from server.common import pit_facts, qmt_announcement_pit as announcement
+
+    engine = _engine()
+    catalog = _catalog(("000001", "000001.SZ"))
+    results = {"000001": []}
+    cutoff = datetime(2026, 11, 6, 18, 20)
+    received = cutoff + timedelta(minutes=1)
+    start, end = date(2026, 10, 7), cutoff.date()
+    batch_id = "qmt-ann-publish-failure"
+    root, entries = announcement.build_batch_root(
+        batch_id=batch_id, fact_cutoff_at=cutoff, received_at=received,
+        window_start=start, window_end=end, catalog=catalog, results=results,
+    )
+
+    cleanup_calls = []
+    append_coverages = pit_facts.append_source_coverages
+    append_events = pit_facts.append_event_revisions
+
+    def db_error(errno):
+        return OperationalError("untrusted statement", {}, Exception(errno, "private details"))
+
+    def append_coverage_then_maybe_fail(connection, arguments):
+        receipts = append_coverages(connection.native, arguments)
+        if failure_phase == "coverage_write":
+            raise db_error(1213)
+        return receipts
+
+    class CommitAcknowledgementLost:
+        def __init__(self, transaction):
+            self.transaction = transaction
+
+        def __getattr__(self, name):
+            return getattr(self.transaction, name)
+
+        def __enter__(self):
+            self.transaction.__enter__()
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            if exc_type is not None:
+                return self.transaction.__exit__(exc_type, exc, traceback)
+            self.commit()
+
+        def commit(self):
+            self.transaction.commit()
+            raise db_error(2013)
+
+    class MysqlSession:
+        dialect = SimpleNamespace(name="mysql")
+
+        def __init__(self, native):
+            self.native = native
+            self.invalidated = False
+
+        def __getattr__(self, name):
+            return getattr(self.native, name)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return self.native.__exit__(*exc)
+
+        def begin(self):
+            transaction = self.native.begin()
+            if failure_phase == "commit":
+                return CommitAcknowledgementLost(transaction)
+            return transaction
+
+        def execute(self, statement):
+            if "GET_LOCK" in str(statement):
+                return self.native.execute(text("SELECT 1"))
+            assert "RELEASE_LOCK" in str(statement)
+            cleanup_calls.append("release")
+            raise db_error(2006)
+
+        def invalidate(self):
+            self.invalidated = True
+            cleanup_calls.append("invalidate")
+
+    monkeypatch.setattr(announcement, "_assert_pit_fact_schema_prepared", lambda _engine: None)
+    monkeypatch.setattr(pit_facts, "append_source_coverages", append_coverage_then_maybe_fail)
+    monkeypatch.setattr(
+        pit_facts, "append_event_revisions",
+        lambda connection, *args, **kwargs: append_events(connection.native, *args, **kwargs),
+    )
+    publication_engine = SimpleNamespace(connect=lambda: MysqlSession(engine.connect()))
+    arguments = dict(
+        batch_id=batch_id, batch_root_hash=root, entries=entries,
+        fact_cutoff_at=cutoff, received_at=received, window_start=start, window_end=end,
+        catalog=catalog, results=results, now_fn=lambda: received,
+    )
+
+    if failure_phase is None:
+        coverage_ids, _ = announcement._publish_batch(publication_engine, **arguments)
+        assert len(coverage_ids) == 1
+    else:
+        with pytest.raises(QMTAnnouncementBlocked) as caught:
+            announcement._publish_batch(publication_engine, **arguments)
+        detail = caught.value.detail
+        assert f"db_phase={failure_phase}" in detail
+        if failure_phase == "coverage_write":
+            assert caught.value.reason_code == "QMT_ANNOUNCEMENT_PUBLISH_DATABASE_ERROR"
+            assert "mysql_errno=1213" in detail
+            assert "commit_state=not_committed" in detail
+        else:
+            assert caught.value.reason_code == "QMT_ANNOUNCEMENT_PUBLISH_COMMIT_UNKNOWN"
+            assert "mysql_errno=2013" in detail
+            assert "commit_state=unknown" in detail
+        assert "private details" not in detail
+        assert "untrusted statement" not in detail
+
+    assert cleanup_calls == ["release", "invalidate"]
+    with engine.connect() as connection:
+        coverage_count = connection.execute(
+            text(f"SELECT COUNT(*) FROM {SOURCE_COVERAGE_TABLE} WHERE batch_id=:batch"),
+            {"batch": batch_id},
+        ).scalar_one()
+    assert coverage_count == (0 if failure_phase == "coverage_write" else 1)
+
+
 @pytest.mark.parametrize("publish_delay_seconds", [2, 1501])
 def test_live_capture_receipt_stays_valid_when_database_publication_takes_time(
     monkeypatch, tmp_path, publish_delay_seconds,

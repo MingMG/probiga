@@ -19,6 +19,7 @@ from decimal import Decimal
 import hashlib
 from itertools import islice
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -30,11 +31,13 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
 
 from integrations.qmt.runtime import connect_xtdata
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+logger = logging.getLogger(__name__)
 QMT_ANNOUNCEMENT_SOURCE = "qmt.announcement"
 CNINFO_ANNOUNCEMENT_SOURCE = "cninfo.announcement"
 EASTMONEY_ANNOUNCEMENT_SOURCE = "eastmoney.notice"
@@ -104,6 +107,7 @@ HISTORICAL_RECONSTRUCTION_BUDGET = timedelta(hours=2)
 HISTORICAL_RECONSTRUCTION_PUBLISH_RESERVE = timedelta(minutes=15)
 HISTORICAL_CAPTURE_DEADLINE = "QMT_ANNOUNCEMENT_RECONSTRUCTION_CAPTURE_DEADLINE"
 HISTORICAL_PUBLISH_DEADLINE = "QMT_ANNOUNCEMENT_RECONSTRUCTION_PUBLISH_DEADLINE"
+PUBLISH_COMMIT_UNKNOWN = "QMT_ANNOUNCEMENT_PUBLISH_COMMIT_UNKNOWN"
 VALIDATION_READ_BATCH_SIZE = 500
 _CODE_RE = re.compile(r"^(?:0|3|4|6|8|9)\d{5}$")
 _QMT_CODE_RE = re.compile(r"^(?:0|3|4|6|8|9)\d{5}\.(?:SH|SZ|BJ)$")
@@ -3252,6 +3256,67 @@ def assert_announcement_pit_schema_prepared(engine: Engine) -> None:
     _assert_pit_fact_schema_prepared(engine)
 
 
+def _publish_error_detail(
+    phase: str, exc: Exception, *, connection: Any = None, commit_state: str,
+) -> str:
+    original = getattr(exc, "orig", None)
+    errno = getattr(original, "errno", None)
+    if type(errno) is not int:
+        args = getattr(original, "args", ())
+        errno = args[0] if args else None
+    errno = errno if type(errno) is int and 0 < errno <= 65535 else "unknown"
+    invalidated = bool(
+        getattr(exc, "connection_invalidated", False)
+        or getattr(connection, "invalidated", False)
+    )
+    return (
+        f"db_phase={phase};error_type={type(exc).__name__};mysql_errno={errno};"
+        f"connection_invalidated={str(invalidated).lower()};commit_state={commit_state}"
+    )
+
+
+def _finish_publish_connection(
+    connection: Any, *, lock_acquired: bool, lock_uncertain: bool, commit_state: str,
+) -> None:
+    phase = "rollback"
+    try:
+        if connection.invalidated:
+            return
+        if lock_uncertain:
+            phase = "invalidate_uncertain_lock"
+            connection.invalidate()
+            return
+        if connection.in_transaction():
+            connection.rollback()
+        if lock_acquired and not connection.invalidated:
+            phase = "release_lock"
+            released = connection.execute(
+                text("SELECT RELEASE_LOCK('probiga:qmt-announcement-pit')")
+            ).scalar_one()
+            if released != 1:
+                raise RuntimeError("publisher lock release was not confirmed")
+            phase = "release_lock_transaction_end"
+            connection.commit()
+    except Exception as exc:
+        logger.warning("Announcement publisher cleanup: %s", _publish_error_detail(
+            phase, exc, connection=connection, commit_state=commit_state,
+        ))
+        try:
+            # Never return a physical session that may still own the lock.
+            connection.invalidate()
+        except Exception as invalidate_exc:
+            logger.warning("Announcement publisher cleanup: %s", _publish_error_detail(
+                "invalidate", invalidate_exc, connection=connection, commit_state=commit_state,
+            ))
+    finally:
+        try:
+            connection.close()
+        except Exception as close_exc:
+            logger.warning("Announcement publisher cleanup: %s", _publish_error_detail(
+                "close", close_exc, connection=connection, commit_state=commit_state,
+            ))
+
+
 def _publish_batch(
     engine: Engine,
     *,
@@ -3280,7 +3345,13 @@ def _publish_batch(
 
     # Keep the transactional boundary guarded as a defence-in-depth recheck;
     # synchronize_qmt_announcements performs the same check before network I/O.
-    _assert_pit_fact_schema_prepared(engine)
+    try:
+        _assert_pit_fact_schema_prepared(engine)
+    except SQLAlchemyError as exc:
+        raise QMTAnnouncementBlocked(
+            "QMT_ANNOUNCEMENT_PUBLISH_DATABASE_ERROR",
+            _publish_error_detail("schema_preflight", exc, commit_state="not_committed"),
+        ) from None
     response_hashes = {
         str(item["stock_code"]): str(item["source_response_hash"])
         for item in entries
@@ -3470,13 +3541,16 @@ def _publish_batch(
                 yield item
 
     def bindings_by_stock(connection: Any) -> Iterator[tuple[str, list[dict[str, str]]]]:
+        nonlocal db_phase
         for offset in range(0, len(catalog.codes), DEFAULT_BATCH_SIZE):
             codes = catalog.codes[offset:offset + DEFAULT_BATCH_SIZE]
+            db_phase = "event_revision_write"
             event_receipts = iter(append_event_revisions(
                 connection, checked_events(codes, offset),
                 known_at=received_at, received_at=received_at,
                 source=source_name, batch_id=batch_id,
             ))
+            db_phase = "coverage_write"
             for code in codes:
                 yield code, [
                     {
@@ -3549,41 +3623,56 @@ def _publish_batch(
             coverage_ids.append(coverage.coverage_id)
 
     check_deadline("db-publish-start")
-    publish_checked_at = received_at
-    with engine.connect() as connection:
-        lock_acquired = False
+    db_phase = "connect"
+    commit_state = "not_committed"
+    connection = None
+    lock_acquired = False
+    lock_uncertain = False
+    try:
+        connection = engine.connect()
         if connection.dialect.name == "mysql":
+            db_phase = "acquire_lock"
+            lock_uncertain = True
             acquired = connection.execute(
                 text("SELECT GET_LOCK('probiga:qmt-announcement-pit', 0)")
             ).scalar_one()
-            if int(acquired or 0) != 1:
+            lock_acquired = int(acquired or 0) == 1
+            lock_uncertain = False
+            if not lock_acquired:
                 raise QMTAnnouncementBlocked(
                     "QMT_ANNOUNCEMENT_PUBLISHER_ALREADY_RUNNING"
                 )
-            lock_acquired = True
             # GET_LOCK is connection-scoped, not transactional.  End the
             # implicit SELECT transaction before starting the atomic DML unit.
+            db_phase = "lock_transaction_end"
             connection.commit()
-        try:
-            with connection.begin():
-                write_rows(connection)
-                # This check is still inside the transaction: exceeding the
-                # total SLA rolls every PIT row back before commit.
-                publish_checked_at = check_deadline("db-precommit")
-        finally:
-            if lock_acquired:
-                try:
-                    if connection.in_transaction():
-                        connection.rollback()
-                    connection.execute(
-                        text("SELECT RELEASE_LOCK('probiga:qmt-announcement-pit')")
-                    )
-                    connection.commit()
-                except Exception:
-                    # Never return a pooled session that may still own the
-                    # publisher lock.
-                    connection.invalidate()
-                    raise
+        db_phase = "transaction_begin"
+        transaction = connection.begin()
+        db_phase = "coverage_write"
+        write_rows(connection)
+        # This check is still inside the transaction: exceeding the total SLA
+        # rolls every PIT row back before commit.
+        publish_checked_at = check_deadline("db-precommit")
+        db_phase = "commit"
+        commit_state = "unknown"
+        transaction.commit()
+        commit_state = "committed"
+    except Exception as exc:
+        if not isinstance(exc, SQLAlchemyError) and commit_state != "unknown":
+            raise
+        if getattr(exc, "connection_invalidated", False):
+            lock_uncertain = True
+        raise QMTAnnouncementBlocked(
+            PUBLISH_COMMIT_UNKNOWN if commit_state == "unknown"
+            else "QMT_ANNOUNCEMENT_PUBLISH_DATABASE_ERROR",
+            _publish_error_detail(db_phase, exc, connection=connection, commit_state=commit_state),
+        ) from None
+    finally:
+        if connection is not None:
+            _finish_publish_connection(
+                connection, lock_acquired=lock_acquired, lock_uncertain=lock_uncertain,
+                commit_state=commit_state,
+            )
     # Never raise a deadline error after the atomic commit: doing so would
     # falsely report ``database_writes=false`` and invite a duplicate rebuild.
     # The final authoritative deadline check happened inside the transaction,
@@ -4027,13 +4116,17 @@ def synchronize_qmt_announcements(
             "real_order_authority": False,
         }
     except QMTAnnouncementBlocked as exc:
-        checkpoint.diagnose(exc.reason_code, exc.detail)
+        try:
+            checkpoint.diagnose(exc.reason_code, exc.detail)
+        except OSError as diagnostic_exc:
+            logger.warning("Announcement checkpoint diagnostic unavailable: %s", type(diagnostic_exc).__name__)
         received = _dt(now_fn())
         return {
             "schema": QMT_ANNOUNCEMENT_TASK_SCHEMA,
             "status": "DATA_BLOCKED",
             "reason_code": exc.reason_code,
             "detail": exc.detail,
+            **({"database_writes": None} if exc.reason_code == PUBLISH_COMMIT_UNKNOWN else {}),
             "source": source_name,
             "primary_source": QMT_ANNOUNCEMENT_SOURCE,
             "fallback_reason": fallback_code,
