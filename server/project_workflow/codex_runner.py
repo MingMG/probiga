@@ -309,6 +309,14 @@ def _new_turn(client, operation, context, config, worktree, session, git, path, 
     return turn if turn["status"] != "inProgress" else client.await_turn(thread_id, turn["id"])
 
 
+def _turn_items(client, thread_id, turn_id, *, direction, limit):
+    response = client.request("thread/items/list", {"threadId": thread_id, "turnId": turn_id,
+                                                   "sortDirection": direction, "limit": limit})
+    for entry in response["data"]:
+        if entry["turnId"] == turn_id:
+            yield entry["item"]
+
+
 def _read_turn(client, journal):
     thread_id = journal["thread_id"]
     turns = client.request("thread/turns/list", {"threadId": thread_id, "limit": 12, "itemsView": "notLoaded"})["data"]
@@ -318,8 +326,7 @@ def _read_turn(client, journal):
             if turn["id"] == turn_id:
                 return turn
         else:
-            items = client.request("thread/items/list", {"threadId": thread_id, "turnId": turn["id"], "limit": 3})["data"]
-            for item in items:
+            for item in _turn_items(client, thread_id, turn["id"], direction="asc", limit=3):
                 if item.get("type") == "userMessage" and any(
                     part.get("text", "").partition("\n")[0] == journal["marker"] for part in item.get("content", [])
                 ):
@@ -331,9 +338,7 @@ _DIAGNOSIS_FIELDS = ("root_cause_hypothesis", "evidence", "recommended_action", 
 
 
 def _diagnosis(client, evidence):
-    response = client.request("thread/items/list", {"threadId": evidence["thread_id"], "turnId": evidence["turn_id"],
-                                                   "sortDirection": "desc", "limit": 6})
-    for item in response["data"]:
+    for item in _turn_items(client, evidence["thread_id"], evidence["turn_id"], direction="desc", limit=6):
         if item.get("type") == "agentMessage":
             try:
                 report = json.loads(item["text"])
