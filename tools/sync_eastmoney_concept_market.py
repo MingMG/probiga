@@ -1104,6 +1104,29 @@ def _publication_engine(primary_engine, datasets: Sequence[str], *, history_engi
     return primary_engine
 
 
+def _publish_current_concept_names(
+    snapshot: DirectorySnapshot, target_date: str, observed_at: datetime,
+) -> dict[str, Any]:
+    from server.common.sector_heatmap_store import publish_concept_names
+
+    rows = []
+    for code, item in zip(snapshot.codes, snapshot.items, strict=True):
+        name = item.get("f14")
+        if str(item.get("f12") or "").strip().upper() != code or not isinstance(name, str) or not name.strip():
+            raise DataBlocked("Eastmoney concept directory name or code is unavailable")
+        rows.append({
+            "index_code": code,
+            "index_name": name,
+            "source_snapshot_at": _eastmoney_source_time(item.get("f124")),
+            "etl_sync_at": observed_at,
+        })
+    return {
+        "status": "COMPLETE",
+        "directory_manifest_sha256": snapshot.evidence["manifest_sha256"],
+        **publish_concept_names(target_date, rows),
+    }
+
+
 def run_publisher(
     engine,
     provider: EastmoneyConceptProvider,
@@ -1192,6 +1215,17 @@ def run_publisher(
                 end_date=range_end,
             )
             result["published"] = True
+            if "current" in frames:
+                try:
+                    result["concept_names"] = _publish_current_concept_names(
+                        snapshot, range_end, now or datetime.now(SHANGHAI),
+                    )
+                except Exception as exc:
+                    result["concept_names"] = {
+                        "status": "UNAVAILABLE",
+                        "reason": "EXACT_CONCEPT_NAMES_PUBLICATION_FAILED",
+                        "error_type": type(exc).__name__,
+                    }
         return result
     except Exception as exc:
         evidence = partial_result()
@@ -1253,6 +1287,8 @@ def build_receipt(
                 "published": bool(result.get("published")),
             }
         )
+        if "concept_names" in result:
+            payload["concept_names"] = result["concept_names"]
     if reason:
         payload["reason"] = str(reason)[:1000]
     payload["result_sha256"] = _digest(payload)

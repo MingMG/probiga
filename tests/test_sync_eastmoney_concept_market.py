@@ -281,6 +281,52 @@ def test_second_dataset_insert_failure_rolls_back_every_scope():
     assert kline_codes == ["BKOLD"]
 
 
+@pytest.mark.parametrize("missing_name", [False, True])
+def test_current_quotes_publish_exact_provider_labels_independently(monkeypatch, tmp_path, missing_name):
+    from server.common import sector_heatmap_store
+
+    engine = _atomic_engine()
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE si_trade_calendar (trade_date TEXT, trade_status INTEGER)"))
+        connection.execute(text("INSERT INTO si_trade_calendar VALUES (:d,1)"), {"d": TARGET})
+    monkeypatch.setattr(market, "MIN_DIRECTORY_CODES", 2)
+    tmp_path.chmod(0o700)
+    monkeypatch.setattr(sector_heatmap_store, "journal_runtime_root", lambda: tmp_path)
+    connection_factory = market._publication_connection
+    monkeypatch.setattr(market, "_publication_connection", lambda engine, **kw: connection_factory(
+        engine, use_mysql_lock=False,
+    ))
+    provider = _Provider([
+        {**_item("BK0002"), "f14": "第二概念"},
+        {**_item("BK0001"), "f14": None if missing_name else "第一概念"},
+    ])
+
+    result = market.run_publisher(engine, provider, datasets=["current"], trade_date=TARGET, now=RUN_TIME)
+    with engine.connect() as connection:
+        assert connection.execute(text(
+            "SELECT index_code,trade_date FROM sm_concept_east_current ORDER BY index_code"
+        )).all() == [("BK0001", TARGET), ("BK0002", TARGET)]
+    assert result["published"] is True and result["db_metrics"]["current"]["row_count"] == 2
+    receipt = market.build_receipt(
+        status="PASS", datasets=["current"], started_at=RUN_TIME,
+        finished_at=RUN_TIME, result=result,
+    )
+    saved = sector_heatmap_store.read_concept_names(TARGET, now=RUN_TIME.replace(tzinfo=None))
+    if missing_name:
+        assert receipt["concept_names"]["status"] == "UNAVAILABLE"
+        assert saved == []
+    else:
+        assert receipt["concept_names"]["status"] == "COMPLETE"
+        assert receipt["concept_names"]["code_count"] == 2
+        assert receipt["concept_names"]["directory_manifest_sha256"] == receipt["directory"]["manifest_sha256"]
+        assert saved == [
+            {"index_code": code, "index_name": name,
+             "source_snapshot_at": "2026-08-26T15:30:00", "etl_sync_at": "2026-08-26T19:00:00"}
+            for code, name in (("BK0001", "第一概念"), ("BK0002", "第二概念"))
+        ]
+    engine.dispose()
+
+
 def test_cli_emits_one_recomputable_receipt(monkeypatch, capsys, calendar_engine):
     monkeypatch.setattr(market, "MIN_DIRECTORY_CODES", 2)
     monkeypatch.setattr(
@@ -305,6 +351,7 @@ def test_cli_emits_one_recomputable_receipt(monkeypatch, capsys, calendar_engine
     assert receipt["requested_trade_date"] == TARGET
     assert receipt["target_trade_date"] == TARGET
     assert receipt["directory_count"] == 2
+    assert "concept_names" not in receipt
     assert receipt["dataset_results"]["current"]["row_count"] == 2
     unsigned = dict(receipt)
     supplied = unsigned.pop("result_sha256")

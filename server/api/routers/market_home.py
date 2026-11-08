@@ -5,7 +5,8 @@ import json
 import logging
 import math
 import re
-from collections import OrderedDict
+import sqlite3
+from collections import OrderedDict, defaultdict
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from threading import Lock
@@ -24,6 +25,7 @@ from server.common.limit_up_events import LIMIT_STATUS_BASIS
 from server.common.limit_up_event_schema import LIMIT_UP_EVENT_TABLE
 from server.common.market_close_ladder import load_market_close_ladder
 from server.common.qmt_attestation_contract import canonical_digest
+from server.common.sector_heatmap_store import read_concept_names, read_industry_flow
 from server.common.sql_reader import read_sql_rows
 from server.common.turnover_snapshot import (
     TURNOVER_CAPTURE_KIND,
@@ -72,6 +74,14 @@ _CACHE_TTL = 10
 _CLOSED_CACHE_TTL = 30
 _CACHE_SIZE = 32
 _LIVE_MAX_AGE = timedelta(seconds=90)
+_HEATMAP_SESSIONS = 5
+_HEATMAP_TAIL = 6
+_HEATMAP_BOARD_LIMIT = 1_500
+_HEATMAP_MINUTES = 240
+_HEATMAP_CONCEPT_SOURCE = "东财概念行情"
+_HEATMAP_INDUSTRY_SOURCE = "东财一级行业行情"
+_HEATMAP_CONCEPT_FLOW_SOURCE = "东财概念主力净流入"
+_HEATMAP_INDUSTRY_FLOW_SOURCE = "东财一级行业主力净流入"
 _cache: OrderedDict[str, tuple[float, dict]] = OrderedDict()
 _cache_lock = Lock()
 
@@ -616,3 +626,202 @@ def market_board(requested: str = Query(alias="date", pattern=r"^\d{4}-\d{2}-\d{
         while len(_cache) > _CACHE_SIZE:
             _cache.popitem(last=False)
     return result
+
+
+def _sector_rank(rows: list[dict], source: str) -> dict:
+    ranked = sorted(rows, key=lambda row: (-row["value"], row["name"], row["code"]))
+    positive = [row for row in ranked if row["value"] > 0]
+    negative = sorted((row for row in ranked if row["value"] < 0),
+                      key=lambda row: (row["value"], row["name"], row["code"]))
+    flat = [row for row in ranked if row["value"] == 0]
+    displayed = positive[:_HEATMAP_TAIL] + negative[:_HEATMAP_TAIL]
+    if len(displayed) < _HEATMAP_TAIL:
+        displayed += flat[:_HEATMAP_TAIL - len(displayed)]
+    note = f"{source} · {len(rows)} 个有数据板块" if rows else f"{source} · 当日数据待核验"
+    return {"status": "available" if rows else "unavailable", "rows": displayed, "note": note}
+
+
+def _native_close_series(window: list[dict]) -> list[float]:
+    closes = [_number(row["close"]) for row in window]
+    changes = [_number(row["change"]) for row in window]
+    if any(close is None or close <= 0 for close in closes) or any(change is None for change in changes):
+        return []
+    previous = [close - change for close, change in zip(closes, changes)]
+    if previous[0] <= 0 or any(abs(prev - close) > 0.02 for prev, close in zip(previous[1:], closes)):
+        return []
+    return [0.0, *[round((close / previous[0] - 1) * 100, 8) for close in closes]]
+
+
+def _sector_changes(rows: list[dict], names: dict[str, str], sessions: list[str], source: str, *, native=False) -> tuple[dict, dict]:
+    history: dict[str, dict[str, dict | None]] = defaultdict(dict)
+    selected = sessions[-1]
+    for row in rows:
+        code, session = str(row["code"] or ""), str(row["session"])[:10]
+        if not code or session not in sessions or (native and not re.fullmatch(r"BK[0-9]{4,8}", code)):
+            continue
+        value = _number(row["change_pct"])
+        # A duplicated identity is ambiguous even when one copy looks valid.
+        valid = value is not None and value > -100 and session not in history[code]
+        history[code][session] = {**row, "change_pct": value} if valid else None
+
+    daily, five_day = [], []
+    for code, changes in history.items():
+        current = changes.get(selected)
+        if current is None:
+            continue
+        identity = {"code": code, "name": names.get(code, code), "source": source}
+        today = {**identity, "value": current["change_pct"]}
+        daily.append(today)
+        window = [changes.get(session) for session in sessions]
+        if len(window) != _HEATMAP_SESSIONS or any(value is None for value in window):
+            continue
+        if native:
+            series = _native_close_series(window)
+        else:
+            gross_return = 1.0
+            series = [0.0]
+            for row in window:
+                gross_return *= 1 + row["change_pct"] / 100
+                series.append(round((gross_return - 1) * 100, 8))
+        if series:
+            curve = {"series": series, "series_label": "近 5 个交易日"}
+            five_day.append({**identity, "value": series[-1], **curve})
+            if not native:
+                today.update(curve)
+    basis = "连续 5 个交易日收盘价" if native else "连续 5 个交易日复合涨幅"
+    return _sector_rank(daily, source), _sector_rank(five_day, f"{source} · {basis}")
+
+
+def _sector_read(engine_factory, sql, params, *, deadline, limit, stage):
+    try:
+        rows = _read(engine_factory(), sql, {**params, "limit": limit + 1}, deadline=deadline)
+        if len(rows) > limit:
+            raise ValueError("sector heatmap row limit exceeded")
+        return rows
+    except (SQLAlchemyError, RuntimeError, TimeoutError, ValueError) as exc:
+        logger.warning("sector heatmap %s unavailable: %s", stage, type(exc).__name__)
+        return []
+
+
+def _concept_minute_curves(metric: dict, closes: dict, selected: str, now: datetime, deadline: float) -> None:
+    codes = [row["code"] for row in metric["rows"]]
+    if not codes:
+        return
+    bindings = {f"code_{index}": code for index, code in enumerate(codes)}
+    placeholders = ", ".join(f":{key}" for key in bindings)
+    rows = _sector_read(get_kline_engine, f"""
+        SELECT /*+ MAX_EXECUTION_TIME(1400) */ index_code, trade_time, price
+        FROM sm_concept_east_minute
+        WHERE trade_date = :selected AND trade_time >= :selected AND trade_time < :tomorrow AND etl_sync_at <= :now
+          AND index_code IN ({placeholders})
+        ORDER BY index_code, trade_time LIMIT :limit
+    """, {**bindings, "selected": selected, "tomorrow": date.fromisoformat(selected) + timedelta(days=1),
+          "now": now}, deadline=deadline, limit=len(codes) * _HEATMAP_MINUTES, stage="concept minute curves")
+    opens = (datetime.fromisoformat(selected + "T09:30:00"), datetime.fromisoformat(selected + "T13:00:00"))
+    expected = [opened + timedelta(minutes=minute) for opened in opens for minute in range(1, 121)]
+    by_code = defaultdict(list)
+    for row in rows:
+        by_code[row["index_code"]].append(row)
+    for row in metric["rows"]:
+        minutes = by_code[row["code"]]
+        if [_clock(point["trade_time"]) for point in minutes] != expected:
+            continue
+        # Keep a bounded, time-ordered series of actual observations, including the close.
+        prices = [_number(point["price"]) for point in minutes]
+        close = closes.get(row["code"])
+        if close is not None and all(price is not None and price > 0 for price in prices) and abs(prices[-1] - close) <= 0.02:
+            row["series"] = [prices[0], *prices[4::5]]
+            row["series_label"] = "当日分时"
+
+
+def _read_sector_store(reader, selected: str, now: datetime) -> list[dict]:
+    try:
+        return reader(selected, now=now)
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        logger.warning("sector heatmap %s unavailable: %s", reader.__name__, type(exc).__name__)
+        return []
+
+
+def build_sector_heatmap(day: date, *, now: datetime) -> dict:
+    selected = day.isoformat()
+    concept = {"change": _sector_rank([], _HEATMAP_CONCEPT_SOURCE),
+               "five_day_return": _sector_rank([], _HEATMAP_CONCEPT_SOURCE),
+               "net_inflow": _sector_rank([], _HEATMAP_CONCEPT_FLOW_SOURCE)}
+    industry = {"change": _sector_rank([], _HEATMAP_INDUSTRY_SOURCE),
+                "five_day_return": _sector_rank([], _HEATMAP_INDUSTRY_SOURCE),
+                "net_inflow": _sector_rank([], _HEATMAP_INDUSTRY_FLOW_SOURCE)}
+    result = {"requested_date": selected, "trade_date": None, "concept": concept, "industry": industry}
+    if day > now.date() or (day == now.date() and now.time() < time(15)):
+        return result
+    deadline = monotonic() + 8
+    sessions = _sector_read(get_engine, """
+        SELECT /*+ MAX_EXECUTION_TIME(1200) */ trade_date FROM si_trade_calendar
+        WHERE trade_status=1 AND trade_date <= :selected
+        ORDER BY trade_date DESC LIMIT :session_limit
+    """, {"selected": selected, "session_limit": _HEATMAP_SESSIONS}, deadline=deadline,
+        limit=_HEATMAP_SESSIONS, stage="trading calendar")
+    sessions = [str(row["trade_date"])[:10] for row in reversed(sessions)]
+    if not sessions or sessions[-1] != selected or len(set(sessions)) != len(sessions):
+        return result
+    result["trade_date"] = selected
+    bounds = {"selected": selected, "start": sessions[0], "now": now}
+    changes = _sector_read(get_kline_engine, """
+        SELECT /*+ MAX_EXECUTION_TIME(1800) */ index_code AS code, trade_date AS session, trade_time,
+               change_pct, close, `change`
+        FROM sm_concept_east_kline WHERE k_type=1 AND trade_date BETWEEN :start AND :selected
+          AND etl_sync_at <= :now LIMIT :limit
+    """, bounds, deadline=deadline, limit=len(sessions) * _HEATMAP_BOARD_LIMIT, stage="concept closes")
+    changes = [row for row in changes if _clock(row["trade_time"]) == _clock(row["session"])]
+    flows = _sector_read(get_engine, """
+        SELECT /*+ MAX_EXECUTION_TIME(1400) */ index_code AS code, MAX(index_name) AS name,
+               MAX(main_net_inflow) AS main_net_inflow, MAX(max_net_inflow) AS max_net_inflow, MAX(lg_net_inflow) AS lg_net_inflow
+        FROM sm_concept_capital_flow_east WHERE days_type=1 AND snapshot_at=:snapshot AND etl_sync_at <= :now
+          AND index_code LIKE 'BK%' GROUP BY index_code HAVING COUNT(*)=1 LIMIT :limit
+    """, {**bounds, "snapshot": selected + " 00:00:00"}, deadline=deadline,
+        limit=_HEATMAP_BOARD_LIMIT, stage="concept capital flow")
+    names = {row["code"]: row["name"] for row in flows if row["name"]}
+    names.update({row["index_code"]: row["index_name"] for row in _read_sector_store(read_concept_names, selected, now)})
+    concept["change"], concept["five_day_return"] = _sector_changes(changes, names, sessions, _HEATMAP_CONCEPT_SOURCE, native=True)
+    flow_rows = []
+    for row in flows:
+        code = row["code"]
+        main, big, largest = map(_number, (row["main_net_inflow"], row["lg_net_inflow"], row["max_net_inflow"]))
+        if re.fullmatch(r"BK[0-9]{4,8}", code) and None not in (main, big, largest) and abs(main - big - largest) <= 0.03:
+            flow_rows.append({"code": code, "name": names.get(code, code), "value": main, "source": _HEATMAP_CONCEPT_FLOW_SOURCE})
+    concept["net_inflow"] = _sector_rank(flow_rows, _HEATMAP_CONCEPT_FLOW_SOURCE)
+
+    industry_changes = _sector_read(get_engine, """
+        SELECT /*+ MAX_EXECUTION_TIME(1500) */ concept_name AS code, concept_code AS native_code,
+               snapshot_date AS session, change_pct, hot_tag
+        FROM st_hot_concept_ths_daily WHERE plate_type=3 AND snapshot_date BETWEEN :start AND :selected
+          AND hot_tag LIKE '东财一级行业%' AND etl_sync_at <= :now LIMIT :limit
+    """, bounds, deadline=deadline, limit=len(sessions) * 100, stage="industry closes")
+    # The collector's fixed industry names identify the board. Its representative
+    # vendor code may change when a primary industry aggregates several children.
+    industry_names = {row["code"]: row["code"] for row in industry_changes if row["code"]}
+    industry["change"], industry["five_day_return"] = _sector_changes(
+        industry_changes, industry_names, sessions, _HEATMAP_INDUSTRY_SOURCE,
+    )
+    native_industries = defaultdict(set)
+    for row in industry_changes:
+        if str(row["session"])[:10] == selected and row["hot_tag"] == "东财一级行业成交额":
+            native_industries[row["native_code"]].add(row["code"])
+    industry_flows = []
+    for row in _read_sector_store(read_industry_flow, selected, now):
+        name_set = native_industries[row["index_code"]]
+        if len(name_set) == 1:
+            industry_flows.append({"code": row["index_code"], "name": next(iter(name_set)),
+                                   "value": float(row["main_net_inflow"]), "source": _HEATMAP_INDUSTRY_FLOW_SOURCE})
+    industry["net_inflow"] = _sector_rank(industry_flows, _HEATMAP_INDUSTRY_FLOW_SOURCE)
+    closes = {row["code"]: _number(row["close"]) for row in changes if str(row["session"])[:10] == selected}
+    _concept_minute_curves(concept["change"], closes, selected, now, deadline)
+    return result
+
+
+@router.get("/monitor/sector-heatmap")
+def sector_heatmap(requested: str = Query(alias="date", pattern=r"^\d{4}-\d{2}-\d{2}$")) -> dict:
+    try:
+        selected_day = date.fromisoformat(requested)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="date must be a valid exchange date") from exc
+    return build_sector_heatmap(selected_day, now=datetime.now(SHANGHAI).replace(tzinfo=None))

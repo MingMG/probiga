@@ -1,10 +1,11 @@
-/* Run: node tests/trading_day_browser.cjs [absolute path to playwright module]. */
+/* Run: node tests/trading_day_browser.cjs [absolute path to playwright module] [--market-heatmap-only]. */
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const http = require('node:http');
 const os = require('node:os');
-const {chromium} = require(process.argv[2] || 'playwright');
+const flags = process.argv.slice(2);
+const {chromium} = require(flags.find(arg=>!arg.startsWith('--')) || 'playwright');
 const root = path.resolve(__dirname, '..');
 const day = '2026-09-18';
 let clock = {server_time:day+' 10:30:00',today:day,active_trade_date:day,ui_trade_date:day,expected_trade_date:day,is_trade_day:true,is_intraday:true,phase:'intraday'};
@@ -44,10 +45,49 @@ async function assertNavigation(page,expected){
   assert.equal(await item.getAttribute('data-trading-view'),view);assert.equal(await item.getAttribute('data-module-page'),'v3');
  }
 }
+async function assertSectorHeatmap(page){
+  await page.waitForSelector('#mh-heatmap-concept .mh-heat-cell');
+  assert.match(await page.locator('#mh-heatmap-concept').innerText(),/算力热度样本[\s\S]*\+2\.31%/);
+  assert.equal(await page.locator('#mh-heatmap-concept .mh-heat-series').count(),1);
+  assert.match(await page.locator('#mh-heatmap-industry').innerText(),/行业涨跌样本[\s\S]*-1\.37%/);
+  await page.locator('[data-mh-heat-mode="concept:net_inflow"]').press('Enter');
+  assert.equal(await page.locator('[data-mh-heat-mode="concept:net_inflow"]').getAttribute('aria-pressed'),'true');
+  assert.equal(await page.locator('[data-mh-heat-mode="industry:change"]').getAttribute('aria-pressed'),'true');
+  assert.match(await page.locator('#mh-heatmap-concept').innerText(),/当日资金样本[\s\S]*-1\.23亿/);
+  assert.equal(await page.locator('#mh-heatmap-concept .mh-heat-series').count(),0);
+  await page.locator('[data-mh-heat-mode="industry:five_day_return"]').click();
+  assert.match(await page.locator('#mh-heatmap-industry').innerText(),/行业5日样本[\s\S]*\+7\.24%/);
+  await page.locator('[data-mh-heat-mode="concept:five_day_return"]').click();
+  assert.match(await page.locator('#mh-heatmap-concept').innerText(),/暂无可核验的5日涨幅榜数据/);
+  assert.match(await page.locator('#mh-heatmap-concept').innerText(),/连续行情暂不齐全/);
+  await page.locator('[data-mh-heat-mode="concept:net_inflow"]').click();
+  for(const width of [1280,760,320]){
+   await page.setViewportSize({width,height:900});
+   assert.ok(await page.locator('.market-home').evaluate(node=>node.scrollWidth<=node.clientWidth),'heatmap overflow '+width);
+  }
+  await page.setViewportSize({width:1280,height:1000});
+}
+async function assertSectorHeatmapDateChanged(page){
+  await page.locator('#mh-heatmap-concept').getByText('前日资金样本').waitFor();
+  assert.equal(await page.locator('[data-mh-heat-mode="concept:net_inflow"]').getAttribute('aria-pressed'),'true');
+  assert.equal(await page.locator('#mh-heatmap-concept').getByText('当日资金样本').count(),0);
+}
 function payload(url){
  if(url.includes('/market-clock'))return clock;
  if(url.includes('premarket-theme-forecast'))return {requested_date:day,session_date:day,source_trade_date:'2026-09-17',stage:'PREMARKET_0908',run_uid:'forecast-test',cutoff_at:day+' 09:08:00',generated_at:day+' 09:08:20',decision_scope:'RESEARCH_DISPLAY_ONLY',themes:[{theme_key:'t1',theme_name:'测试主线',reason:'盘前研究方向',stock_candidates:candidates}]};
  if(url.includes('auction-gate'))return {data:{status:'COMPLETED',decision_date:'2026-09-17',execution_session_date:day,source_run_uid:'separate-auction',evidence_mode:'PERSISTED_IMMUTABLE_RUN',cutoff_at:day+' 09:25:00',summary:{reviewed_count:1,candidate_count:1},assessments:[{stock_code:'600000',stock_name:'观察股1',gate_status:'CONFIRMED',quote_at:day+' 09:25:00',reasons:['独立竞价依据']}]}};
+ if(url.includes('/monitor/sector-heatmap')){
+  const tradeDate=new URL(url).searchParams.get('date');
+  const sample=(name,value,series)=>({code:'BK001',name,value,source:'同日板块证据',series});
+  const available=(...rows)=>({status:'available',note:'精选涨跌两端的来源样本',rows});
+  return {requested_date:tradeDate,trade_date:tradeDate,
+   concept:{change:available(sample('算力热度样本',2.31,[1,2.31])),
+    net_inflow:available(sample(tradeDate===day?'当日资金样本':'前日资金样本',-123000000)),
+    five_day_return:{status:'unavailable',note:'五个交易日的连续行情暂不齐全',rows:[]}},
+   industry:{change:available(sample('行业涨跌样本',-1.37)),
+    net_inflow:available(sample('行业资金样本',20000)),
+    five_day_return:available(sample('行业5日样本',7.24,[1,2,3,4,7.24]))}};
+ }
  if(url.includes('/monitor/data'))return {trade_date:day,total_count:100,up_count:65,down_count:30,total_amount:22000000000,data_time:day+' 10:29:00',is_realtime:true,freshness_status:'fresh'};
  if(url.includes('holding-strategy'))return {trade_date:day,knowledge_cutoff:day+' 10:29:00',historical_read_only:false,data:[{stock_code:'600010',short_name:'已有持仓',shares:100,sellable_shares:0,t1_blocked:true,trade_date:day,latest_price:10,price_trade_date:day,same_session_price:true,action:'核对风险',reason:'持仓观察说明'}]};
  if(url.includes('daily-review/quant'))return {date:day,data:[{review_date:day,publish_status:'ready',generated_at:day+' 17:00:00',data_cutoff_at:day+' 16:00:00',compact_review:'盘后研究回顾',factor_validation_json:'{}'}]};
@@ -90,6 +130,23 @@ const server=http.createServer((req,res)=>{
   await route.fulfill({json:payload(url)});
  });
  try {
+  if(flags.includes('--market-heatmap-only')){
+   await page.route('https://cdn.jsdelivr.net/**',route=>route.fulfill({body:'window.Chart=function(){};'}));
+   await page.goto(base+'/?tab=workbench&trade_date='+day);
+   await assertSectorHeatmap(page);
+   const picker=page.locator('#datePicker');
+   await picker.fill('2026-09-17');
+   const [heatmapRequest]=await Promise.all([
+    page.waitForRequest(req=>new URL(req.url()).pathname==='/api/monitor/sector-heatmap'
+     &&new URL(req.url()).searchParams.get('date')==='2026-09-17'),
+    picker.dispatchEvent('change')
+   ]);
+   assert.equal(heatmapRequest.method(),'GET');
+   await assertSectorHeatmapDateChanged(page);
+   assert.deepEqual(errors,[]);
+   console.log(JSON.stringify({ok:true,mode:'market-heatmap',widths:[1280,760,320]}));
+   return;
+  }
   await page.goto(base+'/harness');await page.evaluate(()=>loaded);
   assert.equal(await page.locator('.td-stockrow:visible').count(),3);
   assert.equal(await page.locator('.td-stockstate').first().textContent(),'待核验');
@@ -187,6 +244,7 @@ const server=http.createServer((req,res)=>{
   // The trading workbench links to the dashboard without losing the date.
   await page.goto(base+'/?tab=trading-day&trade_date='+day);await page.waitForSelector('#tab-trading-day.active .td-hero');
   await page.locator('[data-td-tab="workbench"]').click();await page.waitForSelector('#tab-workbench.active .market-home');
+  await assertSectorHeatmap(page);
   assert.equal(await page.locator('#sidebar [data-tab="workbench"]').count(),1);
   const [overviewRefresh]=await Promise.all([
    page.waitForRequest(req=>new URL(req.url()).pathname==='/api/monitor/data'),
@@ -199,6 +257,7 @@ const server=http.createServer((req,res)=>{
    page.locator('#datePicker').dispatchEvent('change')
   ]);
   assert.equal(new URL(overviewDateChange.url()).searchParams.get('date'),'2026-09-17');
+  await assertSectorHeatmapDateChanged(page);
   await page.waitForFunction(()=>document.querySelector('#tab-workbench .mh-head .mh-meta')?.textContent.includes('2026-09-17'));
   assert.match(page.url(),/trade_date=2026-09-17/);
   await page.goBack();await page.waitForSelector('#tab-trading-day.active .td-hero');
