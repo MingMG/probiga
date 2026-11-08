@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 import hashlib
-from itertools import islice
+from itertools import groupby, islice
 import json
 import logging
 import math
@@ -108,7 +108,7 @@ HISTORICAL_RECONSTRUCTION_PUBLISH_RESERVE = timedelta(minutes=15)
 HISTORICAL_CAPTURE_DEADLINE = "QMT_ANNOUNCEMENT_RECONSTRUCTION_CAPTURE_DEADLINE"
 HISTORICAL_PUBLISH_DEADLINE = "QMT_ANNOUNCEMENT_RECONSTRUCTION_PUBLISH_DEADLINE"
 PUBLISH_COMMIT_UNKNOWN = "QMT_ANNOUNCEMENT_PUBLISH_COMMIT_UNKNOWN"
-VALIDATION_READ_BATCH_SIZE = 500
+VALIDATION_READ_BATCH_SIZE = 40
 _CODE_RE = re.compile(r"^(?:0|3|4|6|8|9)\d{5}$")
 _QMT_CODE_RE = re.compile(r"^(?:0|3|4|6|8|9)\d{5}\.(?:SH|SZ|BJ)$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -2581,7 +2581,11 @@ def validate_complete_historical_reconstruction_batch(
 ) -> dict[str, Any]:
     """Validate one exact post-hoc CNINFO batch and its actual knowledge time."""
 
-    from server.common.pit_facts import _validate_coverage_chain
+    from server.common.pit_facts import (
+        _coverage_payload_columns,
+        _coverage_payload_row,
+        _validate_coverage_chain,
+    )
     from server.common.qmt_stock_catalog import load_stock_catalog
 
     requested = sorted({
@@ -2602,13 +2606,6 @@ def validate_complete_historical_reconstruction_batch(
         raise QMTAnnouncementBlocked(
             "QMT_ANNOUNCEMENT_RECONSTRUCTION_SCOPE_INVALID"
         )
-    statement = text(
-        "SELECT * FROM st_pit_source_coverage "
-        "WHERE fact_kind='event' AND source=:source "
-        "AND stock_code IN :codes AND known_at<=:decision_at "
-        "AND received_at<=:decision_at "
-        "ORDER BY stock_code, scope_hash, revision_no"
-    ).bindparams(bindparam("codes", expanding=True))
     try:
         with engine.connect() as connection:
             dialect = str(connection.dialect.name or "").lower()
@@ -2618,6 +2615,15 @@ def validate_complete_historical_reconstruction_batch(
                 raise ValueError(
                     "announcement reconstruction requires a repeatable-read snapshot"
                 )
+            mysql = dialect == "mysql"
+            payload_columns = _coverage_payload_columns(mysql)
+            statement = text(
+                f"SELECT {payload_columns} FROM st_pit_source_coverage "
+                "WHERE fact_kind='event' AND source=:source "
+                "AND stock_code IN :codes AND known_at<=:decision_at "
+                "AND received_at<=:decision_at "
+                "ORDER BY stock_code, scope_hash, revision_no"
+            ).bindparams(bindparam("codes", expanding=True)).execution_options(stream_results=True)
             # Every valid candidate must cover this required stock. If its
             # historical row is absent, reading unrelated payload chains for
             # the entire universe cannot establish a complete batch.
@@ -2650,46 +2656,43 @@ def validate_complete_historical_reconstruction_batch(
                 code_batch = requested[
                     offset : offset + VALIDATION_READ_BATCH_SIZE
                 ]
-                rows = [
-                    dict(row)
-                    for row in connection.execute(
-                        statement,
-                        {
-                            "source": CNINFO_ANNOUNCEMENT_SOURCE,
-                            "codes": code_batch,
-                            "decision_at": decision,
-                        },
-                    ).mappings()
-                ]
-                chains: dict[tuple[str, str], list[dict[str, Any]]] = {}
-                for row in rows:
-                    key = (
-                        str(row.get("stock_code") or "").zfill(6),
-                        str(row.get("scope_hash") or ""),
-                    )
-                    chains.setdefault(key, []).append(row)
-                for chain in chains.values():
-                    _validate_coverage_chain(chain)
-                    # A later live/query-cutoff revision must not hide an
-                    # earlier immutable reconstruction for this exact target.
-                    for candidate in chain:
-                        if (
-                            candidate.get("watermark_kind")
-                            == "HISTORICAL_RECONSTRUCTION"
-                            and str(candidate.get("coverage_status") or "")
-                            == "COMPLETE"
-                            and date.fromisoformat(
-                                str(candidate.get("window_start"))[:10]
-                            ) <= start
-                            and date.fromisoformat(
-                                str(candidate.get("window_end"))[:10]
-                            ) >= end
-                        ):
-                            batch_id = str(candidate.get("batch_id") or "")
-                            code = str(candidate.get("stock_code") or "").zfill(6)
-                            by_batch.setdefault(batch_id, {})[code] = _dt(
-                                candidate.get("known_at")
-                            )
+                with connection.execute(
+                    statement,
+                    {
+                        "source": CNINFO_ANNOUNCEMENT_SOURCE,
+                        "codes": code_batch,
+                        "decision_at": decision,
+                    },
+                ) as rows:
+                    for _, scope_rows in groupby(
+                        rows.mappings(),
+                        key=lambda row: (row["stock_code"], row["scope_hash"]),
+                    ):
+                        chain = [
+                            _coverage_payload_row(row, mysql=mysql, stage="announcement_history")
+                            for row in scope_rows
+                        ]
+                        _validate_coverage_chain(chain)
+                        # A later live/query-cutoff revision must not hide an
+                        # earlier immutable reconstruction for this exact target.
+                        for candidate in chain:
+                            if (
+                                candidate.get("watermark_kind")
+                                == "HISTORICAL_RECONSTRUCTION"
+                                and str(candidate.get("coverage_status") or "")
+                                == "COMPLETE"
+                                and date.fromisoformat(
+                                    str(candidate.get("window_start"))[:10]
+                                ) <= start
+                                and date.fromisoformat(
+                                    str(candidate.get("window_end"))[:10]
+                                ) >= end
+                            ):
+                                batch_id = str(candidate.get("batch_id") or "")
+                                code = str(candidate.get("stock_code") or "").zfill(6)
+                                by_batch.setdefault(batch_id, {})[code] = _dt(
+                                    candidate.get("known_at")
+                                )
             candidates = [
                 batch_id for batch_id, batch_codes in by_batch.items()
                 if set(batch_codes) == set(requested)
@@ -2720,13 +2723,14 @@ def validate_complete_historical_reconstruction_batch(
                         raise ValueError("reconstruction batch is empty")
                     first_row = connection.execute(
                         text(
-                            "SELECT * FROM st_pit_source_coverage "
+                            "SELECT payload_json FROM st_pit_source_coverage "
                             "WHERE fact_kind='event' AND source=:source "
-                            "AND batch_id=:batch_id ORDER BY stock_code LIMIT 1"
+                            "AND batch_id=:batch_id AND stock_code=:stock_code LIMIT 1"
                         ),
                         {
                             "source": CNINFO_ANNOUNCEMENT_SOURCE,
                             "batch_id": batch_id,
+                            "stock_code": batch_rows[0]["stock_code"],
                         },
                     ).mappings().first()
                     if first_row is None:
@@ -2894,7 +2898,7 @@ def validate_complete_historical_reconstruction_batch(
                     ):
                         raise ValueError("security master timing differs")
                     batch_payload_statement = text(
-                        "SELECT * FROM st_pit_source_coverage "
+                        f"SELECT {payload_columns} FROM st_pit_source_coverage "
                         "WHERE fact_kind='event' AND source=:source "
                         "AND batch_id=:batch_id AND stock_code IN :codes "
                         "ORDER BY stock_code"
@@ -2915,7 +2919,7 @@ def validate_complete_historical_reconstruction_batch(
                                 "codes": code_batch,
                             },
                         ).mappings():
-                            row = dict(raw_row)
+                            row = _coverage_payload_row(raw_row, mysql=mysql, stage="announcement_history")
                             raw = str(row.get("payload_json") or "")
                             payload = json.loads(raw)
                             if canonical_json(payload) != raw:
@@ -3082,6 +3086,9 @@ def validate_complete_historical_reconstruction_batch(
                             "reconstruction_sha256"
                         ],
                     }
+                except SQLAlchemyError:
+                    # Transport failure is not evidence that the batch is absent.
+                    raise
                 except Exception as exc:
                     failure_codes.append(type(exc).__name__)
             raise QMTAnnouncementBlocked(

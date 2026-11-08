@@ -3527,7 +3527,7 @@ def _select_finance_atomic_batch_members(
                     "finance atomic batch requires a repeatable-read snapshot"
                 )
         statement = text(
-            f"SELECT {_finance_coverage_payload_columns(mysql, table_alias='selected')},"
+            f"SELECT {_coverage_payload_columns(mysql, table_alias='selected')},"
             "parent.coverage_id AS _parent_id,parent.scope_hash AS _parent_scope,"
             "parent.revision_no AS _parent_revision,parent.known_at AS _parent_known,"
             "parent.received_at AS _parent_received,parent.covered_through_at AS _parent_covered,"
@@ -3549,7 +3549,7 @@ def _select_finance_atomic_batch_members(
                     statement,
                     {"codes": code_batch, "completed_known_at": completed_known_at},
                 ).mappings():
-                    row = _finance_coverage_payload_row(raw, mysql=mysql)
+                    row = _coverage_payload_row(raw, mysql=mysql)
                     parent = {key: row.pop("_parent_" + key) for key in (
                         "id", "scope", "revision", "known", "received", "covered", "status", "fingerprint",
                     )}
@@ -4390,7 +4390,9 @@ def _date_time_value(
         return None
 
 
-def _decode_finance_seal_payload(packed: object, *, expected_bytes: int) -> str:
+def _decode_coverage_payload(
+    packed: object, *, expected_bytes: int, stage: str = "finance_seal_history",
+) -> str:
     """Decode one MySQL COMPRESS frame within that exact stored payload size.
 
     The database's OCTET_LENGTH from the same row is the inflation bound; no
@@ -4398,28 +4400,28 @@ def _decode_finance_seal_payload(packed: object, *, expected_bytes: int) -> str:
     """
     if (type(expected_bytes) is not int or expected_bytes <= 0
             or not isinstance(packed, (bytes, bytearray, memoryview))):
-        raise ValueError("finance_seal_history: compressed payload type/size differs")
+        raise ValueError(f"{stage}: compressed payload type/size differs")
     packed = bytes(packed)
     if len(packed) <= 4 or int.from_bytes(packed[:4], "little") != expected_bytes:
-        raise ValueError("finance_seal_history: compressed payload length differs")
+        raise ValueError(f"{stage}: compressed payload length differs")
     try:
         decoder = zlib.decompressobj()
         raw = decoder.decompress(packed[4:], expected_bytes + 1)
     except zlib.error as exc:
-        raise ValueError("finance_seal_history: invalid MySQL zlib payload") from exc
+        raise ValueError(f"{stage}: invalid MySQL zlib payload") from exc
     if (len(raw) != expected_bytes or decoder.unconsumed_tail or not decoder.eof):
-        raise ValueError("finance_seal_history: compressed payload inflation/boundary differs")
+        raise ValueError(f"{stage}: compressed payload inflation/boundary differs")
     tail = decoder.unused_data
     if (tail not in (b"", b".") or (tail == b"." and packed[-2] != 0x20)
             or (not tail and packed[-1] == 0x20)):
-        raise ValueError("finance_seal_history: invalid MySQL compressed trailing bytes")
+        raise ValueError(f"{stage}: invalid MySQL compressed trailing bytes")
     try:
         return raw.decode("utf-8")
     except UnicodeError as exc:
-        raise ValueError("finance_seal_history: compressed payload is not UTF-8") from exc
+        raise ValueError(f"{stage}: compressed payload is not UTF-8") from exc
 
 
-def _finance_coverage_payload_columns(mysql: bool, *, table_alias: str = "") -> str:
+def _coverage_payload_columns(mysql: bool, *, table_alias: str = "") -> str:
     prefix = table_alias + "." if table_alias else ""
     if not mysql:
         return prefix + "*"
@@ -4431,12 +4433,14 @@ def _finance_coverage_payload_columns(mysql: bool, *, table_alias: str = "") -> 
     )
 
 
-def _finance_coverage_payload_row(row: Mapping[str, Any], *, mysql: bool) -> dict[str, Any]:
+def _coverage_payload_row(
+    row: Mapping[str, Any], *, mysql: bool, stage: str = "finance_seal_history",
+) -> dict[str, Any]:
     current = dict(row)
     if mysql:
-        current["payload_json"] = _decode_finance_seal_payload(
+        current["payload_json"] = _decode_coverage_payload(
             current.pop("payload_json_compressed"),
-            expected_bytes=current.pop("payload_json_bytes"),
+            expected_bytes=current.pop("payload_json_bytes"), stage=stage,
         )
     return current
 
@@ -4480,7 +4484,7 @@ def _load_latest_finance_atomic_seal_evidence(
         )
         mysql = connection.dialect.name == "mysql"
         payload_statement = text(
-            f"SELECT {_finance_coverage_payload_columns(mysql)} FROM {SOURCE_COVERAGE_TABLE} "
+            f"SELECT {_coverage_payload_columns(mysql)} FROM {SOURCE_COVERAGE_TABLE} "
             "WHERE coverage_id=:coverage_id"
         )
 
@@ -4501,7 +4505,7 @@ def _load_latest_finance_atomic_seal_evidence(
                 }).mappings().first()
                 if raw is None:
                     raise ValueError("finance seal disappeared inside repeatable-read snapshot")
-                latest_row = _finance_coverage_payload_row(raw, mysql=mysql)
+                latest_row = _coverage_payload_row(raw, mysql=mysql)
                 links = connection.execute(text(
                     "SELECT coverage_id,scope_hash,coverage_fingerprint_hash,revision_no,"
                     "supersedes_coverage_id,known_at,received_at,covered_through_at,"
@@ -4558,7 +4562,7 @@ def _load_latest_finance_atomic_seal_evidence(
                     parent = connection.execute(payload_statement, {"coverage_id": parent_id}).mappings().first()
                     if parent is None:
                         raise ValueError("finance atomic batch parent is unavailable")
-                    parent_evidence = validate_snapshot(_finance_coverage_payload_row(parent, mysql=mysql))
+                    parent_evidence = validate_snapshot(_coverage_payload_row(parent, mysql=mysql))
                     seal_rows[anchors[parent_id][0] - 1]["batch_root_sha256"] = parent_evidence.get("batch_root_sha256")
             except OperationalError as exc:
                 exc._pit_read_stage = "finance_seal_history"

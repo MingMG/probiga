@@ -2681,14 +2681,14 @@ def test_finance_compressed_member_reads_preserve_current_revision_and_parent_an
                 pit_module._select_finance_atomic_batch_members(mysql_reader, **kwargs)
     else:
         decoded = []
-        original_decode = pit_module._decode_finance_seal_payload
+        original_decode = pit_module._decode_coverage_payload
 
-        def observe(frame, *, expected_bytes):
-            payload = original_decode(frame, expected_bytes=expected_bytes)
+        def observe(frame, *, expected_bytes, stage):
+            payload = original_decode(frame, expected_bytes=expected_bytes, stage=stage)
             decoded.append(payload.encode("utf-8"))
             return payload
 
-        monkeypatch.setattr(pit_module, "_decode_finance_seal_payload", observe)
+        monkeypatch.setattr(pit_module, "_decode_coverage_payload", observe)
         assert pit_module._select_finance_atomic_batch_members(mysql_reader, **kwargs) == plain
         assert decoded == expected_bytes
     engine.dispose()
@@ -2735,23 +2735,23 @@ def test_finance_history_rejects_broken_compressed_transport(corrupt):
 def test_finance_payload_bound_uses_stored_size_and_preserves_large_unicode_json():
     raw = json.dumps({"title": "原始公告\u0000", "members": "A" * (8 * 1024 * 1024)},
                      ensure_ascii=False).encode("utf-8")
-    assert pit_module._decode_finance_seal_payload(_mysql_compress_frame(raw),
+    assert pit_module._decode_coverage_payload(_mysql_compress_frame(raw),
         expected_bytes=len(raw)).encode("utf-8") == raw
     # The trusted SQL byte length, not the frame's claim, bounds inflation.
     forged = len(raw).to_bytes(4, "little") + zlib.compress(raw + b"X")
     with pytest.raises(ValueError, match="inflation/boundary"):
-        pit_module._decode_finance_seal_payload(forged, expected_bytes=len(raw))
+        pit_module._decode_coverage_payload(forged, expected_bytes=len(raw))
     with pytest.raises(ValueError, match="UTF-8"):
-        pit_module._decode_finance_seal_payload(_mysql_compress_frame(b"\xff"), expected_bytes=1)
+        pit_module._decode_coverage_payload(_mysql_compress_frame(b"\xff"), expected_bytes=1)
 
 
 def test_finance_mysql_space_marker_is_accepted_only_at_the_real_stream_boundary():
     raw = b"\x1f"  # Adler checksum ends in 0x20; MySQL appends the marker.
     frame = _mysql_compress_frame(raw)
     assert frame.endswith(b" .")
-    assert pit_module._decode_finance_seal_payload(frame, expected_bytes=len(raw)) == raw.decode()
+    assert pit_module._decode_coverage_payload(frame, expected_bytes=len(raw)) == raw.decode()
     with pytest.raises(ValueError, match="trailing bytes"):
-        pit_module._decode_finance_seal_payload(frame[:-1], expected_bytes=len(raw))
+        pit_module._decode_coverage_payload(frame[:-1], expected_bytes=len(raw))
 
 
 def test_finance_seal_read_error_reports_only_stage_and_numeric_errno():
