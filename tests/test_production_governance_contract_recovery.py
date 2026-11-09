@@ -38,6 +38,9 @@ class _Result:
     def fetchall(self) -> list[Any]:
         return deepcopy(self._rows)
 
+    def first(self) -> Any:
+        return deepcopy(self._rows[0]) if self._rows else None
+
     def scalar_one_or_none(self) -> Any:
         return self._scalar
 
@@ -423,6 +426,12 @@ class _RollbackConnection:
             return _Result(rows=rows)
         if "information_schema.STATISTICS" in sql:
             return _Result(rows=[(column,) for column in self.engine.primary_key])
+        if sql.startswith("SELECT task_id FROM st_scheduled_task_history "):
+            assert sql.endswith("status='running' LIMIT 1 FOR UPDATE")
+            active = self.engine.running_history_task_ids.intersection(
+                parameters["task_ids"]
+            )
+            return _Result(rows=[(min(active),)] if active else [])
         if sql.startswith("SELECT ") and " FROM st_scheduled_tasks " in sql:
             selected = sql.split(" FROM st_scheduled_tasks ", 1)[0]
             columns = re.findall(r"`([^`]+)`", selected)
@@ -508,6 +517,7 @@ class _RollbackEngine:
         self.executions: list[tuple[str, dict[str, Any]]] = []
         self.tamper_after_update = False
         self.update_rowcount = 1
+        self.running_history_task_ids: set[int] = set()
 
     def connect(self) -> _RollbackContext:
         return _RollbackContext(self, transactional=False)
@@ -619,6 +629,182 @@ def test_forward_recovery_only_replays_linux_enabled_bits(windows_prior, windows
         assert recovery.restore_fenced_linux_qmt_enabled_policy(engine, payload) == {
             "changed_row_count": 0, "verified": True,
         }
+
+
+def _fenced_windows_announcement_rows() -> list[dict[str, Any]]:
+    return [
+        _old_row({**QMT_ANNOUNCEMENT_TASK, "enabled": 1}, 127),
+        *[
+            _old_row({**task, "enabled": 0}, index)
+            for index, task in enumerate(QMT_OPERATION_TASKS, 1)
+        ],
+    ]
+
+
+def _stub_dat_only_writer_proof(monkeypatch, *, instance_id, build_sha, writers, granted=True):
+    from server.common import (
+        qmt_edge_release_receipt,
+        scheduler_runtime_health,
+        scheduler_tasks,
+    )
+
+    def activation(connection, *, expected_build_sha):
+        assert not any(
+            sql.startswith("UPDATE ") for sql, _ in connection.engine.executions
+        )
+        assert expected_build_sha == build_sha
+        return granted, {"status": "READY" if granted else "PENDING", "activation_granted": granted}
+
+    monkeypatch.setattr(
+        qmt_edge_release_receipt, "check_qmt_edge_release_activation", activation
+    )
+    monkeypatch.setattr(
+        scheduler_runtime_health,
+        "check_qmt_windows_edge_identity",
+        lambda connection, *, expected_build_sha: (
+            expected_build_sha == build_sha,
+            {"current": {"instance_id": instance_id}},
+        ),
+    )
+    monkeypatch.setattr(
+        scheduler_tasks,
+        "read_fresh_scheduler_writers_on_connection",
+        lambda connection: [{"instance_id": writer} for writer in writers],
+    )
+
+
+def test_forward_recovery_enables_announcements_behind_dat_only_writer_fence(
+    monkeypatch,
+) -> None:
+    sealed = _fenced_windows_announcement_rows()
+    live = deepcopy(sealed)
+    live[0].update(
+        enabled=0,
+        last_run_status="blocked",
+        last_run_output="current-announcement-run",
+        last_run_at="2026-11-09 22:07:57",
+        updated_at="2026-11-10 04:26:00",
+    )
+    payload = _qmt_rollback_payload(sealed[1:], announcement_rows=sealed[:1])
+    engine = _RollbackEngine(live)
+    instance_id, build_sha = "WINDOWS-52056", "a" * 40
+    _stub_dat_only_writer_proof(
+        monkeypatch, instance_id=instance_id, build_sha=build_sha, writers=[instance_id]
+    )
+
+    assert recovery.restore_fenced_linux_qmt_enabled_policy(
+        engine, payload, windows_instance_id=instance_id, build_sha=build_sha
+    ) == {"changed_row_count": 1, "verified": True}
+    assert engine.rows == [{**live[0], "enabled": 1}, *live[1:]]
+    updates = [
+        (sql, params) for sql, params in engine.executions if sql.startswith("UPDATE ")
+    ]
+    assert len(updates) == 1
+    assert updates[0][1]["restore_id"] == 127
+    assert "SET `enabled`=:enabled,`updated_at`=`updated_at`" in updates[0][0]
+
+    engine.executions.clear()
+    assert recovery.restore_fenced_linux_qmt_enabled_policy(
+        engine, payload, windows_instance_id=instance_id, build_sha=build_sha
+    ) == {"changed_row_count": 0, "verified": True}
+    assert engine.rows == [{**live[0], "enabled": 1}, *live[1:]]
+    assert not any(sql.startswith("UPDATE ") for sql, _ in engine.executions)
+
+
+@pytest.mark.parametrize(
+    "live_instance,writers,granted",
+    [
+        ("WINDOWS-52056", ["OTHER-EDGE"], True),
+        ("WINDOWS-52056", ["WINDOWS-52056", "LINUX-913"], True),
+        ("OTHER-EDGE", ["WINDOWS-52056"], True),
+        ("WINDOWS-52056", ["WINDOWS-52056"], False),
+    ],
+)
+def test_forward_recovery_rejects_wrong_or_nonexclusive_writer_fence(
+    monkeypatch, live_instance, writers, granted,
+) -> None:
+    sealed = _fenced_windows_announcement_rows()
+    linux_row = next(row for row in sealed if row["task_type"] == "qmt_nightly_reconciliation")
+    linux_row["enabled"] = 1
+    live = [{**row, "enabled": 0} for row in sealed]
+    payload = _qmt_rollback_payload(sealed[1:], announcement_rows=sealed[:1])
+    engine = _RollbackEngine(live)
+    instance_id, build_sha = "WINDOWS-52056", "a" * 40
+    _stub_dat_only_writer_proof(
+        monkeypatch,
+        instance_id=live_instance,
+        build_sha=build_sha,
+        writers=writers,
+        granted=granted,
+    )
+
+    with pytest.raises(RuntimeError, match="Windows scheduler enabled policy requires writer fence"):
+        recovery.restore_fenced_linux_qmt_enabled_policy(
+            engine, payload, windows_instance_id=instance_id, build_sha=build_sha
+        )
+
+    assert engine.rows == live
+    assert not any(sql.startswith("UPDATE ") for sql, _ in engine.executions)
+
+
+@pytest.mark.parametrize("unsafe_task", ["running_announcement", "dat_allowlisted"])
+def test_forward_recovery_rejects_windows_task_that_can_still_write(
+    unsafe_task,
+) -> None:
+    sealed = _fenced_windows_announcement_rows()
+    if unsafe_task == "dat_allowlisted":
+        from tools.qmt_host_ownership_contract import QMT_STOCK_DAILY_CANONICAL_TASK
+
+        sealed[0]["enabled"] = 0
+        dat_row = _old_row(QMT_STOCK_DAILY_CANONICAL_TASK, 111)
+        sealed.append(dat_row)
+    payload = _qmt_rollback_payload(
+        sealed[1:1 + len(QMT_OPERATION_TASKS)], announcement_rows=sealed[:1]
+    )
+    if unsafe_task == "dat_allowlisted":
+        # Exercise the restorer's defense separately from the snapshot parser.
+        identity = (dat_row["task_type"], dat_row["script_path"])
+        payload["identities"] = (*payload["identities"], identity)
+        payload["rows"][identity] = dat_row
+    live = [{**row, "enabled": 0} for row in sealed]
+    if unsafe_task == "running_announcement":
+        live[0]["last_run_status"] = "running"
+    engine = _RollbackEngine(live)
+
+    with pytest.raises(RuntimeError, match="Windows scheduler enabled policy requires writer fence"):
+        recovery.restore_fenced_linux_qmt_enabled_policy(
+            engine, payload, windows_instance_id="WINDOWS-52056", build_sha="a" * 40
+        )
+
+    assert engine.rows == live
+    assert not any(sql.startswith("UPDATE ") for sql, _ in engine.executions)
+
+
+
+def test_forward_recovery_rejects_live_durable_announcement_history(monkeypatch) -> None:
+    sealed = _fenced_windows_announcement_rows()
+    live = [{**row, "enabled": 0} for row in sealed]
+    live[0]["last_run_status"] = "blocked"
+    payload = _qmt_rollback_payload(sealed[1:], announcement_rows=sealed[:1])
+    engine = _RollbackEngine(live)
+    engine.running_history_task_ids.add(127)
+    instance_id, build_sha = "WINDOWS-52056", "a" * 40
+    _stub_dat_only_writer_proof(
+        monkeypatch, instance_id=instance_id, build_sha=build_sha, writers=[instance_id]
+    )
+
+    with pytest.raises(RuntimeError, match="Windows scheduler enabled policy requires writer fence"):
+        recovery.restore_fenced_linux_qmt_enabled_policy(
+            engine, payload, windows_instance_id=instance_id, build_sha=build_sha
+        )
+
+    assert engine.rows == live
+    assert not any(sql.startswith("UPDATE ") for sql, _ in engine.executions)
+    assert [
+        set(params["task_ids"])
+        for sql, params in engine.executions
+        if sql.startswith("SELECT task_id FROM st_scheduled_task_history ")
+    ] == [{127}]
 
 
 def test_old_governance_projection_verifies_after_additive_schema_expansion() -> None:
@@ -1144,7 +1330,18 @@ controlled_guard_assert_file() { test -f "$1" && test ! -L "$1"; }
 activation_snapshot_validate() { test "$1" = exact; }
 activation_snapshot_phase() { echo "$phase"; }
 seal() { sha256sum "$1" | cut -d' ' -f1 > "$1.sha"; }
-controlled_guard_governance_contract_snapshot() { echo "$1:${4:-}" >> actions; }
+controlled_guard_governance_contract_snapshot() {
+  case "$1:$4" in
+    verify:forward-governance)
+      test "$#" -eq 5 || return 1
+      ;;
+    restore-enabled-policy:rollback-qmt)
+      test "$#" -eq 6 && test -z "$5" && test "$6" = WINDOWS-52056 || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  printf '%s:%s:%s\n' "$1" "$4" "${6:-}" >> actions
+}
 controlled_guard_capture_forward_task_snapshot() {
   test ! -e "$2"
   echo "$2" > "$2"
@@ -1165,11 +1362,11 @@ echo bad > governance.sha
 if controlled_guard_complete_forward_task_snapshots exact; then exit 4; fi
 test ! -e actions
 seal governance
-controlled_guard_complete_forward_task_snapshots exact
+controlled_guard_complete_forward_task_snapshots exact WINDOWS-52056
 test "$(cat governance)" = unchanged
 test "$(cat qmt-announcement)" = qmt-announcement
-test "$(cat actions)" = $'verify:forward-governance\\nrestore-enabled-policy:rollback-qmt'
-controlled_guard_complete_forward_task_snapshots exact
+test "$(cat actions)" = $'verify:forward-governance:\\nrestore-enabled-policy:rollback-qmt:WINDOWS-52056'
+controlled_guard_complete_forward_task_snapshots exact WINDOWS-52056
 test "$(wc -l < actions)" -eq 2
 """
     script = tmp_path / "missing-forward-task-snapshots.sh"

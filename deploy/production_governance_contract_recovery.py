@@ -11,11 +11,12 @@ from __future__ import annotations
 import argparse
 from datetime import time, timedelta
 import json
+import os
 import re
 import sys
 from typing import Any, TextIO
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 
 from server.common.batch_db import quote_identifier
 from server.common.scheduler_tasks import TASK_PAYLOAD_COLUMNS
@@ -169,6 +170,8 @@ def _static_failure_code(error: Exception) -> str:
         return "update-rowcount"
     if message.startswith("governance runtime or audit fields changed"):
         return "volatile-drift"
+    if message.startswith("Windows scheduler enabled policy requires writer fence"):
+        return "writer-fence"
     if message.startswith("unsupported governance contract action"):
         return "contract-shape"
     return "database-runtime"
@@ -893,18 +896,47 @@ def reconcile_forward_qmt_snapshot(engine, payload, *, action):
             "ignored_runtime_diff_fields":ignored}
 
 
-def restore_fenced_linux_qmt_enabled_policy(engine, payload):
-    """Replay enabled bits while the exact Windows writer remains online."""
+def _verify_dat_only_policy_fence(connection, *, windows_instance_id, build_sha):
+    """Prove the guarded Linux peer cannot authorize full Windows dispatch."""
+    from server.common.qmt_edge_release_receipt import check_qmt_edge_release_activation
+    from server.common.scheduler_runtime_health import check_qmt_windows_edge_identity
+    from server.common.scheduler_tasks import read_fresh_scheduler_writers_on_connection
+
+    if (not windows_instance_id or not re.fullmatch(r"[0-9a-f]{40}", build_sha)
+            or build_sha == "0" * 40):
+        raise RuntimeError("Windows scheduler enabled policy requires writer fence")
+    granted, activation = check_qmt_edge_release_activation(
+        connection, expected_build_sha=build_sha
+    )
+    ready, identity = check_qmt_windows_edge_identity(
+        connection, expected_build_sha=build_sha
+    )
+    current = identity.get("current") or {}
+    writers = read_fresh_scheduler_writers_on_connection(connection)
+    if (not granted or activation.get("status") != "READY"
+            or activation.get("activation_granted") is not True or not ready
+            or current.get("instance_id") != windows_instance_id
+            or len(writers) != 1 or writers[0].get("instance_id") != windows_instance_id):
+        raise RuntimeError("Windows scheduler enabled policy requires writer fence")
+
+
+def restore_fenced_linux_qmt_enabled_policy(
+    engine, payload, *, windows_instance_id: str = "", build_sha: str = ""
+):
+    """Replay sealed enabled bits only for tasks the surviving writer cannot run."""
     from server.api.scheduler_runtime import (
         SCHEDULER_OWNER_LINUX,
         SCHEDULER_OWNER_WINDOWS_QMT,
         scheduler_task_host_owner,
     )
+    from tools.qmt_host_ownership_contract import QMT_DATADIR_DIRECT_TASK_TYPES
 
     if engine.dialect.name != "mysql" or payload.get("snapshot_kind") != "rollback-qmt":
         raise RuntimeError("invalid sealed rollback scheduler snapshot")
-    columns = ("id", "task_type", "script_path", "script_args", "group_name", "enabled")
+    columns = ("id", "task_type", "script_path", "script_args", "group_name",
+               "enabled", "last_run_status")
     changes = []
+    windows_task_ids = []
     with engine.begin() as connection:
         _require_innodb(connection)
         live_columns = _require_schema_columns(connection, set(columns))
@@ -923,13 +955,33 @@ def restore_fenced_linux_qmt_enabled_policy(engine, payload):
             owner = scheduler_task_host_owner(current)
             if owner == SCHEDULER_OWNER_WINDOWS_QMT:
                 if (expected is None
-                    or (expected["task_type"], expected["script_path"]) != identity
-                    or (prior, actual) != (0, 0)):
+                    or (expected["task_type"], expected["script_path"]) != identity):
                     raise RuntimeError("Windows scheduler enabled policy requires writer fence")
+                if (prior, actual) == (0, 0):
+                    continue
+                # The Linux unit guard remains installed. Without a live Linux
+                # activation, the exact Windows writer can only run DAT tasks.
+                if (not windows_instance_id or identity[0] in QMT_DATADIR_DIRECT_TASK_TYPES
+                        or str(current["last_run_status"] or "").strip().lower() == "running"):
+                    raise RuntimeError("Windows scheduler enabled policy requires writer fence")
+                windows_task_ids.append(current["id"])
             elif owner != SCHEDULER_OWNER_LINUX:
                 raise RuntimeError("scheduler enabled policy owner is unavailable")
-            elif actual != prior:
+            if actual != prior:
                 changes.append((identity, current["id"], prior))
+        if windows_task_ids:
+            _verify_dat_only_policy_fence(
+                connection, windows_instance_id=windows_instance_id, build_sha=build_sha
+            )
+            active_history = connection.execute(
+                text(
+                    "SELECT task_id FROM st_scheduled_task_history "
+                    "WHERE task_id IN :task_ids AND status='running' LIMIT 1 FOR UPDATE"
+                ).bindparams(bindparam("task_ids", expanding=True)),
+                {"task_ids": windows_task_ids},
+            ).first()
+            if active_history is not None:
+                raise RuntimeError("Windows scheduler enabled policy requires writer fence")
         for identity, task_id, enabled in changes:
             preserve_updated_at = ",`updated_at`=`updated_at`" if "updated_at" in live_columns else ""
             params = {**_identity_payload(identity), "restore_id": task_id, "enabled": enabled}
@@ -1145,7 +1197,12 @@ def main(argv: list[str] | None = None) -> int:
         ),
         default="forward-governance",
     )
+    parser.add_argument("--windows-instance-id", default="")
     args = parser.parse_args(argv)
+    if args.windows_instance_id and (
+        args.action != "restore-enabled-policy" or args.snapshot_kind != "rollback-qmt"
+    ):
+        parser.error("Windows writer identity requires QMT enabled policy recovery")
     try:
         if args.snapshot_kind == "forward-governance":
             expected = _read_snapshot(sys.stdin)
@@ -1157,7 +1214,10 @@ def main(argv: list[str] | None = None) -> int:
         engine = create_tool_engine()
         try:
             if args.action == "restore-enabled-policy":
-                result = restore_fenced_linux_qmt_enabled_policy(engine, expected)
+                result = restore_fenced_linux_qmt_enabled_policy(
+                    engine, expected, windows_instance_id=args.windows_instance_id,
+                    build_sha=os.environ.get("PROBIGA_EXPECTED_GIT_SHA", ""),
+                )
             elif args.snapshot_kind == "forward-governance":
                 result = reconcile_contract(engine, expected, action=args.action)
             elif args.snapshot_kind == "forward-qmt":
