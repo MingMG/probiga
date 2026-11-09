@@ -5635,11 +5635,13 @@ controlled_guard_governance_contract_snapshot() {
   local snapshot="$3"
   local snapshot_kind="${4:-forward-governance}"
   local partial="${5:-}"
+  local windows_instance="${6:-}"
   local code_root="$CODE_RELEASE_ROOT/$guarded_sha"
   local release_venv="$RELEASE_VENV_ROOT/$guarded_sha"
   local gate_output=""
   local service_user adata_sha adata_tree_sha adata_source
   local release_tree_sha adapter_registry_seal_sha tool_digest
+  local -a policy_args=()
   GOVERNANCE_CONTRACT_FAILURE_CODE=""
   case "$action" in
     restore|verify) ;;
@@ -5648,6 +5650,10 @@ controlled_guard_governance_contract_snapshot() {
       ;;
     *) GOVERNANCE_CONTRACT_FAILURE_CODE=action; return 1 ;;
   esac
+  if [ -n "$windows_instance" ]; then
+    test "$action:$snapshot_kind" = restore-enabled-policy:rollback-qmt || return 1
+    policy_args=(--windows-instance-id "$windows_instance")
+  fi
   case "$snapshot_kind:$snapshot" in
     "forward-governance:$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT"|\
     "forward-qmt:$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT")
@@ -5776,7 +5782,7 @@ controlled_guard_governance_contract_snapshot() {
         PYTHONPATH="$adata_source:$code_root" \
         "$release_venv/bin/python" -P \
         "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" "$action" \
-          "$snapshot_kind" < "$snapshot"
+          "$snapshot_kind" "${policy_args[@]}" < "$snapshot"
     ) 2>&1
   )"; then
     local ignored_line
@@ -5821,6 +5827,8 @@ controlled_guard_governance_contract_snapshot() {
       GOVERNANCE_CONTRACT_FAILURE_CODE=update-rowcount ;;
     *"probiga_governance_contract_failure=volatile-drift"*)
       GOVERNANCE_CONTRACT_FAILURE_CODE=volatile-drift ;;
+    *"probiga_governance_contract_failure=writer-fence"*)
+      GOVERNANCE_CONTRACT_FAILURE_CODE=writer-fence ;;
     *"probiga_governance_contract_failure=database-runtime"*)
       GOVERNANCE_CONTRACT_FAILURE_CODE=database-runtime ;;
     *) GOVERNANCE_CONTRACT_FAILURE_CODE=runner ;;
@@ -9289,7 +9297,7 @@ controlled_guard_capture_forward_task_snapshot() (
   activation_snapshot_install_task_new "$work/sealed-input.json" "$snapshot" "$sha" "$kind"
 )
 controlled_guard_complete_forward_task_snapshots() {
-  local guarded_sha="$1" state
+  local guarded_sha="$1" state windows_instance="${2:-}"
   state="$(controlled_guard_forward_task_snapshot_state "$guarded_sha")" || return 1
   case "$state" in
     complete) return 0 ;;
@@ -9304,7 +9312,8 @@ controlled_guard_complete_forward_task_snapshots() {
   esac
   if [[ "$state" = *:missing ]]; then
     controlled_guard_governance_contract_snapshot restore-enabled-policy "$guarded_sha" \
-      "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT" rollback-qmt || return 1
+      "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT" rollback-qmt "" \
+      "$windows_instance" || return 1
   fi
   if [[ "$state" = missing:* ]]; then
     controlled_guard_capture_forward_task_snapshot "$guarded_sha" governance || return 1
@@ -9492,7 +9501,8 @@ controlled_database_guard_recovery() {
       controlled_guard_assert_boundary "$guarded_sha" "$main_record" \
         "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
     fi
-    controlled_guard_complete_forward_task_snapshots "$guarded_sha" || return 1
+    controlled_guard_complete_forward_task_snapshots "$guarded_sha" \
+      "$forward_windows_instance" || return 1
     controlled_guard_governance_contract_snapshot verify "$guarded_sha" \
       "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || return 1
     controlled_v2_forward_preserve_no_receipt_recovery "$forward_windows_instance" || return 1
