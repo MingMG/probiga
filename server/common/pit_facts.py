@@ -386,6 +386,60 @@ def canonical_hash(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
+def _cninfo_cutoff_partition_valid(
+    receipt: Mapping[str, Any], *, requested_end_time: str,
+    raw_count: int, retained_count: int,
+) -> bool:
+    """Prove the exact-time partition of one exhaustive CNINFO date query."""
+    if "excluded_after_cutoff" not in receipt:
+        return raw_count == retained_count
+    excluded = receipt["excluded_after_cutoff"]
+    if (
+        not isinstance(excluded, list)
+        or not excluded
+        or retained_count < 0
+        or raw_count != retained_count + len(excluded)
+        or raw_count > CNINFO_MAX_PAGES_PER_STOCK * 30
+        or re.fullmatch(r"[0-9]{14}", requested_end_time) is None
+        or requested_end_time.endswith("235959")
+    ):
+        return False
+    try:
+        cutoff = datetime.strptime(requested_end_time, "%Y%m%d%H%M%S")
+    except ValueError:
+        return False
+    seen: set[str] = set()
+    for row in excluded:
+        if not isinstance(row, Mapping) or set(row) != {
+            "source_event_id", "published_at", "source_row_hash",
+        }:
+            return False
+        event_id, published_text, raw_hash = (
+            row["source_event_id"], row["published_at"], row["source_row_hash"],
+        )
+        if (
+            not isinstance(event_id, str) or not 1 <= len(event_id) <= 512
+            or event_id != event_id.strip() or event_id in seen
+            or not isinstance(raw_hash, str) or not _HASH_RE.fullmatch(raw_hash)
+            or not isinstance(published_text, str)
+        ):
+            return False
+        try:
+            published_at = datetime.fromisoformat(published_text)
+        except ValueError:
+            return False
+        if (
+            published_at.tzinfo is not None
+            or published_at.isoformat(sep=" ", timespec="microseconds") != published_text
+            or published_at.microsecond % 1000
+            or published_at.date() != cutoff.date()
+            or published_at <= cutoff
+        ):
+            return False
+        seen.add(event_id)
+    return True
+
+
 def _fallback_event_receipt_valid(
     evidence: Mapping[str, Any],
     *,
@@ -449,6 +503,11 @@ def _fallback_event_receipt_valid(
         extra_count = int(receipt.get("directory_catalog_extra_count"))
     except (TypeError, ValueError, OverflowError):
         return False
+    if not _cninfo_cutoff_partition_valid(
+        receipt, requested_end_time=str(evidence.get("query_end_time") or ""),
+        raw_count=total, retained_count=result_count,
+    ):
+        return False
     page_hashes = receipt.get("page_sha256")
     first_anchor = str(receipt.get("first_page_anchor_sha256") or "")
     last_anchor = str(receipt.get("last_page_anchor_sha256") or "")
@@ -475,6 +534,8 @@ def _fallback_event_receipt_valid(
         "last_page_sha256": last_anchor,
         "first_page_recheck_sha256": first_page_recheck,
     }
+    if "excluded_after_cutoff" in receipt:
+        pagination_payload["excluded_after_cutoff"] = receipt["excluded_after_cutoff"]
     date_shard_manifest = receipt.get("date_shard_manifest")
     date_shard_manifest_hash = str(
         receipt.get("date_shard_manifest_sha256") or ""
@@ -534,8 +595,7 @@ def _fallback_event_receipt_valid(
     })
     catalog_count = int(evidence.get("catalog_member_count") or 0)
     common_pagination_valid = bool(
-        total == result_count
-        and expected_pages == page_count
+        expected_pages == page_count
         and max_pages == CNINFO_MAX_PAGES_PER_STOCK
         and 1 <= page_count <= max_pages
         and reported_pages == total // 30
@@ -693,7 +753,7 @@ def _fallback_event_receipt_valid(
                 and page_count == date_shard_count
                 and expected_pages == date_shard_count
                 and page_hashes == shard_hashes
-                and shard_total == total == result_count
+                and shard_total == total
                 and date_shard_manifest_hash == expected_shard_hash
                 and date_shard_recheck_hash == expected_shard_hash
                 and split_version == CNINFO_DATE_SHARD_SPLIT_VERSION

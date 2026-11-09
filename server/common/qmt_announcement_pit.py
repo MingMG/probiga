@@ -578,6 +578,13 @@ def _fallback_receipt_valid(
         max_pages = int(receipt.get("max_pages_per_stock"))
     except (TypeError, ValueError, OverflowError):
         return False
+    from server.common.pit_facts import _cninfo_cutoff_partition_valid
+
+    if not _cninfo_cutoff_partition_valid(
+        receipt, requested_end_time=requested_end_time,
+        raw_count=provider_total, retained_count=result_count,
+    ):
+        return False
     page_hashes = receipt.get("page_sha256")
     master_start = str(receipt.get("security_master_sha256") or "")
     first_anchor = str(receipt.get("first_page_anchor_sha256") or "")
@@ -635,6 +642,8 @@ def _fallback_receipt_valid(
         "last_page_sha256": last_anchor,
         "first_page_recheck_sha256": first_page_recheck,
     }
+    if "excluded_after_cutoff" in receipt:
+        pagination_payload["excluded_after_cutoff"] = receipt["excluded_after_cutoff"]
     shard_mode = pagination_mode == (
         "EXACT_STOCK_DATE_SHARDS_DOUBLE_ATTESTED"
     )
@@ -654,8 +663,7 @@ def _fallback_receipt_valid(
         })
     expected_pagination_hash = canonical_hash(pagination_payload)
     common_pagination_valid = bool(
-        provider_total == result_count
-        and expected_pages == page_count
+        expected_pages == page_count
         and max_pages == CNINFO_MAX_PAGES_PER_STOCK
         and 1 <= page_count <= max_pages
         and reported_pages == provider_total // 30
@@ -826,7 +834,7 @@ def _fallback_receipt_valid(
                 and page_count == date_shard_count
                 and expected_pages == date_shard_count
                 and page_hashes == shard_hashes
-                and shard_total == provider_total == result_count
+                and shard_total == provider_total
                 and date_shard_manifest_hash == expected_shard_hash
                 and date_shard_recheck_hash == expected_shard_hash
                 and split_version == CNINFO_DATE_SHARD_SPLIT_VERSION
@@ -1544,6 +1552,18 @@ def _load_catalog(engine: Engine, fact_cutoff_at: datetime) -> AnnouncementCatal
     )
 
 
+def _cninfo_directory_identity(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, Mapping):
+        return None
+    identity = {
+        field: str(value.get(field) or "")
+        for field in (
+            "directory_raw_sha256", "directory_manifest_hash", "directory_member_set_hash",
+        )
+    }
+    return identity if all(_SHA256_RE.fullmatch(item) for item in identity.values()) else None
+
+
 def _find_resumable_checkpoint(
     engine: Engine,
     *,
@@ -1555,8 +1575,9 @@ def _find_resumable_checkpoint(
     coverage_target_date: date | str | None,
     coverage_window_start: date,
     capture_window_start: date,
-) -> tuple[datetime, AnnouncementCatalog] | None:
-    candidates: list[tuple[int, datetime, Path, dict[str, Any]]] = []
+    cninfo_directory: dict[str, str] | None = None,
+) -> tuple[datetime, AnnouncementCatalog, dict[str, str] | None] | None:
+    candidates: list[tuple[int, datetime, Path, dict[str, Any], str | None]] = []
     try:
         manifests = list(Path(checkpoint_root).glob("*/manifest.json"))
     except OSError:
@@ -1585,12 +1606,12 @@ def _find_resumable_checkpoint(
             }
         except OSError:
             staged_codes = set()
-        candidates.append((len(staged_codes), cutoff, path, payload))
+        candidates.append((len(staged_codes), cutoff, path, payload, min(staged_codes, default=None)))
     # Prefer the valid capture with the most already-proven members.  A later
     # retry may have created a fresh cutoff before failing; choosing it merely
     # because it is newer would discard safe staging and repeat source work.
     candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    for _staged_count, cutoff, path, payload in candidates:
+    for _staged_count, cutoff, path, payload, first_staged_code in candidates:
         try:
             catalog = _load_catalog(engine, cutoff)
         except Exception:
@@ -1629,6 +1650,12 @@ def _find_resumable_checkpoint(
             "catalog_batch_id": catalog.batch_id,
             "catalog_member_set_hash": catalog.member_set_hash,
         }
+        bound_directory = None
+        if cninfo_directory is not None and "cninfo_directory_identity" in payload:
+            bound_directory = _cninfo_directory_identity(payload["cninfo_directory_identity"])
+            if bound_directory is None:
+                continue
+            expected_seed["cninfo_directory_identity"] = bound_directory
         expected_batch_id = (
             f"{source_prefix}-{cutoff.strftime('%Y%m%dT%H%M%S')}-"
             f"{canonical_hash(expected_seed)[:16]}"
@@ -1650,7 +1677,30 @@ def _find_resumable_checkpoint(
             and payload.get("coverage_window_start")
             == expected_coverage_start.isoformat()
         ):
-            return cutoff, catalog
+            if cninfo_directory is not None:
+                if bound_directory is not None:
+                    if bound_directory != cninfo_directory:
+                        continue
+                else:
+                    # Existing manifests did not bind the directory. Authenticate
+                    # one staged member before treating its directory as the anchor.
+                    if first_staged_code is None:
+                        continue
+                    receipt = AnnouncementCheckpoint(path.parent, payload).load_provider_receipt(first_staged_code)
+                    staged_directory = _cninfo_directory_identity(receipt)
+                    if (
+                        staged_directory is None
+                        or receipt.get("security_master_sha256") != staged_directory["directory_manifest_hash"]
+                        or receipt.get("source") != source
+                        or receipt.get("stock_code") != first_staged_code
+                        or receipt.get("qmt_code") != catalog.qmt_by_code[first_staged_code]
+                    ):
+                        raise QMTAnnouncementBlocked(
+                            "QMT_ANNOUNCEMENT_FALLBACK_RECEIPT_INVALID", first_staged_code,
+                        )
+                    if staged_directory != cninfo_directory:
+                        continue
+            return cutoff, catalog, bound_directory
     return None
 
 
@@ -3818,6 +3868,15 @@ def synchronize_qmt_announcements(
         if parent_proof is not None
         else coverage_window_start
     )
+    cninfo_directory = None
+    if source_name == CNINFO_ANNOUNCEMENT_SOURCE:
+        _connect_announcement_transport(xtdata, source=source_name)
+        read_directory = getattr(xtdata, "capture_directory_identity", None)
+        if callable(read_directory):
+            cninfo_directory = _cninfo_directory_identity(read_directory())
+        if cninfo_directory is None:
+            raise QMTAnnouncementBlocked("ANNOUNCEMENT_FALLBACK_DIRECTORY_IDENTITY_UNAVAILABLE")
+    bound_directory = cninfo_directory
     if resume:
         resumable = _find_resumable_checkpoint(
             engine,
@@ -3829,9 +3888,10 @@ def synchronize_qmt_announcements(
             coverage_target_date=coverage_target_date,
             coverage_window_start=coverage_window_start,
             capture_window_start=capture_window_start,
+            cninfo_directory=cninfo_directory,
         )
         if resumable is not None:
-            fact_cutoff, catalog = resumable
+            fact_cutoff, catalog, bound_directory = resumable
             baseline_results, parent_proof = (
                 _load_incremental_announcement_baseline(
                     engine,
@@ -3866,6 +3926,10 @@ def synchronize_qmt_announcements(
         "catalog_batch_id": catalog.batch_id,
         "catalog_member_set_hash": catalog.member_set_hash,
     }
+    directory_manifest = (
+        {"cninfo_directory_identity": bound_directory} if bound_directory is not None else {}
+    )
+    seed.update(directory_manifest)
     batch_prefix = {
         QMT_ANNOUNCEMENT_SOURCE: "qmt-ann",
         CNINFO_ANNOUNCEMENT_SOURCE: "cninfo-ann",
@@ -3888,9 +3952,11 @@ def synchronize_qmt_announcements(
         fallback_reason=fallback_code,
         coverage_target_date=coverage_target,
         coverage_window_start=window_start,
+        manifest_extra=directory_manifest,
     )
     try:
-        _connect_announcement_transport(xtdata, source=source_name)
+        if cninfo_directory is None:
+            _connect_announcement_transport(xtdata, source=source_name)
         if source_name != QMT_ANNOUNCEMENT_SOURCE:
             restored_receipts: dict[str, dict[str, Any]] = {}
             for code in catalog.codes:

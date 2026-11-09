@@ -958,6 +958,15 @@ class CninfoMarketAnnouncementProvider:
                 self._master_start_captured_at = captured_at
             return self._master_by_code
 
+    def capture_directory_identity(self) -> dict[str, str]:
+        """Bind checkpoint selection to the same directory used for fetching."""
+        self._ensure_security_master()
+        return {
+            "directory_raw_sha256": self._master_raw_hash,
+            "directory_manifest_hash": self._master_start_hash,
+            "directory_member_set_hash": self._master_member_set_hash,
+        }
+
     def _post_page(
         self,
         *,
@@ -1431,6 +1440,7 @@ class CninfoMarketAnnouncementProvider:
         )
         captured_at = self._now_fn().replace(tzinfo=None)
         rows: list[dict[str, Any]] = []
+        excluded_after_cutoff: list[dict[str, str]] = []
         seen: set[tuple[str, str]] = set()
         previous_time: datetime | None = None
         for raw in raw_rows:
@@ -1445,7 +1455,6 @@ class CninfoMarketAnnouncementProvider:
                 or not event_id
                 or not title
                 or not start_at.date() <= published_at.date() <= cutoff.date()
-                or published_at > cutoff
             ):
                 raise AnnouncementProviderError(
                     "ANNOUNCEMENT_FALLBACK_ROW_INVALID", code
@@ -1463,15 +1472,26 @@ class CninfoMarketAnnouncementProvider:
                 )
             seen.add(row_identity)
             previous_time = published_at
+            published_text = published_at.isoformat(sep=" ", timespec="microseconds")
+            source_row_hash = _canonical_hash(raw)
+            if published_at > cutoff:
+                # The provider's date-only query includes the rest of this
+                # calendar day. Keep raw pagination evidence for those rows.
+                if cutoff.strftime("%H%M%S") == "235959" or len(event_id) > 512:
+                    raise AnnouncementProviderError("ANNOUNCEMENT_FALLBACK_ROW_INVALID", code)
+                excluded_after_cutoff.append({
+                    "source_event_id": event_id,
+                    "published_at": published_text,
+                    "source_row_hash": source_row_hash,
+                })
+                continue
             rows.append({
                 "stock_code": code,
                 "qmt_code": instrument,
                 "announcement_id": event_id,
                 "announcementTime": raw.get("announcementTime"),
                 "notice_date": published_at.date().isoformat(),
-                "published_at": published_at.isoformat(
-                    sep=" ", timespec="microseconds"
-                ),
+                "published_at": published_text,
                 "source_published_text": str(raw.get("announcementTime")),
                 "title": title,
                 "detail_url": (
@@ -1482,8 +1502,9 @@ class CninfoMarketAnnouncementProvider:
                 "provider_captured_at": captured_at.isoformat(
                     sep=" ", timespec="microseconds"
                 ),
-                "source_row_hash": _canonical_hash(raw),
+                "source_row_hash": source_row_hash,
             })
+        cutoff_proof = {"excluded_after_cutoff": excluded_after_cutoff} if excluded_after_cutoff else {}
         page_hashes = (
             [str(item["page_sha256"]) for item in date_shard_manifest]
             if date_shard_manifest
@@ -1507,6 +1528,7 @@ class CninfoMarketAnnouncementProvider:
             "first_page_sha256": first_anchor,
             "last_page_sha256": last_anchor,
             "first_page_recheck_sha256": first_page_recheck,
+            **cutoff_proof,
             **({
                 "date_shard_manifest_sha256": date_shard_manifest_sha256,
                 "date_shard_recheck_sha256": date_shard_recheck_sha256,
@@ -1557,6 +1579,7 @@ class CninfoMarketAnnouncementProvider:
                 if date_shard_manifest else ""
             ),
             "rows": rows,
+            **cutoff_proof,
         })
         with self._fetched_lock:
             if code in self._fetched_codes:
@@ -1583,6 +1606,7 @@ class CninfoMarketAnnouncementProvider:
             "max_pages_per_stock": CNINFO_MAX_PAGES_PER_STOCK,
             "result_count": len(rows),
             "provider_total_record_count": total_records,
+            **cutoff_proof,
             "provider_reported_totalpages": reported_totalpages,
             "page_sha256": page_hashes,
             "first_page_anchor_sha256": first_anchor,
@@ -1831,6 +1855,12 @@ class ProviderBackedAnnouncementAdapter:
     def connect(self, *, port: int, remember_if_success: bool) -> None:
         if remember_if_success is not False or not 1 <= int(port) <= 65535:
             raise RuntimeError("announcement fallback connection contract differs")
+
+    def capture_directory_identity(self) -> dict[str, str]:
+        reader = getattr(self._provider, "capture_directory_identity", None)
+        if not callable(reader):
+            raise AnnouncementProviderError("ANNOUNCEMENT_FALLBACK_DIRECTORY_IDENTITY_UNAVAILABLE")
+        return reader()
 
     def download_history_data(
         self,

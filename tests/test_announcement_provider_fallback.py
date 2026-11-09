@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from copy import deepcopy
 from datetime import date, datetime, timedelta
 import json
 import threading
@@ -19,6 +20,7 @@ from server.common.announcement_provider import (
 from server.common.qmt_announcement_pit import (
     ANNOUNCEMENT_FALLBACK_REASON_CODES,
     AnnouncementCatalog,
+    AnnouncementCheckpoint,
     CNINFO_ANNOUNCEMENT_SOURCE,
     HistoricalReconstructionContext,
     QMT_ANNOUNCEMENT_RECONSTRUCTION_AUTHORITY_V3_SCHEMA,
@@ -28,6 +30,7 @@ from server.common.qmt_announcement_pit import (
     _validate_reconstruction_context,
     _explicit_qmt_unavailability_reason,
     _fallback_receipt_valid,
+    canonical_hash,
     synchronize_historical_cninfo_announcements,
     synchronize_qmt_announcements,
     validate_complete_historical_reconstruction_batch,
@@ -76,6 +79,14 @@ def _row_on_date(code: str, index: int, day: date) -> dict:
         "announcementTitle": f"announcement {day:%Y%m%d}-{index}",
         "adjunctUrl": f"finalpage/{code}-{day:%Y%m%d}-{index}.PDF",
     }
+
+
+def _row_at(code: str, index: int, published_at: datetime) -> dict:
+    row = _row_on_date(code, index, published_at.date())
+    row["announcementTime"] = round(
+        published_at.replace(tzinfo=ZoneInfo("Asia/Shanghai")).timestamp() * 1000
+    )
+    return row
 
 
 class _Response:
@@ -1703,8 +1714,126 @@ def test_cninfo_rejects_provider_row_after_historical_target_cutoff() -> None:
     assert exc.value.reason_code == "ANNOUNCEMENT_FALLBACK_ROW_INVALID"
 
 
-def test_cninfo_failed_stock_resumes_same_cutoff_with_staged_receipt(
-    monkeypatch, tmp_path
+@pytest.mark.parametrize("extra_rows", [0, 30])
+def test_cninfo_same_date_late_rows_keep_raw_pagination_and_atomic_pit_proof(
+    tmp_path, monkeypatch, extra_rows,
+) -> None:
+    code = "000877"
+    cutoff = datetime(2026, 11, 9, 18, 30, 31)
+    raw_rows = [
+        _row_at(code, index, published_at)
+        for index, published_at in enumerate((
+            cutoff + timedelta(minutes=10), cutoff + timedelta(milliseconds=1),
+            cutoff, cutoff - timedelta(seconds=1), cutoff - timedelta(hours=2),
+            cutoff - timedelta(days=1), cutoff - timedelta(days=29),
+        ))
+    ]
+    raw_rows.extend(_row_on_date(code, index, date(2026, 10, 20)) for index in range(extra_rows))
+    master = _master(code)
+    catalog = AnnouncementCatalog(
+        batch_id="cninfo-intraday-catalog", manifest_hash="a" * 64, member_set_hash="b" * 64,
+        codes=(code,), qmt_by_code={code: f"{code}.SZ"},
+    )
+    monkeypatch.setattr("server.common.qmt_announcement_pit._load_catalog", lambda *_: catalog)
+    provider = CninfoMarketAnnouncementProvider(
+        client=_Client(masters=[master, master], rows_by_code={code: raw_rows}),
+        minimum_request_interval=0, now_fn=lambda: cutoff + timedelta(minutes=11),
+    )
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    ensure_pit_fact_schema(engine)
+    result = synchronize_qmt_announcements(
+        engine, xtdata=ProviderBackedAnnouncementAdapter(provider), checkpoint_root=tmp_path,
+        source=CNINFO_ANNOUNCEMENT_SOURCE, fallback_reason=next(iter(ANNOUNCEMENT_FALLBACK_REASON_CODES)),
+        capture_fact_cutoff_at=cutoff, now_fn=lambda: cutoff + timedelta(minutes=12),
+    )
+    assert result["status"] == "COMPLETE"
+    assert result["event_count"] == 5 + extra_rows
+    with engine.connect() as connection:
+        payload = json.loads(connection.execute(text("SELECT payload_json FROM st_pit_source_coverage")).scalar_one())
+        event_ids = connection.execute(text("SELECT event_key FROM st_pit_event_revision")).scalars().all()
+    assert set(event_ids) == {f"cninfo:{row['announcementId']}" for row in raw_rows[2:]}
+    evidence = payload["watermark"]["evidence"]
+    receipt = evidence["provider_receipt"]
+    assert receipt["provider_total_record_count"] == 7 + extra_rows
+    assert receipt["result_count"] == 5 + extra_rows
+    assert receipt["excluded_after_cutoff"] == [
+        {
+            "source_event_id": row["announcementId"],
+            "published_at": published_at.isoformat(sep=" ", timespec="microseconds"),
+            "source_row_hash": canonical_hash(row),
+        }
+        for row, published_at in zip(raw_rows, (cutoff + timedelta(minutes=10), cutoff + timedelta(milliseconds=1)))
+    ]
+    if extra_rows:
+        assert sum(shard["result_count"] for shard in receipt["date_shard_manifest"]) == 7 + extra_rows
+    else:
+        assert receipt["page_sha256"] == [canonical_hash(raw_rows)]
+
+    def both_accept(candidate):
+        return (
+            _fallback_receipt_valid(
+                candidate, source=CNINFO_ANNOUNCEMENT_SOURCE, stock_code=code, qmt_code=f"{code}.SZ",
+                requested_start_time="20261010000000", requested_end_time="20261109183031",
+                result_count=5 + extra_rows, catalog_codes=(code,),
+            ),
+            _fallback_event_receipt_valid(
+                {**evidence, "provider_receipt": candidate, "provider_receipt_hash": pit_canonical_hash(candidate)},
+                source=CNINFO_ANNOUNCEMENT_SOURCE, stock_code=code, result_count=5 + extra_rows,
+            ),
+        )
+
+    assert both_accept(receipt) == (True, True)
+    altered = deepcopy(receipt)
+    altered["excluded_after_cutoff"][0]["source_row_hash"] = "0" * 64
+    assert both_accept(altered) == (False, False)
+    if not extra_rows:
+        altered = deepcopy(receipt)
+        altered["excluded_after_cutoff"][0]["published_at"] = cutoff.isoformat(sep=" ", timespec="microseconds")
+        altered["pagination_sha256"] = canonical_hash({
+            "pagination_mode": altered["pagination_mode"],
+            "total_record_count": altered["provider_total_record_count"],
+            "reported_totalpages": altered["provider_reported_totalpages"],
+            "page_count": altered["page_count"],
+            "page_sha256": altered["page_sha256"],
+            "last_page_has_more": altered["last_page_has_more"],
+            "first_page_sha256": altered["first_page_anchor_sha256"],
+            "last_page_sha256": altered["last_page_anchor_sha256"],
+            "first_page_recheck_sha256": altered["first_page_recheck_sha256"],
+            "excluded_after_cutoff": altered["excluded_after_cutoff"],
+        })
+        assert both_accept(altered) == (False, False)
+    for excluded in ([], receipt["excluded_after_cutoff"][:1], [receipt["excluded_after_cutoff"][0]] * 2):
+        assert both_accept({**receipt, "excluded_after_cutoff": excluded}) == (False, False)
+    engine.dispose()
+
+
+@pytest.mark.parametrize("damage, reason", [
+    ("wrong_stock", "ANNOUNCEMENT_FALLBACK_ROW_INVALID"),
+    ("missing_title", "ANNOUNCEMENT_FALLBACK_ROW_INVALID"),
+    ("duplicate", "ANNOUNCEMENT_FALLBACK_PAGINATION_CHANGED"),
+])
+def test_cninfo_same_date_cutoff_does_not_hide_bad_source_rows(damage, reason) -> None:
+    code = "000877"
+    cutoff = datetime(2026, 11, 9, 18, 30, 31)
+    late = _row_at(code, 0, cutoff + timedelta(hours=2))
+    if damage == "wrong_stock":
+        late["secCode"] = "000001"
+    if damage == "missing_title":
+        late["announcementTitle"] = ""
+    raw_rows = [late]
+    if damage == "duplicate":
+        raw_rows.append(_row_at(code, 0, cutoff))
+    provider = _provider(_Client(masters=[_master(code)], rows_by_code={code: raw_rows}))
+    with pytest.raises(AnnouncementProviderError, match=reason):
+        provider.fetch(
+            stock_code=code, qmt_code=f"{code}.SZ",
+            requested_start_time="20261010000000", requested_end_time="20261109183031",
+        )
+
+
+@pytest.mark.parametrize("retry_scope", ["same", "changed", "legacy-same", "legacy-changed", "legacy-tampered"])
+def test_cninfo_failed_stock_resumes_only_matching_directory(
+    monkeypatch, tmp_path, retry_scope,
 ) -> None:
     cutoff = datetime(2026, 8, 29, 9, 0)
     master = _master("000001", "600519")
@@ -1748,38 +1877,82 @@ def test_cninfo_failed_stock_resumes_same_cutoff_with_staged_receipt(
     assert first_client.requested_stock_identities == ["000001,org-000001"]
     staged = list(tmp_path.glob("cninfo-ann-*/results/*.json"))
     assert [path.stem for path in staged] == ["000001"]
+    checkpoint_root = tmp_path
+    staged_path = staged[0]
+    first_batch_id = first["batch_id"]
+    if retry_scope.startswith("legacy-"):
+        # Reproduce the exact pre-directory manifest and batch identifier.
+        checkpoint_root = tmp_path / "legacy-root"
+        manifest = json.loads((staged_path.parents[1] / "manifest.json").read_bytes())
+        seed = {
+            "schema": "probiga.qmt-announcement-batch-id.v2",
+            **{field: manifest[field] for field in (
+                "source", "primary_source", "fallback_reason", "fact_cutoff_at",
+                "coverage_target_date", "window_end", "catalog_batch_id", "catalog_member_set_hash",
+            )},
+            "window_start": manifest["coverage_window_start"],
+            "capture_window_start": manifest["window_start"],
+        }
+        first_batch_id = f"cninfo-ann-{cutoff:%Y%m%dT%H%M%S}-{canonical_hash(seed)[:16]}"
+        legacy = AnnouncementCheckpoint.open(
+            checkpoint_root, batch_id=first_batch_id, fact_cutoff_at=cutoff,
+            window_start=date.fromisoformat(manifest["window_start"]),
+            window_end=cutoff.date(), catalog=catalog, resume=True,
+            source=CNINFO_ANNOUNCEMENT_SOURCE, fallback_reason=fallback_reason,
+        )
+        result = json.loads(staged_path.read_bytes())
+        legacy.save("000001", result["events"], provider_receipt=result["provider_receipt"])
+        staged_path = legacy.root / "results" / "000001.json"
+        if retry_scope == "legacy-tampered":
+            staged_path.write_text(staged_path.read_text(encoding="utf-8").replace('org-000001', 'bad-org'), encoding="utf-8")
+    first_checkpoint = staged_path.parents[1]
+    preserved = {path: path.read_bytes() for path in first_checkpoint.rglob("*.json")}
     unrelated = tmp_path / "zz-unrelated-checkpoint"
     unrelated.mkdir()
     (unrelated / "manifest.json").write_text(
         '{"schema":"unrelated"}', encoding="utf-8"
     )
 
-    second_client = _Client(
-        masters=[master, master], rows_by_code={"600519": []}
-    )
+    changed = retry_scope.endswith("changed")
+    second_master = _master("000001", "000002", "600519") if changed else master
+    second_client = _Client(masters=[second_master, second_master], rows_by_code={"600519": []})
     second_provider = CninfoMarketAnnouncementProvider(
         client=second_client,
         minimum_request_interval=0,
         now_fn=lambda: cutoff + timedelta(seconds=3),
     )
-    second = synchronize_qmt_announcements(
-        engine,
+    retry = dict(
         xtdata=ProviderBackedAnnouncementAdapter(second_provider, workers=1),
-        checkpoint_root=tmp_path,
+        checkpoint_root=checkpoint_root,
         now_fn=lambda: cutoff + timedelta(seconds=4),
         source=CNINFO_ANNOUNCEMENT_SOURCE,
         fallback_reason=fallback_reason,
-        capture_fact_cutoff_at=cutoff + timedelta(seconds=2),
+        capture_fact_cutoff_at=cutoff if changed else cutoff + timedelta(seconds=2),
         resume=True,
         batch_size=100,
     )
+    if retry_scope == "legacy-tampered":
+        with pytest.raises(QMTAnnouncementBlocked, match="CHECKPOINT_RESULT_MIXED_OR_TAMPERED"):
+            synchronize_qmt_announcements(engine, **retry)
+        assert second_client.requested_stock_identities == []
+        return
+    second = synchronize_qmt_announcements(engine, **retry)
 
     assert second["status"] == "COMPLETE"
     assert second["fact_cutoff_at"] == cutoff.isoformat(
         timespec="microseconds"
     )
     assert second["coverage_count"] == 2
-    assert second_client.requested_stock_identities == ["600519,org-600519"]
+    assert second_client.get_count == 2  # start and final anchors, no extra fetch
+    assert second_client.requested_stock_identities == (
+        ["000001,org-000001", "600519,org-600519"] if changed else ["600519,org-600519"]
+    )
+    assert (second["batch_id"] != first_batch_id) is changed
+    assert all(path.read_bytes() == raw for path, raw in preserved.items())
+    assert (first_checkpoint / "complete.json").exists() is not changed
+    assert (checkpoint_root / second["batch_id"] / "complete.json").exists()
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT COUNT(*) FROM st_pit_source_coverage")).scalar_one() == 2
 
 
 @pytest.mark.parametrize("deadline_expires", [False, True])
