@@ -12,7 +12,7 @@ DDL/triggers; a runtime run refuses an absent or drifted schema.
 """
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -25,7 +25,9 @@ import math
 import os
 from pathlib import Path
 import re
+import socket
 import tempfile
+import threading
 from time import monotonic
 from types import MappingProxyType
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
@@ -111,6 +113,11 @@ HISTORICAL_CAPTURE_DEADLINE = "QMT_ANNOUNCEMENT_RECONSTRUCTION_CAPTURE_DEADLINE"
 HISTORICAL_PUBLISH_DEADLINE = "QMT_ANNOUNCEMENT_RECONSTRUCTION_PUBLISH_DEADLINE"
 PUBLISH_COMMIT_UNKNOWN = "QMT_ANNOUNCEMENT_PUBLISH_COMMIT_UNKNOWN"
 VALIDATION_READ_BATCH_SIZE = 40
+LIVE_ANNOUNCEMENT_BATCH_QUERY_TIMEOUT_MS = 60_000
+LIVE_ANNOUNCEMENT_BATCH_VALIDATION_BUDGET_SECONDS = 15 * 60
+LIVE_ANNOUNCEMENT_BATCH_VALIDATION_DEADLINE = "QMT_ANNOUNCEMENT_LIVE_BATCH_VALIDATION_DEADLINE"
+LIVE_ANNOUNCEMENT_BATCH_REPLY_DEADLINE = "QMT_ANNOUNCEMENT_LIVE_BATCH_REPLY_DEADLINE"
+LIVE_ANNOUNCEMENT_BATCH_REPLY_FAILED = "QMT_ANNOUNCEMENT_LIVE_BATCH_REPLY_FAILED"
 _CODE_RE = re.compile(r"^(?:0|3|4|6|8|9)\d{5}$")
 _QMT_CODE_RE = re.compile(r"^(?:0|3|4|6|8|9)\d{5}\.(?:SH|SZ|BJ)$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -2160,6 +2167,174 @@ def _batch_root_from_entries(
     return canonical_hash(payload)
 
 
+def _live_announcement_payload_evidence(row: Mapping[str, Any]) -> tuple[dict, dict]:
+    raw = str(row.get("payload_json") or "")
+    payload = json.loads(raw)
+    if canonical_json(payload) != raw:
+        raise ValueError("coverage payload is not canonical")
+    watermark = payload.get("watermark")
+    evidence = watermark.get("evidence") if isinstance(watermark, dict) else None
+    if (
+        not isinstance(evidence, dict)
+        or row.get("watermark_kind") != "QUERY_CUTOFF"
+        or watermark.get("kind") != "QUERY_CUTOFF"
+    ):
+        raise ValueError("batch lacks query-cutoff evidence")
+    return payload, evidence
+
+
+def _live_announcement_read_hint(*, mysql: bool, deadline: float, stage: str) -> str:
+    remaining_ms = int((deadline - monotonic()) * 1_000)
+    if remaining_ms <= 0:
+        raise QMTAnnouncementBlocked(LIVE_ANNOUNCEMENT_BATCH_VALIDATION_DEADLINE, stage)
+    return (
+        f"/*+ MAX_EXECUTION_TIME({min(remaining_ms, LIVE_ANNOUNCEMENT_BATCH_QUERY_TIMEOUT_MS)}) */ "
+        if mysql else ""
+    )
+
+
+@contextmanager
+def _live_announcement_reply_budget(connection: Any, *, deadline: float, stage: str):
+    """Bound execute and the full reply on this checked-out MySQL connection."""
+    started = monotonic()
+    remaining = deadline - started
+    if remaining <= 0:
+        raise QMTAnnouncementBlocked(LIVE_ANNOUNCEMENT_BATCH_VALIDATION_DEADLINE, stage)
+    if connection.dialect.name != "mysql":
+        yield
+        return
+    dbapi = getattr(getattr(connection, "connection", None), "dbapi_connection", None)
+    original = {
+        name: getattr(dbapi, name) for name in ("_read_timeout", "_write_timeout")
+        if hasattr(dbapi, name)
+    }
+    call_limit = min(
+        remaining, LIVE_ANNOUNCEMENT_BATCH_QUERY_TIMEOUT_MS / 1_000,
+        *(value for value in original.values() if value is not None),
+    )
+    call_deadline = started + call_limit
+    expired = threading.Event()
+    sock = getattr(dbapi, "_sock", None)
+
+    def abort_reply() -> None:
+        expired.set()
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        # On Windows shutdown alone may not interrupt a timed receive.
+        # PyMySQL's buffered makefile also defers a normal socket close.
+        try:
+            descriptor = sock.detach()
+            if descriptor >= 0:
+                socket.close(descriptor)
+        except OSError:
+            pass
+
+    def check_reply(exc: Exception | None = None) -> None:
+        observed = monotonic()
+        if expired.is_set() or observed >= call_deadline:
+            if sock is not None and not getattr(connection, "invalidated", False):
+                if not expired.is_set():
+                    abort_reply()
+                try:
+                    connection.invalidate()
+                except SQLAlchemyError:
+                    logger.warning("Announcement reply connection invalidation failed at %s", stage)
+            reason = (
+                LIVE_ANNOUNCEMENT_BATCH_VALIDATION_DEADLINE if observed >= deadline
+                else LIVE_ANNOUNCEMENT_BATCH_REPLY_DEADLINE
+            )
+            raise QMTAnnouncementBlocked(reason, stage) from exc
+        errno = getattr(getattr(exc, "orig", None), "args", ())
+        if errno and errno[0] == 3024:
+            raise QMTAnnouncementBlocked(LIVE_ANNOUNCEMENT_BATCH_REPLY_DEADLINE, stage) from exc
+        if getattr(exc, "connection_invalidated", False) or getattr(connection, "invalidated", False):
+            raise QMTAnnouncementBlocked(LIVE_ANNOUNCEMENT_BATCH_REPLY_FAILED, stage) from exc
+
+    for name in original:
+        setattr(dbapi, name, call_limit)
+    watchdog = None
+    if sock is not None:
+        watchdog = threading.Timer(max(0.0, call_deadline - monotonic()), abort_reply)
+        watchdog.daemon = True
+        watchdog.start()
+    try:
+        try:
+            yield
+        finally:
+            if watchdog is not None:
+                watchdog.cancel()
+                watchdog.join()
+            for name, value in original.items():
+                setattr(dbapi, name, value)
+    except Exception as exc:
+        check_reply(exc)
+        raise
+    check_reply()
+
+
+def _read_live_announcement_payload_rows(
+    connection: Any, *, source: str, batch_id: str,
+    coverage_ids: Sequence[str], deadline: float, stage: str,
+) -> list[dict[str, Any]]:
+    from server.common.pit_facts import _coverage_payload_columns, _coverage_payload_row
+
+    mysql = connection.dialect.name == "mysql"
+    timeout_hint = _live_announcement_read_hint(mysql=mysql, deadline=deadline, stage=stage)
+    index_hint = " FORCE INDEX (PRIMARY)" if mysql else ""
+    statement = text(
+        f"SELECT {timeout_hint}{_coverage_payload_columns(mysql)} FROM st_pit_source_coverage{index_hint} "
+        "WHERE fact_kind='event' AND source=:source AND batch_id=:batch_id AND coverage_id IN :coverage_ids"
+    ).bindparams(bindparam("coverage_ids", expanding=True)).execution_options(stream_results=True)
+    with _live_announcement_reply_budget(connection, deadline=deadline, stage=stage):
+        with connection.execute(statement, {
+            "source": source, "batch_id": batch_id, "coverage_ids": coverage_ids,
+        }) as result:
+            packed_rows = result.mappings().all()
+    return [
+        _coverage_payload_row(row, mysql=mysql, stage="announcement_live_batch")
+        for row in packed_rows
+    ]
+
+
+def _load_live_announcement_batch_rows(
+    connection: Any,
+    *,
+    source: str,
+    batch_id: str,
+    catalog_codes: Sequence[str],
+    deadline: float,
+) -> Iterator[dict[str, Any]]:
+    """Prove complete batch membership before bounded primary-key payload reads."""
+    mysql = connection.dialect.name == "mysql"
+    timeout_hint = _live_announcement_read_hint(mysql=mysql, deadline=deadline, stage="batch-inventory")
+    # Inventory is deliberately unfiltered by requested codes or knowledge
+    # time so extra, duplicate and out-of-window members cannot be hidden.
+    with _live_announcement_reply_budget(connection, deadline=deadline, stage="batch-inventory"):
+        keys = connection.execute(
+            text(
+                f"SELECT {timeout_hint}coverage_id, stock_code FROM st_pit_source_coverage "
+                "WHERE fact_kind='event' AND source=:source AND batch_id=:batch_id "
+                "ORDER BY stock_code LIMIT :inventory_limit"
+            ),
+            {"source": source, "batch_id": batch_id, "inventory_limit": len(catalog_codes) + 1},
+        ).tuples().all()
+    if [str(code).zfill(6) for _, code in keys] != sorted(catalog_codes):
+        raise ValueError("batch stock set differs from catalog")
+    for offset in range(0, len(keys), VALIDATION_READ_BATCH_SIZE):
+        expected = keys[offset : offset + VALIDATION_READ_BATCH_SIZE]
+        rows = _read_live_announcement_payload_rows(
+            connection, source=source, batch_id=batch_id,
+            coverage_ids=[coverage_id for coverage_id, _ in expected],
+            deadline=deadline, stage=f"batch-payload:{offset}",
+        )
+        for key, row in zip(expected, sorted(rows, key=lambda row: row["stock_code"]), strict=True):
+            if tuple(key) != (row["coverage_id"], row["stock_code"]):
+                raise ValueError("batch coverage row differs from inventory")
+            yield row
+
+
 def validate_complete_qmt_announcement_batch(
     engine: Engine,
     *,
@@ -2204,30 +2379,35 @@ def validate_complete_qmt_announcement_batch(
     end = date.fromisoformat(str(window_end)[:10])
     if start > end:
         raise ValueError("QMT announcement validation window is invalid")
-    statement = text(
-        "SELECT batch_id, stock_code, known_at FROM st_pit_source_coverage "
-        "WHERE fact_kind='event' AND source=:source "
-        "AND watermark_kind='QUERY_CUTOFF' "
-        "AND stock_code IN :codes AND known_at<=:decision_at "
-        "AND received_at<=:decision_at AND coverage_status='COMPLETE' "
-        "AND window_start<=:window_start AND window_end>=:window_end "
-        "ORDER BY known_at DESC, batch_id DESC"
-    ).bindparams(bindparam("codes", expanding=True))
+    deadline = monotonic() + LIVE_ANNOUNCEMENT_BATCH_VALIDATION_BUDGET_SECONDS
     try:
         with engine.connect() as connection:
-            required_rows = [
-                dict(row)
-                for row in connection.execute(
-                    statement,
-                    {
-                        "source": source_name,
-                        "codes": requested_codes,
-                        "decision_at": decision,
-                        "window_start": start,
-                        "window_end": end,
-                    },
-                ).mappings()
-            ]
+            mysql = connection.dialect.name == "mysql"
+            if mysql:
+                with _live_announcement_reply_budget(connection, deadline=deadline, stage="snapshot-isolation"):
+                    if str(connection.get_isolation_level()).upper() not in {"REPEATABLE READ", "SERIALIZABLE"}:
+                        connection = connection.execution_options(isolation_level="REPEATABLE READ")
+            timeout_hint = _live_announcement_read_hint(
+                mysql=mysql, deadline=deadline, stage="candidate-discovery",
+            )
+            statement = text(
+                f"SELECT {timeout_hint}batch_id, stock_code, known_at FROM st_pit_source_coverage "
+                "WHERE fact_kind='event' AND source=:source "
+                "AND watermark_kind='QUERY_CUTOFF' "
+                "AND stock_code IN :codes AND known_at<=:decision_at "
+                "AND received_at<=:decision_at AND coverage_status='COMPLETE' "
+                "AND window_start<=:window_start AND window_end>=:window_end "
+                "ORDER BY known_at DESC, batch_id DESC"
+            ).bindparams(bindparam("codes", expanding=True))
+            with _live_announcement_reply_budget(connection, deadline=deadline, stage="candidate-discovery"):
+                required_rows = connection.execute(statement, {
+                    "source": source_name,
+                    "codes": requested_codes,
+                    "decision_at": decision,
+                    "window_start": start,
+                    "window_end": end,
+                }).mappings().all()
+            _live_announcement_read_hint(mysql=False, deadline=deadline, stage="candidate-discovery")
             by_batch: dict[str, dict[str, dict[str, Any]]] = {}
             for row in required_rows:
                 batch_id = str(row.get("batch_id") or "")
@@ -2251,44 +2431,24 @@ def validate_complete_qmt_announcement_batch(
             failure_codes: list[str] = []
             for candidate in candidates:
                 try:
-                    rows = [
-                        dict(row)
-                        for row in connection.execute(
-                            text(
-                                "SELECT * FROM st_pit_source_coverage "
-                                "WHERE fact_kind='event' AND source=:source "
-                                "AND batch_id=:batch_id ORDER BY stock_code"
-                            ),
-                            {
-                                "source": source_name,
-                                "batch_id": candidate,
-                            },
-                        ).mappings()
-                    ]
-                    if not rows:
+                    timeout_hint = _live_announcement_read_hint(
+                        mysql=mysql, deadline=deadline, stage="first-member-inventory",
+                    )
+                    with _live_announcement_reply_budget(connection, deadline=deadline, stage="first-member-inventory"):
+                        first_id = connection.execute(text(
+                            f"SELECT {timeout_hint}coverage_id FROM st_pit_source_coverage "
+                            "WHERE fact_kind='event' AND source=:source AND batch_id=:batch_id "
+                            "ORDER BY stock_code LIMIT 1"
+                        ), {"source": source_name, "batch_id": candidate}).scalar_one_or_none()
+                    if first_id is None:
                         raise ValueError("batch has no coverage rows")
-                    if len({str(row["stock_code"]) for row in rows}) != len(rows):
-                        raise ValueError("batch contains duplicate stock coverage")
-                    payloads = []
-                    for row in rows:
-                        raw = str(row.get("payload_json") or "")
-                        payload = json.loads(raw)
-                        if canonical_json(payload) != raw:
-                            raise ValueError("coverage payload is not canonical")
-                        watermark = payload.get("watermark")
-                        evidence = (
-                            watermark.get("evidence")
-                            if isinstance(watermark, dict)
-                            else None
-                        )
-                        if (
-                            not isinstance(evidence, dict)
-                            or row.get("watermark_kind") != "QUERY_CUTOFF"
-                            or watermark.get("kind") != "QUERY_CUTOFF"
-                        ):
-                            raise ValueError("batch lacks query-cutoff evidence")
-                        payloads.append((row, payload, evidence))
-                    first_evidence = payloads[0][2]
+                    first_rows = _read_live_announcement_payload_rows(
+                        connection, source=source_name, batch_id=candidate, coverage_ids=[first_id],
+                        deadline=deadline, stage="first-member-payload",
+                    )
+                    if len(first_rows) != 1 or first_rows[0]["coverage_id"] != first_id:
+                        raise ValueError("batch first coverage row differs from inventory")
+                    _, first_evidence = _live_announcement_payload_evidence(first_rows[0])
                     incremental_proof = first_evidence.get(
                         "incremental_proof"
                     )
@@ -2332,11 +2492,10 @@ def validate_complete_qmt_announcement_batch(
                     catalog_batch_id = str(
                         first_evidence.get("catalog_batch_id") or ""
                     )
-                    catalog = load_stock_catalog(
-                        connection,
-                        batch_id=catalog_batch_id,
-                        decision_known_at=event_cutoff,
-                    )
+                    with _live_announcement_reply_budget(connection, deadline=deadline, stage="stock-catalog"):
+                        catalog = load_stock_catalog(
+                            connection, batch_id=catalog_batch_id, decision_known_at=event_cutoff,
+                        )
                     catalog_codes = catalog.eligible_codes(
                         event_cutoff.date().isoformat()
                     )
@@ -2346,10 +2505,7 @@ def validate_complete_qmt_announcement_batch(
                         ).upper()
                         for member in catalog.members
                     }
-                    row_codes = [str(row["stock_code"]).zfill(6) for row in rows]
-                    if row_codes != sorted(catalog_codes):
-                        raise ValueError("batch stock set differs from catalog")
-                    if not set(requested_codes).issubset(row_codes):
+                    if not set(requested_codes).issubset(catalog_codes):
                         raise ValueError("required scope is absent from batch")
                     persisted_start = date.fromisoformat(
                         str(first_evidence.get("window_start"))[:10]
@@ -2367,7 +2523,11 @@ def validate_complete_qmt_announcement_batch(
                     entries: list[dict[str, Any]] = []
                     cninfo_directory_anchors: set[tuple[Any, ...]] = set()
                     root = str(first_evidence.get("global_batch_root_hash") or "")
-                    for row, payload, evidence in payloads:
+                    for row in _load_live_announcement_batch_rows(
+                        connection, source=source_name, batch_id=candidate,
+                        catalog_codes=catalog_codes, deadline=deadline,
+                    ):
+                        payload, evidence = _live_announcement_payload_evidence(row)
                         provider_receipt = evidence.get("provider_receipt")
                         provider_receipt_hash = str(
                             evidence.get("provider_receipt_hash") or ""
@@ -2529,18 +2689,19 @@ def validate_complete_qmt_announcement_batch(
                         parent_received = _dt(
                             incremental_proof.get("parent_received_at")
                         )
-                        parent_row = connection.execute(
-                            text(
-                                "SELECT payload_json FROM "
-                                "st_pit_source_coverage "
-                                "WHERE fact_kind='event' AND source=:source "
-                                "AND batch_id=:batch_id LIMIT 1"
-                            ),
-                            {
-                                "source": source_name,
-                                "batch_id": parent_batch_id,
-                            },
-                        ).mappings().first()
+                        timeout_hint = _live_announcement_read_hint(
+                            mysql=mysql, deadline=deadline, stage="incremental-parent",
+                        )
+                        with _live_announcement_reply_budget(connection, deadline=deadline, stage="incremental-parent"):
+                            parent_row = connection.execute(
+                                text(
+                                    f"SELECT {timeout_hint}payload_json FROM "
+                                    "st_pit_source_coverage "
+                                    "WHERE fact_kind='event' AND source=:source "
+                                    "AND batch_id=:batch_id LIMIT 1"
+                                ),
+                                {"source": source_name, "batch_id": parent_batch_id},
+                            ).mappings().first()
                         if (
                             capture_start == persisted_start
                             or not parent_batch_id
@@ -2579,6 +2740,7 @@ def validate_complete_qmt_announcement_batch(
                             "QMT_ANNOUNCEMENT_FULL_MARKET_ALL_EMPTY_UNPROVEN",
                             candidate,
                         )
+                    _live_announcement_read_hint(mysql=False, deadline=deadline, stage="batch-verified")
                     return {
                         "schema": QMT_ANNOUNCEMENT_BATCH_SCHEMA,
                         "status": "COMPLETE",
@@ -2612,8 +2774,16 @@ def validate_complete_qmt_announcement_batch(
                         "catalog_member_count": len(catalog_codes),
                     }
                 except QMTAnnouncementBlocked as exc:
+                    if exc.reason_code in {
+                        LIVE_ANNOUNCEMENT_BATCH_VALIDATION_DEADLINE,
+                        LIVE_ANNOUNCEMENT_BATCH_REPLY_DEADLINE,
+                        LIVE_ANNOUNCEMENT_BATCH_REPLY_FAILED,
+                    }:
+                        raise
+                    _live_announcement_read_hint(mysql=False, deadline=deadline, stage="candidate-read")
                     failure_codes.append(exc.reason_code)
                 except Exception as exc:
+                    _live_announcement_read_hint(mysql=False, deadline=deadline, stage="candidate-read")
                     failure_codes.append(type(exc).__name__)
             if failure_codes and set(failure_codes) == {
                 "QMT_ANNOUNCEMENT_FULL_MARKET_ALL_EMPTY_UNPROVEN"
