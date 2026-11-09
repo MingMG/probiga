@@ -32,21 +32,26 @@ state_path=Path(sys.argv[2]); state=json.loads(state_path.read_text())
 action=sys.argv[3]; args=sys.argv[4:]
 def save(): state_path.write_text(json.dumps(state))
 if action=="control":
-    mode=args[3]; target=args[2]; attempt=args[4]; prior=args[5]
+    mode=args[3]; target=args[2]; attempt=args[4]; prior=args[5]; prior_linux=args[6]
     state["events"].append(mode)
     if mode=="--abort-precutover":
+        assert args[:3]==["/target","/venvs/"+target,target]
+        assert prior==target and prior_linux=="a"*40 and args[7]=="c"*40
         state["held"]=False; state["aborted"]=True; save()
         print(json.dumps({"status":"inserted","mode":"abort-precutover"})); sys.exit(0)
     base=dict(mode=mode[2:],build_sha=target,prior_build_sha=prior,
-              deployment_attempt_id=attempt,activation_granted=False)
+              prior_linux_build_sha=prior_linux, deployment_attempt_id=attempt,
+              activation_granted=False)
+    actual_prior="e"*40 if state["scenario"] in {"split_granted","split_forward"} else prior
     if mode=="--request-forward-quiescence":
-        if state["scenario"] in {"wrong_forward","forward"}:
+        if state["scenario"] in {"wrong_forward","forward","split_forward"}:
             state["held"]=True; save()
             context=dict(schema="probiga.qmt-edge-forward-only-supersession.v1",
                 protocol="probiga.qmt-edge-forward-only-supersession.v1",scope="FORWARD_ONLY_SUPERSESSION",
-                build_sha=target,original_prior_build_sha=(prior if state["scenario"]=="forward" else "f"*40),
+                build_sha=target,original_prior_build_sha=("f"*40 if state["scenario"]=="wrong_forward" else actual_prior),
                 deployment_attempt_id=attempt,real_order=False)
-            print(json.dumps(dict(base,status="inserted",database_writes=True,context=context)))
+            print(json.dumps(dict(base,status="inserted",database_writes=True,context=context,
+                                  handoff_prior_build_sha=actual_prior)))
         else:
             save()
             print(json.dumps(dict(base,status="not_applicable",database_writes=False,context=None)))
@@ -54,12 +59,13 @@ if action=="control":
         state["held"]=True; save()
         context=dict(schema="probiga.qmt-edge-precutover-context.v1",
             protocol="probiga.qmt-edge-precutover-recovery.v1",build_sha=target,
-            prior_build_sha=prior,deployment_attempt_id=attempt,prior_running=True,
+            prior_build_sha=actual_prior,deployment_attempt_id=attempt,prior_running=True,
             prior_host_name="windows",prior_pid=33320,prior_instance_id="windows-33320",real_order=False)
         if state["scenario"]=="bad_identity": context["prior_build_sha"]="f"*40
         if state["scenario"]=="lost_ack":
             print(json.dumps({"status":"UNAVAILABLE","reason":"lost_commit_ack"})); sys.exit(2)
-        print(json.dumps(dict(base,status="inserted",database_writes=True,context=context)))
+        print(json.dumps(dict(base,status="inserted",database_writes=True,context=context,
+                              handoff_prior_build_sha=actual_prior)))
     sys.exit(0)
 if action=="active": sys.exit(1 if state["linux_stopped"] else 0)
 if action in {"stop","start"}:
@@ -125,6 +131,7 @@ def _run(tmp_path, scenario, *, request=True):
     # Remove the closing if of this extracted production pre-cutover branch.
     rollback = rollback.rsplit("  fi\n",1)[0]
     harness = f'''set -Eeuo pipefail
+export MSYS2_ARG_CONV_EXCL='*'
 RELEASE_SCOPE=COORDINATED
 EXPECTED_SHA={'b'*40}
 PREVIOUS_SHA={'a'*40}
@@ -179,8 +186,9 @@ def test_fresh_windows_heartbeat_reproduces_original_deployment_failure(tmp_path
     assert "fence_passed" not in state["events"]
 
 
-def test_exact_hold_drains_windows_before_linux_stop_and_both_writer_checks_pass(tmp_path):
-    result,state = _run(tmp_path,"healthy")
+@pytest.mark.parametrize("scenario", ["healthy", "split_granted"])
+def test_exact_hold_drains_windows_before_linux_stop_and_both_writer_checks_pass(tmp_path, scenario):
+    result,state = _run(tmp_path,scenario)
     assert result.returncode == 0, result.stdout + result.stderr
     assert state["events"] == ["--request-forward-quiescence","--request-recoverable-quiescence","wait_passed","stop","wait_passed","fence_passed"]
     assert state["held"] and not state["aborted"]
@@ -217,8 +225,9 @@ def test_forward_hold_from_another_original_prior_fails_without_fresh_fallback(t
     assert "fence_passed" not in state["events"]
 
 
-def test_matching_forward_hold_reuses_existing_pending_chain_without_fresh_handoff(tmp_path):
-    result,state = _run(tmp_path,"forward")
+@pytest.mark.parametrize("scenario", ["forward", "split_forward"])
+def test_matching_forward_hold_reuses_existing_pending_chain_without_fresh_handoff(tmp_path, scenario):
+    result,state = _run(tmp_path,scenario)
     assert result.returncode == 0, result.stdout + result.stderr
     assert state["events"] == ["--request-forward-quiescence","wait_passed","stop","wait_passed","fence_passed"]
     assert state["held"] and not state["aborted"]
