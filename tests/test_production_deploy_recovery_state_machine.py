@@ -45,6 +45,265 @@ def _function(name: str, body: str) -> str:
     return f"{name}() {{\n{body}\n}}\n"
 
 
+def test_early_guard_recovery_restores_exact_scheduler_task_plan(tmp_path: Path) -> None:
+    from tools import scheduler_task_release
+
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the scheduler task plan recovery test")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    dispatch = source.index(
+        '\nif [ "$DEPLOY_OPERATION" = recover-database-guard ]; then\n'
+        '  V2_RECOVERY_STEP=dispatch\n'
+    )
+    early = _shell_function_bodies(source[:dispatch])
+    task_plan_restore = "controlled_guard_restore_scheduler_task_plan"
+    governance_restore = "controlled_guard_restore_and_verify_governance_snapshot"
+    functions = "".join(
+        _function(name, early[name])
+        for name in (task_plan_restore, governance_restore) if name in early
+    ).replace(
+        "/usr/bin/python3.14", '"$TEST_PYTHON"'
+    )
+
+    guarded_sha, previous_sha = "a" * 40, "b" * 40
+    task = dict.fromkeys(scheduler_task_release.FIELDS, "")
+    task.update(
+        task_name="Recovery fixture", task_type="fixture_task", enabled=1,
+        interval_minutes=0, sort_order=1, cron_time="1 20 * * *",
+    )
+    plan = scheduler_task_release.build_plan(
+        [task], [{**task, "cron_time": "2 20 * * *"}],
+        previous_sha=previous_sha, target_sha=guarded_sha,
+    )
+    before = {
+        "schema": scheduler_task_release.SNAPSHOT_SCHEMA,
+        "plan_sha256": plan["plan_sha256"],
+        "rows": {"fixture_task": {"id": 17, **task}},
+    }
+    before["snapshot_sha256"] = scheduler_task_release._hash(before)
+    artifact_dir = tmp_path / "artifacts" / guarded_sha
+    artifact_dir.mkdir(parents=True)
+    (artifact_dir / f"scheduler-task-release-{previous_sha}.json").write_text(
+        json.dumps(plan), encoding="utf-8",
+    )
+    (artifact_dir / f"scheduler-task-before-{previous_sha}.json").write_text(
+        json.dumps(before), encoding="utf-8",
+    )
+    helper = tmp_path / "releases" / guarded_sha / "tools" / "scheduler_task_release.py"
+    helper.parent.mkdir(parents=True)
+    shutil.copyfile(ROOT / "tools/scheduler_task_release.py", helper)
+
+    harness = f"""
+set -euo pipefail
+TEST_ROOT={tmp_path.as_posix()!r}
+TEST_PYTHON={Path(sys.executable).as_posix()!r}
+GUARDED_SHA={guarded_sha!r}
+PREVIOUS_SHA={previous_sha!r}
+RELEASE_ARTIFACT_ROOT="$TEST_ROOT/artifacts"
+CODE_RELEASE_ROOT="$TEST_ROOT/releases"
+RELEASE_VENV_ROOT="$TEST_ROOT/venvs"
+ADATA_RUNTIME_ROOT="$TEST_ROOT/adata"
+ACTIVATION_GOVERNANCE_OLD_SNAPSHOT="$TEST_ROOT/governance-old"
+ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT="$TEST_ROOT/qmt-old"
+VENV="$RELEASE_VENV_ROOT/$GUARDED_SHA"
+mkdir -p "$VENV/bin"
+printf '#!/bin/bash\nexit 99\n' > "$VENV/bin/python"
+chmod +x "$VENV/bin/python"
+printf '%s\n' {'c' * 40} > "$VENV/.adata.gitsha"
+printf '%s\n' {'d' * 64} > "$VENV/.adata.tree.sha256"
+unset BOOTSTRAP_PYTHON SERVICE_USER
+activation_snapshot_old_release() {{
+  test "$1" = "$GUARDED_SHA" && printf '%s\n' "$PREVIOUS_SHA"
+}}
+controlled_guard_assert_file() {{
+  test "$2" = 600 && test -f "$1" && test ! -L "$1"
+}}
+git() {{
+  test "$*" = "-C $CODE_RELEASE_ROOT/$GUARDED_SHA rev-parse HEAD" &&
+    printf '%s\n' "$GUARDED_SHA"
+}}
+systemctl() {{
+  test "$*" = "show -p User --value probiga" && printf '%s\n' recovery-service
+}}
+controlled_guard_run_service_gate_with_deadline() {{
+  test "$1:$2:$3" = recovery-service:90s:5s || return 1
+  shift 3
+  local expected
+  for expected in /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+      PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PROBIGA_DEPLOYMENT_MODE=production \
+      "PROBIGA_EXPECTED_GIT_SHA=$GUARDED_SHA" "PROBIGA_BUILD_COMMIT_SHA=$GUARDED_SHA" \
+      "PROBIGA_CODE_ROOT=$CODE_RELEASE_ROOT/$GUARDED_SHA" \
+      "PYTHONPATH=$ADATA_RUNTIME_ROOT/{'c' * 40}-{'d' * 64}:$CODE_RELEASE_ROOT/$GUARDED_SHA" \
+      "$VENV/bin/python" -P "$CODE_RELEASE_ROOT/$GUARDED_SHA/tools/scheduler_task_release.py" restore; do
+    test "$1" = "$expected" || return 1
+    shift
+  done
+  test "$#" -eq 0 || return 1
+  cat > "$TEST_ROOT/restore-packet.json"
+}}
+controlled_guard_governance_contract_snapshot() {{
+  test "$1" = verify && test "$2" = "$GUARDED_SHA" || return 1
+  case "$3:$4" in
+    "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT:rollback-governance"|\
+    "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT:rollback-qmt") return 0 ;;
+    *) return 1 ;;
+  esac
+}}
+{functions}
+controlled_guard_restore_and_verify_governance_snapshot "$GUARDED_SHA" "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT"
+test -s "$TEST_ROOT/restore-packet.json"
+mv "$TEST_ROOT/restore-packet.json" "$TEST_ROOT/restored.json"
+mv "$RELEASE_ARTIFACT_ROOT/$GUARDED_SHA/scheduler-task-before-$PREVIOUS_SHA.json" "$TEST_ROOT/sealed-before.json"
+controlled_guard_restore_and_verify_governance_snapshot "$GUARDED_SHA" "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT"
+test ! -e "$TEST_ROOT/restore-packet.json"
+"""
+    harness_path = tmp_path / "early-task-plan-recovery.sh"
+    harness_path.write_text(harness, encoding="utf-8", newline="\n")
+    completed = subprocess.run(
+        [bash, str(harness_path)],
+        check=False, capture_output=True, text=True, encoding="utf-8",
+        errors="replace", timeout=30,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert json.loads((tmp_path / "restored.json").read_text(encoding="utf-8")) == {
+        "plan": plan, "before": before,
+    }
+
+
+@pytest.mark.parametrize("restore_fails", [False, True])
+def test_newer_deploy_refences_missing_guard_and_restores_old_tasks_before_retiring(
+    tmp_path: Path, restore_fails: bool,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the fenced old-set retirement test")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    bodies = _shell_function_bodies(source)
+    functions = "".join(_function(name, bodies[name]) for name in (
+        "controlled_guard_assert_restore_file",
+        "controlled_v2_retire_fenced_old_set_for_newer_deploy",
+    ))
+    harness = rf"""
+set -euo pipefail
+exec 7>&1
+TEST_ROOT={tmp_path.as_posix()!r}
+DEPLOY_OPERATION=deploy
+EXPECTED_SHA={'c' * 40}
+GUARDED_SHA={'a' * 40}
+OLD_SHA={'b' * 40}
+GUARD_DIR="$TEST_ROOT/guard"
+DATABASE_WRITER_GUARD_DIR="$GUARD_DIR"
+DATABASE_WRITER_GUARD_FILE="$GUARD_DIR/writer-marker"
+DATABASE_WRITER_RESTORE_FILE="$GUARD_DIR/restore"
+ACTIVATION_UNIT_SNAPSHOT_DIR="$GUARD_DIR/transaction"
+ACTIVATION_GOVERNANCE_OLD_SNAPSHOT="$GUARD_DIR/governance-old"
+ACTIVATION_GOVERNANCE_OLD_SHA="$GUARD_DIR/governance-old.sha256"
+ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT="$GUARD_DIR/qmt-old"
+ACTIVATION_QMT_ANNOUNCEMENT_OLD_SHA="$GUARD_DIR/qmt-old.sha256"
+PHASE="$ACTIVATION_UNIT_SNAPSHOT_DIR/phase"
+TRACE="$TEST_ROOT/trace"
+QMT_ENABLED=0
+FENCED=0
+BOUNDARY=0
+RELOADED=0
+mkdir -p "$ACTIVATION_UNIT_SNAPSHOT_DIR"
+printf '%s\n' old-set-restored > "$PHASE"
+printf '%s\n' governance-old > "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT"
+printf '%s\n' enabled=1 > "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT"
+sha256sum "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" | cut -d' ' -f1 > "$ACTIVATION_GOVERNANCE_OLD_SHA"
+sha256sum "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT" | cut -d' ' -f1 > "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SHA"
+printf '%s\n' probiga.database-writer-restore.v1 "release=$GUARDED_SHA" \
+  main_unit=loaded,active,enabled scheduler_unit=loaded,active,enabled \
+  ai_service_unit=not-found,not-found,not-found ai_timer_unit=not-found,not-found,not-found \
+  > "$DATABASE_WRITER_RESTORE_FILE"
+cp "$DATABASE_WRITER_RESTORE_FILE" "$TEST_ROOT/expected-restore"
+record() {{ printf '%s\n' "$1" >> "$TRACE"; }}
+activation_snapshot_phase() {{ cat "$PHASE"; }}
+activation_snapshot_validate() {{ test "$1" = "$GUARDED_SHA" && test -d "$ACTIVATION_UNIT_SNAPSHOT_DIR"; }}
+activation_snapshot_assert_old_set() {{ test "$1" = "$GUARDED_SHA"; }}
+controlled_guard_assert_state_record() {{ test -n "$2"; }}
+controlled_guard_assert_file() {{ test "$2" = 600 && test -f "$1" && test ! -L "$1"; }}
+controlled_guard_assert_directory() {{ test -d "$GUARD_DIR" && record authenticate-restore; }}
+controlled_guard_recreate_file() {{
+  test "$1" = "$GUARDED_SHA" && test ! -e "$DATABASE_WRITER_GUARD_FILE" || return 1
+  printf '%s\n' "$1" > "$DATABASE_WRITER_GUARD_FILE"
+  record recreate
+}}
+controlled_guard_install_dropins() {{
+  test -f "$DATABASE_WRITER_GUARD_FILE" || return 1
+  record install-dropins
+}}
+systemctl() {{
+  test "$*" = daemon-reload || return 1
+  RELOADED=1
+  record daemon-reload
+}}
+controlled_guard_force_all_writers_fenced() {{
+  test "$RELOADED:$QMT_ENABLED" = 1:0 || return 1
+  FENCED=1
+  record fence
+}}
+controlled_guard_assert_boundary() {{
+  test "$FENCED:$QMT_ENABLED" = 1:0 || return 1
+  test "$1" = "$GUARDED_SHA" && test -f "$DATABASE_WRITER_GUARD_FILE" || return 1
+  BOUNDARY=1
+  record boundary
+}}
+controlled_guard_restore_and_verify_governance_snapshot() {{
+  test "$1:$2" = "$GUARDED_SHA:$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" || return 1
+  test "$FENCED:$BOUNDARY:$QMT_ENABLED" = 1:1:0 || return 1
+  test "$(<"$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT")" = enabled=1 || return 1
+  record restore-qmt
+  test {int(restore_fails)} -eq 0 || return 1
+  QMT_ENABLED=1
+}}
+activation_snapshot_set_phase() {{
+  test "$QMT_ENABLED" -eq 1 && test "$1:$2" = "$GUARDED_SHA:old-runtime-verified" || return 1
+  printf '%s\n' "$2" > "$PHASE"
+  record set-phase
+}}
+controlled_guard_cleanup() {{
+  test "$(<"$PHASE")" = old-runtime-verified && test "$QMT_ENABLED" -eq 1 || return 1
+  rm -f "$DATABASE_WRITER_GUARD_FILE"
+  record cleanup
+}}
+sync() {{ test "$*" = "-f $GUARD_DIR"; }}
+activation_snapshot_remove_old_runtime_verified() {{
+  test "$(<"$PHASE")" = old-runtime-verified && test ! -e "$DATABASE_WRITER_RESTORE_FILE" || return 1
+  rm -f "$PHASE"
+  rmdir "$ACTIVATION_UNIT_SNAPSHOT_DIR"
+  record retire-transaction
+}}
+{functions}
+if controlled_v2_retire_fenced_old_set_for_newer_deploy "$GUARDED_SHA" "$OLD_SHA" \
+    loaded,active,enabled loaded,active,enabled not-found,not-found,not-found not-found,not-found,not-found; then
+  test {int(restore_fails)} -eq 0 && test "$QMT_ENABLED" -eq 1 || exit 20
+  test ! -e "$DATABASE_WRITER_RESTORE_FILE" || exit 21
+else
+  test {int(restore_fails)} -eq 1 && test "$QMT_ENABLED" -eq 0 || exit 22
+  test "$(<"$PHASE")" = old-set-restored || exit 23
+  test -f "$DATABASE_WRITER_GUARD_FILE" || exit 24
+  cmp "$DATABASE_WRITER_RESTORE_FILE" "$TEST_ROOT/expected-restore" || exit 25
+fi
+"""
+    harness_path = tmp_path / "retire-fenced-old-set.sh"
+    harness_path.write_text(harness, encoding="utf-8", newline="\n")
+    completed = subprocess.run(
+        [bash, str(harness_path)],
+        check=False, capture_output=True, text=True, encoding="utf-8",
+        errors="replace", timeout=30,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    expected = [
+        "authenticate-restore", "recreate", "install-dropins", "daemon-reload",
+        "fence", "boundary", "restore-qmt",
+    ]
+    if not restore_fails:
+        expected += ["set-phase", "cleanup", "retire-transaction"]
+    assert (tmp_path / "trace").read_text(encoding="utf-8").splitlines() == expected
+
+
 def test_activation_snapshot_fault_is_retryable_and_restores_exact_old_set(
     tmp_path: Path,
 ) -> None:
