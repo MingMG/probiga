@@ -5827,6 +5827,40 @@ controlled_guard_governance_contract_snapshot() {
   esac
   return 1
 }
+controlled_guard_restore_scheduler_task_plan() {
+  local guarded_sha="$1"
+  local artifact_dir="$RELEASE_ARTIFACT_ROOT/$guarded_sha"
+  local code_root="$CODE_RELEASE_ROOT/$guarded_sha"
+  local python_path="$RELEASE_VENV_ROOT/$guarded_sha/bin/python"
+  local helper="$code_root/tools/scheduler_task_release.py"
+  local bootstrap_python=/usr/bin/python3.14
+  local previous_sha plan before service_user
+  local adata_sha adata_tree adata_source
+  [[ "$guarded_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  previous_sha="$(activation_snapshot_old_release "$guarded_sha")" || return 1
+  [[ "$previous_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  plan="$artifact_dir/scheduler-task-release-$previous_sha.json"
+  before="$artifact_dir/scheduler-task-before-$previous_sha.json"
+  # No before-image means this release never acquired authority to change this task scope.
+  if [ ! -e "$before" ] && [ ! -L "$before" ]; then return 0; fi
+  controlled_guard_assert_file "$plan" 600 || return 1
+  controlled_guard_assert_file "$before" 600 || return 1
+  test -d "$code_root" && test ! -L "$code_root" || return 1
+  test "$(git -C "$code_root" rev-parse HEAD)" = "$guarded_sha" || return 1
+  test -x "$bootstrap_python" && test -x "$python_path" || return 1
+  test -f "$helper" && test ! -L "$helper" || return 1
+  adata_sha="$(<"$RELEASE_VENV_ROOT/$guarded_sha/.adata.gitsha")" || return 1
+  adata_tree="$(<"$RELEASE_VENV_ROOT/$guarded_sha/.adata.tree.sha256")" || return 1
+  adata_source="$ADATA_RUNTIME_ROOT/$adata_sha-$adata_tree"
+  service_user="$(systemctl show -p User --value probiga)" || return 1
+  test -n "$service_user" && test "$service_user" != root || return 1
+  "$bootstrap_python" -I "$helper" bundle --plan "$plan" --before "$before" | \
+    controlled_guard_run_service_gate_with_deadline "$service_user" 90s 5s \
+    /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
+    PROBIGA_DEPLOYMENT_MODE=production PROBIGA_EXPECTED_GIT_SHA="$guarded_sha" \
+    PROBIGA_BUILD_COMMIT_SHA="$guarded_sha" PROBIGA_CODE_ROOT="$code_root" \
+    "PYTHONPATH=$adata_source:$code_root" "$python_path" -P "$helper" restore
+}
 controlled_guard_restore_and_verify_governance_snapshot() {
   # Most rollback attempts fail before the scheduler row is changed.  Prove
   # that case first and avoid unnecessary database writes.  A mismatch falls
@@ -6967,11 +7001,9 @@ controlled_v2_retire_fenced_old_set_for_newer_deploy() {
   V2_RECOVERY_STEP=rollback-retire-validate-snapshot
   activation_snapshot_validate "$guarded_sha" >/dev/null || return 1
   activation_snapshot_assert_old_set "$guarded_sha" || return 1
-  # A newer deploy is replacing this already-restored old set.  Validate the
-  # sealed snapshots by digest only: requiring the removed old release runtime
-  # to execute its contract verifier makes retirement impossible after rollback
-  # cleanup, while the new release will establish the live contract after all
-  # writers have remained fenced.
+  # The old unit set can be restored before the task rows are. The guarded
+  # release's sealed snapshots still own those rows until recovery restores
+  # them, before the replacement captures its baseline.
   V2_RECOVERY_STEP=rollback-retire-validate-governance-snapshot
   controlled_guard_assert_file "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" 600 || \
     return 1
@@ -6988,12 +7020,25 @@ controlled_v2_retire_fenced_old_set_for_newer_deploy() {
   test "$(<"$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SHA")" = \
     "$(sha256sum "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT" | cut -d' ' -f1)" || \
     return 1
+  if [ ! -e "$DATABASE_WRITER_GUARD_FILE" ] && \
+    [ ! -L "$DATABASE_WRITER_GUARD_FILE" ]; then
+    V2_RECOVERY_STEP=rollback-retire-recreate-guard
+    controlled_guard_assert_restore_file "$guarded_sha" "$main_record" \
+      "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
+    controlled_guard_recreate_file "$guarded_sha" "$main_record" \
+      "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
+    controlled_guard_install_dropins || return 1
+    systemctl daemon-reload || return 1
+  fi
   V2_RECOVERY_STEP=rollback-retire-force-writers-fenced
   controlled_guard_force_all_writers_fenced "$main_record" \
     "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
   V2_RECOVERY_STEP=rollback-retire-assert-boundary
   controlled_guard_assert_boundary "$guarded_sha" "$main_record" \
     "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
+  V2_RECOVERY_STEP=rollback-retire-restore-old-tasks
+  controlled_guard_restore_and_verify_governance_snapshot "$guarded_sha" \
+    "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" || return 1
   V2_RECOVERY_STEP=rollback-retire-set-phase
   activation_snapshot_set_phase "$guarded_sha" old-runtime-verified || return 1
   V2_RECOVERY_STEP=rollback-retire-cleanup
@@ -14249,37 +14294,6 @@ validate_prepared_scheduler_task_release() {
   controlled_guard_assert_file "$SCHEDULER_TASK_PLAN_FILE" 600 || return 1
   "$BOOTSTRAP_PYTHON" -I "$helper" bundle --plan "$SCHEDULER_TASK_PLAN_FILE" | \
     run_prepared_scheduler_task_release validate
-}
-
-controlled_guard_restore_scheduler_task_plan() {
-  local guarded_sha="$1"
-  local artifact_dir="$RELEASE_ARTIFACT_ROOT/$guarded_sha"
-  local previous_sha plan before
-  local code_root="$CODE_RELEASE_ROOT/$guarded_sha"
-  local python_path="$RELEASE_VENV_ROOT/$guarded_sha/bin/python"
-  local helper="$code_root/tools/scheduler_task_release.py"
-  local adata_sha adata_tree adata_source
-  [[ "$guarded_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
-  previous_sha="$(activation_snapshot_old_release "$guarded_sha")" || return 1
-  [[ "$previous_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
-  plan="$artifact_dir/scheduler-task-release-$previous_sha.json"
-  before="$artifact_dir/scheduler-task-before-$previous_sha.json"
-  # No before-image means this release never acquired authority to change this task scope.
-  if [ ! -e "$before" ] && [ ! -L "$before" ]; then return 0; fi
-  controlled_guard_assert_file "$plan" 600 || return 1
-  controlled_guard_assert_file "$before" 600 || return 1
-  test -d "$code_root" && test ! -L "$code_root" || return 1
-  test "$(git -C "$code_root" rev-parse HEAD)" = "$guarded_sha" || return 1
-  test -x "$python_path" && test -f "$helper" && test ! -L "$helper" || return 1
-  adata_sha="$(<"$RELEASE_VENV_ROOT/$guarded_sha/.adata.gitsha")" || return 1
-  adata_tree="$(<"$RELEASE_VENV_ROOT/$guarded_sha/.adata.tree.sha256")" || return 1
-  adata_source="$ADATA_RUNTIME_ROOT/$adata_sha-$adata_tree"
-  "$BOOTSTRAP_PYTHON" -I "$helper" bundle --plan "$plan" --before "$before" | \
-    controlled_guard_run_service_gate_with_deadline "$SERVICE_USER" 90s 5s \
-    /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
-    PROBIGA_DEPLOYMENT_MODE=production PROBIGA_EXPECTED_GIT_SHA="$guarded_sha" \
-    PROBIGA_BUILD_COMMIT_SHA="$guarded_sha" PROBIGA_CODE_ROOT="$code_root" \
-    "PYTHONPATH=$adata_source:$code_root" "$python_path" -P "$helper" restore
 }
 
 prepare_release() {
