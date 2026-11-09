@@ -1247,6 +1247,18 @@ def build_pool_manifest(
     snapshot = decode_score_snapshot(score_snapshot, trade_date=target) if score_snapshot is not None else None
     if snapshot is not None:
         frozen_analysis = _canonical_rows(snapshot["analysis_rows"], columns=CANONICAL_ANALYSIS_COLUMNS)
+        # A frozen DATETIME can omit zero fractional seconds. Align only the
+        # comparison copy so persisted hashes and sealed snapshot bytes stay exact.
+        for persisted_row, frozen_row in zip(analysis, frozen_analysis):
+            frozen_time = frozen_row["last_news_time"]
+            persisted_time = persisted_row["last_news_time"]
+            if isinstance(frozen_time, str) and persisted_time == f"{frozen_time}.000000":
+                try:
+                    normalized = datetime.fromisoformat(frozen_time).isoformat(timespec="microseconds")
+                except ValueError:
+                    continue
+                if normalized == persisted_time:
+                    frozen_row["last_news_time"] = normalized
         if frozen_analysis != analysis:
             difference = next(
                 (

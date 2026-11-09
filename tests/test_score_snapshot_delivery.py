@@ -1,5 +1,6 @@
 from argparse import Namespace
 from copy import deepcopy
+from datetime import datetime, timedelta
 import json
 
 import pytest
@@ -76,6 +77,39 @@ def test_mutable_daily_projection_cannot_change_a_published_score():
             trade_date=payload["trade_date"], analysis_rows=changed,
             recommendation_rows=[], score_snapshot=receipt["score_snapshot"],
         )
+
+
+def test_pool_readback_matches_frozen_news_time_without_changing_hashes():
+    target = "2026-11-06"
+    original = decode_score_snapshot(scored_publication(
+        [{"stock_code": "000603"}], trade_date=target,
+    )["score_snapshot"])
+    # MySQL returns a native DATETIME while the score snapshot stores JSON.
+    news_time = datetime(2026, 11, 3)
+    persisted_rows = [{**original["analysis_rows"][0], "last_news_time": news_time}]
+    snapshot = build_score_snapshot(
+        trade_date=target, decision_at=original["decision_at"],
+        run_uid=original["run_uid"], build_sha=original["build_sha"],
+        analysis_rows=persisted_rows, scored_rows=original["scored_rows"],
+    )
+    frozen = decode_score_snapshot(snapshot)
+    assert frozen["analysis_rows"][0]["last_news_time"] == "2026-11-03T00:00:00"
+    persisted_hash = build_pool_manifest(
+        trade_date=target, analysis_rows=persisted_rows, recommendation_rows=[],
+    )["analysis_sha256"]
+    manifest = build_pool_manifest(
+        trade_date=target, analysis_rows=persisted_rows,
+        recommendation_rows=[], score_snapshot=snapshot,
+    )
+    assert manifest["analysis_sha256"] == persisted_hash
+    assert decode_score_snapshot(snapshot) == frozen
+    for different_time in (news_time + timedelta(microseconds=1), news_time + timedelta(seconds=1)):
+        with pytest.raises(ValueError, match="PUBLICATION_ROWS_MISMATCH:stock=000603:column=last_news_time"):
+            build_pool_manifest(
+                trade_date=target,
+                analysis_rows=[{**persisted_rows[0], "last_news_time": different_time}],
+                recommendation_rows=[], score_snapshot=snapshot,
+            )
 
 
 def test_late_upper_execution_evidence_preserves_original_scoring_cutoff():
