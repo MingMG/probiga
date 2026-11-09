@@ -17,9 +17,11 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 import hashlib
+from itertools import groupby
 import json
 import math
 import re
+from time import monotonic
 import zlib
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping
 from zoneinfo import ZoneInfo
@@ -58,6 +60,9 @@ FINANCE_ATOMIC_BATCH_HISTORY_LIMIT = 20
 FINANCE_ATOMIC_BATCH_QUERY_CODE_LIMIT = 100
 COMMON_FACT_CUTOFF_QUERY_CODE_LIMIT = 500
 EMPTY_COVERAGE_MYSQL_CODE_LIMIT = 40
+FINANCE_NONFILING_MYSQL_CODE_LIMIT = 40
+FINANCE_NONFILING_MYSQL_QUERY_TIMEOUT_MS = 60_000
+FINANCE_NONFILING_MYSQL_DEADLINE_SECONDS = 30 * 60
 FINANCE_INCREMENTAL_DISCOVERY_SOURCE = "eastmoney.finance.global_discovery"
 FINANCE_INCREMENTAL_DISCOVERY_CODE = "000000"
 FINANCE_INCREMENTAL_DISCOVERY_SCHEMA = (
@@ -2980,41 +2985,67 @@ def load_finance_expected_unavailable(
         return {}, {}
     decision = normalize_decision_at(decision_at)
     report_date = _date_value(expected_report_date, required=False)
-    statement = text(
-        f"SELECT * FROM {SOURCE_COVERAGE_TABLE} "
-        "WHERE fact_kind='finance' AND source=:source "
-        "AND stock_code IN :codes "
-        "AND known_at<=:decision_at AND received_at<=:decision_at "
-        "ORDER BY stock_code, scope_hash, revision_no"
-    ).bindparams(bindparam("codes", expanding=True))
-    with engine.connect() as connection:
-        rows = [
-            dict(row)
-            for row in connection.execute(
-                statement,
-                {
-                    "source": CNINFO_FINANCE_NONFILING_SOURCE,
-                    "codes": normalized_codes,
-                    "decision_at": decision,
-                },
-            ).mappings()
-        ]
-    by_code_scope: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(
-        lambda: defaultdict(list)
-    )
-    for row in rows:
-        by_code_scope[str(row.get("stock_code") or "").zfill(6)][
-            str(row.get("scope_hash") or "")
-        ].append(row)
+
+    def code_chains():
+        deadline = monotonic() + FINANCE_NONFILING_MYSQL_DEADLINE_SECONDS
+        with engine.connect() as connection:
+            mysql = connection.dialect.name == "mysql"
+            batch_size = len(normalized_codes)
+            timeout_hint = ""
+            if mysql:
+                batch_size = FINANCE_NONFILING_MYSQL_CODE_LIMIT
+                timeout_hint = (
+                    f"/*+ MAX_EXECUTION_TIME({FINANCE_NONFILING_MYSQL_QUERY_TIMEOUT_MS}) */ "
+                )
+                if str(connection.get_isolation_level()).upper() != "SERIALIZABLE":
+                    connection = connection.execution_options(
+                        isolation_level="REPEATABLE READ"
+                    )
+            statement = text(
+                f"SELECT {timeout_hint}{_coverage_payload_columns(mysql)} "
+                f"FROM {SOURCE_COVERAGE_TABLE} "
+                "WHERE fact_kind='finance' AND source=:source "
+                "AND stock_code IN :codes "
+                "AND known_at<=:decision_at AND received_at<=:decision_at "
+                "ORDER BY stock_code, scope_hash, revision_no"
+            ).bindparams(bindparam("codes", expanding=True)).execution_options(
+                stream_results=True,
+            )
+            # Each symbol's full chain belongs to one query and all queries
+            # share the same snapshot, including across batch boundaries.
+            with connection.begin():
+                for offset in range(0, len(normalized_codes), batch_size):
+                    if mysql and monotonic() >= deadline:
+                        raise TimeoutError(
+                            f"finance_nonfiling: read deadline after {offset} codes"
+                        )
+                    with connection.execute(statement, {
+                        "source": CNINFO_FINANCE_NONFILING_SOURCE,
+                        "codes": normalized_codes[offset:offset + batch_size],
+                        "decision_at": decision,
+                    }) as rows:
+                        for code, code_rows in groupby(
+                            rows.mappings(),
+                            key=lambda row: str(row["stock_code"] or "").zfill(6),
+                        ):
+                            by_scope: dict[str, list[dict[str, Any]]] = defaultdict(list)
+                            for row in code_rows:
+                                by_scope[str(row["scope_hash"] or "")].append(dict(row))
+                            yield code, by_scope, mysql
     minimum_known = (
         normalize_decision_at(known_after) if known_after is not None else None
     )
     available: dict[str, dict[str, Any]] = {}
     invalid: dict[str, str] = {}
-    for code in normalized_codes:
+    for code, scopes, mysql in code_chains():
         candidates: list[dict[str, Any]] = []
-        for chain in by_code_scope.get(code, {}).values():
+        for chain in scopes.values():
             try:
+                if mysql:
+                    chain = [
+                        _coverage_payload_row(row, mysql=True, stage="finance_nonfiling")
+                        for row in chain
+                    ]
                 _validate_coverage_chain(chain)
             except ValueError as exc:
                 invalid[code] = f"PIT_FINANCE_BAD_UNAVAILABLE_CHAIN:{exc}"
