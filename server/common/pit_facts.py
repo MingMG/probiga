@@ -59,6 +59,7 @@ FINANCE_ATOMIC_BATCH_INCREMENTAL_SCHEMA = (
 FINANCE_ATOMIC_BATCH_HISTORY_LIMIT = 20
 FINANCE_ATOMIC_BATCH_QUERY_CODE_LIMIT = 100
 COMMON_FACT_CUTOFF_QUERY_CODE_LIMIT = 500
+COMMON_LIVE_EVENT_COVERAGE_READ_DEADLINE_SECONDS = 60 * 60
 EMPTY_COVERAGE_MYSQL_CODE_LIMIT = 40
 FINANCE_NONFILING_MYSQL_CODE_LIMIT = 40
 FINANCE_NONFILING_MYSQL_QUERY_TIMEOUT_MS = 60_000
@@ -5141,25 +5142,46 @@ def resolve_common_fact_cutoff(
             else "fact_kind IN ('finance','event')"
         )
     )
-    statement = text(
-        f"SELECT * FROM {SOURCE_COVERAGE_TABLE} "
+    coverage_scope_sql = (
+        f"FROM {SOURCE_COVERAGE_TABLE} "
         f"WHERE {fact_kind_filter} AND stock_code IN :codes "
         "AND known_at<=:decision_at AND received_at<=:decision_at "
         f"{event_filter}"
         "ORDER BY fact_kind, stock_code, scope_hash, revision_no"
-    ).bindparams(bindparam("codes", expanding=True))
+    )
+    statement = text("SELECT * " + coverage_scope_sql).bindparams(bindparam("codes", expanding=True))
     read_errors: list[str] = []
 
     def coverage_chains():
         # A code stays in one chunk, so every revision of every scope is still
         # validated together. The snapshot matches the former single SELECT.
         batch_size = max(1, int(COMMON_FACT_CUTOFF_QUERY_CODE_LIMIT))
+        compressed = False
         try:
             with engine.connect() as connection:
-                if connection.dialect.name == "mysql" and str(
-                    connection.get_isolation_level() or ""
-                ).upper() not in {"REPEATABLE READ", "SERIALIZABLE"}:
-                    raise ValueError("common cutoff requires a repeatable-read snapshot")
+                mysql = connection.dialect.name == "mysql"
+                compressed = bool(
+                    mysql and scan_event and finance_batch and event_batch
+                    and event_batch.get("mode") != "HISTORICAL_RECONSTRUCTION"
+                )
+                snapshot_budget = nullcontext()
+                if compressed:
+                    from server.common.qmt_announcement_pit import (
+                        VALIDATION_READ_BATCH_SIZE,
+                        _live_announcement_read_hint,
+                        _live_announcement_reply_budget,
+                    )
+
+                    batch_size = min(batch_size, VALIDATION_READ_BATCH_SIZE)
+                    deadline = monotonic() + COMMON_LIVE_EVENT_COVERAGE_READ_DEADLINE_SECONDS
+                    snapshot_budget = _live_announcement_reply_budget(
+                        connection, deadline=deadline, stage="common-cutoff-isolation",
+                    )
+                with snapshot_budget:
+                    if mysql and str(connection.get_isolation_level() or "").upper() not in {
+                        "REPEATABLE READ", "SERIALIZABLE",
+                    }:
+                        raise ValueError("common cutoff requires a repeatable-read snapshot")
                 with connection.begin():
                     for offset in range(0, len(normalized_codes), batch_size):
                         parameters = {
@@ -5169,17 +5191,33 @@ def resolve_common_fact_cutoff(
                         chains: dict[
                             tuple[str, str, str], list[dict[str, Any]]
                         ] = defaultdict(list)
-                        for raw in connection.execute(statement, parameters).mappings():
-                            row = dict(raw)
-                            chains[(
-                                str(row.get("fact_kind") or "").lower(),
-                                str(row.get("stock_code") or "").zfill(6),
-                                str(row.get("scope_hash") or ""),
-                            )].append(row)
-                        yield from chains.items()
-                        chains.clear()
+                        chunk_statement = statement
+                        reply_budget = nullcontext()
+                        if compressed:
+                            stage = f"common-cutoff-coverage:{offset}"
+                            hint = _live_announcement_read_hint(mysql=True, deadline=deadline, stage=stage)
+                            chunk_statement = text(
+                                f"SELECT {hint}{_coverage_payload_columns(True)} {coverage_scope_sql}"
+                            ).bindparams(bindparam("codes", expanding=True)).execution_options(stream_results=True)
+                            reply_budget = _live_announcement_reply_budget(connection, deadline=deadline, stage=stage)
+                        with reply_budget, connection.execute(chunk_statement, parameters) as rows:
+                            for raw in rows.mappings():
+                                row = dict(raw)
+                                chains[(
+                                    str(row.get("fact_kind") or "").lower(),
+                                    str(row.get("stock_code") or "").zfill(6),
+                                    str(row.get("scope_hash") or ""),
+                                )].append(row)
+                        for key, chain in chains.items():
+                            yield key, chain, compressed
+                    if compressed:
+                        _live_announcement_read_hint(
+                            mysql=False, deadline=deadline, stage="common-cutoff-coverage-complete",
+                        )
         except Exception as exc:
-            read_errors.append(type(exc).__name__)
+            reason = str(getattr(exc, "reason_code", "") or "")
+            detail = str(getattr(exc, "detail", "") or "")
+            read_errors.append(f"{reason}:{detail}" if compressed and reason else type(exc).__name__)
 
     candidates: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     if historical_selection is not None:
@@ -5192,8 +5230,13 @@ def resolve_common_fact_cutoff(
         windows["finance"][1]
     ).minimum_report_date
     chains = () if historical_selection is not None and finance_batch else coverage_chains()
-    for (kind, code, _scope), chain in chains:
+    for (kind, code, _scope), chain, compressed in chains:
         try:
+            if compressed:
+                chain = [
+                    _coverage_payload_row(row, mysql=True, stage="common_cutoff_event_coverage")
+                    for row in chain
+                ]
             _validate_coverage_chain(chain)
         except ValueError:
             bad.add((kind, code))

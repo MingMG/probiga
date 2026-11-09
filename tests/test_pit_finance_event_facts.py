@@ -2949,6 +2949,123 @@ def test_common_cutoff_later_chunk_failure_cannot_return_partial_receipts(monkey
     engine.dispose()
 
 
+@pytest.mark.parametrize("fault", [None, "predecessor", "later-timeout"])
+def test_live_common_cutoff_preserves_full_event_chains_with_bounded_mysql_transport(
+    monkeypatch, tmp_path, fault,
+):
+    from server.common.announcement_provider import CninfoMarketAnnouncementProvider, ProviderBackedAnnouncementAdapter
+    from server.common.qmt_announcement_pit import CNINFO_ANNOUNCEMENT_SOURCE, synchronize_qmt_announcements
+    from tests.test_announcement_provider_fallback import _Client, _master, _row_at
+    from tests.test_qmt_announcement_pit import _catalog, _install_catalog
+
+    engine = _engine()
+    codes = [f"{index:06d}" for index in range(1, 46)]
+    cutoff = datetime(2026, 8, 30, 18, 20)
+    received = cutoff + timedelta(minutes=5)
+    start = cutoff.date() - timedelta(days=30)
+    catalog = _install_catalog(
+        engine, _catalog(*((code, f"{code}.SZ") for code in codes)),
+        captured_at="2026-08-30 00:00:00",
+    )
+    for code in codes:
+        finance_row = {
+            "stock_code": code, "report_date": "2026-03-31", "report_type": "Q1",
+            "notice_date": "2026-04-25", "roe_wtd": 12.5,
+        }
+        revision = append_finance_revision(engine, finance_row, known_at="2026-08-30 18:01:00")
+        append_source_coverage(
+            engine, fact_kind="finance", stock_code=code, window_start="1900-01-01",
+            window_end=cutoff.date(), known_at="2026-08-30 18:01:00",
+            covered_through_at="2026-08-30 18:01:00", watermark_kind="CAPTURED_AT",
+            watermark_evidence={"source_call": "success"}, source_rows=[finance_row],
+            fact_bindings=[{"revision_id": revision.revision_id, "content_hash": revision.content_hash}],
+            source="adata.finance.core_index", batch_id="finance-coverage-prior",
+        )
+        append_source_coverage(
+            engine, fact_kind="event", stock_code=code, window_start=start,
+            window_end=cutoff.date(), known_at="2026-08-30 18:05:00",
+            covered_through_at="2026-08-30 18:05:00", watermark_kind="CAPTURED_AT",
+            watermark_evidence={"source_call": "success"}, source_rows=[], fact_bindings=[],
+            source=CNINFO_ANNOUNCEMENT_SOURCE, batch_id="event-coverage-prior",
+        )
+    append_finance_atomic_batch_seal(engine, as_of_date=cutoff.date(), completed_known_at="2026-08-30 18:22:00")
+    monkeypatch.setattr("server.common.qmt_announcement_pit._load_catalog", lambda *_: catalog)
+    master = _master(*codes)
+    provider = CninfoMarketAnnouncementProvider(
+        client=_Client(masters=[master, master], rows_by_code={codes[0]: [_row_at(codes[0], 0, cutoff)]}),
+        minimum_request_interval=0, now_fn=lambda: received,
+    )
+    publication = synchronize_qmt_announcements(
+        engine, xtdata=ProviderBackedAnnouncementAdapter(provider), checkpoint_root=tmp_path,
+        source=CNINFO_ANNOUNCEMENT_SOURCE, fallback_reason="QMT_ANNOUNCEMENT_TERMINAL_DEPENDENCY_UNAVAILABLE",
+        capture_fact_cutoff_at=cutoff, now_fn=lambda: received,
+    )
+    assert publication["status"] == "COMPLETE" and publication["coverage_count"] == len(codes)
+    append_source_coverage(
+        engine, fact_kind="event", stock_code=codes[-1], window_start=cutoff.date(),
+        window_end=cutoff.date(), known_at="2026-08-30 18:29:00",
+        covered_through_at="2026-08-30 18:29:00", watermark_kind="CAPTURED_AT",
+        watermark_evidence={"source_call": "success"}, source_rows=[], fact_bindings=[],
+        source=CNINFO_ANNOUNCEMENT_SOURCE, batch_id="event-coverage-successor",
+    )
+    kwargs = dict(
+        codes=codes, decision_at="2026-08-30 18:31:00", require_qmt_event_batch=True,
+        finance_start_date="1900-01-01", finance_end_date=cutoff.date(),
+        event_start_date=start, event_end_date=cutoff.date(),
+    )
+    if fault == "predecessor":
+        with engine.begin() as connection:
+            connection.execute(text("DROP TRIGGER trg_pit_source_coverage_immutable_bu"))
+            connection.execute(text(
+                f"UPDATE {SOURCE_COVERAGE_TABLE} SET watermark_hash='broken' "
+                "WHERE batch_id='event-coverage-prior' AND stock_code=:code"
+            ), {"code": codes[-1]})
+    expected = resolve_common_fact_cutoff(engine, **kwargs)
+    if fault == "predecessor":
+        assert expected["status"] == PIT_DATA_BLOCKED
+        assert expected["reason"] == f"PIT_COMMON_CUTOFF_INCOMPLETE:event:{codes[-1]}:BAD_CHAIN"
+    else:
+        assert expected["status"] == PIT_AVAILABLE
+        assert expected["qmt_event_batch"]["batch_root_hash"] == publication["batch_root_hash"]
+        assert next(row for row in expected["receipts"] if row["stock_code"] == codes[-1]
+                    and row["fact_kind"] == "event")["batch_id"] == publication["batch_id"]
+
+    mysql_reader = _mysql_seal_transport(engine)
+    reads = []
+
+    def record(connection, _cursor, sql, parameters, context, _many):
+        if "ORDER BY fact_kind, stock_code, scope_hash, revision_no" in sql:
+            bindings = context.compiled_parameters[0]
+            chunk = [value for key, value in bindings.items() if key.startswith("codes_")]
+            reads.append((connection.get_transaction(), chunk, sql, context.execution_options))
+            if fault == "later-timeout" and len(reads) == 2:
+                raise OperationalError(sql, parameters, Exception(3024, "execution deadline"))
+        return sql.replace(" FORCE INDEX (PRIMARY)", ""), parameters
+
+    event.listen(engine, "before_cursor_execute", record, retval=True)
+    try:
+        actual = resolve_common_fact_cutoff(mysql_reader, **kwargs)
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+    assert [chunk for _, chunk, _, _ in reads] == [codes[:40], codes[40:]]
+    assert reads[0][0] is not None and all(transaction is reads[0][0] for transaction, *_ in reads)
+    assert all(
+        "COMPRESS(payload_json)" in sql and "MAX_EXECUTION_TIME(60000)" in sql
+        and "batch_id=" not in sql and options["stream_results"]
+        for _, _, sql, options in reads
+    )
+    if fault == "later-timeout":
+        assert actual["status"] == PIT_DATA_BLOCKED
+        assert actual["reason"] == (
+            "PIT_COMMON_CUTOFF_SCHEMA_UNAVAILABLE:"
+            "QMT_ANNOUNCEMENT_LIVE_BATCH_REPLY_DEADLINE:common-cutoff-coverage:40"
+        )
+        assert actual["receipts"] == [] and actual["receipt_root_hash"] == ""
+    else:
+        assert actual == expected
+    engine.dispose()
+
+
 def test_common_cutoff_compact_unsealed_candidate_preserves_nonfiling_metadata(monkeypatch):
     engine = _engine()
     append_finance_expected_unavailable(
