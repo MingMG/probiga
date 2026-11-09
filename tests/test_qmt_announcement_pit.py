@@ -1919,6 +1919,178 @@ def test_database_validator_proves_global_root_and_exact_catalog_binding():
         )
 
 
+@pytest.mark.parametrize("source", [QMT_ANNOUNCEMENT_SOURCE, CNINFO_ANNOUNCEMENT_SOURCE])
+@pytest.mark.parametrize("inventory_damage", [None, "extra", "duplicate", "deadline"])
+def test_live_batch_validates_full_inventory_with_bounded_compressed_primary_key_reads(
+    monkeypatch, tmp_path, source, inventory_damage,
+):
+    from server.common.announcement_provider import CninfoMarketAnnouncementProvider, ProviderBackedAnnouncementAdapter
+    from server.common.qmt_announcement_pit import (
+        LIVE_ANNOUNCEMENT_BATCH_VALIDATION_BUDGET_SECONDS, _publish_batch, build_batch_root,
+    )
+    from tests.test_announcement_provider_fallback import _Client, _master, _row_at
+    from tests.test_pit_finance_event_facts import _mysql_seal_transport
+
+    engine = _engine()
+    catalog = _install_catalog(engine, _catalog(*(
+        (f"{index:06d}", f"{index:06d}.SZ") for index in range(1, 46)
+    )))
+    first_code = catalog.codes[0]
+    cutoff = datetime(2026, 8, 25, 18, 20)
+    received = cutoff + timedelta(minutes=5)
+    start = cutoff.date() - timedelta(days=30)
+    if source == CNINFO_ANNOUNCEMENT_SOURCE:
+        master = _master(*catalog.codes)
+        client = _Client(masters=[master, master], rows_by_code={first_code: [
+            _row_at(first_code, 0, cutoff),
+            _row_at(first_code, 1, cutoff + timedelta(minutes=1)),
+        ]})
+        provider = CninfoMarketAnnouncementProvider(
+            client=client, minimum_request_interval=0, now_fn=lambda: received,
+        )
+        monkeypatch.setattr("server.common.qmt_announcement_pit._load_catalog", lambda *_: catalog)
+        publication = synchronize_qmt_announcements(
+            engine, xtdata=ProviderBackedAnnouncementAdapter(provider), checkpoint_root=tmp_path,
+            capture_fact_cutoff_at=cutoff, now_fn=lambda: received, source=source,
+            fallback_reason="QMT_ANNOUNCEMENT_TERMINAL_DEPENDENCY_UNAVAILABLE",
+        )
+        assert publication["status"] == "COMPLETE" and publication["event_count"] == 1
+        batch_id, root = publication["batch_id"], publication["batch_root_hash"]
+    else:
+        results = {code: [] for code in catalog.codes}
+        results[first_code] = parse_qmt_announcement_frame(
+            stock_code=first_code, qmt_code=catalog.qmt_by_code[first_code],
+            frame=_frame(first_code, "2026-08-25 17:50:00"), fact_cutoff_at=cutoff, window_start=start,
+        )
+        batch_id = "qmt-ann-20260825T182000-bounded-read"
+        root, entries = build_batch_root(
+            batch_id=batch_id, fact_cutoff_at=cutoff, received_at=received,
+            window_start=start, window_end=cutoff.date(), catalog=catalog, results=results,
+        )
+        _publish_batch(
+            engine, batch_id=batch_id, batch_root_hash=root, entries=entries,
+            fact_cutoff_at=cutoff, received_at=received,
+            window_start=start, window_end=cutoff.date(), catalog=catalog, results=results,
+        )
+    options = dict(
+        codes=[catalog.codes[-1]], decision_at=received, fact_cutoff_at=cutoff,
+        window_start=start, window_end=cutoff.date(), source=source,
+    )
+    expected = validate_complete_qmt_announcement_batch(engine, **options)
+    assert expected["batch_root_hash"] == root
+    assert expected["catalog_member_count"] == 45
+    if inventory_damage in {"extra", "duplicate"}:
+        with engine.begin() as connection:
+            row = dict(connection.execute(text(
+                f"SELECT * FROM {SOURCE_COVERAGE_TABLE} WHERE stock_code=:code"
+            ), {"code": first_code}).mappings().one())
+            row.update(
+                coverage_id="c" * 64, scope_hash="d" * 64, coverage_fingerprint_hash="e" * 64,
+                stock_code="000099" if inventory_damage == "extra" else first_code,
+                known_at="2026-08-26 19:00:00", watermark_kind="CAPTURED_AT",
+            )
+            connection.execute(text(
+                f"INSERT INTO {SOURCE_COVERAGE_TABLE} ({','.join(row)}) "
+                f"VALUES ({','.join(':' + column for column in row)})"
+            ), row)
+    mysql_reader = _mysql_seal_transport(engine)
+    reads = []
+    elapsed = [0.0]
+    if inventory_damage == "deadline":
+        monkeypatch.setattr("server.common.qmt_announcement_pit.monotonic", lambda: elapsed[0])
+
+    def record(connection, _cursor, sql, parameters, context, _many):
+        if f"FROM {SOURCE_COVERAGE_TABLE}" in sql:
+            bindings = context.compiled_parameters[0]
+            reads.append((connection.get_transaction(), sql, bindings, context.execution_options))
+            if inventory_damage == "deadline" and sum(key.startswith("coverage_ids_") for key in bindings) == 40:
+                elapsed[0] = LIVE_ANNOUNCEMENT_BATCH_VALIDATION_BUDGET_SECONDS + 1
+        return sql.replace(" FORCE INDEX (PRIMARY)", ""), parameters
+
+    event.listen(engine, "before_cursor_execute", record, retval=True)
+    try:
+        if inventory_damage == "deadline":
+            with pytest.raises(QMTAnnouncementBlocked, match="LIVE_BATCH_VALIDATION_DEADLINE:batch-payload:0"):
+                validate_complete_qmt_announcement_batch(mysql_reader, **options)
+        elif inventory_damage:
+            with pytest.raises(QMTAnnouncementBlocked, match="COMPLETE_BATCH_NOT_FOUND"):
+                validate_complete_qmt_announcement_batch(mysql_reader, **options)
+        else:
+            assert validate_complete_qmt_announcement_batch(mysql_reader, **options) == expected
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+    inventory = [(sql, params) for _, sql, params, _ in reads if "coverage_id, stock_code" in sql]
+    assert len(inventory) == 1 and inventory[0][1]["inventory_limit"] == 46
+    assert "MAX_EXECUTION_TIME" in inventory[0][0] and "known_at" not in inventory[0][0]
+    assert reads[0][0] is not None and all(transaction is reads[0][0] for transaction, *_ in reads)
+    pk_reads = [(sql, params, execution) for _, sql, params, execution in reads if "coverage_id IN" in sql]
+    expected_chunks = {None: [1, 40, 5], "extra": [1], "duplicate": [1], "deadline": [1, 40]}
+    assert [sum(key.startswith("coverage_ids_") for key in params) for _, params, _ in pk_reads] == expected_chunks[inventory_damage]
+    assert all(
+        "COMPRESS(payload_json)" in sql and "FORCE INDEX (PRIMARY)" in sql
+        and "MAX_EXECUTION_TIME(60000)" in sql and execution["stream_results"]
+        for sql, _, execution in pk_reads
+    )
+    engine.dispose()
+
+
+def test_live_batch_reply_watchdog_interrupts_fetch_and_invalidates_the_checkout(monkeypatch):
+    import socket
+    from time import monotonic
+
+    from server.common import qmt_announcement_pit as announcement
+
+    monkeypatch.setattr(announcement, "LIVE_ANNOUNCEMENT_BATCH_QUERY_TIMEOUT_MS", 75)
+    local, peer = socket.socketpair()
+    with local, peer, local.makefile("rb") as buffered_reply:
+        local.settimeout(2.0)
+        dbapi = SimpleNamespace(_sock=local, _read_timeout=None, _write_timeout=1.0)
+        trace = []
+
+        class FragmentedReply:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                trace.append("result-closed")
+
+            def mappings(self):
+                return self
+
+            def all(self):
+                trace.append("fetch")
+                assert dbapi._read_timeout == dbapi._write_timeout == 0.075
+                buffered_reply.read(1)
+                return []
+
+        class CheckedOutConnection:
+            dialect = SimpleNamespace(name="mysql")
+            connection = SimpleNamespace(dbapi_connection=dbapi)
+            invalidated = False
+
+            def execute(self, statement, _parameters):
+                assert "MAX_EXECUTION_TIME(75)" in str(statement)
+                trace.append("execute")
+                return FragmentedReply()
+
+            def invalidate(self):
+                self.invalidated = True
+                trace.append("invalidated")
+
+        connection = CheckedOutConnection()
+        started = monotonic()
+        with pytest.raises(QMTAnnouncementBlocked, match="LIVE_BATCH_REPLY_DEADLINE:batch-payload:40"):
+            announcement._read_live_announcement_payload_rows(
+                connection, source=CNINFO_ANNOUNCEMENT_SOURCE, batch_id="batch",
+                coverage_ids=["a" * 64], deadline=started + 5.0, stage="batch-payload:40",
+            )
+        assert monotonic() - started < 1.5
+        assert trace == ["execute", "fetch", "result-closed", "invalidated"]
+        assert connection.invalidated
+        assert local.fileno() == -1
+        assert (dbapi._read_timeout, dbapi._write_timeout) == (None, 1.0)
+
+
 def test_strict_reader_rejects_legacy_full_market_all_empty_qmt_batch():
     from server.common.qmt_announcement_pit import (
         _publish_batch,
