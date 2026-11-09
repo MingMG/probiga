@@ -234,24 +234,24 @@ def test_finance_delta_reuses_validated_exclusions_without_rereading_parent_hist
     engine.dispose()
 
 
-def _nonfiling_evidence(report_date="2026-03-31") -> dict:
+def _nonfiling_evidence(report_date="2026-03-31", *, stock_code="002731") -> dict:
     from server.common.finance_nonfiling_evidence import EVIDENCE_SCHEMA, nonfiling_statement
     period = "第一季度" if report_date == "2026-03-31" else "半年度"
-    body = f"证券代码：002731。因公司未在法定期限内披露2026年{period}报告，股票继续停牌。"
+    body = f"证券代码：{stock_code}。因公司未在法定期限内披露2026年{period}报告，股票继续停牌。"
     return {
         "evidence_schema": EVIDENCE_SCHEMA,
         "announcement_document_text": body,
         "announcement_document_text_sha256": hashlib.sha256(body.encode()).hexdigest(),
-        "nonfiling_statement": nonfiling_statement(body, "002731", report_date),
+        "nonfiling_statement": nonfiling_statement(body, stock_code, report_date),
         "catalog_identity": {
             "schema": "probiga.cninfo-nonfiling-catalogue.v1",
-            "stock_code": "002731", "org_id": "9900022974",
+            "stock_code": stock_code, "org_id": "9900022974",
             "window_start": "2026-08-01", "window_end": "2026-09-06",
             "page_count": 1, "row_count": 1, "complete": True,
         },
         "source": "cninfo.finance.nonfiling",
         "reason_code": "CNINFO_REGULATORY_PERIODIC_REPORT_NOT_FILED",
-        "stock_code": "002731",
+        "stock_code": stock_code,
         "expected_report_date": report_date,
         "announcement_id": "1225497518",
         "announcement_title": "关于公司未在规定期限内披露定期报告的公告",
@@ -2609,6 +2609,10 @@ def _mysql_seal_transport(engine, *, corrupt=None):
         def get_isolation_level(self):
             return "REPEATABLE READ"
 
+        def execution_options(self, *, isolation_level):
+            assert isolation_level == "REPEATABLE READ"
+            return self
+
         def begin(self):
             return self.connection.begin()
 
@@ -2617,6 +2621,81 @@ def _mysql_seal_transport(engine, *, corrupt=None):
             return self.connection.execute(statement if sql == str(statement) else text(sql), params)
 
     return SimpleNamespace(connect=MysqlConnection)
+
+
+def test_finance_nonfiling_uses_bounded_compressed_reads_without_changing_evidence(monkeypatch):
+    engine = _engine()
+    codes = [f"{code:06d}" for code in range(1, 81)] + ["002731", "002732", "002733"]
+    receipts = {}
+    for code, days in (("000001", (30,)), ("000042", (30, 31)), ("002731", (30, 31))):
+        for day in days:
+            receipts[code, day] = append_finance_expected_unavailable(
+                engine,
+                stock_code=code,
+                expected_report_date="2026-03-31",
+                known_at=f"2026-08-{day} 09:00:00",
+                official_evidence=_nonfiling_evidence(stock_code=code),
+                batch_id=f"nonfiling-{code}-{day}",
+            )
+    with engine.begin() as connection:
+        connection.execute(text("DROP TRIGGER trg_pit_source_coverage_immutable_bu"))
+        connection.execute(text(
+            f"UPDATE {SOURCE_COVERAGE_TABLE} SET watermark_hash='broken' "
+            "WHERE coverage_id=:coverage_id"
+        ), {"coverage_id": receipts["000042", 30].coverage_id})
+
+    mysql_reader = _mysql_seal_transport(engine)
+    queries = []
+
+    def record(connection, _cursor, sql, _parameters, context, _many):
+        if f"FROM {SOURCE_COVERAGE_TABLE}" in sql:
+            bound_codes = [
+                value for key, value in context.compiled_parameters[0].items()
+                if key.startswith("codes_")
+            ]
+            queries.append((
+                connection, connection.get_transaction(), sql, bound_codes,
+                context.execution_options.get("stream_results"),
+            ))
+
+    try:
+        for day in (30, 31):
+            kwargs = {
+                "codes": list(reversed(codes)) + ["002731", ""],
+                "decision_at": f"2026-08-{day} 10:00:00",
+                "expected_report_date": "2026-03-31",
+                "known_after": "2026-08-30 08:55:00",
+            }
+            expected = load_finance_expected_unavailable(engine, **kwargs)
+            available, invalid = expected
+            assert set(available) == {"000001", "002731"}
+            assert available["002731"]["coverage_id"] == receipts["002731", day].coverage_id
+            assert set(invalid) == {"000042"}
+            assert invalid["000042"].startswith("PIT_FINANCE_BAD_UNAVAILABLE_CHAIN:")
+            event.listen(engine, "before_cursor_execute", record)
+            try:
+                assert load_finance_expected_unavailable(mysql_reader, **kwargs) == expected
+            finally:
+                event.remove(engine, "before_cursor_execute", record)
+            assert [bound_codes for _, _, _, bound_codes, _ in queries] == [
+                codes[:40], codes[40:80], codes[80:],
+            ]
+            connection, transaction, *_ = queries[0]
+            assert transaction is not None
+            assert all(
+                current is connection and active is transaction
+                and "COMPRESS(payload_json)" in sql and "OCTET_LENGTH(payload_json)" in sql
+                and "MAX_EXECUTION_TIME(60000)" in sql
+                and streaming is True
+                for current, active, sql, _, streaming in queries
+            )
+            queries.clear()
+        times = iter((0, 0, 1801))
+        monkeypatch.setattr(pit_module, "monotonic", lambda: next(times))
+        with pytest.raises(TimeoutError, match="finance_nonfiling: read deadline after 40 codes"):
+            load_finance_expected_unavailable(mysql_reader, **kwargs)
+    finally:
+        engine.dispose()
 
 
 def test_finance_compressed_history_is_byte_exact_and_preserves_all_seal_results():
