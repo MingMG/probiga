@@ -340,7 +340,7 @@ def test_pre_cutover_rollback_calls_protected_abort_only_after_unchanged_old_run
 
     source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
     start = source.index("\nrollback() {")
-    end = source.index("\nclassify_component_release\n", start)
+    end = source.index("\nprepare_ledger_pending_root\n", start)
     rollback_function = source[start:end]
     trace_path = tmp_path / "rollback-trace.txt"
     trace = trace_path.as_posix()
@@ -352,10 +352,12 @@ DEPLOY_MAIN_BASHPID="$BASHPID"
 DEPLOY_SUCCEEDED=0
 EXPECTED_SHA={CANDIDATE_SHA}
 PREVIOUS_SHA={PRIOR_SHA}
+PREVIOUS_WINDOWS_SHA={PRIOR_SHA}
 CUTOVER_STARTED=0
 CUTOVER_STEP=after_windows_hold_before_cutover
 DEFERRED_DB_CUTOVER_STARTED=0
 PREPARED_CODE_ROOT='{state_root}/absent-prepared'
+RELEASE_VENV_ROOT='{state_root}/candidate-venvs'
 PREVIOUS_CODE_ROOT='{state_root}/fake-prior'
 DATABASE_WRITER_GUARD_FILE='{state_root}/absent-guard'
 DATABASE_WRITER_RESTORE_FILE='{state_root}/absent-restore'
@@ -379,9 +381,10 @@ systemctl() {{ printf 'systemctl %s\\n' "$*" >> "$TRACE"; }}
 git() {{ printf '%s' "$PREVIOUS_SHA"; }}
 verify_previous_main_health_or_stopped() {{ printf '%s\\n' verify-old-api >> "$TRACE"; return {0 if api_ok else 1}; }}
 controlled_guard_run_qmt_activation_tool() {{
-  test "$1" = "$PREVIOUS_CODE_ROOT" && test "$2" = "$PREVIOUS_VENV" &&
-    test "$3" = "$PREVIOUS_SHA" && test "$4" = --abort-precutover &&
-    test "$5" = "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" && test "$6" = "$EXPECTED_SHA" || exit 97
+  test "$1" = "$PREPARED_CODE_ROOT" && test "$2" = "$RELEASE_VENV_ROOT/$EXPECTED_SHA" &&
+    test "$3" = "$EXPECTED_SHA" && test "$4" = --abort-precutover &&
+    test "$5" = "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" && test "$6" = "$EXPECTED_SHA" &&
+    test "$7" = "$PREVIOUS_SHA" && test "$8" = "$PREVIOUS_WINDOWS_SHA" || exit 97
   printf '%s\\n' protected-qmt-abort >> "$TRACE"
   return {0 if broker_ok else 1}
 }}

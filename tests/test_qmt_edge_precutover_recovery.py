@@ -177,6 +177,224 @@ def _ready(engine, sha):
         return ledger.check_qmt_edge_release_activation(connection, expected_build_sha=sha)[0]
 
 
+def _coordinated_manifest(build, parent):
+    from server.common.component_release import build_component_release
+
+    return build_component_release(
+        linux_build_sha=build, windows_build_sha=build, contract_build_sha=build,
+        contract_sha256="c" * 64, parent_linux_build_sha=parent, scope="COORDINATED",
+        created_at="2026-09-05T02:00:00Z",
+    )
+
+
+@pytest.fixture
+def granted_split(engine, monkeypatch):
+    from server.common import component_release_attestation, scheduler_runtime_health
+    from server.engine import strategy_governance
+
+    _handoff(engine)
+    bootstrap.append_release_activation_grant(
+        engine, expected_build_sha=NEW, deployment_attempt_id=ATTEMPT,
+        now=AT + timedelta(seconds=3),
+    )
+    manifests = {
+        OLD: _coordinated_manifest(OLD, "f" * 40),
+        NEW: _coordinated_manifest(NEW, OLD),
+    }
+    metadata_reads = []
+    ancestry_checks = []
+    rejected_targets = set()
+    live_seal = {**_seal(NEW), "trigger_inventory_seal_database": "probiga"}
+    monkeypatch.setattr(
+        component_release_attestation, "load_component_attestation",
+        lambda _connection, sha: manifests[sha],
+    )
+
+    def read_metadata(_connection, *, build_sha, runtime_build_sha, component_manifest_sha256):
+        assert build_sha == NEW
+        assert runtime_build_sha == NEXT
+        assert component_manifest_sha256 == manifests[NEW]["manifest_sha256"]
+        metadata_reads.append(component_manifest_sha256)
+        return dict(live_seal)
+
+    monkeypatch.setattr(strategy_governance, "_validate_trigger_contract_metadata", read_metadata)
+
+    def assert_ancestry(actual_prior, target):
+        assert actual_prior == NEW and target in {NEXT, FOURTH}
+        ancestry_checks.append((actual_prior, target))
+        if target in rejected_targets:
+            raise RuntimeError("target is not a descendant of the granted Windows prior")
+
+    monkeypatch.setattr(bootstrap, "_assert_split_prior_git_ancestry", assert_ancestry)
+
+    def read_retained_seal(sha):
+        assert sha == OLD, "the granted Windows build has no Linux checkout"
+        return _seal(OLD)
+
+    monkeypatch.setattr(bootstrap, "_read_retained_contract_seal", read_retained_seal)
+    monkeypatch.setattr(
+        bootstrap, "check_qmt_windows_edge_identity",
+        scheduler_runtime_health.check_qmt_windows_edge_identity,
+    )
+    with engine.begin() as connection:
+        sqlite = connection.connection.driver_connection
+        sqlite.create_function("NOW", 0, lambda: AT.isoformat(" "))
+        sqlite.create_function("TIMESTAMPDIFF", 3, lambda _unit, heartbeat, now: int(
+            (datetime.fromisoformat(now) - datetime.fromisoformat(heartbeat)).total_seconds()
+        ))
+        connection.execute(text("""
+            CREATE TABLE st_scheduler_runtime (
+                SECOND INTEGER, instance_id TEXT, mode TEXT, host_name TEXT, pid INTEGER,
+                build_sha TEXT, executor_role TEXT, started_at TEXT, heartbeat_at TEXT,
+                poll_seconds INTEGER, max_concurrent_tasks INTEGER
+            )
+        """))
+        connection.execute(text("""
+            INSERT INTO st_scheduler_runtime VALUES
+                (0,'WIN-42','standalone','WIN',42,:sha,'qmt_windows_edge',:at,:at,60,2)
+        """), {"sha": NEW, "at": AT.isoformat(" ")})
+    return SimpleNamespace(
+        engine=engine, manifests=manifests, metadata_reads=metadata_reads, live_seal=live_seal,
+        ancestry_checks=ancestry_checks, rejected_targets=rejected_targets,
+    )
+
+
+def _split_fresh(engine, *, seconds=4):
+    return bootstrap.append_recoverable_release_request(
+        engine, engine, expected_build_sha=NEXT, prior_build_sha=OLD,
+        prior_linux_build_sha=OLD, deployment_attempt_id=NEXT_ATTEMPT,
+        now=AT + timedelta(seconds=seconds),
+    )
+
+
+def _split_forward(engine, *, target=NEXT, attempt=FOURTH_ATTEMPT, seconds=5):
+    return bootstrap.append_forward_release_request(
+        engine, engine, expected_build_sha=target, prior_build_sha=OLD,
+        prior_linux_build_sha=OLD, deployment_attempt_id=attempt,
+        now=AT + timedelta(seconds=seconds),
+    )
+
+
+def test_granted_split_prior_uses_standard_handoff_without_pruned_linux_checkout(granted_split):
+    engine = granted_split.engine
+    assert _split_forward(engine)["status"] == "not_applicable"
+    inserted = _split_fresh(engine)
+    context = inserted["context"]
+    assert inserted["status"] == "inserted"
+    assert inserted["handoff_prior_build_sha"] == NEW
+    assert inserted["activation_granted"] is False
+    assert context["schema"] == recovery.CONTEXT_SCHEMA
+    assert context["prior_build_sha"] == NEW
+    assert context["prior_instance_id"] == "WIN-42"
+    assert context["prior_seal_hash"] == recovery.seal_identity_hash(granted_split.live_seal)
+    assert granted_split.metadata_reads == [granted_split.manifests[NEW]["manifest_sha256"]]
+    assert not _ready(engine, NEW)
+    assert not _ready(engine, NEXT)
+    assert bootstrap.read_release_transition(
+        engine, expected_build_sha=NEW, target_build_sha=NEXT,
+    )["status"] == "PENDING"
+    replay = _split_fresh(engine, seconds=10)
+    assert replay["status"] == "idempotent"
+    assert replay["handoff_prior_build_sha"] == NEW
+    assert replay["context"] == context
+    assert replay["database_writes"] is False
+    assert granted_split.ancestry_checks == [(NEW, NEXT)]
+
+
+@pytest.mark.parametrize(("fault", "message"), [
+    ("wrong_lineage", "lineage or contract differs"),
+    ("wrong_ancestry", "target is not a descendant of the granted Windows prior"),
+    ("stale", "fresh prior Windows writer identity unavailable"),
+    ("ambiguous", "fresh prior Windows writer identity unavailable"),
+])
+def test_granted_split_rejects_unproven_prior_without_new_hold(granted_split, fault, message):
+    engine = granted_split.engine
+    if fault == "wrong_lineage":
+        granted_split.manifests[NEW] = _coordinated_manifest(NEW, FOURTH)
+    elif fault == "wrong_ancestry":
+        granted_split.rejected_targets.add(NEXT)
+    elif fault == "stale":
+        with engine.begin() as connection:
+            connection.execute(text("UPDATE st_scheduler_runtime SET heartbeat_at=:old"), {
+                "old": (AT - timedelta(minutes=5)).isoformat(" "),
+            })
+    else:
+        with engine.begin() as connection:
+            connection.execute(text("""
+                INSERT INTO st_scheduler_runtime
+                SELECT SECOND,'WIN-43',mode,host_name,43,build_sha,executor_role,
+                       started_at,heartbeat_at,poll_seconds,max_concurrent_tasks
+                FROM st_scheduler_runtime
+            """))
+    with pytest.raises(RuntimeError, match=message):
+        _split_fresh(engine)
+    with engine.connect() as connection:
+        assert recovery.latest_hold(connection)["deployment_attempt_id"] == ATTEMPT
+        assert recovery._row(connection, recovery.context_uid(NEXT_ATTEMPT)) is None
+        assert recovery._row(connection, ledger.qmt_edge_release_quiescence_run_uid(NEXT_ATTEMPT)) is None
+    assert _ready(engine, NEW)
+
+
+def test_granted_split_abort_after_lost_ack_revalidates_exact_frozen_prior(granted_split):
+    engine = granted_split.engine
+    _split_fresh(engine)  # A committed hold remains even if the caller never receives its result.
+    with engine.begin() as connection:
+        connection.execute(text("DELETE FROM st_scheduler_runtime"))
+    abort_args = {
+        "expected_build_sha": NEXT,
+        "target_build_sha": NEXT,
+        "prior_build_sha": OLD,
+        "prior_linux_build_sha": OLD,
+        "deployment_attempt_id": NEXT_ATTEMPT,
+        "now": AT + timedelta(seconds=12),
+    }
+    original_comment = granted_split.live_seal["trigger_inventory_table_comment"]
+    granted_split.live_seal["trigger_inventory_table_comment"] = "changed-seal"
+    with pytest.raises(ledger.QmtEdgeReleaseReceiptError, match="prior identity/schema changed"):
+        bootstrap.append_precutover_abort(engine, engine, **abort_args)
+    with engine.connect() as connection:
+        assert recovery._row(connection, ledger.qmt_edge_release_activation_run_uid(NEXT_ATTEMPT)) is None
+    granted_split.live_seal["trigger_inventory_table_comment"] = original_comment
+    aborted = bootstrap.append_precutover_abort(engine, engine, **abort_args)
+    assert aborted["resume_build_sha"] == NEW
+    assert _ready(engine, NEW)
+    assert not _ready(engine, OLD)
+    assert not _ready(engine, NEXT)
+    assert bootstrap.append_precutover_abort(engine, engine, **abort_args)["status"] == "idempotent"
+    assert granted_split.ancestry_checks == [(NEW, NEXT)]
+
+
+def test_granted_split_pending_renewal_and_successor_keep_actual_original_prior(granted_split):
+    engine = granted_split.engine
+    first = _split_fresh(engine)["context"]
+    with engine.begin() as connection:
+        connection.execute(text("DELETE FROM st_scheduler_runtime"))
+    with pytest.raises(RuntimeError, match="forward target equals original prior"):
+        _split_forward(engine, target=NEW)
+    renewed = _split_forward(engine)
+    assert renewed["handoff_prior_build_sha"] == NEW
+    assert renewed["context"]["original_prior_build_sha"] == NEW
+    assert renewed["context"]["supersedes_context_hash"] == first["context_hash"]
+    replay = _split_forward(engine, seconds=20)
+    assert replay["status"] == "idempotent"
+    assert replay["context"] == renewed["context"]
+    assert replay["database_writes"] is False
+    successor = _split_forward(
+        engine, target=FOURTH, attempt="e" * 32, seconds=21,
+    )
+    assert successor["handoff_prior_build_sha"] == NEW
+    assert successor["context"]["original_prior_instance_id"] == "WIN-42"
+    assert successor["context"]["supersedes_context_hash"] == renewed["context"]["context_hash"]
+    assert successor["activation_granted"] is False
+    assert granted_split.ancestry_checks == [(NEW, NEXT), (NEW, NEXT), (NEW, FOURTH)]
+    assert not _ready(engine, NEW)
+    assert not _ready(engine, NEXT)
+    assert not _ready(engine, FOURTH)
+    assert bootstrap.read_release_transition(
+        engine, expected_build_sha=NEW, target_build_sha=FOURTH,
+    )["status"] == "PENDING"
+
+
 def test_pending_hold_fences_prior_without_authorizing_candidate(engine):
     result = _handoff(engine)
     assert result["context"]["prior_build_sha"] == OLD

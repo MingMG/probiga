@@ -7654,6 +7654,8 @@ controlled_guard_run_qmt_activation_tool() {
   local mode="$4"
   local deployment_attempt_id="${5:-}"
   local target_build_sha="${6:-}"
+  local prior_linux_build_sha="${7:-}"
+  local finalized_windows_sha="${8:-}"
   local expected_windows_sha
   local adata_sha
   local adata_source
@@ -7686,24 +7688,25 @@ controlled_guard_run_qmt_activation_tool() {
     --request-forward-quiescence|--request-recoverable-quiescence)
       [[ "$deployment_attempt_id" =~ ^[0-9a-f]{32}$ ]] || return 1
       [[ "$target_build_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+      [[ "$prior_linux_build_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
       test "$target_build_sha" != "$expected_windows_sha" || return 1
-      # This controller runs from the prepared target; the sixth argument is
-      # the prior Windows component, never permission to resume that prior.
+      # The sixth argument is the finalized Windows baseline. The controller
+      # verifies the actual predecessor against the protected handoff ledger.
       mode_args=("$mode" --deployment-attempt-id "$deployment_attempt_id"
-        --prior-build-sha "$target_build_sha")
+        --prior-build-sha "$target_build_sha"
+        --prior-linux-build-sha "$prior_linux_build_sha")
       ;;
     --abort-precutover)
       [[ "$deployment_attempt_id" =~ ^[0-9a-f]{32}$ ]] || return 1
       [[ "$target_build_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
-      test "$target_build_sha" != "$expected_windows_sha" || return 1
-      # The trusted PRIOR release must contain the compatible controller and
-      # reader. Never silently fall back to the old stop-and-overwrite flow.
-      test -f "$code_root/server/common/qmt_edge_release_recovery.py" || {
-        echo "RECOVERY_BLOCKED: prior edge requires controlled compatibility bootstrap" >&2
-        return 1
-      }
+      [[ "$prior_linux_build_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+      [[ "$finalized_windows_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+      test "$target_build_sha" = "$expected_windows_sha" || return 1
+      test "$finalized_windows_sha" != "$target_build_sha" || return 1
       mode_args=("$mode" --deployment-attempt-id "$deployment_attempt_id"
-        --target-build-sha "$target_build_sha")
+        --target-build-sha "$target_build_sha"
+        --prior-build-sha "$finalized_windows_sha"
+        --prior-linux-build-sha "$prior_linux_build_sha")
       ;;
     *) return 1 ;;
   esac
@@ -7916,15 +7919,17 @@ prepare_qmt_windows_edge_handoff() {
   # prior Windows identity. Both paths use the existing append-only hold ledger.
   output="$(controlled_guard_run_qmt_activation_tool \
     "$PREPARED_CODE_ROOT" "$RELEASE_VENV_ROOT/$EXPECTED_SHA" "$EXPECTED_SHA" \
-    --request-forward-quiescence "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" "$PREVIOUS_WINDOWS_SHA")" || status=$?
+    --request-forward-quiescence "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" \
+    "$PREVIOUS_WINDOWS_SHA" "$PREVIOUS_SHA")" || status=$?
   printf '%s\n' "$output"
   test "$status" -eq 0 || return "$status"
   kind="$(printf '%s' "$output" | "$BOOTSTRAP_PYTHON" -I -c '
-import json,sys
+import json,re,sys
 p=json.load(sys.stdin)
-target,prior,attempt=sys.argv[1:]
+target,prior,prior_linux,attempt=sys.argv[1:]
 valid=(isinstance(p,dict) and p.get("mode")=="request-forward-quiescence"
        and p.get("build_sha")==target and p.get("prior_build_sha")==prior
+       and p.get("prior_linux_build_sha")==prior_linux
        and p.get("deployment_attempt_id")==attempt and p.get("activation_granted") is False)
 if not valid: raise SystemExit(2)
 if p.get("status")=="not_applicable":
@@ -7934,32 +7939,43 @@ else:
     c=p.get("context")
     valid=(isinstance(c,dict) and c.get("schema")=="probiga.qmt-edge-forward-only-supersession.v1"
            and c.get("protocol")==c.get("schema") and c.get("scope")=="FORWARD_ONLY_SUPERSESSION"
-           and c.get("build_sha")==target and c.get("original_prior_build_sha")==prior
+           and c.get("build_sha")==target
+           and isinstance(c.get("original_prior_build_sha"),str)
+           and re.fullmatch(r"[0-9a-f]{40}",c["original_prior_build_sha"])
+           and c["original_prior_build_sha"] not in {"0"*40,target}
+           and c["original_prior_build_sha"]==p.get("handoff_prior_build_sha")
            and c.get("deployment_attempt_id")==attempt and c.get("real_order") is False
            and ((p.get("status")=="inserted" and p.get("database_writes") is True)
                 or (p.get("status")=="idempotent" and p.get("database_writes") is False)))
     if not valid: raise SystemExit(2)
     print("forward")
-' "$EXPECTED_SHA" "$PREVIOUS_WINDOWS_SHA" "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID")" || return $?
+' "$EXPECTED_SHA" "$PREVIOUS_WINDOWS_SHA" "$PREVIOUS_SHA" \
+    "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID")" || return $?
   if [ "$kind" = fresh ]; then
     # Set before the call: a lost COMMIT acknowledgement must still attempt the
     # existing unchanged-schema abort, never strand a possibly persisted hold.
     QMT_EDGE_RECOVERABLE_HANDOFF_ATTEMPTED=1
     output="$(controlled_guard_run_qmt_activation_tool \
       "$PREPARED_CODE_ROOT" "$RELEASE_VENV_ROOT/$EXPECTED_SHA" "$EXPECTED_SHA" \
-      --request-recoverable-quiescence "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" "$PREVIOUS_WINDOWS_SHA")" || status=$?
+      --request-recoverable-quiescence "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" \
+      "$PREVIOUS_WINDOWS_SHA" "$PREVIOUS_SHA")" || status=$?
     printf '%s\n' "$output"
     test "$status" -eq 0 || return "$status"
     printf '%s' "$output" | "$BOOTSTRAP_PYTHON" -I -c '
-import json,sys
+import json,re,sys
 p=json.load(sys.stdin)
 c=p.get("context") if isinstance(p,dict) else None
-target,prior,attempt=sys.argv[1:]
+target,prior,prior_linux,attempt=sys.argv[1:]
 valid=(isinstance(c,dict) and p.get("mode")=="request-recoverable-quiescence"
        and p.get("activation_granted") is False
+       and p.get("prior_build_sha")==prior and p.get("prior_linux_build_sha")==prior_linux
        and ((p.get("status")=="inserted" and p.get("database_writes") is True)
             or (p.get("status")=="idempotent" and p.get("database_writes") is False))
-       and c.get("build_sha")==target and c.get("prior_build_sha")==prior
+       and c.get("build_sha")==target
+       and isinstance(c.get("prior_build_sha"),str)
+       and re.fullmatch(r"[0-9a-f]{40}",c["prior_build_sha"])
+       and c["prior_build_sha"] not in {"0"*40,target}
+       and c["prior_build_sha"]==p.get("handoff_prior_build_sha")
        and c.get("deployment_attempt_id")==attempt
        and c.get("protocol")=="probiga.qmt-edge-precutover-recovery.v1"
        and c.get("schema")=="probiga.qmt-edge-precutover-context.v1"
@@ -7967,7 +7983,8 @@ valid=(isinstance(c,dict) and p.get("mode")=="request-recoverable-quiescence"
        and type(c.get("prior_pid")) is int and c["prior_pid"]>0
        and c.get("prior_instance_id")=="{}-{}".format(c.get("prior_host_name"),c.get("prior_pid")))
 raise SystemExit(0 if valid else 2)
-' "$EXPECTED_SHA" "$PREVIOUS_WINDOWS_SHA" "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" || return $?
+' "$EXPECTED_SHA" "$PREVIOUS_WINDOWS_SHA" "$PREVIOUS_SHA" \
+      "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" || return $?
   fi
   # Keep Linux/API serving while the five-minute updater observes the exact
   # hold, drains its owned process tree and stops renewing its writer heartbeat.
@@ -16359,11 +16376,12 @@ rollback() {
         [ "$database_boundary_rollback_failed" -eq 0 ] && \
         [ "$current_sha" = "$PREVIOUS_SHA" ] && \
         [ "$DATABASE_FORWARD_MIGRATION_STARTED" -eq 0 ]; then
-        # Execute from the exact retained prior release. It independently
-        # checks the original seal and the globally latest immutable context.
+        # The prepared controller derives the prior Windows identity from the
+        # exact attempted hold, including when its commit acknowledgement was lost.
         if ! controlled_guard_run_qmt_activation_tool \
-          "$PREVIOUS_CODE_ROOT" "$PREVIOUS_VENV" "$PREVIOUS_SHA" \
-          --abort-precutover "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" "$EXPECTED_SHA"; then
+          "$PREPARED_CODE_ROOT" "$RELEASE_VENV_ROOT/$EXPECTED_SHA" "$EXPECTED_SHA" \
+          --abort-precutover "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" "$EXPECTED_SHA" \
+          "$PREVIOUS_SHA" "$PREVIOUS_WINDOWS_SHA"; then
           echo "RECOVERY_BLOCKED: Windows pre-cutover abort proof failed" >&2
           rollback_failed=1
         fi

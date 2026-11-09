@@ -934,6 +934,7 @@ def _require_existing_release_request(
 def append_recoverable_release_request(
     engine: Any, runtime_engine: Any, *, expected_build_sha: str,
     prior_build_sha: str, deployment_attempt_id: str,
+    prior_linux_build_sha: str | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Pin a live prior writer from the trusted candidate before stopping it.
@@ -946,6 +947,13 @@ def append_recoverable_release_request(
 
     target_build_sha = ledger._build_sha(expected_build_sha)
     prior_build_sha = ledger._build_sha(prior_build_sha)
+    finalized_linux_sha = (
+        ledger._build_sha(prior_linux_build_sha) if prior_linux_build_sha is not None else None
+    )
+    prior_identity = ({
+        "prior_build_sha": prior_build_sha,
+        "prior_linux_build_sha": finalized_linux_sha,
+    } if finalized_linux_sha is not None else {})
     if target_build_sha == prior_build_sha:
         raise RuntimeError("RECOVERY_BLOCKED: handoff target equals prior")
     at = (now or datetime.now()).replace(microsecond=0)
@@ -962,35 +970,70 @@ def append_recoverable_release_request(
             if current_hold is None or current_hold["deployment_attempt_id"] != deployment_attempt_id:
                 raise RuntimeError("RECOVERY_BLOCKED: replayed handoff is not latest")
             context = recovery.load_context(connection, current_hold)
-            if context["prior_build_sha"] != prior_build_sha or context["build_sha"] != target_build_sha:
+            if (context is None or context["schema"] != recovery.CONTEXT_SCHEMA
+                    or context["build_sha"] != target_build_sha):
                 raise RuntimeError("RECOVERY_BLOCKED: replayed handoff identity differs")
-            return {"mode": "request-recoverable-quiescence", "status": "idempotent",
+            actual_prior = context["prior_build_sha"]
+            if actual_prior != prior_build_sha:
+                if finalized_linux_sha is None:
+                    raise RuntimeError("RECOVERY_BLOCKED: replayed handoff identity differs")
+                _attest_frozen_handoff_prior(
+                    connection, runtime_engine, finalized_windows_sha=prior_build_sha,
+                    finalized_linux_sha=finalized_linux_sha, actual_windows_sha=actual_prior,
+                )
+            if finalized_linux_sha is not None:
+                prior_identity["handoff_prior_build_sha"] = actual_prior
+            return {**prior_identity, "mode": "request-recoverable-quiescence", "status": "idempotent",
                     "context": context, "activation_granted": False, "database_writes": False}
-        seal = _attest_forward_prior_database(connection, runtime_engine, prior_build_sha=prior_build_sha)
         previous_hold = recovery.latest_hold(connection)
         previous_context = recovery.load_context(connection, previous_hold) if previous_hold else None
         terminal = _release_terminal(connection, previous_hold, previous_context) if previous_hold else None
         if terminal is None:
             raise RuntimeError("RECOVERY_BLOCKED: prior code activation terminal unavailable")
+        original = _forward_original(previous_context) if previous_context is not None else None
         if terminal[0] == "grant":
-            if previous_hold["build_sha"] != prior_build_sha:
-                raise RuntimeError("RECOVERY_BLOCKED: prior code activation identity differs")
-        elif (previous_context is None
-              or _forward_original(previous_context)["build_sha"] != prior_build_sha
-              or _forward_original(previous_context)["seal_hash"] != recovery.seal_identity_hash(seal)):
+            actual_prior = previous_hold["build_sha"]
+        elif original is not None:
+            actual_prior = original["build_sha"]
+        else:
             raise RuntimeError("RECOVERY_BLOCKED: prior abort identity or schema differs")
+        if actual_prior == target_build_sha:
+            raise RuntimeError("RECOVERY_BLOCKED: handoff target equals prior")
+        if actual_prior != prior_build_sha and (finalized_linux_sha is None or original is None):
+            reason = (
+                "prior code activation identity differs" if terminal[0] == "grant"
+                else "prior abort identity or schema differs"
+            )
+            raise RuntimeError(f"RECOVERY_BLOCKED: {reason}")
+        if actual_prior == prior_build_sha:
+            seal = _attest_forward_prior_database(connection, runtime_engine, prior_build_sha=prior_build_sha)
         with runtime_engine.connect() as runtime:
+            if actual_prior != prior_build_sha:
+                component = _attest_granted_prior_component(
+                    runtime, finalized_windows_sha=prior_build_sha,
+                    finalized_linux_sha=finalized_linux_sha, actual_windows_sha=actual_prior,
+                )
+                _assert_split_prior_git_ancestry(actual_prior, target_build_sha)
+                seal = _attest_split_prior_database(
+                    connection, runtime, actual_windows_sha=actual_prior,
+                    controller_build_sha=target_build_sha, component=component,
+                )
+            seal_hash = recovery.seal_identity_hash(seal)
+            if terminal[0] == "abort" and original["seal_hash"] != seal_hash:
+                raise RuntimeError("RECOVERY_BLOCKED: prior abort identity or schema differs")
             identity_ok, identity = check_qmt_windows_edge_identity(
-                runtime, expected_build_sha=prior_build_sha,
+                runtime, expected_build_sha=actual_prior,
             )
             if not identity_ok:
                 raise RuntimeError("RECOVERY_BLOCKED: fresh prior Windows writer identity unavailable")
             prior = identity["current"]
+            if actual_prior != prior_build_sha and prior["host_name"] != original["host_name"]:
+                raise RuntimeError("RECOVERY_BLOCKED: registered prior Windows host differs")
         context = recovery.build_context(
             hold=hold, prior_build_sha=prior["build_sha"],
             prior_host_name=prior["host_name"], prior_pid=prior["pid"],
             prior_instance_id=prior["instance_id"],
-            prior_seal_hash=recovery.seal_identity_hash(seal), captured_at=at,
+            prior_seal_hash=seal_hash, captured_at=at,
         )
         ledger.insert_qmt_edge_release_quiescence_hold(connection, hold)
         recovery.insert_context(connection, context)
@@ -999,7 +1042,9 @@ def append_recoverable_release_request(
             ledger.insert_qmt_edge_release_request(connection, ledger.build_qmt_edge_release_request(
                 build_sha=target_build_sha, requested_at=at,
             ))
-    return {"mode": "request-recoverable-quiescence", "status": "inserted",
+    if finalized_linux_sha is not None:
+        prior_identity["handoff_prior_build_sha"] = actual_prior
+    return {**prior_identity, "mode": "request-recoverable-quiescence", "status": "inserted",
             "context": context, "activation_granted": False, "database_writes": True}
 
 
@@ -1101,6 +1146,106 @@ def _attest_forward_prior_database(
     seal = _read_retained_contract_seal(prior_build_sha)
     _assert_recovery_database_identity(connection, seal)
     return seal
+
+
+def _attest_granted_prior_component(
+    runtime_connection: Any, *, finalized_windows_sha: str,
+    finalized_linux_sha: str, actual_windows_sha: str,
+) -> dict[str, Any]:
+    from server.common.component_release_attestation import load_component_attestation
+
+    finalized = load_component_attestation(runtime_connection, finalized_linux_sha)
+    actual = load_component_attestation(runtime_connection, actual_windows_sha)
+    if (
+        finalized["linux_build_sha"] != finalized_linux_sha
+        or finalized["windows_build_sha"] != finalized_windows_sha
+        or actual["scope"] != "COORDINATED"
+        or any(actual[key] != actual_windows_sha for key in (
+            "linux_build_sha", "windows_build_sha", "contract_build_sha",
+        ))
+        or actual["parent_linux_build_sha"] != finalized_linux_sha
+        or actual["contract_sha256"] != finalized["contract_sha256"]
+    ):
+        raise RuntimeError("RECOVERY_BLOCKED: granted prior component lineage or contract differs")
+    return actual
+
+
+def _attest_split_prior_database(
+    connection: Any, runtime_connection: Any, *, actual_windows_sha: str,
+    controller_build_sha: str, component: dict[str, Any],
+) -> dict[str, Any]:
+    from server.engine.strategy_governance import _validate_trigger_contract_metadata
+
+    _require_activation_grant_root()
+    if os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip().lower() == "production" and (
+        os.environ.get("PROBIGA_BUILD_COMMIT_SHA", "").strip().lower() != controller_build_sha
+    ):
+        raise RuntimeError("RECOVERY_BLOCKED: handoff controller build differs")
+    # Attest the predecessor's physical seal without claiming its code is the
+    # currently executing controller. The signed manifest binds that predecessor.
+    seal = _validate_trigger_contract_metadata(
+        runtime_connection, build_sha=actual_windows_sha,
+        runtime_build_sha=controller_build_sha,
+        component_manifest_sha256=component["manifest_sha256"],
+    )
+    _assert_recovery_database_identity(connection, seal)
+    return seal
+
+
+def _assert_split_prior_git_ancestry(actual_windows_sha: str, target_build_sha: str) -> None:
+    production = os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip().lower() == "production"
+    git = "git"
+    env = {
+        "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+    if production:
+        expected_root = Path("/opt/ProBigA-releases") / target_build_sha
+        if ROOT != expected_root or os.environ.get("PROBIGA_CODE_ROOT") != str(expected_root):
+            raise RuntimeError("RECOVERY_BLOCKED: handoff Git root differs from controller")
+        _retained_root_path(ROOT, directory=True)
+        git = "/usr/bin/git"
+    else:
+        env.update({key: os.environ[key] for key in ("PATH", "SYSTEMROOT", "WINDIR", "PATHEXT") if key in os.environ})
+    try:
+        result = subprocess.run(
+            [git, "--no-replace-objects", "-c", f"core.hooksPath={os.devnull}",
+             "-c", "core.fsmonitor=false", "merge-base", "--is-ancestor",
+             actual_windows_sha, target_build_sha],
+            cwd=ROOT, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=10, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("RECOVERY_BLOCKED: handoff Git ancestry unavailable") from exc
+    if result.returncode == 1:
+        raise RuntimeError("RECOVERY_BLOCKED: target is not a descendant of the granted Windows prior")
+    if result.returncode != 0:
+        raise RuntimeError("RECOVERY_BLOCKED: handoff Git ancestry unavailable")
+
+
+def _attest_frozen_handoff_prior(
+    connection: Any, runtime_engine: Any, *, finalized_windows_sha: str,
+    finalized_linux_sha: str | None, actual_windows_sha: str,
+) -> None:
+    if actual_windows_sha != finalized_windows_sha and finalized_linux_sha is None:
+        raise RuntimeError("RECOVERY_BLOCKED: original prior build differs")
+    seal = _attest_forward_prior_database(
+        connection, runtime_engine, prior_build_sha=finalized_windows_sha,
+    )
+    if actual_windows_sha != finalized_windows_sha:
+        # A pending handoff already fenced the actual prior. A later schema
+        # seal can retain only the finalized contract, so do not re-attest the
+        # stopped process or require its earlier schema entry to still exist.
+        with runtime_engine.connect() as runtime:
+            _assert_recovery_database_identity(runtime, seal)
+            _attest_granted_prior_component(
+                runtime, finalized_windows_sha=finalized_windows_sha,
+                finalized_linux_sha=finalized_linux_sha, actual_windows_sha=actual_windows_sha,
+            )
 
 
 def _retained_root_path(path: Path, *, directory: bool = False) -> None:
@@ -1233,6 +1378,7 @@ def _read_retained_contract_seal(build_sha: str) -> dict[str, Any]:
 def append_forward_release_request(
     engine: Any, runtime_engine: Any, *, expected_build_sha: str,
     prior_build_sha: str, deployment_attempt_id: str,
+    prior_linux_build_sha: str | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Supersede or renew the latest pending target without reviving a writer."""
@@ -1240,6 +1386,9 @@ def append_forward_release_request(
 
     target = ledger._build_sha(expected_build_sha)
     prior = ledger._build_sha(prior_build_sha)
+    finalized_linux_sha = (
+        ledger._build_sha(prior_linux_build_sha) if prior_linux_build_sha is not None else None
+    )
     attempt = ledger._deployment_attempt_id(deployment_attempt_id)
     if target == prior:
         raise RuntimeError("RECOVERY_BLOCKED: forward target equals original prior")
@@ -1248,6 +1397,8 @@ def append_forward_release_request(
         "prior_build_sha": prior, "deployment_attempt_id": attempt,
         "activation_granted": False,
     }
+    if finalized_linux_sha is not None:
+        base["prior_linux_build_sha"] = finalized_linux_sha
     at = (now or datetime.now()).replace(microsecond=0)
     with recovery.release_control_connection(engine) as connection:
         _attest_activation_grant_connection(connection)
@@ -1278,14 +1429,20 @@ def append_forward_release_request(
             if _release_terminal(connection, old_hold, old_context) is not None:
                 raise RuntimeError("RECOVERY_BLOCKED: superseded hold has a terminal")
         original = _forward_original(chain[-1][1])
-        if original["build_sha"] != prior:
+        actual_prior = original["build_sha"]
+        if actual_prior == target:
+            raise RuntimeError("RECOVERY_BLOCKED: forward target equals original prior")
+        if actual_prior != prior and finalized_linux_sha is None:
             raise RuntimeError("RECOVERY_BLOCKED: original prior build differs")
+        if finalized_linux_sha is not None:
+            base["handoff_prior_build_sha"] = actual_prior
 
         if latest["deployment_attempt_id"] == attempt:
             if latest["build_sha"] != target or context.get("schema") != recovery.FORWARD_CONTEXT_SCHEMA:
                 raise RuntimeError("RECOVERY_BLOCKED: replayed forward identity differs")
-            _attest_forward_prior_database(
-                connection, runtime_engine, prior_build_sha=prior,
+            _attest_frozen_handoff_prior(
+                connection, runtime_engine, finalized_windows_sha=prior,
+                finalized_linux_sha=finalized_linux_sha, actual_windows_sha=actual_prior,
             )
             return {**base, "status": "idempotent",
                     "hold_run_uid": latest["hold_run_uid"],
@@ -1309,9 +1466,12 @@ def append_forward_release_request(
         ) or attempt in protected_attempts:
             raise RuntimeError("RECOVERY_BLOCKED: forward supersession repeats protected history")
 
-        _attest_forward_prior_database(
-            connection, runtime_engine, prior_build_sha=prior,
+        _attest_frozen_handoff_prior(
+            connection, runtime_engine, finalized_windows_sha=prior,
+            finalized_linux_sha=finalized_linux_sha, actual_windows_sha=actual_prior,
         )
+        if actual_prior != prior:
+            _assert_split_prior_git_ancestry(actual_prior, target)
         hold = ledger.build_qmt_edge_release_quiescence_hold(
             build_sha=target, deployment_attempt_id=attempt, requested_at=at,
         )
@@ -1340,11 +1500,21 @@ def append_forward_release_request(
 def append_precutover_abort(
     engine: Any, runtime_engine: Any, *, expected_build_sha: str,
     target_build_sha: str, deployment_attempt_id: str,
+    prior_build_sha: str | None = None, prior_linux_build_sha: str | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Broker calls only after unchanged-schema, pre-cutover rollback proof."""
     from server.common import qmt_edge_release_receipt as ledger
 
+    if (prior_build_sha is None) != (prior_linux_build_sha is None):
+        raise RuntimeError("RECOVERY_BLOCKED: both finalized prior builds are required for abort")
+    if prior_linux_build_sha is not None:
+        prior_build_sha = ledger._build_sha(prior_build_sha)
+        prior_linux_build_sha = ledger._build_sha(prior_linux_build_sha)
+        expected_build_sha = ledger._build_sha(expected_build_sha)
+        target_build_sha = ledger._build_sha(target_build_sha)
+        if expected_build_sha != target_build_sha:
+            raise RuntimeError("RECOVERY_BLOCKED: abort controller differs from target")
     with recovery.release_control_connection(engine) as connection:
         _attest_activation_grant_connection(connection)
         if recovery._row(connection, ledger.qmt_edge_release_quiescence_run_uid(deployment_attempt_id)) is None:
@@ -1354,14 +1524,37 @@ def append_precutover_abort(
         latest = recovery.latest_hold(connection)
         if latest is None or latest["build_sha"] != target_build_sha:
             raise RuntimeError("RECOVERY_BLOCKED: latest target differs")
-        with runtime_engine.connect() as runtime:
-            seal = ledger._validate_qmt_edge_release_activation_trigger_seal(
-                runtime, expected_build_sha=expected_build_sha,
-            )
-        _assert_recovery_database_identity(connection, seal)
+        actual_prior = expected_build_sha
+        if prior_linux_build_sha is None:
+            with runtime_engine.connect() as runtime:
+                seal = ledger._validate_qmt_edge_release_activation_trigger_seal(
+                    runtime, expected_build_sha=actual_prior,
+                )
+            _assert_recovery_database_identity(connection, seal)
+        else:
+            if latest["deployment_attempt_id"] != deployment_attempt_id:
+                raise RuntimeError("RECOVERY_BLOCKED: abort attempt is not globally latest")
+            context = recovery.load_context(connection, latest)
+            if context is None or context["schema"] != recovery.CONTEXT_SCHEMA:
+                raise RuntimeError("RECOVERY_BLOCKED: abort requires a recoverable handoff context")
+            actual_prior = context["prior_build_sha"]
+            if actual_prior == prior_build_sha:
+                seal = _attest_forward_prior_database(
+                    connection, runtime_engine, prior_build_sha=actual_prior,
+                )
+            else:
+                with runtime_engine.connect() as runtime:
+                    component = _attest_granted_prior_component(
+                        runtime, finalized_windows_sha=prior_build_sha,
+                        finalized_linux_sha=prior_linux_build_sha, actual_windows_sha=actual_prior,
+                    )
+                    seal = _attest_split_prior_database(
+                        connection, runtime, actual_windows_sha=actual_prior,
+                        controller_build_sha=expected_build_sha, component=component,
+                    )
         result = recovery.insert_abort(
             connection, expected_attempt=deployment_attempt_id,
-            prior_build_sha=expected_build_sha,
+            prior_build_sha=actual_prior,
             prior_seal_hash=recovery.seal_identity_hash(seal),
             now=(now or datetime.now()).replace(microsecond=0),
         )
@@ -2088,6 +2281,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--deployment-attempt-id")
     parser.add_argument("--target-build-sha")
     parser.add_argument("--prior-build-sha")
+    parser.add_argument("--prior-linux-build-sha")
     parser.add_argument("--runtime-env-file")
     parser.add_argument("--expected-poll-seconds", type=int, default=60)
     parser.add_argument("--heartbeat-timeout-seconds", type=int, default=240)
@@ -2126,8 +2320,15 @@ def main(argv: list[str] | None = None) -> int:
     transition_mode = args.abort_precutover or args.check_transition
     if bool(args.target_build_sha) != bool(transition_mode):
         parser.error("--target-build-sha is required only for pre-cutover handoff modes")
-    if bool(args.prior_build_sha) != bool(args.request_forward_quiescence or args.request_recoverable_quiescence):
-        parser.error("--prior-build-sha is required only for release quiescence")
+    quiescence_mode = args.request_forward_quiescence or args.request_recoverable_quiescence
+    if quiescence_mode and not args.prior_build_sha:
+        parser.error("--prior-build-sha is required for release quiescence")
+    if args.prior_build_sha and not (quiescence_mode or args.abort_precutover):
+        parser.error("--prior-build-sha is only valid for release quiescence or abort")
+    if args.prior_linux_build_sha and not (quiescence_mode or args.abort_precutover):
+        parser.error("--prior-linux-build-sha is only valid for release quiescence or abort")
+    if args.abort_precutover and bool(args.prior_build_sha) != bool(args.prior_linux_build_sha):
+        parser.error("pre-cutover abort requires both prior build arguments when supplied")
     if args.runtime_env_file and not (args.check_transition or args.check_activation):
         parser.error("--runtime-env-file is only valid for read-only transition checks")
     from tools.env_config import create_tool_engine, load_project_env
@@ -2180,18 +2381,22 @@ def main(argv: list[str] | None = None) -> int:
                 engine, runtime_engine, expected_build_sha=args.expected_build_sha,
                 prior_build_sha=args.prior_build_sha,
                 deployment_attempt_id=args.deployment_attempt_id,
+                prior_linux_build_sha=args.prior_linux_build_sha,
             )
         elif args.request_forward_quiescence:
             result = append_forward_release_request(
                 engine, runtime_engine, expected_build_sha=args.expected_build_sha,
                 prior_build_sha=args.prior_build_sha,
                 deployment_attempt_id=args.deployment_attempt_id,
+                prior_linux_build_sha=args.prior_linux_build_sha,
             )
         elif args.abort_precutover:
             result = append_precutover_abort(
                 engine, runtime_engine, expected_build_sha=args.expected_build_sha,
                 target_build_sha=args.target_build_sha,
                 deployment_attempt_id=args.deployment_attempt_id,
+                prior_build_sha=args.prior_build_sha,
+                prior_linux_build_sha=args.prior_linux_build_sha,
             )
         elif args.select_update_target:
             result = select_update_target(engine, expected_build_sha=args.expected_build_sha)
