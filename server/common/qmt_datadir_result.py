@@ -7,9 +7,10 @@ import os
 import re
 from contextlib import nullcontext
 from decimal import Decimal
+from itertools import groupby
 from typing import Any, Mapping, Sequence
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 
 from server.common.qmt_attestation_contract import canonical_digest
 
@@ -290,6 +291,8 @@ def persisted_rows(
     *,
     dataset: str,
     trade_date: str,
+    codes: Sequence[str] | None = None,
+    max_rows: int | None = None,
 ) -> tuple[int, int, list[dict[str, Any]]]:
     table = DATASET_TABLES[dataset]
     code_column = DATASET_CODE_COLUMNS[dataset]
@@ -323,21 +326,37 @@ def persisted_rows(
             "change_pct,volume,amount,snapshot_at"
         )
         where = "trade_date=:trade_date"
+    if codes is not None and not codes:
+        return 0, 0, []
+    if max_rows is not None and max_rows < 1:
+        raise ValueError("QMT datadir row limit is invalid")
+    params = {"trade_date": trade_date, "source": PROVIDER}
+    if codes is not None:
+        where += f" AND {code_column} IN :codes"
+        params["codes"] = list(codes)
+        if dataset in {"stock_minute", "index_minute"}:
+            next_day = dt.date.fromisoformat(trade_date) + dt.timedelta(days=1)
+            where += " AND trade_time>=:session_start AND trade_time<:next_session"
+            params.update(session_start=f"{trade_date} 00:00:00", next_session=f"{next_day} 00:00:00")
+    limit_clause = ""
+    if max_rows is not None:
+        limit_clause = " LIMIT :row_limit"
+        params["row_limit"] = max_rows + 1
+    hint = " /*+ MAX_EXECUTION_TIME(15000) */" if max_rows is not None else ""
+    statement = text(
+        f"SELECT{hint} {columns} FROM `{table}` WHERE {where} "
+        f"ORDER BY {code_column},trade_time{limit_clause}"
+    )
+    if codes is not None:
+        statement = statement.bindparams(bindparam("codes", expanding=True))
     connection_scope = (
         engine.connect() if callable(getattr(engine, "connect", None))
         else nullcontext(engine)
     )
     with connection_scope as connection:
-        rows = [
-            dict(row)
-            for row in connection.execute(
-                text(
-                    f"SELECT {columns} FROM `{table}` WHERE {where} "
-                    f"ORDER BY `{code_column}`,trade_time"
-                ),
-                {"trade_date": trade_date, "source": PROVIDER},
-            ).mappings()
-        ]
+        rows = [dict(row) for row in connection.execute(statement, params).mappings()]
+    if max_rows is not None and len(rows) > max_rows:
+        raise ValueError("QMT datadir selected minute row limit exceeded")
     return len(rows), len({row[code_column] for row in rows if row[code_column] is not None}), rows
 
 
@@ -346,17 +365,26 @@ def persisted_fingerprint(
     *,
     dataset: str,
     trade_date: str,
+    include_security_fingerprints: bool = False,
 ) -> dict[str, Any]:
     row_count, code_count, rows = persisted_rows(
         engine,
         dataset=dataset,
         trade_date=trade_date,
     )
-    return {
+    result = {
         "row_count": row_count,
         "code_count": code_count,
         "row_hash": row_hash(rows),
     }
+    if include_security_fingerprints:
+        code_key = DATASET_CODE_COLUMNS[dataset]
+        inventory = {}
+        for code, group in groupby(rows, key=lambda item: item[code_key]):
+            bars = list(group)
+            inventory[code] = {"row_count": len(bars), "row_hash": row_hash(bars)}
+        result["security_fingerprints"] = inventory
+    return result
 
 
 def validate_persisted_result(

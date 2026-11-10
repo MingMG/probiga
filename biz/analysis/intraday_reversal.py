@@ -3,13 +3,16 @@ from __future__ import annotations
 
 import json
 import math
-from datetime import date, datetime, time, timedelta
-from typing import Any, Sequence
+from datetime import date, datetime, time
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
-from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
+
+from server.common.qmt_index_minute_grid import CORE_GRID
+from server.common.qmt_minute_publication_scope import load_verified_minute_security_rows
 
 
 def _finite(value: Any, default: float = 0.0) -> float:
@@ -201,77 +204,75 @@ def summarize_stock_minutes(
     }
 
 
+def _minute_provenance(proof: Mapping[str, Any], code: str) -> dict[str, Any]:
+    return {
+        "known_at": proof["known_at"],
+        "publication_manifest_sha256": proof["manifest_sha256"],
+        "source_row_sha256": proof["security_fingerprints"][code]["row_hash"],
+    }
+
+
 def load_index_stability(
     engine: Engine,
     *,
     trade_date: str,
+    decision_known_at: datetime | str | None,
+    history_engine: Engine,
 ) -> dict[str, Any]:
-    target = date.fromisoformat(trade_date)
-    next_day = (target + timedelta(days=1)).isoformat()
-    query = text(
-        """
-        SELECT /*+ MAX_EXECUTION_TIME(15000) */
-               index_code, trade_time, price
-        FROM sm_index_minute
-        WHERE index_code=:index_code
-          AND trade_time>=:trade_date
-          AND trade_time<:next_day
-        ORDER BY trade_time
-        """
-    )
+    codes = ("000001", "399001", "399006")
+    if decision_known_at is None:
+        return {"status": "DATA_BLOCKED", "reason": "index minute decision cutoff unavailable"}
     try:
-        with engine.connect() as connection:
-            rows = []
-            for index_code in ("000001", "399001", "399006"):
-                rows.extend(
-                    connection.execute(
-                        query,
-                        {
-                            "index_code": index_code,
-                            "trade_date": trade_date,
-                            "next_day": next_day,
-                        },
-                    ).mappings().all()
-                )
-    except Exception as exc:
-        return {
-            "status": "DATA_BLOCKED",
-            "reason": f"{type(exc).__name__}: index minute unavailable",
-        }
-    frame = pd.DataFrame(rows)
-    if frame.empty:
-        return {"status": "DATA_BLOCKED", "reason": "index minute rows missing"}
-    frame["trade_time"] = pd.to_datetime(frame["trade_time"])
-    frame["price"] = pd.to_numeric(frame["price"], errors="coerce")
-    cutoff = datetime.combine(
-        datetime.fromisoformat(trade_date).date(), time(14, 30)
-    )
+        with engine.connect() as receipt_connection, history_engine.connect() as data_connection:
+            proof, rows_by_code = load_verified_minute_security_rows(
+                receipt_connection, data_connection, dataset="index_minute",
+                trade_date=trade_date, decision_known_at=decision_known_at, codes=codes,
+            )
+    except (SQLAlchemyError, ValueError, TypeError, TimeoutError) as exc:
+        return {"status": "DATA_BLOCKED", "reason": f"index minute proof unavailable ({type(exc).__name__})"}
+    if set(rows_by_code) != set(codes):
+        return {"status": "DATA_BLOCKED", "reason": "index minute publication incomplete at decision cutoff"}
+
+    late_cutoff = datetime.combine(date.fromisoformat(trade_date), time(14, 30))
     items = []
-    for index_code, group in frame.dropna(subset=["price"]).groupby("index_code"):
-        group = group.sort_values("trade_time")
-        late = group[group["trade_time"] >= cutoff]
-        if len(late) < 2 or float(late.iloc[0]["price"]) <= 0:
-            continue
-        late_return = (
-            float(late.iloc[-1]["price"]) / float(late.iloc[0]["price"]) - 1.0
-        ) * 100.0
-        session_open = float(group.iloc[0]["price"])
-        session_return = (
-            float(group.iloc[-1]["price"]) / session_open - 1.0
-        ) * 100.0
+    for code in codes:
+        frame = pd.DataFrame(rows_by_code[code])
+        trade_times = pd.to_datetime(frame["trade_time"])
+        prices = pd.to_numeric(frame["price"], errors="coerce")
+        if (
+            trade_times.dt.strftime("%H:%M:%S").tolist() != list(CORE_GRID)
+            or not prices.map(math.isfinite).all() or not (prices > 0).all()
+        ):
+            return {"status": "DATA_BLOCKED", "reason": "verified index minute grid or price differs"}
+        late = prices[trade_times >= late_cutoff]
+        late_return = (float(late.iloc[-1]) / float(late.iloc[0]) - 1.0) * 100.0
+        session_return = (float(prices.iloc[-1]) / float(prices.iloc[0]) - 1.0) * 100.0
         items.append({
-            "index_code": str(index_code),
+            "index_code": code,
             "session_return_pct": round(session_return, 4),
             "last_30m_return_pct": round(late_return, 4),
-            "stable": bool(session_return >= -0.5 and late_return >= -0.2),
+            "stable": session_return >= -0.5 and late_return >= -0.2,
+            **_minute_provenance(proof, code),
         })
-    if not items:
-        return {"status": "DATA_BLOCKED", "reason": "late index rows missing"}
+    stable_count = sum(item["stable"] for item in items)
     return {
         "status": "AVAILABLE",
+        "source": "qmt_datadir",
+        "known_at": proof["known_at"],
+        "publication_manifest_sha256": proof["manifest_sha256"],
         "indices": items,
-        "stable_count": sum(item["stable"] for item in items),
-        "stable": sum(item["stable"] for item in items) >= 2,
+        "stable_count": stable_count,
+        "stable": stable_count >= 2,
+    }
+
+
+def _blocked_stock_minutes(code: str, reason: str) -> dict[str, Any]:
+    return {
+        "stock_code": code,
+        "minute_available": False,
+        "intraday_event_json": json.dumps(
+            {"status": "DATA_BLOCKED", "reason": reason}, ensure_ascii=False, sort_keys=True,
+        ),
     }
 
 
@@ -280,90 +281,43 @@ def load_intraday_evidence(
     *,
     trade_date: str,
     stock_codes: Sequence[str],
+    decision_known_at: datetime | str | None,
+    daily_pre_close: Mapping[str, Any],
 ) -> pd.DataFrame:
+    """Read selected native minute values against one prior publication."""
     codes = sorted({str(code).zfill(6) for code in stock_codes})
     if not codes:
         return pd.DataFrame()
-    statement = text(
-        """
-        SELECT /*+ MAX_EXECUTION_TIME(30000) */
-               stock_code, trade_time, price, `change`, change_pct,
-               volume, amount, data_source
-        FROM sm_stock_minute
-        WHERE trade_date=:trade_date
-          AND stock_code IN :stock_codes
-          AND price IS NOT NULL
-          AND price > 0
-        ORDER BY stock_code, trade_time
-        """
-    ).bindparams(bindparam("stock_codes", expanding=True))
-    frames = []
-    with engine.connect() as connection:
-        for offset in range(0, len(codes), 200):
-            batch = codes[offset:offset + 200]
-            rows = connection.execute(
-                statement,
-                {"trade_date": trade_date, "stock_codes": batch},
-            ).mappings().all()
-            if rows:
-                frames.append(pd.DataFrame(rows))
-    if not frames:
-        return pd.DataFrame()
-    frame = pd.concat(frames, ignore_index=True)
-    anchor_statement = text(
-        """
-        SELECT stock_code, pre_close
-        FROM sm_stock_kline
-        WHERE trade_date=:trade_date
-          AND k_type=1
-          AND adjust_type=0
-          AND stock_code IN :stock_codes
-        """
-    ).bindparams(bindparam("stock_codes", expanding=True))
-    anchor_frames = []
-    with engine.connect() as connection:
-        for offset in range(0, len(codes), 400):
-            batch = codes[offset:offset + 400]
-            rows = connection.execute(
-                anchor_statement,
-                {"trade_date": trade_date, "stock_codes": batch},
-            ).mappings().all()
-            if rows:
-                anchor_frames.append(pd.DataFrame(rows))
-    if anchor_frames:
-        anchors = pd.concat(anchor_frames, ignore_index=True).drop_duplicates(
-            "stock_code", keep="last"
-        )
-        anchors["stock_code"] = anchors["stock_code"].astype(str).str.zfill(6)
-        frame["stock_code"] = frame["stock_code"].astype(str).str.zfill(6)
-        frame = frame.merge(anchors, on="stock_code", how="left")
+    if decision_known_at is None:
+        return pd.DataFrame([_blocked_stock_minutes(code, "stock minute decision cutoff unavailable") for code in codes])
+
+    anchors = {code: _finite(daily_pre_close.get(code), math.nan) for code in codes}
+    requested = [code for code in codes if math.isfinite(anchors[code]) and anchors[code] > 0]
+    proof, rows_by_code = {}, {}
+    missing_reason = "stock minute publication unavailable at decision cutoff"
+    if requested:
+        try:
+            with engine.connect() as connection:
+                proof, rows_by_code = load_verified_minute_security_rows(
+                    connection, connection, dataset="stock_minute", trade_date=trade_date,
+                    decision_known_at=decision_known_at, codes=requested,
+                )
+        except (SQLAlchemyError, ValueError, TypeError, TimeoutError) as exc:
+            missing_reason = f"stock minute proof unavailable ({type(exc).__name__})"
     summaries = []
-    for code, group in frame.groupby("stock_code", sort=True):
-        sources = sorted(
-            str(value) for value in group["data_source"].dropna().unique()
-        )
-        if len(sources) != 1:
-            summaries.append({
-                "stock_code": str(code).zfill(6),
-                "minute_available": False,
-                "minute_rows": int(len(group)),
-                "minute_source": ",".join(sources),
-                "intraday_event_json": json.dumps(
-                    {
-                        "status": "DATA_BLOCKED",
-                        "reason": "mixed minute sources",
-                        "sources": sources,
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                ),
-            })
+    for code in codes:
+        if code not in requested:
+            summaries.append(_blocked_stock_minutes(code, "verified daily pre-close unavailable"))
             continue
-        summaries.append(
-            summarize_stock_minutes(
-                group,
-                stock_code=str(code).zfill(6),
-                source=sources[0],
-            )
-        )
+        if code not in rows_by_code:
+            reason = "verified stock minute rows missing or changed" if proof else missing_reason
+            summaries.append(_blocked_stock_minutes(code, reason))
+            continue
+        frame = pd.DataFrame(rows_by_code[code])
+        frame["pre_close"] = anchors[code]
+        summary = summarize_stock_minutes(frame, stock_code=code, source="qmt_datadir")
+        event = json.loads(summary["intraday_event_json"])
+        event.update(_minute_provenance(proof, code))
+        summary["intraday_event_json"] = json.dumps(event, ensure_ascii=False, sort_keys=True)
+        summaries.append(summary)
     return pd.DataFrame(summaries)

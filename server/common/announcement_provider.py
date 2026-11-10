@@ -33,6 +33,8 @@ CNINFO_MAX_PAGES_PER_STOCK = 200
 CNINFO_DATE_SHARD_MIN_STABLE_ROUNDS = 2
 CNINFO_DATE_SHARD_MAX_CAPTURE_ROUNDS = 8
 CNINFO_DATE_SHARD_SPLIT_VERSION = "MIDPOINT_INCLUSIVE_V1"
+_CNINFO_FROZEN_PAGINATION_SCHEMA = "probiga.cninfo-frozen-pagination.v1"
+_CNINFO_FROZEN_PAGINATION_QUALITY = "EXACT_STOCK_DATE_SHARDS_FROZEN_CUTOFF_DOUBLE_ATTESTED"
 ANNOUNCEMENT_DB_PUBLISH_RESERVE_SECONDS = 60.0
 _QMT_CODE_RE = re.compile(r"^(?:0|3|4|6|8|9)\d{5}\.(?:SH|SZ|BJ)$")
 
@@ -1107,8 +1109,8 @@ class CninfoMarketAnnouncementProvider:
         result set nor a harmless duplicate.  Split the date interval until
         every leaf is one exhausted page where possible.  A single dense day
         that still spans pages is accepted only as one internally complete
-        sweep; the caller independently repeats the whole tree until two
-        consecutive raw-by-identity snapshots are exactly equal.
+        sweep. The caller independently repeats the whole tree until two
+        consecutive complete sweeps agree on the requested cutoff.
         """
 
         query_count = 0
@@ -1274,6 +1276,26 @@ class CninfoMarketAnnouncementProvider:
             )
         return rows, leaves, query_count, root_total, root_reported_pages
 
+    def _validated_source_row(
+        self, raw: Mapping[str, Any], *, code: str, start_at: datetime, cutoff: datetime,
+    ) -> tuple[str, str, datetime]:
+        row_code = str(raw.get("secCode") or "").strip().zfill(6)
+        event_id = str(raw.get("announcementId") or "").strip()
+        title = str(raw.get("announcementTitle") or "").strip()
+        published_at = self._publication_datetime(raw.get("announcementTime"))
+        if (
+            row_code != code
+            or not event_id
+            or not title
+            or not start_at.date() <= published_at.date() <= cutoff.date()
+            or (
+                published_at > cutoff
+                and (cutoff.strftime("%H%M%S") == "235959" or len(event_id) > 512)
+            )
+        ):
+            raise AnnouncementProviderError("ANNOUNCEMENT_FALLBACK_ROW_INVALID", code)
+        return event_id, title, published_at
+
     def fetch(
         self,
         *,
@@ -1321,6 +1343,7 @@ class CninfoMarketAnnouncementProvider:
         pagination_invalid_round_count = 0
         pagination_complete_round_sha256: list[str] = []
         pagination_complete_round_attempts: list[int] = []
+        complete_rounds: list[dict[str, Any]] = []
         pagination_mode = "EXACT_STOCK_SINGLE_PAGE"
         quality_status = "EXACT_STOCK_PAGINATION_EXHAUSTED"
         if provider_pages == 1:
@@ -1332,7 +1355,7 @@ class CninfoMarketAnnouncementProvider:
             raw_rows = list(pages[0])
         else:
             total_query_counter = [1]
-            previous_round_hash = ""
+            previous_frozen_hash = ""
             previous_complete_attempt = 0
             accepted: tuple[
                 list[dict[str, Any]], list[dict[str, Any]], int, int, int
@@ -1356,13 +1379,11 @@ class CninfoMarketAnnouncementProvider:
                     pagination_invalid_round_count += 1
                     # An incomplete sweep breaks consecutiveness.  A later
                     # snapshot must establish a new two-round stable pair.
-                    previous_round_hash = ""
+                    previous_frozen_hash = ""
                     previous_complete_attempt = 0
                     root_body = None
                     continue
-                current_rows, _current_manifest, _, current_total, current_pages = (
-                    current
-                )
+                current_rows, current_manifest, query_count, current_total, current_pages = current
                 canonical_rows = sorted(
                     current_rows,
                     key=lambda item: (
@@ -1370,11 +1391,21 @@ class CninfoMarketAnnouncementProvider:
                         str(item.get("announcementId") or ""),
                     ),
                 )
-                # Each sweep has already proved full page/count/identity
-                # coverage.  Compare its complete raw records by identity:
-                # equal-time announcements may change order or page position
-                # without changing any record.  Keep the accepted raw page
-                # and manifest hashes below as the pagination audit evidence.
+                # Exhaust and validate the whole date query before partitioning
+                # it. Later same-day publications can shift raw page boundaries.
+                frozen_rows = [
+                    raw for raw in canonical_rows
+                    if self._validated_source_row(
+                        raw, code=code, start_at=start_at, cutoff=cutoff,
+                    )[2] <= cutoff
+                ]
+                frozen_hash = _canonical_hash({
+                    "schema": _CNINFO_FROZEN_PAGINATION_SCHEMA,
+                    "stock_code": code,
+                    "requested_start_time": requested_start_time,
+                    "requested_end_time": requested_end_time,
+                    "rows_by_identity": frozen_rows,
+                })
                 current_round_hash = _canonical_hash({
                     "schema": "probiga.cninfo-date-shard-capture-round.v2",
                     "split_version": CNINFO_DATE_SHARD_SPLIT_VERSION,
@@ -1382,17 +1413,28 @@ class CninfoMarketAnnouncementProvider:
                     "root_reported_totalpages": current_pages,
                     "rows_by_identity": canonical_rows,
                 })
+                manifest_hash = _canonical_hash({
+                    "schema": "probiga.cninfo-date-shard-manifest.v1",
+                    "stock_code": code,
+                    "requested_start_time": requested_start_time,
+                    "requested_end_time": requested_end_time,
+                    "shards": current_manifest,
+                })
+                complete_rounds.append({
+                    "raw_manifest": current_manifest,
+                    "raw_manifest_sha256": manifest_hash,
+                    "raw_count": current_total,
+                    "query_count": query_count,
+                    "frozen_sha256": frozen_hash,
+                    "retained_count": len(frozen_rows),
+                })
                 pagination_complete_round_sha256.append(current_round_hash)
                 pagination_complete_round_attempts.append(attempt)
-                if (
-                    previous_round_hash
-                    and current_round_hash == previous_round_hash
-                    and previous_complete_attempt == attempt - 1
-                ):
+                if frozen_hash == previous_frozen_hash and previous_complete_attempt == attempt - 1:
                     accepted = current
                     pagination_attempt_count = attempt
                     break
-                previous_round_hash = current_round_hash
+                previous_frozen_hash = frozen_hash
                 previous_complete_attempt = attempt
                 root_body = None
             if accepted is None:
@@ -1409,76 +1451,37 @@ class CninfoMarketAnnouncementProvider:
             ) = accepted
             pagination_query_count = total_query_counter[0]
             pagination_round_count = len(pagination_complete_round_sha256)
-            date_shard_manifest_sha256 = _canonical_hash({
-                "schema": "probiga.cninfo-date-shard-manifest.v1",
-                "stock_code": code,
-                "requested_start_time": requested_start_time,
-                "requested_end_time": requested_end_time,
-                "shards": date_shard_manifest,
-            })
-            date_shard_recheck_sha256 = _canonical_hash({
-                "schema": "probiga.cninfo-date-shard-manifest.v1",
-                "stock_code": code,
-                "requested_start_time": requested_start_time,
-                "requested_end_time": requested_end_time,
-                "shards": date_shard_manifest,
-            })
+            date_shard_manifest_sha256 = complete_rounds[-1]["raw_manifest_sha256"]
+            date_shard_recheck_sha256 = complete_rounds[-2]["raw_manifest_sha256"]
             pages = []
             pagination_mode = "EXACT_STOCK_DATE_SHARDS_DOUBLE_ATTESTED"
-            quality_status = "EXACT_STOCK_DATE_SHARDS_DOUBLE_ATTESTED"
+            quality_status = _CNINFO_FROZEN_PAGINATION_QUALITY
         if len(raw_rows) != total_records:
             raise AnnouncementProviderError(
                 "ANNOUNCEMENT_FALLBACK_PAGINATION_INCOMPLETE",
                 f"stock={code},total",
             )
-        raw_rows.sort(
-            key=lambda item: (
-                int(item.get("announcementTime") or 0),
-                str(item.get("announcementId") or ""),
-            ),
-            reverse=True,
-        )
+        validated_rows = [
+            (raw, *self._validated_source_row(raw, code=code, start_at=start_at, cutoff=cutoff))
+            for raw in raw_rows
+        ]
+        validated_rows.sort(key=lambda item: (item[3], item[1]), reverse=True)
         captured_at = self._now_fn().replace(tzinfo=None)
         rows: list[dict[str, Any]] = []
         excluded_after_cutoff: list[dict[str, str]] = []
-        seen: set[tuple[str, str]] = set()
-        previous_time: datetime | None = None
-        for raw in raw_rows:
-            row_code = str(raw.get("secCode") or "").strip().zfill(6)
-            event_id = str(raw.get("announcementId") or "").strip()
-            title = str(raw.get("announcementTitle") or "").strip()
-            published_at = self._publication_datetime(
-                raw.get("announcementTime")
-            )
-            if (
-                row_code != code
-                or not event_id
-                or not title
-                or not start_at.date() <= published_at.date() <= cutoff.date()
-            ):
-                raise AnnouncementProviderError(
-                    "ANNOUNCEMENT_FALLBACK_ROW_INVALID", code
-                )
-            row_identity = (row_code, event_id)
-            if row_identity in seen:
+        seen: set[str] = set()
+        for raw, event_id, title, published_at in validated_rows:
+            if event_id in seen:
                 raise AnnouncementProviderError(
                     "ANNOUNCEMENT_FALLBACK_PAGINATION_CHANGED",
                     f"duplicate={code}:{event_id}",
                 )
-            if previous_time is not None and published_at > previous_time:
-                raise AnnouncementProviderError(
-                    "ANNOUNCEMENT_FALLBACK_PAGINATION_CHANGED",
-                    f"stock={code},order",
-                )
-            seen.add(row_identity)
-            previous_time = published_at
+            seen.add(event_id)
             published_text = published_at.isoformat(sep=" ", timespec="microseconds")
             source_row_hash = _canonical_hash(raw)
             if published_at > cutoff:
                 # The provider's date-only query includes the rest of this
                 # calendar day. Keep raw pagination evidence for those rows.
-                if cutoff.strftime("%H%M%S") == "235959" or len(event_id) > 512:
-                    raise AnnouncementProviderError("ANNOUNCEMENT_FALLBACK_ROW_INVALID", code)
                 excluded_after_cutoff.append({
                     "source_event_id": event_id,
                     "published_at": published_text,
@@ -1504,7 +1507,14 @@ class CninfoMarketAnnouncementProvider:
                 ),
                 "source_row_hash": source_row_hash,
             })
-        cutoff_proof = {"excluded_after_cutoff": excluded_after_cutoff} if excluded_after_cutoff else {}
+        cutoff_proof: dict[str, Any] = {}
+        if excluded_after_cutoff:
+            cutoff_proof["excluded_after_cutoff"] = excluded_after_cutoff
+        if complete_rounds:
+            cutoff_proof["pagination_frozen_proof"] = {
+                "schema": _CNINFO_FROZEN_PAGINATION_SCHEMA,
+                "complete_rounds": complete_rounds,
+            }
         page_hashes = (
             [str(item["page_sha256"]) for item in date_shard_manifest]
             if date_shard_manifest
@@ -1547,8 +1557,12 @@ class CninfoMarketAnnouncementProvider:
                 "date_shard_split_version": CNINFO_DATE_SHARD_SPLIT_VERSION,
             } if date_shard_manifest else {}),
         })
+        payload_schema = (
+            "probiga.cninfo-per-stock-announcement.v2"
+            if complete_rounds else "probiga.cninfo-per-stock-announcement.v1"
+        )
         payload_hash = _canonical_hash({
-            "schema": "probiga.cninfo-per-stock-announcement.v1",
+            "schema": payload_schema,
             "security_master_sha256": self._master_start_hash,
             "stock_code": code,
             "qmt_code": instrument,
@@ -1641,9 +1655,7 @@ class CninfoMarketAnnouncementProvider:
             "provider_payload_sha256": payload_hash,
             "permission_status": "PUBLIC",
             "quality_status": quality_status,
-            "data_version": _canonical_hash(
-                "probiga.cninfo-per-stock-announcement.v1"
-            ),
+            "data_version": _canonical_hash(payload_schema),
         }
         return ProviderResult(tuple(rows), receipt)
 

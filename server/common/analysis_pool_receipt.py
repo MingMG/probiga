@@ -54,6 +54,9 @@ SCORE_SNAPSHOT_SCHEMA = "probiga.analysis-score-snapshot.v1"
 TURNOVER_DIRECT_FORMULA = "EASTMONEY_PUSH2HIS_F61_PERCENT"
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 ANALYSIS_POOL_PUBLISHER_TASK_TYPES = frozenset({"analysis_fast"})
+PREMARKET_POOL_TASK = "strategy_external_overlay"
+ANALYSIS_SCORE_PUBLICATION_TASK_TYPES = ANALYSIS_POOL_PUBLISHER_TASK_TYPES | {PREMARKET_POOL_TASK}
+
 CANONICAL_ANALYSIS_COLUMNS = tuple(
     name
     for name in ANALYSIS_COLUMN_CONTRACT
@@ -400,11 +403,22 @@ def build_score_snapshot(
     *, trade_date: str, decision_at: datetime | str, run_uid: str,
     build_sha: str, analysis_rows: Iterable[Mapping[str, Any]],
     scored_rows: Iterable[Mapping[str, Any]],
+    fixed_market_context: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload = _score_snapshot_payload(
         trade_date=trade_date, decision_at=decision_at, run_uid=run_uid,
         build_sha=build_sha, analysis_rows=analysis_rows, scored_rows=scored_rows,
     )
+    if fixed_market_context is not None:
+        context = dict(fixed_market_context)
+        digest = str(context.pop("context_sha256", ""))
+        if (
+            context.get("trade_date") != trade_date
+            or context.get("decision_known_at") != payload["input_decision_at"]
+            or canonical_sha256(context) != digest
+        ):
+            raise ValueError("ANALYSIS_SCORE_FIXED_MARKET_CONTEXT_MISMATCH")
+        payload["fixed_market_context"] = {**context, "context_sha256": digest}
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
     return _score_snapshot_envelope(payload, raw, _snapshot_compress(payload))
 
@@ -1510,7 +1524,7 @@ def build_publication_receipt(
     score_snapshot: Mapping[str, Any],
 ) -> dict[str, Any]:
     snapshot = decode_score_snapshot(score_snapshot, trade_date=str(manifest.get("trade_date") or ""))
-    if publisher_task_type not in ANALYSIS_POOL_PUBLISHER_TASK_TYPES:
+    if publisher_task_type not in ANALYSIS_SCORE_PUBLICATION_TASK_TYPES:
         raise ValueError("ANALYSIS_CANONICAL_PUBLISHER_REQUIRED")
     if datetime.fromisoformat(str(published_at)) < datetime.fromisoformat(snapshot["decision_at"]):
         raise ValueError("ANALYSIS_PUBLICATION_PRECEDES_DECISION")
@@ -1541,7 +1555,7 @@ def publication_receipt_is_valid(value: Mapping[str, Any]) -> bool:
         return False
     return bool(
         value.get("schema") == ANALYSIS_POOL_RECEIPT_SCHEMA
-        and value.get("publisher_task_type") in ANALYSIS_POOL_PUBLISHER_TASK_TYPES
+        and value.get("publisher_task_type") in ANALYSIS_SCORE_PUBLICATION_TASK_TYPES
         and re.fullmatch(r"[0-9a-f]{64}", supplied)
         and supplied == canonical_sha256(core)
         and snapshot["run_uid"] == value.get("run_uid")

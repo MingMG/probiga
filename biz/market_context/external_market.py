@@ -9,6 +9,8 @@ instead of silently treating them as neutral.
 from __future__ import annotations
 
 import csv
+from collections.abc import Mapping
+from contextlib import nullcontext
 import json
 import logging
 import math
@@ -16,7 +18,7 @@ import re
 import uuid
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time as datetime_time, timedelta
 from typing import Any, Iterable
 from urllib.parse import quote, urlencode
 from urllib.request import Request, build_opener, ProxyHandler
@@ -26,6 +28,7 @@ import pandas as pd
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from server.common.authoritative_market_clock import STRATEGY_POOL_PREMARKET_REVISION_TIME
 from server.common.sql_reader import read_sql_rows
 from server.common.runtime_table_schema import (
     RuntimeColumn,
@@ -38,6 +41,9 @@ from server.common.runtime_table_schema import (
 logger = logging.getLogger(__name__)
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 MAX_QUOTE_AGE_SECONDS = 96 * 60 * 60
+PREMARKET_EXTERNAL_TASK_TYPE = "strategy_external_market_snapshot"
+PREMARKET_EXTERNAL_CAPTURE_TIME = datetime_time(8, 15)
+PREMARKET_EXTERNAL_SNAPSHOT_SCHEMA = "probiga.external-market-premarket-snapshot.v1"
 
 
 def _public_json(request: Request, *, timeout: int) -> dict[str, Any]:
@@ -1120,6 +1126,113 @@ def store_external_market_snapshot(engine: Engine, snapshot: dict[str, Any]) -> 
         "acquisition_status": snapshot.get("acquisition_status") or "FAILED",
         "missing_symbols": list(snapshot.get("missing_symbols") or []),
     }
+
+
+def _external_premarket_persisted_proof(
+    engine, *, snapshot_id: str, captured_at: datetime,
+) -> tuple[str, list[str]]:
+    from server.common.analysis_pool_receipt import canonical_sha256
+
+    expected = [symbol for symbol, _ in EXTERNAL_MARKET_SYMBOLS]
+    scope = engine.connect() if hasattr(engine, "connect") else nullcontext(engine)
+    with scope as connection:
+        hint = "/*+ MAX_EXECUTION_TIME(4000) */ " if connection.dialect.name == "mysql" else ""
+        rows = connection.execute(text(f"""
+            SELECT {hint}snapshot_id, context_date, captured_at, source, symbol, display_name,
+                   price, change_pct, previous_close, market_time, availability, payload_json
+            FROM st_external_market_context WHERE snapshot_id=:snapshot_id
+            ORDER BY symbol LIMIT :row_limit
+        """), {"snapshot_id": snapshot_id, "row_limit": len(expected) + 1}).mappings().all()
+    if sorted(row["symbol"] for row in rows) != sorted(expected):
+        raise ValueError("external snapshot instrument inventory differs")
+    unavailable = set()
+    for row in rows:
+        if (
+            row["snapshot_id"] != snapshot_id or str(row["context_date"]) != captured_at.date().isoformat()
+            or _as_datetime(row["captured_at"]) != captured_at or not row["source"]
+        ):
+            raise ValueError("external snapshot persisted identity differs")
+        if row["availability"] == "available":
+            quote_time = _as_datetime(row["market_time"])
+            if (
+                quote_time is None or quote_time > captured_at
+                or (captured_at - quote_time).total_seconds() > MAX_QUOTE_AGE_SECONDS
+                or _number(row["price"]) is None or _number(row["change_pct"]) is None
+            ):
+                raise ValueError("external snapshot quote time or values differ")
+        elif row["availability"] == "missing":
+            unavailable.add(row["symbol"])
+        else:
+            raise ValueError("external snapshot instrument status differs")
+    digest = canonical_sha256([
+        {name: None if value is None else str(value) for name, value in row.items()}
+        for row in rows
+    ])
+    return digest, [symbol for symbol in expected if symbol in unavailable]
+
+
+def validate_premarket_external_market_receipt(
+    receipt: Mapping[str, Any], *, expected_execution_session: str | None = None,
+    cutoff: datetime | None = None, finished_at: datetime | None = None,
+) -> tuple[datetime, Mapping[str, Any]]:
+    """Check the immutable stdout receipt and strict Shanghai time bounds."""
+    if not isinstance(receipt, Mapping):
+        raise ValueError("external snapshot receipt is unavailable")
+    session = date.fromisoformat(str(receipt.get("execution_session_date") or ""))
+    captured_at = _as_datetime(receipt.get("captured_at"))
+    stored_at = _as_datetime(receipt.get("stored_at"))
+    source_start = datetime.combine(session, PREMARKET_EXTERNAL_CAPTURE_TIME)
+    decision = datetime.combine(session, STRATEGY_POOL_PREMARKET_REVISION_TIME)
+    report = receipt.get("external_market")
+    snapshot_id = str(receipt.get("snapshot_id") or "")
+    score = report.get("external_market_score") if isinstance(report, Mapping) else None
+    if (
+        receipt.get("schema") != PREMARKET_EXTERNAL_SNAPSHOT_SCHEMA
+        or receipt.get("status") != "COMPLETE"
+        or receipt.get("execution_session_date") != session.isoformat()
+        or (expected_execution_session is not None and expected_execution_session != session.isoformat())
+        or (cutoff is not None and _shanghai_naive(cutoff) != decision)
+        or captured_at is None or stored_at is None
+        or not source_start <= captured_at < decision
+        or not captured_at <= stored_at <= decision
+        or (finished_at is not None and not stored_at <= _shanghai_naive(finished_at) <= decision)
+        or str(uuid.UUID(snapshot_id)) != snapshot_id
+        or re.fullmatch(r"[0-9a-f]{64}", str(receipt.get("persisted_sha256") or "")) is None
+        or receipt.get("automatic_real_order_submission") is not False
+        or receipt.get("real_order_authority") is not False
+        or receipt.get("canonical_recommendation_writes") is not False
+        or not isinstance(report, Mapping)
+        or report.get("snapshot_id") != snapshot_id
+        or report.get("context_date") != session.isoformat()
+        or _as_datetime(report.get("captured_at")) != captured_at.replace(microsecond=0)
+        or type(report.get("available_count")) is not int
+        or not 0 < report["available_count"] <= len(EXTERNAL_MARKET_SYMBOLS)
+        or report.get("expected_count") != len(EXTERNAL_MARKET_SYMBOLS)
+        or report.get("external_market_data_quality") not in {"PASS", "WATCH"}
+        or report.get("external_market_status") not in {"SUPPORT", "NEUTRAL", "RISK", "UNKNOWN"}
+        or (score is not None and (type(score) not in {int, float} or not 0 <= score <= 100))
+    ):
+        raise ValueError("external snapshot receipt identity, time or coverage differs")
+    return captured_at, report
+
+
+def load_verified_premarket_external_market_context(
+    engine, *, receipt: Mapping[str, Any], cutoff: datetime, finished_at: datetime,
+) -> dict[str, Any]:
+    """Replay a signed scheduler receipt's exact stored snapshot without re-scoring it."""
+    captured_at, report = validate_premarket_external_market_receipt(
+        receipt, cutoff=cutoff, finished_at=finished_at,
+    )
+    digest, missing = _external_premarket_persisted_proof(
+        engine, snapshot_id=receipt["snapshot_id"], captured_at=captured_at.replace(microsecond=0),
+    )
+    if (
+        digest != receipt["persisted_sha256"] or report.get("missing_symbols") != missing
+        or report["available_count"] != len(EXTERNAL_MARKET_SYMBOLS) - len(missing)
+        or report.get("acquisition_status") != ("PARTIAL" if missing else "COMPLETE")
+    ):
+        raise ValueError("external snapshot persisted coverage or digest differs")
+    return dict(report)
 
 
 def _parse_cutoff(as_of: datetime | str | date | None) -> datetime:

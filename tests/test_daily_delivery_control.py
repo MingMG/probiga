@@ -959,3 +959,88 @@ def test_scheduler_delivery_api_returns_only_materialized_truth():
             trade_date="2026-09-02",
             release_id=BUILD_SHA,
         )
+
+
+def test_frozen_pool_revision_requires_the_current_initial_receipt():
+    from server.common.authoritative_market_clock import (
+        PRODUCTION_TIMEZONE,
+        StrategyPoolDecisionSlot,
+    )
+
+    target = "2026-09-02"
+    engine = _engine()
+
+    def draft(run_uid, status="PASS"):
+        control.start_daily_stage_attempt(
+            engine,
+            scheduler_run_uid=run_uid,
+            stage_name="strategy_governance_daily",
+            trade_date=target,
+            release_id=BUILD_SHA,
+            strategy_release_id=STRATEGY_RELEASE_ID,
+            lease_owner="linux-100",
+        )
+        with engine.begin() as connection:
+            control.finish_daily_stage_attempt(
+                connection, scheduler_run_uid=run_uid, status="success",
+            )
+            session = control.ensure_daily_delivery_session(
+                connection, trade_date=target, release_id=BUILD_SHA,
+                strategy_release_id=STRATEGY_RELEASE_ID,
+            )
+            return control.build_terminal_delivery_receipt(
+                session=session, scheduler_run_uid=run_uid,
+                stage_name="strategy_governance_daily", status=status,
+                strategy_release_id=STRATEGY_RELEASE_ID,
+                legacy_receipt=_legacy_delivery("6" * 32),
+                degradations=[{"code": "EXTERNAL_SNAPSHOT_UNAVAILABLE"}] if status == "DEGRADED" else None,
+            )
+
+    def bind(receipt, phase, cutoff, parent=""):
+        scheduled = datetime.fromisoformat(cutoff).replace(tzinfo=PRODUCTION_TIMEZONE)
+        return control.bind_frozen_pool_decision(
+            receipt,
+            slot=StrategyPoolDecisionSlot(
+                phase, target, "2026-09-03", scheduled, scheduled + timedelta(minutes=5),
+            ),
+            score_snapshot={
+                "trade_date": target,
+                "payload_sha256": receipt["score_snapshot_id"],
+                "decision_at": cutoff,
+                "input_decision_at": cutoff,
+            },
+            parent_receipt_uid=parent,
+            diff_sha256="d" * 64 if parent else "",
+        )
+
+    first = bind(draft("1" * 32), "INITIAL", "2026-09-02T22:20:00")
+    with engine.begin() as connection:
+        initial = control.persist_terminal_delivery_receipt(connection, receipt=first)
+
+    second = draft("2" * 32, status="DEGRADED")
+    stale = bind(second, "PREMARKET_REVISION", "2026-09-03T08:30:00", "f" * 64)
+    with pytest.raises(RuntimeError, match="parent changed"):
+        with engine.begin() as connection:
+            control.persist_terminal_delivery_receipt(connection, receipt=stale)
+
+    revised = bind(second, "PREMARKET_REVISION", "2026-09-03T08:30:00", initial["receipt_uid"])
+    with pytest.raises(RuntimeError, match="receipt seal differs"):
+        with engine.begin() as connection:
+            connection.execute(
+                text(f"UPDATE {control.RECEIPT_TABLE} SET receipt_sha256=:bad WHERE receipt_uid=:uid"),
+                {"uid": initial["receipt_uid"], "bad": "0" * 64},
+            )
+            control.persist_terminal_delivery_receipt(connection, receipt=revised)
+    with engine.begin() as connection:
+        current = control.persist_terminal_delivery_receipt(connection, receipt=revised)
+        assert control.persist_terminal_delivery_receipt(connection, receipt=revised) == current
+        stored_initial = connection.execute(
+            text(f"SELECT receipt_json FROM {control.RECEIPT_TABLE} WHERE receipt_uid=:uid"),
+            {"uid": initial["receipt_uid"]},
+        ).scalar_one()
+    assert json.loads(stored_initial) == initial
+    selected = control.read_daily_delivery(engine, trade_date=target, release_id=BUILD_SHA)
+    assert selected["receipt"] == current
+    assert selected["session"]["status"] == current["status"] == "DEGRADED"
+    assert current["generation"] == initial["generation"] + 1
+    assert current["frozen_pool_decision"]["parent_receipt_uid"] == initial["receipt_uid"]

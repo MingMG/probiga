@@ -64,6 +64,7 @@ from integrations.qmt.datadir_import import (  # noqa: E402
 from server.common.config import get_minute_mysql_url  # noqa: E402
 from server.common.engine_factory import create_pooled_engine  # noqa: E402
 from server.common.qmt_index_minute_grid import CORE_GRID  # noqa: E402
+from server.common.qmt_minute_publication_scope import seal_minute_security_publication  # noqa: E402
 from server.common.authoritative_market_clock import (  # noqa: E402
     authoritative_closed_trade_date,
 )
@@ -104,7 +105,8 @@ def _minute_write_connection(engine):
 
 
 def _completion_detail(fingerprint):
-    return {**{key: value for key, value in fingerprint.items() if key != "business_row_hash"},
+    return {**{key: value for key, value in fingerprint.items()
+               if key not in {"business_row_hash", "security_fingerprints"}},
             "readback_rows": fingerprint["row_count"],
             "readback_codes": fingerprint["code_count"]}
 
@@ -206,7 +208,8 @@ def _reuse_existing_partition(engine, *, session, scope, datadir_roots=(), unive
             try:
                 fingerprint = persisted_matrix(connection, session.isoformat(), scope=scope,
                     run_id=candidates[0]["run_id"] if candidates else receipt.get("run_id", "") if receipt else "",
-                    operation="existing_partition_readback", include_business_fingerprint=bool(datadir_roots))
+                    operation="existing_partition_readback", include_business_fingerprint=bool(datadir_roots),
+                    include_security_fingerprints=True)
             except ValueError:
                 return None
             original = next((item for item in candidates
@@ -232,6 +235,9 @@ def _reuse_existing_partition(engine, *, session, scope, datadir_roots=(), unive
                 row_count=fingerprint["row_count"], code_count=fingerprint["code_count"],
                 content_sha256=original["content_sha256"], finished=True,
                 detail={**_completion_detail(fingerprint), "reused_existing_partition": True})
+            seal_minute_security_publication(
+                connection, dataset=DATASET, trade_date=session.isoformat(), fingerprints=fingerprint,
+            )
             clear_minute_attempt(connection, session)
     print(f"{session} REUSED rows={fingerprint['row_count']} codes={fingerprint['code_count']}", flush=True)
     return {"session": session.isoformat(), "status": STATUS_COMPLETE,
@@ -604,7 +610,7 @@ def _publish_locked(conn, *, session, entry, run_id, root, replace, replace_sour
     progress.emit("server_publication", status="COMPLETE",
         phase_seconds=round(time.monotonic()-published_started, 6))
     fingerprint = persisted_matrix(conn, session.isoformat(), scope=scope,
-        run_id=run_id, operation="publication_readback")
+        run_id=run_id, operation="publication_readback", include_security_fingerprints=True)
     rows, codes = fingerprint["row_count"], fingerprint["code_count"]
     if rows != entry["rows"] or codes != len(entry["codes"]):
         raise ValueError("exact minute matrix differs from harvested partition")
@@ -612,6 +618,9 @@ def _publish_locked(conn, *, session, entry, run_id, root, replace, replace_sour
     write_receipt(conn, session=session, root=str(root), status=STATUS_COMPLETE,
         run_id=run_id, row_count=rows, code_count=codes,
         content_sha256=entry["digest"], finished=True, detail=_completion_detail(fingerprint))
+    seal_minute_security_publication(
+        conn, dataset=DATASET, trade_date=session.isoformat(), fingerprints=fingerprint,
+    )
     clear_minute_attempt(conn, session)
     return {"session": session.isoformat(), "status": STATUS_COMPLETE,
             "rows": rows, "codes": codes, "root": str(root)}

@@ -279,6 +279,7 @@
     var loadSeq=++state.loadSeq;
     state.candidateRefreshSeq+=1;state.candidateRefreshPending=false;
     state.loading=true;state.truthLoading=true;state.errors={};state.staleKeys={};state.pendingKeys={};
+    state.candidateRevision=null;renderCandidateRevisionComparison();
     state.researchStockPool={};state.researchStockPoolRequestDate='';state.researchCandidatePage=1;delete state.loadedKeys.researchStockPool;
     el('updatedAt').textContent='读取中';
     el('truthContext').setAttribute('aria-busy','true');
@@ -332,6 +333,7 @@
       delete state.pendingKeys.context;delete state.pendingKeys.overview;delete state.pendingKeys.stockPool;
       state.truthLoading=false;
       el('updatedAt').textContent='同批次结果已加载 · 补充数据后台读取中';renderAll();activateView(view);notifyParentResize();
+      if(view==='candidates')updateCandidateRevisionComparison();
       if(view==='candidates'&&!stockPoolIsReadable(state.stockPool))add('stockPool',function(){return stockPoolWithHistoricalFallback(state.requestedDate)},{});
       if(view==='candidates'){
         var formalRequestDate=String(state.requestedDate||(daily.context||{}).requested_date||(daily.context||{}).requested_trade_date||(daily.stock_pool||{}).requested_trade_date||(daily.context||{}).decision_session_date||(daily.stock_pool||{}).trade_date||'').slice(0,10),researchRequestDate=researchPoolRequestDate(state.requestedDateMode,formalRequestDate,daily,state.marketClock);
@@ -598,6 +600,91 @@
     el('candidateReconstructionTitle').textContent=shortTradeDate(target)+' 研究观察票池';el('candidateReconstructionAuthority').textContent='仅供观察';el('candidateReconstructionMeta').textContent='已筛出符合观察条件的股票，尚未满足正式买入条件。数据日 '+target+'，实际生成 '+displayDateTime(pool.generated_at||pool.published_at||pool.research_known_at)+'，共 '+Number((pool.summary||{}).observation_stock_count||0)+' 只；页面只展示观察原因，不会触发买卖或下单。';
     var emptyText=String(pool.status||'').toUpperCase()==='EMPTY'?'该日已完成筛选，没有符合观察条件的股票。':'当前筛选条件下没有研究观察股票。';el('candidateReconstructionCards').innerHTML=pageRows.length?pageRows.map(card).join(''):'<p class="empty">'+esc(emptyText)+'</p>';el('candidateReconstructionRows').innerHTML=pageRows.length?pageRows.map(function(item){return '<tr><td>'+num(item.rank_no,0)+'</td><td>'+security(item.stock_code,item.stock_name)+'</td><td>'+esc((item.strategy_keys||[]).map(strategy).join(' / ')||'—')+'</td><td>'+esc(observationStatus(item))+' · 仅供观察</td><td>'+num(item.raw_score,3)+'</td><td class="reason">'+esc(reasons(item))+'</td></tr>'}).join(''):empty(6,emptyText);
     el('candidateReconstructionPageStatus').textContent='第 '+state.researchCandidatePage+' / '+pageCount+' 页';el('candidateReconstructionPrev').disabled=state.researchCandidatePage<=1;el('candidateReconstructionNext').disabled=state.researchCandidatePage>=pageCount;el('candidateReconstructionPager').hidden=rows.length<=pageSize;return {visible:true,filteredCount:rows.length,totalCount:items.length}
+  }
+  function candidateRevisionIdentity(pool,requestedDate){
+    var runUid=String(pool.run_uid||''),priorUid=String(pool.supersedes_run_uid||'');
+    var resultHash=String(pool.canonical_result_hash||''),dataDate=String(pool.trade_date||'');
+    if(!stockPoolIsReadable(pool)||pool.source_system!=='STRATEGY_GOVERNANCE'||pool.decision_scope!=='CANONICAL_GOVERNANCE'||
+        pool.governance_deferred===true||pool.activation_enabled===false||pool.is_historical_fallback===true||pool.is_as_of_fallback===true||
+        !/^\d{4}-\d{2}-\d{2}$/.test(dataDate)||dataDate!==requestedDate||
+        !/^[0-9a-f]{32}$/.test(runUid)||!/^[0-9a-f]{32}$/.test(priorUid)||/^0+$/.test(runUid)||/^0+$/.test(priorUid)||
+        runUid===priorUid||!/^[0-9a-f]{64}$/.test(resultHash)||/^0+$/.test(resultHash))return null;
+    var codes=pool.items.filter(function(row){return row&&row.is_strategy_candidate===true}).map(function(row){return row.stock_code}).sort();
+    if(codes.some(function(code){return typeof code!=='string'||!/^\d{6}$/.test(code)||code==='000000'})||new Set(codes).size!==codes.length)return null;
+    return {runUid:runUid,priorUid:priorUid,resultHash:resultHash,date:dataDate,codes:codes};
+  }
+  function candidateRevisionResult(payload,identity){
+    var diff=unwrap(payload)||{},prior=diff.prior||{},current=diff.next||{},counts=diff.counts||{};
+    if(payload.comparison_time_source!=='GOVERNANCE_RUN_FINISHED_AT'||payload.read_only!==true||payload.real_order_authority!==false||
+        diff.schema!=='probiga.trading-v3.pool-revision-diff.v1'||!/^[0-9a-f]{64}$/.test(String(diff.diff_sha256||''))||/^0+$/.test(diff.diff_sha256)||
+        prior.run_uid!==identity.priorUid||current.run_uid!==identity.runUid||current.result_hash!==identity.resultHash||
+        !/^[0-9a-f]{64}$/.test(String(prior.result_hash||''))||/^0+$/.test(prior.result_hash)||
+        prior.data_trade_date!==identity.date||current.data_trade_date!==identity.date||prior.complete!==true||current.complete!==true||
+        !(Date.parse(prior.finished_at)<Date.parse(current.finished_at)))return null;
+    var added=diff.added,removed=diff.removed,retained=diff.retained;
+    if(!Array.isArray(added)||!Array.isArray(removed)||!Array.isArray(retained)||
+        counts.added!==added.length||counts.removed!==removed.length||counts.retained!==retained.length||
+        prior.stock_count!==removed.length+retained.length||current.stock_count!==added.length+retained.length)return null;
+    var codes=new Set(),allRows=added.concat(removed,retained);
+    for(var index=0;index<allRows.length;index+=1){
+      var row=allRows[index],code=row&&row.stock_code;
+      if(typeof code!=='string'||!/^\d{6}$/.test(code)||code==='000000'||codes.has(code))return null;
+      codes.add(code);
+    }
+    var nextCodes=added.concat(retained).map(function(row){return row.stock_code}).sort();
+    if(nextCodes.length!==identity.codes.length||nextCodes.some(function(code,index){return code!==identity.codes[index]}))return null;
+    return diff;
+  }
+  function renderCandidateRevisionComparison(){
+    var panel=el('candidateRevisionComparison'),request=state.candidateRevision,details=el('candidateRevisionDetails');
+    panel.hidden=!request;
+    var diff=request&&request.diff;
+    details.hidden=!diff;
+    if(!request)return;
+    el('candidateRevisionStatus').textContent=diff?'新增 '+diff.counts.added+' 只 · 移除 '+diff.counts.removed+' 只 · 保留 '+diff.counts.retained+' 只':
+      request.failed?'两份版本暂无法核验，增删明细不可用。':'正在核验同一交易日的两个版本…';
+    if(!diff)return;
+    var meta=el('candidateRevisionMeta');
+    meta.textContent=diff.next.data_trade_date+' · 上一版 '+diff.prior.run_uid.slice(0,12)+'（完成于 '+displayDateTime(diff.prior.finished_at)+'） · 当前版 '+diff.next.run_uid.slice(0,12)+'（完成于 '+displayDateTime(diff.next.finished_at)+'）';
+    meta.title='上一版 '+diff.prior.run_uid+' / '+diff.prior.result_hash+'\n当前版 '+diff.next.run_uid+' / '+diff.next.result_hash;
+    function list(rows){
+      if(!rows.length)return '<li>0 只</li>';
+      return rows.map(function(row){
+        var strategies=Array.isArray(row.strategy_keys)?row.strategy_keys.map(strategy):[];
+        var reasons=Array.isArray(row.reasons)?row.reasons:[];
+        var blockers=Array.isArray(row.blocking_reasons)?row.blocking_reasons:[];
+        var evidence=strategies.concat(reasons,blockers).filter(Boolean);
+        return '<li><strong>'+esc(row.stock_code)+'</strong><small>'+esc(evidence.join(' · ')||'该版本未记录理由')+'</small></li>';
+      }).join('');
+    }
+    el('candidateRevisionAddedTitle').textContent='新增 · 当前版证据';
+    el('candidateRevisionRemovedTitle').textContent='移除 · 上一版证据';
+    el('candidateRevisionAdded').innerHTML=list(diff.added);
+    el('candidateRevisionRemoved').innerHTML=list(diff.removed);
+    el('candidateRevisionPreviousTitle').textContent='上一版名单（'+diff.prior.stock_count+' 只）';
+    el('candidateRevisionPreviousRows').innerHTML=list(diff.removed.concat(diff.retained.map(function(row){
+      return Object.assign({},row.prior,{stock_code:row.stock_code});
+    })).sort(function(a,b){return a.stock_code.localeCompare(b.stock_code)}));
+  }
+  function updateCandidateRevisionComparison(){
+    var pool=state.stockPool||{};
+    var date=String(state.requestedDate||pool.requested_trade_date||pool.trade_date||'');
+    var identity=state.errors.candidateDailyRefresh?null:candidateRevisionIdentity(pool,date);
+    if(!identity){state.candidateRevision=null;renderCandidateRevisionComparison();return}
+    var key=[identity.date,identity.priorUid,identity.runUid,identity.resultHash].join('/');
+    if(state.candidateRevision&&state.candidateRevision.key===key)return;
+    var request={key:key,diff:null,failed:false};
+    state.candidateRevision=request;
+    el('candidateRevisionPrevious').open=false;
+    renderCandidateRevisionComparison();
+    function finish(diff){
+      if(state.candidateRevision!==request)return;
+      request.diff=diff;request.failed=!diff;
+      renderCandidateRevisionComparison();notifyParentResize();
+    }
+    api3('/stock-pool/revision-diff?prior_run_uid='+encodeURIComponent(identity.priorUid)+'&next_run_uid='+encodeURIComponent(identity.runUid),30000)
+      .then(function(payload){finish(candidateRevisionResult(payload||{},identity))})
+      .catch(function(){finish(null)});
   }
   function renderCandidates(){
     var strategies=Object.keys(strategyNames);if(el('strategyFilter').options.length===1){strategies.forEach(function(k){el('strategyFilter').insertAdjacentHTML('beforeend','<option value="'+k+'">'+esc(strategy(k))+'</option>')})}
@@ -887,6 +974,7 @@
       var dailyResult=results[0],deliveryResult=results[1];
       if(dailyResult.ok){var daily=dailyResult.value||{},dailyDate=String(((daily.context||{}).requested_date)||((daily.context||{}).requested_trade_date)||((daily.stock_pool||{}).requested_trade_date)||((daily.stock_pool||{}).trade_date)||'').slice(0,10);if(daily.context&&daily.overview&&daily.stock_pool&&(!dailyDate||dailyDate===formalTarget)){state.dailyResult=daily;state.context=daily.context;state.overview=daily.overview;state.stockPool=daily.stock_pool;delete state.errors.candidateDailyRefresh}else state.errors.candidateDailyRefresh='每日原子结果与当前请求日不一致'}else state.errors.candidateDailyRefresh=dailyResult.error;
       if(deliveryResult.ok){state.dailyDelivery=deliveryResult.value||{};delete state.errors.candidateDailyDelivery}else state.errors.candidateDailyDelivery=deliveryResult.error;
+      updateCandidateRevisionComparison();
       var researchTarget=researchPoolRequestDate(dateMode,formalTarget,state.dailyResult,state.marketClock);if(!/^\d{4}-\d{2}-\d{2}$/.test(researchTarget))return null;
       if(researchTarget!==state.researchStockPoolRequestDate)state.researchStockPool={};state.researchStockPoolRequestDate=researchTarget;
       return requestResult('candidateResearchPool',api3('/research/stock-pool?trade_date='+encodeURIComponent(researchTarget),60000),{}).then(function(researchResult){return {researchResult:researchResult,researchTarget:researchTarget}})
