@@ -1630,7 +1630,21 @@ def validate_release_data_readiness(
         producer_role = "windows" if task_type in WINDOWS_QMT_EDGE_TASK_TYPES or task_type in WINDOWS_NON_QMT_EGRESS_TASK_TYPES else "linux"
         producer_build_sha = runtime_component_build_sha(producer_role, expected_build_sha=build_sha)
         task = dict(task_rows[task_type])
-        history = _latest_release_history_row(engine, task=task)
+        expected_target = expected_targets.get(task_type)
+        finance_history = None
+        if task_type == "stock_finance" and expected_target is not None:
+            from server.api.scheduler_runtime import _load_completed_stock_finance_history
+
+            with engine.connect() as connection:
+                finance_history = _load_completed_stock_finance_history(
+                    connection, target=expected_target, current_linux_build_sha=producer_build_sha,
+                    decision_at=decision_time,
+                )
+        if finance_history is not None:
+            history = finance_history
+            producer_build_sha = history["build_sha"]
+        else:
+            history = _latest_release_history_row(engine, task=task)
         finished_at = _naive_shanghai(
             history.get("finished_at"), field=f"{task_type}.finished_at"
         )
@@ -1639,7 +1653,7 @@ def validate_release_data_readiness(
             RELEASE_DATA_READINESS_DEFAULT_MAX_AGE,
         )
         if (
-            finished_at < decision_time - max_age
+            (finance_history is None and finished_at < decision_time - max_age)
             or finished_at > decision_time + timedelta(minutes=5)
         ):
             raise RuntimeError(
@@ -1659,7 +1673,7 @@ def validate_release_data_readiness(
             history.get("run_at"), field=f"{task_type}.run_at"
         )
         if (
-            history_started_at < decision_time - max_age
+            (finance_history is None and history_started_at < decision_time - max_age)
             or history_started_at > finished_at
         ):
             raise RuntimeError(
@@ -1700,8 +1714,9 @@ def validate_release_data_readiness(
         # scheduler/recommendation audit identity used by the live run.
         task["_scheduler_history_run_uid"] = str(history.get("run_uid") or "")
         task["_scheduler_expected_build_sha"] = producer_build_sha
-        evidence_target = evidence.get("release_target_date")
-        expected_target = expected_targets.get(task_type)
+        evidence_target = evidence.get(
+            "target_trade_date" if finance_history is not None else "release_target_date"
+        )
         if expected_target is not None and str(evidence_target or "") != expected_target:
             raise RuntimeError(
                 f"release task {task_type} validation target differs: "
@@ -1731,25 +1746,29 @@ def validate_release_data_readiness(
             raise RuntimeError(
                 f"release task {task_type} receipt replay is not successful"
             )
-        validation = validate_scheduler_task_result(
-            task,
-            engine=engine,
-            started_at=history_started_at,
-            now=decision_time,
-            output=replay_output,
-        )
-        if validation.checked is not True or validation.ok is not True:
-            raise RuntimeError(
-                f"release task {task_type} persisted data is not verified: "
-                f"checked={validation.checked} message={validation.message}"
+        if finance_history is not None:
+            validation_message = "Original validated finance completion and exact durable seal verified"
+        else:
+            validation = validate_scheduler_task_result(
+                task,
+                engine=engine,
+                started_at=history_started_at,
+                now=decision_time,
+                output=replay_output,
             )
+            if validation.checked is not True or validation.ok is not True:
+                raise RuntimeError(
+                    f"release task {task_type} persisted data is not verified: "
+                    f"checked={validation.checked} message={validation.message}"
+                )
+            validation_message = validation.message
         task_proofs[task_type] = {
             "build_sha": producer_build_sha,
             "status": str(history["status"]),
             "run_uid": str(history.get("run_uid") or ""),
             "finished_at": finished_at.isoformat(sep=" ", timespec="seconds"),
             "evidence_sha256": str(evidence["evidence_sha256"]),
-            "validation": validation.message,
+            "validation": validation_message,
         }
         if evidence_target is not None:
             task_proofs[task_type]["target_date"] = str(evidence_target)

@@ -1683,7 +1683,8 @@ def _scheduler_evidence(
     }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def test_daily_delivery_receipt_binds_cross_host_inputs_pool_and_governance(monkeypatch):
+@pytest.mark.parametrize("prior_finance", [False, True])
+def test_daily_delivery_receipt_binds_cross_host_inputs_pool_and_governance(monkeypatch, prior_finance):
     from tests.score_snapshot_helpers import scored_publication
     publication = scored_publication(trade_date="2026-08-26")
     monkeypatch.setattr(daily_delivery_control, "load_published_analysis_receipt",
@@ -1717,7 +1718,8 @@ def test_daily_delivery_receipt_binds_cross_host_inputs_pool_and_governance(monk
             CREATE TABLE st_scheduled_task_history (
                 id INTEGER PRIMARY KEY, run_uid TEXT, task_type TEXT,
                 run_at DATETIME, finished_at DATETIME, status TEXT,
-                exit_code INTEGER, output TEXT, build_sha TEXT
+                exit_code INTEGER, output TEXT, build_sha TEXT, task_id INTEGER,
+                task_name TEXT, trigger_source TEXT
             )
         """))
         connection.execute(text("""
@@ -1821,6 +1823,22 @@ def test_daily_delivery_receipt_binds_cross_host_inputs_pool_and_governance(monk
             "pool_hash": "5" * 64,
             "membership_hash": "6" * 64,
         })
+    if prior_finance:
+        from tests.test_stock_finance_receipt_reuse import install_finance_completion
+
+        with engine.begin() as connection:
+            connection.execute(text("""
+                UPDATE st_scheduled_task_history SET status='failed', exit_code=1, output='',
+                       run_at='2026-08-27 20:12:00', finished_at='2026-08-27 20:13:00'
+                WHERE task_type='stock_finance'
+            """))
+        original_finance, _ = install_finance_completion(
+            engine, monkeypatch, target=target, started=datetime(2026, 8, 27, 20, 10),
+        )
+        monkeypatch.setattr(
+            scheduler_runtime, "_dependency_component_build_shas",
+            lambda *_args, **_kwargs: {"linux": build_sha, "windows": build_sha},
+        )
     manifest = {
         "analysis_count": 5205,
         "recommendation_count": 80,
@@ -1873,6 +1891,16 @@ def test_daily_delivery_receipt_binds_cross_host_inputs_pool_and_governance(monk
     assert receipt["scheduler_run_date"] == "2026-08-27"
     assert receipt["recommendation_count"] == 80
     assert receipt["strategy_pool_api_run_uid"] == governance_run_uid
+    if prior_finance:
+        finance_proof = next(
+            proof for proof in receipt["base_data_receipts"] if proof["task_type"] == "stock_finance"
+        )
+        assert finance_proof == {
+            "task_type": "stock_finance",
+            "run_uid": original_finance["run_uid"],
+            "evidence_sha256": original_finance["evidence_sha256"],
+            "input_receipt_root_sha256": original_finance["input_receipt_root_sha256"],
+        }
     core = dict(receipt)
     supplied_hash = core.pop("delivery_receipt_sha256")
     assert supplied_hash == scheduler_runtime.canonical_sha256(core)
