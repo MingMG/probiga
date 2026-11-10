@@ -31,7 +31,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import bindparam, inspect, text
 from sqlalchemy.engine import Connection, Engine
-from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 
 from server.common.finance_coverage import (
     finance_disclosure_gate,
@@ -861,6 +861,63 @@ def _live_capture_allowed(
     return (
         timedelta(0) <= known_at - fact_cutoff_at <= MAX_LIVE_CAPTURE_DELAY
     )
+
+
+def _verified_cninfo_coverage_known(
+    row: Mapping[str, Any],
+    batch: Mapping[str, Any] | None,
+    *,
+    fact_cutoff_at: datetime,
+    decision_at: datetime,
+    completion_known_at: datetime | None,
+) -> bool:
+    """Use exact CNInfo evidence only after its actual immutable receipt."""
+    if (
+        not batch
+        or completion_known_at is None
+        or batch.get("status") != "COMPLETE"
+        or batch.get("source") != CNINFO_EVENT_SOURCE
+        or row.get("source") != CNINFO_EVENT_SOURCE
+        or row.get("fact_kind") != "event"
+        or row.get("watermark_kind") != "QUERY_CUTOFF"
+        or row.get("coverage_status") != "COMPLETE"
+        or not batch.get("batch_id")
+        or row.get("batch_id") != batch["batch_id"]
+        or not _HASH_RE.fullmatch(str(batch.get("batch_root_hash") or ""))
+    ):
+        return False
+    known = _row_datetime(row.get("known_at"))
+    received = _row_datetime(row.get("received_at"))
+    return (
+        known == received == _row_datetime(batch.get("received_at"))
+        and fact_cutoff_at <= _row_datetime(batch.get("fact_cutoff_at"))
+        == _row_datetime(row.get("covered_through_at"))
+        <= known <= completion_known_at <= decision_at
+    )
+
+
+def _late_cninfo_completion(
+    engine: Engine, batch: Mapping[str, Any], *,
+    fact_cutoff_at: datetime, decision_at: datetime,
+) -> tuple[bool, datetime | None]:
+    if (
+        not batch
+        or batch.get("source") != CNINFO_EVENT_SOURCE
+        or batch.get("schema") != "probiga.qmt-announcement-batch.v1"
+    ):
+        return False, None
+    if _live_capture_allowed(
+        fact_cutoff_at=fact_cutoff_at,
+        decision_at=decision_at,
+        known_at=_row_datetime(batch.get("received_at")),
+    ):
+        return False, None
+    from server.common.daily_delivery_control import load_completed_cninfo_announcement_at
+
+    try:
+        return True, load_completed_cninfo_announcement_at(engine, batch=batch, decision_at=decision_at)
+    except (ValueError, TypeError, RuntimeError, SQLAlchemyError):
+        return True, None
 
 
 def normalize_published_at(value: Any) -> tuple[datetime | None, str, str]:
@@ -2912,6 +2969,8 @@ def _authoritative_empty_coverage(
     end_date: date,
     source: str = "",
     batch_id: str = "",
+    verified_event_batch: Mapping[str, Any] | None = None,
+    event_completion_at: datetime | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
     """Resolve complete zero-result receipts without crossing their watermark."""
 
@@ -3022,6 +3081,11 @@ def _authoritative_empty_coverage(
                         fact_cutoff_at=fact_cutoff_at,
                         decision_at=decision_at,
                         known_at=_row_datetime(latest.get("known_at")),
+                    )
+                    or _verified_cninfo_coverage_known(
+                        latest, verified_event_batch,
+                        fact_cutoff_at=fact_cutoff_at, decision_at=decision_at,
+                        completion_known_at=event_completion_at,
                     )
                     or (
                         bool(batch_id)
@@ -5601,6 +5665,9 @@ def resolve_common_fact_cutoff(
         )
         for row in selected
     )
+    _, event_completion_at = _late_cninfo_completion(
+        engine, event_batch, fact_cutoff_at=fact_cutoff, decision_at=decision,
+    )
     retrospective_batch_id = (
         str(event_batch.get("batch_id") or "")
         if event_batch.get("mode") == "HISTORICAL_RECONSTRUCTION"
@@ -5615,6 +5682,10 @@ def resolve_common_fact_cutoff(
             and str(row.get("watermark_kind") or "")
             == "HISTORICAL_RECONSTRUCTION"
             and _row_datetime(row.get("known_at")) <= decision
+        )
+        and not _verified_cninfo_coverage_known(
+            row, event_batch, fact_cutoff_at=fact_cutoff, decision_at=decision,
+            completion_known_at=event_completion_at,
         )
         and not _live_capture_allowed(
                 fact_cutoff_at=fact_cutoff,
@@ -6362,6 +6433,20 @@ def load_event_facts(
                 reason=_announcement_batch_read_reason(exc),
                 status=PIT_DATA_BLOCKED,
             )
+    event_completion_at = None
+    if selection is None:
+        requires_completion, event_completion_at = _late_cninfo_completion(
+            engine, event_batch, fact_cutoff_at=fact_cutoff, decision_at=decision,
+        )
+        if requires_completion and event_completion_at is None:
+            return _blocked_batch(
+                table_name=EVENT_REVISION_TABLE,
+                codes=normalized_codes,
+                decision_at=decision,
+                fact_cutoff_at=fact_cutoff,
+                reason="PIT_EVENT_LATE_PUBLICATION_NOT_COMPLETED_AT_CUTOFF",
+                status=PIT_DATA_BLOCKED,
+            )
     try:
         rows = _query_revisions(
             engine, table_name=EVENT_REVISION_TABLE, codes=normalized_codes,
@@ -6397,6 +6482,8 @@ def load_event_facts(
                 end_date=end,
                 source=(str(event_batch.get("source") or "") if event_batch else ""),
                 batch_id=str(event_batch.get("batch_id") or ""),
+                verified_event_batch=event_batch,
+                event_completion_at=event_completion_at,
             )
         else:
             coverage_errors = {}

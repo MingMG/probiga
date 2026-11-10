@@ -3493,3 +3493,104 @@ def test_finance_revision_chunks_preserve_nonfiling_with_single_connection_pool(
     assert result.coverage_by_code["002731"]["coverage_id"]
     assert engine.pool.checkedout() == 0
     engine.dispose()
+
+def test_complete_late_cninfo_batch_is_visible_only_after_actual_receipt(tmp_path, monkeypatch):
+    from server.common.announcement_provider import CninfoMarketAnnouncementProvider, ProviderBackedAnnouncementAdapter
+    from server.common.qmt_announcement_pit import CNINFO_ANNOUNCEMENT_SOURCE, synchronize_qmt_announcements
+    from tests.test_announcement_provider_fallback import _Client, _master, _row_at
+    from tests.test_qmt_announcement_pit import _catalog, _install_catalog
+
+    engine = _engine()
+    codes = ["000001", "000002"]
+    cutoff = datetime(2026, 8, 30, 18, 20)
+    received = cutoff + timedelta(hours=6)
+    target = cutoff.date()
+    start = target - timedelta(days=30)
+    catalog = _install_catalog(
+        engine, _catalog(*((code, f"{code}.SZ") for code in codes)),
+        captured_at="2026-08-30 00:00:00",
+    )
+    for code in codes:
+        finance = {
+            "stock_code": code, "report_date": "2026-03-31", "report_type": "Q1",
+            "notice_date": "2026-04-25", "roe_wtd": 12.5,
+        }
+        revision = append_finance_revision(engine, finance, known_at="2026-08-30 18:01:00")
+        append_source_coverage(
+            engine, fact_kind="finance", stock_code=code, window_start="1900-01-01",
+            window_end=target, known_at="2026-08-30 18:01:00",
+            covered_through_at="2026-08-30 18:01:00", watermark_kind="CAPTURED_AT",
+            watermark_evidence={"source_call": "success"}, source_rows=[finance],
+            fact_bindings=[{"revision_id": revision.revision_id, "content_hash": revision.content_hash}],
+            source="adata.finance.core_index", batch_id="finance-first",
+        )
+    append_finance_atomic_batch_seal(
+        engine, as_of_date=target, completed_known_at="2026-08-30 18:22:00",
+    )
+    monkeypatch.setattr("server.common.qmt_announcement_pit._load_catalog", lambda *_: catalog)
+    master = _master(*codes)
+    provider = CninfoMarketAnnouncementProvider(
+        client=_Client(masters=[master, master], rows_by_code={codes[0]: [_row_at(codes[0], 0, cutoff)]}),
+        minimum_request_interval=0, now_fn=lambda: received,
+    )
+    publication = synchronize_qmt_announcements(
+        engine, xtdata=ProviderBackedAnnouncementAdapter(provider), checkpoint_root=tmp_path,
+        source=CNINFO_ANNOUNCEMENT_SOURCE, fallback_reason="QMT_ANNOUNCEMENT_TERMINAL_DEPENDENCY_UNAVAILABLE",
+        capture_fact_cutoff_at=cutoff, now_fn=lambda: received,
+    )
+    assert publication["status"] == "COMPLETE"
+    common_inputs = dict(
+        codes=codes, finance_start_date="1900-01-01", finance_end_date=target,
+        event_start_date=start, event_end_date=target, require_qmt_event_batch=True,
+    )
+    assert resolve_common_fact_cutoff(
+        engine, **common_inputs, decision_at=received - timedelta(seconds=1),
+    )["status"] == PIT_DATA_BLOCKED
+
+    # The source batch already exists in this fixture. A later evaluation
+    # still cannot use it before the scheduler verified the actual commit.
+    accepted_at = received + timedelta(minutes=1)
+    assert resolve_common_fact_cutoff(
+        engine, **common_inputs, decision_at=received + timedelta(seconds=1),
+    )["status"] == PIT_DATA_BLOCKED
+
+    from server.common import daily_delivery_control as control
+    from tests.test_daily_delivery_control import _stage_evidence
+
+    control.privileged_migrate_daily_delivery_schema(engine)
+    stage, uid = "qmt_announcement_pit", "1" * 32
+    monkeypatch.setattr(control, "_control_now", lambda: received)
+    control.start_daily_stage_attempt(
+        engine, scheduler_run_uid=uid, stage_name=stage, trade_date=target,
+        release_id="a" * 40, strategy_release_id="b" * 64,
+        lease_owner="test-windows",
+    )
+    evidence = _stage_evidence(uid, stage=stage, target=target.isoformat())
+    evidence.pop("evidence_sha256")
+    output = json.dumps(publication, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(output.encode()).hexdigest()
+    evidence.update(replay_output=output, replay_output_sha256=digest, input_receipt_root_sha256=digest)
+    evidence["evidence_sha256"] = control.canonical_sha256(evidence)
+    with engine.begin() as connection:
+        control.finish_daily_stage_attempt(
+            connection, scheduler_run_uid=uid, status="success", now=accepted_at,
+            input_root_sha256=digest, checkpoint=evidence,
+        )
+    assert resolve_common_fact_cutoff(
+        engine, **common_inputs, decision_at=accepted_at - timedelta(seconds=1),
+    )["status"] == PIT_DATA_BLOCKED
+    selected = resolve_common_fact_cutoff(
+        engine, **common_inputs, decision_at=accepted_at + timedelta(seconds=1),
+    )
+    assert selected["status"] == PIT_AVAILABLE, selected["reason"]
+    assert selected["qmt_event_batch"]["batch_root_hash"] == publication["batch_root_hash"]
+    assert selected["qmt_event_batch"]["received_at"] == publication["received_at"]
+    result = load_event_facts(
+        engine, codes=codes, start_date=start, end_date=target,
+        decision_at=accepted_at + timedelta(seconds=1), fact_cutoff_at=cutoff,
+        require_qmt_complete_batch=True,
+    )
+    assert result.status_for(codes[0]) == PIT_AVAILABLE
+    assert result.status_for(codes[1]) == PIT_AVAILABLE
+    assert result.facts[codes[0]]
+    assert result.facts[codes[1]] == []
