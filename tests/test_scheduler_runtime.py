@@ -5339,6 +5339,96 @@ def test_release_analysis_recovery_request_is_claimed_and_removed(
     assert not request_path.exists()
 
 
+@pytest.mark.parametrize("mode", ["formal", "research"])
+def test_formal_analysis_drains_existing_workers_without_blocking_alerts(tmp_path, monkeypatch, mode):
+    target = "2026-11-09"
+    now = datetime(2026, 11, 10, 11, 21)
+    request_path = tmp_path / "release-analysis-recovery-request.json"
+    analysis_id, notice_id, concept_id, alert_id = 37, 62, 64, 141
+    engine = MagicMock()
+    rows = engine.connect.return_value.__enter__.return_value.execute.return_value
+    rows.keys.return_value = [
+        "id", "task_name", "task_type", "script_path", "script_args", "cron_time",
+        "interval_minutes", "enabled", "date_param", "last_run_at", "last_triggered_at",
+        "last_run_status", "last_run_duration", "last_run_output",
+    ]
+    rows.fetchall.return_value = [
+        (analysis_id, "analysis", "analysis_fast", "tools/run_ai_recommendation_premarket.py",
+         "--top-n 80 --min-score 62 --json", "22:20",
+         0, 1, "", None, None, "", 0, ""),
+        (concept_id, "concept", "eastmoney_concept_current", "tools/sync_eastmoney_concept_market.py",
+         "--dataset current --json", "00:00", 1, 1, "", None, None, "", 0, ""),
+        (alert_id, "alert", "intraday_market_alert", "tools/run_intraday_market_alert.py",
+         "", "00:00", 1, 1, "", None, None, "", 0, ""),
+    ]
+    monkeypatch.setattr(scheduler_runtime, "get_engine", lambda: engine)
+    monkeypatch.setattr(scheduler_runtime, "_scheduler_executor_role", lambda _mode: "linux_standalone")
+    monkeypatch.setattr(scheduler_runtime, "_now_shanghai_naive", lambda: now)
+    monkeypatch.setattr(scheduler_runtime, "_scheduler_build_commit_sha", lambda: "a" * 40)
+    monkeypatch.setattr(scheduler_runtime, "get_scheduler_runtime_config", lambda: {
+        "poll_seconds": 15, "max_concurrent_tasks": 4,
+    })
+    monkeypatch.setattr(scheduler_runtime, "_release_analysis_recovery_request_path", lambda: request_path)
+    monkeypatch.setattr(scheduler_runtime, "release_analysis_recovery_readiness", lambda *_: (
+        True, "ready", {"target_trade_date": target},
+    ))
+    monkeypatch.setattr(scheduler_runtime, "_standalone_heartbeat_allows_dispatch", lambda *_: (True, {}))
+    for name in ("_write_scheduler_heartbeat", "_cleanup_stale_running_tasks", "_maybe_cleanup_history",
+                 "_retry_pending_terminal_writes"):
+        monkeypatch.setattr(scheduler_runtime, name, lambda *_: None)
+    monkeypatch.setattr(scheduler_runtime, "_release_catchup_disabled_for_deferred_database", lambda: True)
+    monkeypatch.setattr(scheduler_runtime, "_strategy_pipeline_dependencies_ready", lambda *_: (True, "ready"))
+    monkeypatch.setattr(scheduler_runtime, "_should_skip_non_trading_day", lambda *_: False)
+    host_filter = scheduler_runtime._should_skip_task_for_host
+    monkeypatch.setattr(scheduler_runtime, "_should_skip_task_for_host",
+                        lambda row: host_filter(row, platform_name="posix"))
+
+    monkeypatch.setattr(scheduler_runtime, "_attach_daily_recovery_targets", lambda *_, **__: None)
+    monkeypatch.setattr(scheduler_runtime, "_scheduler_stopping", False)
+    monkeypatch.setattr(scheduler_runtime, "_windows_scheduler_lease", None)
+    monkeypatch.setattr(scheduler_runtime, "_running_procs", {})
+    for lane in ("core", "fast_lane", "bulk_history", "provider_maintenance", "quote_lane",
+                 "alert_lane", "delivery_lane", "exclusive"):
+        monkeypatch.setattr(scheduler_runtime, f"_{lane}_running_task_ids", set())
+    active = {notice_id}
+    monkeypatch.setattr(scheduler_runtime, "_running_task_ids", active)
+
+    requested = scheduler_runtime.request_release_analysis_recovery(engine, target, mode=mode)
+    claims = []
+    polls = []
+
+    def claim(row, _engine, *, run_uid):
+        claims.append((row["id"], row.get("_scheduler_target_trade_date")))
+        return True, run_uid
+
+    monkeypatch.setattr(scheduler_runtime, "_claim_task_run_with_audit", claim)
+    worker = MagicMock()
+    monkeypatch.setattr(scheduler_runtime.threading, "Thread", worker)
+
+    def finish_poll(_stop_event, _poll_seconds):
+        polls.append(list(claims))
+        claims.clear()
+        if len(polls) == 1:
+            active.discard(notice_id)
+        elif len(polls) == 2:
+            active.discard(concept_id)
+            active.discard(analysis_id)
+            scheduler_runtime._exclusive_running_task_ids.discard(analysis_id)
+        return len(polls) == 3
+
+    monkeypatch.setattr(scheduler_runtime, "_wait_for_scheduler_poll", finish_poll)
+    scheduler_runtime._check_and_run_tasks(mode="standalone")
+
+    if mode == "formal":
+        assert polls == [[(alert_id, None)], [(analysis_id, target)], [(concept_id, None)]]
+    else:
+        assert polls == [[(concept_id, None), (alert_id, None)], [], [(analysis_id, target)]]
+    assert worker.return_value.start.call_count == 3
+    status = scheduler_runtime.read_release_analysis_recovery_status()
+    assert status["request_id"] == requested["request_id"] and status["status"] == "DISPATCHED"
+    assert not request_path.exists()
+
+
 def test_research_recovery_request_is_explicit_and_isolated(
     tmp_path: Path,
 ) -> None:

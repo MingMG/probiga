@@ -10624,7 +10624,10 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
 
             # Keep all rows available as immutable cross-host dependencies,
             # but evaluate due times and dispatch gates only for owned work.
+            formal_recovery_draining = False
             for row in candidates:
+                if formal_recovery_draining and not _uses_alert_lane(row):
+                    continue
                 task_id = row["id"]
                 task_name = row["task_name"]
                 owner = scheduler_task_host_owner(row)
@@ -10925,6 +10928,20 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                             max_general_tasks=max_pending_tasks,
                         )
                     ):
+                        if (
+                            owner == SCHEDULER_OWNER_LINUX
+                            and row.get("task_type") == "analysis_fast"
+                            and release_recovery_requested
+                            and row.get("_release_analysis_research_mode") is not True
+                            and uses_exclusive_lane
+                            and (_running_task_ids - _alert_lane_running_task_ids)
+                        ):
+                            # The ready request already ranks first. Let existing
+                            # workers finish instead of refilling the queue under it.
+                            formal_recovery_draining = True
+                            logger.info(
+                                "Formal analysis recovery waiting for existing non-alert workers"
+                            )
                         logger.debug(
                             "Scheduler capacity full (%s); defer task %s",
                             max_pending_tasks,
