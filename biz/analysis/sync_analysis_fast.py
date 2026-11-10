@@ -5277,6 +5277,7 @@ def _prepare_batch_outputs(
     reuse_preliminary_snapshot: bool = False,
     return_scored: bool = False,
     allow_degraded_inputs: bool = False,
+    event_checkpoint_path: Path | None = None,
 ) -> Any:
     scoped_codes = _normalize_stock_codes(stock_codes)
     decision_at: datetime | str | None = (
@@ -5429,6 +5430,13 @@ def _prepare_batch_outputs(
             "receipts": [],
         }
     elif decision_at is not None:
+        def announcement_progress(completed: int, total: int) -> None:
+            _emit_progress(
+                progress_callback, stage="validate_announcement_history", percent=13,
+                step=f"公告历史已核对 {completed}/{total} 只", done=completed,
+                total=total, trade_date=trade_date,
+            )
+
         common_cutoff = resolve_common_fact_cutoff(
             engine,
             codes=feature_codes,
@@ -5441,6 +5449,8 @@ def _prepare_batch_outputs(
             event_end_date=trade_date,
             require_qmt_event_batch=True,
             capture_historical_selection=historical_event_reads.append,
+            event_checkpoint_path=event_checkpoint_path,
+            event_progress=announcement_progress if event_checkpoint_path is not None else None,
         )
     fact_cutoff_at: datetime | str | None = (
         common_cutoff.get("fact_cutoff_at")
@@ -5850,6 +5860,12 @@ def run_batch(
             ),
             return_scored=True,
             allow_degraded_inputs=allow_degraded_inputs,
+            event_checkpoint_path=(
+                Path(os.environ.get("PROBIGA_JOB_LOG_ROOT") or "/var/lib/probiga/jobs")
+                / "analysis-event-coverage.sqlite"
+                if production and publish and task_type == "analysis_fast" and not allow_degraded_inputs
+                else None
+            ),
         )
         score_snapshot = build_score_snapshot(
             trade_date=trade_date, decision_at=execution_time, run_uid=publication_run_uid,

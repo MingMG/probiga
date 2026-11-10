@@ -2487,45 +2487,43 @@ def validate_complete_qmt_announcement_batch(
                 with _live_announcement_reply_budget(connection, deadline=deadline, stage="snapshot-isolation"):
                     if str(connection.get_isolation_level()).upper() not in {"REPEATABLE READ", "SERIALIZABLE"}:
                         connection = connection.execution_options(isolation_level="REPEATABLE READ")
-            timeout_hint = _live_announcement_read_hint(
-                mysql=mysql, deadline=deadline, stage="candidate-discovery",
-            )
-            statement = text(
-                f"SELECT {timeout_hint}batch_id, stock_code, known_at FROM st_pit_source_coverage "
-                "WHERE fact_kind='event' AND source=:source "
-                "AND watermark_kind='QUERY_CUTOFF' "
-                "AND stock_code IN :codes AND known_at<=:decision_at "
-                "AND received_at<=:decision_at AND coverage_status='COMPLETE' "
-                "AND window_start<=:window_start AND window_end>=:window_end "
-                "ORDER BY known_at DESC, batch_id DESC"
-            ).bindparams(bindparam("codes", expanding=True))
-            with _live_announcement_reply_budget(connection, deadline=deadline, stage="candidate-discovery"):
-                required_rows = connection.execute(statement, {
-                    "source": source_name,
-                    "codes": requested_codes,
-                    "decision_at": decision,
-                    "window_start": start,
-                    "window_end": end,
-                }).mappings().all()
+            by_batch: dict[str, dict[str, datetime]] = {}
+            code_limit = VALIDATION_INVENTORY_CODE_LIMIT if mysql else len(requested_codes)
+            for offset in range(0, len(requested_codes), code_limit):
+                stage = f"candidate-discovery:{offset}" if mysql else "candidate-discovery"
+                timeout_hint = _live_announcement_read_hint(
+                    mysql=mysql, deadline=deadline, stage=stage,
+                )
+                statement = text(
+                    f"SELECT {timeout_hint}batch_id, stock_code, known_at FROM st_pit_source_coverage "
+                    "WHERE fact_kind='event' AND source=:source "
+                    "AND watermark_kind='QUERY_CUTOFF' "
+                    "AND stock_code IN :codes AND known_at<=:decision_at "
+                    "AND received_at<=:decision_at AND coverage_status='COMPLETE' "
+                    "AND window_start<=:window_start AND window_end>=:window_end"
+                ).bindparams(bindparam("codes", expanding=True)).execution_options(stream_results=True)
+                with _live_announcement_reply_budget(connection, deadline=deadline, stage=stage):
+                    with connection.execute(statement, {
+                        "source": source_name,
+                        "codes": requested_codes[offset:offset + code_limit],
+                        "decision_at": decision,
+                        "window_start": start,
+                        "window_end": end,
+                    }) as rows:
+                        for batch_id, code, known_at in rows.tuples():
+                            members = by_batch.setdefault(str(batch_id or ""), {})
+                            stock_code = str(code or "").zfill(6)
+                            known = _dt(known_at)
+                            if stock_code not in members or known > members[stock_code]:
+                                members[stock_code] = known
             _live_announcement_read_hint(mysql=False, deadline=deadline, stage="candidate-discovery")
-            by_batch: dict[str, dict[str, dict[str, Any]]] = {}
-            for row in required_rows:
-                batch_id = str(row.get("batch_id") or "")
-                code = str(row.get("stock_code") or "").zfill(6)
-                existing = by_batch.setdefault(batch_id, {}).get(code)
-                if existing is None or _dt(row.get("known_at")) > _dt(
-                    existing.get("known_at")
-                ):
-                    by_batch[batch_id][code] = row
+            requested_set = set(requested_codes)
             candidates = [
                 batch_id for batch_id, rows in by_batch.items()
-                if set(rows) == set(requested_codes)
+                if rows.keys() == requested_set
             ]
             candidates.sort(
-                key=lambda batch_id: max(
-                    _dt(row.get("known_at"))
-                    for row in by_batch[batch_id].values()
-                ),
+                key=lambda batch_id: (max(by_batch[batch_id].values()), batch_id),
                 reverse=True,
             )
             failure_codes: list[str] = []

@@ -1984,7 +1984,8 @@ def test_live_batch_validates_full_inventory_with_bounded_compressed_primary_key
             window_start=start, window_end=cutoff.date(), catalog=catalog, results=results,
         )
     options = dict(
-        codes=[catalog.codes[-1]], decision_at=received, fact_cutoff_at=cutoff,
+        codes=catalog.codes if inventory_damage is None else [catalog.codes[-1]],
+        decision_at=received, fact_cutoff_at=cutoff,
         window_start=start, window_end=cutoff.date(), source=source,
     )
     expected = validate_complete_qmt_announcement_batch(engine, **options)
@@ -2086,6 +2087,14 @@ def test_live_batch_validates_full_inventory_with_bounded_compressed_primary_key
             assert validate_complete_qmt_announcement_batch(mysql_reader, **options) == expected
     finally:
         event.remove(engine, "before_cursor_execute", record)
+    discovery = [
+        [value for key, value in params.items() if key.startswith("codes_")]
+        for _, sql, params, _ in reads if "batch_id, stock_code, known_at" in sql
+    ]
+    assert discovery == (
+        [list(catalog.codes[offset:offset + 20]) for offset in (0, 20, 40)]
+        if inventory_damage is None else [[catalog.codes[-1]]]
+    )
     inventory = [(sql, params) for _, sql, params, _ in reads if "coverage_id, stock_code" in sql]
     inventory_ranges = [
         (None, catalog.codes[20], 21), (catalog.codes[20], catalog.codes[40], 21),
