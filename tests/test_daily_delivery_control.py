@@ -825,7 +825,9 @@ def test_degraded_delivery_is_not_demoted_by_a_later_failed_retry():
     assert materialized["receipt"]["receipt_uid"] == degraded["receipt_uid"]
 
 
-@pytest.mark.parametrize("stage", ["stock_finance", "analysis_upper_evidence_prepare"])
+@pytest.mark.parametrize(
+    "stage", ["stock_finance", "analysis_upper_evidence_prepare", "analysis_fast"]
+)
 def test_scheduler_failure_only_delivery_stage_materializes_terminal_receipt(
     stage, scheduler_terminal_case,
 ):
@@ -874,7 +876,7 @@ def test_scheduler_failure_only_delivery_stage_materializes_terminal_receipt(
         trade_date="2026-09-02",
         release_id=BUILD_SHA,
     )
-    if stage == "stock_finance":
+    if stage in {"stock_finance", "analysis_upper_evidence_prepare"}:
         assert materialized["session"]["status"] == "RUNNING"
         assert materialized["receipt"] is None
     else:

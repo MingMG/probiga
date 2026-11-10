@@ -73,6 +73,7 @@ from server.common.qmt_edge_release_receipt import (
 from server.common.release_data_readiness_contract import (
     FINALIZED_MINUTE_TASK_TYPES,
     DAILY_DATA_INGESTION_TASK_TYPES,
+    DAILY_RESULT_NONTERMINAL_TASK_TYPES,
     DAILY_RESULT_POST_DELIVERY_DEPENDENCIES,
     DAILY_RESULT_RECOVERY_DEPENDENCIES,
     DAILY_RESULT_RECOVERY_TASK_TYPES,
@@ -9322,7 +9323,7 @@ def _task_history_finish(
                 )
             if (
                 stage_attempt is not None
-                and normalized_task_type not in DAILY_DATA_INGESTION_TASK_TYPES
+                and normalized_task_type not in DAILY_RESULT_NONTERMINAL_TASK_TYPES
                 and str(stage_attempt.get("status") or "") != "SUPERSEDED"
                 and (
                     status != "success"
@@ -9708,7 +9709,7 @@ def _run_task_impl(
             # can be reused and emits a receipt bound to that attestation.
             # A prior stage checkpoint cannot prove this dispatch's inputs.
             reuse_completed_stage=False,
-            preserve_session_status=(task_type in DAILY_DATA_INGESTION_TASK_TYPES),
+            preserve_session_status=(task_type in DAILY_RESULT_NONTERMINAL_TASK_TYPES),
         )
         with _running_lock:
             _terminal_stage_identities[exact_history_uid] = _terminal_stage_identity(stage_attempt)

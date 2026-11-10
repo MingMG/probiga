@@ -331,7 +331,6 @@ RELEASE_DATA_CATCHUP_DEPENDENCIES = {
         "market_overview_daily",
     ),
     "analysis_fast": (
-        "analysis_upper_evidence_prepare",
         "target_turnover_snapshot",
         "qmt_membership_snapshot",
         "qmt_announcement_pit",
@@ -369,7 +368,6 @@ DAILY_RESULT_RECOVERY_DEPENDENCIES = {
         "stock_finance",
     ),
     "analysis_fast": (
-        "analysis_upper_evidence_prepare",
         "target_turnover_snapshot",
         "qmt_membership_snapshot",
         "qmt_announcement_pit",
@@ -411,6 +409,15 @@ DAILY_DATA_INGESTION_TASK_TYPES = frozenset(
 if not DAILY_DATA_INGESTION_TASK_TYPES <= DAILY_RESULT_RECOVERY_TASK_TYPES:
     raise RuntimeError("daily ingestion contract contains an unmanaged task")
 
+# Upper-limit evidence can change execution eligibility, but the formal
+# analysis can still publish a scored pool with that evidence unavailable.
+# Keep the collector's stage history without granting it terminal authority.
+DAILY_RESULT_NONTERMINAL_TASK_TYPES = DAILY_DATA_INGESTION_TASK_TYPES | {
+    "analysis_upper_evidence_prepare",
+}
+if not DAILY_RESULT_NONTERMINAL_TASK_TYPES <= DAILY_RESULT_RECOVERY_TASK_TYPES:
+    raise RuntimeError("nonterminal delivery contract contains an unmanaged task")
+
 # Outbound delivery is a separate, retryable tail of the recovery DAG.  It is
 # target-bound and automatic, but it deliberately does not own the canonical
 # daily-control watermark: the sender validates the two completed terminal
@@ -443,6 +450,7 @@ if RELEASE_DATA_CATCHUP_TASK_TYPES & RELEASE_CATCHUP_FORBIDDEN_EXECUTION_TASK_TY
 
 __all__ = [
     "DAILY_RESULT_POST_DELIVERY_DEPENDENCIES",
+    "DAILY_RESULT_NONTERMINAL_TASK_TYPES",
     "DAILY_RESULT_RECOVERY_DEPENDENCIES",
     "DAILY_RESULT_RECOVERY_TASK_TYPES",
     "DAILY_RESULT_TARGET_BOUND_TASK_TYPES",
