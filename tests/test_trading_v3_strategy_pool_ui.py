@@ -9,6 +9,41 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js unavailable")
+def test_explicit_archive_identity_stays_read_only_in_browser():
+    script = (ROOT / "server/static/js/trading-v3.js").read_text(encoding="utf-8")
+    start = script.index("  function stockPoolIsReadable(pool)")
+    end = script.index("  function researchPoolRequestDate(", start)
+    harness = script[start:end] + r"""
+const assert = require('node:assert/strict');
+const day = '2026-11-10', root = 'b'.repeat(64), build = 'c'.repeat(40);
+const pool = {
+  archived: true, historical_read_only: true, actionable_output_allowed: false, real_order_authority: false,
+  trade_date: day, decision_session_date: day, execution_session_date: '2026-11-11', run_uid: 'a'.repeat(32),
+  canonical_result_hash: root, build_commit_sha: build, pool_status: 'READY', pool_readable: true,
+  run_status: 'COMPLETED', decision_integrity_verified: true, decision_scope: 'RESEARCH_ONLY',
+  items: [{stock_code: '600001', is_strategy_candidate: true}], summary: {stock_count: 1, strategy_candidate_count: 1}
+};
+const daily = {
+  delivery_status: 'ARCHIVED', requested_trade_date: day,
+  context: {context_mode: 'ARCHIVED_DAILY_RESULT', historical_read_only: true, actionable_output_allowed: false,
+            data_date: day, run_uid: pool.run_uid, canonical_result_hash: root},
+  archive: {producer_build_sha: build, receipt_sha256: 'd'.repeat(64)}, acceptance: {accepted: false}
+};
+assert.equal(dailyResultReadPath(day, 'EXPLICIT_HISTORICAL'), '/daily-result?trade_date=2026-11-10&archive=true');
+assert.equal(dailyResultReadPath(day, 'DEFAULT'), '/daily-result?trade_date=2026-11-10');
+assert.equal(dailyResultReadPath('', 'EXPLICIT_HISTORICAL'), '/daily-result');
+assert.equal(archivedDailyResult(daily, pool), true);
+assert.equal(archivedDailyResult({...daily, acceptance: {accepted: true}}, pool), false);
+assert.equal(archivedDailyResult(daily, {...pool, canonical_result_hash: 'e'.repeat(64)}), false);
+assert.equal(stockPoolFormalTruth(pool, day, day).ready, false);
+"""
+    result = subprocess.run(
+        [shutil.which("node"), "-"], input=harness, capture_output=True, text=True, encoding="utf-8",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_strategy_pool_defaults_to_strategy_selected_stocks_without_hiding_research_rows():
     script = (ROOT / "server/static/js/trading-v3.js").read_text(encoding="utf-8")
     page = (ROOT / "server/static/trading-v3.html").read_text(encoding="utf-8")

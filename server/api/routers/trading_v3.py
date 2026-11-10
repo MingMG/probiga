@@ -27,7 +27,10 @@ from server.api.routers._engine import get_engine
 from server.api.scheduler_runtime import launch_scheduler_task
 from server.common.config import get_scheduler_runtime_config
 from server.common.component_release import runtime_component_build_sha
-from server.common.component_release_attestation import require_compatible_component_build
+from server.common.component_release_attestation import (
+    load_component_attestation, require_compatible_component_build,
+)
+from server.common.daily_delivery_control import read_daily_delivery
 from server.common.readiness_snapshot import ReadinessSnapshot
 from server.common.authoritative_market_clock import (
     authoritative_closed_trade_date,
@@ -321,11 +324,9 @@ def _deferred_decision_context(
     }
 
 
-def _deferred_stock_pool_projection(
-    payload: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Keep immutable audit rows while removing every current action plan."""
-
+def _read_only_stock_pool_items(
+    payload: Mapping[str, Any], *, label: str, reason: str,
+) -> list[dict[str, Any]]:
     projected_items: list[dict[str, Any]] = []
     for raw_item in list(payload.get("items") or []):
         if not isinstance(raw_item, Mapping):
@@ -344,14 +345,26 @@ def _deferred_stock_pool_projection(
             **plan,
             "source_actionability": source_actionability,
             "actionability": "RESEARCH_ONLY",
-            "label": "治理数据库迁移延期；当前仅保留只读研究审计",
+            "label": label,
             "buy_range": None,
             "sell_range": None,
             "protective_stop": None,
-            "range_status": "GOVERNANCE_DATABASE_DEFERRED",
+            "range_status": reason,
             "execution_authority": "NONE",
         }
         projected_items.append(item)
+    return projected_items
+
+
+def _deferred_stock_pool_projection(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Keep immutable audit rows while removing every current action plan."""
+
+    projected_items = _read_only_stock_pool_items(
+        payload, label="治理数据库迁移延期；当前仅保留只读研究审计",
+        reason="GOVERNANCE_DATABASE_DEFERRED",
+    )
 
     summary = dict(payload.get("summary") or {})
     for field in (
@@ -2602,6 +2615,59 @@ def _daily_canonical_build_compatible(engine: Any, producer_build_sha: str, api_
         return False
 
 
+def _archived_daily_result_receipt(
+    engine: Any, canonical: Mapping[str, Any], pool: Mapping[str, Any], trade_date: date,
+) -> dict[str, str] | None:
+    """Authenticate the original release and the exact sealed daily delivery."""
+    snapshot = canonical.get("snapshot")
+    producer = str(pool.get("build_commit_sha") or "").strip().lower()
+    run_uid = str(pool.get("run_uid") or "")
+    root = _daily_canonical_result_hash(pool.get("canonical_result_hash"))
+    day = trade_date.isoformat()
+    if (
+        not isinstance(snapshot, Mapping)
+        or snapshot.get("is_canonical") is not True or snapshot.get("input_ready") is not True
+        or snapshot.get("result_mode") != "CANONICAL_PERSISTED"
+        or snapshot.get("automatic_real_order_submission") is not False
+        or snapshot.get("real_order_authority") is not False
+        or _iso_date(snapshot.get("trade_date")) != day
+        or snapshot.get("run_uid") != run_uid
+        or not re.fullmatch(r"[0-9a-f]{32}", run_uid) or run_uid == "0" * 32
+        or root is None or _daily_canonical_result_hash(snapshot.get("canonical_result_hash")) != root
+        or not _valid_daily_build_sha(producer) or snapshot.get("build_commit_sha") != producer
+    ):
+        return None
+    try:
+        with engine.connect() as connection:
+            component = load_component_attestation(connection, producer)
+        contract = component["contract_build_sha"]
+        if component["linux_build_sha"] != producer or not _valid_daily_build_sha(contract):
+            return None
+        delivery = read_daily_delivery(engine, trade_date=day, release_id=contract, attempt_limit=1)
+        receipt = (delivery or {}).get("receipt")
+        session = (delivery or {}).get("session") or {}
+        if (
+            not isinstance(receipt, Mapping)
+            or receipt.get("schema") != "probiga.daily-delivery.v1"
+            or receipt.get("status") not in {"PASS", "DEGRADED"}
+            or receipt.get("status") != session.get("status")
+            or receipt.get("trade_date") != day or receipt.get("release_id") != contract
+            or receipt.get("governance_run_uid") != run_uid
+            or _daily_canonical_result_hash((receipt.get("strategy_pool") or {}).get("root")) != root
+            or receipt.get("automatic_real_order_submission") is not False
+            or receipt.get("real_order_authority") is not False
+            or _daily_canonical_result_hash(receipt.get("receipt_uid")) is None
+            or _daily_canonical_result_hash(receipt.get("receipt_sha256")) is None
+        ):
+            return None
+        return {
+            "receipt_uid": receipt["receipt_uid"], "receipt_sha256": receipt["receipt_sha256"],
+            "producer_build_sha": producer, "contract_release_id": contract,
+        }
+    except (AttributeError, KeyError, SQLAlchemyError, TypeError, ValueError, RuntimeError):
+        return None
+
+
 def _daily_context_from_pool(
     pool: Mapping[str, Any],
     *,
@@ -3037,6 +3103,7 @@ def _daily_overview_from_pool(
 def daily_result(
     trade_date: date | None = Query(default=None),
     force: bool = Query(default=False),
+    archive: bool = Query(default=False),
 ):
     """Return one atomic, exact-date first-screen delivery receipt.
 
@@ -3047,6 +3114,7 @@ def daily_result(
     """
 
     requested_trade_date = trade_date if isinstance(trade_date, date) else None
+    archive_requested = archive is True and requested_trade_date is not None
     force_refresh = force if isinstance(force, bool) else False
     started = monotonic()
     repository = _repo()
@@ -3061,6 +3129,8 @@ def daily_result(
         if resolved_trade_date is not None
         else "authoritative-closed-unavailable"
     )
+    if archive_requested:
+        cache_key = f"archive:{cache_key}"
     if not force_refresh:
         cached = _daily_result_cache_get(cache_key)
         if cached is not None:
@@ -3121,6 +3191,41 @@ def daily_result(
         expected_execution_session_date=execution_session_date,
         canonical_build_compatible=canonical_pool_build_compatible,
     )
+    archive_receipt = None
+    if (
+        archive_requested and isinstance(canonical, Mapping)
+        and authoritative_trade_date is not None and requested_trade_date <= authoritative_trade_date
+        and not execution_session_error and execution_session_date is not None
+        and pool.get("governance_deferred") is not True
+        and (not canonical_pool_build_compatible or pool.get("historical_read_only") is True)
+    ):
+        archived_context = _daily_context_from_pool(
+            {**pool, "historical_read_only": False}, requested_date=requested_trade_date,
+            expected_execution_session_date=execution_session_date,
+        )
+        if archived_context.get("decision_integrity_verified") is True:
+            archive_receipt = _archived_daily_result_receipt(
+                getattr(repository, "engine", None), canonical, pool, requested_trade_date,
+            )
+        if archive_receipt is not None:
+            read_only = {
+                "historical_read_only": True, "decision_scope": "RESEARCH_ONLY",
+                "execution_authority": "NONE", "paper_order_authority": "NONE",
+                "order_authority": False, "real_order_allowed": False,
+                "actionable_output_allowed": False, "actionable_status": "HISTORICAL_READ_ONLY",
+            }
+            pool_context = {
+                **archived_context, **read_only, "context_mode": "ARCHIVED_DAILY_RESULT",
+                "expected_build_sha": str(build_sha or "").strip().lower() or None,
+                "reason_codes": [*archived_context["reason_codes"], "EXACT_PRIOR_DAILY_RESULT_VERIFIED_READ_ONLY"],
+            }
+            pool = {
+                **pool, **read_only, "archived": True,
+                "automatic_real_order_submission": False, "real_order_authority": False,
+                "items": _read_only_stock_pool_items(
+                    pool, label="历史票池仅供复核", reason="ARCHIVED_DAILY_RESULT",
+                ),
+            }
     if date_resolution_error:
         pool_context["reason_codes"].append(
             "AUTHORITATIVE_CLOSED_TRADE_DATE_UNAVAILABLE"
@@ -3141,7 +3246,10 @@ def daily_result(
             context = runtime
 
     safety_started = monotonic()
-    real_trading_safety = _daily_real_trading_safety(repository)
+    real_trading_safety = (
+        _daily_real_trading_safety(repository)
+        if archive_receipt is None else {"verified": False, "status": "NOT_APPLICABLE"}
+    )
     safety_ms = int((monotonic() - safety_started) * 1000)
     overview = _daily_overview_from_pool(
         pool,
@@ -3155,6 +3263,8 @@ def daily_result(
         pool,
         exact_pool=exact_pool,
     )
+    if archive_receipt is not None:
+        strategy_pool.update(historical_read_only=True, actionable_output_allowed=False, order_authority=False)
     projected_stock_pool = _daily_stock_pool_projection(pool)
     same_run_uid = bool(
         exact_pool
@@ -3163,9 +3273,9 @@ def daily_result(
         and context.get("run_uid") == strategy_pool.get("run_uid")
     )
     scheduler_started = monotonic()
-    scheduler = _daily_scheduler_health(
-        getattr(repository, "engine", None),
-        expected_build_sha=build_sha,
+    scheduler = (
+        _daily_scheduler_health(getattr(repository, "engine", None), expected_build_sha=build_sha)
+        if archive_receipt is None else {"healthy": False, "status": "NOT_APPLICABLE"}
     )
     scheduler_ms = int((monotonic() - scheduler_started) * 1000)
     api_build_sha = str(build_sha or "").strip().lower()
@@ -3199,10 +3309,12 @@ def daily_result(
         and linux_scheduler_build_sha == api_build_sha
         and qmt_scheduler_build_sha == api_build_sha
     )
-    try:
-        expected_windows_build_sha = runtime_component_build_sha("windows", expected_build_sha=api_build_sha)
-    except Exception:
-        expected_windows_build_sha = ""
+    expected_windows_build_sha = ""
+    if archive_receipt is None:
+        try:
+            expected_windows_build_sha = runtime_component_build_sha("windows", expected_build_sha=api_build_sha)
+        except Exception:
+            pass
     scheduler_components_match = bool(
         _valid_daily_build_sha(api_build_sha)
         and linux_scheduler_build_sha == api_build_sha
@@ -3216,14 +3328,15 @@ def daily_result(
         build_reason_codes.append("CANONICAL_POOL_BUILD_INVALID")
     elif not canonical_pool_build_compatible:
         build_reason_codes.append("CANONICAL_POOL_BUILD_MISMATCH")
-    if not _valid_daily_build_sha(linux_scheduler_build_sha):
-        build_reason_codes.append("LINUX_SCHEDULER_BUILD_INVALID")
-    elif linux_scheduler_build_sha != api_build_sha:
-        build_reason_codes.append("LINUX_SCHEDULER_BUILD_MISMATCH")
-    if not _valid_daily_build_sha(qmt_scheduler_build_sha):
-        build_reason_codes.append("QMT_SCHEDULER_BUILD_INVALID")
-    elif qmt_scheduler_build_sha != expected_windows_build_sha:
-        build_reason_codes.append("QMT_SCHEDULER_BUILD_MISMATCH")
+    if archive_receipt is None:
+        if not _valid_daily_build_sha(linux_scheduler_build_sha):
+            build_reason_codes.append("LINUX_SCHEDULER_BUILD_INVALID")
+        elif linux_scheduler_build_sha != api_build_sha:
+            build_reason_codes.append("LINUX_SCHEDULER_BUILD_MISMATCH")
+        if not _valid_daily_build_sha(qmt_scheduler_build_sha):
+            build_reason_codes.append("QMT_SCHEDULER_BUILD_INVALID")
+        elif qmt_scheduler_build_sha != expected_windows_build_sha:
+            build_reason_codes.append("QMT_SCHEDULER_BUILD_MISMATCH")
     build_identity = {
         "api_build_sha": api_build_sha or None,
         "canonical_pool_build_sha": canonical_pool_build_sha or None,
@@ -3255,7 +3368,11 @@ def daily_result(
     decision_status = str(
         context.get("decision_status") or "UNAVAILABLE"
     ).upper()
-    if data_status == "LOADING" or decision_status == "LOADING":
+    if archive_receipt is not None:
+        delivery_status = "ARCHIVED"
+        reason_code = "EXACT_PRIOR_DAILY_RESULT_VERIFIED_READ_ONLY"
+        envelope_status = "ok"
+    elif data_status == "LOADING" or decision_status == "LOADING":
         delivery_status = "LOADING"
         reason_code = "DAILY_PIPELINE_IN_PROGRESS"
         envelope_status = "loading"
@@ -3391,6 +3508,8 @@ def daily_result(
         "real_order_authority": False,
         "envelope_status": envelope_status,
     }
+    if archive_receipt is not None:
+        payload["archive"] = archive_receipt
     _daily_result_cache_set(cache_key, payload)
     return _envelope(payload, status=envelope_status)
 
