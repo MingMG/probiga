@@ -1015,13 +1015,17 @@ def test_full_catalog_batch_writes_events_and_authoritative_empty_for_beijing(
 
 
 def test_next_daily_batch_reuses_validated_baseline_and_queries_short_overlap(
-    monkeypatch, tmp_path: Path
+    tmp_path: Path
 ):
     engine = _engine()
     catalog = _catalog(("000001", "000001.SZ"), ("430001", "430001.BJ"))
     _install_catalog(engine, catalog)
     xtdata = _XtData({
-        "000001.SZ": _frame("000001", "2026-07-30 10:00:00"),
+        "000001.SZ": pd.concat([
+            _frame("000001", "2026-07-26 10:00:00").assign(announcement_id="A-expired"),
+            _frame("000001", "2026-07-30 10:00:00"),
+            _frame("000001", "2026-08-23 10:00:00").assign(announcement_id="A-overlap"),
+        ], ignore_index=True),
         "430001.BJ": pd.DataFrame(),
     })
     first = synchronize_qmt_announcements(
@@ -1034,8 +1038,22 @@ def test_next_daily_batch_reuses_validated_baseline_and_queries_short_overlap(
         ),
         batch_size=2,
     )
-    assert first["status"] == "COMPLETE"
+    assert first["status"] == "COMPLETE", first
+    assert first["event_count"] == 3
 
+    prior_payload_batch_sizes = []
+    unbounded_baseline_queries = []
+
+    def reject_second_parent_read(_connection, _cursor, statement, parameters, _context, _executemany):
+        normalized = " ".join(statement.lower().split())
+        if normalized.startswith("select stock_code, payload_json from st_pit_source_coverage"):
+            unbounded_baseline_queries.append(statement)
+            raise OperationalError(statement, parameters, TimeoutError("unbounded parent reply"))
+        if (normalized.startswith("select * from st_pit_source_coverage")
+                and "coverage_id in (" in normalized and first["batch_id"] in parameters):
+            prior_payload_batch_sizes.append(len(parameters) - 2)
+
+    event.listen(engine, "before_cursor_execute", reject_second_parent_read)
     xtdata.frames["000001.SZ"] = pd.DataFrame([{
         "time": "2026-08-26 17:50:00",
         "title": "000001新公告",
@@ -1054,9 +1072,11 @@ def test_next_daily_batch_reuses_validated_baseline_and_queries_short_overlap(
         batch_size=2,
     )
 
-    assert second["status"] == "COMPLETE"
+    assert second["status"] == "COMPLETE", second
+    assert not unbounded_baseline_queries, "the validator already read these parent payloads"
     assert second["parent_batch_id"] == first["batch_id"]
     assert second["parent_batch_root_hash"] == first["batch_root_hash"]
+    assert prior_payload_batch_sizes == [1, 2]  # First-member probe, then one bounded member read.
     assert second["capture_window_start"] == "2026-08-23"
     assert xtdata.reads[0]["start_time"] == "20260823000000"
     assert second["event_count"] == 2
