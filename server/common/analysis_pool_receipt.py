@@ -56,6 +56,7 @@ _SHANGHAI = ZoneInfo("Asia/Shanghai")
 ANALYSIS_POOL_PUBLISHER_TASK_TYPES = frozenset({"analysis_fast"})
 PREMARKET_POOL_TASK = "strategy_external_overlay"
 ANALYSIS_SCORE_PUBLICATION_TASK_TYPES = ANALYSIS_POOL_PUBLISHER_TASK_TYPES | {PREMARKET_POOL_TASK}
+FROZEN_INITIAL_ANNOUNCEMENT_SCHEMA = "probiga.frozen-initial-announcement-source.v1"
 
 CANONICAL_ANALYSIS_COLUMNS = tuple(
     name
@@ -399,11 +400,82 @@ def _score_snapshot_envelope(payload: dict, raw: bytes, compressed: bytes, *, en
     }
 
 
+def _validate_frozen_announcement_source(
+    source: Mapping[str, Any], *, trade_date: str, decision_at: str,
+) -> dict[str, Any]:
+    from server.common.authoritative_market_clock import STRATEGY_POOL_INITIAL_TIME
+
+    expected_fields = {
+        "schema", "task_type", "trade_date", "scheduler_run_uid", "evidence_sha256",
+        "input_receipt_root_sha256", "producer_build_sha", "contract_release_id",
+        "batch_id", "batch_root_hash", "source", "fact_cutoff_at", "received_at", "finished_at",
+    }
+    if not isinstance(source, Mapping) or set(source) != expected_fields:
+        raise ValueError("ANALYSIS_SCORE_FROZEN_ANNOUNCEMENT_MISMATCH")
+    cutoff = datetime.combine(date.fromisoformat(trade_date), STRATEGY_POOL_INITIAL_TIME)
+    try:
+        timestamps = tuple(datetime.fromisoformat(source[field]) for field in (
+            "fact_cutoff_at", "received_at", "finished_at",
+        ))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("ANALYSIS_SCORE_FROZEN_ANNOUNCEMENT_MISMATCH") from exc
+    fact_cutoff, received, finished = timestamps
+    if (
+        source["schema"] != FROZEN_INITIAL_ANNOUNCEMENT_SCHEMA
+        or source["task_type"] != "qmt_announcement_pit" or source["trade_date"] != trade_date
+        or cutoff.isoformat(timespec="seconds") != decision_at
+        or any(value.tzinfo is not None for value in timestamps)
+        or fact_cutoff.date() != cutoff.date()
+        or not fact_cutoff <= received <= finished <= cutoff
+        or source["source"] not in {"qmt.announcement", "cninfo.announcement", "eastmoney.announcement"}
+        or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", str(source["batch_id"]))
+        or not re.fullmatch(r"[0-9a-f]{32}", str(source["scheduler_run_uid"]))
+        or any(not re.fullmatch(r"[0-9a-f]{40}", str(source[field])) for field in (
+            "producer_build_sha", "contract_release_id",
+        ))
+        or any(not re.fullmatch(r"[0-9a-f]{64}", str(source[field])) for field in (
+            "evidence_sha256", "input_receipt_root_sha256", "batch_root_hash",
+        ))
+    ):
+        raise ValueError("ANALYSIS_SCORE_FROZEN_ANNOUNCEMENT_MISMATCH")
+    return dict(source)
+
+
+def _validate_frozen_core_inputs(
+    inputs: Mapping[str, Any], *, initial_announcement: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    stages = {
+        "kline": "qmt_stock_daily_canonical", "turnover": "target_turnover_snapshot",
+        "financial": "stock_finance",
+        "announcement": "qmt_announcement_pit" if initial_announcement else "qmt_announcement_premarket_prepare",
+    }
+    if not isinstance(inputs, Mapping) or set(inputs) != set(stages):
+        raise ValueError("ANALYSIS_SCORE_FROZEN_CORE_INPUTS_MISMATCH")
+    for key, stage in stages.items():
+        item = inputs[key]
+        fields = {"stage", "dataset_id", "root"} | ({"input_root"} if key == "announcement" else set())
+        if (
+            not isinstance(item, Mapping) or set(item) != fields or item["stage"] != stage
+            or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", str(item["dataset_id"]))
+            or not re.fullmatch(r"[0-9a-f]{64}", str(item["root"]))
+            or (key == "announcement" and not re.fullmatch(r"[0-9a-f]{64}", str(item["input_root"])))
+        ):
+            raise ValueError("ANALYSIS_SCORE_FROZEN_CORE_INPUTS_MISMATCH")
+    if initial_announcement and inputs["announcement"] != {
+        "stage": "qmt_announcement_pit", "dataset_id": initial_announcement["scheduler_run_uid"],
+        "root": initial_announcement["evidence_sha256"], "input_root": initial_announcement["batch_root_hash"],
+    }:
+        raise ValueError("ANALYSIS_SCORE_FROZEN_CORE_INPUTS_MISMATCH")
+    return {key: dict(value) for key, value in inputs.items()}
+
+
 def build_score_snapshot(
     *, trade_date: str, decision_at: datetime | str, run_uid: str,
     build_sha: str, analysis_rows: Iterable[Mapping[str, Any]],
     scored_rows: Iterable[Mapping[str, Any]],
     fixed_market_context: Mapping[str, Any] | None = None,
+    frozen_announcement_source: Mapping[str, Any] | None = None,
+    frozen_core_inputs: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload = _score_snapshot_payload(
         trade_date=trade_date, decision_at=decision_at, run_uid=run_uid,
@@ -419,6 +491,15 @@ def build_score_snapshot(
         ):
             raise ValueError("ANALYSIS_SCORE_FIXED_MARKET_CONTEXT_MISMATCH")
         payload["fixed_market_context"] = {**context, "context_sha256": digest}
+    if frozen_announcement_source is not None:
+        payload["frozen_announcement_source"] = _validate_frozen_announcement_source(
+            frozen_announcement_source, trade_date=trade_date,
+            decision_at=payload["input_decision_at"],
+        )
+    if frozen_core_inputs is not None:
+        payload["frozen_core_inputs"] = _validate_frozen_core_inputs(
+            frozen_core_inputs, initial_announcement=payload.get("frozen_announcement_source"),
+        )
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
     return _score_snapshot_envelope(payload, raw, _snapshot_compress(payload))
 
@@ -453,6 +534,15 @@ def decode_score_snapshot(value: Mapping[str, Any], *, trade_date: str | None = 
         trade_date is not None and payload["trade_date"] != trade_date
     ):
         raise ValueError("ANALYSIS_SCORE_SNAPSHOT_BINDING_MISMATCH")
+    if "frozen_announcement_source" in payload:
+        _validate_frozen_announcement_source(
+            payload["frozen_announcement_source"], trade_date=payload["trade_date"],
+            decision_at=payload["input_decision_at"],
+        )
+    if "frozen_core_inputs" in payload:
+        _validate_frozen_core_inputs(
+            payload["frozen_core_inputs"], initial_announcement=payload.get("frozen_announcement_source"),
+        )
     return payload
 
 

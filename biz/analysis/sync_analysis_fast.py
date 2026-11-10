@@ -60,7 +60,9 @@ from server.common.daily_stock_universe import (
     load_daily_stock_universe,
     validate_daily_stock_coverage,
 )
-from server.common.daily_delivery_control import FrozenPremarketAnnouncement
+from server.common.daily_delivery_control import (
+    FrozenPremarketAnnouncement, select_frozen_initial_announcement_source,
+)
 from server.common.pit_facts import (
     HistoricalEventRead,
     PIT_AVAILABLE,
@@ -5336,7 +5338,9 @@ def _prepare_batch_outputs(
     event_window_end = (
         decision_at.date().isoformat() if pool_decision_phase == "PREMARKET_REVISION" else trade_date
     )
-    if reuse_preliminary_snapshot:
+    # The upper-evidence snapshot does not seal the fixed market context or
+    # the exact announcement completion needed for the first formal pool.
+    if reuse_preliminary_snapshot and pool_decision_phase is None:
         if decision_at is None or not publisher_build_sha:
             raise RuntimeError(
                 "DATA_BLOCKED: preliminary snapshot identity is incomplete"
@@ -5354,12 +5358,6 @@ def _prepare_batch_outputs(
             decision_at=decision_at,
             collector_build_sha=publisher_build_sha,
         )
-        if (
-            pool_decision_phase is not None
-            and preliminary_receipt
-            and preliminary_receipt.get("decision_at") != decision_at.isoformat(timespec="seconds")
-        ):
-            preliminary_receipt = {}
         if not preliminary_receipt:
             # Upper-limit evidence is optional.  When task101 could not run
             # because MyQuant is unavailable, the same deterministic full
@@ -5464,6 +5462,7 @@ def _prepare_batch_outputs(
             progress_callback=progress_callback,
         )
     historical_event_reads: list[HistoricalEventRead] = []
+    initial_announcement = None
     common_cutoff: dict[str, Any] = {
         "status": PIT_DATA_BLOCKED,
         "reason": "PIT_COMMON_CUTOFF_EXACT_DECISION_TIME_REQUIRED",
@@ -5487,6 +5486,13 @@ def _prepare_batch_outputs(
             "receipts": [],
         }
     elif decision_at is not None:
+        if pool_decision_phase == "INITIAL":
+            initial_announcement = select_frozen_initial_announcement_source(
+                engine, trade_date=trade_date, decision_at=decision_at,
+            )
+            if initial_announcement is None:
+                raise RuntimeError("ANALYSIS_INITIAL_SIGNED_ANNOUNCEMENT_UNAVAILABLE")
+
         def announcement_progress(completed: int, total: int) -> None:
             _emit_progress(
                 progress_callback, stage="validate_announcement_history", percent=13,
@@ -5513,6 +5519,8 @@ def _prepare_batch_outputs(
             event_progress=announcement_progress if event_checkpoint_path is not None else None,
             **({"required_premarket_announcement": required_premarket_announcement}
                if required_premarket_announcement is not None else {}),
+            **({"required_initial_announcement": initial_announcement}
+               if initial_announcement is not None else {}),
         )
     fact_cutoff_at: datetime | str | None = (
         common_cutoff.get("fact_cutoff_at")
@@ -5755,24 +5763,36 @@ def _prepare_batch_outputs(
         )
     if pool_decision_phase is not None:
         daily_window = kline_all.attrs["qmt_daily_input_window"]
-        if required_premarket_announcement is not None:
-            event = required_premarket_announcement.receipt
-            finance_evidence = common_cutoff.get("finance_atomic_batch") or {}
-            scored.attrs["frozen_core_inputs"] = {
-                "kline": {"stage": "qmt_stock_daily_canonical",
-                          "dataset_id": daily_window["daily_truth_sha256"],
-                          "root": daily_window["daily_partition_roots"][trade_date]},
-                "turnover": {"stage": "target_turnover_snapshot",
-                             "dataset_id": turnover_input_proof["turnover_snapshot_run_id"],
-                             "root": turnover_input_proof["turnover_full_market_proof_root_sha256"]},
-                "financial": {"stage": "stock_finance",
-                              "dataset_id": finance_evidence["seal_coverage_id"],
-                              "root": finance_evidence["batch_root_sha256"]},
-                "announcement": {"stage": "qmt_announcement_premarket_prepare",
-                                 "dataset_id": event["premarket_source"]["scheduler_run_uid"],
-                                 "root": event["stage_evidence_sha256"],
-                                 "input_root": event["batch_root_hash"]},
+        if initial_announcement is not None:
+            frozen_announcement_source = initial_announcement.score_binding
+            scored.attrs["frozen_announcement_source"] = frozen_announcement_source
+            event_input = {
+                "stage": "qmt_announcement_pit",
+                "dataset_id": frozen_announcement_source["scheduler_run_uid"],
+                "root": frozen_announcement_source["evidence_sha256"],
+                "input_root": frozen_announcement_source["batch_root_hash"],
             }
+        else:
+            event = required_premarket_announcement.receipt
+            event_input = {
+                "stage": "qmt_announcement_premarket_prepare",
+                "dataset_id": event["premarket_source"]["scheduler_run_uid"],
+                "root": event["stage_evidence_sha256"],
+                "input_root": event["batch_root_hash"],
+            }
+        finance_evidence = common_cutoff["finance_atomic_batch"]
+        scored.attrs["frozen_core_inputs"] = {
+            "kline": {"stage": "qmt_stock_daily_canonical",
+                      "dataset_id": daily_window["daily_truth_sha256"],
+                      "root": daily_window["daily_partition_roots"][trade_date]},
+            "turnover": {"stage": "target_turnover_snapshot",
+                         "dataset_id": turnover_input_proof["turnover_snapshot_run_id"],
+                         "root": turnover_input_proof["turnover_full_market_proof_root_sha256"]},
+            "financial": {"stage": "stock_finance",
+                          "dataset_id": finance_evidence["seal_coverage_id"],
+                          "root": finance_evidence["batch_root_sha256"]},
+            "announcement": event_input,
+        }
         from server.engine.strategy_center import build_fixed_market_context
         scored.attrs["fixed_market_context"] = build_fixed_market_context(
             trade_date=trade_date,
@@ -5898,6 +5918,8 @@ def prepare_frozen_strategy_pool_scoring(
         analysis_rows=analysis_rows,
         scored_rows=scored.to_dict("records"),
         fixed_market_context=scored.attrs.get("fixed_market_context"),
+        frozen_announcement_source=scored.attrs.get("frozen_announcement_source"),
+        frozen_core_inputs=scored.attrs.get("frozen_core_inputs"),
     )
     return {
         "phase": slot.phase,
@@ -6049,6 +6071,8 @@ def run_batch(
             build_sha=publisher_build_sha, analysis_rows=analysis_rows,
             scored_rows=scored.to_dict("records"),
             fixed_market_context=scored.attrs.get("fixed_market_context"),
+            frozen_announcement_source=scored.attrs.get("frozen_announcement_source"),
+            frozen_core_inputs=scored.attrs.get("frozen_core_inputs"),
         ) if publish else None
         _emit_progress(
             progress_callback,

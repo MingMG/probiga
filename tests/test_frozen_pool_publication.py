@@ -71,9 +71,17 @@ def prepared(monkeypatch):
     rows = [{**row, "flow_input_decision_at": CUTOFF} for row in fixture["scored_rows"]]
     context = {"trade_date": DAY, "decision_known_at": CUTOFF}
     context["context_sha256"] = delivery.canonical_sha256(context)
+    core_inputs = {
+        "kline": {"stage": "qmt_stock_daily_canonical", "dataset_id": "bars", "root": "b" * 64},
+        "turnover": {"stage": "target_turnover_snapshot", "dataset_id": "turn", "root": "c" * 64},
+        "financial": {"stage": "stock_finance", "dataset_id": "finance", "root": "d" * 64},
+        "announcement": {"stage": "qmt_announcement_premarket_prepare", "dataset_id": "e" * 32,
+                         "root": SOURCE, "input_root": "f" * 64},
+    }
     envelope = build_score_snapshot(
         trade_date=DAY, decision_at=CUTOFF, run_uid=RUN, build_sha=BUILD,
         analysis_rows=fixture["analysis_rows"], scored_rows=rows, fixed_market_context=context,
+        frozen_core_inputs=core_inputs,
     )
     work = {
         "schema": publication.PREMARKET_POOL_WORK_SCHEMA, "run_uid": RUN, "build_sha": BUILD,
@@ -82,13 +90,7 @@ def prepared(monkeypatch):
             "phase": SLOT.phase, "data_trade_date": DAY, "execution_session_date": SESSION,
             "cutoff_at": SLOT.scheduled_at.isoformat(), "evaluated_at": SLOT.evaluated_at.isoformat(),
             "score_snapshot": envelope, "analysis_rows": fixture["analysis_rows"], "recommendation_rows": [],
-            "core_inputs": {
-                "kline": {"stage": "qmt_stock_daily_canonical", "dataset_id": "bars", "root": "b" * 64},
-                "turnover": {"stage": "target_turnover_snapshot", "dataset_id": "turn", "root": "c" * 64},
-                "financial": {"stage": "stock_finance", "dataset_id": "finance", "root": "d" * 64},
-                "announcement": {"stage": "qmt_announcement_premarket_prepare", "dataset_id": "e" * 32,
-                                 "root": SOURCE, "input_root": "f" * 64},
-            },
+            "core_inputs": core_inputs,
         },
     }
     monkeypatch.setattr(component_release, "runtime_contract_build_sha", lambda **_: CONTRACT)

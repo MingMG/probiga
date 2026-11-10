@@ -3627,7 +3627,7 @@ def test_complete_late_cninfo_batch_is_visible_only_after_actual_receipt(tmp_pat
 
 def test_premarket_announcement_uses_only_completed_signed_batch_members(tmp_path):
     from types import MappingProxyType
-    from server.common.daily_delivery_control import FrozenPremarketAnnouncement
+    from server.common.daily_delivery_control import FrozenInitialAnnouncement, FrozenPremarketAnnouncement
     from server.common.qmt_announcement_pit import synchronize_qmt_announcements
     from tests.test_qmt_announcement_pit import _Clock, _XtData, _catalog, _frame, _install_catalog
 
@@ -3663,6 +3663,31 @@ def test_premarket_announcement_uses_only_completed_signed_batch_members(tmp_pat
         )
 
     parent = capture(_frame("000001", "2026-08-21 10:00:00"), now_fn=_Clock(datetime(2026, 8, 25, 18, 20)))
+    newer_evening = capture(
+        _frame("000001", "2026-08-25 19:00:00").assign(announcement_id="not-in-signed-initial"),
+        now_fn=_Clock(datetime(2026, 8, 25, 19, 5)), resume=False,
+    )
+    assert newer_evening["status"] == "COMPLETE"
+    initial_receipt = FrozenInitialAnnouncement(MappingProxyType({
+        **parent, "stage_finished_at": "2026-08-25T18:22:00+08:00",
+        "stage_attempt_uid": "c" * 64, "stage_evidence_sha256": "d" * 64,
+    }), MappingProxyType({}))
+    initial_cutoff = datetime(2026, 8, 25, 22, 20)
+    selected_initial = []
+    initial = pit_module.resolve_strategy_fact_cutoffs(
+        engine, codes=codes, decision_at=initial_cutoff, finance_start_date="1900-01-01",
+        finance_end_date=data_date, event_start_date=start, event_end_date=data_date,
+        require_qmt_event_batch=True, required_initial_announcement=initial_receipt,
+        capture_historical_selection=selected_initial.append,
+    )
+    assert initial["status"] == PIT_AVAILABLE, initial["reason"]
+    assert initial["qmt_event_batch"]["batch_id"] == parent["batch_id"]
+    initial_facts = load_event_facts(
+        engine, codes=codes, start_date=start, end_date=data_date,
+        decision_at=initial_cutoff, fact_cutoff_at=parent["fact_cutoff_at"],
+        require_qmt_complete_batch=True, historical_selection=selected_initial[0],
+    )
+    assert {item["event_key"] for item in initial_facts.facts[codes[0]]} == {"qmt:A-000001"}
     signed_parent = {key: parent[key] for key in (
         "batch_id", "batch_root_hash", "source", "fallback_reason", "received_at",
         "window_start", "window_end", "fact_cutoff_at",

@@ -44,7 +44,7 @@ from server.common.finance_nonfiling_evidence import (
 from server.common.pit_event_coverage_checkpoint import EventCoverageCheckpoint
 
 if TYPE_CHECKING:
-    from server.common.daily_delivery_control import FrozenPremarketAnnouncement
+    from server.common.daily_delivery_control import FrozenInitialAnnouncement, FrozenPremarketAnnouncement
     from server.common.qmt_announcement_pit import HistoricalAnnouncementSelection
 
 logger = logging.getLogger(__name__)
@@ -5388,7 +5388,7 @@ class _LiveEventSelection:
 
 
 @dataclass(frozen=True)
-class _PremarketEventSelection(_LiveEventSelection):
+class _SignedLiveEventSelection(_LiveEventSelection):
     completion_at: datetime
     bindings: Mapping[str, tuple[Mapping[str, str], ...]]
 
@@ -5425,44 +5425,25 @@ def _announcement_batch_read_reason(error: Exception) -> str:
     return reason or f"PIT_QMT_EVENT_BATCH_UNAVAILABLE:{type(error).__name__}"
 
 
-def _load_certified_premarket_event_selection(
-    engine: Engine, required: FrozenPremarketAnnouncement, *, codes: list[str],
-    decision: datetime, data_date: date, window_start: date, window_end: date,
-) -> _PremarketEventSelection:
-    from server.common.daily_delivery_control import FrozenPremarketAnnouncement
+def _bind_signed_live_event_selection(
+    engine: Engine, receipt: Mapping[str, Any], *, codes: list[str],
+    decision: datetime, cutoff: datetime, completion: datetime,
+    window_start: date, window_end: date, phase: str,
+) -> _SignedLiveEventSelection:
     from server.common.qmt_announcement_pit import (
         QMT_ANNOUNCEMENT_TASK_SCHEMA,
         validate_complete_qmt_announcement_batch,
     )
 
-    if not isinstance(required, FrozenPremarketAnnouncement):
-        raise ValueError("premarket announcement requires a verified stage receipt")
-    receipt = required.receipt
-    stage = receipt["premarket_source"]
     source = receipt["source"]
-    cutoff = _row_datetime(receipt["fact_cutoff_at"])
-    received = _row_datetime(receipt["received_at"])
-    published = _row_datetime(receipt["publish_completed_at"])
-    completion = _row_datetime(receipt["stage_finished_at"])
     if (
         receipt["schema"] != QMT_ANNOUNCEMENT_TASK_SCHEMA or receipt["status"] != "COMPLETE"
         or source not in {QMT_EVENT_SOURCE, CNINFO_EVENT_SOURCE}
         or not receipt["batch_id"] or not _HASH_RE.fullmatch(str(receipt["batch_root_hash"]))
         or not _HASH_RE.fullmatch(str(receipt["stage_evidence_sha256"]))
         or not _HASH_RE.fullmatch(str(receipt["stage_attempt_uid"]))
-        or stage["data_trade_date"] != data_date.isoformat()
-        or receipt["coverage_target_date"] != data_date.isoformat()
-        or stage["execution_session_date"] != window_end.isoformat()
-        or receipt["window_end"] != window_end.isoformat()
-        or not data_date < cutoff.date() == window_end == decision.date()
-        or cutoff != _row_datetime(stage["source_cutoff_at"])
-        or decision != _row_datetime(stage["decision_cutoff_at"])
-        or not cutoff <= received <= published <= completion <= decision
-        or receipt["parent_batch_id"] != stage["parent_batch_id"]
-        or receipt["parent_batch_root_hash"] != stage["parent_batch_root_hash"]
-        or source != stage["parent_source"]
     ):
-        raise ValueError("premarket announcement source or completion scope differs")
+        raise ValueError("signed announcement stage identity differs")
     captured: list[dict[str, tuple[dict[str, Any], list[dict[str, str]]]]] = []
     batch = validate_complete_qmt_announcement_batch(
         engine, codes=codes, decision_at=decision, fact_cutoff_at=cutoff,
@@ -5477,12 +5458,12 @@ def _load_certified_premarket_event_selection(
             "catalog_manifest_hash", "catalog_member_set_hash", "fallback_reason",
         )
     ) or batch.get("catalog_member_count") != receipt.get("stock_count"):
-        raise ValueError("premarket announcement durable batch differs from its stage receipt")
+        raise ValueError("announcement durable batch differs from its signed stage receipt")
     members = captured[0]
-    return _PremarketEventSelection(
+    return _SignedLiveEventSelection(
         engine=engine, decision_at=decision, window_start=window_start, window_end=window_end,
         batch=MappingProxyType({
-            **batch, "premarket_stage": {
+            **batch, f"{phase}_stage": {
                 "attempt_uid": receipt["stage_attempt_uid"],
                 "evidence_sha256": receipt["stage_evidence_sha256"],
                 "completed_at": _dt_text(completion),
@@ -5496,6 +5477,68 @@ def _load_certified_premarket_event_selection(
             code: tuple(MappingProxyType(binding) for binding in bindings)
             for code, (_, bindings) in members.items()
         }),
+    )
+
+
+def _load_certified_initial_event_selection(
+    engine: Engine, required: FrozenInitialAnnouncement, *, codes: list[str],
+    decision: datetime, data_date: date, window_start: date, window_end: date,
+) -> _SignedLiveEventSelection:
+    from server.common.authoritative_market_clock import STRATEGY_POOL_INITIAL_TIME
+    from server.common.daily_delivery_control import FrozenInitialAnnouncement
+
+    if not isinstance(required, FrozenInitialAnnouncement):
+        raise ValueError("initial announcement requires a verified stage receipt")
+    receipt = required.receipt
+    cutoff = _row_datetime(receipt["fact_cutoff_at"])
+    received = _row_datetime(receipt["received_at"])
+    completion = _row_datetime(receipt["stage_finished_at"])
+    if (
+        receipt.get("mode")
+        or receipt["window_start"] != (data_date - timedelta(days=30)).isoformat()
+        or receipt["window_end"] != data_date.isoformat()
+        or not data_date == cutoff.date() == window_end
+        or decision != datetime.combine(data_date, STRATEGY_POOL_INITIAL_TIME)
+        or not cutoff <= received <= completion <= decision
+    ):
+        raise ValueError("initial announcement source or completion scope differs")
+    return _bind_signed_live_event_selection(
+        engine, receipt, codes=codes, decision=decision, cutoff=cutoff, completion=completion,
+        window_start=window_start, window_end=window_end, phase="initial",
+    )
+
+
+def _load_certified_premarket_event_selection(
+    engine: Engine, required: FrozenPremarketAnnouncement, *, codes: list[str],
+    decision: datetime, data_date: date, window_start: date, window_end: date,
+) -> _SignedLiveEventSelection:
+    from server.common.daily_delivery_control import FrozenPremarketAnnouncement
+
+    if not isinstance(required, FrozenPremarketAnnouncement):
+        raise ValueError("premarket announcement requires a verified stage receipt")
+    receipt = required.receipt
+    stage = receipt["premarket_source"]
+    cutoff = _row_datetime(receipt["fact_cutoff_at"])
+    received = _row_datetime(receipt["received_at"])
+    published = _row_datetime(receipt["publish_completed_at"])
+    completion = _row_datetime(receipt["stage_finished_at"])
+    if (
+        stage["data_trade_date"] != data_date.isoformat()
+        or receipt["coverage_target_date"] != data_date.isoformat()
+        or stage["execution_session_date"] != window_end.isoformat()
+        or receipt["window_end"] != window_end.isoformat()
+        or not data_date < cutoff.date() == window_end == decision.date()
+        or cutoff != _row_datetime(stage["source_cutoff_at"])
+        or decision != _row_datetime(stage["decision_cutoff_at"])
+        or not cutoff <= received <= published <= completion <= decision
+        or receipt["parent_batch_id"] != stage["parent_batch_id"]
+        or receipt["parent_batch_root_hash"] != stage["parent_batch_root_hash"]
+        or receipt["source"] != stage["parent_source"]
+    ):
+        raise ValueError("premarket announcement source or completion scope differs")
+    return _bind_signed_live_event_selection(
+        engine, receipt, codes=codes, decision=decision, cutoff=cutoff, completion=completion,
+        window_start=window_start, window_end=window_end, phase="premarket",
     )
 
 
@@ -5514,6 +5557,7 @@ def resolve_common_fact_cutoff(
     event_checkpoint_path: Path | None = None,
     event_progress: Callable[[int, int], None] | None = None,
     required_premarket_announcement: FrozenPremarketAnnouncement | None = None,
+    required_initial_announcement: FrozenInitialAnnouncement | None = None,
     _dataset_cutoffs: bool = False,
 ) -> dict[str, Any]:
     """Resolve one immutable COMPLETE-coverage cutoff (T) for a live batch (E)."""
@@ -5541,10 +5585,17 @@ def resolve_common_fact_cutoff(
     }
     if not normalized_codes:
         return {**blocked, "reason": "PIT_COMMON_CUTOFF_EMPTY_SCOPE"}
-    if required_premarket_announcement is not None and not (
-        _dataset_cutoffs and require_qmt_event_batch and include_event_facts
-    ):
-        return {**blocked, "reason": "PIT_PREMARKET_ANNOUNCEMENT_SCOPE_REQUIRED"}
+    if required_initial_announcement is not None and required_premarket_announcement is not None:
+        return {**blocked, "reason": "PIT_SIGNED_ANNOUNCEMENT_SCOPE_CONFLICT"}
+    signed_source = required_initial_announcement
+    signed_phase = "INITIAL"
+    read_signed_selection = _load_certified_initial_event_selection
+    if required_premarket_announcement is not None:
+        signed_source = required_premarket_announcement
+        signed_phase = "PREMARKET"
+        read_signed_selection = _load_certified_premarket_event_selection
+    if signed_source is not None and not (_dataset_cutoffs and require_qmt_event_batch and include_event_facts):
+        return {**blocked, "reason": f"PIT_{signed_phase}_ANNOUNCEMENT_SCOPE_REQUIRED"}
     for kind, (start, end) in windows.items():
         if start is None or end is None or start > end:
             raise ValueError(f"{kind} coverage window is invalid")
@@ -5572,16 +5623,16 @@ def resolve_common_fact_cutoff(
     event_batch: dict[str, Any] = {}
     historical_selections: list[HistoricalAnnouncementSelection] = []
     reusable_live_batch: list[bool] = []
-    premarket_selection = None
-    if required_premarket_announcement is not None:
+    signed_live_selection = None
+    if signed_source is not None:
         try:
-            premarket_selection = _load_certified_premarket_event_selection(
-                engine, required_premarket_announcement, codes=normalized_codes, decision=decision,
+            signed_live_selection = read_signed_selection(
+                engine, signed_source, codes=normalized_codes, decision=decision,
                 data_date=windows["finance"][1], window_start=windows["event"][0], window_end=windows["event"][1],
             )
-            event_batch = dict(premarket_selection.batch)
+            event_batch = dict(signed_live_selection.batch)
         except Exception as exc:
-            return {**blocked, "reason": "PIT_PREMARKET_ANNOUNCEMENT_INVALID:" + _announcement_batch_read_reason(exc)}
+            return {**blocked, "reason": f"PIT_{signed_phase}_ANNOUNCEMENT_INVALID:" + _announcement_batch_read_reason(exc)}
     elif require_qmt_event_batch and include_event_facts:
         try:
             from server.common.qmt_announcement_pit import (
@@ -5607,7 +5658,7 @@ def resolve_common_fact_cutoff(
                 "reason": _announcement_batch_read_reason(exc),
             }
     historical_selection = next(iter(historical_selections), None)
-    exact_event_selection = premarket_selection or historical_selection
+    exact_event_selection = signed_live_selection or historical_selection
     scan_event = include_event_facts and exact_event_selection is None
     event_filter = ""
     query_params: dict[str, Any] = {
@@ -5883,7 +5934,7 @@ def resolve_common_fact_cutoff(
         return source_cutoffs[row["fact_kind"]] if _dataset_cutoffs else fact_cutoff
 
     event_completion_at = None
-    if premarket_selection is None:
+    if signed_live_selection is None:
         _, event_completion_at = _late_cninfo_completion(
             engine, event_batch, fact_cutoff_at=source_cutoffs.get("event", fact_cutoff)
             if _dataset_cutoffs else fact_cutoff, decision_at=decision,
@@ -5904,11 +5955,11 @@ def resolve_common_fact_cutoff(
             and _row_datetime(row.get("known_at")) <= decision
         )
         and not (
-            premarket_selection is not None
+            signed_live_selection is not None
             and row.get("fact_kind") == "event"
             and row.get("batch_id") == event_batch["batch_id"]
             and cutoff_for(row) == _row_datetime(event_batch["fact_cutoff_at"])
-            <= _row_datetime(row["known_at"]) <= premarket_selection.completion_at <= decision
+            <= _row_datetime(row["known_at"]) <= signed_live_selection.completion_at <= decision
         )
         and not _verified_cninfo_coverage_known(
             row, event_batch, fact_cutoff_at=cutoff_for(row), decision_at=decision,
@@ -6598,8 +6649,8 @@ def load_finance_history_facts(
     )
 
 
-def _query_premarket_bound_event_revisions(
-    engine: Engine, selection: _PremarketEventSelection,
+def _query_signed_bound_event_revisions(
+    engine: Engine, selection: _SignedLiveEventSelection,
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
     """Resolve only identities committed to the exact signed coverage receipt."""
     from server.common.qmt_announcement_pit import (
@@ -6612,7 +6663,7 @@ def _query_premarket_bound_event_revisions(
         for binding in bindings:
             revision_id = binding["revision_id"]
             if revision_id in expected:
-                raise ValueError("premarket announcement fact binding is duplicated")
+                raise ValueError("signed announcement fact binding is duplicated")
             expected[revision_id] = (code, binding["content_hash"])
     if not expected:
         return [], {}
@@ -6634,15 +6685,15 @@ def _query_premarket_bound_event_revisions(
         limit = COMMON_FACT_CUTOFF_QUERY_CODE_LIMIT
         for offset in range(0, len(ids), limit):
             requested = ids[offset:offset + limit]
-            with _live_announcement_reply_budget(connection, deadline=deadline, stage="premarket-bound-revisions"):
+            with _live_announcement_reply_budget(connection, deadline=deadline, stage="signed-announcement-bound-revisions"):
                 observed = connection.execute(
                     bound_statement, {**params, "ids": requested},
                 ).mappings().all()
             if {item["revision_id"] for item in observed} != set(requested):
-                raise ValueError("premarket announcement bound revision is missing")
+                raise ValueError("signed announcement bound revision is missing")
             for row in observed:
                 if (row["stock_code"], row["content_hash"]) != expected[row["revision_id"]]:
-                    raise ValueError("premarket announcement bound content differs")
+                    raise ValueError("signed announcement bound content differs")
                 day = (
                     _row_datetime(row["published_at"]).date()
                     if row["published_at"] is not None else _date_value(row["event_date"], required=True)
@@ -6650,7 +6701,7 @@ def _query_premarket_bound_event_revisions(
                 if selection.window_start <= day <= selection.window_end:
                     identity = row["identity_hash"]
                     if identity in selected:
-                        raise ValueError("premarket announcement identity has conflicting bindings")
+                        raise ValueError("signed announcement identity has conflicting bindings")
                     selected[identity] = row["revision_id"], int(row["revision_no"])
         history_statement = text(f"""
             SELECT /*+ MAX_EXECUTION_TIME(15000) */ * FROM {EVENT_REVISION_TABLE}
@@ -6661,12 +6712,12 @@ def _query_premarket_bound_event_revisions(
         identities = sorted(selected)
         for offset in range(0, len(identities), limit):
             requested = identities[offset:offset + limit]
-            with _live_announcement_reply_budget(connection, deadline=deadline, stage="premarket-bound-history"):
+            with _live_announcement_reply_budget(connection, deadline=deadline, stage="signed-announcement-bound-history"):
                 for row in connection.execute(history_statement, {**params, "ids": requested}).mappings():
                     if row["revision_no"] <= selected[row["identity_hash"]][1]:
                         histories.append(dict(row))
     if set(selected) != {row["identity_hash"] for row in histories}:
-        raise ValueError("premarket announcement bound revision history is missing")
+        raise ValueError("signed announcement bound revision history is missing")
     return histories, {identity: binding[0] for identity, binding in selected.items()}
 
 
@@ -6762,8 +6813,8 @@ def load_event_facts(
             )
     bound_ids = {}
     try:
-        if isinstance(selection, _PremarketEventSelection):
-            rows, bound_ids = _query_premarket_bound_event_revisions(engine, selection)
+        if isinstance(selection, _SignedLiveEventSelection):
+            rows, bound_ids = _query_signed_bound_event_revisions(engine, selection)
         else:
             rows = _query_revisions(
                 engine, table_name=EVENT_REVISION_TABLE, codes=normalized_codes,
@@ -6810,7 +6861,7 @@ def load_event_facts(
                 )
                 for code, (row, is_scope_head) in selection.members.items()
                 if is_scope_head and (
-                    (not by_code_identity.get(code) if isinstance(selection, _PremarketEventSelection)
+                    (not by_code_identity.get(code) if isinstance(selection, _SignedLiveEventSelection)
                      else int(row["result_count"]) == 0)
                 )
             }
@@ -6850,7 +6901,7 @@ def load_event_facts(
                     fact_cutoff_at=fact_cutoff,
                     decision_at=decision,
                 )
-                if isinstance(selection, _PremarketEventSelection) and (
+                if isinstance(selection, _SignedLiveEventSelection) and (
                     selected is None or selected["revision_id"] != bound_ids.get(identity)
                 ):
                     blocked_reasons.append("PIT_EVENT_BOUND_REVISION_NOT_ELIGIBLE")

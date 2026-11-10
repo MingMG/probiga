@@ -1,10 +1,14 @@
-from datetime import datetime
+from datetime import datetime, timedelta
+import hashlib
+import json
 
 import pandas as pd
+import pytest
 from sqlalchemy import create_engine, text
 
 from biz.analysis import sync_analysis_fast as analysis
-from server.common.analysis_pool_receipt import decode_score_snapshot
+from server.common.analysis_pool_receipt import build_score_snapshot, decode_score_snapshot
+from server.common import daily_delivery_control as control
 from server.common.daily_delivery_control import FrozenPremarketAnnouncement
 from tests.score_snapshot_helpers import scored_publication
 
@@ -60,3 +64,114 @@ def test_two_frozen_scores_keep_the_initial_input_boundary_after_a_late_event(mo
     assert decode_score_snapshot(revised["score_snapshot"])["input_decision_at"] == "2026-11-11T08:30:00"
     with engine.connect() as conn:
         assert conn.execute(text("SELECT stock_code FROM st_recommended_stocks")).scalar_one() == "600001"
+
+
+def test_fixed_initial_score_seals_consumed_announcement_instead_of_newer_stage(monkeypatch):
+    from server.common.qmt_announcement_pit import QMT_ANNOUNCEMENT_TASK_SCHEMA
+
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "development")
+    engine = create_engine("sqlite://")
+    control.privileged_migrate_daily_delivery_schema(engine)
+    trade_date = "2026-11-10"
+    cutoff = datetime.fromisoformat(trade_date + "T22:20:00")
+    stage = "qmt_announcement_pit"
+
+    def seal(uid, batch_hash, fact_cutoff, received, finished, *, window_start="2026-10-11"):
+        started = finished - timedelta(seconds=30)
+        monkeypatch.setattr(control, "_control_now", lambda: started)
+        control.start_daily_stage_attempt(
+            engine, scheduler_run_uid=uid, stage_name=stage, trade_date=trade_date,
+            release_id="a" * 40, strategy_release_id="b" * 64, lease_owner="windows-fixture",
+        )
+        result = {
+            "schema": QMT_ANNOUNCEMENT_TASK_SCHEMA, "status": "COMPLETE",
+            "reason_code": "QMT_ANNOUNCEMENT_FULL_MARKET_COMPLETE",
+            "source": "qmt.announcement", "batch_id": "qmt-ann-" + uid, "batch_root_hash": batch_hash,
+            "window_start": window_start, "window_end": trade_date,
+            "catalog_batch_id": "verified-catalog", "catalog_manifest_hash": "e" * 64,
+            "catalog_member_set_hash": "f" * 64,
+            "fact_cutoff_at": fact_cutoff.isoformat(),
+            "decision_at": received.isoformat(), "received_at": received.isoformat(),
+            "stock_count": 2, "coverage_count": 2,
+            "capture_seconds": int((received - fact_cutoff).total_seconds()),
+            "automatic_real_order_submission": False, "real_order_authority": False,
+        }
+        replay = json.dumps(result)
+        digest = hashlib.sha256(replay.encode()).hexdigest()
+        evidence = {
+            "schema": control.SCHEDULER_VALIDATION_EVIDENCE_SCHEMA,
+            "run_uid": uid, "task_type": stage, "build_sha": "a" * 40,
+            "status": "success", "exit_code": 0, "validation_checked": True, "validation_ok": True,
+            "replay_output": replay, "replay_output_sha256": digest,
+            "input_receipt_root_sha256": digest, "target_trade_date": trade_date,
+        }
+        with engine.begin() as conn:
+            control.finish_daily_stage_attempt(
+                conn, scheduler_run_uid=uid, status="success", input_root_sha256=digest,
+                checkpoint={**evidence, "evidence_sha256": control.canonical_sha256(evidence)},
+                now=finished,
+            )
+        return {**result, "catalog_member_count": 2}
+
+    early = seal("1" * 32, "c" * 64, cutoff - timedelta(hours=2),
+                 cutoff - timedelta(minutes=20), cutoff - timedelta(minutes=19))
+    seal("4" * 32, "9" * 64, cutoff - timedelta(minutes=10),
+         cutoff - timedelta(minutes=5), cutoff - timedelta(minutes=4),
+         window_start="2026-10-12")
+    late = seal("2" * 32, "d" * 64, cutoff - timedelta(minutes=25),
+                cutoff - timedelta(minutes=2), cutoff + timedelta(minutes=1))
+    assert control.load_signed_announcement_source(engine, batch=late, decision_at=cutoff) is None
+    source = control.load_signed_announcement_source(engine, batch=early, decision_at=cutoff)
+    selected = control.select_frozen_initial_announcement_source(engine, trade_date=trade_date, decision_at=cutoff)
+    assert selected.score_binding == source
+    assert selected.receipt["batch_id"] == early["batch_id"]
+    assert selected.receipt["stage_evidence_sha256"] == source["evidence_sha256"]
+    assert source["scheduler_run_uid"] == "1" * 32 and source["batch_root_hash"] == "c" * 64
+    assert source["finished_at"] == "2026-11-10T22:01:00.000000"
+    fixture = decode_score_snapshot(scored_publication(trade_date=trade_date)["score_snapshot"])
+    core = {
+        "kline": {"stage": "qmt_stock_daily_canonical", "dataset_id": "daily", "root": "e" * 64},
+        "turnover": {"stage": "target_turnover_snapshot", "dataset_id": "turnover", "root": "f" * 64},
+        "financial": {"stage": "stock_finance", "dataset_id": "finance", "root": "a" * 64},
+        "announcement": {"stage": stage, "dataset_id": source["scheduler_run_uid"],
+                         "root": source["evidence_sha256"], "input_root": source["batch_root_hash"]},
+    }
+    args = {
+        "trade_date": trade_date, "decision_at": cutoff, "run_uid": "3" * 32, "build_sha": "b" * 40,
+        "analysis_rows": fixture["analysis_rows"],
+        "scored_rows": [{**row, "flow_input_decision_at": cutoff.isoformat()} for row in fixture["scored_rows"]],
+    }
+    sealed = decode_score_snapshot(build_score_snapshot(
+        **args, frozen_announcement_source=source, frozen_core_inputs=core,
+    ))
+    assert sealed["frozen_announcement_source"] == source
+    assert sealed["frozen_core_inputs"] == core
+    assert "frozen_announcement_source" not in decode_score_snapshot(build_score_snapshot(**args))
+    with pytest.raises(ValueError, match="FROZEN_ANNOUNCEMENT_MISMATCH"):
+        build_score_snapshot(
+            **args, frozen_announcement_source={**source, "finished_at": (cutoff + timedelta(seconds=1)).isoformat()},
+        )
+    with pytest.raises(ValueError, match="FROZEN_CORE_INPUTS_MISMATCH"):
+        build_score_snapshot(
+            **args, frozen_announcement_source=source,
+            frozen_core_inputs={**core, "announcement": {**core["announcement"], "input_root": late["batch_root_hash"]}},
+        )
+
+
+def test_fixed_initial_does_not_reuse_preliminary_without_its_exact_source_contract(monkeypatch):
+    monkeypatch.setattr(
+        analysis, "load_latest_preliminary_analysis_receipt",
+        lambda *_args, **_kwargs: pytest.fail("legacy preliminary cannot prove fixed sources"),
+    )
+
+    def entered_full_fixed_scoring(*_args, **kwargs):
+        assert kwargs["decision_known_at"] == datetime(2026, 11, 10, 22, 20)
+        raise RuntimeError("entered full fixed scoring")
+
+    monkeypatch.setattr(analysis, "load_kline_features", entered_full_fixed_scoring)
+    with pytest.raises(RuntimeError, match="entered full fixed scoring"):
+        analysis._prepare_batch_outputs(
+            engine=object(), trade_date="2026-11-10", min_score=62, top_n=80,
+            news_cutoff_time="2026-11-10T22:20:00", publisher_build_sha="2" * 40,
+            reuse_preliminary_snapshot=True, pool_decision_phase="INITIAL",
+        )

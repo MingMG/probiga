@@ -179,6 +179,7 @@ def publish_prepared_premarket_pool(
     if (
         not isinstance(core_inputs, Mapping)
         or not isinstance(core_inputs.get("announcement"), Mapping)
+        or core_inputs != snapshot.get("frozen_core_inputs")
         or core_inputs["announcement"].get("root") != work["source_evidence_sha256"]
         or not isinstance(market_context, dict)
     ):

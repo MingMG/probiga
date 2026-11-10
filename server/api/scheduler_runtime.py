@@ -8535,7 +8535,26 @@ def _build_daily_result_delivery_receipt(
     producer_run_uid = str(producer.get("run_uid") or "").strip().lower()
     from server.common.daily_delivery_control import load_published_analysis_receipt
     from server.common.analysis_pool_receipt import publication_is_complete_empty
-    publication = load_published_analysis_receipt(connection, target, run_uid=producer_run_uid)
+    decoded_score = []
+    publication = load_published_analysis_receipt(
+        connection, target, run_uid=producer_run_uid, capture_score=decoded_score.append,
+    )
+    score_cutoff = f"{target}T{ANALYSIS_DAILY_PIPELINE_DECISION_TIME}"
+    scoring_snapshot = publication["score_snapshot"]
+    is_fixed_initial = all(scoring_snapshot.get(field) == score_cutoff for field in ("decision_at", "input_decision_at"))
+    frozen_announcement = frozen_core_inputs = None
+    if is_fixed_initial:
+        if len(decoded_score) != 1:
+            raise RuntimeError("daily delivery frozen score proof is unavailable")
+        frozen_announcement = decoded_score[0].get("frozen_announcement_source")
+        frozen_core_inputs = decoded_score[0].get("frozen_core_inputs")
+        if (
+            not isinstance(frozen_announcement, Mapping)
+            or not isinstance(frozen_core_inputs, Mapping)
+            or (frozen_core_inputs.get("announcement") or {}).get("dataset_id") != frozen_announcement["scheduler_run_uid"]
+            or (frozen_core_inputs.get("announcement") or {}).get("root") != frozen_announcement["evidence_sha256"]
+        ):
+            raise RuntimeError("daily delivery score's exact frozen sources are unavailable")
     manifest = read_persisted_pool_manifest(connection, target, score_snapshot=publication["score_snapshot"])
     membership_proofs = manifest.get("membership_proofs")
     analysis_count = int(manifest.get("analysis_count") or 0)
@@ -8637,6 +8656,22 @@ def _build_daily_result_delivery_receipt(
         expected_build_sha=build_sha,
         component_build_shas=component_build_shas,
     )
+    if frozen_announcement is not None:
+        exact_announcements = [
+            row for row in dependency_rows if row["task_type"] == "qmt_announcement_pit"
+            and row["run_uid"] == frozen_announcement["scheduler_run_uid"]
+        ]
+        if len(exact_announcements) != 1:
+            raise RuntimeError("daily delivery frozen announcement task identity differs")
+        exact_row = exact_announcements[0]
+        exact_evidence = _history_validation_evidence(exact_row.get("output")) or {}
+        if (
+            exact_evidence.get("evidence_sha256") != frozen_announcement["evidence_sha256"]
+            or exact_evidence.get("input_receipt_root_sha256") != frozen_announcement["input_receipt_root_sha256"]
+            or exact_row.get("build_sha") != frozen_announcement["producer_build_sha"]
+        ):
+            raise RuntimeError("daily delivery frozen announcement evidence differs")
+        latest_by_type["qmt_announcement_pit"] = exact_row
     selected = [
         latest_by_type[task_type]
         for task_type in required_dependencies
@@ -8794,9 +8829,7 @@ def _build_daily_result_delivery_receipt(
             "score_snapshot_id": score_snapshot_identity(core),
         }
     )
-    score_cutoff = f"{target}T{ANALYSIS_DAILY_PIPELINE_DECISION_TIME}"
-    scoring_snapshot = publication["score_snapshot"]
-    if all(scoring_snapshot.get(field) == score_cutoff for field in ("decision_at", "input_decision_at")):
+    if is_fixed_initial:
         producer_started = _coerce_datetime(producer.get("started_at"))
         if producer_started is None:
             raise RuntimeError("daily delivery frozen score start time is unavailable")
@@ -8805,6 +8838,7 @@ def _build_daily_result_delivery_receipt(
                 "trade_date", "decision_at", "input_decision_at", "payload_sha256",
             )},
             "evaluated_at": producer_started.isoformat(timespec="seconds"),
+            "core_inputs": frozen_core_inputs,
         }
     return {
         **core,
@@ -9540,6 +9574,7 @@ def _task_history_finish(
                     if status == "success" and delivery_receipt
                     else "BLOCKED"
                 )
+                frozen_score = delivery_receipt.get("frozen_score_snapshot")
                 control_receipt = build_terminal_delivery_receipt(
                     session=session,
                     scheduler_run_uid=str(run_uid or "").strip().lower(),
@@ -9550,6 +9585,7 @@ def _task_history_finish(
                     status=control_status,
                     strategy_release_id=strategy_release_id,
                     legacy_receipt=(delivery_receipt or None),
+                    exact_core_inputs=(frozen_score.get("core_inputs") if isinstance(frozen_score, dict) else None),
                     degradations=delivery_receipt.get("degradations") or [],
                     retryable=(
                         bool(blocking.get("retryable"))
@@ -9567,7 +9603,6 @@ def _task_history_finish(
                         else None
                     ),
                 )
-                frozen_score = delivery_receipt.get("frozen_score_snapshot")
                 if isinstance(frozen_score, dict):
                     slot = resolve_strategy_pool_decision_slot(
                         conn,
