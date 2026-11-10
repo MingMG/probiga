@@ -5332,7 +5332,10 @@ def _claim_task_run(row: dict, engine) -> bool:
 
 
 def _claim_task_run_with_audit(row: dict, engine, *, run_uid: str) -> tuple[bool, str | None]:
-    if str(row.get("task_type") or "").strip() == "intraday_market_alert":
+    task_type = str(row.get("task_type") or "").strip()
+    if task_type == "intraday_market_alert" or (
+        task_type == "analysis_fast" and row.get("_release_analysis_research_mode") is not True
+    ):
         history_uid = _task_history_start(engine, row, run_uid=run_uid, claim_first=True)
         return history_uid is not None, history_uid
     if not _claim_task_run(row, engine):

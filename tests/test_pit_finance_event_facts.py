@@ -2966,7 +2966,7 @@ def test_common_cutoff_reports_only_fixed_announcement_reply_stages(monkeypatch,
     engine.dispose()
 
 
-@pytest.mark.parametrize("fault", [None, "predecessor", "later-timeout", "missing-payload"])
+@pytest.mark.parametrize("fault", [None, "predecessor", "later-timeout", "missing-payload", "checkpoint-resume"])
 def test_live_common_cutoff_preserves_full_event_chains_with_bounded_mysql_transport(
     monkeypatch, tmp_path, fault,
 ):
@@ -3073,8 +3073,10 @@ def test_live_common_cutoff_preserves_full_event_chains_with_bounded_mysql_trans
         )).tuples().all())
     mysql_reader = _mysql_seal_transport(engine)
     inventories, size_reads, payloads = [], [], []
+    checkpoint_interrupted = False
 
     def record(connection, _cursor, sql, parameters, context, _many):
+        nonlocal checkpoint_interrupted
         if "FORCE INDEX (uk_pit_coverage_scope_revision)" in sql:
             bindings = context.compiled_parameters[0]
             scopes = [value for key, value in bindings.items() if key.startswith("scope_hashes_")]
@@ -3090,6 +3092,9 @@ def test_live_common_cutoff_preserves_full_event_chains_with_bounded_mysql_trans
             ids = [value for key, value in bindings.items() if key.startswith("coverage_ids_")]
             payloads.append((connection.get_transaction(), ids, sql, context.execution_options))
             if fault == "later-timeout" and len(inventories) == 2:
+                raise OperationalError(sql, parameters, Exception(3024, "execution deadline"))
+            if fault == "checkpoint-resume" and len(inventories) == 2 and not checkpoint_interrupted:
+                checkpoint_interrupted = True
                 raise OperationalError(sql, parameters, Exception(3024, "execution deadline"))
             if fault == "missing-payload" and len(inventories) == 2:
                 sql += f" AND coverage_id<>'{ids[0]}'"
@@ -3121,6 +3126,75 @@ def test_live_common_cutoff_preserves_full_event_chains_with_bounded_mysql_trans
     event.listen(engine, "before_cursor_execute", record, retval=True)
     selections = []
     try:
+        if fault == "checkpoint-resume":
+            monkeypatch.setattr(
+                "server.engine.strategy_governance.validate_privileged_trigger_migration_seal",
+                lambda _connection: {
+                    "trigger_inventory_server_uuid": "isolated-database",
+                    "trigger_inventory_seal_database": "isolated-schema",
+                    "pit_fact_schema_contract_hash": "contract",
+                    "trigger_inventory_table_comment": "attested-schema",
+                },
+            )
+            checkpoint_args = {"event_checkpoint_path": tmp_path / "analysis-state" / "event.sqlite"}
+            progress = []
+            interrupted = resolve_common_fact_cutoff(
+                mysql_reader, **kwargs, **checkpoint_args,
+                event_progress=lambda done, total: progress.append((done, total)),
+            )
+            assert interrupted["status"] == PIT_DATA_BLOCKED
+            assert interrupted["receipt_root_hash"] == "" and interrupted["receipts"] == []
+            assert progress == [(0, 45), (40, 45)]
+            first_chunk_ids = {key for _, keys, *_ in payloads[:-1] for key in keys}
+            assert first_chunk_ids
+            inventories.clear()
+            size_reads.clear()
+            payloads.clear()
+
+            resumed = resolve_common_fact_cutoff(
+                mysql_reader, **kwargs, **checkpoint_args, capture_historical_selection=selections.append,
+            )
+            assert resumed == expected
+            assert len(inventories) == 2
+            assert payloads and not any(first_chunk_ids.intersection(keys) for _, keys, *_ in payloads)
+
+            damaged_checkpoint = tmp_path / "analysis-state" / "damaged.sqlite"
+            damaged_checkpoint.write_text("invalid local state", encoding="utf-8")
+            damaged_checkpoint.chmod(0o600)
+            assert resolve_common_fact_cutoff(
+                mysql_reader, **kwargs, event_checkpoint_path=damaged_checkpoint,
+            ) == expected
+
+            late = append_source_coverage(
+                engine, fact_kind="event", stock_code=codes[0], window_start=start,
+                window_end=cutoff.date(), known_at="2026-08-30 18:32:00",
+                covered_through_at="2026-08-30 18:32:00", watermark_kind="CAPTURED_AT",
+                watermark_evidence={"source_call": "success"}, source_rows=[], fact_bindings=[],
+                source=CNINFO_ANNOUNCEMENT_SOURCE, batch_id="event-coverage-late",
+            )
+            inventories.clear()
+            size_reads.clear()
+            payloads.clear()
+            assert resolve_common_fact_cutoff(mysql_reader, **kwargs, **checkpoint_args) == expected
+            assert not payloads and not size_reads
+
+            later = {**kwargs, "decision_at": "2026-08-30 18:33:00"}
+            assert resolve_common_fact_cutoff(mysql_reader, **later, **checkpoint_args) == (
+                resolve_common_fact_cutoff(engine, **later)
+            )
+            assert [key for _, keys, *_ in payloads for key in keys] == [late.coverage_id]
+
+            with engine.begin() as connection:
+                connection.execute(text("DROP TRIGGER trg_pit_source_coverage_immutable_bu"))
+                connection.execute(text(
+                    f"UPDATE {SOURCE_COVERAGE_TABLE} SET watermark_hash='broken' "
+                    "WHERE batch_id='event-coverage-prior' AND stock_code=:code"
+                ), {"code": codes[-1]})
+            corrupted = resolve_common_fact_cutoff(mysql_reader, **later, **checkpoint_args)
+            assert corrupted["status"] == PIT_DATA_BLOCKED
+            assert corrupted["reason"] == f"PIT_COMMON_CUTOFF_INCOMPLETE:event:{codes[-1]}:BAD_CHAIN"
+            engine.dispose()
+            return
         actual = resolve_common_fact_cutoff(mysql_reader, **kwargs, capture_historical_selection=selections.append)
         assert_bounded_reads()
         if fault is None:

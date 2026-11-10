@@ -19,7 +19,9 @@ from decimal import Decimal
 import hashlib
 from itertools import groupby
 import json
+import logging
 import math
+from pathlib import Path
 import re
 from time import monotonic
 from types import MappingProxyType
@@ -39,9 +41,12 @@ from server.common.finance_nonfiling_evidence import (
     EVIDENCE_SCHEMA as FINANCE_NONFILING_BODY_SCHEMA,
     validate_document_body_evidence,
 )
+from server.common.pit_event_coverage_checkpoint import EventCoverageCheckpoint
 
 if TYPE_CHECKING:
     from server.common.qmt_announcement_pit import HistoricalAnnouncementSelection
+
+logger = logging.getLogger(__name__)
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -4581,24 +4586,24 @@ def _coverage_payload_row(
     return current
 
 
-def _read_indexed_event_coverage_rows(
+def _read_indexed_event_coverage_inventory(
     connection: Connection, *, codes: list[str], source: str, decision_at: datetime,
-    deadline: float, stage: str,
-) -> Iterable[dict[str, Any]]:
-    """Read each complete source scope through its index and bounded PK replies."""
+    deadline: float, stage: str, include_metadata: bool = False,
+) -> dict[str, dict[str, Any]]:
     from server.common.qmt_announcement_pit import (
-        VALIDATION_READ_BATCH_SIZE,
-        _bounded_announcement_payload_keys,
         _live_announcement_read_hint,
         _live_announcement_reply_budget,
-        _read_live_announcement_payload_sizes,
     )
 
     code_by_scope = {_source_coverage_scope_hash("event", code, source): code for code in codes}
     inventory_stage = f"{stage}:inventory"
     hint = _live_announcement_read_hint(mysql=True, deadline=deadline, stage=inventory_stage)
+    columns = (
+        ",".join(sorted(_REQUIRED_COLUMNS[SOURCE_COVERAGE_TABLE] - {"payload_json"}))
+        if include_metadata else "coverage_id, stock_code, scope_hash, revision_no"
+    )
     inventory = text(
-        f"SELECT {hint}coverage_id, stock_code, scope_hash, revision_no "
+        f"SELECT {hint}{columns} "
         f"FROM {SOURCE_COVERAGE_TABLE} FORCE INDEX (uk_pit_coverage_scope_revision) "
         "WHERE scope_hash IN :scope_hashes AND fact_kind='event' AND source=:source "
         "AND known_at<=:decision_at AND received_at<=:decision_at "
@@ -4609,12 +4614,29 @@ def _read_indexed_event_coverage_rows(
         with connection.execute(inventory, {
             "scope_hashes": sorted(code_by_scope), "source": source, "decision_at": decision_at,
         }) as rows:
-            for coverage_id, code, scope, revision in rows.tuples():
+            for row in rows.mappings():
+                coverage_id, code, scope, revision = (
+                    row["coverage_id"], row["stock_code"], row["scope_hash"], row["revision_no"],
+                )
                 if (not _HASH_RE.fullmatch(str(coverage_id)) or coverage_id in expected
                         or code_by_scope.get(scope) != code
                         or type(revision) is not int or revision <= 0):
                     raise ValueError("event coverage inventory identity differs")
-                expected[coverage_id] = (code, scope, revision)
+                expected[coverage_id] = dict(row)
+    return expected
+
+
+def _read_indexed_event_coverage_payloads(
+    connection: Connection, *, expected: Mapping[str, Mapping[str, Any]],
+    source: str, deadline: float, stage: str,
+) -> Iterable[dict[str, Any]]:
+    from server.common.qmt_announcement_pit import (
+        VALIDATION_READ_BATCH_SIZE,
+        _bounded_announcement_payload_keys,
+        _live_announcement_read_hint,
+        _live_announcement_reply_budget,
+        _read_live_announcement_payload_sizes,
+    )
 
     ordered_ids = list(expected)
     payload_offset = 0
@@ -4641,12 +4663,79 @@ def _read_indexed_event_coverage_rows(
                 raise ValueError("event coverage payload membership differs from inventory")
             for coverage_id, payload_bytes in batch:
                 row = actual[coverage_id]
-                if ((row["stock_code"], row["scope_hash"], row["revision_no"]) != expected[coverage_id]
+                if (any(row.get(key) != value for key, value in expected[coverage_id].items())
                         or row["payload_json_bytes"] != payload_bytes
                         or row["fact_kind"] != "event" or row["source"] != source):
                     raise ValueError("event coverage payload identity differs from inventory")
                 yield dict(row)
             payload_offset += len(batch_ids)
+
+
+def _read_indexed_event_coverage_rows(
+    connection: Connection, *, codes: list[str], source: str, decision_at: datetime,
+    deadline: float, stage: str,
+) -> Iterable[dict[str, Any]]:
+    """Read each complete source scope through its index and bounded PK replies."""
+    expected = _read_indexed_event_coverage_inventory(
+        connection, codes=codes, source=source, decision_at=decision_at, deadline=deadline, stage=stage,
+    )
+    yield from _read_indexed_event_coverage_payloads(
+        connection, expected=expected, source=source, deadline=deadline, stage=stage,
+    )
+
+
+def _read_verified_event_coverage_chunk(
+    connection: Connection, *, codes: list[str], source: str, decision_at: datetime,
+    deadline: float, stage: str, checkpoint: EventCoverageCheckpoint,
+) -> tuple[dict[str, list[dict[str, Any]]], set[str]]:
+    """Validate only the suffix after a matching, previously verified prefix."""
+    inventory = _read_indexed_event_coverage_inventory(
+        connection, codes=codes, source=source, decision_at=decision_at, deadline=deadline,
+        stage=stage, include_metadata=True,
+    )
+    scopes: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in inventory.values():
+        scopes[row["scope_hash"]].append(row)
+    prior = checkpoint.load(list(scopes))
+    prefixes, pending = {}, {}
+    for scope, rows in scopes.items():
+        count, digest = prior.get(scope, (0, ""))
+        if type(count) is not int or not 0 < count <= len(rows) or canonical_hash(rows[:count]) != digest:
+            count = 0
+        prefixes[scope] = count
+        pending.update((row["coverage_id"], row) for row in rows[count:])
+
+    packed = {
+        row["coverage_id"]: row
+        for row in _read_indexed_event_coverage_payloads(
+            connection, expected=pending, source=source, deadline=deadline, stage=stage,
+        )
+    }
+    valid, invalid, verified = {}, set(), []
+    for scope, rows in scopes.items():
+        count = prefixes[scope]
+        head = rows[count - 1] if count else None
+        suffix = rows[count:]
+        try:
+            _validate_coverage_chain(
+                (
+                    _coverage_payload_row(
+                        packed.pop(row["coverage_id"]), mysql=True, stage="common_cutoff_event_coverage",
+                    )
+                    for row in suffix
+                ),
+                first_revision=count + 1,
+                previous_id=head["coverage_id"] if head else None,
+                previous_known=_row_datetime(head["known_at"]) if head else None,
+            )
+        except ValueError:
+            invalid.add(rows[0]["stock_code"])
+            continue
+        valid[scope] = rows
+        if suffix:
+            verified.append((scope, len(rows), canonical_hash(rows)))
+    checkpoint.save(verified)
+    return valid, invalid
 
 
 def _load_latest_finance_atomic_seal_evidence(
@@ -5142,7 +5231,7 @@ def _announcement_batch_read_reason(error: Exception) -> str:
         LIVE_ANNOUNCEMENT_BATCH_REPLY_FAILED,
         LIVE_ANNOUNCEMENT_BATCH_VALIDATION_DEADLINE,
     } and re.fullmatch(
-        r"snapshot-isolation|candidate-discovery|first-member-(?:inventory|payload)|"
+        r"snapshot-isolation|candidate-discovery(?::[0-9]{1,8})?|first-member-(?:inventory|payload)|"
         r"stock-catalog|batch-verified|batch-inventory(?::[0-9]{1,8})?|"
         r"batch-payload(?:-size)?:[0-9]{1,8}|"
         r"incremental-parent|candidate-read",
@@ -5164,6 +5253,8 @@ def resolve_common_fact_cutoff(
     require_qmt_event_batch: bool = False,
     include_event_facts: bool = True,
     capture_historical_selection: Callable[[HistoricalEventRead], None] | None = None,
+    event_checkpoint_path: Path | None = None,
+    event_progress: Callable[[int, int], None] | None = None,
 ) -> dict[str, Any]:
     """Resolve one immutable COMPLETE-coverage cutoff (T) for a live batch (E)."""
 
@@ -5279,6 +5370,7 @@ def resolve_common_fact_cutoff(
     )
     statement = text("SELECT * " + coverage_scope_sql).bindparams(bindparam("codes", expanding=True))
     read_errors: list[str] = []
+    bad: set[tuple[str, str]] = set()
 
     def coverage_chains():
         # A code stays in one chunk, so every revision of every scope is still
@@ -5311,18 +5403,54 @@ def resolve_common_fact_cutoff(
                     }:
                         raise ValueError("common cutoff requires a repeatable-read snapshot")
                 with connection.begin():
+                    checkpoint = None
+                    if compressed and event_checkpoint_path is not None:
+                        from server.engine.strategy_governance import validate_privileged_trigger_migration_seal
+
+                        # A checkpoint stands in only for payloads protected by
+                        # the attested append-only schema on this database.
+                        with _live_announcement_reply_budget(
+                            connection, deadline=deadline, stage="common-cutoff-checkpoint-identity",
+                        ):
+                            try:
+                                seal = validate_privileged_trigger_migration_seal(connection)
+                            except RuntimeError:
+                                logger.warning("Event coverage checkpoint identity is unavailable; verifying the full input")
+                            else:
+                                identity = {
+                                    "version": EventCoverageCheckpoint.VERSION,
+                                    "server": seal["trigger_inventory_server_uuid"],
+                                    "database": seal["trigger_inventory_seal_database"],
+                                    "contract": seal["pit_fact_schema_contract_hash"],
+                                    "seal": seal["trigger_inventory_table_comment"],
+                                }
+                                checkpoint = EventCoverageCheckpoint(event_checkpoint_path, canonical_hash(identity))
+                    if event_progress is not None:
+                        event_progress(0, len(normalized_codes))
                     for offset in range(0, len(normalized_codes), batch_size):
                         parameters = {
                             **query_params,
                             "codes": normalized_codes[offset:offset + batch_size],
                         }
+                        stage = f"common-cutoff-coverage:{offset}"
+                        if checkpoint is not None:
+                            verified, invalid = _read_verified_event_coverage_chunk(
+                                connection, codes=parameters["codes"], source=parameters["event_source"],
+                                decision_at=decision, deadline=deadline, stage=stage, checkpoint=checkpoint,
+                            )
+                            bad.update(("event", code) for code in invalid)
+                            for scope, chain in verified.items():
+                                yield ("event", chain[0]["stock_code"], scope), chain, False, True
+                            if event_progress is not None:
+                                event_progress(offset + len(parameters["codes"]), len(normalized_codes))
+                            continue
                         chains: dict[
                             tuple[str, str, str], list[dict[str, Any]]
                         ] = defaultdict(list)
                         rows = (
                             nullcontext(_read_indexed_event_coverage_rows(
                                 connection, codes=parameters["codes"], source=parameters["event_source"],
-                                decision_at=decision, deadline=deadline, stage=f"common-cutoff-coverage:{offset}",
+                                decision_at=decision, deadline=deadline, stage=stage,
                             ))
                             if compressed else connection.execute(statement, parameters)
                         )
@@ -5335,7 +5463,9 @@ def resolve_common_fact_cutoff(
                                     str(row.get("scope_hash") or ""),
                                 )].append(row)
                         for key, chain in chains.items():
-                            yield key, chain, compressed
+                            yield key, chain, compressed, False
+                        if event_progress is not None:
+                            event_progress(offset + len(parameters["codes"]), len(normalized_codes))
                     if compressed:
                         _live_announcement_read_hint(
                             mysql=False, deadline=deadline, stage="common-cutoff-coverage-complete",
@@ -5351,20 +5481,20 @@ def resolve_common_fact_cutoff(
         # catalog and batch-root checks at this decision time.
         for code, (row, _) in historical_selection.members.items():
             candidates[("event", code)].append(dict(row))
-    bad: set[tuple[str, str]] = set()
     live_scope_heads: set[str] = set()
     required_finance_report = finance_disclosure_gate(
         windows["finance"][1]
     ).minimum_report_date
     chains = () if historical_selection is not None and finance_batch else coverage_chains()
-    for (kind, code, _scope), chain, compressed in chains:
+    for (kind, code, _scope), chain, compressed, verified in chains:
         try:
             if compressed:
                 chain = [
                     _coverage_payload_row(row, mysql=True, stage="common_cutoff_event_coverage")
                     for row in chain
                 ]
-            _validate_coverage_chain(chain)
+            if not verified:
+                _validate_coverage_chain(chain)
         except ValueError:
             bad.add((kind, code))
             continue

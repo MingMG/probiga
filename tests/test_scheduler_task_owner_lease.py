@@ -136,16 +136,22 @@ def test_exact_market_ladder_claim_inserts_renews_and_recovers_its_audit(case, m
     assert not owner.renew()
 
 
-@pytest.fixture
-def alert_claim(case, monkeypatch):
+@pytest.fixture(params=[
+    (140, "intraday alert", "intraday_market_alert", "manual"),
+    (37, "formal analysis", "analysis_fast", "release_catchup"),
+], ids=["intraday-alert", "formal-analysis"])
+def atomic_claim(case, monkeypatch, request):
     engine, clock, _, _ = case
+    task_id, task_name, task_type, explicit_trigger = request.param
     prior_time = "2026-11-01 14:35:00"
     with engine.begin() as conn:
         conn.execute(text("DELETE FROM st_scheduled_task_history"))
-        conn.execute(text("""UPDATE st_scheduled_tasks SET id=140, task_name='intraday alert',
-            task_type='intraday_market_alert', last_run_status='success', last_run_at=:prior,
+        conn.execute(text("""UPDATE st_scheduled_tasks SET id=:task_id, task_name=:task_name,
+            task_type=:task_type, last_run_status='success', last_run_at=:prior,
             last_triggered_at=:prior, last_run_output='previous receipt', last_run_duration=7,
-            updated_at=:prior"""), {"prior": prior_time})
+            updated_at=:prior"""), {
+                "task_id": task_id, "task_name": task_name, "task_type": task_type, "prior": prior_time,
+            })
     monkeypatch.setattr(runtime, "_ensure_task_history_table", lambda engine: None)
     monkeypatch.setattr(runtime, "gethostname", lambda: "linux-host")
     monkeypatch.setattr(runtime, "_scheduler_instance_id", "linux-host-58860")
@@ -157,33 +163,42 @@ def alert_claim(case, monkeypatch):
     monkeypatch.setattr(runtime, "_terminal_session_identities", {})
     monkeypatch.setattr(runtime, "_running_task_ids", set())
     with engine.connect() as conn:
-        task = dict(conn.execute(text("SELECT * FROM st_scheduled_tasks WHERE id=140")).mappings().one())
-    return engine, clock, task
+        task = dict(conn.execute(
+            text("SELECT * FROM st_scheduled_tasks WHERE id=:task_id"), {"task_id": task_id},
+        ).mappings().one())
+    return engine, clock, task, explicit_trigger
 
 
-def test_alert_audit_insert_failure_rolls_back_claim_and_keeps_previous_result(alert_claim):
-    engine, _, task = alert_claim
+def test_audit_insert_failure_rolls_back_claim_and_keeps_previous_result(atomic_claim):
+    engine, _, task, explicit_trigger = atomic_claim
+    request = {**task, "_trigger_source": explicit_trigger}
     with engine.begin() as conn:
-        conn.execute(text("""CREATE TRIGGER reject_initial_alert_audit
-            BEFORE INSERT ON st_scheduled_task_history WHEN NEW.task_id=140
+        conn.execute(text("""CREATE TRIGGER reject_initial_audit
+            BEFORE INSERT ON st_scheduled_task_history
             BEGIN SELECT RAISE(ABORT,'initial audit unavailable'); END"""))
 
-    with pytest.raises(IntegrityError, match="initial audit unavailable"):
-        runtime._claim_task_run_with_audit(task, engine, run_uid="e" * 32)
+    failure = None
+    try:
+        runtime._claim_task_run_with_audit(request, engine, run_uid="e" * 32)
+    except IntegrityError as exc:
+        failure = exc
 
     with engine.connect() as conn:
-        projection = dict(conn.execute(text("SELECT * FROM st_scheduled_tasks WHERE id=140")).mappings().one())
+        projection = dict(conn.execute(
+            text("SELECT * FROM st_scheduled_tasks WHERE id=:task_id"), {"task_id": task["id"]},
+        ).mappings().one())
         assert projection == task
         assert conn.execute(text("SELECT COUNT(*) FROM st_scheduled_task_history")).scalar_one() == 0
     assert not runtime._task_owner_leases
+    assert failure is not None and "initial audit unavailable" in str(failure)
 
     with engine.begin() as conn:
-        conn.execute(text("DROP TRIGGER reject_initial_alert_audit"))
-    assert runtime._claim_task_run_with_audit(task, engine, run_uid="f" * 32) == (True, "f" * 32)
+        conn.execute(text("DROP TRIGGER reject_initial_audit"))
+    assert runtime._claim_task_run_with_audit(request, engine, run_uid="f" * 32) == (True, "f" * 32)
 
 
-def test_manual_and_scheduled_alert_claims_create_one_running_audit(alert_claim):
-    engine, clock, task = alert_claim
+def test_explicit_and_scheduled_claims_create_one_running_audit(atomic_claim):
+    engine, clock, task, explicit_trigger = atomic_claim
     barrier = threading.Barrier(2)
 
     def claim(trigger, run_uid):
@@ -191,18 +206,23 @@ def test_manual_and_scheduled_alert_claims_create_one_running_audit(alert_claim)
         return runtime._claim_task_run_with_audit({**task, "_trigger_source": trigger}, engine, run_uid=run_uid)
 
     with ThreadPoolExecutor(max_workers=2) as workers:
-        manual = workers.submit(claim, "manual", "e" * 32)
+        explicit = workers.submit(claim, explicit_trigger, "e" * 32)
         scheduled = workers.submit(claim, "scheduled", "f" * 32)
-        results = [manual.result(timeout=5), scheduled.result(timeout=5)]
+        results = [explicit.result(timeout=5), scheduled.result(timeout=5)]
 
     assert results.count((False, None)) == 1
     (winner,) = [run_uid for claimed, run_uid in results if claimed]
+    params = {"task_id": task["id"]}
     with engine.connect() as conn:
-        projection = conn.execute(text("SELECT last_run_status,last_run_at FROM st_scheduled_tasks WHERE id=140")).one()
-        audit = dict(conn.execute(text("SELECT * FROM st_scheduled_task_history WHERE task_id=140")).mappings().one())
+        projection = conn.execute(
+            text("SELECT last_run_status,last_run_at FROM st_scheduled_tasks WHERE id=:task_id"), params,
+        ).one()
+        audit = dict(conn.execute(
+            text("SELECT * FROM st_scheduled_task_history WHERE task_id=:task_id"), params,
+        ).mappings().one())
     assert (projection.last_run_status, projection.last_run_at) == ("running", audit["run_at"])
     assert audit["run_uid"] == winner
-    assert audit["trigger_source"] == ("manual" if winner == "e" * 32 else "scheduled")
+    assert audit["trigger_source"] == (explicit_trigger if winner == "e" * 32 else "scheduled")
     assert lease.read(audit)["identity"]["run_uid"] == winner
     clock[0] += timedelta(seconds=30)
     owner = runtime._task_owner_leases[winner]

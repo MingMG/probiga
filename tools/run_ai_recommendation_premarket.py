@@ -79,6 +79,7 @@ def _write_analysis_progress(run_uid: str, event: dict) -> None:
             "schema": "probiga.analysis-execution-progress.v1",
             "run_uid": run_uid,
             **event,
+            "updated_at": datetime.now(PRODUCTION_TIMEZONE).isoformat(timespec="seconds"),
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -631,6 +632,10 @@ def main() -> int:
                 _write_analysis_progress(run_uid, event)
                 stage = str(event.get("stage") or "")
                 if stage == "done":
+                    return
+                if stage == "validate_announcement_history" and event.get("done") != 0:
+                    # The local progress record already carries the full shard
+                    # count. Avoid a second MySQL round trip for every shard.
                     return
                 percent = int(event.get("percent") or 0)
                 _recommended_run_history_update(run_uid, status="running", payload={

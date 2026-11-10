@@ -2,7 +2,7 @@
 
 The cache is a source of bars, never an authority for missing securities.  A
 publication accounts for the independent catalog with real bars, native
-post-close suspension observations, or dated exchange listing evidence.  The
+post-close suspension observations, or dated official suspension/listing evidence.  The
 proof uses the existing append-only coverage ledger; no synthetic bar is made.
 """
 from __future__ import annotations
@@ -17,7 +17,11 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import text
 
 from server.common.qmt_attestation_contract import canonical_digest
-from server.common.official_historical_daily_evidence import historical_daily_evidence
+from server.common.official_historical_daily_evidence import (
+    DAILY_SUSPENSION_KIND,
+    historical_daily_evidence,
+    official_daily_suspension_evidence,
+)
 from server.common.historical_daily_bar_evidence import SINA_PROVIDER, SINA_QUALITY, verify_public_bar
 from server.common.qmt_post_close_block_evidence import KIND as POST_CLOSE_KIND, verify_post_close_revision
 from server.common.qmt_stock_catalog import load_stock_catalog
@@ -50,8 +54,7 @@ def _zero(value: Any) -> bool:
         return False
 
 
-def suspension_evidence(snapshot: Mapping[str, Any], code: str, day: str, cutoff: datetime) -> dict:
-    """Prove the installed QMT full-tick suspension semantics at the close."""
+def _native_post_close_tick(snapshot: Mapping[str, Any], code: str, day: str, cutoff: datetime) -> tuple[dict, datetime]:
     if (snapshot.get("source") != "gj_big_qmt_inner"
             or snapshot.get("quote_acquisition_protocol") != "probiga.qmt-full-tick-poll.v1"
             or snapshot.get("quote_acquisition_mode") != "full_tick_poll"):
@@ -68,14 +71,35 @@ def suspension_evidence(snapshot: Mapping[str, Any], code: str, day: str, cutoff
     if (not closed <= observed <= generated <= cutoff
             or observed.date().isoformat() != day
             or event.date().isoformat() != day
-            or raw.get("_probiga_acquisition_method") != "ContextInfo.get_full_tick"
-            or type(raw.get("stockStatus")) is not int or raw["stockStatus"] != 7
+            or raw.get("_probiga_acquisition_method") != "ContextInfo.get_full_tick"):
+        raise ValueError("target-day native post-close suspension is unproven: " + code)
+    return raw, generated
+
+
+def suspension_evidence(snapshot: Mapping[str, Any], code: str, day: str, cutoff: datetime) -> dict:
+    """Prove the installed QMT full-tick suspension semantics at the close."""
+    raw, generated = _native_post_close_tick(snapshot, code, day, cutoff)
+    if (type(raw.get("stockStatus")) is not int or raw["stockStatus"] != 7
             or not all(_zero(raw.get(field)) for field in ("open", "high", "low", "volume", "amount"))):
         raise ValueError("target-day native post-close suspension is unproven: " + code)
-    return {"kind": "NATIVE_QMT_SUSPENSION", "stock_code": code,
-            "target_date": day, "snapshot_generated_at": generated.isoformat(" "),
-            "snapshot_batch_id": str(snapshot.get("batch_id") or ""),
-            "native_tick": raw}
+    return {"kind": "NATIVE_QMT_SUSPENSION", "stock_code": code, "target_date": day,
+            **_snapshot_evidence(snapshot, raw, generated)}
+
+
+def _snapshot_evidence(snapshot: Mapping[str, Any], raw: dict, generated: datetime) -> dict:
+    return {"snapshot_generated_at": generated.isoformat(" "),
+            "snapshot_batch_id": str(snapshot.get("batch_id") or ""), "native_tick": raw}
+
+
+def _official_suspension_with_native_tick(
+    snapshot: Mapping[str, Any], documents: list[dict], code: str, day: str, cutoff: datetime,
+) -> dict:
+    raw, generated = _native_post_close_tick(snapshot, code, day, cutoff)
+    if (not str(snapshot.get("batch_id") or "").strip()
+            or not all(_zero(raw.get(field)) for field in ("open", "high", "low", "volume", "amount"))):
+        raise ValueError("official daily suspension requires target-day native zero turnover: " + code)
+    official = official_daily_suspension_evidence(documents, stock_code=code, day=day, cutoff=cutoff)
+    return {**official, **_snapshot_evidence(snapshot, raw, generated)}
 
 
 def listing_evidence(value: Mapping[str, Any], code: str, day: str) -> dict:
@@ -135,6 +159,7 @@ def validate_native_revision(old, new, correction, *, prior_hash, cutoff):
 def build_manifest(*, catalog, calendar, day: str, rows: Sequence[Mapping[str, Any]],
                    run_id: str, captured_at: datetime, snapshot: Mapping[str, Any] | None = None,
                    listings: Mapping[str, Any] | None = None,
+                   daily_suspension_documents: Mapping[str, list[dict]] | None = None,
                    historical_documents: Mapping[str, list[dict]] | None = None,
                    historical_public_bars: Mapping[str, dict] | None = None,
                    previous_session: str = "") -> dict:
@@ -153,6 +178,10 @@ def build_manifest(*, catalog, calendar, day: str, rows: Sequence[Mapping[str, A
     if historical_documents is not None:
         if captured.date().isoformat() <= day or set(historical_documents) != set(expected) - by_code.keys():
             raise ValueError("historical daily lifecycle inventory differs")
+    suspensions = dict(daily_suspension_documents or {})
+    if suspensions and (historical_documents is not None
+                        or not set(suspensions) <= set(expected) - by_code.keys() - set(listings or {})):
+        raise ValueError("official daily suspension inventory differs")
     public = dict(historical_public_bars or {})
     if public:
         if (historical_documents is None or not set(public) <= by_code.keys()
@@ -173,6 +202,11 @@ def build_manifest(*, catalog, calendar, day: str, rows: Sequence[Mapping[str, A
                 raise ValueError(f"historical daily lifecycle {day} {code}: {exc}") from exc
         elif code in (listings or {}):
             kind, evidence = "NOT_LISTED", listing_evidence(listings[code], code, day)
+        elif code in suspensions:
+            kind = "NO_TRADE"
+            evidence = _official_suspension_with_native_tick(
+                snapshot or {}, suspensions[code], code, day, captured,
+            )
         else:
             kind, evidence = "NO_TRADE", suspension_evidence(snapshot or {}, code, day, captured)
         core = {"stock_code": code, "classification": kind, "evidence": evidence}
@@ -206,10 +240,15 @@ def validate_manifest(manifest: Mapping[str, Any], *, catalog, calendar) -> dict
     for entity in no_trade:
         proof = entity["evidence"]
         code = entity["stock_code"]
+        day = str(original["trade_date"])
+        cutoff = _stamp(original["captured_at"])
         symbol = code + (".SH" if code.startswith("6") else ".BJ" if code.startswith(("4", "8", "9")) else ".SZ")
         envelope = {**snapshot, "generated_at": proof["snapshot_generated_at"],
                     "batch_id": proof["snapshot_batch_id"], "quotes": {symbol: proof["native_tick"]}}
-        if suspension_evidence(envelope, code, str(original["trade_date"]), _stamp(original["captured_at"])) != proof:
+        if proof.get("kind") == DAILY_SUSPENSION_KIND:
+            if _official_suspension_with_native_tick(envelope, proof["documents"], code, day, cutoff) != proof:
+                raise ValueError("official daily suspension evidence differs")
+        elif suspension_evidence(envelope, code, day, cutoff) != proof:
             raise ValueError("native suspension evidence differs")
     # Rebuild canonical entities, with each no-bar proof checked above.
     expected = sorted(catalog.eligible_codes(str(original["trade_date"])))

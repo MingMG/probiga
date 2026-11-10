@@ -20,6 +20,8 @@ from server.common.official_listing_evidence import (
 )
 
 SCHEMA = "probiga.official-historical-daily-evidence.v1"
+DAILY_SUSPENSION_SCHEMA = "probiga.official-daily-suspension.v1"
+DAILY_SUSPENSION_KIND = "OFFICIAL_DAILY_SUSPENSION"
 CHINA = ZoneInfo("Asia/Shanghai")
 _CODE = re.compile(r"(?:证券|股票)代码[:：]([0-9]{6})(?![0-9])")
 _URL = re.compile(r"/finalpage/(\d{4}-\d{2}-\d{2})/\d+\.PDF", re.I)
@@ -28,6 +30,11 @@ _DAY = r"(\d{4})年(\d{1,2})月(\d{1,2})日"
 _WEEKDAY = r"(?:[（(](?:星期|周)[一二三四五六日天][）)])?"
 _SUSPEND = re.compile(r"(?:自|于)" + _DAY + _WEEKDAY + r"(?:开市)?起(?:开始)?停牌")
 _RESUME = re.compile(r"(?:将于|自|于)" + _DAY + _WEEKDAY + r"(?:开市)?起复牌")
+_FULL_DAY_SUSPEND = re.compile(
+    r"(?:本公司|公司)股票(?:将)?(?:于|自)" + _DAY + _WEEKDAY
+    + r"(?:全天停牌|停牌全天|停牌(?:一天|1天)(?![半0-9]))"
+)
+_SAME_DAY_RESUME = re.compile(r"(?:将于|自|于)" + _DAY + _WEEKDAY + r"(?:开市)?(?:起)?(?:复牌|恢复交易)")
 _DELIST = re.compile(r"摘牌日期[:：]" + _DAY)
 _SERIES = re.compile(r"于(\d{4}年\d{1,2}月\d{1,2}日(?:、(?:\d{4}年)?\d{1,2}月\d{1,2}日){1,15})连续停牌")
 _RECEIVED = re.compile(r"于" + _DAY + r"收到(?:了)?上海证券交易所[^。]{1,180}终止上市[^。]{0,20}事先告知书")
@@ -102,11 +109,9 @@ def _classification(texts: list[tuple[date, str]], target: date) -> str:
     raise ValueError("official no-bar lifecycle is unproven for target session")
 
 
-def historical_daily_evidence(documents: list[dict], *, stock_code: str, day: str,
-                              cutoff: datetime) -> tuple[str, dict]:
+def _validated_documents(documents: list[dict], *, stock_code: str, cutoff: datetime):
     if not 1 <= len(documents) <= 4:
         raise ValueError("historical daily evidence document count differs")
-    target = date.fromisoformat(day)
     cutoff = cutoff.replace(tzinfo=CHINA) if cutoff.tzinfo is None else cutoff.astimezone(CHINA)
     ordered = sorted(documents, key=lambda item: item["source_url"])
     if len({item["source_url"] for item in ordered}) != len(ordered):
@@ -124,9 +129,51 @@ def historical_daily_evidence(documents: list[dict], *, stock_code: str, day: st
                 or not _HASH.fullmatch(item["official_document_sha256"])):
             raise ValueError("historical daily evidence document identity or time differs")
         texts.append((published, compact))
-    classification = _classification(texts, target)
+    return ordered, texts
+
+
+def historical_daily_evidence(documents: list[dict], *, stock_code: str, day: str,
+                              cutoff: datetime) -> tuple[str, dict]:
+    ordered, texts = _validated_documents(documents, stock_code=stock_code, cutoff=cutoff)
+    classification = _classification(texts, date.fromisoformat(day))
     return classification, {"kind": "OFFICIAL_HISTORICAL_LIFECYCLE", "schema": SCHEMA,
                             "stock_code": stock_code, "target_date": day, "documents": ordered}
+
+
+def official_daily_suspension_evidence(documents: list[dict], *, stock_code: str, day: str,
+                                       cutoff: datetime) -> dict:
+    """Bind a definitive full-day notice to the issuer, session and observed availability."""
+    ordered, texts = _validated_documents(documents, stock_code=stock_code, cutoff=cutoff)
+    target = date.fromisoformat(day)
+    for document, (published, _) in zip(ordered, texts):
+        announcement_id = document.get("announcement_id")
+        source_ms = document.get("announcement_time_ms")
+        if (not isinstance(announcement_id, str)
+                or document["source_url"].rsplit("/", 1)[-1].split(".")[0] != announcement_id
+                or type(source_ms) is not int or not 10**12 <= source_ms < 10**13
+                or not _HASH.fullmatch(str(document.get("source_row_sha256") or ""))):
+            raise ValueError("official daily suspension publication identity differs")
+        source_at = datetime.fromtimestamp(source_ms / 1000, CHINA)
+        if (source_at.date() != published or published > target
+                or source_at > datetime.fromisoformat(document["observed_at"])):
+            raise ValueError("official daily suspension publication time differs")
+    if any(target in _dates(_SAME_DAY_RESUME, body) for _, body in texts):
+        raise ValueError("official evidence shows trading resumed on target session")
+    if not any(target in _dates(_FULL_DAY_SUSPEND, body) for _, body in texts):
+        raise ValueError("official full-day suspension is unproven for target session")
+    return {"kind": DAILY_SUSPENSION_KIND, "schema": DAILY_SUSPENSION_SCHEMA,
+            "stock_code": stock_code, "target_date": day, "documents": ordered}
+
+
+def _read_document(session, url: str, *, deadline: float) -> dict:
+    raw = _fetch(session, "GET", url, deadline=deadline, stage="historical_lifecycle_document",
+                 cap=MAX_DOCUMENT_BYTES)
+    observed = datetime.now(CHINA).replace(microsecond=0).isoformat()
+    source_text = extract_document_text(raw)
+    _remaining(deadline, "historical_lifecycle_parse")
+    return {"source_url": url, "observed_at": observed, "source_text": source_text,
+            "source_text_sha256": sha256(source_text.encode("utf-8")).hexdigest(),
+            "official_document_sha256": sha256(raw).hexdigest()}
 
 
 def _read_documents(locators: dict[str, list[str]], timeout_seconds: float) -> dict[str, list[dict]]:
@@ -135,16 +182,7 @@ def _read_documents(locators: dict[str, list[str]], timeout_seconds: float) -> d
     with requests.Session() as session:
         session.headers.update({"User-Agent": "Mozilla/5.0", "Referer": BASE + "/"})
         for code, urls in locators.items():
-            result[code] = []
-            for url in urls:
-                raw = _fetch(session, "GET", url, deadline=deadline, stage="historical_lifecycle_document",
-                             cap=MAX_DOCUMENT_BYTES)
-                observed = datetime.now(CHINA).replace(microsecond=0).isoformat()
-                source_text = extract_document_text(raw)
-                _remaining(deadline, "historical_lifecycle_parse")
-                result[code].append({"source_url": url, "observed_at": observed, "source_text": source_text,
-                                     "source_text_sha256": sha256(source_text.encode("utf-8")).hexdigest(),
-                                     "official_document_sha256": sha256(raw).hexdigest()})
+            result[code] = [_read_document(session, url, deadline=deadline) for url in urls]
     return result
 
 
@@ -158,9 +196,41 @@ def _validate_locators(locators: dict[str, list[str]]) -> None:
             _document_date(url)
 
 
-def load_historical_documents(locators: dict[str, list[str]], *, timeout_seconds: float = 75) -> dict:
-    """Only the official PDF locators are supplied by the operator."""
-    _validate_locators(locators)
+def _read_daily_suspension_documents(codes: list[str], target_date: str, timeout_seconds: float) -> dict:
+    from server.common.announcement_provider import CninfoMarketAnnouncementProvider
+
+    target = date.fromisoformat(target_date)
+    deadline = time.monotonic() + timeout_seconds
+    start = (target - timedelta(days=7)).strftime("%Y%m%d") + "000000"
+    end = target.strftime("%Y%m%d") + "235959"
+    result = {}
+    provider = CninfoMarketAnnouncementProvider()
+    try:
+        provider.bind_capture_deadline(remaining_seconds=_remaining(deadline, "suspension_inventory"))
+        with requests.Session() as session:
+            session.headers.update({"User-Agent": "Mozilla/5.0", "Referer": BASE + "/"})
+            for code in codes:
+                market = "SH" if code.startswith("6") else "BJ" if code.startswith(("4", "8", "9")) else "SZ"
+                inventory = provider.fetch(stock_code=code, qmt_code=f"{code}.{market}",
+                                           requested_start_time=start, requested_end_time=end)
+                matches = [row for row in inventory.rows if any(term in row["title"] for term in ("停牌", "复牌"))]
+                if not 1 <= len(matches) <= 4:
+                    continue
+                documents = []
+                for row in matches:
+                    url = row["detail_url"]
+                    _document_date(url)
+                    document = _read_document(session, url, deadline=deadline)
+                    documents.append({**document, "announcement_id": row["announcement_id"],
+                                      "announcement_time_ms": int(row["announcementTime"]),
+                                      "source_row_sha256": row["source_row_hash"]})
+                result[code] = documents
+    finally:
+        provider.close()
+    return result
+
+
+def _document_worker(payload: dict, timeout_seconds: float) -> dict:
     if not 0 < timeout_seconds <= 120:
         raise ValueError("historical lifecycle deadline differs")
     from server.common.process_env import build_child_env
@@ -169,7 +239,7 @@ def load_historical_documents(locators: dict[str, list[str]], *, timeout_seconds
     try:
         worker = subprocess.run(
             [sys.executable, "-B", "-m", __name__], cwd=root, env=build_child_env(root),
-            input=json.dumps({"locators": locators, "timeout_seconds": timeout_seconds}),
+            input=json.dumps({**payload, "timeout_seconds": timeout_seconds}),
             capture_output=True, text=True, encoding="utf-8", timeout=timeout_seconds,
             **({"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}),
         )
@@ -178,13 +248,43 @@ def load_historical_documents(locators: dict[str, list[str]], *, timeout_seconds
     if worker.returncode or len(worker.stdout.encode("utf-8")) > 4 * 1024 * 1024:
         raise RuntimeError("historical_lifecycle_document: official evidence worker failed")
     result = json.loads(worker.stdout)
+    if not isinstance(result, dict):
+        raise ValueError("historical daily evidence worker inventory differs")
+    return result
+
+
+def load_historical_documents(locators: dict[str, list[str]], *, timeout_seconds: float = 75) -> dict:
+    """Only the official PDF locators are supplied by the operator."""
+    _validate_locators(locators)
+    result = _document_worker({"locators": locators}, timeout_seconds)
     if set(result) != set(locators):
         raise ValueError("historical daily evidence worker inventory differs")
+    return result
+
+
+def _validate_daily_codes(codes: list[str], target_date: str) -> None:
+    date.fromisoformat(target_date)
+    if not 1 <= len(codes) <= 20 or any(not re.fullmatch(r"[0-9]{6}", code) for code in codes):
+        raise ValueError("official daily suspension evidence request bounds differ")
+
+
+def load_daily_suspension_documents(codes: list[str], *, target_date: str, timeout_seconds: float = 20) -> dict:
+    """Read exact-issuer CNINFO PDFs only for unresolved missing daily bars."""
+    requested = sorted(set(codes))
+    _validate_daily_codes(requested, target_date)
+    result = _document_worker({"codes": requested, "target_date": target_date}, timeout_seconds)
+    if set(result) - set(requested):
+        raise ValueError("official daily suspension worker inventory differs")
     return result
 
 
 if __name__ == "__main__":
     sys.stdout.reconfigure(encoding="utf-8")
     args = json.load(sys.stdin)
-    _validate_locators(args["locators"])
-    print(json.dumps(_read_documents(**args), ensure_ascii=False))
+    if "locators" in args:
+        _validate_locators(args["locators"])
+        result = _read_documents(**args)
+    else:
+        _validate_daily_codes(args["codes"], args["target_date"])
+        result = _read_daily_suspension_documents(**args)
+    print(json.dumps(result, ensure_ascii=False))
