@@ -5143,7 +5143,8 @@ def _announcement_batch_read_reason(error: Exception) -> str:
         LIVE_ANNOUNCEMENT_BATCH_VALIDATION_DEADLINE,
     } and re.fullmatch(
         r"snapshot-isolation|candidate-discovery|first-member-(?:inventory|payload)|"
-        r"stock-catalog|batch-(?:inventory|verified)|batch-payload(?:-size)?:[0-9]{1,8}|"
+        r"stock-catalog|batch-verified|batch-inventory(?::[0-9]{1,8})?|"
+        r"batch-payload(?:-size)?:[0-9]{1,8}|"
         r"incremental-parent|candidate-read",
         detail,
     ):
