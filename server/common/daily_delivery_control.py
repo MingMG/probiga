@@ -276,6 +276,64 @@ def load_completed_market_capture_receipt(
     raise DailyDeliveryControlError("MARKET_CAPTURE_COMPLETION_UNAVAILABLE")
 
 
+def load_completed_cninfo_announcement_at(
+    engine, *, batch: Mapping[str, Any], decision_at: datetime,
+) -> datetime | None:
+    """Return the validated publication time for this exact durable batch."""
+    from server.common.qmt_announcement_pit import QMT_ANNOUNCEMENT_TASK_SCHEMA, validate_task_result
+
+    target = _normalized_trade_date(batch["window_end"])
+    stage = "qmt_announcement_pit"
+    received = _datetime_value(batch.get("received_at"))
+    if received is None or received > decision_at:
+        return None
+    with (nullcontext(engine) if hasattr(engine, "execute") else engine.connect()) as connection:
+        attempts = connection.execute(text(f"""
+            SELECT a.*, s.trade_date, s.release_id
+            FROM {ATTEMPT_TABLE} a JOIN {SESSION_TABLE} s ON s.session_uid=a.session_uid
+            WHERE s.trade_date=:target AND a.stage_name=:stage AND a.status='SUCCESS'
+              AND a.finished_at BETWEEN :received AND :decision
+            ORDER BY a.finished_at DESC, a.id DESC LIMIT 12
+        """), {
+            "target": target, "stage": stage, "received": received, "decision": decision_at,
+        }).mappings().all()
+    for attempt in attempts:
+        try:
+            checkpoint = _validated_completed_stage_checkpoint(
+                attempt, session=attempt, stage_name=stage, engine=engine,
+            )
+        except DailyDeliveryFenceLost:
+            continue
+        matches = []
+        for raw in str(checkpoint["replay_output"]).splitlines():
+            try:
+                item = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            if (
+                isinstance(item, dict)
+                and item.get("schema") == QMT_ANNOUNCEMENT_TASK_SCHEMA
+                and item.get("batch_id") == batch["batch_id"]
+            ):
+                matches.append(item)
+        if not matches:
+            continue
+        if len(matches) != 1:
+            raise DailyDeliveryControlError("announcement completion receipt is ambiguous")
+        item = matches[0]
+        if (
+            item.get("source") != batch["source"]
+            or item.get("batch_root_hash") != batch["batch_root_hash"]
+            or item.get("window_end") != target
+            or item.get("received_at") != batch["received_at"]
+            or item.get("stock_count") != batch["catalog_member_count"]
+            or validate_task_result(item, 0) != "complete"
+        ):
+            raise DailyDeliveryControlError("announcement completion receipt differs")
+        return _datetime_value(attempt["finished_at"])
+    return None
+
+
 def load_published_analysis_receipt(
     engine, target_date: object, decision_at: datetime | None = None,
     *, run_uid: str | None = None,
