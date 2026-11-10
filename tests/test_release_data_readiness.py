@@ -270,6 +270,36 @@ def test_release_readiness_preserves_validated_finance_degraded_disposition(monk
         _validate_ready(monkeypatch, engine)
 
 
+def test_release_readiness_accepts_original_finance_completion_on_same_contract(monkeypatch):
+    from tests.test_stock_finance_receipt_reuse import install_finance_completion
+
+    engine = _readiness_engine()
+    target = "2026-08-26"
+    with engine.begin() as connection:
+        finance = connection.execute(text("""
+            SELECT id, task_name FROM st_scheduled_tasks WHERE task_type='stock_finance'
+        """)).mappings().one()
+        connection.execute(text("""
+            UPDATE st_scheduled_task_history SET status='failed', exit_code=1, output=''
+            WHERE task_type='stock_finance'
+        """))
+    evidence, finished = install_finance_completion(
+        engine, monkeypatch, target=target, started=NOW - timedelta(minutes=20),
+        task_id=finance["id"], task_name=finance["task_name"],
+    )
+    monkeypatch.setattr(ensure_quality_gate, "runtime_component_build_sha", lambda *_args, **_kwargs: BUILD_SHA)
+    result = _validate_ready(monkeypatch, engine, dispositions={"stock_finance": "degraded"})
+    assert result["status"] == "READY"
+    assert result["build_sha"] == BUILD_SHA
+    assert result["tasks"]["stock_finance"] == {
+        "build_sha": evidence["build_sha"], "status": "degraded", "run_uid": evidence["run_uid"],
+        "finished_at": finished.isoformat(sep=" ", timespec="seconds"),
+        "evidence_sha256": evidence["evidence_sha256"],
+        "validation": "Original validated finance completion and exact durable seal verified",
+        "target_date": target,
+    }
+
+
 def test_release_readiness_replay_binds_analysis_to_scheduler_run_and_build(
     monkeypatch,
 ):
