@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import pytest
 from sqlalchemy import create_engine, event, text
+from sqlalchemy.exc import OperationalError
 
 from server.common.pit_facts import (
     EVENT_REVISION_TABLE,
@@ -1923,7 +1924,10 @@ def test_database_validator_proves_global_root_and_exact_catalog_binding():
 
 @pytest.mark.parametrize("source", [QMT_ANNOUNCEMENT_SOURCE, CNINFO_ANNOUNCEMENT_SOURCE])
 @pytest.mark.parametrize(
-    "inventory_damage", [None, "extra", "duplicate", "deadline", "byte-limit", "size-mismatch"],
+    "inventory_damage", [
+        None, "extra-below", "extra-gap", "extra-above", "duplicate", "missing",
+        "inventory-timeout", "deadline", "byte-limit", "size-mismatch",
+    ],
 )
 def test_live_batch_validates_full_inventory_with_bounded_compressed_primary_key_reads(
     monkeypatch, tmp_path, source, inventory_damage,
@@ -1940,7 +1944,7 @@ def test_live_batch_validates_full_inventory_with_bounded_compressed_primary_key
 
     engine = _engine()
     catalog = _install_catalog(engine, _catalog(*(
-        (f"{index:06d}", f"{index:06d}.SZ") for index in range(1, 46)
+        (f"{index:06d}", f"{index:06d}.SZ") for index in range(2, 91, 2)
     )))
     first_code = catalog.codes[0]
     cutoff = datetime(2026, 8, 25, 18, 20)
@@ -2001,23 +2005,45 @@ def test_live_batch_validates_full_inventory_with_bounded_compressed_primary_key
                     connection, source=source, batch_id="different-batch", **size_args,
                 )
     byte_limit = min(raw_sizes.values()) * 2
+    monkeypatch.setattr("server.common.qmt_announcement_pit.VALIDATION_INVENTORY_CODE_LIMIT", 20)
     if inventory_damage == "byte-limit":
         monkeypatch.setattr("server.common.qmt_announcement_pit.VALIDATION_READ_PAYLOAD_BYTES", byte_limit)
-    if inventory_damage in {"extra", "duplicate"}:
+    bad_code_by_damage = {
+        "extra-below": "000001", "extra-gap": "000063", "extra-above": "000099",
+        "duplicate": catalog.codes[20],
+    }
+    if inventory_damage in bad_code_by_damage:
         with engine.begin() as connection:
             row = dict(connection.execute(text(
                 f"SELECT * FROM {SOURCE_COVERAGE_TABLE} WHERE stock_code=:code"
             ), {"code": first_code}).mappings().one())
             row.update(
                 coverage_id="c" * 64, scope_hash="d" * 64, coverage_fingerprint_hash="e" * 64,
-                stock_code="000099" if inventory_damage == "extra" else first_code,
-                known_at="2026-08-26 19:00:00", watermark_kind="CAPTURED_AT",
+                stock_code=bad_code_by_damage[inventory_damage],
+                known_at="2026-08-26 19:00:00",
+                # The below-minimum row also becomes the initial header. Keep
+                # its header parseable so this case reaches the inventory gate.
+                watermark_kind="QUERY_CUTOFF" if inventory_damage == "extra-below" else "CAPTURED_AT",
             )
             connection.execute(text(
                 f"INSERT INTO {SOURCE_COVERAGE_TABLE} ({','.join(row)}) "
                 f"VALUES ({','.join(':' + column for column in row)})"
             ), row)
+    if inventory_damage == "missing":
+        with engine.begin() as connection:
+            connection.execute(text("DROP TRIGGER trg_pit_source_coverage_immutable_bd"))
+            connection.execute(text(
+                f"DELETE FROM {SOURCE_COVERAGE_TABLE} WHERE stock_code=:code"
+            ), {"code": catalog.codes[20]})
     mysql_reader = _mysql_seal_transport(engine)
+
+    class InventoryMysqlConnection(mysql_reader.connect):
+        def execute(self, statement, params):
+            if "coverage_id, stock_code" in str(statement):
+                return self.connection.execute(statement, params)
+            return super().execute(statement, params)
+
+    mysql_reader.connect = InventoryMysqlConnection
     reads = []
     elapsed = [0.0]
     if inventory_damage == "deadline":
@@ -2027,6 +2053,11 @@ def test_live_batch_validates_full_inventory_with_bounded_compressed_primary_key
         if f"FROM {SOURCE_COVERAGE_TABLE}" in sql:
             bindings = context.compiled_parameters[0]
             reads.append((connection.get_transaction(), sql, bindings, context.execution_options))
+            if (
+                inventory_damage == "inventory-timeout" and "coverage_id, stock_code" in sql
+                and bindings.get("lower_code") == catalog.codes[20]
+            ):
+                raise OperationalError(sql, parameters, Exception(3024, "execution deadline"))
             if "COMPRESS(payload_json)" in sql and inventory_damage == "deadline" and sum(
                 key.startswith("coverage_ids_") for key in bindings
             ) == 40:
@@ -2036,14 +2067,19 @@ def test_live_batch_validates_full_inventory_with_bounded_compressed_primary_key
                     "coverage_id, OCTET_LENGTH(payload_json)",
                     "coverage_id, OCTET_LENGTH(payload_json) + 1",
                 )
-        return sql.replace(" FORCE INDEX (PRIMARY)", ""), parameters
+        return sql.replace(" FORCE INDEX (PRIMARY)", "").replace(
+            " FORCE INDEX (idx_pit_coverage_decision)", "",
+        ), parameters
 
     event.listen(engine, "before_cursor_execute", record, retval=True)
     try:
         if inventory_damage == "deadline":
             with pytest.raises(QMTAnnouncementBlocked, match="LIVE_BATCH_VALIDATION_DEADLINE:batch-payload:0"):
                 validate_complete_qmt_announcement_batch(mysql_reader, **options)
-        elif inventory_damage in {"extra", "duplicate", "size-mismatch"}:
+        elif inventory_damage == "inventory-timeout":
+            with pytest.raises(QMTAnnouncementBlocked, match="LIVE_BATCH_REPLY_DEADLINE:batch-inventory:20"):
+                validate_complete_qmt_announcement_batch(mysql_reader, **options)
+        elif inventory_damage in {*bad_code_by_damage, "missing", "size-mismatch"}:
             with pytest.raises(QMTAnnouncementBlocked, match="COMPLETE_BATCH_NOT_FOUND"):
                 validate_complete_qmt_announcement_batch(mysql_reader, **options)
         else:
@@ -2051,15 +2087,32 @@ def test_live_batch_validates_full_inventory_with_bounded_compressed_primary_key
     finally:
         event.remove(engine, "before_cursor_execute", record)
     inventory = [(sql, params) for _, sql, params, _ in reads if "coverage_id, stock_code" in sql]
-    assert len(inventory) == 1 and inventory[0][1]["inventory_limit"] == 46
-    assert "MAX_EXECUTION_TIME" in inventory[0][0] and "known_at" not in inventory[0][0]
+    inventory_ranges = [
+        (None, catalog.codes[20], 21), (catalog.codes[20], catalog.codes[40], 21),
+        (catalog.codes[40], None, 6),
+    ]
+    stopped_range_count = {
+        "extra-below": 1, "extra-gap": 2, "duplicate": 2, "missing": 2, "inventory-timeout": 2,
+    }.get(inventory_damage, 3)
+    assert [
+        (params.get("lower_code"), params.get("upper_code"), params["inventory_limit"])
+        for _, params in inventory
+    ] == inventory_ranges[:stopped_range_count]
+    assert all(
+        "FORCE INDEX (idx_pit_coverage_decision)" in sql and "MAX_EXECUTION_TIME" in sql
+        and "known_at" not in sql and "stock_code IN" not in sql
+        and ("stock_code>=" in sql) == ("lower_code" in params)
+        and ("stock_code<" in sql) == ("upper_code" in params)
+        for sql, params in inventory
+    )
     assert reads[0][0] is not None and all(transaction is reads[0][0] for transaction, *_ in reads)
     size_reads = [
         (sql, params) for _, sql, params, _ in reads
         if "coverage_id, OCTET_LENGTH(payload_json)" in sql
     ]
     expected_size_chunks = [40, 5]
-    if inventory_damage in {"extra", "duplicate"}:
+    inventory_failures = {*bad_code_by_damage, "missing", "inventory-timeout"}
+    if inventory_damage in inventory_failures:
         expected_size_chunks = []
     elif inventory_damage in {"deadline", "size-mismatch"}:
         expected_size_chunks = [40]
@@ -2079,10 +2132,8 @@ def test_live_batch_validates_full_inventory_with_bounded_compressed_primary_key
         assert max(map(len, payload_id_chunks)) <= 2
         assert all(len(chunk) == 1 or sum(raw_sizes[key] for key in chunk) <= byte_limit for chunk in payload_id_chunks)
     else:
-        expected_chunks = {
-            None: [1, 40, 5], "extra": [1], "duplicate": [1],
-            "deadline": [1, 40], "size-mismatch": [1, 40],
-        }
+        expected_chunks = {None: [1, 40, 5], "deadline": [1, 40], "size-mismatch": [1, 40]}
+        expected_chunks.update(dict.fromkeys(inventory_failures, [1]))
         assert list(map(len, payload_id_chunks)) == expected_chunks[inventory_damage]
     assert all(
         "COMPRESS(payload_json)" in sql and "FORCE INDEX (PRIMARY)" in sql

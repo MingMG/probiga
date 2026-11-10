@@ -114,6 +114,7 @@ HISTORICAL_PUBLISH_DEADLINE = "QMT_ANNOUNCEMENT_RECONSTRUCTION_PUBLISH_DEADLINE"
 PUBLISH_COMMIT_UNKNOWN = "QMT_ANNOUNCEMENT_PUBLISH_COMMIT_UNKNOWN"
 VALIDATION_READ_BATCH_SIZE = 40
 VALIDATION_READ_PAYLOAD_BYTES = 4 * 1024 * 1024
+VALIDATION_INVENTORY_CODE_LIMIT = 400
 LIVE_ANNOUNCEMENT_BATCH_QUERY_TIMEOUT_MS = 60_000
 LIVE_ANNOUNCEMENT_BATCH_VALIDATION_BUDGET_SECONDS = 15 * 60
 LIVE_ANNOUNCEMENT_BATCH_VALIDATION_DEADLINE = "QMT_ANNOUNCEMENT_LIVE_BATCH_VALIDATION_DEADLINE"
@@ -2352,6 +2353,48 @@ def _read_live_announcement_payload_rows(
     ]
 
 
+def _load_live_announcement_batch_inventory(
+    connection: Any,
+    *,
+    source: str,
+    batch_id: str,
+    catalog_codes: Sequence[str],
+    deadline: float,
+) -> list[tuple[str, str]]:
+    """Read the exact ordered membership from the caller's batch snapshot."""
+    mysql = connection.dialect.name == "mysql"
+    codes = sorted(catalog_codes)
+    inventory_limit = VALIDATION_INVENTORY_CODE_LIMIT if mysql else max(1, len(codes))
+    index_hint = " FORCE INDEX (idx_pit_coverage_decision)" if mysql else ""
+    keys = []
+    for offset in range(0, max(1, len(codes)), inventory_limit):
+        end = offset + inventory_limit
+        expected_codes = codes[offset:end]
+        params = {"source": source, "batch_id": batch_id, "inventory_limit": len(expected_codes) + 1}
+        bounds = ""
+        # The first/last ranges have open ends. Every stored code belongs to
+        # exactly one range, including unknown codes between catalog members.
+        # No requested-code or time filter can hide extra batch rows.
+        if offset:
+            bounds += " AND stock_code>=:lower_code"
+            params["lower_code"] = codes[offset]
+        if end < len(codes):
+            bounds += " AND stock_code<:upper_code"
+            params["upper_code"] = codes[end]
+        stage = f"batch-inventory:{offset}" if mysql else "batch-inventory"
+        timeout_hint = _live_announcement_read_hint(mysql=mysql, deadline=deadline, stage=stage)
+        with _live_announcement_reply_budget(connection, deadline=deadline, stage=stage):
+            range_keys = connection.execute(text(
+                f"SELECT {timeout_hint}coverage_id, stock_code FROM st_pit_source_coverage{index_hint} "
+                "WHERE fact_kind='event' AND source=:source AND batch_id=:batch_id"
+                f"{bounds} ORDER BY stock_code LIMIT :inventory_limit"
+            ), params).tuples().all()
+        if [str(code).zfill(6) for _, code in range_keys] != expected_codes:
+            raise ValueError("batch stock set differs from catalog")
+        keys.extend((coverage_id, code) for coverage_id, code in range_keys)
+    return keys
+
+
 def _load_live_announcement_batch_rows(
     connection: Any,
     *,
@@ -2361,21 +2404,9 @@ def _load_live_announcement_batch_rows(
     deadline: float,
 ) -> Iterator[dict[str, Any]]:
     """Prove complete batch membership before bounded primary-key payload reads."""
-    mysql = connection.dialect.name == "mysql"
-    timeout_hint = _live_announcement_read_hint(mysql=mysql, deadline=deadline, stage="batch-inventory")
-    # Inventory is deliberately unfiltered by requested codes or knowledge
-    # time so extra, duplicate and out-of-window members cannot be hidden.
-    with _live_announcement_reply_budget(connection, deadline=deadline, stage="batch-inventory"):
-        keys = connection.execute(
-            text(
-                f"SELECT {timeout_hint}coverage_id, stock_code FROM st_pit_source_coverage "
-                "WHERE fact_kind='event' AND source=:source AND batch_id=:batch_id "
-                "ORDER BY stock_code LIMIT :inventory_limit"
-            ),
-            {"source": source, "batch_id": batch_id, "inventory_limit": len(catalog_codes) + 1},
-        ).tuples().all()
-    if [str(code).zfill(6) for _, code in keys] != sorted(catalog_codes):
-        raise ValueError("batch stock set differs from catalog")
+    keys = _load_live_announcement_batch_inventory(
+        connection, source=source, batch_id=batch_id, catalog_codes=catalog_codes, deadline=deadline,
+    )
     for offset in range(0, len(keys), VALIDATION_READ_BATCH_SIZE):
         expected = keys[offset : offset + VALIDATION_READ_BATCH_SIZE]
         codes_by_id = dict(expected)
