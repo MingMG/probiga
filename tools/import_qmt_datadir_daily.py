@@ -41,7 +41,11 @@ from server.common.historical_daily_bar_evidence import (  # noqa: E402
     load_public_bars,
 )
 from server.common.mysql_lock import STOCK_KLINE_FREEZE_LOCK_NAME, mysql_named_lock  # noqa: E402
-from server.common.official_historical_daily_evidence import load_historical_documents  # noqa: E402
+from server.common.official_historical_daily_evidence import (  # noqa: E402
+    DAILY_SUSPENSION_KIND,
+    load_daily_suspension_documents,
+    load_historical_documents,
+)
 from server.common.qmt_attestation_contract import canonical_digest  # noqa: E402
 from server.common.qmt_trade_calendar import (  # noqa: E402
     load_trade_calendar_receipt,
@@ -274,9 +278,12 @@ def _coverage_manifest(engine, *, session, harvested, run_id, historical_documen
         listings.update(load_official_listing_evidence(
             unresolved, target_date=day, deadline_seconds=20,
         ))
+        unresolved = sorted(set(unresolved) - set(listings))
+    suspensions = load_daily_suspension_documents(unresolved, target_date=day) if unresolved else {}
     cutoff = dt.datetime.now(CST).replace(tzinfo=None, microsecond=0)
     return build_manifest(catalog=catalog, calendar=calendar, day=day, rows=rows,
-                          run_id=run_id, captured_at=cutoff, snapshot=snapshot, listings=listings)
+                          run_id=run_id, captured_at=cutoff, snapshot=snapshot, listings=listings,
+                          daily_suspension_documents=suspensions)
 
 
 @contextmanager
@@ -489,6 +496,22 @@ def _publish(
     historical = coverage_manifest.get("historical_reconstruction") is True
     repair = historical or bool(coverage_manifest.get("native_amount_correction"))
     with _daily_transaction(engine) as connection:
+        if os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip().lower() == "production" and any(
+            entity["evidence"].get("kind") == DAILY_SUSPENSION_KIND
+            for entity in coverage_manifest["entities"]
+        ):
+            # The older DAT-only writer can start during Windows handoff.
+            # Publish this new proof only after its Linux reader is active.
+            from server.api.scheduler_runtime import _verified_linux_activation_build
+            from server.common.component_release import runtime_component_build_sha
+            from server.common.config import get_scheduler_runtime_config
+
+            linux_sha, reason = _verified_linux_activation_build(
+                connection, build_sha=runtime_component_build_sha("windows"),
+                expected_poll_seconds=int(get_scheduler_runtime_config()["poll_seconds"]),
+            )
+            if linux_sha is None:
+                raise RuntimeError(f"official daily suspension Linux reader is unavailable: {reason}")
         previous = None
         if repair:
             missing, corrections, previous = _historical_append_plan(connection, day=session.isoformat(), proof=coverage_manifest)

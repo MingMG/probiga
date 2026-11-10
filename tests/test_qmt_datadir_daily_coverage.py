@@ -636,6 +636,127 @@ def test_native_poll_after_slow_catalog_read_is_bound_to_actual_observation_time
     assert sum(entity["classification"] == "NO_TRADE" for entity in proof["entities"]) == 6
 
 
+def _full_day_halt_document(*, body=None, observed="2026-11-10T19:54:00+08:00"):
+    body = body or ("证券代码：688053。关于撤销其他风险警示暨停牌的公告。"
+                    "公司股票将于2026年11月10日停牌一天，自2026年11月11日起复牌交易。")
+    return {
+        "source_url": "https://static.cninfo.com.cn/finalpage/2026-11-10/1225663598.PDF",
+        "observed_at": observed,
+        "source_text": body,
+        "source_text_sha256": hashlib.sha256(body.encode()).hexdigest(),
+        "official_document_sha256": "d" * 64,
+        "announcement_id": "1225663598",
+        "announcement_time_ms": 1794240000000,
+        "source_row_sha256": "f" * 64,
+    }
+
+
+def test_post_close_daily_import_accepts_official_full_day_halt_when_native_status_is_five(monkeypatch):
+    from tools import import_qmt_datadir_daily as importer
+    from integrations.bigqmt import spool
+    from server.common import official_listing_evidence
+
+    day, code, other = "2026-11-10", "688053", "688798"
+    cutoff = datetime(2026, 11, 10, 20)
+    catalog, calendar = authorities()
+    catalog.eligible_codes = lambda day: [TRADED, code, other]
+    calendar.sessions_between = lambda start, end: [day]
+    quote = {"time": int(datetime(2026, 11, 10, 15, 0, tzinfo=coverage.CHINA).timestamp() * 1000),
+             "_probiga_observed_at": "2026-11-10 15:10:06",
+             "_probiga_acquisition_method": "ContextInfo.get_full_tick", "stockStatus": 5,
+             "open": 0, "high": 0, "low": 0, "volume": 0, "amount": 0}
+    native = {**snapshot(), "generated_at": "2026-11-10 19:56:00",
+              "quotes": {code + ".SH": quote, other + ".SH": {**quote, "stockStatus": 7}}}
+    with pytest.raises(ValueError, match="native post-close suspension is unproven: 688053"):
+        coverage.suspension_evidence(native, code, day, cutoff)
+
+    engine = database(monkeypatch)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, timezone=None):
+            return cutoff.replace(tzinfo=timezone)
+
+    monkeypatch.setattr(importer.dt, "datetime", Clock)
+    for module in (importer, coverage):
+        monkeypatch.setattr(module, "load_stock_catalog", lambda *args, **kwargs: catalog)
+        monkeypatch.setattr(module, "load_trade_calendar_receipt", lambda *args, **kwargs: calendar)
+    monkeypatch.setattr(spool, "read_snapshot", lambda *args, **kwargs: native)
+    monkeypatch.setattr(importer, "retained_listing_evidence", lambda *args, **kwargs: {})
+    monkeypatch.setattr(official_listing_evidence, "load_official_listing_evidence", lambda *args, **kwargs: {})
+
+    def official(codes, *, target_date):
+        assert codes == [code] and target_date == day
+        return {code: [_full_day_halt_document()]}
+
+    monkeypatch.setattr(importer, "load_daily_suspension_documents", official)
+    harvested = {"codes": {TRADED}, "rows": [(TRADED, day, day, 10, 11, 11, 10, 100, 1100, 10, 1, 10)]}
+    proof = importer._coverage_manifest(engine, session=date.fromisoformat(day), harvested=harvested, run_id="qdd-exact")
+    assert [(row["stock_code"], row["classification"]) for row in proof["entities"]] == [
+        (TRADED, "TRADED"), (code, "NO_TRADE"), (other, "NO_TRADE"),
+    ]
+    assert [row["evidence"]["kind"] for row in proof["entities"][1:]] == [
+        "OFFICIAL_DAILY_SUSPENSION", "NATIVE_QMT_SUSPENSION",
+    ]
+    quote["volume"] = 1
+    with pytest.raises(ValueError, match="requires target-day native zero turnover"):
+        importer._coverage_manifest(engine, session=date.fromisoformat(day), harvested=harvested, run_id="conflict")
+    quote["volume"] = 0
+    from server.api import scheduler_runtime
+    from server.common import component_release
+
+    with monkeypatch.context() as production:
+        production.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+        production.setattr(importer, "_daily_transaction", lambda engine: engine.begin())
+        production.setattr(component_release, "runtime_component_build_sha", lambda role: "a" * 40)
+        production.setattr(
+            scheduler_runtime, "_verified_linux_activation_build",
+            lambda *args, **kwargs: (None, "linux_active_lease_unavailable"),
+        )
+        with pytest.raises(RuntimeError, match="official daily suspension Linux reader is unavailable"):
+            importer._publish(
+                engine, session=date.fromisoformat(day), rows=harvested["rows"], covered_codes={TRADED},
+                short_names={}, run_id="qdd-exact", source_root=None, content_sha256="b" * 64,
+                eligible_code_count=3, coverage_manifest=proof,
+            )
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE sm_stock_kline SET trade_date=:day"), {"day": day})
+        coverage.insert_manifest(connection, proof)
+    assert coverage.load_daily_manifest(engine, day, decision_known_at=cutoff) == proof
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT COUNT(*) FROM sm_stock_kline")).scalar_one() == 1
+    from server.common.qmt_attestation_contract import canonical_digest
+
+    tampered = deepcopy(proof)
+    entity = tampered["entities"][1]
+    entity["evidence"]["native_tick"]["amount"] = 1
+    entity["row_hash"] = canonical_digest({k: v for k, v in entity.items() if k != "row_hash"})
+    tampered["manifest_hash"] = canonical_digest({k: v for k, v in tampered.items() if k != "manifest_hash"})
+    with pytest.raises(ValueError, match="requires target-day native zero turnover"):
+        coverage.validate_manifest(tampered, catalog=catalog, calendar=calendar)
+    engine.dispose()
+
+
+@pytest.mark.parametrize("change", ["late", "wrong_issuer", "partial", "resumed", "misbound_notice"])
+def test_official_same_day_suspension_rejects_unavailable_or_inexact_issuer_evidence(change):
+    from server.common.official_historical_daily_evidence import official_daily_suspension_evidence
+
+    body = {
+        "wrong_issuer": "证券代码：688798。公司股票将于2026年11月10日停牌一天。",
+        "partial": "证券代码：688053。公司股票将于2026年11月10日停牌半天。",
+        "resumed": "证券代码：688053。公司股票将于2026年11月10日停牌一天，另将于2026年11月10日复牌。",
+    }.get(change)
+    doc = _full_day_halt_document(body=body, observed=(
+        "2026-11-10T20:00:01+08:00" if change == "late" else "2026-11-10T19:54:00+08:00"
+    ))
+    if change == "misbound_notice":
+        doc["announcement_id"] = "1225664395"
+    with pytest.raises(ValueError, match="official|document identity or time"):
+        official_daily_suspension_evidence(
+            [doc], stock_code="688053", day="2026-11-10", cutoff=datetime(2026, 11, 10, 20),
+        )
+
+
 @pytest.mark.parametrize("field,value", [("captured_at", "2026-11-02 19:00:00"), ("calendar_manifest_hash", "f" * 64)])
 def test_persisted_metadata_cannot_rebind_a_sealed_daily_manifest(monkeypatch, field, value):
     engine = database(monkeypatch)
