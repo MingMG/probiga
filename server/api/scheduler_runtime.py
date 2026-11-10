@@ -1677,6 +1677,12 @@ def _release_history_evidence_valid(row: dict, build_sha: str) -> bool:
     new-build replay that could create that proof.
     """
 
+    if (
+        row.get("task_type") == "stock_finance"
+        and row.get("_completed_stock_finance_target")
+        and row["_completed_stock_finance_target"] == row.get("_release_expected_target_date")
+    ):
+        return True
     source = str(row.get("_release_terminal_output") or "")
     candidates = []
     for line in source.splitlines():
@@ -2558,22 +2564,39 @@ def _release_catchup_dependencies_ready(
         return True, "ready"
     build_sha = _scheduler_build_commit_sha()
     component_build_shas = None
+    finance_history = None
+    downstream_target = str(
+        row.get("_release_expected_target_date") or ""
+    ).strip()
     if engine is not None:
         try:
             with engine.connect() as connection:
                 component_build_shas = _dependency_component_build_shas(
                     connection, dependencies, local_build_sha=build_sha,
                 )
+                finance_rows = grouped.get("stock_finance", [])
+                if "stock_finance" in dependencies and len(finance_rows) == 1:
+                    upstream = finance_rows[0]
+                    if (
+                        downstream_target != upstream.get("_release_expected_target_date")
+                        or not _release_history_evidence_valid(upstream, component_build_shas["linux"])
+                    ):
+                        finance_history = _load_completed_stock_finance_history(
+                            connection, target=downstream_target,
+                            current_linux_build_sha=component_build_shas["linux"],
+                            decision_at=now or _now_shanghai_naive(),
+                        )
+                        if finance_history and finance_history["task_id"] != upstream.get("id"):
+                            finance_history = None
         except Exception as exc:
             return False, f"dependency_build_identity_unavailable:{type(exc).__name__}"
-    downstream_target = str(
-        row.get("_release_expected_target_date") or ""
-    ).strip()
     for dependency in dependencies:
         matches = grouped.get(dependency, [])
         if len(matches) != 1:
             return False, f"{dependency}:missing_or_duplicate"
         upstream = matches[0]
+        if dependency == "stock_finance" and finance_history is not None:
+            continue
         if not _release_history_evidence_valid(upstream, _task_component_build_sha(
             dependency, build_sha, component_build_shas=component_build_shas,
         )):
@@ -3711,12 +3734,156 @@ def _history_validation_evidence(output: object) -> dict | None:
     return evidence if evidence_sha256 == expected else None
 
 
+def _load_completed_stock_finance_history(
+    connection,
+    *,
+    target: str,
+    current_linux_build_sha: str,
+    decision_at: datetime,
+) -> dict | None:
+    """Reuse an exact finance seal through its original terminal scheduler run."""
+
+    if not target or os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip().lower() != "production":
+        return None
+    from server.common.component_release_attestation import require_compatible_component_build
+    from server.common.daily_delivery_control import _validated_completed_stage_checkpoint
+    from server.common.pit_facts import (
+        FINANCE_ATOMIC_BATCH_CODE,
+        FINANCE_ATOMIC_BATCH_SOURCE,
+        normalize_decision_at,
+    )
+
+    session = daily_session_identity(
+        target, runtime_contract_build_sha(expected_build_sha=_scheduler_build_commit_sha()),
+    )
+    decision = normalize_decision_at(decision_at)
+    row = connection.execute(text("""
+        SELECT /*+ MAX_EXECUTION_TIME(3000) */
+               h.id AS history_id, h.task_id, h.task_name, h.run_uid, h.task_type, h.run_at,
+               h.finished_at, h.status, h.exit_code, h.output, h.build_sha, h.trigger_source,
+               a.status AS stage_status, a.started_at AS stage_started_at,
+               a.finished_at AS stage_finished_at, a.input_root_sha256, a.checkpoint_json
+        FROM st_daily_stage_attempt AS a
+        JOIN st_daily_delivery_session AS s ON s.session_uid=a.session_uid
+        JOIN st_scheduled_task_history AS h ON h.run_uid=a.scheduler_run_uid
+        WHERE a.session_uid=:session_uid AND s.trade_date=:trade_date
+          AND s.release_id=:release_id AND a.stage_name='stock_finance' AND a.shard_id='main'
+          AND a.status IN ('SUCCESS','DEGRADED') AND h.task_type='stock_finance'
+          AND h.status IN ('success','degraded') AND h.exit_code=0
+          AND a.finished_at<=:decision_at AND h.finished_at<=:decision_at
+        ORDER BY a.attempt_no DESC
+        LIMIT 1
+    """), {
+        **session, "decision_at": decision,
+    }).mappings().first()
+    if row is None:
+        return None
+    history = dict(row)
+    try:
+        checkpoint = _validated_completed_stage_checkpoint(
+            {
+                "checkpoint_json": history.pop("checkpoint_json"),
+                "input_root_sha256": history.pop("input_root_sha256"),
+                "scheduler_run_uid": history["run_uid"],
+                "status": history.pop("stage_status"),
+            },
+            session=session, stage_name="stock_finance", engine=connection,
+        )
+        producer = str(history["build_sha"] or "").lower()
+        if producer != current_linux_build_sha:
+            require_compatible_component_build(connection, producer, current_linux_build_sha)
+    except RuntimeError:
+        return None
+    started = _coerce_datetime(history["run_at"])
+    finished = _coerce_datetime(history["finished_at"])
+    stage_started = _coerce_datetime(history.pop("stage_started_at"))
+    stage_finished = _coerce_datetime(history.pop("stage_finished_at"))
+    if (
+        checkpoint != _history_validation_evidence(history["output"])
+        or checkpoint["build_sha"] != producer
+        or checkpoint["status"] != history["status"]
+        or checkpoint.get("task_id") != history["task_id"]
+        or not started or not finished or not stage_started or not stage_finished
+        or started.date().isoformat() < session["trade_date"]
+        or not started <= finished <= decision
+        or not stage_started <= stage_finished <= decision
+    ):
+        return None
+
+    receipts = [
+        item for item in _iter_scheduler_output_payloads(checkpoint["replay_output"])
+        if item.get("schema") in {
+            "probiga.finance-sync-result.v2", "probiga.finance-atomic-batch-result.v1",
+        }
+    ]
+    if len(receipts) != 1:
+        return None
+    receipt = receipts[0]
+    seal = receipt.get("atomic_batch") if receipt["schema"] == "probiga.finance-sync-result.v2" else receipt
+    if not isinstance(seal, dict) or seal.get("as_of_date") != target:
+        return None
+    seal_id = str(seal.get("seal_coverage_id") or "")
+    seal_root = str(seal.get("batch_root_sha256") or "")
+    try:
+        completed = normalize_decision_at(seal["completed_known_at"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", seal_id)
+        or not re.fullmatch(r"[0-9a-f]{64}", seal_root)
+        or not started - timedelta(minutes=5) <= completed <= decision
+        # Scheduler clocks are persisted to whole seconds, unlike the PIT seal.
+        or completed >= min(finished, stage_finished) + timedelta(seconds=1)
+    ):
+        return None
+    # The original validator proved the complete immutable seal and its catalog.
+    # Check that exact row by primary key, without rereading all finance members.
+    durable = connection.execute(text("""
+        SELECT /*+ MAX_EXECUTION_TIME(3000) */ coverage_id FROM st_pit_source_coverage
+        WHERE coverage_id=:coverage_id AND fact_kind='finance' AND source=:source
+          AND stock_code=:stock_code AND coverage_status='COMPLETE'
+          AND result_count=0 AND window_start='1900-01-01' AND window_end=:target
+          AND known_at=:completed_at AND received_at=:completed_at AND covered_through_at=:completed_at
+          AND batch_id=:batch_id
+          AND JSON_EXTRACT(payload_json, '$.watermark.evidence.batch_root_sha256')=JSON_EXTRACT(:root_json, '$')
+    """), {
+        "coverage_id": seal_id, "source": FINANCE_ATOMIC_BATCH_SOURCE,
+        "stock_code": FINANCE_ATOMIC_BATCH_CODE, "target": target, "completed_at": completed,
+        "batch_id": f"finance-atomic-{seal_root[:32]}", "root_json": json.dumps(seal_root),
+    }).first()
+    return history if durable is not None else None
+
+
+def _attach_completed_stock_finance_target(engine, rows: list[dict], *, now: datetime) -> None:
+    for row in rows:
+        target = str(row.get("_release_expected_target_date") or "")
+        if (
+            row.get("task_type") != "stock_finance"
+            or not target
+            or target != row.get("_scheduler_target_trade_date")
+        ):
+            continue
+        try:
+            with engine.connect() as connection:
+                history = _load_completed_stock_finance_history(
+                    connection, target=target,
+                    current_linux_build_sha=_scheduler_build_commit_sha(), decision_at=now,
+                )
+        except Exception as exc:
+            logger.warning("Stock finance completion lookup unavailable: %s", type(exc).__name__)
+            row["_stock_finance_completion_unavailable"] = True
+            continue
+        if history and history["task_id"] == row.get("id"):
+            row["_completed_stock_finance_target"] = target
+
+
 def _latest_daily_histories_for_target(
     history_rows: list[dict],
     *,
     expected_trade_date: str,
     expected_build_sha: str,
     component_build_shas: dict[str, str] | None = None,
+    completed_stock_finance_history: dict | None = None,
 ) -> dict[str, dict]:
     """Pick the latest self-verified history per task for one target/build.
 
@@ -3750,6 +3917,8 @@ def _latest_daily_histories_for_target(
         ):
             continue
         selected[task_type] = history
+    if completed_stock_finance_history is not None:
+        selected["stock_finance"] = completed_stock_finance_history
     return selected
 
 
@@ -3761,6 +3930,7 @@ def evaluate_immutable_daily_dependency_histories(
     expected_trade_date: str,
     expected_build_sha: str,
     component_build_shas: dict[str, str] | None = None,
+    completed_stock_finance_history: dict | None = None,
 ) -> tuple[bool, str]:
     """Bind the daily DAG to immutable validated run identities and inputs."""
 
@@ -3793,6 +3963,9 @@ def evaluate_immutable_daily_dependency_histories(
         producer_build_sha = _task_component_build_sha(
             dependency, build_sha, component_build_shas=component_build_shas,
         )
+        if dependency == "stock_finance" and upstream is completed_stock_finance_history:
+            # This original history was bound to the signed same-contract stage and seal.
+            producer_build_sha = str(upstream.get("build_sha") or "").strip().lower()
         run_uid = str(upstream.get("run_uid") or "").strip().lower()
         run_at = _coerce_datetime(upstream.get("run_at"))
         finished_at = _coerce_datetime(upstream.get("finished_at"))
@@ -4221,6 +4394,7 @@ def _strategy_pipeline_dependencies_ready(
     expected_trade_date = str(
         row.get("_scheduler_target_trade_date") or ""
     ).strip()
+    finance_history = None
     if evidence_dependencies is not None:
         try:
             parsed_expected_trade_date = date.fromisoformat(
@@ -4237,7 +4411,7 @@ def _strategy_pipeline_dependencies_ready(
                 for item in connection.execute(
                     text(
                         "SELECT task_type, enabled, last_triggered_at, "
-                        "last_run_status, last_run_output FROM st_scheduled_tasks "
+                        "last_run_status, last_run_output, id FROM st_scheduled_tasks "
                         f"WHERE task_type IN ({placeholders}) "
                         "ORDER BY task_type, id"
                     ),
@@ -4249,6 +4423,11 @@ def _strategy_pipeline_dependencies_ready(
                     connection, dependency_types,
                     local_build_sha=_scheduler_build_commit_sha(),
                 )
+                if "stock_finance" in evidence_dependencies:
+                    finance_history = _load_completed_stock_finance_history(
+                        connection, target=expected_trade_date,
+                        current_linux_build_sha=component_build_shas["linux"], decision_at=now,
+                    )
                 history_rows = [
                     dict(item)
                     for item in connection.execute(
@@ -4300,12 +4479,18 @@ def _strategy_pipeline_dependencies_ready(
         )
         if duplicate_task:
             return False, f"{duplicate_task}:missing_or_duplicate"
+        if finance_history and not any(
+            item.get("task_type") == "stock_finance" and item.get("id") == finance_history["task_id"]
+            for item in task_rows
+        ):
+            return False, "stock_finance:history_task_mismatch"
         expected_build_sha = _scheduler_build_commit_sha()
         latest_histories = _latest_daily_histories_for_target(
             history_rows,
             expected_trade_date=expected_trade_date,
             expected_build_sha=expected_build_sha,
             component_build_shas=component_build_shas,
+            completed_stock_finance_history=finance_history,
         )
         downstream_history = latest_histories.get(task_type)
         selected_histories = [
@@ -4322,6 +4507,7 @@ def _strategy_pipeline_dependencies_ready(
             expected_trade_date=expected_trade_date,
             expected_build_sha=expected_build_sha,
             component_build_shas=component_build_shas,
+            completed_stock_finance_history=finance_history,
         )
         if ready and "qmt_stock_daily_canonical" in evidence_dependencies:
             try:
@@ -8650,11 +8836,16 @@ def _build_daily_result_delivery_receipt(
     component_build_shas = _dependency_component_build_shas(
         connection, required_dependencies, local_build_sha=build_sha,
     )
+    finance_history = _load_completed_stock_finance_history(
+        connection, target=target,
+        current_linux_build_sha=component_build_shas["linux"], decision_at=scheduler_run_at,
+    )
     latest_by_type = _latest_daily_histories_for_target(
         dependency_rows,
         expected_trade_date=target,
         expected_build_sha=build_sha,
         component_build_shas=component_build_shas,
+        completed_stock_finance_history=finance_history,
     )
     if frozen_announcement is not None:
         exact_announcements = [
@@ -8684,6 +8875,7 @@ def _build_daily_result_delivery_receipt(
         expected_trade_date=target,
         expected_build_sha=build_sha,
         component_build_shas=component_build_shas,
+        completed_stock_finance_history=finance_history,
     )
     if not ready:
         raise RuntimeError(f"daily delivery base data differs: {reason}")
@@ -10813,6 +11005,8 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                     rows,
                     now=now,
                 )
+                if os.name != "nt":
+                    _attach_completed_stock_finance_target(engine, rows, now=now)
                 release_authorized, release_authorization_reason = (
                     _attach_release_catchup_authorization(
                         engine,
@@ -10872,6 +11066,11 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
             formal_recovery_draining = False
             for row in candidates:
                 if formal_recovery_draining and not _uses_alert_lane(row):
+                    continue
+                if (
+                    row.get("_completed_stock_finance_target")
+                    or row.get("_stock_finance_completion_unavailable")
+                ):
                     continue
                 task_id = row["id"]
                 task_name = row["task_name"]
