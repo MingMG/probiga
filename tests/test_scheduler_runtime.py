@@ -1333,7 +1333,6 @@ class SchedulerRuntimeTest(unittest.TestCase):
             "stock_finance",
             "capital_flow_batch_fast",
             "target_turnover_snapshot",
-            "analysis_upper_evidence_prepare",
             "analysis_fast",
             "strategy_governance_daily",
         })
@@ -5048,7 +5047,6 @@ def test_release_catchup_dependency_graph_is_acyclic_and_never_holds_worker_lane
     }
     fast_dependencies = morning_dependencies | {
         "target_turnover_snapshot",
-        "analysis_upper_evidence_prepare",
         "qmt_membership_snapshot",
     }
     assert set(graph["analysis_fast"]) == fast_dependencies
@@ -6974,13 +6972,13 @@ def test_release_daily_analysis_rejects_exact_build_dependency_for_other_date():
         "_release_expected_target_available": True,
         "_release_expected_target_date": "2026-08-27",
     }
-    upper = _release_terminal_row(
-        "analysis_upper_evidence_prepare",
+    turnover = _release_terminal_row(
+        "target_turnover_snapshot",
         task_id=995,
         build_sha=build_sha,
         target_date="2026-08-26",
     )
-    upper.update(
+    turnover.update(
         {
             "_release_expected_target_required": True,
             "_release_expected_target_available": True,
@@ -6993,10 +6991,10 @@ def test_release_daily_analysis_rejects_exact_build_dependency_for_other_date():
     ):
         ready, reason = scheduler_runtime._release_catchup_dependencies_ready(
             downstream,
-            [downstream, upper],
+            [downstream, turnover],
         )
     assert not ready
-    assert reason == "analysis_upper_evidence_prepare:target_date_mismatch"
+    assert reason == "target_turnover_snapshot:target_date_mismatch"
 
 
 @pytest.mark.parametrize(
@@ -8002,6 +8000,18 @@ def test_daily_analysis_dag_binds_immutable_run_build_date_and_input_root(
         )
     )
     assert ready, reason
+
+    if downstream_type in {"analysis_fast", "strategy_governance_daily"}:
+        failed_upper = {
+            "task_type": "analysis_upper_evidence_prepare",
+            "status": "failed",
+            "output": "MyQuant evidence unavailable",
+        }
+        ready, reason = scheduler_runtime.evaluate_immutable_daily_dependency_histories(
+            downstream_type, [*histories, failed_upper], now=now,
+            expected_trade_date="2026-08-27", expected_build_sha=build_sha,
+        )
+        assert ready, reason
 
     for notice_status in ("failed", "running"):
         notice = {

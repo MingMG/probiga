@@ -2949,7 +2949,24 @@ def test_common_cutoff_later_chunk_failure_cannot_return_partial_receipts(monkey
     engine.dispose()
 
 
-@pytest.mark.parametrize("fault", [None, "predecessor", "later-timeout"])
+@pytest.mark.parametrize("stage, exposed", [("batch-payload:440", True), ("untrusted endpoint text", False)])
+def test_common_cutoff_reports_only_fixed_announcement_reply_stages(monkeypatch, stage, exposed):
+    from server.common.qmt_announcement_pit import LIVE_ANNOUNCEMENT_BATCH_REPLY_DEADLINE, QMTAnnouncementBlocked
+
+    engine, kwargs = _sealed_common_cutoff_case()
+
+    def timeout(*_args, **_kwargs):
+        raise QMTAnnouncementBlocked(LIVE_ANNOUNCEMENT_BATCH_REPLY_DEADLINE, stage)
+
+    monkeypatch.setattr("server.common.qmt_announcement_pit.validate_complete_announcement_batch", timeout)
+    result = resolve_common_fact_cutoff(engine, **kwargs, require_qmt_event_batch=True)
+    assert result["status"] == PIT_DATA_BLOCKED
+    assert result["reason"] == LIVE_ANNOUNCEMENT_BATCH_REPLY_DEADLINE + (f":{stage}" if exposed else "")
+    assert result["receipts"] == []
+    engine.dispose()
+
+
+@pytest.mark.parametrize("fault", [None, "predecessor", "later-timeout", "missing-payload"])
 def test_live_common_cutoff_preserves_full_event_chains_with_bounded_mysql_transport(
     monkeypatch, tmp_path, fault,
 ):
@@ -3030,39 +3047,126 @@ def test_live_common_cutoff_preserves_full_event_chains_with_bounded_mysql_trans
         assert next(row for row in expected["receipts"] if row["stock_code"] == codes[-1]
                     and row["fact_kind"] == "event")["batch_id"] == publication["batch_id"]
 
+    empty_kwargs = dict(
+        fact_kind="event", codes=codes, decision_at=datetime(2026, 8, 30, 18, 31),
+        fact_cutoff_at=cutoff, start_date=start, end_date=cutoff.date(),
+        source=CNINFO_ANNOUNCEMENT_SOURCE, batch_id=publication["batch_id"],
+    )
+    if fault is None:
+        expected_empty, expected_errors = pit_module._authoritative_empty_coverage(engine, **empty_kwargs)
+        assert codes[1] in expected_empty and codes[0] not in expected_empty
+        assert codes[-1] not in expected_empty and expected_errors == {}
+        event_kwargs = dict(
+            codes=codes, decision_at=kwargs["decision_at"], fact_cutoff_at=expected["fact_cutoff_at"],
+            start_date=start, end_date=cutoff.date(), require_qmt_complete_batch=True,
+        )
+        expected_events = load_event_facts(engine, **event_kwargs)
+        assert expected_events.status_for(codes[0]) == PIT_AVAILABLE
+        assert expected_events.status_for(codes[1]) == PIT_AVAILABLE
+        assert expected_events.status_for(codes[-1]) == PIT_NO_ROWS
+
+    payload_budget = 7000
+    monkeypatch.setattr("server.common.qmt_announcement_pit.VALIDATION_READ_PAYLOAD_BYTES", payload_budget)
+    with engine.connect() as connection:
+        sizes = dict(connection.execute(text(
+            f"SELECT coverage_id, LENGTH(CAST(payload_json AS BLOB)) FROM {SOURCE_COVERAGE_TABLE}"
+        )).tuples().all())
     mysql_reader = _mysql_seal_transport(engine)
-    reads = []
+    inventories, size_reads, payloads = [], [], []
 
     def record(connection, _cursor, sql, parameters, context, _many):
-        if "ORDER BY fact_kind, stock_code, scope_hash, revision_no" in sql:
+        if "FORCE INDEX (uk_pit_coverage_scope_revision)" in sql:
             bindings = context.compiled_parameters[0]
-            chunk = [value for key, value in bindings.items() if key.startswith("codes_")]
-            reads.append((connection.get_transaction(), chunk, sql, context.execution_options))
-            if fault == "later-timeout" and len(reads) == 2:
+            scopes = [value for key, value in bindings.items() if key.startswith("scope_hashes_")]
+            inventories.append((connection.get_transaction(), scopes, sql, context.execution_options))
+        if "FORCE INDEX (PRIMARY)" in sql and "OCTET_LENGTH(payload_json)" in sql and (
+            "COMPRESS(payload_json)" not in sql and "AND batch_id=" not in sql
+        ):
+            bindings = context.compiled_parameters[0]
+            ids = [value for key, value in bindings.items() if key.startswith("coverage_ids_")]
+            size_reads.append((connection.get_transaction(), ids))
+        if "FORCE INDEX (PRIMARY) WHERE coverage_id IN" in sql:
+            bindings = context.compiled_parameters[0]
+            ids = [value for key, value in bindings.items() if key.startswith("coverage_ids_")]
+            payloads.append((connection.get_transaction(), ids, sql, context.execution_options))
+            if fault == "later-timeout" and len(inventories) == 2:
                 raise OperationalError(sql, parameters, Exception(3024, "execution deadline"))
-        return sql.replace(" FORCE INDEX (PRIMARY)", ""), parameters
+            if fault == "missing-payload" and len(inventories) == 2:
+                sql += f" AND coverage_id<>'{ids[0]}'"
+        return sql.replace(" FORCE INDEX (PRIMARY)", "").replace(
+            " FORCE INDEX (uk_pit_coverage_scope_revision)", "",
+        ), parameters
+
+    def assert_bounded_reads():
+        assert [scopes for _, scopes, _, _ in inventories] == [
+            sorted(pit_module._source_coverage_scope_hash("event", code, CNINFO_ANNOUNCEMENT_SOURCE)
+                   for code in group)
+            for group in (codes[:40], codes[40:])
+        ]
+        transaction = inventories[0][0]
+        assert transaction is not None and all(row[0] is transaction for row in inventories + size_reads + payloads)
+        assert all(
+            "payload_json" not in sql and "known_at<=" in sql and "received_at<=" in sql and "batch_id=" not in sql
+            and options["stream_results"]
+            for _, _, sql, options in inventories
+        )
+        assert size_reads and all(0 < len(ids) <= 40 for _, ids in size_reads)
+        assert payloads and all(
+            len(ids) <= 40 and (len(ids) == 1 or sum(sizes[key] for key in ids) <= payload_budget)
+            and "COMPRESS(payload_json)" in sql and "MAX_EXECUTION_TIME(60000)" in sql
+            and options["stream_results"]
+            for _, ids, sql, options in payloads
+        )
 
     event.listen(engine, "before_cursor_execute", record, retval=True)
+    selections = []
     try:
-        actual = resolve_common_fact_cutoff(mysql_reader, **kwargs)
+        actual = resolve_common_fact_cutoff(mysql_reader, **kwargs, capture_historical_selection=selections.append)
+        assert_bounded_reads()
+        if fault is None:
+            inventories.clear()
+            size_reads.clear()
+            payloads.clear()
+            assert pit_module._authoritative_empty_coverage(mysql_reader, **empty_kwargs) == (
+                expected_empty, expected_errors,
+            )
+            assert_bounded_reads()
     finally:
         event.remove(engine, "before_cursor_execute", record)
-    assert [chunk for _, chunk, _, _ in reads] == [codes[:40], codes[40:]]
-    assert reads[0][0] is not None and all(transaction is reads[0][0] for transaction, *_ in reads)
-    assert all(
-        "COMPRESS(payload_json)" in sql and "MAX_EXECUTION_TIME(60000)" in sql
-        and "batch_id=" not in sql and options["stream_results"]
-        for _, _, sql, options in reads
-    )
-    if fault == "later-timeout":
+    if fault in {"later-timeout", "missing-payload"}:
         assert actual["status"] == PIT_DATA_BLOCKED
-        assert actual["reason"] == (
-            "PIT_COMMON_CUTOFF_SCHEMA_UNAVAILABLE:"
-            "QMT_ANNOUNCEMENT_LIVE_BATCH_REPLY_DEADLINE:common-cutoff-coverage:40"
+        assert actual["reason"] == "PIT_COMMON_CUTOFF_SCHEMA_UNAVAILABLE:" + (
+            "QMT_ANNOUNCEMENT_LIVE_BATCH_REPLY_DEADLINE:common-cutoff-coverage:40:payload:0"
+            if fault == "later-timeout" else "ValueError"
         )
         assert actual["receipts"] == [] and actual["receipt_root_hash"] == ""
     else:
         assert actual == expected
+    if fault is None:
+        assert len(selections) == 1
+        proof = selections[0]
+        assert proof.selection.batch["batch_root_hash"] == publication["batch_root_hash"]
+        assert proof.selection.members[codes[-1]][1] is False
+        assert "payload_json" not in proof.selection.members[codes[0]][0]
+
+        def unexpected_read(*_args, **_kwargs):
+            pytest.fail("a sealed live sidecar must avoid another announcement or coverage proof read")
+
+        monkeypatch.setattr(pit_module, "_authoritative_empty_coverage", unexpected_read)
+        monkeypatch.setattr(
+            "server.common.qmt_announcement_pit.validate_complete_announcement_batch", unexpected_read,
+        )
+        assert load_event_facts(mysql_reader, **event_kwargs, historical_selection=proof) == expected_events
+        for mismatch in (
+            {"codes": codes[:-1]}, {"decision_at": "2026-08-30 18:31:01"},
+            {"fact_cutoff_at": cutoff - timedelta(seconds=1)}, {"start_date": start - timedelta(days=1)},
+        ):
+            rejected = load_event_facts(mysql_reader, **{**event_kwargs, **mismatch}, historical_selection=proof)
+            assert rejected.reason_for(codes[0]) == "PIT_EVENT_VALIDATED_LIVE_SCOPE_MISMATCH"
+        wrong_engine = load_event_facts(engine, **event_kwargs, historical_selection=proof)
+        assert wrong_engine.reason_for(codes[0]) == "PIT_EVENT_VALIDATED_LIVE_SCOPE_MISMATCH"
+    else:
+        assert selections == []
     engine.dispose()
 
 

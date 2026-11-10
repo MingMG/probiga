@@ -113,6 +113,7 @@ HISTORICAL_CAPTURE_DEADLINE = "QMT_ANNOUNCEMENT_RECONSTRUCTION_CAPTURE_DEADLINE"
 HISTORICAL_PUBLISH_DEADLINE = "QMT_ANNOUNCEMENT_RECONSTRUCTION_PUBLISH_DEADLINE"
 PUBLISH_COMMIT_UNKNOWN = "QMT_ANNOUNCEMENT_PUBLISH_COMMIT_UNKNOWN"
 VALIDATION_READ_BATCH_SIZE = 40
+VALIDATION_READ_PAYLOAD_BYTES = 4 * 1024 * 1024
 LIVE_ANNOUNCEMENT_BATCH_QUERY_TIMEOUT_MS = 60_000
 LIVE_ANNOUNCEMENT_BATCH_VALIDATION_BUDGET_SECONDS = 15 * 60
 LIVE_ANNOUNCEMENT_BATCH_VALIDATION_DEADLINE = "QMT_ANNOUNCEMENT_LIVE_BATCH_VALIDATION_DEADLINE"
@@ -2274,6 +2275,59 @@ def _live_announcement_reply_budget(connection: Any, *, deadline: float, stage: 
     check_reply()
 
 
+def _bounded_announcement_payload_keys(
+    keys: Sequence[tuple[str, int]], *, max_rows: int = VALIDATION_READ_BATCH_SIZE,
+) -> Iterator[list[tuple[str, int]]]:
+    """Keep payload reads small, isolating any indivisible oversized row."""
+    if max_rows <= 0:
+        raise ValueError("announcement payload batch row limit must be positive")
+    batch: list[tuple[str, int]] = []
+    batch_bytes = 0
+    for key in keys:
+        _, payload_bytes = key
+        if type(payload_bytes) is not int or payload_bytes <= 0:
+            raise ValueError("announcement payload byte size differs")
+        if batch and (
+            len(batch) == max_rows
+            or batch_bytes + payload_bytes > VALIDATION_READ_PAYLOAD_BYTES
+        ):
+            yield batch
+            batch = []
+            batch_bytes = 0
+        if payload_bytes > VALIDATION_READ_PAYLOAD_BYTES:
+            # The canonical payload must still be read and verified in full.
+            yield [key]
+        else:
+            batch.append(key)
+            batch_bytes += payload_bytes
+    if batch:
+        yield batch
+
+
+def _read_live_announcement_payload_sizes(
+    connection: Any, *, source: str, batch_id: str | None = None,
+    coverage_ids: Sequence[str], deadline: float, stage: str,
+) -> dict[str, int]:
+    mysql = connection.dialect.name == "mysql"
+    timeout_hint = _live_announcement_read_hint(mysql=mysql, deadline=deadline, stage=stage)
+    index_hint = " FORCE INDEX (PRIMARY)" if mysql else ""
+    batch_filter = " AND batch_id=:batch_id" if batch_id is not None else ""
+    payload_bytes = "OCTET_LENGTH(payload_json)" if mysql else "LENGTH(CAST(payload_json AS BLOB))"
+    statement = text(
+        f"SELECT {timeout_hint}coverage_id, {payload_bytes} FROM st_pit_source_coverage{index_hint} "
+        f"WHERE fact_kind='event' AND source=:source{batch_filter} AND coverage_id IN :coverage_ids"
+    ).bindparams(bindparam("coverage_ids", expanding=True))
+    params: dict[str, Any] = {"source": source, "coverage_ids": coverage_ids}
+    if batch_id is not None:
+        params["batch_id"] = batch_id
+    with _live_announcement_reply_budget(connection, deadline=deadline, stage=stage):
+        rows = connection.execute(statement, params).tuples().all()
+    sizes = dict(rows)
+    if len(rows) != len(coverage_ids) or sizes.keys() != set(coverage_ids):
+        raise ValueError("batch coverage sizes differ from inventory")
+    return sizes
+
+
 def _read_live_announcement_payload_rows(
     connection: Any, *, source: str, batch_id: str,
     coverage_ids: Sequence[str], deadline: float, stage: str,
@@ -2324,15 +2378,30 @@ def _load_live_announcement_batch_rows(
         raise ValueError("batch stock set differs from catalog")
     for offset in range(0, len(keys), VALIDATION_READ_BATCH_SIZE):
         expected = keys[offset : offset + VALIDATION_READ_BATCH_SIZE]
-        rows = _read_live_announcement_payload_rows(
-            connection, source=source, batch_id=batch_id,
-            coverage_ids=[coverage_id for coverage_id, _ in expected],
-            deadline=deadline, stage=f"batch-payload:{offset}",
+        codes_by_id = dict(expected)
+        sizes = _read_live_announcement_payload_sizes(
+            connection, source=source, batch_id=batch_id, coverage_ids=list(codes_by_id),
+            deadline=deadline, stage=f"batch-payload-size:{offset}",
         )
-        for key, row in zip(expected, sorted(rows, key=lambda row: row["stock_code"]), strict=True):
-            if tuple(key) != (row["coverage_id"], row["stock_code"]):
-                raise ValueError("batch coverage row differs from inventory")
-            yield row
+        sized_keys = [(coverage_id, sizes[coverage_id]) for coverage_id, _ in expected]
+        payload_offset = offset
+        for payload_keys in _bounded_announcement_payload_keys(sized_keys):
+            rows = _read_live_announcement_payload_rows(
+                connection, source=source, batch_id=batch_id,
+                coverage_ids=[coverage_id for coverage_id, _ in payload_keys],
+                deadline=deadline, stage=f"batch-payload:{payload_offset}",
+            )
+            for (coverage_id, payload_bytes), row in zip(
+                payload_keys, sorted(rows, key=lambda row: row["stock_code"]), strict=True,
+            ):
+                if (
+                    coverage_id != row["coverage_id"]
+                    or codes_by_id[coverage_id] != row["stock_code"]
+                    or payload_bytes != len(row["payload_json"].encode("utf-8"))
+                ):
+                    raise ValueError("batch coverage row differs from inventory")
+                yield row
+            payload_offset += len(payload_keys)
 
 
 def validate_complete_qmt_announcement_batch(
@@ -3379,6 +3448,7 @@ def validate_complete_announcement_batch(
     engine: Engine,
     *,
     capture_historical_selection: Callable[[HistoricalAnnouncementSelection], None] | None = None,
+    capture_live_reuse: Callable[[], None] | None = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
     """Prefer QMT and use a fully proven fallback batch only when absent.
@@ -3390,7 +3460,7 @@ def validate_complete_announcement_batch(
     """
 
     try:
-        return validate_complete_qmt_announcement_batch(
+        proof = validate_complete_qmt_announcement_batch(
             engine, source=QMT_ANNOUNCEMENT_SOURCE, **kwargs
         )
     except QMTAnnouncementBlocked as exc:
@@ -3409,12 +3479,17 @@ def validate_complete_announcement_batch(
             # The downstream cutoff can reject a legacy QMT candidate before
             # the all-empty check. Keep that case on the explicit T validation.
             capture_historical_selection = None
+            capture_live_reuse = None
+    else:
+        if capture_live_reuse is not None:
+            capture_live_reuse()
+        return proof
     for fallback_source in (
         CNINFO_ANNOUNCEMENT_SOURCE,
         EASTMONEY_ANNOUNCEMENT_SOURCE,
     ):
         try:
-            return validate_complete_qmt_announcement_batch(
+            proof = validate_complete_qmt_announcement_batch(
                 engine, source=fallback_source, **kwargs
             )
         except QMTAnnouncementBlocked as exc:
@@ -3442,6 +3517,10 @@ def validate_complete_announcement_batch(
                         and historical_exc.detail == "no-common-batch"
                     ):
                         raise
+        else:
+            if capture_live_reuse is not None:
+                capture_live_reuse()
+            return proof
     raise QMTAnnouncementBlocked(
         "QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND", "no-common-batch"
     )

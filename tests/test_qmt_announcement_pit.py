@@ -4,6 +4,7 @@ from datetime import date, datetime, timedelta
 from hashlib import sha256
 import json
 from pathlib import Path
+from time import monotonic
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -24,6 +25,7 @@ from server.common.qmt_announcement_pit import (
     AnnouncementCatalog,
     AnnouncementCheckpoint,
     CNINFO_ANNOUNCEMENT_SOURCE,
+    EASTMONEY_ANNOUNCEMENT_SOURCE,
     QMTAnnouncementBlocked,
     QMT_ANNOUNCEMENT_SOURCE,
     _assert_pit_fact_schema_prepared,
@@ -1920,13 +1922,18 @@ def test_database_validator_proves_global_root_and_exact_catalog_binding():
 
 
 @pytest.mark.parametrize("source", [QMT_ANNOUNCEMENT_SOURCE, CNINFO_ANNOUNCEMENT_SOURCE])
-@pytest.mark.parametrize("inventory_damage", [None, "extra", "duplicate", "deadline"])
+@pytest.mark.parametrize(
+    "inventory_damage", [None, "extra", "duplicate", "deadline", "byte-limit", "size-mismatch"],
+)
 def test_live_batch_validates_full_inventory_with_bounded_compressed_primary_key_reads(
     monkeypatch, tmp_path, source, inventory_damage,
 ):
     from server.common.announcement_provider import CninfoMarketAnnouncementProvider, ProviderBackedAnnouncementAdapter
     from server.common.qmt_announcement_pit import (
-        LIVE_ANNOUNCEMENT_BATCH_VALIDATION_BUDGET_SECONDS, _publish_batch, build_batch_root,
+        LIVE_ANNOUNCEMENT_BATCH_VALIDATION_BUDGET_SECONDS,
+        _publish_batch,
+        _read_live_announcement_payload_sizes,
+        build_batch_root,
     )
     from tests.test_announcement_provider_fallback import _Client, _master, _row_at
     from tests.test_pit_finance_event_facts import _mysql_seal_transport
@@ -1979,6 +1986,23 @@ def test_live_batch_validates_full_inventory_with_bounded_compressed_primary_key
     expected = validate_complete_qmt_announcement_batch(engine, **options)
     assert expected["batch_root_hash"] == root
     assert expected["catalog_member_count"] == 45
+    with engine.connect() as connection:
+        raw_sizes = dict(connection.execute(text(
+            f"SELECT coverage_id, LENGTH(CAST(payload_json AS BLOB)) FROM {SOURCE_COVERAGE_TABLE}"
+        )).tuples().all())
+        if inventory_damage is None:
+            coverage_id = next(iter(raw_sizes))
+            size_args = dict(coverage_ids=[coverage_id], deadline=monotonic() + 5, stage="test-scope")
+            assert _read_live_announcement_payload_sizes(connection, source=source, **size_args) == {
+                coverage_id: raw_sizes[coverage_id],
+            }
+            with pytest.raises(ValueError, match="coverage sizes differ"):
+                _read_live_announcement_payload_sizes(
+                    connection, source=source, batch_id="different-batch", **size_args,
+                )
+    byte_limit = min(raw_sizes.values()) * 2
+    if inventory_damage == "byte-limit":
+        monkeypatch.setattr("server.common.qmt_announcement_pit.VALIDATION_READ_PAYLOAD_BYTES", byte_limit)
     if inventory_damage in {"extra", "duplicate"}:
         with engine.begin() as connection:
             row = dict(connection.execute(text(
@@ -2003,8 +2027,15 @@ def test_live_batch_validates_full_inventory_with_bounded_compressed_primary_key
         if f"FROM {SOURCE_COVERAGE_TABLE}" in sql:
             bindings = context.compiled_parameters[0]
             reads.append((connection.get_transaction(), sql, bindings, context.execution_options))
-            if inventory_damage == "deadline" and sum(key.startswith("coverage_ids_") for key in bindings) == 40:
+            if "COMPRESS(payload_json)" in sql and inventory_damage == "deadline" and sum(
+                key.startswith("coverage_ids_") for key in bindings
+            ) == 40:
                 elapsed[0] = LIVE_ANNOUNCEMENT_BATCH_VALIDATION_BUDGET_SECONDS + 1
+            if inventory_damage == "size-mismatch":
+                sql = sql.replace(
+                    "coverage_id, OCTET_LENGTH(payload_json)",
+                    "coverage_id, OCTET_LENGTH(payload_json) + 1",
+                )
         return sql.replace(" FORCE INDEX (PRIMARY)", ""), parameters
 
     event.listen(engine, "before_cursor_execute", record, retval=True)
@@ -2012,7 +2043,7 @@ def test_live_batch_validates_full_inventory_with_bounded_compressed_primary_key
         if inventory_damage == "deadline":
             with pytest.raises(QMTAnnouncementBlocked, match="LIVE_BATCH_VALIDATION_DEADLINE:batch-payload:0"):
                 validate_complete_qmt_announcement_batch(mysql_reader, **options)
-        elif inventory_damage:
+        elif inventory_damage in {"extra", "duplicate", "size-mismatch"}:
             with pytest.raises(QMTAnnouncementBlocked, match="COMPLETE_BATCH_NOT_FOUND"):
                 validate_complete_qmt_announcement_batch(mysql_reader, **options)
         else:
@@ -2023,15 +2054,55 @@ def test_live_batch_validates_full_inventory_with_bounded_compressed_primary_key
     assert len(inventory) == 1 and inventory[0][1]["inventory_limit"] == 46
     assert "MAX_EXECUTION_TIME" in inventory[0][0] and "known_at" not in inventory[0][0]
     assert reads[0][0] is not None and all(transaction is reads[0][0] for transaction, *_ in reads)
-    pk_reads = [(sql, params, execution) for _, sql, params, execution in reads if "coverage_id IN" in sql]
-    expected_chunks = {None: [1, 40, 5], "extra": [1], "duplicate": [1], "deadline": [1, 40]}
-    assert [sum(key.startswith("coverage_ids_") for key in params) for _, params, _ in pk_reads] == expected_chunks[inventory_damage]
+    size_reads = [
+        (sql, params) for _, sql, params, _ in reads
+        if "coverage_id, OCTET_LENGTH(payload_json)" in sql
+    ]
+    expected_size_chunks = [40, 5]
+    if inventory_damage in {"extra", "duplicate"}:
+        expected_size_chunks = []
+    elif inventory_damage in {"deadline", "size-mismatch"}:
+        expected_size_chunks = [40]
+    assert [sum(key.startswith("coverage_ids_") for key in params) for _, params in size_reads] == expected_size_chunks
+    assert all("FORCE INDEX (PRIMARY)" in sql and "ORDER BY" not in sql for sql, _ in size_reads)
+    pk_reads = [
+        (sql, params, execution) for _, sql, params, execution in reads
+        if "COMPRESS(payload_json)" in sql
+    ]
+    payload_id_chunks = [
+        [value for key, value in params.items() if key.startswith("coverage_ids_")]
+        for _, params, _ in pk_reads
+    ]
+    if inventory_damage == "byte-limit":
+        assert len(payload_id_chunks[0]) == 1
+        assert sorted(coverage_id for chunk in payload_id_chunks[1:] for coverage_id in chunk) == sorted(raw_sizes)
+        assert max(map(len, payload_id_chunks)) <= 2
+        assert all(len(chunk) == 1 or sum(raw_sizes[key] for key in chunk) <= byte_limit for chunk in payload_id_chunks)
+    else:
+        expected_chunks = {
+            None: [1, 40, 5], "extra": [1], "duplicate": [1],
+            "deadline": [1, 40], "size-mismatch": [1, 40],
+        }
+        assert list(map(len, payload_id_chunks)) == expected_chunks[inventory_damage]
     assert all(
         "COMPRESS(payload_json)" in sql and "FORCE INDEX (PRIMARY)" in sql
         and "MAX_EXECUTION_TIME(60000)" in sql and execution["stream_results"]
         for sql, _, execution in pk_reads
     )
     engine.dispose()
+
+
+def test_announcement_payload_batches_isolate_oversized_rows_without_dropping_keys():
+    from server.common.qmt_announcement_pit import (
+        VALIDATION_READ_PAYLOAD_BYTES,
+        _bounded_announcement_payload_keys,
+    )
+
+    cap = VALIDATION_READ_PAYLOAD_BYTES
+    keys = [("a", 1), ("b", cap - 1), ("c", 1), ("d", cap + 1), ("e", 1), ("f", 2), ("g", 3)]
+    assert list(_bounded_announcement_payload_keys(keys, max_rows=2)) == [
+        keys[:2], [keys[2]], [keys[3]], keys[4:6], [keys[6]],
+    ]
 
 
 def test_live_batch_reply_watchdog_interrupts_fetch_and_invalidates_the_checkout(monkeypatch):
@@ -2178,11 +2249,50 @@ def test_authoritative_reader_uses_cninfo_after_isolating_legacy_empty_qmt(
         module, "validate_complete_qmt_announcement_batch", validate
     )
 
-    assert validate_complete_announcement_batch(object()) == fallback_proof
+    captured = []
+    assert validate_complete_announcement_batch(
+        object(), capture_live_reuse=lambda: captured.append(True),
+    ) == fallback_proof
+    assert captured == []
     assert calls == [
         QMT_ANNOUNCEMENT_SOURCE,
         module.CNINFO_ANNOUNCEMENT_SOURCE,
     ]
+
+
+@pytest.mark.parametrize(
+    "winner",
+    [QMT_ANNOUNCEMENT_SOURCE, CNINFO_ANNOUNCEMENT_SOURCE, "historical", EASTMONEY_ANNOUNCEMENT_SOURCE],
+)
+def test_authoritative_reader_marks_only_successful_live_proof_reusable(monkeypatch, winner):
+    from server.common import qmt_announcement_pit as module
+
+    proof = {"source": winner}
+    captures = []
+
+    def validate_live(_engine, *, source):
+        if source == winner:
+            return proof
+        raise QMTAnnouncementBlocked(
+            "QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND", "no-common-batch",
+        )
+
+    def validate_historical(_engine, *, capture_historical_selection, **_kwargs):
+        if winner == "historical":
+            capture_historical_selection(winner)
+            return proof
+        raise QMTAnnouncementBlocked(
+            "QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND", "no-common-batch",
+        )
+
+    monkeypatch.setattr(module, "validate_complete_qmt_announcement_batch", validate_live)
+    monkeypatch.setattr(module, "validate_complete_historical_reconstruction_batch", validate_historical)
+    assert validate_complete_announcement_batch(
+        object(),
+        capture_live_reuse=lambda: captures.append("live"),
+        capture_historical_selection=captures.append,
+    ) is proof
+    assert captures == ["historical" if winner == "historical" else "live"]
 
 
 def test_authoritative_reader_does_not_hide_other_malformed_qmt_batches(

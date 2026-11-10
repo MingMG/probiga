@@ -22,6 +22,7 @@ import json
 import math
 import re
 from time import monotonic
+from types import MappingProxyType
 import zlib
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping
 from zoneinfo import ZoneInfo
@@ -59,7 +60,7 @@ FINANCE_ATOMIC_BATCH_INCREMENTAL_SCHEMA = (
 FINANCE_ATOMIC_BATCH_HISTORY_LIMIT = 20
 FINANCE_ATOMIC_BATCH_QUERY_CODE_LIMIT = 100
 COMMON_FACT_CUTOFF_QUERY_CODE_LIMIT = 500
-COMMON_LIVE_EVENT_COVERAGE_READ_DEADLINE_SECONDS = 60 * 60
+LIVE_EVENT_COVERAGE_READ_DEADLINE_SECONDS = 60 * 60
 EMPTY_COVERAGE_MYSQL_CODE_LIMIT = 40
 FINANCE_NONFILING_MYSQL_CODE_LIMIT = 40
 FINANCE_NONFILING_MYSQL_QUERY_TIMEOUT_MS = 60_000
@@ -1463,6 +1464,15 @@ def _coverage_receipt(
     )
 
 
+def _source_coverage_scope_hash(fact_kind: str, stock_code: str, source: str) -> str:
+    return canonical_hash({
+        "schema": "probiga.pit-source-coverage-scope.v1",
+        "fact_kind": fact_kind,
+        "stock_code": stock_code,
+        "source": source,
+    })
+
+
 def _prepare_source_coverage(
     *,
     fact_kind: str,
@@ -1693,14 +1703,7 @@ def _prepare_source_coverage(
         kind != "event" or source_name not in AUTHORITATIVE_EVENT_SOURCES
     ):
         raise ValueError("query-cutoff is reserved for authoritative announcements")
-    scope_hash = canonical_hash(
-        {
-            "schema": "probiga.pit-source-coverage-scope.v1",
-            "fact_kind": kind,
-            "stock_code": code,
-            "source": source_name,
-        }
-    )
+    scope_hash = _source_coverage_scope_hash(kind, code, source_name)
     payload = {
         "schema": "probiga.pit-source-coverage-payload.v1",
         "fact_kind": kind,
@@ -2844,13 +2847,9 @@ def _validate_coverage_chain(
         expected_watermark_hash = canonical_hash(watermark)
         if str(row.get("watermark_hash") or "") != expected_watermark_hash:
             raise ValueError("PIT coverage watermark hash differs")
-        expected_scope = canonical_hash(
-            {
-                "schema": "probiga.pit-source-coverage-scope.v1",
-                "fact_kind": str(row.get("fact_kind") or ""),
-                "stock_code": str(row.get("stock_code") or ""),
-                "source": str(row.get("source") or "")[:64],
-            }
+        expected_scope = _source_coverage_scope_hash(
+            str(row.get("fact_kind") or ""), str(row.get("stock_code") or ""),
+            str(row.get("source") or "")[:64],
         )
         if str(row.get("scope_hash") or "") != expected_scope:
             raise ValueError("PIT coverage scope hash differs")
@@ -2927,10 +2926,24 @@ def _authoritative_empty_coverage(
     def code_chains():
         with engine.connect() as connection:
             mysql = connection.dialect.name == "mysql"
-            if mysql and str(
-                connection.get_isolation_level() or ""
-            ).upper() not in {"REPEATABLE READ", "SERIALIZABLE"}:
-                raise ValueError("empty coverage requires a repeatable-read snapshot")
+            indexed_event = bool(
+                mysql and fact_kind == "event" and batch_id and source in AUTHORITATIVE_EVENT_SOURCES
+            )
+            snapshot_budget = nullcontext()
+            if indexed_event:
+                from server.common.qmt_announcement_pit import (
+                    _live_announcement_read_hint, _live_announcement_reply_budget,
+                )
+
+                deadline = monotonic() + LIVE_EVENT_COVERAGE_READ_DEADLINE_SECONDS
+                snapshot_budget = _live_announcement_reply_budget(
+                    connection, deadline=deadline, stage="event-empty-coverage-isolation",
+                )
+            with snapshot_budget:
+                if mysql and str(
+                    connection.get_isolation_level() or ""
+                ).upper() not in {"REPEATABLE READ", "SERIALIZABLE"}:
+                    raise ValueError("empty coverage requires a repeatable-read snapshot")
             # Keep each code's full chain in one chunk and limit the number of
             # codes transferred together on the remote MySQL connection.
             batch_size = max(1, int(COMMON_FACT_CUTOFF_QUERY_CODE_LIMIT))
@@ -2951,10 +2964,15 @@ def _authoritative_empty_coverage(
                     by_code_scope: dict[
                         str, dict[str, list[dict[str, Any]]]
                     ] = defaultdict(lambda: defaultdict(list))
-                    with connection.execute(
-                        statement, {**params, "codes": code_batch}
-                    ) as rows:
-                        for raw in rows.mappings():
+                    rows = (
+                        nullcontext(_read_indexed_event_coverage_rows(
+                            connection, codes=code_batch, source=source, decision_at=decision_at,
+                            deadline=deadline, stage=f"event-empty-coverage:{offset}",
+                        ))
+                        if indexed_event else connection.execute(statement, {**params, "codes": code_batch})
+                    )
+                    with rows as result:
+                        for raw in result if indexed_event else result.mappings():
                             row = dict(raw)
                             by_code_scope[str(row.get("stock_code") or "").zfill(6)][
                                 str(row.get("scope_hash") or "")
@@ -2962,6 +2980,10 @@ def _authoritative_empty_coverage(
                     for code in code_batch:
                         yield code, by_code_scope.get(code, {}), mysql
                     by_code_scope.clear()
+                if indexed_event:
+                    _live_announcement_read_hint(
+                        mysql=False, deadline=deadline, stage="event-empty-coverage-complete",
+                    )
 
     available: dict[str, dict[str, Any]] = {}
     invalid: dict[str, str] = {}
@@ -4559,6 +4581,74 @@ def _coverage_payload_row(
     return current
 
 
+def _read_indexed_event_coverage_rows(
+    connection: Connection, *, codes: list[str], source: str, decision_at: datetime,
+    deadline: float, stage: str,
+) -> Iterable[dict[str, Any]]:
+    """Read each complete source scope through its index and bounded PK replies."""
+    from server.common.qmt_announcement_pit import (
+        VALIDATION_READ_BATCH_SIZE,
+        _bounded_announcement_payload_keys,
+        _live_announcement_read_hint,
+        _live_announcement_reply_budget,
+        _read_live_announcement_payload_sizes,
+    )
+
+    code_by_scope = {_source_coverage_scope_hash("event", code, source): code for code in codes}
+    inventory_stage = f"{stage}:inventory"
+    hint = _live_announcement_read_hint(mysql=True, deadline=deadline, stage=inventory_stage)
+    inventory = text(
+        f"SELECT {hint}coverage_id, stock_code, scope_hash, revision_no "
+        f"FROM {SOURCE_COVERAGE_TABLE} FORCE INDEX (uk_pit_coverage_scope_revision) "
+        "WHERE scope_hash IN :scope_hashes AND fact_kind='event' AND source=:source "
+        "AND known_at<=:decision_at AND received_at<=:decision_at "
+        "ORDER BY scope_hash, revision_no"
+    ).bindparams(bindparam("scope_hashes", expanding=True)).execution_options(stream_results=True)
+    expected = {}
+    with _live_announcement_reply_budget(connection, deadline=deadline, stage=inventory_stage):
+        with connection.execute(inventory, {
+            "scope_hashes": sorted(code_by_scope), "source": source, "decision_at": decision_at,
+        }) as rows:
+            for coverage_id, code, scope, revision in rows.tuples():
+                if (not _HASH_RE.fullmatch(str(coverage_id)) or coverage_id in expected
+                        or code_by_scope.get(scope) != code
+                        or type(revision) is not int or revision <= 0):
+                    raise ValueError("event coverage inventory identity differs")
+                expected[coverage_id] = (code, scope, revision)
+
+    ordered_ids = list(expected)
+    payload_offset = 0
+    for offset in range(0, len(ordered_ids), VALIDATION_READ_BATCH_SIZE):
+        ids = ordered_ids[offset:offset + VALIDATION_READ_BATCH_SIZE]
+        sizes = _read_live_announcement_payload_sizes(
+            connection, source=source, coverage_ids=ids, deadline=deadline,
+            stage=f"{stage}:size:{offset}",
+        )
+        for batch in _bounded_announcement_payload_keys([(key, sizes[key]) for key in ids]):
+            payload_stage = f"{stage}:payload:{payload_offset}"
+            hint = _live_announcement_read_hint(mysql=True, deadline=deadline, stage=payload_stage)
+            payload = text(
+                f"SELECT {hint}{_coverage_payload_columns(True)} "
+                f"FROM {SOURCE_COVERAGE_TABLE} FORCE INDEX (PRIMARY) "
+                "WHERE coverage_id IN :coverage_ids"
+            ).bindparams(bindparam("coverage_ids", expanding=True)).execution_options(stream_results=True)
+            batch_ids = [coverage_id for coverage_id, _ in batch]
+            with _live_announcement_reply_budget(connection, deadline=deadline, stage=payload_stage):
+                with connection.execute(payload, {"coverage_ids": batch_ids}) as rows:
+                    packed_rows = rows.mappings().all()
+            actual = {row["coverage_id"]: row for row in packed_rows}
+            if len(packed_rows) != len(batch_ids) or actual.keys() != set(batch_ids):
+                raise ValueError("event coverage payload membership differs from inventory")
+            for coverage_id, payload_bytes in batch:
+                row = actual[coverage_id]
+                if ((row["stock_code"], row["scope_hash"], row["revision_no"]) != expected[coverage_id]
+                        or row["payload_json_bytes"] != payload_bytes
+                        or row["fact_kind"] != "event" or row["source"] != source):
+                    raise ValueError("event coverage payload identity differs from inventory")
+                yield dict(row)
+            payload_offset += len(batch_ids)
+
+
 def _load_latest_finance_atomic_seal_evidence(
     engine: Engine,
     *,
@@ -5021,9 +5111,44 @@ def load_finance_atomic_batch_seal(
 
 
 @dataclass(frozen=True)
+class _LiveEventSelection:
+    engine: Engine
+    decision_at: datetime
+    window_start: date
+    window_end: date
+    batch: Mapping[str, Any]
+    members: Mapping[str, tuple[Mapping[str, Any], bool]]
+
+
+@dataclass(frozen=True)
 class HistoricalEventRead:
-    selection: HistoricalAnnouncementSelection
+    """In-run authoritative event proof and the exact cutoff it resolved."""
+
+    selection: HistoricalAnnouncementSelection | _LiveEventSelection
     fact_cutoff_at: datetime
+
+
+def _announcement_batch_read_reason(error: Exception) -> str:
+    from server.common.qmt_announcement_pit import (
+        LIVE_ANNOUNCEMENT_BATCH_REPLY_DEADLINE,
+        LIVE_ANNOUNCEMENT_BATCH_REPLY_FAILED,
+        LIVE_ANNOUNCEMENT_BATCH_VALIDATION_DEADLINE,
+    )
+
+    reason = str(getattr(error, "reason_code", "") or "")
+    detail = str(getattr(error, "detail", "") or "")
+    if reason in {
+        LIVE_ANNOUNCEMENT_BATCH_REPLY_DEADLINE,
+        LIVE_ANNOUNCEMENT_BATCH_REPLY_FAILED,
+        LIVE_ANNOUNCEMENT_BATCH_VALIDATION_DEADLINE,
+    } and re.fullmatch(
+        r"snapshot-isolation|candidate-discovery|first-member-(?:inventory|payload)|"
+        r"stock-catalog|batch-(?:inventory|verified)|batch-payload(?:-size)?:[0-9]{1,8}|"
+        r"incremental-parent|candidate-read",
+        detail,
+    ):
+        return f"{reason}:{detail}"
+    return reason or f"PIT_QMT_EVENT_BATCH_UNAVAILABLE:{type(error).__name__}"
 
 
 def resolve_common_fact_cutoff(
@@ -5090,6 +5215,7 @@ def resolve_common_fact_cutoff(
         }
     event_batch: dict[str, Any] = {}
     historical_selections: list[HistoricalAnnouncementSelection] = []
+    reusable_live_batch: list[bool] = []
     if require_qmt_event_batch and include_event_facts:
         try:
             from server.common.qmt_announcement_pit import (
@@ -5105,13 +5231,14 @@ def resolve_common_fact_cutoff(
                 capture_historical_selection=(
                     historical_selections.append if capture_historical_selection else None
                 ),
+                capture_live_reuse=(
+                    (lambda: reusable_live_batch.append(True)) if capture_historical_selection else None
+                ),
             )
         except Exception as exc:
-            reason_code = str(getattr(exc, "reason_code", "") or "")
             return {
                 **blocked,
-                "reason": reason_code
-                or f"PIT_QMT_EVENT_BATCH_UNAVAILABLE:{type(exc).__name__}",
+                "reason": _announcement_batch_read_reason(exc),
             }
     historical_selection = next(iter(historical_selections), None)
     scan_event = include_event_facts and historical_selection is None
@@ -5173,7 +5300,7 @@ def resolve_common_fact_cutoff(
                     )
 
                     batch_size = min(batch_size, VALIDATION_READ_BATCH_SIZE)
-                    deadline = monotonic() + COMMON_LIVE_EVENT_COVERAGE_READ_DEADLINE_SECONDS
+                    deadline = monotonic() + LIVE_EVENT_COVERAGE_READ_DEADLINE_SECONDS
                     snapshot_budget = _live_announcement_reply_budget(
                         connection, deadline=deadline, stage="common-cutoff-isolation",
                     )
@@ -5191,17 +5318,15 @@ def resolve_common_fact_cutoff(
                         chains: dict[
                             tuple[str, str, str], list[dict[str, Any]]
                         ] = defaultdict(list)
-                        chunk_statement = statement
-                        reply_budget = nullcontext()
-                        if compressed:
-                            stage = f"common-cutoff-coverage:{offset}"
-                            hint = _live_announcement_read_hint(mysql=True, deadline=deadline, stage=stage)
-                            chunk_statement = text(
-                                f"SELECT {hint}{_coverage_payload_columns(True)} {coverage_scope_sql}"
-                            ).bindparams(bindparam("codes", expanding=True)).execution_options(stream_results=True)
-                            reply_budget = _live_announcement_reply_budget(connection, deadline=deadline, stage=stage)
-                        with reply_budget, connection.execute(chunk_statement, parameters) as rows:
-                            for raw in rows.mappings():
+                        rows = (
+                            nullcontext(_read_indexed_event_coverage_rows(
+                                connection, codes=parameters["codes"], source=parameters["event_source"],
+                                decision_at=decision, deadline=deadline, stage=f"common-cutoff-coverage:{offset}",
+                            ))
+                            if compressed else connection.execute(statement, parameters)
+                        )
+                        with rows as result:
+                            for raw in result if compressed else result.mappings():
                                 row = dict(raw)
                                 chains[(
                                     str(row.get("fact_kind") or "").lower(),
@@ -5226,6 +5351,7 @@ def resolve_common_fact_cutoff(
         for code, (row, _) in historical_selection.members.items():
             candidates[("event", code)].append(dict(row))
     bad: set[tuple[str, str]] = set()
+    live_scope_heads: set[str] = set()
     required_finance_report = finance_disclosure_gate(
         windows["finance"][1]
     ).minimum_report_date
@@ -5254,6 +5380,8 @@ def resolve_common_fact_cutoff(
             # sealed by the authoritative event batch rather than allowing a
             # later, valid live revision in the same scope to hide it.
             latest = sealed_rows[-1]
+            if reusable_live_batch and latest is chain[-1]:
+                live_scope_heads.add(str(latest["coverage_id"]))
         start, end = windows[kind]
         complete_window = (
             str(latest.get("coverage_status") or "") == "COMPLETE"
@@ -5438,8 +5566,20 @@ def resolve_common_fact_cutoff(
                 "data_excluded_codes", "data_excluded_reasons", "data_exclusions",
             )
         })
-    if historical_selection is not None and capture_historical_selection is not None:
-        capture_historical_selection(HistoricalEventRead(historical_selection, fact_cutoff))
+    if capture_historical_selection is not None:
+        event_selection = historical_selection
+        if event_selection is None and reusable_live_batch:
+            event_selection = _LiveEventSelection(
+                engine, decision, windows["event"][0], windows["event"][1],
+                MappingProxyType(dict(event_batch)), MappingProxyType({
+                    str(row["stock_code"]): (
+                        MappingProxyType(dict(row)), str(row["coverage_id"]) in live_scope_heads,
+                    )
+                    for row in selected if row["fact_kind"] == "event"
+                }),
+            )
+        if event_selection is not None:
+            capture_historical_selection(HistoricalEventRead(event_selection, fact_cutoff))
     return result
 
 
@@ -6077,19 +6217,18 @@ def load_event_facts(
                     codes=normalized_codes,
                     decision_at=decision,
                     fact_cutoff_at=fact_cutoff,
-                    reason="PIT_EVENT_VALIDATED_HISTORY_SCOPE_MISMATCH",
+                    reason=("PIT_EVENT_VALIDATED_LIVE_SCOPE_MISMATCH"
+                            if isinstance(selection, _LiveEventSelection)
+                            else "PIT_EVENT_VALIDATED_HISTORY_SCOPE_MISMATCH"),
                     status=PIT_DATA_BLOCKED,
                 )
         except Exception as exc:
-            reason = str(getattr(exc, "reason_code", "") or "") or (
-                f"PIT_QMT_EVENT_BATCH_UNAVAILABLE:{type(exc).__name__}"
-            )
             return _blocked_batch(
                 table_name=EVENT_REVISION_TABLE,
                 codes=normalized_codes,
                 decision_at=decision,
                 fact_cutoff_at=fact_cutoff,
-                reason=reason,
+                reason=_announcement_batch_read_reason(exc),
                 status=PIT_DATA_BLOCKED,
             )
     try:
@@ -6139,8 +6278,11 @@ def load_event_facts(
             }
     except Exception as exc:
         empty_coverage = {}
+        reason = str(getattr(exc, "reason_code", "") or "")
+        detail = str(getattr(exc, "detail", "") or "")
+        diagnostic = f"{reason}:{detail}" if reason else type(exc).__name__
         coverage_errors = {
-            code: f"PIT_EVENT_COVERAGE_SCHEMA_UNAVAILABLE:{type(exc).__name__}"
+            code: f"PIT_EVENT_COVERAGE_SCHEMA_UNAVAILABLE:{diagnostic}"
             for code in normalized_codes
         }
     facts: dict[str, list[dict[str, Any]]] = {}
