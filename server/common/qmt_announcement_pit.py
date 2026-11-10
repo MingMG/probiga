@@ -1713,6 +1713,14 @@ def _find_resumable_checkpoint(
     return None
 
 
+@dataclass(frozen=True)
+class _IncrementalBaselineCapture:
+    batch_id: str
+    coverage_start: date
+    capture_start: date
+    accept: Callable[[dict[str, list[dict[str, Any]]]], None]
+
+
 def _load_incremental_announcement_baseline(
     engine: Engine,
     *,
@@ -1760,6 +1768,8 @@ def _load_incremental_announcement_baseline(
                 prior_cutoff = _dt(evidence["fact_cutoff_at"])
                 prior_start = date.fromisoformat(str(evidence["window_start"])[:10])
                 prior_end = date.fromisoformat(str(evidence["window_end"])[:10])
+                batch_id = str(candidate["batch_id"])
+                accepted: list[dict[str, list[dict[str, Any]]]] = []
                 proof = validate_complete_qmt_announcement_batch(
                     engine,
                     codes=[catalog.codes[0]],
@@ -1768,46 +1778,17 @@ def _load_incremental_announcement_baseline(
                     window_start=max(coverage_window_start, prior_start),
                     window_end=min(capture_window_start, prior_end),
                     source=source,
+                    _baseline_capture=_IncrementalBaselineCapture(
+                        batch_id, coverage_window_start, capture_window_start, accepted.append,
+                    ),
                 )
-                batch_id = str(candidate["batch_id"])
-                if str(proof.get("batch_id") or "") != batch_id:
+                if str(proof.get("batch_id") or "") != batch_id or len(accepted) != 1:
                     continue
-                with engine.connect() as connection:
-                    rows = [
-                        dict(row)
-                        for row in connection.execute(
-                            text(
-                                "SELECT stock_code, payload_json "
-                                "FROM st_pit_source_coverage "
-                                "WHERE fact_kind='event' AND source=:source "
-                                "AND batch_id=:batch_id ORDER BY stock_code"
-                            ),
-                            {"source": source, "batch_id": batch_id},
-                        ).mappings()
-                    ]
-                if [str(row["stock_code"]).zfill(6) for row in rows] != list(
-                    catalog.codes
-                ):
+                baseline = accepted[0]
+                if list(baseline) != list(catalog.codes):
                     # Catalog additions/removals require a complete rebuild so
                     # a newly listed symbol never inherits an empty history.
                     continue
-                baseline: dict[str, list[dict[str, Any]]] = {}
-                for row in rows:
-                    code = str(row["stock_code"]).zfill(6)
-                    row_payload = json.loads(str(row.get("payload_json") or ""))
-                    source_rows = row_payload.get("source_rows")
-                    if not isinstance(source_rows, list):
-                        raise ValueError("baseline source rows are unavailable")
-                    baseline[code] = [
-                        dict(item)
-                        for item in source_rows
-                        if (
-                            isinstance(item, Mapping)
-                            and coverage_window_start
-                            <= _validated_source_publication_evidence(item)[0]
-                            < capture_window_start
-                        )
-                    ]
                 return baseline, {
                     "parent_batch_id": batch_id,
                     "parent_batch_root_hash": str(
@@ -2444,6 +2425,7 @@ def validate_complete_qmt_announcement_batch(
     window_end: date | str,
     fact_cutoff_at: datetime | str | None = None,
     source: str = QMT_ANNOUNCEMENT_SOURCE,
+    _baseline_capture: _IncrementalBaselineCapture | None = None,
 ) -> dict[str, Any]:
     """Prove one atomic, catalog-exact QMT event coverage batch.
 
@@ -2488,6 +2470,7 @@ def validate_complete_qmt_announcement_batch(
                     if str(connection.get_isolation_level()).upper() not in {"REPEATABLE READ", "SERIALIZABLE"}:
                         connection = connection.execution_options(isolation_level="REPEATABLE READ")
             by_batch: dict[str, dict[str, datetime]] = {}
+            candidate_filter = " AND batch_id=:baseline_batch_id" if _baseline_capture else ""
             code_limit = VALIDATION_INVENTORY_CODE_LIMIT if mysql else len(requested_codes)
             for offset in range(0, len(requested_codes), code_limit):
                 stage = f"candidate-discovery:{offset}" if mysql else "candidate-discovery"
@@ -2501,15 +2484,19 @@ def validate_complete_qmt_announcement_batch(
                     "AND stock_code IN :codes AND known_at<=:decision_at "
                     "AND received_at<=:decision_at AND coverage_status='COMPLETE' "
                     "AND window_start<=:window_start AND window_end>=:window_end"
+                    f"{candidate_filter}"
                 ).bindparams(bindparam("codes", expanding=True)).execution_options(stream_results=True)
+                parameters = {
+                    "source": source_name,
+                    "codes": requested_codes[offset:offset + code_limit],
+                    "decision_at": decision,
+                    "window_start": start,
+                    "window_end": end,
+                }
+                if _baseline_capture is not None:
+                    parameters["baseline_batch_id"] = _baseline_capture.batch_id
                 with _live_announcement_reply_budget(connection, deadline=deadline, stage=stage):
-                    with connection.execute(statement, {
-                        "source": source_name,
-                        "codes": requested_codes[offset:offset + code_limit],
-                        "decision_at": decision,
-                        "window_start": start,
-                        "window_end": end,
-                    }) as rows:
+                    with connection.execute(statement, parameters) as rows:
                         for batch_id, code, known_at in rows.tuples():
                             members = by_batch.setdefault(str(batch_id or ""), {})
                             stock_code = str(code or "").zfill(6)
@@ -2619,6 +2606,7 @@ def validate_complete_qmt_announcement_batch(
                     ))
                     requested_end_time = _qmt_time(event_cutoff)
                     entries: list[dict[str, Any]] = []
+                    baseline_rows: dict[str, list[dict[str, Any]]] = {}
                     cninfo_directory_anchors: set[tuple[Any, ...]] = set()
                     root = str(first_evidence.get("global_batch_root_hash") or "")
                     for row in _load_live_announcement_batch_rows(
@@ -2738,6 +2726,20 @@ def validate_complete_qmt_announcement_batch(
                                     ),
                                 ))
                         entries.append(entry)
+                        if _baseline_capture is not None:
+                            source_rows = payload.get("source_rows")
+                            if (not isinstance(source_rows, list)
+                                    or len(source_rows) != entry["result_count"]
+                                    or any(not isinstance(item, dict) for item in source_rows)
+                                    or payload.get("source_response_hash") != entry["source_response_hash"]
+                                    or _source_response_hash(source_rows) != entry["source_response_hash"]):
+                                raise ValueError("baseline source response hash or row count differs")
+                            baseline_rows[entry["stock_code"]] = [
+                                dict(item) for item in source_rows
+                                if _baseline_capture.coverage_start
+                                <= _validated_source_publication_evidence(item)[0]
+                                < _baseline_capture.capture_start
+                            ]
                     if (
                         source_name == CNINFO_ANNOUNCEMENT_SOURCE
                         and len(cninfo_directory_anchors) != 1
@@ -2839,6 +2841,9 @@ def validate_complete_qmt_announcement_batch(
                             candidate,
                         )
                     _live_announcement_read_hint(mysql=False, deadline=deadline, stage="batch-verified")
+                    if _baseline_capture is not None:
+                        # A rejected candidate never contributes rows to the next capture.
+                        _baseline_capture.accept(baseline_rows)
                     return {
                         "schema": QMT_ANNOUNCEMENT_BATCH_SCHEMA,
                         "status": "COMPLETE",
