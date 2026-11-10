@@ -4442,8 +4442,17 @@ class SchedulerRuntimeTest(unittest.TestCase):
         fake_proc.communicate.return_value = ("partial", "killed")
         fake_proc.returncode = -9
         scheduler_runtime._timeout_requested_task_ids.add(810)
+        argument_row = scheduler_runtime._task_argument_row
+
+        def after_initial_cutoff(row, **kwargs):
+            return argument_row(row, **{
+                **kwargs,
+                "now": datetime.fromisoformat(f"{kwargs['target_date']}T23:00:00"),
+            })
 
         with patch(
+            "server.api.scheduler_runtime._task_argument_row", side_effect=after_initial_cutoff,
+        ), patch(
             "server.api.scheduler_runtime._task_history_finish"
         ) as history_finish, patch(
             "server.api.scheduler_runtime.resolve_scheduler_script",
@@ -7332,15 +7341,21 @@ def test_release_date_dispatch_preserves_ordinary_and_live_snapshot_semantics():
         object(),
         now=datetime(2026, 8, 27, 18, 50, tzinfo=shanghai),
     ) == "2026-08-27"
+    with pytest.raises(RuntimeError, match="initial cutoff has not arrived"):
+        scheduler_runtime._task_argument_row(
+            ordinary,
+            now=datetime(2026, 8, 27, 10, 50, tzinfo=ZoneInfo("UTC")),
+            target_date="2026-08-27",
+        )
     utc_bound = scheduler_runtime._task_argument_row(
         ordinary,
-        now=datetime(2026, 8, 27, 10, 50, tzinfo=ZoneInfo("UTC")),
+        now=datetime(2026, 8, 27, 14, 50, tzinfo=ZoneInfo("UTC")),
         target_date="2026-08-27",
     )
-    assert utc_bound["_scheduler_execution_time"] == "2026-08-27T18:50:00"
-    assert utc_bound["_scheduler_pipeline_decision_at"] == (
-        "2026-08-27T18:50:00"
-    )
+    assert utc_bound["_scheduler_dispatch_time"] == "2026-08-27T22:50:00"
+    assert utc_bound["_scheduler_execution_time"] == "2026-08-27T22:20:00"
+    assert utc_bound["_scheduler_pipeline_decision_at"] == "2026-08-27T22:20:00"
+    assert utc_bound["_scheduler_pipeline_phase"] == "INITIAL"
 
     recovery_upper = scheduler_runtime._task_argument_row(
         {
@@ -7374,9 +7389,8 @@ def test_release_date_dispatch_preserves_ordinary_and_live_snapshot_semantics():
         target_date="2026-08-28",
         engine=NoUpperEngine(),
     )
-    assert recovery_analysis["_scheduler_pipeline_decision_at"] == (
-        "2026-08-30T02:00:00"
-    )
+    assert recovery_analysis["_scheduler_dispatch_time"] == "2026-08-30T02:00:00"
+    assert recovery_analysis["_scheduler_pipeline_decision_at"] == "2026-08-28T22:20:00"
 
     live_snapshot = {
         "task_type": "hot_rank_ths",

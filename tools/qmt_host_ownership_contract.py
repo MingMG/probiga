@@ -12,6 +12,7 @@ from server.common.exposure_risk_watch_task_contract import (
 )
 from tools.qmt_announcement_task_contract import (
     ANALYSIS_UPPER_EVIDENCE_CRON,
+    PREMARKET_ANNOUNCEMENT_TASK,
     QMT_ANNOUNCEMENT_FALLBACK_EGRESS_CONTRACT,
     QMT_ANNOUNCEMENT_FALLBACK_PROVIDER,
     TASK as QMT_ANNOUNCEMENT_TASK,
@@ -543,6 +544,7 @@ WINDOWS_QMT_EDGE_TASKS = (
     QMT_INTRADAY_REALTIME_TASK,
     QMT_MEMBERSHIP_SNAPSHOT_TASK,
     QMT_ANNOUNCEMENT_TASK,
+    PREMARKET_ANNOUNCEMENT_TASK,
     TASKS_BY_TYPE["qmt_local_gap_repair_execute"],
     TASKS_BY_TYPE["qmt_local_history_2024"],
     TASKS_BY_TYPE["qmt_reference_incremental"],
@@ -585,12 +587,13 @@ WINDOWS_QMT_EDGE_TASKS_BY_TYPE = {
     str(task["task_type"]): task for task in WINDOWS_QMT_EDGE_TASKS
 }
 WINDOWS_QMT_EDGE_FALLBACK_EGRESS_CONTRACTS_BY_TYPE = {
-    str(QMT_ANNOUNCEMENT_TASK["task_type"]): {
+    str(task["task_type"]): {
         **QMT_ANNOUNCEMENT_FALLBACK_EGRESS_CONTRACT,
-        "task_type": str(QMT_ANNOUNCEMENT_TASK["task_type"]),
-        "script_path": str(QMT_ANNOUNCEMENT_TASK["script_path"]),
-        "script_args": str(QMT_ANNOUNCEMENT_TASK["script_args"]),
-    },
+        "task_type": str(task["task_type"]),
+        "script_path": str(task["script_path"]),
+        "script_args": str(task["script_args"]),
+    }
+    for task in (QMT_ANNOUNCEMENT_TASK, PREMARKET_ANNOUNCEMENT_TASK)
 }
 LINUX_QMT_TASKS_BY_TYPE = {
     str(task["task_type"]): task for task in LINUX_QMT_TASKS

@@ -1744,7 +1744,7 @@ def test_daily_delivery_receipt_binds_cross_host_inputs_pool_and_governance(monk
                 executable_count INTEGER, canonical_pool_sha256 TEXT,
                 membership_snapshot_date DATE,
                 membership_snapshot_source TEXT,
-                membership_proof_sha256 TEXT, published_at DATETIME
+                membership_proof_sha256 TEXT, published_at DATETIME, started_at DATETIME
             )
         """))
         connection.execute(text("""
@@ -1812,7 +1812,7 @@ def test_daily_delivery_receipt_binds_cross_host_inputs_pool_and_governance(monk
             INSERT INTO st_recommended_run_history VALUES (
                 1, :run_uid, :target, :build_sha, 'done', 5205, 80, 12,
                 :pool_hash, :target, 'gj_big_qmt_inner', :membership_hash,
-                '2026-08-27 20:05:00'
+                '2026-08-27 20:05:00', '2026-08-27 20:04:00'
             )
         """), {
             "run_uid": analysis_run_uid,

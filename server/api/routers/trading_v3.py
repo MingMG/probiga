@@ -40,9 +40,12 @@ from server.common.strategy_governance_mode import (
     strategy_governance_database_deferred,
 )
 from server.common.canonical_decision_bridge import (
+    _pool_items as _canonical_governance_pool_items,
+    _target_rows as _canonical_governance_target_rows,
     canonical_governance_decision,
     canonical_governance_decision_for_run,
 )
+from server.engine.strategy_governance import load_completed_governance_revision_pair
 from server.trading_v3.config import config_hash, load_v3_config
 from server.trading_v3.decision_intelligence import (
     DecisionIntelligenceError,
@@ -51,6 +54,7 @@ from server.trading_v3.decision_intelligence import (
     optimize_advisory_portfolio,
 )
 from server.trading_v3.decision_truth import canonical_hash
+from server.trading_v3.pool_revision_diff import build_pool_revision_diff
 from server.trading_v3.horizon_contracts import (
     CalibrationEvidence,
     HORIZON_CONTRACT_SCHEMA,
@@ -2205,6 +2209,101 @@ def stock_pool(
     return _envelope(payload)
 
 
+def _governance_stock_pool_with_revision(governance: Mapping[str, Any]) -> dict[str, Any]:
+    pool = dict(governance.get("pool") or {})
+    pool.pop("supersedes_run_uid", None)
+    snapshot = governance.get("snapshot")
+    if not isinstance(snapshot, Mapping):
+        return pool
+    previous_uid = str(snapshot.get("supersedes_run_uid") or "")
+    run_uid = str(snapshot.get("run_uid") or "")
+    revision = snapshot.get("run_revision")
+    result_hash = _daily_canonical_result_hash(snapshot.get("canonical_result_hash"))
+    if (
+        snapshot.get("is_canonical") is True
+        and snapshot.get("result_mode") == "CANONICAL_PERSISTED"
+        and snapshot.get("input_ready") is True
+        and pool.get("source_system") == "STRATEGY_GOVERNANCE"
+        and pool.get("decision_scope") == "CANONICAL_GOVERNANCE"
+        and pool.get("decision_integrity_verified") is True
+        and pool.get("is_as_of_fallback") is not True
+        and pool.get("is_historical_fallback") is not True
+        and pool.get("run_uid") == run_uid
+        and pool.get("trade_date") == snapshot.get("trade_date")
+        and result_hash
+        and result_hash == _daily_canonical_result_hash(pool.get("canonical_result_hash"))
+        and type(revision) is int and revision > 1
+        and re.fullmatch(r"[0-9a-f]{32}", previous_uid)
+        and previous_uid not in {"0" * 32, run_uid}
+    ):
+        pool["supersedes_run_uid"] = previous_uid
+    return pool
+
+
+def _governance_pool_revision_members(
+    snapshot: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    targets = _canonical_governance_target_rows(snapshot)
+    items = _canonical_governance_pool_items(snapshot, targets)
+    pools = snapshot["pools"]
+    expected_codes = {
+        row["stock_code"]
+        for rows in (pools["observation"], pools["confirmation"], pools["tradable"], targets)
+        for row in rows
+    }
+    if (
+        any(
+            not isinstance(code, str) or not re.fullmatch(r"[0-9]{6}", code) or code == "000000"
+            for code in expected_codes
+        )
+        or {item["stock_code"] for item in items} != expected_codes
+    ):
+        raise ValueError("verified governance stock membership differs from V3 projection")
+    return {
+        "run_uid": snapshot["run_uid"],
+        "result_hash": snapshot["canonical_result_hash"],
+        "data_trade_date": snapshot["trade_date"],
+        "finished_at": snapshot["finished_at"],
+        "complete": True,
+        "stock_count": len(expected_codes),
+    }, items
+
+
+@router.get("/stock-pool/revision-diff")
+def stock_pool_revision_diff(
+    prior_run_uid: str = Query(pattern=r"^[0-9a-f]{32}$"),
+    next_run_uid: str = Query(pattern=r"^[0-9a-f]{32}$"),
+):
+    """Compare two explicit sealed governance revisions without changing a pool."""
+    if prior_run_uid == next_run_uid or "0" * 32 in (prior_run_uid, next_run_uid):
+        raise HTTPException(status_code=422, detail="DISTINCT_GOVERNANCE_RUN_UIDS_REQUIRED")
+    if strategy_governance_database_deferred():
+        raise HTTPException(status_code=503, detail="GOVERNANCE_DATABASE_DEFERRED")
+    try:
+        prior, successor = load_completed_governance_revision_pair(prior_run_uid, next_run_uid)
+        prior_identity, prior_rows = _governance_pool_revision_members(prior)
+        next_identity, next_rows = _governance_pool_revision_members(successor)
+        diff = build_pool_revision_diff(
+            prior_identity=prior_identity,
+            next_identity=next_identity,
+            prior_rows=prior_rows,
+            next_rows=next_rows,
+            time_field="finished_at",
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="COMPLETED_GOVERNANCE_REVISION_UNAVAILABLE") from exc
+    except (RuntimeError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail="GOVERNANCE_REVISION_PAIR_UNVERIFIED") from exc
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=503, detail="GOVERNANCE_DATABASE_UNAVAILABLE") from exc
+    return {
+        **_envelope(diff),
+        "comparison_time_source": "GOVERNANCE_RUN_FINISHED_AT",
+        "read_only": True,
+        "real_order_authority": False,
+    }
+
+
 def _stock_pool_payload(
     *,
     trade_date: date | None,
@@ -2225,7 +2324,7 @@ def _stock_pool_payload(
             latest_as_of=True,
         )
         if governance is not None:
-            payload = governance["pool"]
+            payload = _governance_stock_pool_with_revision(governance)
     if strategy_governance_database_deferred():
         payload = _deferred_stock_pool_projection(payload)
     verified_pool = bool(
@@ -2984,7 +3083,7 @@ def daily_result(
         else None
     )
     pool = (
-        dict(canonical.get("pool") or {})
+        _governance_stock_pool_with_revision(canonical)
         if isinstance(canonical, Mapping)
         else _daily_unavailable_stock_pool(resolved_trade_date)
     )

@@ -56,6 +56,7 @@ from tools.final_pool_delivery_task_contract import (
 )
 from tools.qmt_announcement_task_contract import (
     ANALYSIS_FAST_CRON,
+    PREMARKET_ANNOUNCEMENT_TASK,
     TASK as QMT_ANNOUNCEMENT_TASK,
 )
 from tools.qmt_host_ownership_contract import (
@@ -316,6 +317,7 @@ DERIVED_MARKET_TASKS = (
 )
 TASKS = [
     dict(QMT_ANNOUNCEMENT_TASK),
+    dict(PREMARKET_ANNOUNCEMENT_TASK),
     dict(QMT_CATALOG_CAPABILITY_TASK),
     dict(QMT_INDEX_CURRENT_TASK),
     dict(QMT_INDEX_KLINE_TASK),
@@ -625,7 +627,20 @@ TASKS = [
         "description": "已停用：canonical票池仅由22:20固定PIT流水线发布；早盘不得用不同cutoff覆盖前夜已验证票池。",
     },
     {
-        "task_name": "08:30外盘评分修正及票池更新",
+        "task_name": "08:15外部市场快照",
+        "task_type": "strategy_external_market_snapshot",
+        "group_name": "AI推荐",
+        "script_path": "tools/refresh_external_market_context.py",
+        "script_args": "--premarket --attempts 1 --json",
+        "cron_time": "08:15",
+        "interval_minutes": 0,
+        "enabled": 1,
+        "sort_order": 92,
+        "date_param": "",
+        "description": "独立采集外部市场快照，记录实际收到和入库时间。缺失时盘前版照常运行。",
+    },
+    {
+        "task_name": "08:30正式策略票池盘前修订",
         "task_type": "strategy_external_overlay",
         "group_name": "AI推荐",
         "script_path": "tools/run_strategy_external_overlay.py",
@@ -636,8 +651,8 @@ TASKS = [
         "sort_order": 92,
         "date_param": "",
         "description": (
-            "单次采集隔夜美股及早盘日韩市场，对前夜已验证候选做±3分封顶"
-            "的全局风险修正并生成治理修订；缺失按中性处理，不触发QMT补抓。"
+            "按08:30固定时点重算策略池；复用已验收的公告、行情、财务和资金数据。"
+            "有合格外盘快照时进行±3分风险修正。新版失败保留原票池，不触发QMT补抓。"
         ),
     },
     {

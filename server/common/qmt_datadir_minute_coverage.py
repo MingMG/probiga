@@ -76,7 +76,8 @@ def matrix_consume_budget(scope: dict) -> float:
 
 
 def validate_matrix(rows, *, day: str, scope: dict, deadline_seconds: float | None = None,
-                    progress=None, query_started=None, include_business_fingerprint: bool = False) -> dict:
+                    progress=None, query_started=None, include_business_fingerprint: bool = False,
+                    include_security_fingerprints: bool = False) -> dict:
     """Consume ordered rows in bounded memory; hash matches canonical_rows JSON."""
     from server.common.qmt_datadir_result import _normalize
 
@@ -110,6 +111,8 @@ def validate_matrix(rows, *, day: str, scope: dict, deadline_seconds: float | No
     current_code, count = None, 0
     digest = sha256(b"[")
     business_digest = sha256(b"[") if include_business_fingerprint else None
+    security_digest = None
+    security_fingerprints = {}
     business_fields = ("stock_code", "trade_time", "trade_date", "price", "change",
                        "change_pct", "volume", "amount", "qmt_code")
     consume_started = time.monotonic()
@@ -144,6 +147,13 @@ def validate_matrix(rows, *, day: str, scope: dict, deadline_seconds: float | No
                 raise ValueError("minute matrix native grid is incomplete")
             if code in seen_codes:
                 raise ValueError("minute matrix security ordering differs")
+            if security_digest is not None:
+                security_digest.update(b"]")
+                security_fingerprints[current_code] = {
+                    "row_count": len(current_times), "row_hash": security_digest.hexdigest(),
+                }
+            if include_security_fingerprints:
+                security_digest = sha256(b"[")
             seen_codes.add(code)
             current_code, current_times = code, set()
         if moment in current_times:
@@ -164,7 +174,12 @@ def validate_matrix(rows, *, day: str, scope: dict, deadline_seconds: float | No
             if business_digest is not None:
                 business_digest.update(b",")
         normalized = {str(key): normalize(value) for key, value in row.items()}
-        digest.update(encode(normalized).encode("utf-8"))
+        encoded = encode(normalized).encode("utf-8")
+        digest.update(encoded)
+        if security_digest is not None:
+            if len(current_times) > 1:
+                security_digest.update(b",")
+            security_digest.update(encoded)
         if business_digest is not None:
             business = {key: normalized[key] if key not in numbers or isinstance(row[key], Decimal)
                         else normalize(numbers[key])
@@ -192,6 +207,12 @@ def validate_matrix(rows, *, day: str, scope: dict, deadline_seconds: float | No
     if business_digest is not None:
         business_digest.update(b"]")
         fingerprint["business_row_hash"] = business_digest.hexdigest()
+    if security_digest is not None:
+        security_digest.update(b"]")
+        security_fingerprints[current_code] = {
+            "row_count": len(current_times), "row_hash": security_digest.hexdigest(),
+        }
+        fingerprint["security_fingerprints"] = security_fingerprints
     return fingerprint
 
 
@@ -344,7 +365,8 @@ def _mysql_matrix_rows(connection, day, *, scope, deadline, run_id=None):
 
 
 def persisted_matrix(engine, day: str, *, scope: dict, run_id: str = "",
-                     operation: str = "matrix_readback", include_business_fingerprint: bool = False) -> dict:
+                     operation: str = "matrix_readback", include_business_fingerprint: bool = False,
+                     include_security_fingerprints: bool = False) -> dict:
     progress = MinuteImportProgress(run_id=run_id,
         total_units=len(scope["codes"])*len(CORE_GRID), operation=operation, days=[day])
     consume_budget = matrix_consume_budget(scope)
@@ -377,7 +399,7 @@ def persisted_matrix(engine, day: str, *, scope: dict, run_id: str = "",
         try:
             return validate_matrix(rows, day=day, scope=scope, progress=progress,
                 query_started=query_started, include_business_fingerprint=include_business_fingerprint,
-                deadline_seconds=consume_budget)
+                include_security_fingerprints=include_security_fingerprints, deadline_seconds=consume_budget)
         except Exception as exc:
             progress.emit("consume", status="FAILED", error_type=type(exc).__name__,
                 budget_seconds=consume_budget)
