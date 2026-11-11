@@ -12,6 +12,7 @@ import logging
 import os
 from pathlib import Path
 import re
+from socket import gethostname
 import stat
 import subprocess
 import sys
@@ -58,7 +59,9 @@ from server.common.authoritative_market_clock import (
     DAILY_CLOSE_READY_TIME,
     PRODUCTION_TIMEZONE,
     authoritative_closed_trade_date,
+    resolve_strategy_pool_decision_slot,
 )
+from server.common.component_release import runtime_contract_build_sha
 from server.common.qmt_stock_catalog import load_stock_catalog
 from server.common.qmt_datadir_daily_coverage import (
     PROVIDER as QMT_DATADIR_PROVIDER,
@@ -74,6 +77,9 @@ from server.common.qmt_attestation_contract import (
 )
 from server.common.qmt_trade_calendar import load_trade_calendar_receipt
 from tools.qmt_announcement_task_contract import (
+    PREMARKET_ANNOUNCEMENT_DECISION_TIME,
+    PREMARKET_ANNOUNCEMENT_SOURCE_TIME,
+    PREMARKET_ANNOUNCEMENT_TASK_TYPE,
     QMT_ANNOUNCEMENT_CHECKPOINT_DIR,
 )
 
@@ -358,15 +364,16 @@ def _fallback_announcement_adapter(
     )
 
 
-def _announcement_capture_options(adapter, *, engine, no_resume: bool) -> dict:
+def _announcement_capture_options(
+    adapter, *, engine, no_resume: bool, coverage_target_date: str | None = None,
+) -> dict:
     force_fresh_capture = bool(
         getattr(adapter, "force_fresh_capture", False)
     )
     resumable_capture = bool(
         getattr(adapter, "resumable_capture", False)
     )
-    coverage_target_date = None
-    if force_fresh_capture:
+    if force_fresh_capture and coverage_target_date is None:
         coverage_target_date = authoritative_closed_trade_date(engine)
         if not coverage_target_date:
             raise QMTAnnouncementBlocked(
@@ -1762,7 +1769,152 @@ def _blocked(reason_code: str, detail: str = "") -> dict:
     }
 
 
-def main(argv: list[str] | None = None) -> int:
+_PREMARKET_SOURCE_RESULT_SCHEMA = "probiga.qmt-announcement-premarket-source.v1"
+
+
+def _premarket_slot_fields(
+    *, trade_date: str, source_cutoff: str, decision_cutoff: str,
+) -> dict[str, str]:
+    data_session = date.fromisoformat(trade_date)
+    source = _shanghai_naive(datetime.fromisoformat(source_cutoff))
+    decision = _shanghai_naive(datetime.fromisoformat(decision_cutoff))
+    if (
+        data_session.isoformat() != trade_date
+        or data_session >= decision.date()
+        or source != datetime.fromisoformat(
+            f"{decision.date()}T{PREMARKET_ANNOUNCEMENT_SOURCE_TIME}"
+        )
+        or decision != datetime.fromisoformat(
+            f"{decision.date()}T{PREMARKET_ANNOUNCEMENT_DECISION_TIME}"
+        )
+    ):
+        raise ValueError("premarket announcement source slot differs")
+    return {
+        "schema": _PREMARKET_SOURCE_RESULT_SCHEMA,
+        "data_trade_date": trade_date,
+        "execution_session_date": decision.date().isoformat(),
+        "source_cutoff_at": source.isoformat(timespec="microseconds"),
+        "decision_cutoff_at": decision.isoformat(timespec="microseconds"),
+    }
+
+
+def _premarket_source_claim(
+    engine, *, fields: Mapping[str, str], now: datetime,
+) -> dict[str, str]:
+    source = datetime.fromisoformat(fields["source_cutoff_at"])
+    decision = datetime.fromisoformat(fields["decision_cutoff_at"])
+    current = _shanghai_naive(now)
+    if not source <= current < decision:
+        raise QMTAnnouncementBlocked("QMT_ANNOUNCEMENT_PREMARKET_WINDOW_CLOSED")
+    run_uid = os.environ.get("PROBIGA_SCHEDULER_HISTORY_RUN_UID", "").strip()
+    build_sha = os.environ.get("PROBIGA_SCHEDULER_BUILD_SHA", "").strip()
+    task_id = os.environ.get("PROBIGA_SCHEDULER_TASK_ID", "").strip()
+    if (
+        os.environ.get("PROBIGA_SCHEDULER_TASK_TYPE") != PREMARKET_ANNOUNCEMENT_TASK_TYPE
+        or os.environ.get("PROBIGA_SCHEDULER_EXECUTOR_ROLE") != "qmt_windows_edge"
+        or not re.fullmatch(r"[0-9a-f]{32}", run_uid)
+        or not re.fullmatch(r"[0-9a-f]{40}", build_sha)
+        or not re.fullmatch(r"[1-9][0-9]*", task_id)
+    ):
+        raise QMTAnnouncementBlocked("QMT_ANNOUNCEMENT_PREMARKET_OWNER_UNAVAILABLE")
+    slot = resolve_strategy_pool_decision_slot(
+        engine, data_trade_date=fields["data_trade_date"],
+        phase="PREMARKET_REVISION", evaluated_at=decision,
+    )
+    if (
+        slot.execution_session_date != fields["execution_session_date"]
+        or _shanghai_naive(slot.scheduled_at) != decision
+    ):
+        raise QMTAnnouncementBlocked("QMT_ANNOUNCEMENT_PREMARKET_SLOT_DIFFERS")
+    with engine.connect() as connection:
+        claim_time = connection.execute(text(
+            "SELECT run_at FROM st_scheduled_task_history "
+            "WHERE run_uid=:run_uid AND task_id=:task_id AND task_type=:task_type "
+            "AND build_sha=:build_sha AND host_name=:host_name "
+            "AND status='running' AND trigger_source='scheduled'"
+        ), {
+            "run_uid": run_uid, "task_id": int(task_id), "build_sha": build_sha,
+            "task_type": PREMARKET_ANNOUNCEMENT_TASK_TYPE, "host_name": gethostname()[:128],
+        }).scalar_one_or_none()
+    if claim_time is None or not source <= _shanghai_naive(
+        datetime.fromisoformat(str(claim_time))
+    ) <= current:
+        raise QMTAnnouncementBlocked("QMT_ANNOUNCEMENT_PREMARKET_OWNER_UNAVAILABLE")
+    return {
+        **fields,
+        "scheduler_run_uid": run_uid,
+        "scheduler_build_sha": build_sha,
+    }
+
+
+def validate_premarket_source_task_result(
+    payload: dict, process_exit: int, *, expected_trade_date: str,
+    expected_source_cutoff: str, expected_decision_cutoff: str,
+    expected_scheduler_run_uid: str, expected_build_sha: str,
+    started_at: datetime | None = None, finished_at: datetime | None = None,
+    expected_parent: Mapping[str, str] | None = None,
+) -> str:
+    """Replay the exact producer contract under its Windows scheduler identity."""
+    disposition = validate_task_result(payload, process_exit)
+    if disposition != "complete":
+        return disposition
+    fields = _premarket_slot_fields(
+        trade_date=expected_trade_date, source_cutoff=expected_source_cutoff,
+        decision_cutoff=expected_decision_cutoff,
+    )
+    source = datetime.fromisoformat(fields["source_cutoff_at"])
+    decision = datetime.fromisoformat(fields["decision_cutoff_at"])
+    cutoff = _shanghai_naive(datetime.fromisoformat(payload["fact_cutoff_at"]))
+    received = _shanghai_naive(datetime.fromisoformat(payload["received_at"]))
+    published = _shanghai_naive(datetime.fromisoformat(str(payload.get("publish_completed_at") or "")))
+    receipt = payload.get("premarket_source")
+    if not isinstance(receipt, Mapping):
+        raise ValueError("premarket announcement source receipt is missing")
+    parent_batch = str(receipt.get("parent_batch_id") or "")
+    parent_root = str(receipt.get("parent_batch_root_hash") or "")
+    parent_source = str(receipt.get("parent_source") or "")
+    if (
+        not re.fullmatch(r"[0-9a-f]{32}", expected_scheduler_run_uid)
+        or not re.fullmatch(r"[0-9a-f]{40}", expected_build_sha)
+        or receipt != {
+            **fields, "scheduler_run_uid": expected_scheduler_run_uid,
+            "scheduler_build_sha": expected_build_sha,
+            "parent_batch_id": parent_batch,
+            "parent_batch_root_hash": parent_root,
+            "parent_source": parent_source,
+        }
+        or not parent_batch or parent_batch == payload.get("batch_id")
+        or not re.fullmatch(r"[0-9a-f]{64}", parent_root)
+        or payload.get("parent_batch_id") != parent_batch
+        or payload.get("parent_batch_root_hash") != parent_root
+        or not re.fullmatch(r"[0-9a-f]{64}", str(payload.get("incremental_chain_root_hash") or ""))
+        or parent_source != payload.get("source")
+        or (expected_parent is not None and (
+            parent_batch != expected_parent.get("batch_id")
+            or parent_root != expected_parent.get("batch_root_hash")
+            or parent_source != expected_parent.get("source")
+            or str(payload.get("fallback_reason") or "")
+            != str(expected_parent.get("fallback_reason") or "")
+        ))
+        or payload.get("mode")
+        or payload.get("source") not in {
+            QMT_ANNOUNCEMENT_SOURCE, CNINFO_ANNOUNCEMENT_SOURCE,
+        }
+        or payload.get("coverage_target_date") != expected_trade_date
+        or payload.get("window_start") != (
+            date.fromisoformat(expected_trade_date) - timedelta(days=DEFAULT_WINDOW_DAYS)
+        ).isoformat()
+        or payload.get("window_end") != fields["execution_session_date"]
+        or cutoff != source
+        or not source <= received <= published <= decision
+        or (started_at is not None and not source <= _shanghai_naive(started_at) <= received)
+        or (finished_at is not None and not published <= _shanghai_naive(finished_at) <= decision)
+    ):
+        raise ValueError("premarket announcement source receipt identity or time differs")
+    return disposition
+
+
+def main(argv: list[str] | None = None, *, premarket_source: bool = False) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--window-days", type=int, default=30)
     parser.add_argument(
@@ -1821,6 +1973,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--expected-build-sha", default="")
     parser.add_argument("--expected-trade-date", default="")
+    if premarket_source:
+        parser.add_argument("--premarket-source-cutoff", required=True)
+        parser.add_argument("--premarket-decision-cutoff", required=True)
     parser.add_argument(
         "--validate-result-exit", type=int, default=-1,
         help=argparse.SUPPRESS,
@@ -1835,6 +1990,15 @@ def main(argv: list[str] | None = None) -> int:
         args.recover_missing_historical,
         args.research_recover_date,
     ))
+    if premarket_source and (
+        historical_modes or not args.expected_trade_date or args.no_resume
+        or args.window_days != DEFAULT_WINDOW_DAYS or args.overlap_days != 3
+        or args.batch_size != DEFAULT_BATCH_SIZE or args.data_adapter != "auto"
+        or args.fallback_provider != "cninfo"
+        or args.checkpoint_dir != QMT_ANNOUNCEMENT_CHECKPOINT_DIR
+        or args.validate_existing_result_exit >= 0 or args.validate_result_exit >= 0
+    ):
+        parser.error("premarket source requires the frozen Windows scheduler arguments")
     if historical_modes > 1:
         parser.error("historical batch modes are mutually exclusive")
     if args.research_recover_date:
@@ -1886,6 +2050,8 @@ def main(argv: list[str] | None = None) -> int:
     validation_run_uid = ""
     validation_build_sha = ""
     execution_origin = ""
+    premarket_claim: dict[str, str] = {}
+    premarket_parent = None
     try:
         if historical_modes:
             if (
@@ -1915,7 +2081,7 @@ def main(argv: list[str] | None = None) -> int:
                     "PROBIGA_SCHEDULER_BUILD_SHA", ""
                 ).strip().lower()
                 execution_origin = QMT_ANNOUNCEMENT_SCHEDULER_RECOVERY_ORIGIN
-        if args.recover_missing_historical or manual_research:
+        if args.recover_missing_historical or manual_research or premarket_source:
             engine = create_tool_engine(connect_args={"connect_timeout": 8, "read_timeout": 45, "write_timeout": 45})
         else:
             engine = create_tool_engine()
@@ -1995,7 +2161,45 @@ def main(argv: list[str] | None = None) -> int:
                 finally:
                     _close_announcement_fallback(fallback)
         else:
-            if args.expected_trade_date:
+            frozen_capture_options = {}
+            if premarket_source:
+                fields = _premarket_slot_fields(
+                    trade_date=target_text, source_cutoff=args.premarket_source_cutoff,
+                    decision_cutoff=args.premarket_decision_cutoff,
+                )
+                premarket_claim = _premarket_source_claim(
+                    engine, fields=fields, now=datetime.now(PRODUCTION_TIMEZONE),
+                )
+                from server.common.daily_delivery_control import load_frozen_initial_announcement_parent
+
+                premarket_parent = load_frozen_initial_announcement_parent(
+                    engine, trade_date=target_text,
+                    release_id=runtime_contract_build_sha(
+                        expected_build_sha=premarket_claim["scheduler_build_sha"],
+                    ),
+                )
+                if not premarket_parent:
+                    raise QMTAnnouncementBlocked("QMT_ANNOUNCEMENT_PREMARKET_PARENT_UNAVAILABLE")
+                parent_source = premarket_parent.get("source")
+                parent_fallback_reason = str(premarket_parent.get("fallback_reason") or "")
+                if not (
+                    parent_source == QMT_ANNOUNCEMENT_SOURCE and not parent_fallback_reason
+                    or parent_source == CNINFO_ANNOUNCEMENT_SOURCE
+                    and parent_fallback_reason in ANNOUNCEMENT_FALLBACK_REASON_CODES
+                ):
+                    raise QMTAnnouncementBlocked("QMT_ANNOUNCEMENT_PREMARKET_PARENT_SOURCE_DIFFERS")
+                premarket_claim.update({
+                    "parent_batch_id": premarket_parent["batch_id"],
+                    "parent_batch_root_hash": premarket_parent["batch_root_hash"],
+                    "parent_source": parent_source,
+                })
+                frozen_capture_options = {
+                    "require_exact_capture_cutoff": True,
+                    "capture_fact_cutoff_at": fields["source_cutoff_at"],
+                    "completion_deadline_at": fields["decision_cutoff_at"],
+                    "required_incremental_parent": premarket_parent,
+                }
+            elif args.expected_trade_date:
                 raise QMTAnnouncementBlocked(
                     "QMT_ANNOUNCEMENT_CAPTURE_ARGUMENTS_INVALID"
                 )
@@ -2005,27 +2209,36 @@ def main(argv: list[str] | None = None) -> int:
             # single machine JSON record so scheduler validation cannot accept
             # ambiguity.
             with redirect_stdout(sys.stderr):
-                try:
-                    xtdata = _announcement_data_adapter(args.data_adapter)
-                    capture_options = _announcement_capture_options(
-                        xtdata, engine=engine, no_resume=args.no_resume
-                    )
-                    primary_payload = synchronize_qmt_announcements(
-                        engine,
-                        xtdata=xtdata,
-                        checkpoint_root=checkpoint_dir,
-                        window_days=args.window_days,
-                        overlap_days=args.overlap_days,
-                        batch_size=args.batch_size,
-                        **capture_options,
-                    )
-                except Exception as exc:
-                    primary_reason = _explicit_qmt_unavailability_reason(exc)
-                    if not primary_reason:
-                        raise
+                inherited_fallback = (
+                    premarket_parent is not None
+                    and premarket_parent["source"] == CNINFO_ANNOUNCEMENT_SOURCE
+                )
+                if inherited_fallback:
                     primary_payload = _blocked(
-                        primary_reason, type(exc).__name__
+                        premarket_parent["fallback_reason"], "signed-initial-source",
                     )
+                else:
+                    try:
+                        xtdata = _announcement_data_adapter(args.data_adapter)
+                        capture_options = _announcement_capture_options(
+                            xtdata, engine=engine, no_resume=args.no_resume,
+                            coverage_target_date=target_text if premarket_source else None,
+                        )
+                        primary_payload = synchronize_qmt_announcements(
+                            engine,
+                            xtdata=xtdata,
+                            checkpoint_root=checkpoint_dir,
+                            window_days=args.window_days,
+                            overlap_days=args.overlap_days,
+                            batch_size=args.batch_size,
+                            **capture_options,
+                            **frozen_capture_options,
+                        )
+                    except Exception as exc:
+                        primary_reason = _explicit_qmt_unavailability_reason(exc)
+                        if not primary_reason:
+                            raise
+                        primary_payload = _blocked(primary_reason, type(exc).__name__)
                 payload = primary_payload
                 primary_reason = str(
                     primary_payload.get("reason_code") or ""
@@ -2034,6 +2247,7 @@ def main(argv: list[str] | None = None) -> int:
                     primary_payload.get("status") == "DATA_BLOCKED"
                     and primary_reason in ANNOUNCEMENT_FALLBACK_REASON_CODES
                     and args.fallback_provider != "none"
+                    and (not premarket_source or inherited_fallback)
                 ):
                     fallback = None
                     try:
@@ -2041,8 +2255,13 @@ def main(argv: list[str] | None = None) -> int:
                             args.fallback_provider
                         )
                         fallback_options = _announcement_capture_options(
-                            fallback, engine=engine, no_resume=args.no_resume
+                            fallback, engine=engine, no_resume=args.no_resume,
+                            coverage_target_date=target_text if premarket_source else None,
                         )
+                        fallback_options["capture_fact_cutoff_at"] = primary_payload.get(
+                            "fact_cutoff_at"
+                        )
+                        fallback_options.update(frozen_capture_options)
                         payload = synchronize_qmt_announcements(
                             engine,
                             xtdata=fallback,
@@ -2052,13 +2271,11 @@ def main(argv: list[str] | None = None) -> int:
                             batch_size=args.batch_size,
                             source=str(fallback.source),
                             fallback_reason=primary_reason,
-                            capture_fact_cutoff_at=primary_payload.get(
-                                "fact_cutoff_at"
-                            ),
                             **fallback_options,
                         )
-                        payload["primary_attempt_status"] = "DATA_BLOCKED"
-                        payload["primary_attempt_reason_code"] = primary_reason
+                        if not inherited_fallback:
+                            payload["primary_attempt_status"] = "DATA_BLOCKED"
+                            payload["primary_attempt_reason_code"] = primary_reason
                     except Exception as exc:
                         reason = str(
                             getattr(exc, "reason_code", "") or ""
@@ -2075,9 +2292,10 @@ def main(argv: list[str] | None = None) -> int:
                             ),
                             "primary_source": QMT_ANNOUNCEMENT_SOURCE,
                             "fallback_reason": primary_reason,
-                            "primary_attempt_status": "DATA_BLOCKED",
-                            "primary_attempt_reason_code": primary_reason,
                         })
+                        if not inherited_fallback:
+                            payload["primary_attempt_status"] = "DATA_BLOCKED"
+                            payload["primary_attempt_reason_code"] = primary_reason
                     finally:
                         _close_announcement_fallback(fallback)
     except Exception as exc:
@@ -2123,9 +2341,22 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         if engine is not None:
             engine.dispose()
+    if premarket_claim:
+        payload["premarket_source"] = premarket_claim
     process_exit = 0 if payload.get("status") == "COMPLETE" else 2
     try:
-        validate_task_result(payload, process_exit)
+        if premarket_source and process_exit == 0:
+            validate_premarket_source_task_result(
+                payload, process_exit, expected_trade_date=target_text,
+                expected_source_cutoff=args.premarket_source_cutoff,
+                expected_decision_cutoff=args.premarket_decision_cutoff,
+                expected_scheduler_run_uid=premarket_claim["scheduler_run_uid"],
+                expected_build_sha=premarket_claim["scheduler_build_sha"],
+                finished_at=datetime.now(PRODUCTION_TIMEZONE),
+                expected_parent=premarket_parent,
+            )
+        else:
+            validate_task_result(payload, process_exit)
     except Exception as exc:
         payload = _blocked(
             "QMT_ANNOUNCEMENT_INVALID_RESULT_CONTRACT", type(exc).__name__

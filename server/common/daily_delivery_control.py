@@ -15,11 +15,19 @@ import json
 import os
 import re
 from contextlib import nullcontext
-from datetime import date, datetime, timedelta
-from typing import Any, Mapping
+from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta
+from types import MappingProxyType
+from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
+from server.common.authoritative_market_clock import (
+    PRODUCTION_TIMEZONE,
+    STRATEGY_POOL_INITIAL_TIME,
+    STRATEGY_POOL_PREMARKET_REVISION_TIME,
+    StrategyPoolDecisionSlot,
+)
 from server.common.component_release_attestation import load_component_attestation
 from tools.qmt_host_ownership_contract import (
     WINDOWS_QMT_EDGE_TASK_TYPES,
@@ -276,26 +284,41 @@ def load_completed_market_capture_receipt(
     raise DailyDeliveryControlError("MARKET_CAPTURE_COMPLETION_UNAVAILABLE")
 
 
-def load_completed_cninfo_announcement_at(
-    engine, *, batch: Mapping[str, Any], decision_at: datetime,
-) -> datetime | None:
-    """Return the validated publication time for this exact durable batch."""
+@dataclass(frozen=True)
+class FrozenInitialAnnouncement:
+    receipt: Mapping[str, object]
+    score_binding: Mapping[str, object]
+
+
+def _read_signed_announcement_completion(
+    engine, *, target: str, decision_at: datetime, batch: Mapping[str, Any] | None,
+) -> FrozenInitialAnnouncement | None:
+    from server.common.analysis_pool_receipt import FROZEN_INITIAL_ANNOUNCEMENT_SCHEMA
     from server.common.qmt_announcement_pit import QMT_ANNOUNCEMENT_TASK_SCHEMA, validate_task_result
 
-    target = _normalized_trade_date(batch["window_end"])
     stage = "qmt_announcement_pit"
-    received = _datetime_value(batch.get("received_at"))
-    if received is None or received > decision_at:
-        return None
+    session = date.fromisoformat(target)
+    if decision_at.tzinfo is not None:
+        decision_at = decision_at.astimezone(CONTROL_TIMEZONE).replace(tzinfo=None)
+    if batch is None:
+        if decision_at != datetime.combine(session, STRATEGY_POOL_INITIAL_TIME):
+            raise ValueError("initial announcement selection requires its exact fixed slot")
+        not_before = datetime.combine(session, time.min)
+    else:
+        received = _datetime_value(batch.get("received_at"))
+        fact_cutoff = _datetime_value(batch.get("fact_cutoff_at"))
+        if fact_cutoff is None or received is None or not fact_cutoff <= received <= decision_at:
+            return None
+        not_before = received
     with (nullcontext(engine) if hasattr(engine, "execute") else engine.connect()) as connection:
         attempts = connection.execute(text(f"""
             SELECT a.*, s.trade_date, s.release_id
             FROM {ATTEMPT_TABLE} a JOIN {SESSION_TABLE} s ON s.session_uid=a.session_uid
             WHERE s.trade_date=:target AND a.stage_name=:stage AND a.status='SUCCESS'
-              AND a.finished_at BETWEEN :received AND :decision
+              AND a.finished_at BETWEEN :not_before AND :decision
             ORDER BY a.finished_at DESC, a.id DESC LIMIT 12
         """), {
-            "target": target, "stage": stage, "received": received, "decision": decision_at,
+            "target": target, "stage": stage, "not_before": not_before, "decision": decision_at,
         }).mappings().all()
     for attempt in attempts:
         try:
@@ -313,43 +336,111 @@ def load_completed_cninfo_announcement_at(
             if (
                 isinstance(item, dict)
                 and item.get("schema") == QMT_ANNOUNCEMENT_TASK_SCHEMA
-                and item.get("batch_id") == batch["batch_id"]
+                and (batch is None or item.get("batch_id") == batch["batch_id"])
             ):
                 matches.append(item)
         if not matches:
             continue
         if len(matches) != 1:
+            if batch is None:
+                continue
             raise DailyDeliveryControlError("announcement completion receipt is ambiguous")
         item = matches[0]
-        if (
-            item.get("source") != batch["source"]
-            or item.get("batch_root_hash") != batch["batch_root_hash"]
-            or item.get("window_end") != target
-            or item.get("received_at") != batch["received_at"]
-            or item.get("stock_count") != batch["catalog_member_count"]
-            or validate_task_result(item, 0) != "complete"
-        ):
-            raise DailyDeliveryControlError("announcement completion receipt differs")
-        return _datetime_value(attempt["finished_at"])
+        try:
+            received = _datetime_value(item.get("received_at"))
+            fact_cutoff = _datetime_value(item.get("fact_cutoff_at"))
+            finished = _datetime_value(attempt["finished_at"])
+            if (
+                item.get("window_end") != target or validate_task_result(item, 0) != "complete"
+                or fact_cutoff is None or received is None or finished is None
+                or not fact_cutoff <= received <= finished <= decision_at
+                or (batch is None and (
+                    item.get("mode") or fact_cutoff.date() != session
+                    or item.get("window_start") != (session - timedelta(days=30)).isoformat()
+                    or not item.get("catalog_batch_id")
+                    or any(SHA64_RE.fullmatch(str(item.get(key) or "")) is None for key in (
+                        "catalog_manifest_hash", "catalog_member_set_hash",
+                    ))
+                ))
+                or (batch is not None and (
+                    item.get("source") != batch["source"]
+                    or item.get("batch_root_hash") != batch["batch_root_hash"]
+                    or fact_cutoff != _datetime_value(batch.get("fact_cutoff_at"))
+                    or received != _datetime_value(batch.get("received_at"))
+                    or item.get("stock_count") != batch["catalog_member_count"]
+                ))
+            ):
+                raise ValueError("nightly announcement completion differs")
+        except (TypeError, ValueError) as exc:
+            if batch is None:
+                continue
+            raise DailyDeliveryControlError("announcement completion receipt differs") from exc
+        binding = {
+            "schema": FROZEN_INITIAL_ANNOUNCEMENT_SCHEMA, "task_type": stage,
+            "trade_date": target, "scheduler_run_uid": str(attempt["scheduler_run_uid"]),
+            "evidence_sha256": checkpoint["evidence_sha256"],
+            "input_receipt_root_sha256": checkpoint["input_receipt_root_sha256"],
+            "producer_build_sha": checkpoint["build_sha"],
+            "contract_release_id": str(attempt["release_id"]),
+            "batch_id": item["batch_id"], "batch_root_hash": item["batch_root_hash"],
+            "source": item["source"], "fact_cutoff_at": fact_cutoff.isoformat(timespec="microseconds"),
+            "received_at": received.isoformat(timespec="microseconds"),
+            "finished_at": finished.isoformat(timespec="microseconds"),
+        }
+        return FrozenInitialAnnouncement(
+            MappingProxyType({
+                **item, "stage_finished_at": finished.replace(tzinfo=CONTROL_TIMEZONE).isoformat(),
+                "stage_attempt_uid": attempt["attempt_uid"], "stage_evidence_sha256": checkpoint["evidence_sha256"],
+            }),
+            MappingProxyType(binding),
+        )
     return None
+
+
+def load_signed_announcement_source(
+    engine, *, batch: Mapping[str, Any], decision_at: datetime,
+) -> dict[str, Any] | None:
+    """Resolve the exact signed nightly completion for an already validated batch."""
+    result = _read_signed_announcement_completion(
+        engine, target=_normalized_trade_date(batch["window_end"]), decision_at=decision_at, batch=batch,
+    )
+    return dict(result.score_binding) if result else None
+
+
+def select_frozen_initial_announcement_source(
+    engine, *, trade_date: str, decision_at: datetime,
+) -> FrozenInitialAnnouncement | None:
+    """Choose the latest original nightly batch already certified by 22:20."""
+    return _read_signed_announcement_completion(
+        engine, target=_normalized_trade_date(trade_date), decision_at=decision_at, batch=None,
+    )
+
+
+def load_completed_cninfo_announcement_at(
+    engine, *, batch: Mapping[str, Any], decision_at: datetime,
+) -> datetime | None:
+    """Return the validated publication time for this exact durable batch."""
+    source = load_signed_announcement_source(engine, batch=batch, decision_at=decision_at)
+    return _datetime_value(source["finished_at"]) if source else None
 
 
 def load_published_analysis_receipt(
     engine, target_date: object, decision_at: datetime | None = None,
     *, run_uid: str | None = None,
+    capture_score: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, object]:
     """Read the exact successful scoring publication, independent of governance.
 
     An invalid newest publication fails closed. Older mutable projections never
     substitute for its immutable, complete scoring universe.
     """
-    from server.common.analysis_pool_receipt import decode_score_snapshot
+    from server.common.analysis_pool_receipt import PREMARKET_POOL_TASK, decode_score_snapshot
 
     target = _normalized_trade_date(target_date)
     cutoff = decision_at or _control_now()
     if cutoff.tzinfo is not None:
         cutoff = cutoff.astimezone(CONTROL_TIMEZONE).replace(tzinfo=None)
-    params = {"target": target, "cutoff": cutoff}
+    params = {"target": target, "cutoff": cutoff, "premarket_stage": PREMARKET_POOL_TASK}
     run_clause = ""
     if run_uid is not None:
         if RUN_UID_RE.fullmatch(run_uid) is None:
@@ -361,7 +452,7 @@ def load_published_analysis_receipt(
             SELECT a.*, s.trade_date, s.release_id
             FROM {ATTEMPT_TABLE} a JOIN {SESSION_TABLE} s
               ON s.session_uid=a.session_uid
-            WHERE s.trade_date=:target AND a.stage_name='analysis_fast'
+            WHERE s.trade_date=:target AND a.stage_name IN ('analysis_fast', :premarket_stage)
               AND a.status='SUCCESS' AND a.finished_at<=:cutoff
               {run_clause}
             ORDER BY a.finished_at DESC, a.id DESC LIMIT 1
@@ -369,12 +460,13 @@ def load_published_analysis_receipt(
     if row is None:
         raise DailyDeliveryControlError("ANALYSIS_PUBLISHED_SNAPSHOT_UNAVAILABLE")
     try:
-        checkpoint = _validated_completed_stage_checkpoint(row, session=row, stage_name="analysis_fast", engine=engine)
+        checkpoint = _validated_completed_stage_checkpoint(row, session=row, stage_name=str(row["stage_name"]), engine=engine)
         receipt = dict(checkpoint.get("publication_receipt") or {})
         reference = analysis_publication_reference(receipt)
         snapshot = decode_score_snapshot(receipt.get("score_snapshot"), trade_date=target)
         published = datetime.fromisoformat(str(receipt.get("published_at")))
         if (receipt["trade_date"] != target or receipt["build_sha"] != checkpoint["build_sha"]
+                or receipt["publisher_task_type"] != row["stage_name"]
                 or receipt["run_uid"] != row["output_dataset_id"]
                 or snapshot["run_uid"] != receipt["run_uid"]
                 or snapshot["build_sha"] != receipt["build_sha"]
@@ -385,6 +477,8 @@ def load_published_analysis_receipt(
             raise ValueError("publication history binding differs")
     except (ValueError, TypeError, KeyError, DailyDeliveryFenceLost) as exc:
         raise DailyDeliveryControlError("ANALYSIS_PUBLISHED_SNAPSHOT_INVALID") from exc
+    if capture_score is not None:
+        capture_score(snapshot)
     return receipt
 
 
@@ -1533,6 +1627,7 @@ def build_terminal_delivery_receipt(
     status: str,
     strategy_release_id: object,
     legacy_receipt: Mapping[str, object] | None = None,
+    exact_core_inputs: Mapping[str, Mapping[str, object]] | None = None,
     degradations: list[Mapping[str, object]] | None = None,
     retryable: bool = False,
     error_code: object = None,
@@ -1555,6 +1650,26 @@ def build_terminal_delivery_receipt(
     legacy = dict(legacy_receipt or {})
     score_id = score_snapshot_identity(legacy) if normalized_status != "BLOCKED" else None
     core_inputs = _core_input_bindings(legacy)
+    if exact_core_inputs is not None:
+        expected_stages = {
+            "kline": "qmt_stock_daily_canonical", "turnover": "target_turnover_snapshot",
+            "financial": "stock_finance", "announcement": None,
+        }
+        if normalized_status == "BLOCKED" or set(exact_core_inputs) != set(expected_stages):
+            raise ValueError("fixed revision core source bindings differ")
+        core_inputs = {}
+        for name, expected_stage in expected_stages.items():
+            source = dict(exact_core_inputs[name])
+            if (
+                (source.get("stage") not in {"qmt_announcement_pit", "qmt_announcement_premarket_prepare"}
+                 if name == "announcement" else source.get("stage") != expected_stage)
+                or SHA64_RE.fullmatch(str(source.get("root") or "")) is None
+                or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", str(source.get("dataset_id") or ""))
+                or (source.get("input_root") is not None and
+                    SHA64_RE.fullmatch(str(source["input_root"])) is None)
+            ):
+                raise ValueError(f"fixed revision {name} source binding differs")
+            core_inputs[name] = source
     if normalized_status != "BLOCKED" and set(core_inputs) != {
         "kline",
         "turnover",
@@ -1591,7 +1706,8 @@ def build_terminal_delivery_receipt(
         "terminal_stage": stage,
         "core_inputs": core_inputs,
         "feature_snapshot_id": (
-            str(legacy.get("base_data_receipt_root_sha256") or "") or None
+            canonical_sha256(core_inputs) if exact_core_inputs is not None
+            else str(legacy.get("base_data_receipt_root_sha256") or "") or None
         ),
         "score_snapshot_id": score_id,
         "strategy_pool": {
@@ -1628,6 +1744,305 @@ def build_terminal_delivery_receipt(
         "real_order_authority": False,
     }
     return {**core, "receipt_sha256": canonical_sha256(core)}
+
+
+def validate_frozen_pool_decision(
+    value: object, *, trade_date: object,
+) -> dict[str, object]:
+    if not isinstance(value, Mapping) or set(value) != {
+        "schema", "phase", "execution_session_date", "cutoff_at", "evaluated_at",
+        "parent_receipt_uid", "diff_sha256",
+    } or value.get("schema") != "probiga.frozen-pool-decision.v1":
+        raise ValueError("frozen pool decision is invalid")
+    target = date.fromisoformat(_normalized_trade_date(trade_date))
+    execution = date.fromisoformat(_normalized_trade_date(value["execution_session_date"]))
+    scheduled = datetime.fromisoformat(str(value["cutoff_at"]))
+    evaluated = datetime.fromisoformat(str(value["evaluated_at"]))
+    if (
+        execution <= target
+        or scheduled.utcoffset() is None or evaluated.utcoffset() is None
+        or scheduled.astimezone(PRODUCTION_TIMEZONE).isoformat(timespec="seconds") != value["cutoff_at"]
+        or evaluated.astimezone(PRODUCTION_TIMEZONE).isoformat(timespec="seconds") != value["evaluated_at"]
+        or evaluated < scheduled
+    ):
+        raise ValueError("frozen pool decision time identity differs")
+    phase = value["phase"]
+    if phase == "INITIAL":
+        expected = datetime.combine(target, STRATEGY_POOL_INITIAL_TIME, PRODUCTION_TIMEZONE)
+        if value["parent_receipt_uid"] is not None or value["diff_sha256"] is not None:
+            raise ValueError("initial frozen pool cannot supersede a receipt")
+    elif phase == "PREMARKET_REVISION":
+        expected = datetime.combine(execution, STRATEGY_POOL_PREMARKET_REVISION_TIME, PRODUCTION_TIMEZONE)
+        if any(
+            SHA64_RE.fullmatch(str(value[field] or "")) is None
+            for field in ("parent_receipt_uid", "diff_sha256")
+        ):
+            raise ValueError("premarket frozen pool requires the prior receipt and stock changes")
+    else:
+        raise ValueError("frozen pool decision phase is invalid")
+    if scheduled != expected:
+        raise ValueError("frozen pool decision cutoff differs from its scheduled slot")
+    return dict(value)
+
+
+def bind_frozen_pool_decision(
+    receipt: Mapping[str, object],
+    *,
+    slot: StrategyPoolDecisionSlot,
+    score_snapshot: Mapping[str, object],
+    parent_receipt_uid: str = "",
+    diff_sha256: str = "",
+) -> dict[str, object]:
+    """Bind a verified pool and its exact input cutoff to one publication slot."""
+    core = dict(receipt)
+    seal = str(core.pop("receipt_sha256", "") or "")
+    if canonical_sha256(core) != seal or core.get("status") not in {"PASS", "DEGRADED"}:
+        raise ValueError("frozen pool decision requires a verified delivery receipt")
+    if "frozen_pool_decision" in core:
+        raise ValueError("frozen pool decision is already bound")
+    scheduled = slot.scheduled_at.astimezone(PRODUCTION_TIMEZONE)
+    actual = slot.evaluated_at.astimezone(PRODUCTION_TIMEZONE)
+    if (
+        slot.scheduled_at.utcoffset() is None or slot.evaluated_at.utcoffset() is None
+        or actual < scheduled
+        or core.get("trade_date") != slot.data_trade_date
+        or score_snapshot.get("trade_date") != slot.data_trade_date
+        or SHA64_RE.fullmatch(str(core.get("score_snapshot_id") or "")) is None
+        or core.get("score_snapshot_id") != score_snapshot.get("payload_sha256")
+    ):
+        raise ValueError("frozen pool decision does not match the score snapshot")
+    cutoff = scheduled.replace(tzinfo=None).isoformat(timespec="seconds")
+    if any(score_snapshot.get(key) != cutoff for key in ("decision_at", "input_decision_at")):
+        raise ValueError("frozen pool score input cutoff differs from its slot")
+    core["frozen_pool_decision"] = validate_frozen_pool_decision({
+        "schema": "probiga.frozen-pool-decision.v1",
+        "phase": slot.phase,
+        "execution_session_date": slot.execution_session_date,
+        "cutoff_at": scheduled.isoformat(timespec="seconds"),
+        "evaluated_at": actual.isoformat(timespec="seconds"),
+        "parent_receipt_uid": parent_receipt_uid or None,
+        "diff_sha256": diff_sha256 or None,
+    }, trade_date=slot.data_trade_date)
+    return {**core, "receipt_sha256": canonical_sha256(core)}
+
+
+def _read_sealed_canonical_delivery(
+    connection, session: Mapping[str, object],
+) -> dict[str, object] | None:
+    receipt_uid = str(session.get("canonical_receipt_uid") or "")
+    if not receipt_uid:
+        return None
+    row = _one_mapping(connection.execute(
+        text(f"SELECT receipt_json, receipt_sha256 FROM {RECEIPT_TABLE} "
+             "WHERE receipt_uid=:receipt_uid"),
+        {"receipt_uid": receipt_uid},
+    ))
+    try:
+        receipt = json.loads(str((row or {}).get("receipt_json") or "{}"))
+        supplied = str(receipt.pop("receipt_sha256", "")).lower()
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise RuntimeError("materialized daily delivery receipt seal differs") from exc
+    if (
+        SHA64_RE.fullmatch(supplied) is None
+        or supplied != str((row or {}).get("receipt_sha256") or "").lower()
+        or canonical_sha256(receipt) != supplied
+        or str(receipt.get("receipt_uid") or "") != receipt_uid
+        or any(
+            str(receipt.get(key) or "").lower() != str(session.get(key) or "").lower()
+            for key in ("session_uid", "run_id", "release_id", "strategy_release_id")
+        )
+        or str(receipt.get("trade_date") or "")[:10] != str(session.get("trade_date") or "")[:10]
+        or (session.get("status") in TERMINAL_STATUSES and receipt.get("status") != session.get("status"))
+    ):
+        raise RuntimeError("materialized daily delivery receipt seal differs")
+    return {**receipt, "receipt_sha256": supplied}
+
+
+def load_frozen_initial_delivery(connection, session_uid: str) -> dict[str, object] | None:
+    """Read the initial receipt under the session lock used by revision CAS."""
+    session = load_daily_delivery_session(connection, session_uid)
+    if session.get("status") not in {"PASS", "DEGRADED"}:
+        return None
+    receipt = _read_sealed_canonical_delivery(connection, session)
+    if not receipt or receipt.get("frozen_pool_decision") is None:
+        return None
+    phase = validate_frozen_pool_decision(receipt["frozen_pool_decision"], trade_date=receipt["trade_date"])
+    return receipt if phase["phase"] == "INITIAL" else None
+
+
+def load_frozen_initial_announcement_parent(engine, trade_date, release_id):
+    """Resolve the actual signed source batch used by the current frozen first pool."""
+    from server.common.qmt_announcement_pit import QMT_ANNOUNCEMENT_TASK_SCHEMA, validate_task_result
+
+    identity = daily_session_identity(trade_date, release_id)
+    target, session_uid = identity["trade_date"], identity["session_uid"]
+    with engine.connect() as connection:
+        session = _select_session(connection, session_uid, for_update=False)
+        if session is None or session.get("status") not in {"PASS", "DEGRADED"}:
+            return None
+        initial = _read_sealed_canonical_delivery(connection, session)
+        if not initial or initial.get("frozen_pool_decision") is None:
+            return None
+        phase = validate_frozen_pool_decision(initial["frozen_pool_decision"], trade_date=target)
+        if phase["phase"] != "INITIAL":
+            return None
+        announcement = (initial.get("core_inputs") or {}).get("announcement") or {}
+        stage, source_run = announcement.get("stage"), announcement.get("dataset_id")
+        if stage != "qmt_announcement_pit" or RUN_UID_RE.fullmatch(str(source_run or "")) is None:
+            raise DailyDeliveryControlError("initial frozen announcement source identity differs")
+        attempt = _one_mapping(connection.execute(text(f"""
+            SELECT * FROM {ATTEMPT_TABLE}
+            WHERE session_uid=:session_uid AND scheduler_run_uid=:source_run
+              AND stage_name=:stage AND status='SUCCESS'
+        """), {"session_uid": session_uid, "source_run": source_run, "stage": stage}))
+        if attempt is None:
+            raise DailyDeliveryControlError("initial frozen announcement attempt is unavailable")
+        evidence = _validated_completed_stage_checkpoint(
+            attempt, session=session, stage_name=stage, engine=connection,
+        )
+    if evidence.get("evidence_sha256") != announcement.get("root"):
+        raise DailyDeliveryControlError("initial frozen announcement evidence root differs")
+    matches = []
+    for line in str(evidence.get("replay_output") or "").splitlines():
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(item, dict) and item.get("schema") == QMT_ANNOUNCEMENT_TASK_SCHEMA:
+            matches.append(item)
+    if (
+        len(matches) != 1 or validate_task_result(matches[0], 0) != "complete"
+        or matches[0].get("window_end") != target
+    ):
+        raise DailyDeliveryControlError("initial frozen announcement result differs")
+    result = matches[0]
+    return {key: result[key] for key in (
+        "batch_id", "batch_root_hash", "source", "fallback_reason", "received_at",
+        "window_start", "window_end", "fact_cutoff_at",
+    )}
+
+
+@dataclass(frozen=True)
+class FrozenPremarketAnnouncement:
+    receipt: Mapping[str, object]
+
+
+def load_frozen_premarket_announcement(
+    engine, trade_date: str, release_id: str, slot: StrategyPoolDecisionSlot,
+) -> FrozenPremarketAnnouncement | None:
+    """Read the signed next-session source receipt that had completed by the slot."""
+    from server.common.qmt_announcement_pit import QMT_ANNOUNCEMENT_TASK_SCHEMA
+    from tools.qmt_announcement_task_contract import (
+        PREMARKET_ANNOUNCEMENT_SOURCE_TIME, PREMARKET_ANNOUNCEMENT_TASK_TYPE,
+    )
+    from tools.sync_qmt_announcement_pit import validate_premarket_source_task_result
+
+    identity = daily_session_identity(trade_date, release_id)
+    if slot.phase != "PREMARKET_REVISION" or slot.data_trade_date != identity["trade_date"]:
+        raise ValueError("premarket announcement requires its exact fixed decision slot")
+    decision = slot.scheduled_at.astimezone(PRODUCTION_TIMEZONE)
+    source = datetime.combine(
+        date.fromisoformat(slot.execution_session_date),
+        time.fromisoformat(PREMARKET_ANNOUNCEMENT_SOURCE_TIME),
+        PRODUCTION_TIMEZONE,
+    )
+    parent = load_frozen_initial_announcement_parent(engine, trade_date, release_id)
+    if not parent:
+        return None
+    stage = PREMARKET_ANNOUNCEMENT_TASK_TYPE
+    with engine.connect() as connection:
+        attempts = connection.execute(text(f"""
+            SELECT a.*, s.trade_date, s.release_id
+            FROM {ATTEMPT_TABLE} a JOIN {SESSION_TABLE} s ON s.session_uid=a.session_uid
+            WHERE a.session_uid=:session_uid AND a.stage_name=:stage AND a.status='SUCCESS'
+              AND a.started_at>=:source AND a.finished_at<=:decision
+            ORDER BY a.finished_at DESC, a.id DESC LIMIT 2
+        """), {
+            "session_uid": identity["session_uid"], "stage": stage,
+            "source": source.replace(tzinfo=None), "decision": decision.replace(tzinfo=None),
+        }).mappings().all()
+        if not attempts:
+            return None
+        if len(attempts) != 1:
+            raise DailyDeliveryControlError("premarket announcement completion is ambiguous")
+        attempt = attempts[0]
+        evidence = _validated_completed_stage_checkpoint(
+            attempt, session=attempt, stage_name=stage, engine=connection,
+        )
+    results = []
+    for line in str(evidence["replay_output"]).splitlines():
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(item, dict) and item.get("schema") == QMT_ANNOUNCEMENT_TASK_SCHEMA:
+            results.append(item)
+    started, finished = _datetime_value(attempt["started_at"]), _datetime_value(attempt["finished_at"])
+    if len(results) != 1 or started is None or finished is None:
+        raise DailyDeliveryControlError("premarket announcement result is unavailable")
+    if validate_premarket_source_task_result(
+        results[0], 0,
+        expected_trade_date=identity["trade_date"],
+        expected_source_cutoff=source.isoformat(timespec="seconds"),
+        expected_decision_cutoff=decision.isoformat(timespec="seconds"),
+        expected_scheduler_run_uid=str(attempt["scheduler_run_uid"]),
+        expected_build_sha=str(evidence["build_sha"]),
+        started_at=started, finished_at=finished, expected_parent=parent,
+    ) != "complete":
+        raise DailyDeliveryControlError("premarket announcement result differs")
+    return FrozenPremarketAnnouncement(MappingProxyType({
+        **results[0],
+        "stage_finished_at": finished.replace(tzinfo=PRODUCTION_TIMEZONE).isoformat(),
+        "stage_evidence_sha256": evidence["evidence_sha256"],
+        "stage_attempt_uid": attempt["attempt_uid"],
+    }))
+
+
+def load_frozen_premarket_external_context(
+    engine, trade_date: str, release_id: str, slot: StrategyPoolDecisionSlot,
+) -> dict[str, object] | None:
+    """Return the stored external market snapshot certified before this slot."""
+    from biz.market_context.external_market import (
+        PREMARKET_EXTERNAL_SNAPSHOT_SCHEMA, PREMARKET_EXTERNAL_TASK_TYPE,
+        load_verified_premarket_external_market_context,
+    )
+
+    identity = daily_session_identity(trade_date, release_id)
+    if slot.phase != "PREMARKET_REVISION" or slot.data_trade_date != identity["trade_date"]:
+        raise ValueError("external market context requires its exact fixed decision slot")
+    cutoff = slot.scheduled_at.astimezone(PRODUCTION_TIMEZONE)
+    start = datetime.combine(cutoff.date(), time(8, 15))
+    with (nullcontext(engine) if hasattr(engine, "execute") else engine.connect()) as connection:
+        attempts = connection.execute(text(f"""
+            SELECT a.*, s.trade_date, s.release_id FROM {ATTEMPT_TABLE} a
+            JOIN {SESSION_TABLE} s ON s.session_uid=a.session_uid
+            WHERE a.session_uid=:uid AND a.stage_name=:stage AND a.status='SUCCESS'
+              AND a.started_at>=:start AND a.finished_at<=:cutoff
+            ORDER BY a.finished_at DESC, a.id DESC LIMIT 2
+        """), {
+            "uid": identity["session_uid"], "stage": PREMARKET_EXTERNAL_TASK_TYPE,
+            "start": start, "cutoff": cutoff.replace(tzinfo=None),
+        }).mappings().all()
+        if len(attempts) != 1:
+            return None
+        attempt = attempts[0]
+        evidence = _validated_completed_stage_checkpoint(
+            attempt, session=attempt, stage_name=PREMARKET_EXTERNAL_TASK_TYPE, engine=connection,
+        )
+        matches = []
+        for line in str(evidence["replay_output"]).splitlines():
+            try:
+                item = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(item, dict) and item.get("schema") == PREMARKET_EXTERNAL_SNAPSHOT_SCHEMA:
+                matches.append(item)
+        if len(matches) != 1:
+            raise DailyDeliveryControlError("external market signed receipt differs")
+    return load_verified_premarket_external_market_context(
+        getattr(engine, "engine", engine), receipt=matches[0], cutoff=cutoff,
+        finished_at=_datetime_value(attempt["finished_at"]),
+    )
 
 
 def persist_terminal_delivery_receipt(
@@ -1706,6 +2121,38 @@ def persist_terminal_delivery_receipt(
         if canonical_sha256(source) != supplied_hash:
             raise RuntimeError("scheduler run already has a different delivery receipt")
         return {**stored, "receipt_sha256": stored_final_hash}
+    frozen_decision = payload.get("frozen_pool_decision")
+    promote_revision = False
+    if frozen_decision is not None:
+        if status not in {"PASS", "DEGRADED"}:
+            raise ValueError("frozen pool decision requires a verified result")
+        frozen_decision = validate_frozen_pool_decision(
+            frozen_decision, trade_date=payload["trade_date"],
+        )
+        phase = frozen_decision["phase"]
+        current_receipt_uid = str(session.get("canonical_receipt_uid") or "")
+        if phase == "INITIAL":
+            if current_receipt_uid and session.get("status") in {"PASS", "DEGRADED"}:
+                raise RuntimeError("initial frozen pool already has a canonical receipt")
+        elif phase == "PREMARKET_REVISION":
+            if not current_receipt_uid or current_receipt_uid != frozen_decision.get("parent_receipt_uid"):
+                raise RuntimeError("frozen pool revision parent changed before publication")
+            prior_receipt = _read_sealed_canonical_delivery(connection, session)
+            if prior_receipt is None or prior_receipt.get("status") not in {"PASS", "DEGRADED"}:
+                raise RuntimeError("initial frozen pool is unavailable")
+            prior_decision = validate_frozen_pool_decision(
+                prior_receipt.get("frozen_pool_decision"), trade_date=payload["trade_date"],
+            )
+            if (
+                not isinstance(prior_decision, Mapping)
+                or prior_decision.get("phase") != "INITIAL"
+                or prior_decision.get("execution_session_date") != frozen_decision.get("execution_session_date")
+                or str(prior_decision.get("cutoff_at") or "") >= str(frozen_decision.get("cutoff_at") or "")
+            ):
+                raise RuntimeError("premarket frozen pool already published or the initial receipt differs")
+            promote_revision = True
+        else:
+            raise ValueError("frozen pool decision phase is invalid")
     generation = int(session.get("latest_generation") or 0) + 1
     receipt_uid = canonical_sha256(
         {
@@ -1728,7 +2175,7 @@ def persist_terminal_delivery_receipt(
     current = now or _control_now()
     formal_pool = complete.get("formal_pool")
     formal = dict(formal_pool) if isinstance(formal_pool, Mapping) else {}
-    updated = connection.execute(
+    connection.execute(
         text(f"""
             INSERT INTO {RECEIPT_TABLE}
                 (receipt_uid, session_uid, generation, status,
@@ -1770,10 +2217,11 @@ def persist_terminal_delivery_receipt(
             "created_at": current,
         },
     )
-    connection.execute(
+    updated = connection.execute(
         text(f"""
             UPDATE {SESSION_TABLE}
             SET status=CASE
+                    WHEN :promote_revision=1 THEN :status
                     WHEN status='PASS' AND :status<>'PASS' THEN status
                     WHEN status='DEGRADED' AND :status='BLOCKED'
                     THEN status
@@ -1781,11 +2229,13 @@ def persist_terminal_delivery_receipt(
                 END,
                 latest_generation=:generation,
                 canonical_receipt_uid=CASE
+                    WHEN :promote_revision=1 THEN :receipt_uid
                     WHEN (status='PASS' AND :status<>'PASS')
                       OR (status='DEGRADED' AND :status='BLOCKED')
                     THEN canonical_receipt_uid ELSE :receipt_uid
                 END,
                 terminal_at=CASE
+                    WHEN :promote_revision=1 THEN :terminal_at
                     WHEN (status='PASS' AND :status<>'PASS')
                       OR (status='DEGRADED' AND :status='BLOCKED')
                     THEN terminal_at ELSE :terminal_at
@@ -1798,6 +2248,7 @@ def persist_terminal_delivery_receipt(
             "status": status,
             "generation": generation,
             "previous_generation": generation - 1,
+            "promote_revision": int(promote_revision),
             "receipt_uid": receipt_uid,
             "terminal_at": current,
             "session_uid": session_uid,
@@ -1838,15 +2289,7 @@ def read_daily_delivery(
         )
         if session is None:
             return None
-        receipt_row = _one_mapping(
-            connection.execute(
-                text(
-                    f"SELECT receipt_json, receipt_sha256 FROM {RECEIPT_TABLE} "
-                    "WHERE receipt_uid=:receipt_uid LIMIT 1"
-                ),
-                {"receipt_uid": session.get("canonical_receipt_uid")},
-            )
-        )
+        receipt = _read_sealed_canonical_delivery(connection, session)
         attempts = [
             dict(row)
             for row in connection.execute(
@@ -1866,35 +2309,6 @@ def read_daily_delivery(
                 },
             ).mappings().all()
         ]
-    receipt = None
-    if receipt_row is not None:
-        receipt = json.loads(str(receipt_row.get("receipt_json") or "{}"))
-        supplied = str(receipt.pop("receipt_sha256", "")).lower()
-        if (
-            SHA64_RE.fullmatch(supplied) is None
-            or supplied
-            != str(receipt_row.get("receipt_sha256") or "").lower()
-            or canonical_sha256(receipt) != supplied
-            or str(receipt.get("receipt_uid") or "")
-            != str(session.get("canonical_receipt_uid") or "")
-            or str(receipt.get("session_uid") or "")
-            != str(session.get("session_uid") or "")
-            or str(receipt.get("run_id") or "")
-            != str(session.get("run_id") or "")
-            or str(receipt.get("release_id") or "").lower()
-            != str(session.get("release_id") or "").lower()
-            or str(receipt.get("strategy_release_id") or "").lower()
-            != str(session.get("strategy_release_id") or "").lower()
-            or str(receipt.get("trade_date") or "")[:10]
-            != str(session.get("trade_date") or "")[:10]
-            or (
-                str(session.get("status") or "") in TERMINAL_STATUSES
-                and str(receipt.get("status") or "")
-                != str(session.get("status") or "")
-            )
-        ):
-            raise RuntimeError("materialized daily delivery receipt seal differs")
-        receipt["receipt_sha256"] = supplied
     return {"session": session, "receipt": receipt, "attempts": attempts}
 
 

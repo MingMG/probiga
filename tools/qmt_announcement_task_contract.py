@@ -33,6 +33,9 @@ QMT_ANNOUNCEMENT_FALLBACK_EGRESS_CONTRACT = {
 # other required data product; it is therefore intentionally not constrained
 # to start within 30 minutes of the announcement task.
 QMT_ANNOUNCEMENT_CRON = "18:20"
+PREMARKET_ANNOUNCEMENT_TASK_TYPE = "qmt_announcement_premarket_prepare"
+PREMARKET_ANNOUNCEMENT_SOURCE_TIME = "07:00"
+PREMARKET_ANNOUNCEMENT_DECISION_TIME = "08:30"
 ANALYSIS_UPPER_EVIDENCE_CRON = "22:10"
 ANALYSIS_FAST_CRON = "22:20"
 STRATEGY_GOVERNANCE_CRON = "22:35"
@@ -64,6 +67,18 @@ TASK = {
     ),
     "sort_order": 89,
     "enabled": 1,
+}
+
+PREMARKET_ANNOUNCEMENT_TASK = {
+    **TASK,
+    "task_name": "国金QMT盘前公告补充",
+    "task_type": PREMARKET_ANNOUNCEMENT_TASK_TYPE,
+    "script_path": "tools/prepare_qmt_announcement_premarket.py",
+    "cron_time": PREMARKET_ANNOUNCEMENT_SOURCE_TIME,
+    "description": (
+        "仅于下一实际交易日补充首版已验证公告，覆盖至07:00；"
+        "08:30前未完成时保留首版并注明公告增量不可用。"
+    ),
 }
 
 
@@ -110,6 +125,10 @@ __all__ = [
     "ANALYSIS_FAST_CRON",
     "ANALYSIS_UPPER_EVIDENCE_CRON",
     "MIN_ANALYSIS_GOVERNANCE_GAP_MINUTES",
+    "PREMARKET_ANNOUNCEMENT_DECISION_TIME",
+    "PREMARKET_ANNOUNCEMENT_SOURCE_TIME",
+    "PREMARKET_ANNOUNCEMENT_TASK",
+    "PREMARKET_ANNOUNCEMENT_TASK_TYPE",
     "QMT_ANNOUNCEMENT_CHECKPOINT_DIR",
     "QMT_ANNOUNCEMENT_FALLBACK_EGRESS_CONTRACT",
     "QMT_ANNOUNCEMENT_FALLBACK_PROVIDER",

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 import sys
 from datetime import date
@@ -320,6 +321,37 @@ def _safe_contract_failure_output(
     }
 
 
+def _load_fixed_initial_scoring(engine, target: str, build_sha: str) -> dict:
+    from server.common.authoritative_market_clock import (
+        STRATEGY_POOL_INITIAL_TIME, authoritative_closed_trade_date,
+    )
+    from server.common.daily_delivery_control import (
+        DailyDeliveryControlError, load_published_analysis_receipt,
+    )
+
+    target = target or authoritative_closed_trade_date(engine)
+    snapshots: list[dict] = []
+    try:
+        receipt = load_published_analysis_receipt(engine, target, capture_score=snapshots.append)
+    except DailyDeliveryControlError:
+        return {"error": "正式评分尚未完成"}
+    snapshot = snapshots[0]
+    cutoff = f"{target}T{STRATEGY_POOL_INITIAL_TIME.isoformat()}"
+    if (
+        receipt.get("build_sha") != build_sha
+        or snapshot.get("decision_at") != cutoff
+        or snapshot.get("input_decision_at") != cutoff
+        or not isinstance(snapshot.get("fixed_market_context"), dict)
+    ):
+        return {"error": "正式评分与晚间固定截点或当前版本不匹配"}
+    return {
+        "trade_date": target,
+        "decision_known_at": cutoff,
+        "analysis_run_uid": receipt["run_uid"],
+        "fixed_market_context": snapshot["fixed_market_context"],
+    }
+
+
 def run_daily_governance(
     *,
     requested_trade_date: str = "",
@@ -341,6 +373,11 @@ def run_daily_governance(
         from server.engine import strategy_governance as governance_engine
         from server.engine.strategy_center import bind_external_market_overlay
 
+        fixed_scoring = (
+            _load_fixed_initial_scoring(engine, requested_trade_date, expected_build_sha)
+            if expected_build_sha and external_market_context is None
+            else None
+        )
         with bind_external_market_overlay(external_market_context):
             result = orchestrate_strategy_governance(
                 requested_trade_date=requested_trade_date,
@@ -353,7 +390,7 @@ def run_daily_governance(
                 # An explicit authoritative date is an operator-requested
                 # revision; the ordinary scheduler is a no-op when a canonical
                 # run already exists.
-                allow_revision=bool(requested_trade_date),
+                allow_revision=bool(requested_trade_date) and fixed_scoring is None,
                 engine=engine,
                 industry_capture=(
                     lambda _engine, *, trade_date: _capture_industry_history(
@@ -365,6 +402,7 @@ def run_daily_governance(
                 # before any calendar read or governance write.
                 process_preflight=_bootstrap_execution_adapters,
                 ensure_build_commit_sha=expected_build_sha,
+                fixed_scoring=fixed_scoring,
             )
     finally:
         engine.dispose()
@@ -443,6 +481,15 @@ def main() -> int:
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             print(f"invalid:{type(exc).__name__}", file=sys.stderr)
             return 2
+    if os.environ.get("PROBIGA_SCHEDULER_TASK_TYPE") == "strategy_governance_daily":
+        scheduler_build_sha = os.environ.get("PROBIGA_SCHEDULER_BUILD_SHA", "").strip().lower()
+        if (
+            re.fullmatch(r"[0-9a-f]{40}", scheduler_build_sha) is None
+            or scheduler_build_sha == "0" * 40
+            or (expected_build_sha and expected_build_sha != scheduler_build_sha)
+        ):
+            parser.error("治理任务构建版本与调度记录不一致")
+        expected_build_sha = scheduler_build_sha
     _load_project_env()
     output, process_exit = run_daily_governance(
         requested_trade_date=str(args.trade_date or "").strip(),

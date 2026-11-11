@@ -8,6 +8,8 @@ from typing import Any
 
 from tools.qmt_announcement_task_contract import (
     ANALYSIS_DAILY_PIPELINE_DECISION_TIME,
+    PREMARKET_ANNOUNCEMENT_TASK,
+    PREMARKET_ANNOUNCEMENT_TASK_TYPE,
     TASK as QMT_ANNOUNCEMENT_TASK,
 )
 from server.common.release_data_readiness_contract import (
@@ -26,6 +28,7 @@ NO_DEFAULT_DATE_TASK_TYPES = {
     "portfolio_quote_refresh",
     "public_quote_failover",
     "qmt_announcement_pit",
+    PREMARKET_ANNOUNCEMENT_TASK_TYPE,
     "stock_snapshot_daily",
     "strategy_governance_daily",
     "trading_v2_intraday_activation",
@@ -298,6 +301,22 @@ def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: s
                 )
         _bind_daily_evidence_identity(args, row, target_date=today)
         return args
+    if task_type == PREMARKET_ANNOUNCEMENT_TASK_TYPE:
+        source_cutoff = str(row.get("_scheduler_premarket_source_cutoff") or "")
+        decision_cutoff = str(row.get("_scheduler_premarket_decision_cutoff") or "")
+        if (
+            str(row.get("_trigger_source") or "scheduled") != "scheduled"
+            or not scheduler_target_bound
+            or not source_cutoff or not decision_cutoff
+            or normalized_path != PREMARKET_ANNOUNCEMENT_TASK["script_path"]
+            or args != str(PREMARKET_ANNOUNCEMENT_TASK["script_args"]).split()
+        ):
+            raise ValueError("premarket announcement scheduler contract differs")
+        return [
+            *args, "--expected-trade-date", today,
+            "--premarket-source-cutoff", source_cutoff,
+            "--premarket-decision-cutoff", decision_cutoff,
+        ]
     if task_type == "qmt_announcement_pit":
         expected_capture_args = str(
             QMT_ANNOUNCEMENT_TASK["script_args"]

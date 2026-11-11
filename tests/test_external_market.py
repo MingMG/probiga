@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+import json
+import sys
 from zoneinfo import ZoneInfo
 
 import pytest
+from sqlalchemy import create_engine, text
 
 from biz.market_context import external_market as external
 
@@ -14,6 +17,10 @@ from biz.market_context.external_market import (
     _parse_yahoo_chart_payload,
     _score_snapshot,
 )
+from server.common.scheduler_args import build_scheduler_task_args
+from server.common.scheduler_validation import scheduler_output_status, validate_scheduler_task_result
+from tools import ensure_quality_gate
+from tools import refresh_external_market_context as external_capture
 
 
 def _item(symbol: str, change_pct: float) -> dict:
@@ -28,6 +35,110 @@ def _item(symbol: str, change_pct: float) -> dict:
 
 
 AS_OF = datetime(2026, 9, 12, 8, 30)
+
+
+def test_0815_external_snapshot_persists_actual_capture_once_and_replays_without_scoring(
+    tmp_path, monkeypatch, capsys,
+):
+    engine = create_engine(f"sqlite:///{tmp_path / 'external_snapshot.db'}")
+    with engine.begin() as connection:
+        connection.execute(text(
+            "CREATE TABLE si_trade_calendar (trade_date TEXT, trade_status INTEGER)"
+        ))
+        connection.execute(text(
+            "INSERT INTO si_trade_calendar VALUES ('2026-09-30',1),('2026-10-08',1)"
+        ))
+        connection.execute(text("""
+            CREATE TABLE st_external_market_context (
+                snapshot_id TEXT, context_date TEXT, captured_at TEXT, source TEXT, symbol TEXT,
+                display_name TEXT, price REAL, change_pct REAL, previous_close REAL,
+                market_time TEXT, availability TEXT, payload_json TEXT
+            )
+        """))
+    monkeypatch.setattr(external, "ensure_external_market_table", lambda _engine: None)
+    monkeypatch.setattr(external_capture, "load_project_env", lambda: None)
+    monkeypatch.setattr(external_capture, "create_tool_engine", lambda **_kwargs: engine)
+    start = datetime(2026, 10, 8, 8, 15, 13, 123000)
+    observed = datetime(2026, 10, 8, 8, 16, 4, 567000)
+    committed = datetime(2026, 10, 8, 8, 16, 5, 789000)
+    timestamps = iter([start, observed, committed])
+    monkeypatch.setattr(external_capture, "_now_shanghai", lambda: next(timestamps))
+    missing = [symbol for symbol, _ in EXTERNAL_MARKET_SYMBOLS if symbol != "nasdaq"]
+    fetches = []
+
+    def capture(*, as_of):
+        fetches.append(as_of)
+        return {
+            "snapshot_id": "00000000-0000-4000-8000-000000000001",
+            "context_date": as_of.date().isoformat(), "captured_at": as_of,
+            "items": [
+                {**_item("nasdaq", 1.5), "market_time": "2026-10-08T04:00:00"},
+                *[
+                    {"symbol": symbol, "source": "external.unavailable", "availability": "missing"}
+                    for symbol in missing
+                ],
+            ],
+            "external_market_data_quality": "WATCH",
+            "external_market_status": "SUPPORT", "external_market_score": 53.7,
+            "available_count": 1, "expected_count": len(EXTERNAL_MARKET_SYMBOLS),
+            "missing_symbols": missing, "acquisition_status": "PARTIAL",
+        }
+
+    monkeypatch.setattr(external_capture, "fetch_external_market_snapshot", capture)
+    task_type = external.PREMARKET_EXTERNAL_TASK_TYPE
+    task = next(item for item in ensure_quality_gate.TASKS if item["task_type"] == task_type)
+    assert task["enabled"] == 1 and task["cron_time"] == "08:15"
+    assert task_type not in ensure_quality_gate.REQUIRED_DATA_TASK_CONTRACT_TYPES
+    args = build_scheduler_task_args(task, task["script_path"], "2026-09-30")
+    monkeypatch.setattr(sys, "argv", [task["script_path"], *args])
+    assert external_capture.main() == 0
+    output = capsys.readouterr().out
+    receipt = json.loads(output)
+    assert fetches == [start]
+    assert receipt["captured_at"] == observed.isoformat()
+    assert receipt["stored_at"] == committed.isoformat()
+    assert receipt["execution_session_date"] == "2026-10-08"
+    assert receipt["canonical_recommendation_writes"] is False
+    assert receipt["automatic_real_order_submission"] is False
+    assert receipt["real_order_authority"] is False
+    assert receipt["external_market"]["captured_at"] == "2026-10-08 08:16:04"
+
+    monkeypatch.setattr(external, "_score_snapshot", lambda *_a: pytest.fail("must not re-score stored evidence"))
+    monkeypatch.setattr(external_capture, "fetch_external_market_snapshot", lambda **_k: pytest.fail("must not re-fetch"))
+    cutoff = datetime(2026, 10, 8, 8, 30)
+    task = {**task, "_scheduler_target_trade_date": "2026-09-30", "_scheduler_premarket_execution_session": "2026-10-08"}
+    assert scheduler_output_status(task, output, return_code=0) == "success"
+    assert validate_scheduler_task_result(
+        task, engine=engine, started_at=start, now=committed + timedelta(seconds=1), output=output,
+    ).ok
+    assert not validate_scheduler_task_result(
+        {**task, "_scheduler_target_trade_date": "2026-10-08"},
+        engine=engine, started_at=start, now=committed + timedelta(seconds=1), output=output,
+    ).ok
+    read = external.load_verified_premarket_external_market_context(
+        engine, receipt=receipt, cutoff=cutoff, finished_at=committed + timedelta(seconds=1),
+    )
+    assert read["external_market_score"] == 53.7
+    with pytest.raises(ValueError, match="time or coverage"):
+        external.load_verified_premarket_external_market_context(
+            engine, receipt=receipt, cutoff=cutoff, finished_at=cutoff + timedelta(microseconds=1),
+        )
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE st_external_market_context SET change_pct=99 WHERE symbol='nasdaq'"))
+    with pytest.raises(ValueError, match="persisted coverage or digest differs"):
+        external.load_verified_premarket_external_market_context(
+            engine, receipt=receipt, cutoff=cutoff, finished_at=committed + timedelta(seconds=1),
+        )
+
+    late_times = iter([start, cutoff])
+    monkeypatch.setattr(external_capture, "_now_shanghai", lambda: next(late_times))
+    monkeypatch.setattr(external_capture, "fetch_external_market_snapshot", capture)
+    monkeypatch.setattr(
+        external_capture, "store_external_market_snapshot",
+        lambda *_a: pytest.fail("late source evidence must not be stored for the fixed slot"),
+    )
+    assert external_capture.main() == 2
+    assert json.loads(capsys.readouterr().out)["reason_code"] == "EXTERNAL_MARKET_SOURCE_DEADLINE"
 
 
 def _quote(symbol, **changes):

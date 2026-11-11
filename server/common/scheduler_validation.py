@@ -18,6 +18,13 @@ from typing import Any, Mapping
 from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Engine
 
+from biz.market_context.external_market import (
+    PREMARKET_EXTERNAL_CAPTURE_TIME,
+    PREMARKET_EXTERNAL_SNAPSHOT_SCHEMA,
+    PREMARKET_EXTERNAL_TASK_TYPE,
+    load_verified_premarket_external_market_context,
+    validate_premarket_external_market_receipt,
+)
 from server.common.batch_db import quote_identifier, routed_read_engine
 from server.common.analysis_pool_receipt import (
     ANALYSIS_POOL_RECEIPT_SCHEMA,
@@ -58,6 +65,7 @@ from server.common.qmt_stock_catalog import load_target_stock_catalog
 from server.common.release_data_readiness_contract import (
     release_catchup_closed_ready_time,
 )
+from tools.qmt_announcement_task_contract import PREMARKET_ANNOUNCEMENT_TASK_TYPE
 
 
 @dataclass(frozen=True)
@@ -165,6 +173,9 @@ _FINANCE_LEGAL_EMPTY_REASON = "NEW_LISTING_AFTER_DISCLOSURE_DEADLINE"
 _RESEARCH_POOL_TASK_TYPE = "trading_v3_research_pool"
 _RESEARCH_POOL_TASK_SCHEMA = "probiga.trading-v3-research-pool-task.v1"
 _QMT_ANNOUNCEMENT_TASK_TYPE = "qmt_announcement_pit"
+_QMT_ANNOUNCEMENT_RECEIPT_TASK_TYPES = {
+    _QMT_ANNOUNCEMENT_TASK_TYPE, PREMARKET_ANNOUNCEMENT_TASK_TYPE,
+}
 _QMT_ANNOUNCEMENT_TASK_SCHEMA = "probiga.qmt-announcement-task-result.v1"
 
 
@@ -2758,11 +2769,37 @@ def _validate_qmt_announcement_scheduler_receipt(
     *,
     started_at: datetime | None = None,
     now: datetime | None = None,
+    engine: Engine | None = None,
 ) -> str:
     """Replay the existing capture/reconstruction receipt for its exact target."""
 
     from server.common.qmt_announcement_pit import validate_task_result
 
+    if task.get("task_type") == PREMARKET_ANNOUNCEMENT_TASK_TYPE:
+        from tools.sync_qmt_announcement_pit import validate_premarket_source_task_result
+
+        target = str(task.get("_scheduler_target_trade_date") or "")
+        build = str(task.get("_scheduler_expected_build_sha") or "")
+        parent = None
+        if engine is not None and process_exit == 0:
+            from server.common.component_release import runtime_contract_build_sha
+            from server.common.daily_delivery_control import load_frozen_initial_announcement_parent
+
+            parent = load_frozen_initial_announcement_parent(
+                engine, trade_date=target,
+                release_id=runtime_contract_build_sha(expected_build_sha=build),
+            )
+            if not parent:
+                raise ValueError("premarket announcement initial source is unavailable")
+        return validate_premarket_source_task_result(
+            dict(payload), process_exit,
+            expected_trade_date=target,
+            expected_source_cutoff=str(task.get("_scheduler_premarket_source_cutoff") or ""),
+            expected_decision_cutoff=str(task.get("_scheduler_premarket_decision_cutoff") or ""),
+            expected_scheduler_run_uid=str(task.get("_scheduler_history_run_uid") or ""),
+            expected_build_sha=build, started_at=started_at, finished_at=now,
+            expected_parent=parent,
+        )
     release_catchup = str(task.get("_trigger_source") or "").strip() == "release_catchup"
     if not release_catchup:
         return validate_task_result(dict(payload), process_exit)
@@ -2822,6 +2859,24 @@ def scheduler_output_status(
     same-day retries.  ``blocked`` accurately represents both conditions.
     """
     task_type = str(task.get("task_type") or "").strip()
+    if task_type == "strategy_external_overlay":
+        from server.common.frozen_strategy_pool_work import PREMARKET_POOL_WORK_REF_SCHEMA
+
+        if return_code == 0:
+            return "success" if _single_nested_machine_payload(output, schema=PREMARKET_POOL_WORK_REF_SCHEMA) else "failed"
+        blocked = _single_nested_machine_payload(output, schema="probiga.premarket-pool-skipped.v1")
+        return "blocked" if blocked and blocked.get("status") == "blocked" else "failed"
+    if task_type == PREMARKET_EXTERNAL_TASK_TYPE:
+        receipt = _single_nested_machine_payload(output, schema=PREMARKET_EXTERNAL_SNAPSHOT_SCHEMA)
+        if return_code != 0 or receipt is None or task.get("script_path") != "tools/refresh_external_market_context.py":
+            return "failed"
+        try:
+            validate_premarket_external_market_receipt(
+                receipt, expected_execution_session=task.get("_scheduler_premarket_execution_session"),
+            )
+        except (TypeError, ValueError, OverflowError):
+            return "failed"
+        return "success"
     if (task_type == "analysis_premarket_external"
             and task.get("script_path") == "tools/run_premarket_theme_forecast.py"):
         from biz.premarket.theme_forecast import PREMARKET_PUBLICATION_SCHEMA
@@ -3344,7 +3399,7 @@ def scheduler_output_status(
             )
             else "failed"
         )
-    if task_type == "qmt_announcement_pit":
+    if task_type in _QMT_ANNOUNCEMENT_RECEIPT_TASK_TYPES:
         candidates: list[Mapping[str, Any]] = []
         for line in str(output or "").splitlines():
             candidate = line.strip()
@@ -4453,6 +4508,58 @@ def validate_scheduler_task_result(
     output: str | None = None,
 ) -> SchedulerValidationResult:
     task_type = str(task.get("task_type") or "").strip()
+    if task_type == "strategy_external_overlay":
+        from server.common.frozen_strategy_pool_work import PREMARKET_POOL_WORK_REF_SCHEMA
+
+        item = _single_nested_machine_payload(output, schema=PREMARKET_POOL_WORK_REF_SCHEMA) or {}
+        ok = (
+            task.get("script_path") == "tools/run_strategy_external_overlay.py"
+            and item.get("run_uid") == task.get("_scheduler_history_run_uid")
+            and item.get("build_sha") == task.get("_scheduler_expected_build_sha")
+            and item.get("trade_date") == task.get("_scheduler_target_trade_date")
+            and re.fullmatch(r"[0-9a-f]{64}", str(item.get("sha256") or "")) is not None
+            and type(item.get("bytes")) is int and item["bytes"] > 0
+            and item.get("automatic_real_order_submission") is False
+            and item.get("real_order_authority") is False
+        )
+        return SchedulerValidationResult(True, ok, "premarket score work reference checked")
+    if task_type == PREMARKET_EXTERNAL_TASK_TYPE:
+        from server.common.authoritative_market_clock import (
+            STRATEGY_POOL_PREMARKET_REVISION_TIME, resolve_strategy_pool_decision_slot,
+        )
+
+        try:
+            receipt = _single_nested_machine_payload(output, schema=PREMARKET_EXTERNAL_SNAPSHOT_SCHEMA)
+            if receipt is None or task.get("script_path") != "tools/refresh_external_market_context.py":
+                raise ValueError("external market scheduler receipt is missing")
+            captured_at, _report = validate_premarket_external_market_receipt(
+                receipt, expected_execution_session=task.get("_scheduler_premarket_execution_session"),
+            )
+            decision = datetime.combine(captured_at.date(), STRATEGY_POOL_PREMARKET_REVISION_TIME)
+            current = now or datetime.now(PRODUCTION_TIMEZONE)
+            started = (
+                started_at.astimezone(PRODUCTION_TIMEZONE).replace(tzinfo=None)
+                if started_at is not None and started_at.tzinfo is not None else started_at
+            )
+            capture_start = datetime.combine(captured_at.date(), PREMARKET_EXTERNAL_CAPTURE_TIME)
+            if started is None or not capture_start <= started <= captured_at:
+                raise ValueError("external market scheduler start time differs")
+            slot = resolve_strategy_pool_decision_slot(
+                engine, data_trade_date=str(task.get("_scheduler_target_trade_date") or ""),
+                phase="PREMARKET_REVISION", evaluated_at=decision,
+            )
+            if slot.scheduled_at.replace(tzinfo=None) != decision:
+                raise ValueError("external market scheduler execution session differs")
+            verified = load_verified_premarket_external_market_context(
+                engine, receipt=receipt, cutoff=decision, finished_at=current,
+            )
+            return SchedulerValidationResult(
+                checked=True, ok=True, message=f"external market snapshot verified: {verified['snapshot_id']}",
+            )
+        except Exception as exc:
+            return SchedulerValidationResult(
+                checked=True, ok=False, message=f"external market snapshot validation failed: {type(exc).__name__}",
+            )
     if (task_type == "analysis_premarket_external"
             and task.get("script_path") == "tools/run_premarket_theme_forecast.py"):
         from biz.premarket.theme_forecast import (
@@ -4557,7 +4664,7 @@ def validate_scheduler_task_result(
     requirements = TASK_OUTPUT_REQUIREMENTS.get(task_type)
     exact_v3_receipt = task_type in TRADING_V3_DECISION_TASK_TYPES
     exact_research_receipt = task_type == _RESEARCH_POOL_TASK_TYPE
-    exact_qmt_announcement_receipt = task_type == _QMT_ANNOUNCEMENT_TASK_TYPE
+    exact_qmt_announcement_receipt = task_type in _QMT_ANNOUNCEMENT_RECEIPT_TASK_TYPES
     exact_membership_receipt = task_type == _QMT_MEMBERSHIP_TASK_TYPE
     exact_analysis_evidence = task_type in {
         _TARGET_TURNOVER_TASK_TYPE,
@@ -5015,18 +5122,18 @@ def validate_scheduler_task_result(
             )
             if payload is None:
                 raise ValueError(
-                    "qmt_announcement_pit: exact task receipt is missing"
+                    f"{task_type}: exact task receipt is missing"
                 )
             disposition = _validate_qmt_announcement_scheduler_receipt(
-                task, payload, 0, started_at=started_at, now=now
+                task, payload, 0, started_at=started_at, now=now, engine=engine,
             )
             if disposition != "complete":
                 raise ValueError(
-                    "qmt_announcement_pit: exact task receipt is incomplete"
+                    f"{task_type}: exact task receipt is incomplete"
                 )
             messages.append(
-                "qmt_announcement_pit exact publication verified: "
-                f"date={payload.get('trade_date') or payload.get('window_end')}"
+                f"{task_type} exact publication verified: "
+                f"date={payload.get('trade_date') or payload.get('coverage_target_date') or payload.get('window_end')}"
             )
         if exact_research_receipt:
             payload = _single_nested_machine_payload(
