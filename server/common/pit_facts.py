@@ -2448,6 +2448,7 @@ def _latest_revision_for_fact_cutoff(
 def _read_finance_payload_rows(
     connection: Connection, *, table_name: str, statement: Any,
     parameters: Mapping[str, Any], deadline: float, stage_prefix: str,
+    omit_nonempty_coverage_for: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     from server.common.qmt_announcement_pit import (
         _bounded_announcement_payload_keys, _live_announcement_read_hint,
@@ -2478,12 +2479,33 @@ def _read_finance_payload_rows(
     inventory_stage = stage_prefix + "-inventory"
     inventory = read(statement, parameters, inventory_stage)
     expected = {row[id_column]: row for row in inventory}
+    inventory_columns = {id_column}
+    if omit_nonempty_coverage_for:
+        if table_name != SOURCE_COVERAGE_TABLE:
+            raise ValueError("finance coverage filtering requires source coverage")
+        inventory_columns.update({"stock_code", "scope_hash", "revision_no", "coverage_status", "result_count"})
     if (len(expected) != len(inventory)
-            or any(set(row) != {id_column} for row in inventory)
+            or any(set(row) != inventory_columns for row in inventory)
             or any(not _HASH_RE.fullmatch(str(key)) for key in expected)):
         raise invalid("finance inventory identity differs", inventory_stage)
+    if omit_nonempty_coverage_for:
+        def stock_scope(row):
+            return row["stock_code"], row["scope_hash"]
+
+        ordered_ids = []
+        for (code, _), scope_rows in groupby(inventory, key=stock_scope):
+            chain = list(scope_rows)
+            head = chain[-1]
+            # Only an eligible empty head can affect a stock that has revision
+            # identities. For those heads the complete predecessor chain is
+            # still needed to detect corruption before accepting the proof.
+            if code not in omit_nonempty_coverage_for or (
+                head["coverage_status"] == "COMPLETE" and head["result_count"] == 0
+            ):
+                ordered_ids.extend(row[id_column] for row in chain)
+    else:
+        ordered_ids = list(expected)
     packed_by_id = {}
-    ordered_ids = list(expected)
     metadata_columns = ",".join(sorted(_REQUIRED_COLUMNS[table_name] - {"payload_json"}))
     for offset in range(0, len(ordered_ids), FINANCE_REVISION_MYSQL_PAYLOAD_ROW_LIMIT):
         revision_ids = ordered_ids[offset:offset + FINANCE_REVISION_MYSQL_PAYLOAD_ROW_LIMIT]
@@ -2515,8 +2537,12 @@ def _read_finance_payload_rows(
             for key, payload_bytes in batch:
                 if actual[key]["payload_json_bytes"] != payload_bytes:
                     raise invalid("finance payload size differs", stage)
+                if omit_nonempty_coverage_for and any(
+                    actual[key][column] != expected[key][column] for column in inventory_columns
+                ):
+                    raise invalid("finance coverage payload inventory differs", stage)
                 packed_by_id[key] = actual[key]
-    return [packed_by_id[row[id_column]] for row in inventory]
+    return [packed_by_id[key] for key in ordered_ids]
 
 
 def _query_revisions(
@@ -3071,6 +3097,7 @@ def _authoritative_empty_coverage(
     verified_event_batch: Mapping[str, Any] | None = None,
     event_completion_at: datetime | None = None,
     read_deadline: float | None = None,
+    codes_with_revisions: set[str] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
     """Resolve complete zero-result receipts without crossing their watermark."""
 
@@ -3094,6 +3121,7 @@ def _authoritative_empty_coverage(
                 mysql and fact_kind == "event" and batch_id and source in AUTHORITATIVE_EVENT_SOURCES
             )
             indexed_finance = mysql and fact_kind == "finance"
+            omit_nonempty_for = codes_with_revisions if indexed_finance else None
             snapshot_budget = nullcontext()
             if indexed_event:
                 from server.common.qmt_announcement_pit import (
@@ -3120,10 +3148,12 @@ def _authoritative_empty_coverage(
             batch_size = max(1, int(COMMON_FACT_CUTOFF_QUERY_CODE_LIMIT))
             if mysql:
                 batch_size = min(batch_size, EMPTY_COVERAGE_MYSQL_CODE_LIMIT)
-            columns = (
-                "coverage_id"
-                if indexed_finance else _coverage_payload_columns(mysql)
-            )
+            if omit_nonempty_for:
+                columns = "coverage_id,stock_code,scope_hash,revision_no,coverage_status,result_count"
+            elif indexed_finance:
+                columns = "coverage_id"
+            else:
+                columns = _coverage_payload_columns(mysql)
             hint = _live_announcement_read_hint(
                 mysql=True, deadline=deadline, stage="finance-empty-coverage-inventory",
             ) if indexed_finance else ""
@@ -3152,6 +3182,7 @@ def _authoritative_empty_coverage(
                             connection, table_name=SOURCE_COVERAGE_TABLE, statement=statement,
                             parameters={**params, "codes": code_batch}, deadline=deadline,
                             stage_prefix="finance-empty-coverage",
+                            omit_nonempty_coverage_for=omit_nonempty_for,
                         ))
                     else:
                         rows = connection.execute(statement, {**params, "codes": code_batch})
@@ -5986,15 +6017,17 @@ def load_finance_facts(
     read_deadline = monotonic() + FINANCE_REVISION_MYSQL_DEADLINE_SECONDS
     revision_errors: list[str] = []
 
-    def read_failure(exc: Exception) -> str:
+    def read_failure(exc: Exception, *, default_stage: str = "", override_reason: str = "") -> str:
         diagnostic = type(exc).__name__
         stage = getattr(exc, "_pit_read_stage", "") or getattr(exc, "detail", "")
-        if re.fullmatch(
+        if not re.fullmatch(
             r"finance-(revision|empty-coverage|nonfiling)-(inventory|decode|size:[0-9]+|payload:[0-9]+)",
             str(stage),
         ):
+            stage = default_stage
+        if stage:
             diagnostic += f":stage={stage}"
-        reason = str(getattr(exc, "reason_code", "") or "")
+        reason = override_reason or str(getattr(exc, "reason_code", "") or "")
         if reason in {
             "QMT_ANNOUNCEMENT_LIVE_BATCH_VALIDATION_DEADLINE",
             "QMT_ANNOUNCEMENT_LIVE_BATCH_REPLY_DEADLINE",
@@ -6002,6 +6035,19 @@ def load_finance_facts(
         }:
             diagnostic += f":reason={reason}"
         return diagnostic
+
+    def shared_deadline_failure(stage: str, error: Exception | None) -> PITFactBatch | None:
+        deadline_reason = "QMT_ANNOUNCEMENT_LIVE_BATCH_VALIDATION_DEADLINE"
+        if monotonic() < read_deadline and getattr(error, "reason_code", "") != deadline_reason:
+            return None
+        return _blocked_batch(
+            table_name=FINANCE_REVISION_TABLE, codes=normalized_codes,
+            decision_at=decision, fact_cutoff_at=fact_cutoff,
+            reason="PIT_FINANCE_SCHEMA_UNAVAILABLE:" + read_failure(
+                error if error is not None else TimeoutError(),
+                default_stage=stage, override_reason=deadline_reason,
+            ),
+        )
 
     def revision_groups():
         # One historical finance scan held 264k rows (214 MiB of JSON) and
@@ -6039,55 +6085,14 @@ def load_finance_facts(
         except Exception as exc:
             revision_errors.append(read_failure(exc))
 
-    try:
-        empty_coverage, coverage_errors = _authoritative_empty_coverage(
-            engine,
-            fact_kind="finance",
-            codes=normalized_codes,
-            fact_cutoff_at=fact_cutoff,
-            decision_at=decision,
-            start_date=date(1900, 1, 1),
-            end_date=end_date,
-            read_deadline=read_deadline,
-        )
-    except Exception as exc:
-        empty_coverage = {}
-        coverage_errors = {
-            code: f"PIT_FINANCE_COVERAGE_SCHEMA_UNAVAILABLE:{read_failure(exc)}"
-            for code in normalized_codes
-        }
-    required_report_date = finance_disclosure_gate(end_date).minimum_report_date
-    try:
-        expected_unavailable, unavailable_errors = (
-            load_finance_expected_unavailable(
-                engine,
-                codes=normalized_codes,
-                decision_at=decision,
-                expected_report_date=required_report_date,
-                read_deadline=read_deadline,
-            )
-        )
-    except Exception as exc:
-        expected_unavailable = {}
-        unavailable_errors = {
-            code: (
-                "PIT_FINANCE_UNAVAILABLE_SCHEMA_UNAVAILABLE:"
-                f"{read_failure(exc)}"
-            )
-            for code in normalized_codes
-        }
-    coverage_errors.update(unavailable_errors)
-    resolved_coverage = {
-        **empty_coverage,
-        **expected_unavailable,
-        **data_exclusions,
-    }
-    facts: dict[str, dict[str, Any]] = {}
+    codes_with_revisions: set[str] = set()
+    selected_by_code: dict[str, dict[str, Any]] = {}
+    ineligible_revision_reasons: dict[str, str] = {}
     statuses: dict[str, str] = {}
     reasons: dict[str, str] = {}
-    # Finish coverage reads before the revision iterator holds a connection;
-    # this also works with a one-connection pool.
     for code, identities in revision_groups():
+        if identities:
+            codes_with_revisions.add(code)
         if code in data_exclusions:
             statuses[code] = PIT_DATA_BLOCKED
             reasons[code] = (
@@ -6095,18 +6100,6 @@ def load_finance_facts(
             )
             continue
         if not identities:
-            if code in expected_unavailable:
-                statuses[code] = PIT_AVAILABLE
-                reasons[code] = "PIT_FINANCE_EXPECTED_UNAVAILABLE"
-            elif code in empty_coverage:
-                statuses[code] = PIT_AVAILABLE
-                reasons[code] = "PIT_FINANCE_AUTHORITATIVE_EMPTY"
-            elif code in coverage_errors and "BAD_COVERAGE_CHAIN" in coverage_errors[code]:
-                statuses[code] = PIT_DATA_BLOCKED
-                reasons[code] = coverage_errors[code]
-            else:
-                statuses[code] = PIT_NO_ROWS
-                reasons[code] = "PIT_FINANCE_NO_ROWS"
             continue
         latest_by_identity: list[dict[str, Any]] = []
         selection_reasons: list[str] = []
@@ -6127,30 +6120,13 @@ def load_finance_facts(
             reasons[code] = f"PIT_FINANCE_BAD_CHAIN:{exc}"
             continue
         if not latest_by_identity:
-            if code in expected_unavailable:
-                statuses[code] = PIT_AVAILABLE
-                reasons[code] = "PIT_FINANCE_EXPECTED_UNAVAILABLE"
-            elif code in empty_coverage:
-                statuses[code] = PIT_AVAILABLE
-                reasons[code] = "PIT_FINANCE_AUTHORITATIVE_EMPTY"
-            elif selection_reasons:
-                statuses[code] = PIT_DATA_BLOCKED
-                reasons[code] = sorted(selection_reasons)[0]
-            else:
-                statuses[code] = PIT_NO_ROWS
-                reasons[code] = "PIT_FINANCE_NO_ROWS_AT_FACT_CUTOFF"
+            if selection_reasons:
+                ineligible_revision_reasons[code] = min(selection_reasons)
             continue
         newest_report = max(
             _date_value(row.get("report_date"), required=True)
             for row in latest_by_identity
         )
-        if (
-            code in expected_unavailable
-            and newest_report < required_report_date
-        ):
-            statuses[code] = PIT_AVAILABLE
-            reasons[code] = "PIT_FINANCE_EXPECTED_UNAVAILABLE"
-            continue
         candidates = [
             row for row in latest_by_identity
             if _date_value(row.get("report_date"), required=True) == newest_report
@@ -6165,7 +6141,97 @@ def load_finance_facts(
                 _row_datetime(row["known_at"]), int(row.get("revision_no") or 0),
             )
         )
-        selected = candidates[-1]
+        selected_by_code[code] = candidates[-1]
+    if revision_errors:
+        return _blocked_batch(
+            table_name=FINANCE_REVISION_TABLE, codes=normalized_codes,
+            decision_at=decision, fact_cutoff_at=fact_cutoff,
+            reason="PIT_FINANCE_SCHEMA_UNAVAILABLE:" + revision_errors[0],
+        )
+
+    # The revision iterator has released its snapshot before these reads, even
+    # when the pool has just one connection.
+    coverage_error = None
+    try:
+        empty_coverage, coverage_errors = _authoritative_empty_coverage(
+            engine,
+            fact_kind="finance",
+            codes=normalized_codes,
+            fact_cutoff_at=fact_cutoff,
+            decision_at=decision,
+            start_date=date(1900, 1, 1),
+            end_date=end_date,
+            read_deadline=read_deadline,
+            codes_with_revisions=codes_with_revisions,
+        )
+    except Exception as exc:
+        coverage_error = exc
+        empty_coverage = {}
+        coverage_errors = {
+            code: f"PIT_FINANCE_COVERAGE_SCHEMA_UNAVAILABLE:{read_failure(exc)}"
+            for code in normalized_codes
+        }
+    deadline_failure = shared_deadline_failure("finance-empty-coverage", coverage_error)
+    if deadline_failure is not None:
+        return deadline_failure
+    required_report_date = finance_disclosure_gate(end_date).minimum_report_date
+    nonfiling_error = None
+    try:
+        expected_unavailable, unavailable_errors = (
+            load_finance_expected_unavailable(
+                engine,
+                codes=normalized_codes,
+                decision_at=decision,
+                expected_report_date=required_report_date,
+                read_deadline=read_deadline,
+            )
+        )
+    except Exception as exc:
+        nonfiling_error = exc
+        expected_unavailable = {}
+        unavailable_errors = {
+            code: (
+                "PIT_FINANCE_UNAVAILABLE_SCHEMA_UNAVAILABLE:"
+                f"{read_failure(exc)}"
+            )
+            for code in normalized_codes
+        }
+    deadline_failure = shared_deadline_failure("finance-nonfiling", nonfiling_error)
+    if deadline_failure is not None:
+        return deadline_failure
+    coverage_errors.update(unavailable_errors)
+    resolved_coverage = {**empty_coverage, **expected_unavailable, **data_exclusions}
+
+    facts: dict[str, dict[str, Any]] = {}
+    for code in normalized_codes:
+        if code in statuses:
+            continue
+        selected = selected_by_code.get(code)
+        if selected is None:
+            if code in expected_unavailable:
+                statuses[code] = PIT_AVAILABLE
+                reasons[code] = "PIT_FINANCE_EXPECTED_UNAVAILABLE"
+            elif code in empty_coverage:
+                statuses[code] = PIT_AVAILABLE
+                reasons[code] = "PIT_FINANCE_AUTHORITATIVE_EMPTY"
+            elif code in ineligible_revision_reasons:
+                statuses[code] = PIT_DATA_BLOCKED
+                reasons[code] = ineligible_revision_reasons[code]
+            elif code not in codes_with_revisions and "BAD_COVERAGE_CHAIN" in coverage_errors.get(code, ""):
+                statuses[code] = PIT_DATA_BLOCKED
+                reasons[code] = coverage_errors[code]
+            else:
+                statuses[code] = PIT_NO_ROWS
+                reasons[code] = (
+                    "PIT_FINANCE_NO_ROWS_AT_FACT_CUTOFF" if code in codes_with_revisions
+                    else "PIT_FINANCE_NO_ROWS"
+                )
+            continue
+        newest_report = _date_value(selected.get("report_date"), required=True)
+        if code in expected_unavailable and newest_report < required_report_date:
+            statuses[code] = PIT_AVAILABLE
+            reasons[code] = "PIT_FINANCE_EXPECTED_UNAVAILABLE"
+            continue
         payload = _parse_payload(selected)
         exact_publication = bool(
             selected.get("publication_time_status") == TIME_VERIFIED
@@ -6207,12 +6273,6 @@ def load_finance_facts(
         facts[code] = payload
         statuses[code] = PIT_AVAILABLE
         reasons[code] = ""
-    if revision_errors:
-        return _blocked_batch(
-            table_name=FINANCE_REVISION_TABLE, codes=normalized_codes,
-            decision_at=decision, fact_cutoff_at=fact_cutoff,
-            reason="PIT_FINANCE_SCHEMA_UNAVAILABLE:" + revision_errors[0],
-        )
     manifest = {
         "schema": "probiga.pit-finance-selection.v1",
         "fact_cutoff_at": _dt_text(fact_cutoff),
