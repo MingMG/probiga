@@ -64,7 +64,9 @@ from integrations.qmt.datadir_import import (  # noqa: E402
 from server.common.config import get_minute_mysql_url  # noqa: E402
 from server.common.engine_factory import create_pooled_engine  # noqa: E402
 from server.common.qmt_index_minute_grid import CORE_GRID  # noqa: E402
-from server.common.qmt_minute_publication_scope import seal_minute_security_publication  # noqa: E402
+from server.common.qmt_minute_publication_scope import (  # noqa: E402
+    load_verified_minute_security_rows, seal_minute_security_publication,
+)
 from server.common.authoritative_market_clock import (  # noqa: E402
     authoritative_closed_trade_date,
 )
@@ -193,6 +195,23 @@ def _prior_completed_partitions(connection, session, receipt):
     return valid
 
 
+def _completed_security_publication_matches(engine, *, session, receipt, stock_code):
+    """Reuse a previously opened proof under the unchanged daily scope."""
+    with engine.connect() as connection:
+        proof, rows = load_verified_minute_security_rows(
+            connection, connection, dataset=DATASET, trade_date=session.isoformat(),
+            decision_known_at=dt.datetime.now(CST), codes=[stock_code],
+        )
+    return bool(
+        proof and stock_code in rows and receipt["status"] == STATUS_COMPLETE
+        and proof["run_id"] == receipt["run_id"]
+        and proof["source_content_sha256"] == receipt["content_sha256"]
+        and proof["partition_row_hash"] == receipt["detail"].get("row_hash")
+        and len(proof["security_fingerprints"]) == receipt["code_count"]
+        and sum(item["row_count"] for item in proof["security_fingerprints"].values()) == receipt["row_count"]
+    )
+
+
 def _reuse_existing_partition(engine, *, session, scope, datadir_roots=(), universe=()):
     """Rebind proven existing data to today's valid scope without rewriting rows."""
     with _minute_write_connection(engine) as connection:
@@ -229,15 +248,34 @@ def _reuse_existing_partition(engine, *, session, scope, datadir_roots=(), unive
             if original is None:
                 return None
             trade_scope(connection, session.isoformat(), manifest_hash=scope["full_market_manifest_hash"])
-            archive_minute_publication(connection, receipt)
-            write_receipt(connection, session=session, root=original["source_root"],
-                status=STATUS_COMPLETE, run_id=original["run_id"],
-                row_count=fingerprint["row_count"], code_count=fingerprint["code_count"],
-                content_sha256=original["content_sha256"], finished=True,
-                detail={**_completion_detail(fingerprint), "reused_existing_partition": True})
-            seal_minute_security_publication(
-                connection, dataset=DATASET, trade_date=session.isoformat(), fingerprints=fingerprint,
+            proof, _ = load_verified_minute_security_rows(
+                connection, connection, dataset=DATASET, trade_date=session.isoformat(),
+                decision_known_at=dt.datetime.now(CST),
+                codes=[min(fingerprint["security_fingerprints"])],
             )
+            matching_proof = bool(
+                proof and proof["run_id"] == original["run_id"]
+                and proof["source_content_sha256"] == original["content_sha256"]
+                and proof["partition_row_hash"] == fingerprint["row_hash"]
+                and proof["security_fingerprints"] == fingerprint["security_fingerprints"]
+            )
+            if not (
+                matching_proof
+                and receipt is not None
+                and receipt["status"] == STATUS_COMPLETE
+                and receipt["run_id"] == original["run_id"]
+                and receipt["detail"].get("full_market_manifest_hash") == scope["full_market_manifest_hash"]
+            ):
+                archive_minute_publication(connection, receipt)
+                write_receipt(connection, session=session, root=original["source_root"],
+                    status=STATUS_COMPLETE, run_id=original["run_id"],
+                    row_count=fingerprint["row_count"], code_count=fingerprint["code_count"],
+                    content_sha256=original["content_sha256"], finished=True,
+                    detail={**_completion_detail(fingerprint), "reused_existing_partition": True})
+                if not matching_proof:
+                    seal_minute_security_publication(
+                        connection, dataset=DATASET, trade_date=session.isoformat(), fingerprints=fingerprint,
+                    )
             clear_minute_attempt(connection, session)
     print(f"{session} REUSED rows={fingerprint['row_count']} codes={fingerprint['code_count']}", flush=True)
     return {"session": session.isoformat(), "status": STATUS_COMPLETE,
@@ -384,10 +422,6 @@ def main(argv: list[str] | None = None) -> int:
         Path(item)
         for item in (args.datadir_root or DEFAULT_DATADIRS)
     ]
-    missing_roots = [str(root) for root in datadir_roots if not root.is_dir()]
-    if missing_roots:
-        parser.error(f"datadir root does not exist: {', '.join(missing_roots)}")
-
     sessions = _sessions(engine, start, end)
     if not sessions:
         parser.error("the QMT calendar has no session in the requested range")
@@ -423,7 +457,17 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(report, ensure_ascii=False, indent=1))
         return 0
 
-    todo = [item for item in plans if item.action in ACTIONABLE]
+    ordered = universe.ordered()
+    todo = []
+    for item in plans:
+        if item.action == "SKIP_COMPLETE":
+            if ordered and _completed_security_publication_matches(
+                engine, session=item.session, receipt=receipts[item.session], stock_code=ordered[0].code,
+            ):
+                continue
+        elif item.action not in ACTIONABLE:
+            continue
+        todo.append(item)
     if not todo:
         print("nothing to import")
         return _finish_run(engine, sessions=sessions, emit_json=args.json, cleanup_existing=True)
@@ -434,7 +478,6 @@ def main(argv: list[str] | None = None) -> int:
         for item in todo if item.action == "REPLACE"
         for source in item.existing_sources
     })
-    ordered = universe.ordered()
     try:
         scopes = {item.session: trade_scope(engine, item.session.isoformat()) for item in todo}
     except ValueError as exc:
@@ -446,7 +489,7 @@ def main(argv: list[str] | None = None) -> int:
     published: dict[dt.date, dict] = {}
     for item in todo:
         outcome = _reuse_existing_partition(engine, session=item.session, scope=scopes[item.session],
-            datadir_roots=datadir_roots, universe=ordered)
+            datadir_roots=() if item.action == "SKIP_COMPLETE" else datadir_roots, universe=ordered)
         if outcome is not None:
             _report_stage_cleanup(engine, session=item.session, run_id=outcome["run_id"],
                 deadline=time.monotonic() + 180)
@@ -461,6 +504,11 @@ def main(argv: list[str] | None = None) -> int:
     # order and a session is published from the first root that proves
     # coverage; a thin root leaves the date open for the next one.
     shortfalls: dict[dt.date, dict] = {}
+
+    if any(item.session not in published for item in todo):
+        missing_roots = [str(root) for root in datadir_roots if not root.is_dir()]
+        if missing_roots:
+            parser.error(f"datadir root does not exist: {', '.join(missing_roots)}")
 
     for root in datadir_roots:
         pending = [item for item in todo if item.session not in published]

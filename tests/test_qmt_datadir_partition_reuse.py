@@ -15,6 +15,7 @@ from integrations.qmt.datadir import CST, DAT_HEADER, MINUTE_PERIOD
 from integrations.qmt.datadir_import import ATTEMPT_DATASET, SOURCE, Universe, UniverseMember
 from server.common import qmt_datadir_minute_coverage as coverage
 from server.common import qmt_datadir_result as results
+from server.common.qmt_minute_publication_scope import seal_minute_security_publication
 from tools import import_qmt_datadir_history as importer
 
 
@@ -270,12 +271,16 @@ def test_minute_cli_checks_current_daily_authority_before_reusing_complete_recei
     day = str(DAY)
     current_hash = item.scope["full_market_manifest_hash"]
     receipt_hash = current_hash if case == "current" else "b" * 64
-    actual = coverage.persisted_matrix(item.engine, day, scope=item.scope)
+    actual = coverage.persisted_matrix(item.engine, day, scope=item.scope,
+        include_security_fingerprints=(case == "current"))
     detail = {**importer._completion_detail(actual), "full_market_manifest_hash": receipt_hash}
     with item.engine.begin() as connection:
         importer.write_receipt(connection, session=DAY, root=str(item.root), status="COMPLETE",
             run_id="original-minute-run", code_count=2, row_count=482, content_sha256="c" * 64,
             detail=detail, finished=True)
+        if case == "current":
+            seal_minute_security_publication(connection, dataset="stock_minute",
+                trade_date=day, fingerprints=actual)
         if case != "missing":
             connection.execute(text("""INSERT INTO qmt_history_coverage_manifest
                 (trade_date,manifest_hash,dataset,provider,schema_version,status,strategy_eligible,captured_at) VALUES

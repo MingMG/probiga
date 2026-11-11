@@ -39,9 +39,12 @@ from server.common.qmt_datadir_result import (  # noqa: E402
     load_receipt,
     partition_from_receipt,
     persisted_fingerprint,
+    SHA64,
 )
 from server.common.qmt_index_minute_grid import index_minute_grids  # noqa: E402
-from server.common.qmt_minute_publication_scope import seal_minute_security_publication  # noqa: E402
+from server.common.qmt_minute_publication_scope import (  # noqa: E402
+    load_verified_minute_security_rows, seal_minute_security_publication,
+)
 from server.common.qmt_trade_calendar import (  # noqa: E402
     load_trade_calendar_receipt,
 )
@@ -381,6 +384,77 @@ def _task_result(engine, *, dataset: str, sessions: list[dt.date]) -> dict:
     )
 
 
+def _reuse_existing_minute_partition(engine, history, *, session, catalog, minimum_coverage):
+    """Open an original completed index partition before reading DAT files."""
+    day = session.isoformat()
+    expected_codes = set(expected_codes_by_session(catalog, [day])[day])
+    with engine.begin() as connection:
+        receipt = load_receipt(connection, dataset="index_minute", trade_date=day)
+        if not receipt or receipt["status"] != "COMPLETE" or not receipt.get("finished_at"):
+            return False
+        original = partition_from_receipt(receipt)
+        if (
+            not original["source_root"] or not original["run_id"]
+            or SHA64.fullmatch(original["content_sha256"]) is None
+            or SHA64.fullmatch(original["row_hash"]) is None
+            or original["eligible_code_count"] != len(expected_codes)
+            or original["code_count"] < math.ceil(len(expected_codes) * minimum_coverage)
+            or original["readback_rows"] != original["row_count"]
+            or original["readback_codes"] != original["code_count"]
+            or original["coverage"] != original["code_count"] / len(expected_codes)
+        ):
+            return False
+        with history.connect() as data_connection:
+            sampled_code = min(expected_codes)
+            decision_at = dt.datetime.now(CST)
+            proof, rows = load_verified_minute_security_rows(
+                connection, data_connection, dataset="index_minute", trade_date=day,
+                decision_known_at=decision_at, codes=[sampled_code],
+            )
+            if proof and sampled_code not in proof["security_fingerprints"]:
+                sampled_code = min(proof["security_fingerprints"])
+                proof, rows = load_verified_minute_security_rows(
+                    connection, data_connection, dataset="index_minute", trade_date=day,
+                    decision_known_at=decision_at, codes=[sampled_code],
+                )
+            if (
+                proof and sampled_code in rows and proof["run_id"] == original["run_id"]
+                and proof["source_content_sha256"] == original["content_sha256"]
+                and proof["partition_row_hash"] == original["row_hash"]
+                and len(proof["security_fingerprints"]) == original["code_count"]
+                and sum(item["row_count"] for item in proof["security_fingerprints"].values()) == original["row_count"]
+                and set(proof["security_fingerprints"]) <= expected_codes
+            ):
+                return True
+            fingerprint = persisted_fingerprint(
+                data_connection, dataset="index_minute", trade_date=day,
+                include_security_fingerprints=True,
+            )
+            if (
+                any(fingerprint[key] != original[key] for key in ("row_hash", "row_count", "code_count"))
+                or not set(fingerprint["security_fingerprints"]) <= expected_codes
+            ):
+                return False
+        detail = {
+            **receipt["detail"], "reused_existing_partition": True,
+            "prior_completion": {**original, "finished_at": str(receipt["finished_at"])},
+        }
+        updated = connection.execute(text(
+            "UPDATE qmt_datadir_import_partition SET finished_at=NOW(),detail_json=:detail "
+            "WHERE dataset='index_minute' AND trade_date=:day AND status='COMPLETE' "
+            "AND run_id=:run_id AND content_sha256=:content_sha256"
+        ), {
+            "day": day, "run_id": original["run_id"], "content_sha256": original["content_sha256"],
+            "detail": json.dumps(detail, ensure_ascii=False, separators=(",", ":")),
+        })
+        if updated.rowcount != 1:
+            raise ValueError("original index minute completion changed during verification")
+        seal_minute_security_publication(
+            connection, dataset="index_minute", trade_date=day, fingerprints=fingerprint,
+        )
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", choices=sorted(DATASETS), required=True)
@@ -409,6 +483,18 @@ def main(argv: list[str] | None = None) -> int:
     sessions = _sessions(engine, start, end)
     if not sessions:
         parser.error("no QMT calendar session in the requested range")
+    catalog = _load_catalog(engine)
+    pending = []
+    for session in sessions:
+        if args.apply and args.dataset == "minute" and _reuse_existing_minute_partition(
+            engine, history, session=session, catalog=catalog, minimum_coverage=args.min_coverage,
+        ):
+            continue
+        pending.append(session)
+    if not pending:
+        print(json.dumps(_task_result(engine, dataset=dataset, sessions=sessions),
+                         ensure_ascii=False, separators=(",", ":")))
+        return 0
     root = Path(args.datadir_root)
     if not root.is_dir():
         payload = build_unavailable_result(
@@ -420,14 +506,13 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
         return 2
 
-    catalog = _load_catalog(engine)
     harvested = _harvest(
         root,
         dataset=args.dataset,
         catalog=catalog,
-        sessions=sessions,
+        sessions=pending,
     )
-    for session in sessions:
+    for session in pending:
         day = session.isoformat()
         required = math.ceil(harvested["eligible"][day] * args.min_coverage)
         if (
@@ -461,22 +546,21 @@ def main(argv: list[str] | None = None) -> int:
     table = DATASETS[args.dataset]["table"]
     if args.dataset == "kline":
         where = "trade_date BETWEEN :start_date AND :end_date AND k_type=1"
+        replacement_dates = {"start_date": min(pending), "end_date": max(pending)}
     else:
-        where = "trade_date BETWEEN :start_date AND :end_date"
+        replacement_dates = {f"session_{index}": session for index, session in enumerate(pending)}
+        where = "trade_date IN (" + ",".join(":" + key for key in replacement_dates) + ")"
     replace_table_rows(
         frame,
         table,
         history,
         where_sql=where,
-        params={
-            "start_date": min(sessions),
-            "end_date": max(sessions),
-        },
+        params=replacement_dates,
         chunksize=2000,
         method="multi",
     )
     run_id = f"qid_{dt.datetime.now(CST):%Y%m%d%H%M%S}"
-    for session in sessions:
+    for session in pending:
         day = session.isoformat()
         fingerprint = persisted_fingerprint(
             history,
