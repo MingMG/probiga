@@ -11,6 +11,7 @@ from sqlalchemy import create_engine, text
 import integrations.qmt.runtime as qmt_runtime
 import tools.env_config as env_config
 import tools.sync_qmt_announcement_pit as announcement_tool
+from server.common import daily_delivery_control
 from tools.check_strategy_governance_health import (
     _qmt_announcement_scheduler_checks,
 )
@@ -44,6 +45,8 @@ from tools.qmt_announcement_task_contract import (
     ANALYSIS_FAST_CRON,
     ANALYSIS_UPPER_EVIDENCE_CRON,
     MIN_ANALYSIS_GOVERNANCE_GAP_MINUTES,
+    PREMARKET_ANNOUNCEMENT_TASK,
+    PREMARKET_ANNOUNCEMENT_TASK_TYPE,
     QMT_ANNOUNCEMENT_CHECKPOINT_DIR,
     QMT_ANNOUNCEMENT_FALLBACK_EGRESS_CONTRACT,
     QMT_ANNOUNCEMENT_FALLBACK_PROVIDER,
@@ -101,6 +104,156 @@ def _dependency(task_type, at, status="success"):
         "last_triggered_at": at,
         "last_run_status": status,
     }
+
+
+def test_premarket_announcement_scheduler_uses_one_signed_parent_across_holiday(
+    monkeypatch, tmp_path, capsys,
+):
+    engine = create_engine(f"sqlite:///{tmp_path / 'premarket.db'}")
+    with engine.begin() as connection:
+        connection.execute(text(
+            "CREATE TABLE si_trade_calendar (trade_date TEXT, trade_status INTEGER)"
+        ))
+        connection.execute(text(
+            "INSERT INTO si_trade_calendar VALUES "
+            "('2026-09-30',1),('2026-10-01',0),('2026-10-08',1)"
+        ))
+        connection.execute(text(
+            "CREATE TABLE st_scheduled_task_history (run_uid TEXT, task_id INTEGER, "
+            "task_type TEXT, run_at TEXT, build_sha TEXT, host_name TEXT, "
+            "status TEXT, trigger_source TEXT)"
+        ))
+        connection.execute(text(
+            "INSERT INTO st_scheduled_task_history VALUES "
+            "(:uid, 128, :task, '2026-10-08 07:00:03', :build, :host, 'running', 'scheduled')"
+        ), {
+            "uid": "a" * 32, "build": "b" * 40, "task": PREMARKET_ANNOUNCEMENT_TASK_TYPE,
+            "host": announcement_tool.gethostname()[:128],
+        })
+
+    class FixedClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = cls(2026, 10, 8, 7, 41)
+            return value.replace(tzinfo=tz)
+
+    for key, value in {
+        "HISTORY_RUN_UID": "a" * 32,
+        "BUILD_SHA": "b" * 40,
+        "TASK_ID": "128",
+        "TASK_TYPE": PREMARKET_ANNOUNCEMENT_TASK_TYPE,
+        "EXECUTOR_ROLE": "qmt_windows_edge",
+    }.items():
+        monkeypatch.setenv(f"PROBIGA_SCHEDULER_{key}", value)
+    monkeypatch.setattr(announcement_tool, "datetime", FixedClock)
+    monkeypatch.setattr(env_config, "load_project_env", lambda: None)
+    monkeypatch.setattr(env_config, "create_tool_engine", lambda **_kwargs: engine)
+    monkeypatch.setattr(announcement_tool, "_checkpoint_root", lambda _path: tmp_path)
+    monkeypatch.setattr(
+        announcement_tool, "runtime_contract_build_sha",
+        lambda *, expected_build_sha: "c" * 40,
+    )
+    reason = "QMT_ANNOUNCEMENT_API_UNAVAILABLE"
+    parent = {
+        "batch_id": "cninfo-ann-signed-first", "batch_root_hash": "d" * 64,
+        "source": "cninfo.announcement", "fallback_reason": reason,
+        "window_start": "2026-08-31", "window_end": "2026-09-30",
+        "received_at": "2026-09-30T21:00:00", "fact_cutoff_at": "2026-09-30T18:20:00",
+    }
+    parent_calls = []
+
+    def load_parent(_engine, *, trade_date, release_id):
+        parent_calls.append((trade_date, release_id))
+        return parent
+
+    monkeypatch.setattr(daily_delivery_control, "load_frozen_initial_announcement_parent", load_parent)
+    monkeypatch.setattr(
+        announcement_tool, "_announcement_data_adapter",
+        lambda _mode: pytest.fail("signed CNINFO lineage must avoid a second native capture"),
+    )
+    adapter = type("Fallback", (), {
+        "source": "cninfo.announcement", "force_fresh_capture": True, "resumable_capture": True,
+    })()
+    monkeypatch.setattr(announcement_tool, "_fallback_announcement_adapter", lambda _mode: adapter)
+    captures = []
+
+    def synchronize(_engine, **kwargs):
+        captures.append(kwargs)
+        return {
+            **_result(), "batch_id": "cninfo-ann-premarket-next",
+            "source": adapter.source, "primary_source": "qmt.announcement",
+            "fallback_reason": reason, "coverage_target_date": "2026-09-30",
+            "parent_batch_id": parent["batch_id"], "parent_batch_root_hash": parent["batch_root_hash"],
+            "incremental_chain_root_hash": "f" * 64,
+            "window_start": "2026-08-31", "window_end": "2026-10-08",
+            "fact_cutoff_at": "2026-10-08T07:00:00",
+            "received_at": "2026-10-08T07:40:00", "decision_at": "2026-10-08T07:40:00",
+            "publish_completed_at": "2026-10-08T07:40:30",
+            "capture_seconds": 2400, "event_count": 0, "empty_stock_count": 5500,
+        }
+
+    monkeypatch.setattr(announcement_tool, "synchronize_qmt_announcements", synchronize)
+    task = {
+        **PREMARKET_ANNOUNCEMENT_TASK,
+        "_trigger_source": "scheduled",
+        "_scheduler_target_trade_date": "2026-09-30",
+        "_scheduler_premarket_source_cutoff": "2026-10-08T07:00:00",
+        "_scheduler_premarket_decision_cutoff": "2026-10-08T08:30:00",
+        "_scheduler_history_run_uid": "a" * 32, "_scheduler_expected_build_sha": "b" * 40,
+    }
+    args = build_scheduler_task_args(task, task["script_path"], "2026-09-30")
+    assert announcement_tool.main(args, premarket_source=True) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert parent_calls == [("2026-09-30", "c" * 40)]
+    assert len(captures) == 1
+    assert captures[0]["required_incremental_parent"] == parent
+    assert captures[0]["coverage_target_date"] == "2026-09-30"
+    assert captures[0]["capture_fact_cutoff_at"] == "2026-10-08T07:00:00.000000"
+    assert captures[0]["completion_deadline_at"] == "2026-10-08T08:30:00.000000"
+    assert captures[0]["require_exact_capture_cutoff"] is True
+    assert "primary_attempt_status" not in result
+    assert scheduler_output_status(task, json.dumps(result), return_code=0) == "success"
+    assert scheduler_output_status(
+        {**task, "_scheduler_history_run_uid": "f" * 32}, json.dumps(result), return_code=0,
+    ) == "failed"
+    assert scheduler_output_status(
+        task, json.dumps({**result, "coverage_target_date": "2026-10-08"}), return_code=0,
+    ) == "failed"
+    assert scheduler_output_status(
+        task, json.dumps({**result, "publish_completed_at": "2026-10-08T08:30:00.000001"}),
+        return_code=0,
+    ) == "failed"
+
+    from server.common import component_release
+
+    monkeypatch.setattr(
+        component_release, "runtime_contract_build_sha",
+        lambda *, expected_build_sha: "c" * 40,
+    )
+    postrun = {
+        "engine": engine, "started_at": datetime(2026, 10, 8, 7, 0, 3),
+        "output": json.dumps(result),
+    }
+    assert validate_scheduler_task_result(
+        task, now=datetime(2026, 10, 8, 8, 30), **postrun,
+    ).ok
+    assert not validate_scheduler_task_result(
+        task, now=datetime(2026, 10, 8, 8, 30, 0, 1), **postrun,
+    ).ok
+    result["premarket_source"]["parent_batch_root_hash"] = "e" * 64
+    result["parent_batch_root_hash"] = "e" * 64
+    assert not validate_scheduler_task_result(
+        task, now=datetime(2026, 10, 8, 8, 30),
+        **{**postrun, "output": json.dumps(result)},
+    ).ok
+
+    monkeypatch.setattr(daily_delivery_control, "load_frozen_initial_announcement_parent", lambda *_a, **_k: None)
+    assert announcement_tool.main(args, premarket_source=True) == 2
+    assert json.loads(capsys.readouterr().out)["reason_code"] == "QMT_ANNOUNCEMENT_PREMARKET_PARENT_UNAVAILABLE"
+    assert len(captures) == 1
+    for invalid in ({**task, "_trigger_source": "manual"}, {**task, "_scheduler_premarket_source_cutoff": ""}):
+        with pytest.raises(ValueError, match="premarket announcement scheduler contract"):
+            build_scheduler_task_args(invalid, task["script_path"], "2026-09-30")
 
 
 def test_frozen_cross_host_pipeline_order_is_qmt_then_analysis_then_governance():

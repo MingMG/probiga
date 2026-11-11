@@ -21,7 +21,7 @@ import re
 import subprocess
 import sys
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import date, datetime, time as datetime_time, timedelta
 from decimal import Decimal, ROUND_HALF_UP
@@ -33,13 +33,15 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 from sqlalchemy import text
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from server.common.batch_db import create_batch_engine
+from server.common.kline_data import get_kline_engine
+from server.common.minute_data import get_minute_engine
 from server.common.strategy_daily_input_window import (
     ANALYSIS_DAILY_INPUT_SESSIONS,
     daily_input_catalog_join,
@@ -58,6 +60,9 @@ from server.common.daily_stock_universe import (
     load_daily_stock_universe,
     validate_daily_stock_coverage,
 )
+from server.common.daily_delivery_control import (
+    FrozenPremarketAnnouncement, select_frozen_initial_announcement_source,
+)
 from server.common.pit_facts import (
     HistoricalEventRead,
     PIT_AVAILABLE,
@@ -66,9 +71,17 @@ from server.common.pit_facts import (
     load_finance_facts,
     normalize_decision_at,
     resolve_common_fact_cutoff,
+    resolve_strategy_fact_cutoffs,
+)
+from server.common.authoritative_market_clock import (
+    STRATEGY_POOL_INITIAL_TIME,
+    StrategyPoolDecisionPhase,
+    resolve_strategy_pool_decision_slot,
 )
 from server.common.analysis_pool_receipt import (
     ANALYSIS_POOL_PUBLISHER_TASK_TYPES,
+    ANALYSIS_SCORE_PUBLICATION_TASK_TYPES,
+    PREMARKET_POOL_TASK,
     build_publication_receipt,
     build_score_snapshot,
     build_preliminary_analysis_snapshot,
@@ -103,6 +116,7 @@ from .tactical_market import (
     attach_daily_tactical_features,
     attach_intraday_tactical_features,
     load_tactical_context,
+    market_snapshot,
     tactical_candidate_codes,
 )
 
@@ -1926,6 +1940,29 @@ def _load_kline_features_from_snapshot(
         verification_engine=verification_engine,
     )
     result.attrs["qmt_daily_input_window"] = daily_window
+    market_sessions = set(daily_window["sessions"][-20:])
+    market_rows = df.loc[
+        df["stock_code"].astype(str).str.zfill(6).str.startswith(("0", "3", "6"))
+        & df["trade_date"].astype(str).isin(market_sessions),
+        ["trade_date", "change_pct"],
+    ].copy()
+    market_rows["change_pct"] = pd.to_numeric(market_rows["change_pct"], errors="coerce")
+    market_rows = market_rows.loc[np.isfinite(market_rows["change_pct"])]
+    result.attrs["frozen_daily_market_rows"] = [
+        {
+            "trade_date": str(day),
+            "market_change_pct": float(group["change_pct"].mean()),
+            "breadth_pct": float(group["change_pct"].gt(0).mean() * 100.0),
+            "universe_count": len(group),
+        }
+        for day, group in market_rows.groupby("trade_date", sort=True)
+    ]
+    previous_date = date.fromisoformat(daily_window["sessions"][-2])
+    previous_market = df[df["trade_date"] == previous_date]
+    if not previous_market.empty:
+        result.attrs["tactical_previous_market"] = market_snapshot(
+            previous_market, previous_date.isoformat(),
+        )
     _emit_progress(
         progress_callback,
         stage="load_kline_done",
@@ -2490,6 +2527,7 @@ def load_notice_features(
     fact_cutoff_at: datetime | str | None = None,
     stock_codes: list[str],
     historical_selection: HistoricalEventRead | None = None,
+    event_window_end: date | str | None = None,
 ) -> pd.DataFrame:
     codes = _normalize_stock_codes(stock_codes) or []
     if not codes:
@@ -2523,7 +2561,7 @@ def load_notice_features(
         decision_at=decision,
         fact_cutoff_at=fact_cutoff_at,
         start_date=date.fromisoformat(trade_date) - timedelta(days=lookback_days),
-        end_date=trade_date,
+        end_date=event_window_end or trade_date,
         require_qmt_complete_batch=True,
         historical_selection=historical_selection,
     )
@@ -4818,7 +4856,13 @@ def save_outputs(
     publisher_task_type: str = "",
     publisher_build_sha: str = "",
     score_snapshot: Mapping[str, Any] | None = None,
+    publication_connection: Connection | None = None,
 ) -> dict[str, Any] | None:
+    """Publish rows in their own transaction or the caller's atomic release."""
+    if publication_connection is not None and (
+        publication_connection.engine is not engine or not publication_connection.in_transaction()
+    ):
+        raise ValueError("analysis publication requires its active database transaction")
     analysis_sql = """
         INSERT INTO stock_analysis_result (
             stock_code, stock_name, analysis_date, last_news_time,
@@ -4946,7 +4990,8 @@ def save_outputs(
             or re.fullmatch(r"[0-9a-f]{32}", run_uid) is None
             or re.fullmatch(r"[0-9a-f]{40}", build_sha) is None
             or build_sha == "0" * 40
-            or task_type not in ANALYSIS_POOL_PUBLISHER_TASK_TYPES
+            or task_type not in ANALYSIS_SCORE_PUBLICATION_TASK_TYPES
+            or (task_type == PREMARKET_POOL_TASK and publication_connection is None)
         ):
             raise RuntimeError("analysis publication identity is invalid")
         if scoped_codes:
@@ -4987,7 +5032,8 @@ def save_outputs(
             row["recommend_status"] = candidate_status
             row["ordinary_buy_eligible"] = candidate_ordinary
         write_rec_rows.append(row)
-    with engine.begin() as conn:
+    transaction = engine.begin() if publication_connection is None else nullcontext(publication_connection)
+    with transaction as conn:
         logger.info("Writing %s analysis rows for %s", len(analysis_rows), trade_date)
         _delete_scope_rows(
             conn,
@@ -5287,6 +5333,8 @@ def _prepare_batch_outputs(
     return_scored: bool = False,
     allow_degraded_inputs: bool = False,
     event_checkpoint_path: Path | None = None,
+    pool_decision_phase: StrategyPoolDecisionPhase | None = None,
+    required_premarket_announcement: FrozenPremarketAnnouncement | None = None,
 ) -> Any:
     scoped_codes = _normalize_stock_codes(stock_codes)
     decision_at: datetime | str | None = (
@@ -5294,7 +5342,14 @@ def _prepare_batch_outputs(
         if news_cutoff_time is not None
         else None
     )
-    if reuse_preliminary_snapshot:
+    if pool_decision_phase is not None and decision_at is None:
+        raise RuntimeError("DATA_BLOCKED: fixed pool decision time is unavailable")
+    event_window_end = (
+        decision_at.date().isoformat() if pool_decision_phase == "PREMARKET_REVISION" else trade_date
+    )
+    # The upper-evidence snapshot does not seal the fixed market context or
+    # the exact announcement completion needed for the first formal pool.
+    if reuse_preliminary_snapshot and pool_decision_phase is None:
         if decision_at is None or not publisher_build_sha:
             raise RuntimeError(
                 "DATA_BLOCKED: preliminary snapshot identity is incomplete"
@@ -5416,6 +5471,7 @@ def _prepare_batch_outputs(
             progress_callback=progress_callback,
         )
     historical_event_reads: list[HistoricalEventRead] = []
+    initial_announcement = None
     common_cutoff: dict[str, Any] = {
         "status": PIT_DATA_BLOCKED,
         "reason": "PIT_COMMON_CUTOFF_EXACT_DECISION_TIME_REQUIRED",
@@ -5439,6 +5495,13 @@ def _prepare_batch_outputs(
             "receipts": [],
         }
     elif decision_at is not None:
+        if pool_decision_phase == "INITIAL":
+            initial_announcement = select_frozen_initial_announcement_source(
+                engine, trade_date=trade_date, decision_at=decision_at,
+            )
+            if initial_announcement is None:
+                raise RuntimeError("ANALYSIS_INITIAL_SIGNED_ANNOUNCEMENT_UNAVAILABLE")
+
         def announcement_progress(completed: int, total: int) -> None:
             _emit_progress(
                 progress_callback, stage="validate_announcement_history", percent=13,
@@ -5446,7 +5509,10 @@ def _prepare_batch_outputs(
                 total=total, trade_date=trade_date,
             )
 
-        common_cutoff = resolve_common_fact_cutoff(
+        resolve_cutoffs = (
+            resolve_strategy_fact_cutoffs if pool_decision_phase else resolve_common_fact_cutoff
+        )
+        common_cutoff = resolve_cutoffs(
             engine,
             codes=feature_codes,
             decision_at=decision_at,
@@ -5455,17 +5521,24 @@ def _prepare_batch_outputs(
             event_start_date=(
                 date.fromisoformat(trade_date) - timedelta(days=14)
             ),
-            event_end_date=trade_date,
+            event_end_date=event_window_end,
             require_qmt_event_batch=True,
             capture_historical_selection=historical_event_reads.append,
             event_checkpoint_path=event_checkpoint_path,
             event_progress=announcement_progress if event_checkpoint_path is not None else None,
+            **({"required_premarket_announcement": required_premarket_announcement}
+               if required_premarket_announcement is not None else {}),
+            **({"required_initial_announcement": initial_announcement}
+               if initial_announcement is not None else {}),
         )
     fact_cutoff_at: datetime | str | None = (
         common_cutoff.get("fact_cutoff_at")
         if common_cutoff.get("status") == PIT_AVAILABLE
         else None
     )
+    source_cutoffs = common_cutoff.get("source_cutoff_at") or {}
+    finance_cutoff = source_cutoffs.get("finance", fact_cutoff_at)
+    event_cutoff = source_cutoffs.get("event", fact_cutoff_at)
     reader_decision_at = (
         decision_at
         if common_cutoff.get("status") == PIT_AVAILABLE
@@ -5484,7 +5557,7 @@ def _prepare_batch_outputs(
             engine,
             trade_date,
             decision_at=reader_decision_at,
-            fact_cutoff_at=fact_cutoff_at,
+            fact_cutoff_at=finance_cutoff,
             stock_codes=feature_codes,
             progress_callback=progress_callback,
         ),
@@ -5541,8 +5614,9 @@ def _prepare_batch_outputs(
             engine,
             trade_date,
             decision_at=reader_decision_at,
-            fact_cutoff_at=fact_cutoff_at,
+            fact_cutoff_at=event_cutoff,
             stock_codes=feature_codes,
+            event_window_end=event_window_end,
             historical_selection=next(iter(historical_event_reads), None),
         ),
         scoped_codes,
@@ -5611,6 +5685,7 @@ def _prepare_batch_outputs(
             engine,
             trade_date=trade_date,
             frame=kline_all,
+            decision_known_at=decision_at if pool_decision_phase else None,
         )
         tactical_daily = attach_daily_tactical_features(
             kline_all,
@@ -5618,13 +5693,17 @@ def _prepare_batch_outputs(
         )
         tactical_codes = tactical_candidate_codes(tactical_daily)
         intraday_evidence = load_intraday_evidence(
-            engine,
+            get_minute_engine() if decision_at is not None and tactical_codes else engine,
             trade_date=trade_date,
             stock_codes=tactical_codes,
+            decision_known_at=decision_at,
+            daily_pre_close=dict(zip(kline_all["stock_code"], kline_all["pre_close"])),
         )
         index_stability = load_index_stability(
             engine,
             trade_date=trade_date,
+            decision_known_at=decision_at,
+            history_engine=get_kline_engine() if decision_at is not None else engine,
         )
 
     logger.info(
@@ -5656,6 +5735,10 @@ def _prepare_batch_outputs(
         index_stability=index_stability,
     )
     scored["hot_trade_date"] = hot_date
+    scored["index_minute_publication_sha256"] = (
+        index_stability.get("publication_manifest_sha256")
+        if index_stability.get("status") == "AVAILABLE" else None
+    )
     flow_proof_fields = (
         "flow_input_root_sha256",
         "flow_input_count",
@@ -5687,6 +5770,45 @@ def _prepare_batch_outputs(
             min_score=min_score,
             flow_date=flow_date,
             publisher_build_sha=publisher_build_sha,
+        )
+    if pool_decision_phase is not None:
+        daily_window = kline_all.attrs["qmt_daily_input_window"]
+        if initial_announcement is not None:
+            frozen_announcement_source = initial_announcement.score_binding
+            scored.attrs["frozen_announcement_source"] = frozen_announcement_source
+            event_input = {
+                "stage": "qmt_announcement_pit",
+                "dataset_id": frozen_announcement_source["scheduler_run_uid"],
+                "root": frozen_announcement_source["evidence_sha256"],
+                "input_root": frozen_announcement_source["batch_root_hash"],
+            }
+        else:
+            event = required_premarket_announcement.receipt
+            event_input = {
+                "stage": "qmt_announcement_premarket_prepare",
+                "dataset_id": event["premarket_source"]["scheduler_run_uid"],
+                "root": event["stage_evidence_sha256"],
+                "input_root": event["batch_root_hash"],
+            }
+        finance_evidence = common_cutoff["finance_atomic_batch"]
+        scored.attrs["frozen_core_inputs"] = {
+            "kline": {"stage": "qmt_stock_daily_canonical",
+                      "dataset_id": daily_window["daily_truth_sha256"],
+                      "root": daily_window["daily_partition_roots"][trade_date]},
+            "turnover": {"stage": "target_turnover_snapshot",
+                         "dataset_id": turnover_input_proof["turnover_snapshot_run_id"],
+                         "root": turnover_input_proof["turnover_full_market_proof_root_sha256"]},
+            "financial": {"stage": "stock_finance",
+                          "dataset_id": finance_evidence["seal_coverage_id"],
+                          "root": finance_evidence["batch_root_sha256"]},
+            "announcement": event_input,
+        }
+        from server.engine.strategy_center import build_fixed_market_context
+        scored.attrs["fixed_market_context"] = build_fixed_market_context(
+            trade_date=trade_date,
+            decision_known_at=decision_at,
+            daily_input_window=kline_all.attrs["qmt_daily_input_window"],
+            daily_market_rows=kline_all.attrs["frozen_daily_market_rows"],
         )
     analysis_rows = build_analysis_rows(scored, trade_date)
     rec_rows = build_recommendation_rows(scored, trade_date, top_n=top_n, min_score=min_score)
@@ -5752,6 +5874,77 @@ def prepare_preliminary_upper_subject_receipt(
         analysis_snapshot=analysis_snapshot,
     )
     return validate_preliminary_upper_subject_receipt(receipt)
+
+
+def prepare_frozen_strategy_pool_scoring(
+    engine: Engine,
+    *,
+    data_trade_date: str,
+    phase: StrategyPoolDecisionPhase,
+    run_uid: str,
+    build_sha: str,
+    top_n: int = 80,
+    min_score: float = 62.0,
+    progress_callback: ProgressCallback | None = None,
+    required_premarket_announcement: FrozenPremarketAnnouncement | None = None,
+) -> dict[str, Any]:
+    """Score the full universe at one fixed slot without replacing prior rows."""
+
+    if re.fullmatch(r"[0-9a-f]{32}", run_uid) is None:
+        raise ValueError("frozen strategy pool run identity is invalid")
+    if re.fullmatch(r"[0-9a-f]{40}", build_sha) is None or build_sha == "0" * 40:
+        raise ValueError("frozen strategy pool build identity is invalid")
+    slot = resolve_strategy_pool_decision_slot(
+        engine,
+        data_trade_date=data_trade_date,
+        phase=phase,
+        evaluated_at=_now_shanghai_naive(),
+    )
+    if (slot.phase == "PREMARKET_REVISION") != isinstance(
+        required_premarket_announcement, FrozenPremarketAnnouncement,
+    ):
+        raise RuntimeError("fixed premarket scoring requires its signed announcement source")
+    cutoff = slot.scheduled_at.replace(tzinfo=None).isoformat(timespec="seconds")
+    analysis_rows, recommendations, mood, flow_date, hot_date, scored = (
+        _prepare_batch_outputs(
+            engine=engine,
+            trade_date=slot.data_trade_date,
+            min_score=min_score,
+            top_n=top_n,
+            progress_callback=progress_callback,
+            news_cutoff_time=cutoff,
+            publisher_build_sha=build_sha,
+            return_scored=True,
+            refresh_upper_limit=slot.phase == "INITIAL",
+            pool_decision_phase=slot.phase,
+            required_premarket_announcement=required_premarket_announcement,
+        )
+    )
+    score_snapshot = build_score_snapshot(
+        trade_date=slot.data_trade_date,
+        decision_at=cutoff,
+        run_uid=run_uid,
+        build_sha=build_sha,
+        analysis_rows=analysis_rows,
+        scored_rows=scored.to_dict("records"),
+        fixed_market_context=scored.attrs.get("fixed_market_context"),
+        frozen_announcement_source=scored.attrs.get("frozen_announcement_source"),
+        frozen_core_inputs=scored.attrs.get("frozen_core_inputs"),
+    )
+    return {
+        "phase": slot.phase,
+        "data_trade_date": slot.data_trade_date,
+        "execution_session_date": slot.execution_session_date,
+        "cutoff_at": slot.scheduled_at.isoformat(timespec="seconds"),
+        "evaluated_at": slot.evaluated_at.isoformat(timespec="seconds"),
+        "score_snapshot": score_snapshot,
+        "core_inputs": scored.attrs.get("frozen_core_inputs"),
+        "analysis_rows": analysis_rows,
+        "recommendation_rows": recommendations,
+        "market_mood_score": mood,
+        "flow_date": flow_date,
+        "hot_date": hot_date,
+    }
 
 
 def run_batch(
@@ -5870,6 +6063,12 @@ def run_batch(
             ),
             return_scored=True,
             allow_degraded_inputs=allow_degraded_inputs,
+            pool_decision_phase=(
+                "INITIAL"
+                if publish and task_type == "analysis_fast"
+                and exact_decision_at.time() == STRATEGY_POOL_INITIAL_TIME
+                and not allow_degraded_inputs else None
+            ),
             event_checkpoint_path=(
                 Path(os.environ.get("PROBIGA_JOB_LOG_ROOT") or "/var/lib/probiga/jobs")
                 / "analysis-event-coverage.sqlite"
@@ -5881,6 +6080,9 @@ def run_batch(
             trade_date=trade_date, decision_at=execution_time, run_uid=publication_run_uid,
             build_sha=publisher_build_sha, analysis_rows=analysis_rows,
             scored_rows=scored.to_dict("records"),
+            fixed_market_context=scored.attrs.get("fixed_market_context"),
+            frozen_announcement_source=scored.attrs.get("frozen_announcement_source"),
+            frozen_core_inputs=scored.attrs.get("frozen_core_inputs"),
         ) if publish else None
         _emit_progress(
             progress_callback,
@@ -6037,19 +6239,21 @@ def _prebind_direct_publication_history(
     top_n: int,
     strict_prev_trade_day: bool,
     execution_time: str,
+    publication_connection: Connection | None = None,
 ) -> None:
     """Create the exact recommendation audit row for a direct scheduler CLI."""
 
     if (
         re.fullmatch(r"[0-9a-f]{32}", run_uid) is None
-        or task_type not in ANALYSIS_POOL_PUBLISHER_TASK_TYPES
+        or task_type not in ANALYSIS_SCORE_PUBLICATION_TASK_TYPES
+        or (task_type == PREMARKET_POOL_TASK and publication_connection is None)
         or re.fullmatch(r"[0-9a-f]{40}", build_sha) is None
         or build_sha == "0" * 40
         or date.fromisoformat(trade_date).isoformat() != trade_date
     ):
         raise RuntimeError("direct analysis publication identity is invalid")
     validate_recommended_run_history_schema(engine)
-    with engine.begin() as connection:
+    with (engine.begin() if publication_connection is None else nullcontext(publication_connection)) as connection:
         existing = connection.execute(text("""
             SELECT run_uid
             FROM st_recommended_run_history
@@ -6096,6 +6300,7 @@ def _finish_direct_publication_history(
     success: bool,
     error: str = "",
     publication_receipt: Mapping[str, Any] | None = None,
+    publication_connection: Connection | None = None,
 ) -> None:
     """Persist one terminal recommendation audit before scheduler validation."""
 
@@ -6104,7 +6309,8 @@ def _finish_direct_publication_history(
         if (
             not publication_receipt_is_valid(receipt)
             or receipt.get("run_uid") != run_uid
-            or receipt.get("publisher_task_type") not in ANALYSIS_POOL_PUBLISHER_TASK_TYPES
+            or receipt.get("publisher_task_type") not in ANALYSIS_SCORE_PUBLICATION_TASK_TYPES
+            or (receipt.get("publisher_task_type") == PREMARKET_POOL_TASK and publication_connection is None)
         ):
             raise RuntimeError("direct analysis publication receipt is invalid")
         counts = [receipt.get(field) for field in (
@@ -6127,7 +6333,7 @@ def _finish_direct_publication_history(
             raise RuntimeError("direct analysis publication timestamp is invalid") from exc
         if published_at.tzinfo is not None:
             raise RuntimeError("direct analysis publication timestamp is invalid")
-    with engine.begin() as connection:
+    with (engine.begin() if publication_connection is None else nullcontext(publication_connection)) as connection:
         if success:
             history_rows = connection.execute(text("""
                 SELECT published_at FROM st_recommended_run_history

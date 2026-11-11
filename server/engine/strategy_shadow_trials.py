@@ -17,6 +17,7 @@ from sqlalchemy import text
 
 from server.common.analysis_pool_receipt import canonical_sha256, decode_score_snapshot
 from server.common.daily_delivery_control import load_published_analysis_receipt
+from server.common.pit_facts import normalize_decision_at
 from server.engine.strategy_execution_adapters import verified_native_candidate_batch, _stable_candidate_runtime_value
 from server.engine.shadow_trial_policy import SHADOW_EXECUTION_POLICY
 
@@ -63,9 +64,19 @@ def _projection(signal: Mapping[str, Any]) -> dict[str, Any]:
     return {field: signal.get(field) for field in _SIGNAL_FIELDS}
 
 
-def _analysis_source(connection: Any, target: str, run_uid: str | None = None) -> tuple[dict, dict]:
-    receipt = load_published_analysis_receipt(connection.engine, target, run_uid=run_uid)
+def _analysis_source(
+    connection: Any, target: str, run_uid: str | None = None,
+    *, decision_known_at: datetime | str | None = None,
+) -> tuple[dict, dict]:
+    if decision_known_at is not None and not run_uid:
+        raise ValueError("SHADOW_ANALYSIS_EXACT_RUN_REQUIRED")
+    receipt = load_published_analysis_receipt(connection, target, run_uid=run_uid)
     snapshot = decode_score_snapshot(receipt["score_snapshot"], trade_date=target)
+    if decision_known_at is not None and (
+        snapshot["run_uid"] != run_uid
+        or normalize_decision_at(snapshot["decision_at"]) != normalize_decision_at(decision_known_at)
+    ):
+        raise ValueError("SHADOW_ANALYSIS_SCORE_CUTOFF_MISMATCH")
     return receipt, snapshot
 
 
@@ -111,20 +122,35 @@ def _manifest_signal(
     }
 
 
-def _v3_source(connection: Any, strategy: Mapping[str, Any], target: str, run_uid: str | None = None) -> dict:
+def _v3_source(
+    connection: Any, strategy: Mapping[str, Any], target: str, run_uid: str | None = None,
+    *, decision_known_at: datetime | str | None = None,
+) -> dict:
     from server.trading_v3.paper_execution import _verify_persisted_decision_truth
 
     model_version = str((strategy.get("evaluator_config") or {}).get("model_version") or "")
     if not model_version or str(strategy["current_version"]) != f"{model_version}:{strategy['strategy_key']}":
         raise ValueError("SHADOW_V3_VERSION_BINDING_INVALID")
-    rows = connection.execute(text("""
+    cutoff = normalize_decision_at(decision_known_at) if decision_known_at is not None else None
+    cutoff_sql = ""
+    params = {"trade_date": target, "model_version": model_version, "run_uid": run_uid}
+    if cutoff is not None:
+        cutoff_sql = """
+          AND decision_at <= completed_at AND created_at <= completed_at
+          AND completed_at <= :cutoff
+        """
+        params["cutoff"] = cutoff
+    rows = connection.execute(text(f"""
         SELECT * FROM st_decision_run_v3
         WHERE trade_date=:trade_date AND model_version=:model_version
           AND status='COMPLETED' AND mode='close'
           AND (:run_uid IS NULL OR run_uid=:run_uid)
-        ORDER BY decision_at DESC, created_at DESC LIMIT 1
-    """), {"trade_date": target, "model_version": model_version, "run_uid": run_uid}).mappings().all()
+          {cutoff_sql}
+        ORDER BY decision_at DESC, created_at DESC, run_uid DESC LIMIT 1
+    """), params).mappings().all()
     if len(rows) != 1:
+        if cutoff is not None:
+            raise ValueError("SHADOW_V3_COMPLETED_SOURCE_UNAVAILABLE_AS_OF")
         raise ValueError("SHADOW_V3_COMPLETED_SOURCE_MISSING")
     run = dict(rows[0])
     targets = [dict(row) for row in connection.execute(text(
@@ -135,7 +161,7 @@ def _v3_source(connection: Any, strategy: Mapping[str, Any], target: str, run_ui
     )).mappings().one()
     _portfolio, _equity, verified, reason = _verify_persisted_decision_truth(
         connection, account=dict(account), run=run, targets=targets,
-        account_id="paper-main-v2", now=datetime.now().replace(microsecond=0),
+        account_id="paper-main-v2", now=cutoff or datetime.now().replace(microsecond=0),
         enforce_current_account=False,
     )
     if not verified or reason:
@@ -215,10 +241,16 @@ def native_trial_candidate_batch(
     rows = []
     market_route = None
     cache = source_cache if source_cache is not None else {}
+    cutoff = context.get("decision_known_at")
+    cutoff_options = {"decision_known_at": cutoff} if cutoff is not None else {}
+    analysis_run_uid = context.get("analysis_run_uid")
     if source_kind == "immutable_manifest":
-        if "analysis" not in cache:
-            cache["analysis"] = _analysis_source(connection, target)
-        receipt, snapshot = cache["analysis"]
+        source_key = ("analysis", target, analysis_run_uid, cutoff)
+        if source_key not in cache:
+            cache[source_key] = _analysis_source(
+                connection, target, analysis_run_uid, **cutoff_options,
+            )
+        receipt, snapshot = cache[source_key]
         for raw in snapshot["scored_rows"]:
             signal = _manifest_signal(
                 strategy, raw, target=target, market=context["market"],
@@ -232,11 +264,13 @@ def native_trial_candidate_batch(
                 "market": _stable_candidate_runtime_value(dict(context["market"])),
                 "signal_sha256": canonical_sha256(_projection(signal)),
             }
+            if cutoff is not None:
+                signal["native_source_binding"]["decision_known_at"] = cutoff
             rows.append(signal)
     elif source_kind == "immutable_v3_sleeve":
-        source_key = ("v3", strategy["evaluator_config"]["model_version"], target)
+        source_key = ("v3", strategy["evaluator_config"]["model_version"], target, cutoff)
         if source_key not in cache:
-            cache[source_key] = _v3_source(connection, strategy, target)
+            cache[source_key] = _v3_source(connection, strategy, target, **cutoff_options)
         source = cache[source_key]
         market_route = _v3_market_route(strategy, source["run"])
         for forecast in source["forecasts"].values():
@@ -251,6 +285,8 @@ def native_trial_candidate_batch(
                 "forecast_id": str(forecast["forecast_id"]), "market_route": market_route,
                 "signal_sha256": canonical_sha256(_projection(signal)),
             }
+            if cutoff is not None:
+                signal["native_source_binding"]["decision_known_at"] = cutoff
             rows.append(signal)
     else:
         raise ValueError("SHADOW_NATIVE_SOURCE_KIND_INVALID")
@@ -273,14 +309,21 @@ def verify_native_trial_source(connection: Any, *, plan: Mapping[str, Any], cand
                 "parameters": json.loads(str(version["parameters_json"]))}
     if binding.get("source_kind") != version["source_kind"] or version["version_hash"] != plan["strategy_version_hash"]:
         raise ValueError("SHADOW_NATIVE_VERSION_SOURCE_MISMATCH")
+    cutoff_options = {"decision_known_at": binding["decision_known_at"]} if "decision_known_at" in binding else {}
     if version["source_kind"] == "immutable_manifest":
-        receipt, snapshot = _analysis_source(connection, plan["trade_date"], str(binding["source_run_uid"]))
+        receipt, snapshot = _analysis_source(
+            connection, plan["trade_date"], str(binding["source_run_uid"]),
+            **cutoff_options,
+        )
         matches = [row for row in snapshot["scored_rows"] if str(row["stock_code"]) == plan["stock_code"]]
         if len(matches) != 1 or canonical_sha256(receipt) != binding.get("receipt_sha256") or canonical_sha256(matches[0]) != binding.get("source_row_sha256"):
             raise ValueError("SHADOW_ANALYSIS_SOURCE_ROOT_MISMATCH")
         expected = _manifest_signal(strategy, matches[0], target=plan["trade_date"], market=binding["market"])
     elif version["source_kind"] == "immutable_v3_sleeve":
-        source = _v3_source(connection, strategy, plan["trade_date"], str(binding["source_run_uid"]))
+        source = _v3_source(
+            connection, strategy, plan["trade_date"], str(binding["source_run_uid"]),
+            **cutoff_options,
+        )
         forecast = source["forecasts"].get(str(binding.get("forecast_id") or ""))
         route = _v3_market_route(strategy, source["run"])
         if forecast is None or str(source["run"]["result_hash"]) != binding.get("result_hash") or route != binding.get("market_route") or route["multiplier"] <= 0:

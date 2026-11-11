@@ -1093,6 +1093,91 @@ def test_next_daily_batch_reuses_validated_baseline_and_queries_short_overlap(
     ]
 
 
+@pytest.mark.parametrize("late_at_write", [False, True])
+def test_premarket_announcement_uses_exact_signed_parent_and_cutoff(
+    monkeypatch, tmp_path, late_at_write,
+):
+    from server.common import qmt_announcement_pit as core
+
+    engine = _engine()
+    catalog = _catalog(("000001", "000001.SZ"))
+    _install_catalog(engine, catalog)
+    original = _XtData({"000001.SZ": _frame("000001", "2026-08-21 10:00:00")})
+    parent = synchronize_qmt_announcements(
+        engine, xtdata=original, checkpoint_root=tmp_path,
+        now_fn=_Clock(datetime(2026, 8, 25, 18, 20), datetime(2026, 8, 25, 18, 25)),
+    )
+    assert parent["status"] == "COMPLETE"
+    signed_parent = {key: parent[key] for key in (
+        "batch_id", "batch_root_hash", "source", "fallback_reason", "received_at",
+        "window_start", "window_end", "fact_cutoff_at",
+    )}
+
+    # A later complete result from the same source is not the signed parent.
+    other = synchronize_qmt_announcements(
+        engine, xtdata=_XtData({"000001.SZ": pd.DataFrame()}), checkpoint_root=tmp_path,
+        now_fn=_Clock(datetime(2026, 8, 25, 21, 20), datetime(2026, 8, 25, 21, 25)),
+    )
+    assert other["status"] == "COMPLETE" and other["batch_id"] != parent["batch_id"]
+
+    def reject_ordinary_resume(*_args, **_kwargs):
+        pytest.fail("exact premarket must not select a checkpoint from another capture cutoff")
+
+    monkeypatch.setattr(core, "_find_resumable_checkpoint", reject_ordinary_resume)
+    xtdata = _XtData({"000001.SZ": _frame(
+        "000001", "2026-08-26 06:59:59",
+    ).assign(announcement_id="A-premarket")})
+    cutoff = datetime(2026, 8, 26, 7)
+    deadline = datetime(2026, 8, 26, 8, 30)
+    clock = _Clock(datetime(2026, 8, 26, 7, 5))
+    options = {
+        "xtdata": xtdata, "checkpoint_root": tmp_path, "now_fn": clock,
+        "coverage_target_date": "2026-08-25", "capture_fact_cutoff_at": cutoff,
+        "require_exact_capture_cutoff": True, "completion_deadline_at": deadline,
+    }
+    with pytest.raises(QMTAnnouncementBlocked, match="PREMARKET_SIGNED_PARENT_UNAVAILABLE"):
+        synchronize_qmt_announcements(
+            engine, required_incremental_parent={**signed_parent, "batch_root_hash": "f" * 64}, **options,
+        )
+    assert not xtdata.connected_ports and not xtdata.reads
+
+    def cross_deadline_during_coverage(_connection, _cursor, statement, _params, _context, _many):
+        if statement.lstrip().upper().startswith("INSERT INTO ST_PIT_SOURCE_COVERAGE"):
+            clock.last = deadline + timedelta(seconds=1)
+
+    if late_at_write:
+        event.listen(engine, "before_cursor_execute", cross_deadline_during_coverage)
+    result = synchronize_qmt_announcements(engine, required_incremental_parent=signed_parent, **options)
+    assert result["coverage_target_date"] == "2026-08-25"
+    assert result["window_end"] == "2026-08-26"
+    assert result["fact_cutoff_at"] == "2026-08-26T07:00:00.000000"
+    assert result["parent_batch_id"] == parent["batch_id"]
+    assert result["parent_batch_root_hash"] == parent["batch_root_hash"]
+    assert xtdata.reads[0]["start_time"] == "20260822000000"
+    assert xtdata.reads[0]["end_time"] == "20260826070000"
+    with engine.connect() as connection:
+        persisted = connection.execute(text("SELECT COUNT(*) FROM st_pit_source_coverage WHERE batch_id=:batch"),
+            {"batch": result["batch_id"]}).scalar_one()
+        persisted_events = connection.execute(text("SELECT COUNT(*) FROM st_pit_event_revision WHERE batch_id=:batch"),
+            {"batch": result["batch_id"]}).scalar_one()
+    if late_at_write:
+        assert result["status"] == "DATA_BLOCKED"
+        assert result["reason_code"] == "QMT_ANNOUNCEMENT_PREMARKET_PUBLISH_DEADLINE"
+        assert persisted == persisted_events == 0
+    else:
+        assert result["status"] == "COMPLETE"
+        assert result["publish_completed_at"] == "2026-08-26T07:05:00.000000"
+        assert result["event_count"] == 2
+        assert persisted == 1 and persisted_events == 1  # The prefix revision is reused from its parent.
+        facts = load_event_facts(
+            engine, codes=["000001"], decision_at=datetime(2026, 8, 26, 7, 5),
+            fact_cutoff_at=cutoff, start_date="2026-07-26", end_date="2026-08-26",
+            require_qmt_complete_batch=True,
+        )
+        assert {item["event_key"] for item in facts.facts["000001"]} == {"qmt:A-000001", "qmt:A-premarket"}
+    engine.dispose()
+
+
 def test_weekend_capture_covers_full_friday_window_through_real_saturday_cutoff(
     monkeypatch, tmp_path,
 ):

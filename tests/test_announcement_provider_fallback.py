@@ -34,6 +34,7 @@ from server.common.qmt_announcement_pit import (
     synchronize_historical_cninfo_announcements,
     synchronize_qmt_announcements,
     validate_complete_historical_reconstruction_batch,
+    validate_complete_qmt_announcement_batch,
     validate_task_result,
 )
 from server.common.pit_facts import (
@@ -603,6 +604,131 @@ def test_cninfo_dense_day_raw_drift_never_becomes_complete() -> None:
     assert exc.value.reason_code == "ANNOUNCEMENT_FALLBACK_PAGINATION_CHANGED"
 
 
+def _rehash_cninfo_shard_pagination(receipt: dict) -> None:
+    payload = {
+        "total_record_count": receipt["provider_total_record_count"],
+        "reported_totalpages": receipt["provider_reported_totalpages"],
+        "first_page_sha256": receipt["first_page_anchor_sha256"],
+        "last_page_sha256": receipt["last_page_anchor_sha256"],
+        **{field: receipt[field] for field in (
+            "pagination_mode", "page_count", "page_sha256", "last_page_has_more",
+            "first_page_recheck_sha256", "date_shard_manifest_sha256", "date_shard_recheck_sha256",
+            "pagination_round_count", "pagination_query_count", "pagination_attempt_count",
+            "pagination_invalid_round_count", "pagination_complete_round_sha256",
+            "pagination_complete_round_attempts", "date_shard_split_version",
+            "excluded_after_cutoff", "pagination_frozen_proof",
+        ) if field in receipt},
+    }
+    receipt["pagination_sha256"] = canonical_hash(payload)
+
+
+def test_cninfo_post_cutoff_insert_does_not_change_frozen_sweeps(
+    tmp_path, monkeypatch,
+) -> None:
+    code = "000877"
+    cutoff = datetime(2026, 11, 9, 18, 30, 31)
+    retained = [
+        _row_at(code, index, cutoff - timedelta(seconds=index))
+        for index in range(60)
+    ]
+    late = _row_at(code, 60, cutoff + timedelta(milliseconds=1))
+
+    class LateInsertClient(_Client):
+        capture_round = 0
+
+        def post(self, url, *, data):
+            if data["seDate"] == "2026-10-10~2026-11-09" and data["pageNum"] == "1":
+                self.capture_round += 1
+                self.rows_by_code[code] = (
+                    [late, *retained] if self.capture_round % 2 == 0 else retained
+                )
+            return super().post(url, data=data)
+
+    master = _master(code)
+    client = LateInsertClient(masters=[master, master], rows_by_code={code: retained})
+    catalog = AnnouncementCatalog(
+        batch_id="cninfo-frozen-catalog", manifest_hash="a" * 64, member_set_hash="b" * 64,
+        codes=(code,), qmt_by_code={code: f"{code}.SZ"},
+    )
+    monkeypatch.setattr("server.common.qmt_announcement_pit._load_catalog", lambda *_: catalog)
+    received = cutoff + timedelta(minutes=5)
+    provider = CninfoMarketAnnouncementProvider(
+        client=client, minimum_request_interval=0, now_fn=lambda: received,
+    )
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    ensure_pit_fact_schema(engine)
+    result = synchronize_qmt_announcements(
+        engine, xtdata=ProviderBackedAnnouncementAdapter(provider), checkpoint_root=tmp_path,
+        source=CNINFO_ANNOUNCEMENT_SOURCE, fallback_reason=next(iter(ANNOUNCEMENT_FALLBACK_REASON_CODES)),
+        capture_fact_cutoff_at=cutoff, now_fn=lambda: received,
+    )
+    assert result["status"] == "COMPLETE"
+    assert client.capture_round == 2
+    assert result["event_count"] == 60
+    with engine.connect() as connection:
+        coverage = connection.execute(text("""
+            SELECT payload_json, known_at FROM st_pit_source_coverage
+            WHERE stock_code = :code
+        """), {"code": code}).mappings().one()
+        event_ids = connection.execute(text("SELECT event_key FROM st_pit_event_revision")).scalars().all()
+    engine.dispose()
+    assert set(event_ids) == {f"cninfo:{row['announcementId']}" for row in retained}
+    assert datetime.fromisoformat(coverage["known_at"]) == received
+    evidence = json.loads(coverage["payload_json"])["watermark"]["evidence"]
+    receipt = evidence["provider_receipt"]
+    assert receipt["provider_total_record_count"] == 61
+    assert receipt["pagination_complete_round_attempts"] == [1, 2]
+    assert len(set(receipt["pagination_complete_round_sha256"])) == 2
+    assert receipt["excluded_after_cutoff"][0]["source_event_id"] == late["announcementId"]
+    assert receipt["pagination_frozen_proof"]["schema"] == "probiga.cninfo-frozen-pagination.v1"
+    prior, final = receipt["pagination_frozen_proof"]["complete_rounds"]
+    assert prior["raw_count"] == 60 and final["raw_count"] == 61
+    assert prior["query_count"] + 1 == final["query_count"]
+    assert prior["frozen_sha256"] == final["frozen_sha256"]
+    assert prior["raw_manifest_sha256"] == receipt["date_shard_recheck_sha256"]
+    assert final["raw_manifest_sha256"] == receipt["date_shard_manifest_sha256"]
+    assert prior["raw_manifest_sha256"] != final["raw_manifest_sha256"]
+
+    def both_validate(candidate):
+        return (
+            _fallback_receipt_valid(
+                candidate, source=CNINFO_ANNOUNCEMENT_SOURCE, stock_code=code, qmt_code=f"{code}.SZ",
+                requested_start_time="20261010000000", requested_end_time="20261109183031",
+                result_count=60, catalog_codes=(code,),
+            ),
+            _fallback_event_receipt_valid(
+                {**evidence, "provider_receipt": candidate, "provider_receipt_hash": pit_canonical_hash(candidate)},
+                source=CNINFO_ANNOUNCEMENT_SOURCE, stock_code=code, result_count=60,
+            ),
+        )
+
+    assert both_validate(receipt) == (True, True)
+    for changed_field, changed_value in (
+        ("frozen_sha256", "f" * 64),
+        ("raw_manifest_sha256", "f" * 64),
+        ("retained_count", 59),
+        ("query_count", prior["query_count"] + 1),
+    ):
+        changed = deepcopy(receipt)
+        changed["pagination_frozen_proof"]["complete_rounds"][0][changed_field] = changed_value
+        _rehash_cninfo_shard_pagination(changed)
+        assert both_validate(changed) == (False, False)
+
+    changed = deepcopy(receipt)
+    changed["pagination_frozen_proof"]["schema"] = "probiga.cninfo-frozen-pagination.v99"
+    _rehash_cninfo_shard_pagination(changed)
+    assert both_validate(changed) == (False, False)
+
+    # A legacy receipt needs identical raw digests and its original manifest
+    # commitment. Merely removing the new proof cannot certify different raw sets.
+    changed = deepcopy(receipt)
+    changed.pop("pagination_frozen_proof")
+    changed["quality_status"] = "EXACT_STOCK_DATE_SHARDS_DOUBLE_ATTESTED"
+    changed["date_shard_recheck_sha256"] = changed["date_shard_manifest_sha256"]
+    _rehash_cninfo_shard_pagination(changed)
+    assert both_validate(changed) == (False, False)
+
+
 @pytest.mark.parametrize("shape", ["within_page", "across_pages", "split_leaves"])
 def test_cninfo_complete_sweeps_accept_same_raw_records_in_different_order(
     shape: str,
@@ -663,6 +789,26 @@ def test_cninfo_complete_sweeps_accept_same_raw_records_in_different_order(
         result_count=40,
         catalog_codes=(code,),
     ) is True
+
+    # Reproduce the immutable legacy encoding for an already sealed raw pair.
+    receipt.pop("pagination_frozen_proof")
+    receipt["quality_status"] = "EXACT_STOCK_DATE_SHARDS_DOUBLE_ATTESTED"
+    receipt["data_version"] = canonical_hash("probiga.cninfo-per-stock-announcement.v1")
+    receipt["date_shard_recheck_sha256"] = receipt["date_shard_manifest_sha256"]
+    _rehash_cninfo_shard_pagination(receipt)
+    assert _fallback_receipt_valid(
+        receipt, source=CNINFO_ANNOUNCEMENT_SOURCE, stock_code=code,
+        qmt_code=f"{code}.SZ", requested_start_time="20260729000000",
+        requested_end_time="20260828235959", result_count=40, catalog_codes=(code,),
+    )
+    assert _fallback_event_receipt_valid(
+        {
+            "provider_receipt": receipt, "provider_receipt_hash": pit_canonical_hash(receipt),
+            "window_start": "2026-07-29", "query_end_time": "20260828235959",
+            "catalog_member_count": 1,
+        },
+        source=CNINFO_ANNOUNCEMENT_SOURCE, stock_code=code, result_count=40,
+    )
 
 
 @pytest.mark.parametrize("fault", ["missing_row", "raw_field_drift", "nonconsecutive"])
@@ -1079,6 +1225,127 @@ def test_cninfo_exact_receipts_publish_one_atomic_catalog_batch(
             "SELECT COUNT(*) FROM st_pit_event_revision "
             "WHERE source='cninfo.announcement' AND batch_id=:batch_id"
         ), {"batch_id": result["batch_id"]}).scalar_one() == 1
+
+
+def test_cninfo_delta_validates_frozen_source_window_and_merged_parent(
+    monkeypatch, tmp_path,
+) -> None:
+    from server.common.qmt_stock_catalog import StockCatalogBatch
+
+    codes = ("000001", "600519")
+    qmt_by_code = dict(zip(codes, ("000001.SZ", "600519.SH")))
+    catalog = AnnouncementCatalog(
+        batch_id="cninfo-delta-catalog", manifest_hash="a" * 64, member_set_hash="b" * 64,
+        codes=codes, qmt_by_code=qmt_by_code,
+    )
+    stock_catalog = StockCatalogBatch(
+        batch_id=catalog.batch_id, captured_at="2026-08-25 18:00:00",
+        history_complete_from="2020-01-01", member_count=len(codes),
+        member_set_hash=catalog.member_set_hash, manifest_hash=catalog.manifest_hash,
+        native_sectors=("沪深A股",), members=tuple({
+            "stock_code": code, "qmt_code": qmt_by_code[code], "list_date": "2020-01-01",
+            "expire_date": None, "instrument_batch_id": "cninfo-delta-catalog-instruments",
+            "instrument_type": "STOCK",
+        } for code in codes),
+    )
+    monkeypatch.setattr("server.common.qmt_announcement_pit._load_catalog", lambda *_: catalog)
+    monkeypatch.setattr("server.common.qmt_stock_catalog.load_stock_catalog", lambda *_args, **_kwargs: stock_catalog)
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    ensure_pit_fact_schema(engine)
+    master = _master(*codes)
+    initial_cutoff = datetime(2026, 8, 25, 18, 20)
+    delta_cutoff = datetime(2026, 8, 26, 18, 20)
+    prefix = {code: [_row_at(code, 0, datetime(2026, 8, 22, 17, 50))] for code in codes}
+    eligible_delta = [
+        _row_at(codes[0], index, delta_cutoff - timedelta(seconds=index)) for index in range(1, 32)
+    ]
+    late = _row_at(codes[0], 32, delta_cutoff + timedelta(milliseconds=1))
+
+    def publish(cutoff, rows):
+        provider = CninfoMarketAnnouncementProvider(
+            client=_Client(masters=[master, master], rows_by_code=rows),
+            minimum_request_interval=0, now_fn=lambda: cutoff + timedelta(minutes=3),
+        )
+        return synchronize_qmt_announcements(
+            engine, xtdata=ProviderBackedAnnouncementAdapter(provider), checkpoint_root=tmp_path,
+            source=CNINFO_ANNOUNCEMENT_SOURCE, fallback_reason="QMT_ANNOUNCEMENT_NO_PERMISSION_OR_QUERY_FAILED",
+            capture_fact_cutoff_at=cutoff, now_fn=lambda: cutoff + timedelta(minutes=5),
+            resume=False,
+        )
+
+    parent = publish(initial_cutoff, prefix)
+    assert parent["status"] == "COMPLETE"
+    child = publish(delta_cutoff, {codes[0]: [late, *eligible_delta, *prefix[codes[0]]], codes[1]: prefix[codes[1]]})
+    assert child["status"] == "COMPLETE"
+    assert child["parent_batch_id"] == parent["batch_id"]
+    assert child["capture_window_start"] == "2026-08-23"
+    assert child["event_count"] == len(eligible_delta) + len(codes)
+    assert child["empty_stock_count"] == 0
+
+    with engine.connect() as connection:
+        payloads = {
+            code: json.loads(payload) for code, payload in connection.execute(text("""
+                SELECT stock_code, payload_json FROM st_pit_source_coverage WHERE batch_id=:batch_id
+            """), {"batch_id": child["batch_id"]})
+        }
+    for code, retained_count in zip(codes, (len(eligible_delta), 0)):
+        payload = payloads[code]
+        evidence = payload["watermark"]["evidence"]
+        receipt = evidence["provider_receipt"]
+        assert receipt["requested_start_time"] == "20260823000000"
+        assert receipt["result_count"] == retained_count
+        assert payload["result_count"] == retained_count + 1
+        assert _fallback_event_receipt_valid(
+            evidence, source=CNINFO_ANNOUNCEMENT_SOURCE, stock_code=code,
+            result_count=payload["result_count"], source_rows=payload["source_rows"],
+        )
+    first_receipt = payloads[codes[0]]["watermark"]["evidence"]["provider_receipt"]
+    assert first_receipt["pagination_frozen_proof"]["schema"] == "probiga.cninfo-frozen-pagination.v1"
+    assert first_receipt["excluded_after_cutoff"][0]["source_event_id"] == late["announcementId"]
+
+    proof = validate_complete_qmt_announcement_batch(
+        engine, codes=codes, decision_at=delta_cutoff + timedelta(minutes=5), fact_cutoff_at=delta_cutoff,
+        window_start="2026-07-27", window_end="2026-08-26", source=CNINFO_ANNOUNCEMENT_SOURCE,
+    )
+    assert proof["batch_id"] == child["batch_id"]
+    assert proof["incremental_chain_root_hash"] == child["incremental_chain_root_hash"]
+    facts = load_event_facts(
+        engine, codes=codes, decision_at=delta_cutoff + timedelta(minutes=5), fact_cutoff_at=delta_cutoff,
+        start_date="2026-07-27", end_date="2026-08-26", require_qmt_complete_batch=True,
+    )
+    assert len(facts.facts[codes[0]]) == len(eligible_delta) + 1
+    assert len(facts.facts[codes[1]]) == 1
+
+    payload = payloads[codes[0]]
+    bad_rows = deepcopy(payload["source_rows"])
+    bad_rows[-1]["published_at"] = (delta_cutoff + timedelta(milliseconds=1)).isoformat(timespec="microseconds")
+    assert not _fallback_event_receipt_valid(
+        payload["watermark"]["evidence"], source=CNINFO_ANNOUNCEMENT_SOURCE,
+        stock_code=codes[0], result_count=payload["result_count"], source_rows=bad_rows,
+    )
+
+    from server.common import qmt_announcement_pit as announcement_pit
+
+    decode = announcement_pit._live_announcement_payload_evidence
+    for field in ("delta_root_hash", "prefix_root_hash"):
+        def altered_proof(row):
+            payload, evidence = decode(row)
+            if row.get("batch_id") == child["batch_id"]:
+                chain = evidence["incremental_proof"]
+                chain[field] = "f" * 64
+                chain["chain_root_hash"] = canonical_hash({
+                    key: value for key, value in chain.items() if key != "chain_root_hash"
+                })
+            return payload, evidence
+
+        monkeypatch.setattr(announcement_pit, "_live_announcement_payload_evidence", altered_proof)
+        with pytest.raises(QMTAnnouncementBlocked, match="QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND"):
+            validate_complete_qmt_announcement_batch(
+                engine, codes=codes, decision_at=delta_cutoff + timedelta(minutes=5),
+                fact_cutoff_at=delta_cutoff, window_start="2026-07-27",
+                window_end="2026-08-26", source=CNINFO_ANNOUNCEMENT_SOURCE,
+            )
+    engine.dispose()
 
 
 def _assert_historical_selection_reuse(
