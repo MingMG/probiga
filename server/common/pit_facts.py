@@ -2445,7 +2445,7 @@ def _latest_revision_for_fact_cutoff(
     return eligible, reason
 
 
-def _read_finance_payload_rows(
+def _read_pit_payload_rows(
     connection: Connection, *, table_name: str, statement: Any,
     parameters: Mapping[str, Any], deadline: float, stage_prefix: str,
     omit_nonempty_coverage_for: set[str] | None = None,
@@ -2470,13 +2470,19 @@ def _read_finance_payload_rows(
         return exc
 
     id_column = {
-        FINANCE_REVISION_TABLE: "revision_id", SOURCE_COVERAGE_TABLE: "coverage_id",
+        EVENT_REVISION_TABLE: "revision_id", FINANCE_REVISION_TABLE: "revision_id",
+        SOURCE_COVERAGE_TABLE: "coverage_id",
     }.get(table_name)
     if id_column is None:
-        raise ValueError("finance payload table differs")
-    if str(connection.get_isolation_level() or "").upper() not in {"REPEATABLE READ", "SERIALIZABLE"}:
-        raise ValueError("finance revisions require a repeatable-read snapshot")
+        raise ValueError("PIT payload table differs")
     inventory_stage = stage_prefix + "-inventory"
+    try:
+        with _live_announcement_reply_budget(connection, deadline=deadline, stage=inventory_stage):
+            if str(connection.get_isolation_level() or "").upper() not in {"REPEATABLE READ", "SERIALIZABLE"}:
+                raise ValueError("PIT payload reads require a repeatable-read snapshot")
+    except Exception as exc:
+        setattr(exc, "_pit_read_stage", inventory_stage)
+        raise
     inventory = read(statement, parameters, inventory_stage)
     expected = {row[id_column]: row for row in inventory}
     inventory_columns = {id_column}
@@ -2487,7 +2493,7 @@ def _read_finance_payload_rows(
     if (len(expected) != len(inventory)
             or any(set(row) != inventory_columns for row in inventory)
             or any(not _HASH_RE.fullmatch(str(key)) for key in expected)):
-        raise invalid("finance inventory identity differs", inventory_stage)
+        raise invalid("PIT inventory identity differs", inventory_stage)
     if omit_nonempty_coverage_for:
         def stock_scope(row):
             return row["stock_code"], row["scope_hash"]
@@ -2517,8 +2523,11 @@ def _read_finance_payload_rows(
         ).bindparams(bindparam("row_ids", expanding=True)).execution_options(stream_results=True)
         size_rows = read(sizes_query, {"row_ids": revision_ids}, stage)
         sizes = {row[id_column]: row["payload_json_bytes"] for row in size_rows}
-        if len(size_rows) != len(revision_ids) or sizes.keys() != set(revision_ids):
-            raise invalid("finance payload size inventory differs", stage)
+        if (
+            len(size_rows) != len(revision_ids) or sizes.keys() != set(revision_ids)
+            or any(type(size) is not int or size <= 0 for size in sizes.values())
+        ):
+            raise invalid("PIT payload size inventory differs", stage)
         for batch in _bounded_announcement_payload_keys(
             [(key, sizes[key]) for key in revision_ids], max_rows=FINANCE_REVISION_MYSQL_PAYLOAD_ROW_LIMIT,
         ):
@@ -2533,16 +2542,131 @@ def _read_finance_payload_rows(
             packed = read(payload_query, {"row_ids": batch_ids}, stage)
             actual = {row[id_column]: row for row in packed}
             if len(packed) != len(batch_ids) or actual.keys() != set(batch_ids):
-                raise invalid("finance payload membership differs", stage)
+                raise invalid("PIT payload membership differs", stage)
             for key, payload_bytes in batch:
                 if actual[key]["payload_json_bytes"] != payload_bytes:
-                    raise invalid("finance payload size differs", stage)
+                    raise invalid("PIT payload size differs", stage)
                 if omit_nonempty_coverage_for and any(
                     actual[key][column] != expected[key][column] for column in inventory_columns
                 ):
                     raise invalid("finance coverage payload inventory differs", stage)
                 packed_by_id[key] = actual[key]
     return [packed_by_id[key] for key in ordered_ids]
+
+
+def _query_event_revisions(
+    connection: Connection, *, codes: list[str], decision_at: datetime,
+    start_date: date | None, end_date: date, source: str, read_deadline: float | None,
+) -> list[dict[str, Any]]:
+    from server.common.qmt_announcement_pit import (
+        VALIDATION_READ_BATCH_SIZE, _live_announcement_read_hint, _live_announcement_reply_budget,
+    )
+
+    mysql = connection.dialect.name == "mysql"
+    deadline = read_deadline if read_deadline is not None else monotonic() + 30 * 60
+
+    def read_rows(statement, parameters, stage):
+        try:
+            with _live_announcement_reply_budget(connection, deadline=deadline, stage=stage):
+                with connection.execute(statement.execution_options(stream_results=True), parameters) as result:
+                    return [dict(row) for row in result.mappings()]
+        except Exception as exc:
+            setattr(exc, "_pit_read_stage", stage)
+            raise
+
+    def fail(message, stage):
+        exc = ValueError(message)
+        setattr(exc, "_pit_read_stage", stage)
+        raise exc
+
+    isolation_stage = "event-revision-snapshot"
+    if mysql:
+        try:
+            with _live_announcement_reply_budget(connection, deadline=deadline, stage=isolation_stage):
+                if str(connection.get_isolation_level() or "").upper() not in {"REPEATABLE READ", "SERIALIZABLE"}:
+                    raise ValueError("PIT event revisions require a repeatable-read snapshot")
+        except Exception as exc:
+            setattr(exc, "_pit_read_stage", isolation_stage)
+            raise
+
+    visibility = "known_at<=:decision_at AND received_at<=:decision_at"
+    visibility_params: dict[str, Any] = {"decision_at": decision_at}
+    if source:
+        visibility += " AND source=:source"
+        visibility_params["source"] = source
+    date_window = "fact_date<=:end_date"
+    window_params = {"end_date": end_date}
+    if start_date is not None:
+        date_window += " AND fact_date>=:start_date"
+        window_params["start_date"] = start_date
+
+    stocks = sorted(set(codes))
+    seen_identities: set[str] = set()
+    rows = []
+    identity_offset = 0
+    # Each identity includes its stock. Pick each head at E before filtering
+    # by publication day, then read every visible predecessor in the same
+    # snapshot. An unchanged revision can be bound into a later coverage batch.
+    transaction_open = isinstance(connection, Connection) and connection.in_transaction()
+    with (nullcontext() if transaction_open else connection.begin()):
+        for stock_offset in range(0, len(stocks), VALIDATION_READ_BATCH_SIZE):
+            stock_batch = stocks[stock_offset:stock_offset + VALIDATION_READ_BATCH_SIZE]
+            stock_set = set(stock_batch)
+            stage = f"event-revision-identities:{stock_offset}"
+            hint = _live_announcement_read_hint(mysql=mysql, deadline=deadline, stage=stage)
+            identity_query = text(
+                f"SELECT {hint}identity_hash,stock_code FROM ("
+                "SELECT identity_hash,stock_code,COALESCE(DATE(published_at),event_date) AS fact_date, "
+                "ROW_NUMBER() OVER (PARTITION BY identity_hash ORDER BY revision_no DESC) AS rn "
+                f"FROM {EVENT_REVISION_TABLE} WHERE stock_code IN :codes AND {visibility}"
+                f") selected WHERE rn=1 AND (fact_date IS NULL OR ({date_window})) ORDER BY identity_hash"
+            ).bindparams(bindparam("codes", expanding=True))
+            inventory = read_rows(
+                identity_query, {**visibility_params, **window_params, "codes": stock_batch}, stage,
+            )
+            if any(set(row) != {"identity_hash", "stock_code"} for row in inventory):
+                fail("PIT event revision identity inventory differs", stage)
+            by_identity = {row["identity_hash"]: row["stock_code"] for row in inventory}
+            if (
+                len(by_identity) != len(inventory) or seen_identities.intersection(by_identity)
+                or any(not _HASH_RE.fullmatch(str(key)) or code not in stock_set for key, code in by_identity.items())
+            ):
+                fail("PIT event revision identity inventory differs", stage)
+            seen_identities.update(by_identity)
+            identities = list(by_identity)
+            for offset in range(0, len(identities), 400):
+                identity_batch = identities[offset:offset + 400]
+                stage = f"event-revision-history:{identity_offset}"
+                identity_offset += len(identity_batch)
+                columns = "revision_id" if mysql else "*"
+                hint = _live_announcement_read_hint(mysql=mysql, deadline=deadline, stage=f"{stage}-inventory")
+                history_query = text(
+                    f"SELECT {hint}{columns} FROM {EVENT_REVISION_TABLE} "
+                    f"WHERE identity_hash IN :identities AND {visibility} "
+                    "ORDER BY stock_code, identity_hash, revision_no"
+                ).bindparams(bindparam("identities", expanding=True))
+                parameters = {**visibility_params, "identities": identity_batch}
+                if mysql:
+                    history = _read_pit_payload_rows(
+                        connection, table_name=EVENT_REVISION_TABLE, statement=history_query,
+                        parameters=parameters, deadline=deadline, stage_prefix=stage,
+                    )
+                else:
+                    history = read_rows(history_query, parameters, f"{stage}-inventory")
+                observed = {row["identity_hash"] for row in history}
+                if observed != set(identity_batch) or any(
+                    row["stock_code"] != by_identity.get(row["identity_hash"]) for row in history
+                ):
+                    fail("PIT event revision history identity or stock differs", stage)
+                for row in history:
+                    try:
+                        rows.append(_coverage_payload_row(row, mysql=mysql, stage=f"{stage}-decode"))
+                    except ValueError as exc:
+                        setattr(exc, "_pit_read_stage", f"{stage}-decode")
+                        raise
+    rows.sort(key=lambda row: (row["stock_code"], row["identity_hash"], row["revision_no"]))
+    _live_announcement_read_hint(mysql=False, deadline=deadline, stage="event-revision-complete")
+    return rows
 
 
 def _query_revisions(
@@ -2558,68 +2682,11 @@ def _query_revisions(
     read_deadline: float | None = None,
 ) -> list[dict[str, Any]]:
     if table_name == EVENT_REVISION_TABLE:
-        identity_params: dict[str, Any] = {
-            "codes": codes,
-            "decision_at": decision_at,
-            "end_date": end_date,
-        }
-        source_filter = ""
-        if source:
-            source_filter += " AND source=:source"
-            identity_params["source"] = source
-        # Do not filter revisions by coverage batch.  An unchanged event is
-        # idempotently bound into a later full-market coverage response while
-        # retaining the immutable batch_id of its first revision.
-        # Exact publication date controls visibility windows.  Eastmoney may
-        # assign tomorrow's business ``notice_date`` to an announcement that
-        # was actually published tonight; filtering on event_date would hide
-        # a risk fact that the system already knew.  Unverified rows retain
-        # event_date only for retrieval and remain fail-closed at selection.
-        date_window = "fact_date<=:end_date"
-        if start_date is not None:
-            date_window += " AND fact_date>=:start_date"
-            identity_params["start_date"] = start_date
-        identity_statement = text(
-            f"SELECT identity_hash FROM ("
-            f"SELECT identity_hash, "
-            f"COALESCE(DATE(published_at), event_date) AS fact_date, "
-            f"ROW_NUMBER() OVER (PARTITION BY identity_hash "
-            f"ORDER BY revision_no DESC) AS rn "
-            f"FROM {EVENT_REVISION_TABLE} WHERE stock_code IN :codes "
-            f"AND known_at<=:decision_at AND received_at<=:decision_at"
-            f"{source_filter}"
-            f") selected WHERE rn=1 AND (fact_date IS NULL OR "
-            f"({date_window})) ORDER BY identity_hash"
-        ).bindparams(bindparam("codes", expanding=True))
         with (nullcontext(engine) if isinstance(engine, Connection) else engine.connect()) as connection:
-            identities = [
-                str(row[0])
-                for row in connection.execute(
-                    identity_statement, identity_params
-                ).fetchall()
-            ]
-            if not identities:
-                return []
-            statement = text(
-                f"SELECT * FROM {EVENT_REVISION_TABLE} "
-                f"WHERE identity_hash IN :identities "
-                f"AND known_at<=:decision_at AND received_at<=:decision_at "
-                f"{source_filter} "
-                f"ORDER BY stock_code, identity_hash, revision_no"
-            ).bindparams(bindparam("identities", expanding=True))
-            return [
-                dict(row)
-                for row in connection.execute(
-                    statement,
-                    {
-                        "identities": identities,
-                        "decision_at": decision_at,
-                        **(
-                            {"source": source} if source else {}
-                        ),
-                    },
-                ).mappings()
-            ]
+            return _query_event_revisions(
+                connection, codes=codes, decision_at=decision_at, start_date=start_date,
+                end_date=end_date, source=source, read_deadline=read_deadline,
+            )
     date_column = "report_date" if table_name == FINANCE_REVISION_TABLE else "event_date"
     date_filter = f"AND {date_column}<=:end_date "
     params: dict[str, Any] = {
@@ -2648,7 +2715,7 @@ def _query_revisions(
             f"{date_filter}ORDER BY stock_code, identity_hash, revision_no"
         ).bindparams(bindparam("codes", expanding=True))
         if mysql_finance:
-            packed = _read_finance_payload_rows(
+            packed = _read_pit_payload_rows(
                 connection, table_name=FINANCE_REVISION_TABLE, statement=statement, parameters=params,
                 deadline=read_deadline, stage_prefix="finance-revision",
             )
@@ -3178,7 +3245,7 @@ def _authoritative_empty_coverage(
                             deadline=deadline, stage=f"event-empty-coverage:{offset}",
                         ))
                     elif indexed_finance:
-                        rows = nullcontext(_read_finance_payload_rows(
+                        rows = nullcontext(_read_pit_payload_rows(
                             connection, table_name=SOURCE_COVERAGE_TABLE, statement=statement,
                             parameters={**params, "codes": code_batch}, deadline=deadline,
                             stage_prefix="finance-empty-coverage",
@@ -3335,7 +3402,7 @@ def load_finance_expected_unavailable(
                         "decision_at": decision,
                     }
                     rows = (
-                        nullcontext(_read_finance_payload_rows(
+                        nullcontext(_read_pit_payload_rows(
                             connection, table_name=SOURCE_COVERAGE_TABLE, statement=statement,
                             parameters=parameters, deadline=deadline, stage_prefix="finance-nonfiling",
                         ))
@@ -6674,11 +6741,26 @@ def load_event_facts(
             batch_id=str(event_batch.get("batch_id") or ""),
         )
     except Exception as exc:
+        diagnostic = type(exc).__name__
+        stage = str(getattr(exc, "_pit_read_stage", "") or getattr(exc, "detail", ""))
+        if re.fullmatch(
+            r"event-revision-(?:snapshot|complete|identities:[0-9]+|"
+            r"history:[0-9]+(?:-(?:inventory|decode|size:[0-9]+|payload:[0-9]+))?)",
+            stage,
+        ):
+            diagnostic += f":stage={stage}"
+        reason = str(getattr(exc, "reason_code", "") or "")
+        if reason in {
+            "QMT_ANNOUNCEMENT_LIVE_BATCH_VALIDATION_DEADLINE",
+            "QMT_ANNOUNCEMENT_LIVE_BATCH_REPLY_DEADLINE",
+            "QMT_ANNOUNCEMENT_LIVE_BATCH_REPLY_FAILED",
+        }:
+            diagnostic += f":reason={reason}"
         return _blocked_batch(
             table_name=EVENT_REVISION_TABLE, codes=normalized_codes,
             decision_at=decision,
             fact_cutoff_at=fact_cutoff,
-            reason=f"PIT_EVENT_SCHEMA_UNAVAILABLE:{type(exc).__name__}",
+            reason=f"PIT_EVENT_SCHEMA_UNAVAILABLE:{diagnostic}",
         )
 
     by_code_identity: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(
