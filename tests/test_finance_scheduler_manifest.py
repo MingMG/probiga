@@ -1,9 +1,12 @@
+from contextlib import contextmanager
 from copy import deepcopy
 from datetime import date, datetime
 import json
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import create_engine, event, text
+from sqlalchemy.exc import OperationalError
 
 from server.common import scheduler_validation as validation
 from server.common.pit_facts import build_finance_data_exclusion
@@ -139,6 +142,159 @@ def test_finance_exact_run_binding_keeps_prior_target_after_midnight(monkeypatch
     )
     assert ok, message
     assert observed[0]["as_of_date"] == date(2026, 9, 7)
+
+
+def _sqlite_finance_metadata(engine):
+    @event.listens_for(engine, "before_cursor_execute", retval=True)
+    def translate_metadata(_conn, _cursor, statement, parameters, _context, _many):
+        if "FROM information_schema.COLUMNS" in statement:
+            # Adapt metadata introspection only. Coverage and seal queries use
+            # the real public validator and execute unchanged against SQLite.
+            statement = "SELECT name AS COLUMN_NAME FROM pragma_table_info(?)"
+        return statement, parameters
+
+
+@pytest.fixture(scope="module")
+def finance_manifest_history():
+    from server.common.finance_coverage import finance_disclosure_gate
+    from server.common.pit_facts import append_finance_atomic_batch_seal
+    from tests.test_pit_finance_event_facts import (
+        _engine, _finance_data_exclusion, _install_finance_test_catalog,
+        _install_prior_finance_coverage,
+    )
+
+    engine = _engine()
+    _install_finance_test_catalog(engine)
+    _install_prior_finance_coverage(engine)
+    target = date(2026, 8, 30)
+    seal = append_finance_atomic_batch_seal(
+        engine, as_of_date=target, completed_known_at="2026-08-30 01:10:00",
+        data_exclusions=[_finance_data_exclusion(observed="2026-08-30 01:08:00")],
+    )
+    gate = finance_disclosure_gate(target)
+    receipt = {
+        **_receipt(),
+        "as_of": target.isoformat(),
+        "minimum_report_date": gate.minimum_report_date.isoformat(),
+        "minimum_report_disclosure_deadline": gate.disclosure_deadline.isoformat(),
+        "atomic_batch": seal,
+        "failure_sample": [{"stock_code": "002731", "error": "Timeout"}],
+        **{key: seal[key] for key in (
+            "data_excluded_count", "available_code_count", "data_excluded_codes",
+            "data_excluded_reasons", "data_exclusions",
+        )},
+    }
+    with engine.begin() as connection:
+        historical = dict(connection.execute(text(
+            "SELECT * FROM st_pit_source_coverage WHERE source='adata.finance.core_index'"
+        )).mappings().one())
+        columns = tuple(historical)
+        connection.execute(text(
+            "CREATE INDEX idx_pit_coverage_decision ON st_pit_source_coverage "
+            "(fact_kind,stock_code,known_at,window_start,window_end)"
+        ))
+        # Earlier matching rows outside the two-member target catalog grow the
+        # generic aggregate. The exact persisted seal still covers two members.
+        connection.execute(text(
+            "INSERT INTO st_pit_source_coverage (" + ",".join(columns) + ") VALUES ("
+            + ",".join(":" + column for column in columns) + ")"
+        ), [
+            {
+                **historical,
+                "coverage_id": f"{number:064x}",
+                "scope_hash": f"{number + 6000:064x}",
+                "stock_code": f"{number + 100000:06d}",
+                "batch_id": f"older-finance-{number}",
+            }
+            for number in range(1, 6001)
+        ])
+    _sqlite_finance_metadata(engine)
+    yield engine, receipt
+    engine.dispose()
+
+
+@contextmanager
+def _sqlite_query_work_budget(engine, *, maximum_steps=20_000):
+    raw = engine.raw_connection()
+    connection = raw.driver_connection
+    raw.close()
+    completed_steps = 0
+
+    def progress():
+        nonlocal completed_steps
+        completed_steps += 100
+        return int(completed_steps > maximum_steps)
+
+    connection.set_progress_handler(progress, 100)
+    try:
+        yield
+    finally:
+        connection.set_progress_handler(None, 0)
+
+
+def _validate_finance_history(engine, receipt):
+    return validation.validate_scheduler_task_result(
+        {"task_type": "stock_finance"}, engine=engine,
+        started_at=datetime(2026, 8, 30, 1, 6), now=datetime(2026, 8, 30, 1, 11),
+        output=json.dumps(receipt),
+    )
+
+
+def test_finance_scheduler_checks_presence_then_reads_the_exact_seal_within_budget(finance_manifest_history):
+    engine, receipt = finance_manifest_history
+    where = validation.TASK_OUTPUT_REQUIREMENTS["stock_finance"][0].where_sql
+    with _sqlite_query_work_budget(engine):
+        with pytest.raises(OperationalError, match="interrupted"):
+            with engine.connect() as connection:
+                connection.execute(text(
+                    "SELECT COUNT(*) AS row_count, MAX(known_at) AS max_freshness "
+                    f"FROM st_pit_source_coverage WHERE ({where})"
+                )).one()
+
+    with _sqlite_query_work_budget(engine):
+        result = _validate_finance_history(engine, receipt)
+    assert result.checked and result.ok, result.message
+    assert "codes=2 available=1 data_excluded=1" in result.message
+    assert f"seal={receipt['atomic_batch']['seal_coverage_id']}" in result.message
+
+
+@pytest.mark.parametrize("field,reason", [
+    ("seal_coverage_id", "output atomic seal validation failed"),
+    ("batch_root_sha256", "output seal identity, full catalog or exclusions differ"),
+])
+def test_finance_scheduler_requires_the_submitted_seal_after_presence_check(
+    finance_manifest_history, field, reason,
+):
+    engine, receipt = finance_manifest_history
+    wrong = deepcopy(receipt)
+    wrong["atomic_batch"][field] = "f" * 64
+    with _sqlite_query_work_budget(engine):
+        result = _validate_finance_history(engine, wrong)
+    assert result.checked and not result.ok
+    assert reason in result.message
+
+
+def test_finance_scheduler_presence_requires_an_actual_qualifying_source_row():
+    engine = create_engine("sqlite://")
+    try:
+        with engine.begin() as connection:
+            connection.execute(text(
+                "CREATE TABLE st_pit_source_coverage (fact_kind TEXT, source TEXT, "
+                "coverage_status TEXT, result_count INTEGER, known_at TEXT)"
+            ))
+            connection.execute(text(
+                "INSERT INTO st_pit_source_coverage VALUES "
+                "('event','adata.finance.core_index','COMPLETE',1,'2026-08-29'),"
+                "('finance','some.other.provider','COMPLETE',1,'2026-08-29'),"
+                "('finance','adata.finance.core_index','BLOCKED',1,'2026-08-29'),"
+                "('finance','eastmoney.finance.mainfinadata.direct','COMPLETE',0,'2026-08-29')"
+            ))
+        _sqlite_finance_metadata(engine)
+        result = _validate_finance_history(engine, _receipt())
+        assert result.checked and not result.ok
+        assert "st_pit_source_coverage: only 0 rows" in result.message
+    finally:
+        engine.dispose()
 
 
 def test_full_market_nested_discovery_receipt_fits_actual_scheduler_history_budget():
