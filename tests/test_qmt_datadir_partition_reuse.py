@@ -2,6 +2,7 @@
 from datetime import date, datetime
 import json
 from pathlib import Path
+import re
 import sqlite3
 from time import monotonic
 from types import SimpleNamespace
@@ -12,10 +13,14 @@ from sqlalchemy import create_engine, event, text
 from sqlalchemy.exc import OperationalError
 
 from integrations.qmt.datadir import CST, DAT_HEADER, MINUTE_PERIOD
+from integrations.qmt import datadir_import
 from integrations.qmt.datadir_import import ATTEMPT_DATASET, SOURCE, Universe, UniverseMember
+from server.common.auxiliary_runtime_schema import QMT_DATADIR_STAGE_INDEX_NAME
 from server.common import qmt_datadir_minute_coverage as coverage
 from server.common import qmt_datadir_result as results
-from server.common.qmt_minute_publication_scope import seal_minute_security_publication
+from server.common.qmt_minute_publication_scope import (
+    load_verified_minute_security_rows, seal_minute_security_publication,
+)
 from tools import import_qmt_datadir_history as importer
 
 
@@ -164,6 +169,141 @@ def test_stage_timeout_preserves_old_complete_publication_and_retries_landed_run
     assert results.load_receipt(item.engine, dataset=ATTEMPT_DATASET, trade_date=str(DAY)) is None
     published = results.load_receipt(item.engine, dataset="stock_minute", trade_date=str(DAY))
     assert published["run_id"] == "retry-run" and published["status"] == "COMPLETE"
+
+
+def _bounded_mysql_publication(connection, *, attempts, fail_batch, **kwargs):
+    """Run the actual indexed reconciliation and INSERT SELECT on SQLite."""
+    driver = connection.connection.driver_connection
+
+    def execute(statement, parameters):
+        sql = statement.text
+        if "information_schema.COLUMNS" in sql:
+            sql = sql.replace("information_schema.COLUMNS", "test_mysql_columns")
+            sql = sql.replace("TABLE_SCHEMA=DATABASE() AND ", "")
+        sql = re.sub(r"FORCE INDEX \(([^)]+)\)", r"INDEXED BY \1", sql)
+        sql = re.sub(r"CAST\(([^()]+) AS BINARY\)", r"\1 COLLATE BINARY", sql)
+        adapted = text(sql).bindparams(*statement._bindparams.values())
+        if not sql.lstrip().startswith(f"INSERT INTO `{datadir_import.TARGET_TABLE}`"):
+            return connection.execute(adapted, parameters)
+        attempt = dict(codes=tuple(parameters["codes"]), inserted=None, steps=0)
+        attempts.append(attempt)
+        budget = 1000 if len(attempts) == fail_batch else 500_000
+
+        def budget_progress():
+            attempt["steps"] += 100
+            return int(attempt["steps"] == budget)
+
+        driver.set_progress_handler(budget_progress, 100)
+        try:
+            inserted = connection.execute(adapted, parameters)
+            attempt["inserted"] = inserted.rowcount
+            return inserted
+        except OperationalError as exc:
+            if "interrupted" not in str(exc.orig):
+                raise
+            raise OperationalError(sql, {}, Exception(2013, "bounded minute INSERT SELECT reply timed out")) from exc
+        finally:
+            driver.set_progress_handler(None, 0)
+
+    mysql = SimpleNamespace(dialect=SimpleNamespace(name="mysql"), execute=execute)
+    return datadir_import.publish_session(mysql, batch_codes=50, **kwargs)
+
+
+def test_indexed_minute_insert_batches_fit_budget_and_commit_one_exact_receipt(existing_partition, monkeypatch):
+    item = existing_partition
+    _publish_original(item)
+    day = str(DAY)
+    codes = ("000001", *(f"{code:06d}" for code in range(600000, 600054)))
+    run = "qdd_20261103044000_abcdef12"
+    row_count = len(codes) * len(coverage.CORE_GRID)
+    scope = {**item.scope, "codes": codes, "eligible_code_count": len(codes),
+        "daily_close_by_code": dict.fromkeys(codes, "10"),
+        "expected_traded_code_set_sha256": importer.canonical_digest(list(codes))}
+    monkeypatch.setattr(importer, "trade_scope", lambda *_args, **_kwargs: scope)
+    with item.engine.begin() as connection:
+        connection.execute(text(f"CREATE INDEX `{QMT_DATADIR_STAGE_INDEX_NAME}` "
+            "ON qmt_datadir_minute_stage(run_id,trade_date,stock_code,trade_time)"))
+        connection.execute(text("CREATE INDEX idx_smm_date_source_code_time "
+            "ON sm_stock_minute(trade_date,data_source,stock_code,trade_time)"))
+        connection.execute(text("CREATE TABLE test_mysql_columns "
+            "(TABLE_NAME, CHARACTER_SET_NAME, COLLATION_NAME, COLUMN_NAME)"))
+        connection.execute(text("INSERT INTO test_mysql_columns VALUES "
+            "('sm_stock_minute','utf8mb4','utf8mb4_bin','stock_code'),"
+            "('qmt_datadir_minute_stage','utf8mb4','utf8mb4_bin','stock_code')"))
+        connection.execute(text("INSERT INTO qmt_datadir_minute_stage VALUES "
+            "(:run,:code,:stamp,:day,10,0,0,100,1000,:symbol)"), [
+                dict(run=run, code=code, stamp=f"{day} {moment}", day=day,
+                     symbol=code + (".SH" if code.startswith("6") else ".SZ"))
+                for code in codes for moment in coverage.CORE_GRID
+            ])
+
+    original_rows = _stored_rows(item.engine)
+    original_receipt = results.load_receipt(item.engine, dataset="stock_minute", trade_date=day)
+    entry = dict(rows=row_count, codes=list(codes), digest="d" * 64)
+    attempts = []
+    fail_batch = None
+
+    def publish(connection, **kwargs):
+        return _bounded_mysql_publication(connection, attempts=attempts, fail_batch=fail_batch, **kwargs)
+
+    def attempt_publication():
+        return importer._publish_one(item.engine, session=DAY, entry=entry, run_id=run,
+            root=item.root, replace=False, replace_sources=[], scope=scope)
+
+    def assert_failed_attempt_retained():
+        assert _stored_rows(item.engine) == original_rows
+        assert results.load_receipt(item.engine, dataset="stock_minute", trade_date=day) == original_receipt
+        failure = results.load_receipt(item.engine, dataset=ATTEMPT_DATASET, trade_date=day)
+        assert failure["status"] == "FAILED" and failure["run_id"] == run
+        assert failure["detail"]["staged_rows_retained"] is True
+        with item.engine.connect() as connection:
+            assert connection.execute(text("SELECT COUNT(*) FROM qmt_datadir_minute_stage "
+                "WHERE run_id=:run"), {"run": run}).scalar_one() == row_count
+
+    monkeypatch.setattr(importer, "publish_session", publish)
+    # Replay the old 50-security statement under the identical per-query budget.
+    with monkeypatch.context() as old_width:
+        old_width.setattr(datadir_import, "MINUTE_PUBLICATION_BATCH_CODES", 50, raising=False)
+        assert attempt_publication()["status"] == "FAILED"
+    assert attempts == [dict(codes=codes[:50], inserted=None, steps=500_000)]
+    assert_failed_attempt_retained()
+
+    attempts.clear()
+    fail_batch = 2
+    assert attempt_publication()["status"] == "FAILED"
+    assert [attempt["codes"] for attempt in attempts] == [codes[:16], codes[16:32]]
+    assert attempts[0]["inserted"] == 14 * len(coverage.CORE_GRID)
+    assert attempts[1]["inserted"] is None
+    assert_failed_attempt_retained()
+    log_path = item.root / "jobs" / "qmt-datadir-progress" / f"{run}.jsonl"
+    logged = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    failure = [event for event in logged if event["phase"] == "server_publication" and event["status"] == "FAILED"][-1]
+    assert (failure["sql_phase"], failure["batch_number"], failure["batch_security_count"]) == ("insert_missing", 2, 16)
+    assert failure["completed_units"] == 16 * len(coverage.CORE_GRID)
+
+    attempts.clear()
+    fail_batch = None
+    completed = importer._resume_staged_partition(item.engine, session=DAY, scope=scope,
+        replace=False, replace_sources=[])
+    assert completed["status"] == "COMPLETE" and completed["rows"] == row_count
+    assert [attempt["codes"] for attempt in attempts] == [codes[offset:offset + 16] for offset in range(0, len(codes), 16)]
+    assert all(0 < attempt["steps"] < 500_000 for attempt in attempts)
+    assert sum(attempt["inserted"] for attempt in attempts) == row_count - len(original_rows)
+    assert results.load_receipt(item.engine, dataset=ATTEMPT_DATASET, trade_date=day) is None
+    receipt = results.load_receipt(item.engine, dataset="stock_minute", trade_date=day)
+    assert (receipt["status"], receipt["run_id"], receipt["content_sha256"]) == ("COMPLETE", run, entry["digest"])
+    assert (receipt["row_count"], receipt["code_count"]) == (row_count, len(codes))
+    matrix = coverage.persisted_matrix(item.engine, day, scope=scope)
+    assert receipt["detail"]["row_hash"] == matrix["row_hash"]
+    with item.engine.connect() as connection:
+        proof, rows = load_verified_minute_security_rows(connection, connection,
+            dataset="stock_minute", trade_date=day, decision_known_at="2026-11-03 05:00:00", codes=codes)
+        assert connection.execute(text("SELECT COUNT(*) FROM qmt_datadir_minute_stage")).scalar_one() == 0
+    assert proof["run_id"] == run and proof["partition_row_hash"] == matrix["row_hash"]
+    assert set(rows) == set(codes)
+    assert all(len(bars) == len(coverage.CORE_GRID) for bars in rows.values())
+    final_log = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    assert {event["budget_seconds"] for event in final_log if event.get("completed_securities") == len(codes)} == {2100}
 
 
 def test_post_commit_cleanup_timeout_keeps_pass_and_retries_without_harvest(

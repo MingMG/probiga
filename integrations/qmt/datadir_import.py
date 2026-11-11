@@ -61,6 +61,10 @@ STATUS_FAILED = "FAILED"
 DEFAULT_CHUNK_ROWS = 5000
 DEFAULT_SESSIONS_PER_BATCH = 20
 STAGE_CLEANUP_BATCH_ROWS = 10_000
+# A native full-session write can take over 15 minutes. Bound each SQL slice
+# under the existing 45-second socket timeout while one transaction covers the day.
+MINUTE_PUBLICATION_BATCH_CODES = 16
+MINUTE_PUBLICATION_DEADLINE_SECONDS = 2100
 
 MINUTE_COLUMNS = (
     "stock_code",
@@ -495,15 +499,23 @@ def publish_session(
     run_id: str,
     batch_id: str,
     replace_sources: Sequence[str],
-    batch_codes: int = 50,
-    deadline_seconds: float = 900,
+    batch_codes: int = MINUTE_PUBLICATION_BATCH_CODES,
+    deadline_seconds: float = MINUTE_PUBLICATION_DEADLINE_SECONDS,
     progress=None,
 ) -> None:
     """Reconcile bounded stock batches inside the caller's one atomic transaction."""
-    if batch_codes < 1 or deadline_seconds <= 0:
+    if batch_codes < 1 or not 0 < deadline_seconds <= MINUTE_PUBLICATION_DEADLINE_SECONDS:
         raise ValueError("minute publication batch/deadline is invalid")
     sources = sorted({SOURCE, *replace_sources})
     mysql = conn.dialect.name == "mysql"
+    if mysql:
+        batch_codes = min(batch_codes, MINUTE_PUBLICATION_BATCH_CODES)
+    deadline = time.monotonic() + deadline_seconds
+
+    def check_deadline():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("minute_publication: total deadline exceeded")
+
     stage_index = f" FORCE INDEX (`{QMT_DATADIR_STAGE_INDEX_NAME}`)" if mysql else ""
     target_index = " FORCE INDEX (idx_smm_date_source_code_time)" if mysql else ""
     stock_encodings = {}
@@ -524,6 +536,7 @@ def publish_session(
             for charset, collation in stock_encodings.values()
         ):
             raise RuntimeError("minute_publication: stock code collation metadata differs")
+    check_deadline()
     staged_counts = {str(code): int(count) for code, count in conn.execute(text(
         f"SELECT stock_code,COUNT(*) FROM `{STAGE_TABLE}`{stage_index} "
         "WHERE run_id=:r AND trade_date=:d GROUP BY stock_code"
@@ -533,13 +546,14 @@ def publish_session(
         f"SELECT DISTINCT stock_code FROM `{TARGET_TABLE}` "
         "WHERE trade_date=:d AND data_source IN :sources"
     ).bindparams(bindparam("sources", expanding=True))
+    check_deadline()
     existing_codes = {
         str(row[0])
         for row in conn.execute(current_codes, {"d": session, "sources": sources})
     }
     codes.update(existing_codes)
     ordered = sorted(codes)
-    deadline = time.monotonic() + deadline_seconds
+    check_deadline()
 
     def exact_text(expression):
         return f"CAST({expression} AS BINARY)" if mysql else f"{expression} COLLATE BINARY"
@@ -618,8 +632,6 @@ def publish_session(
         """).bindparams(bindparam("codes", expanding=True))
     processed_rows = inserted_rows = deleted_rows = 0
     for offset in range(0, len(ordered), batch_codes):
-        if time.monotonic() >= deadline:
-            raise TimeoutError("minute_publication: total deadline exceeded")
         batch = ordered[offset:offset + batch_codes]
         params = {
             "source": SOURCE,
@@ -632,15 +644,27 @@ def publish_session(
             "d": session,
             "codes": batch,
         }
-        ids = conn.execute(victims, params).scalars().all() if existing_codes else []
-        for start in range(0, len(ids), 500):
-            if time.monotonic() >= deadline:
-                raise TimeoutError("minute_publication: total deadline exceeded")
-            deleted = conn.execute(delete, {"ids": ids[start:start + 500]})
-            deleted_rows += max(0, int(deleted.rowcount or 0))
-        if time.monotonic() >= deadline:
-            raise TimeoutError("minute_publication: total deadline exceeded")
-        inserted = conn.execute(insert, params)
+        sql_phase = "find_replacement_rows" if existing_codes else "insert_missing"
+        try:
+            check_deadline()
+            ids = conn.execute(victims, params).scalars().all() if existing_codes else []
+            sql_phase = "delete_replacement_rows"
+            for start in range(0, len(ids), 500):
+                check_deadline()
+                deleted = conn.execute(delete, {"ids": ids[start:start + 500]})
+                deleted_rows += max(0, int(deleted.rowcount or 0))
+            sql_phase = "insert_missing"
+            check_deadline()
+            inserted = conn.execute(insert, params)
+            check_deadline()
+        except Exception as exc:
+            if progress is not None:
+                progress.emit(
+                    "server_publication", status="FAILED", current_unit=batch[-1],
+                    sql_phase=sql_phase, batch_number=offset // batch_codes + 1,
+                    batch_security_count=len(batch), error_type=type(exc).__name__,
+                )
+            raise
         processed_rows += sum(staged_counts.get(code, 0) for code in batch)
         inserted_rows += max(0, int(inserted.rowcount or 0))
         if progress is not None:
@@ -649,8 +673,7 @@ def publish_session(
                 completed_securities=min(offset + len(batch), len(ordered)),
                 total_securities=len(ordered), budget_seconds=deadline_seconds,
                 budget_remaining_seconds=round(max(0.0, deadline - time.monotonic()), 6))
-    if time.monotonic() >= deadline:
-        raise TimeoutError("minute_publication: total deadline exceeded")
+    check_deadline()
 
 
 def readback_session(conn: Connection, session: dt.date) -> tuple[int, int]:
