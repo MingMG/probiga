@@ -4230,6 +4230,7 @@ class _NoDeltaEngine:
 @pytest.mark.parametrize("failure_step", (
     None, "lineage", "v3_migrations", "runtime_bundle", "governance_base",
     "runtime_seed", "inventory_seal", "dividend_task_migration", "dividend_task_runtime",
+    "pit_batch_index",
 ))
 def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
     monkeypatch,
@@ -4237,6 +4238,7 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
 ):
     from server.api.routers import _engine as api_engine_module
     from server.common import pit_facts
+    from server.common import pit_source_coverage_index
     from server.common import production_runtime_schema_bundle
     from server.common import qmt_history_coverage
     from server.common import scheduler_runtime_schema
@@ -4607,6 +4609,15 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
         lambda engine: record_validator_engine("pit", engine) or {"valid": True},
     )
     monkeypatch.setattr(
+        pit_source_coverage_index,
+        "ensure_pit_source_coverage_batch_index",
+        lambda engine: (
+            calls.append("pit-batch-index-off")
+            or (engine is migrator_engine or pytest.fail("batch index used the runtime engine"))
+            and {"created": False, "verified": True}
+        ),
+    )
+    monkeypatch.setattr(
         qmt_reference,
         "attest_prepared_reference_schema",
         lambda _engine: {
@@ -4768,6 +4779,8 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
             "runtime_bundle": (production_runtime_schema_bundle,
                                "privileged_migrate_runtime_schema_bundle",
                                "runtime_schema_bundle"),
+            "pit_batch_index": (pit_source_coverage_index,
+                                "ensure_pit_source_coverage_batch_index", "pit_fact_schema"),
             "governance_base": (strategy_governance,
                                 "ensure_strategy_governance_tables",
                                 "governance_base_schema"),
@@ -4835,6 +4848,9 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
     assert detail["funding_checkpoint_trigger_count"] == 4
     assert detail["trust_restoration_verified"] is True
     assert detail["runtime_least_privilege_verified"] is True
+    assert detail["pit_fact_batch_index"] == {"created": False, "verified": True}
+    assert calls.count("pit-batch-index-off") == 1
+    assert calls.index("pit-schema-off") < calls.index("pit-batch-index-off") < calls.index("governance-schema-base")
     assert [
         call.get("base_schema_only") for call in governance_schema_calls
     ] == [True, None]
