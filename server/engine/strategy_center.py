@@ -17,7 +17,7 @@ import copy
 import threading
 import time
 from collections import OrderedDict, defaultdict
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -25,14 +25,23 @@ from typing import Any, Iterable, Mapping
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
 from integrations.bigqmt.reference import PROVIDER_ID
 from server.api.routers._engine import get_engine
 from server.common.kline_data import get_kline_engine
 from server.common.analysis_pool_receipt import (
-    ANALYSIS_POOL_PUBLISHER_TASK_TYPES,
+    ANALYSIS_SCORE_PUBLICATION_TASK_TYPES,
+    CANONICAL_RECOMMENDATION_COLUMNS,
+    _canonical_rows,
+    _live_publication_gates_aligned,
+    canonical_sha256,
+    publication_is_complete_empty,
 )
+from server.common.daily_delivery_control import DailyDeliveryControlError
+from server.common.pit_facts import normalize_decision_at
 from server.common.sql_reader import (
+    bind_sql_connection,
     current_bound_sql_connection,
     read_sql_rows,
 )
@@ -80,6 +89,12 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _REFERENCE_POOL_DIR = _PROJECT_ROOT / "data" / "strategy_center"
 _MARKET_SNAPSHOT_CACHE: OrderedDict[str, tuple[float, dict[str, Any]]] = OrderedDict()
 _MARKET_SNAPSHOT_CACHE_LOCK = threading.Lock()
+_FIXED_MARKET_CONTEXT_SCHEMA = "probiga.strategy-fixed-market-context.v1"
+_MARKET_TAPE_SESSIONS = 20
+_MARKET_OPTIONAL_AS_OF = {
+    key: "UNAVAILABLE_AS_OF"
+    for key in ("sentiment", "style", "news_event_risk", "long_term_trend", "external_market_overlay")
+}
 
 
 STRATEGY_CATALOG: tuple[dict[str, Any], ...] = stock_strategy_catalog()
@@ -352,6 +367,7 @@ def _recommendation_publication_proof(
     trade_date: str,
     *,
     source_row_count: int,
+    analysis_run_uid: str | None = None,
 ) -> dict[str, Any]:
     """Verify that the mutable recommendation partition was published.
 
@@ -389,19 +405,23 @@ def _recommendation_publication_proof(
             "reason": "推荐发布历史缺少完整回执字段",
         }
     try:
+        exact_run = " AND run_uid=:run_uid" if analysis_run_uid is not None else ""
+        params = {"trade_date": target}
+        if analysis_run_uid is not None:
+            params["run_uid"] = analysis_run_uid
         rows = _db_read(
-            """
+            f"""
             SELECT run_uid, trade_date, status, finished_at, published_at,
                    publisher_task_type, canonical_pool_sha256, passed, total,
                    build_sha, membership_snapshot_date,
                    membership_snapshot_source, membership_proof_sha256
             FROM st_recommended_run_history
             WHERE trade_date=:trade_date
-              AND status='done'
+              AND status='done'{exact_run}
             ORDER BY published_at DESC, finished_at DESC, id DESC
             LIMIT 2
             """,
-            {"trade_date": target},
+            params,
         )
     except Exception as exc:
         return {
@@ -429,7 +449,8 @@ def _recommendation_publication_proof(
         analysis_count = -1
     valid = all((
         re.fullmatch(r"[0-9a-f]{32}", run_uid) is not None,
-        task_type in ANALYSIS_POOL_PUBLISHER_TASK_TYPES,
+        analysis_run_uid is None or run_uid == analysis_run_uid,
+        task_type in ANALYSIS_SCORE_PUBLICATION_TASK_TYPES,
         re.fullmatch(r"[0-9a-f]{64}", canonical_hash) is not None,
         re.fullmatch(r"[0-9a-f]{40}", build_sha) is not None,
         build_sha != "0" * 40,
@@ -480,6 +501,7 @@ def _candidate_source_contract(
     *,
     reference_pool: dict[str, Any] | None = None,
     dynamic_adapter_statuses: list[dict[str, Any]] | None = None,
+    fixed_publication_proof: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Prove that an empty candidate list came from a completed source read."""
 
@@ -493,6 +515,9 @@ def _candidate_source_contract(
         if not target or not reference_pool.get("_path"):
             status, query_completed = "INCOMPLETE", False
             reason = "日期化候选源缺少可验证路径或交易日"
+    elif fixed_publication_proof is not None:
+        # The fixed loader already read and checked the entire exact projection.
+        source_row_count = len(rows)
     elif not _table_exists("st_recommended_stocks"):
         status, query_completed = "MISSING", False
         reason = "候选源表st_recommended_stocks不存在"
@@ -522,7 +547,7 @@ def _candidate_source_contract(
                 reason = f"候选源完成证明查询失败：{type(exc).__name__}"
     publication_proof: dict[str, Any] | None = None
     if not reference_pool and status == "COMPLETED":
-        publication_proof = _recommendation_publication_proof(
+        publication_proof = fixed_publication_proof or _recommendation_publication_proof(
             target,
             source_row_count=source_row_count,
         )
@@ -568,7 +593,8 @@ def _candidate_source_contract(
     ]
     if invalid_dynamic_runs:
         status, query_completed = "INCOMPLETE", False
-        reason = "动态策略候选运行缺少完整CandidateBatch回执"
+        source_block = next((item for item in invalid_dynamic_runs if item.get("status") == "ADAPTER_SOURCE_BLOCKED"), None)
+        reason = str(source_block["reason"]) if source_block else "动态策略候选运行缺少完整CandidateBatch回执"
     dynamic_receipts = [
         dict(item.get("candidate_run_receipt") or {})
         for item in sorted(
@@ -1422,8 +1448,8 @@ def aggregate_candidates(
 
 
 def _db_read(sql: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-    engine = get_engine()
-    return read_sql_rows(engine, sql, params, context="strategy_center")
+    bound = current_bound_sql_connection()
+    return read_sql_rows(bound if bound is not None else get_engine(), sql, params, context="strategy_center")
 
 
 def _db_write(sql: str, params: dict[str, Any] | None = None) -> None:
@@ -2036,24 +2062,32 @@ def load_strategy_configs() -> dict[str, dict[str, Any]]:
     return result
 
 
-def load_strategy_metrics(as_of_date: str) -> dict[str, dict[str, Any]]:
+def load_strategy_metrics(
+    as_of_date: str, *, decision_known_at: datetime | str | None = None,
+) -> dict[str, dict[str, Any]]:
     metrics: dict[str, dict[str, Any]] = {}
     requested_day = date.fromisoformat(as_of_date)
     now = datetime.now(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
     cutoff = min(datetime.combine(requested_day + timedelta(days=1), datetime.min.time()), now)
+    fixed_slot = decision_known_at is not None
+    comparison = "<=" if fixed_slot else "<"
+    if fixed_slot:
+        cutoff = normalize_decision_at(decision_known_at)
+        if cutoff.date() < requested_day:
+            raise ValueError("strategy metric cutoff precedes the data trade date")
     params = {"as_of_date": as_of_date, "known_before": cutoff}
     if _table_exists("st_strategy_center_metric"):
         try:
-            rows = _db_read("""
+            rows = _db_read(f"""
                 SELECT m.*
                 FROM st_strategy_center_metric m
                 INNER JOIN (
                     SELECT strategy_key, MAX(as_of_date) AS latest_date
                     FROM st_strategy_center_metric
-                    WHERE as_of_date <= :as_of_date AND created_at < :known_before
+                    WHERE as_of_date <= :as_of_date AND created_at {comparison} :known_before
                     GROUP BY strategy_key
                 ) latest ON latest.strategy_key = m.strategy_key AND latest.latest_date = m.as_of_date
-                WHERE m.created_at < :known_before
+                WHERE m.created_at {comparison} :known_before
             """, params)
             for row in rows:
                 if str(row.get("source") or "").startswith(("st_sim_position", "st_recommended_stocks")):
@@ -2063,6 +2097,11 @@ def load_strategy_metrics(as_of_date: str) -> dict[str, dict[str, Any]]:
                 metrics[str(row.get("strategy_key") or "")] = row
         except Exception as exc:
             _safe_fallback_log(logging.DEBUG, "metric_snapshot", exc)
+
+    if fixed_slot:
+        # Mutable descriptive ledgers cannot reconstruct their old projection.
+        # These display-only samples never change the performance multiplier.
+        return metrics
 
     # Closed positions describe trade outcomes, not a portfolio NAV. Keep
     # live simulation separate from replay runs and require knowledge-time
@@ -2427,6 +2466,124 @@ def load_recommendation_rows(trade_date: str, limit: int = 200) -> list[dict[str
         return []
 
 
+def _load_fixed_recommendation_inputs(
+    connection, *, trade_date: str, analysis_run_uid: str, cutoff: str,
+    market_context_sha256: str,
+    prepared_analysis_publication: Mapping[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any], tuple[dict, dict] | None]:
+    from server.engine.strategy_shadow_trials import _analysis_source
+
+    def blocked(reason: str):
+        return [], {
+            "schema": "probiga.strategy-candidate-publication-proof.v1",
+            "status": "BLOCKED",
+            "trade_date": trade_date,
+            "publisher_run_uid": analysis_run_uid,
+            "reason": reason,
+        }, None
+
+    try:
+        if prepared_analysis_publication is None:
+            receipt, snapshot = _analysis_source(
+                connection, trade_date, analysis_run_uid, decision_known_at=cutoff,
+            )
+        else:
+            from server.common.analysis_pool_receipt import decode_score_snapshot, publication_receipt_is_valid
+
+            receipt = dict(prepared_analysis_publication)
+            if (
+                connection is not current_bound_sql_connection()
+                or not connection.in_transaction()
+                or not publication_receipt_is_valid(receipt)
+                or receipt.get("trade_date") != trade_date
+                or receipt.get("run_uid") != analysis_run_uid
+            ):
+                return blocked("ANALYSIS_FIXED_PREPARED_PUBLICATION_INVALID")
+            snapshot = decode_score_snapshot(receipt["score_snapshot"], trade_date=trade_date)
+            if any(
+                snapshot.get(key) != cutoff
+                for key in ("decision_at", "input_decision_at")
+            ):
+                return blocked("ANALYSIS_FIXED_SCORE_IDENTITY_MISMATCH")
+            staged = connection.execute(text("""
+                SELECT trade_date, build_sha, publisher_task_type, published_at,
+                       canonical_pool_sha256, total, passed, executable_count
+                  FROM st_recommended_run_history
+                 WHERE run_uid=:run_uid AND scheduler_job_id=:run_uid AND status='done'
+            """), {"run_uid": analysis_run_uid}).mappings().one_or_none()
+            if (
+                staged is None
+                or staged["published_at"] is None
+                or str(staged["trade_date"])[:10] != trade_date
+                or any(
+                    staged[key] != receipt[key] for key in
+                    ("build_sha", "publisher_task_type", "canonical_pool_sha256", "executable_count")
+                )
+                or staged["total"] != receipt["analysis_count"]
+                or staged["passed"] != receipt["recommendation_count"]
+            ):
+                return blocked("ANALYSIS_FIXED_PREPARED_HISTORY_MISMATCH")
+    except DailyDeliveryControlError as exc:
+        return blocked(str(exc))
+    except SQLAlchemyError:
+        return blocked("ANALYSIS_FIXED_PUBLICATION_UNAVAILABLE")
+    except ValueError:
+        return blocked("ANALYSIS_FIXED_SCORE_IDENTITY_MISMATCH")
+    if (snapshot.get("fixed_market_context") or {}).get("context_sha256") != market_context_sha256:
+        return blocked("ANALYSIS_FIXED_MARKET_CONTEXT_MISMATCH")
+
+    expected_count = int(receipt["recommendation_count"])
+    columns = ", ".join(f"`{name}`" for name in (
+        *CANONICAL_RECOMMENDATION_COLUMNS,
+        "recommend_status", "ordinary_buy_eligible", "publication_status",
+    ))
+    try:
+        rows = [dict(row) for row in connection.execute(text(f"""
+            SELECT /*+ MAX_EXECUTION_TIME(3000) */ {columns}
+              FROM st_recommended_stocks
+             WHERE pick_date=:trade_date AND publisher_run_uid=:run_uid
+               AND publication_status='ACTIVE'
+             ORDER BY final_trade_score DESC, stock_code ASC LIMIT :row_limit
+        """), {
+            "trade_date": trade_date, "run_uid": analysis_run_uid,
+            "row_limit": expected_count + 1,
+        }).mappings()]
+    except SQLAlchemyError:
+        return blocked("ANALYSIS_FIXED_ACTIVE_PROJECTION_UNAVAILABLE")
+    if (
+        len(rows) != expected_count
+        or (not rows and not publication_is_complete_empty(receipt))
+        or any(not _live_publication_gates_aligned(row) for row in rows)
+    ):
+        return blocked("ANALYSIS_FIXED_ACTIVE_PROJECTION_MISMATCH")
+    try:
+        projection_hash = canonical_sha256({
+            "trade_date": trade_date,
+            "rows": _canonical_rows(rows, columns=CANONICAL_RECOMMENDATION_COLUMNS),
+        })
+    except ValueError:
+        return blocked("ANALYSIS_FIXED_ACTIVE_PROJECTION_MISMATCH")
+    if projection_hash != receipt["recommendation_sha256"]:
+        return blocked("ANALYSIS_FIXED_ACTIVE_PROJECTION_MISMATCH")
+
+    proof = _recommendation_publication_proof(
+        trade_date, source_row_count=expected_count, analysis_run_uid=analysis_run_uid,
+    )
+    if (
+        proof.get("status") != "COMPLETED"
+        or proof.get("canonical_pool_sha256") != receipt["canonical_pool_sha256"]
+        or proof.get("build_sha") != receipt["build_sha"]
+        or normalize_decision_at(proof["published_at"]) != normalize_decision_at(receipt["published_at"])
+    ):
+        return blocked("ANALYSIS_FIXED_PUBLICATION_HISTORY_MISMATCH")
+    return rows, {
+        **proof,
+        "analysis_score_snapshot_sha256": receipt["score_snapshot_sha256"],
+        "decision_known_at": cutoff,
+        "recommendation_sha256": projection_hash,
+    }, (receipt, snapshot)
+
+
 def _previous_market_state(trade_date: str) -> dict[str, Any] | None:
     if not trade_date or not _table_exists("st_market_state_daily"):
         return None
@@ -2488,24 +2645,35 @@ def _kline_market_features(trade_date: str) -> dict[str, Any]:
     valid = [
         row for row in rows
         if int(_num(row.get("universe_count"), 0) or 0) >= minimum_count
+        and _num(row.get("market_change_pct")) is not None
+        and _num(row.get("breadth_pct")) is not None
     ]
     if not valid:
         return {}
-    changes = [float(_num(row.get("market_change_pct"), 0.0) or 0.0) for row in valid]
-    breadths = [float(_num(row.get("breadth_pct"), 0.0) or 0.0) for row in valid]
+    return _market_tape_features(
+        valid, trade_date,
+        source=str(fallback.get("source") or "sm_stock_kline_equal_weight_a_share"),
+    )
+
+
+def _market_tape_features(
+    valid: list[dict[str, Any]], trade_date: str, *, source: str,
+) -> dict[str, Any]:
+    """Apply the versioned tape formulas to descending session aggregates."""
+    changes = [float(row["market_change_pct"]) for row in valid]
+    breadths = [float(row["breadth_pct"]) for row in valid]
     ret_5d = sum(changes[:5])
     ret_20d = sum(changes[:20])
     breadth = breadths[0]
     breadth_5d = sum(breadths[:5]) / max(1, min(5, len(breadths)))
     market_change = changes[0]
-    trend = _clamp(50 + ret_5d * 3 + ret_20d + (breadth - 50) * 0.4, default=50.0)
-    switch = _clamp(abs(breadth - breadth_5d) * 2 + abs(ret_5d) * 3, default=0.0)
+    trend = _clamp(50 + ret_5d * 3 + ret_20d + (breadth - 50) * 0.4)
+    switch = _clamp(abs(breadth - breadth_5d) * 2 + abs(ret_5d) * 3)
     risk = _clamp(
         20
         + max(0.0, -market_change) * 10
         + max(0.0, 50 - breadth) * 1.2
         + max(0.0, -ret_5d) * 4,
-        default=20.0,
     )
     latest_date = normalize_trade_date(str(valid[0].get("trade_date") or "")[:10])
     return {
@@ -2518,8 +2686,142 @@ def _kline_market_features(trade_date: str) -> dict[str, Any]:
         "ret_5d_pct": round(ret_5d, 4),
         "ret_20d_pct": round(ret_20d, 4),
         "universe_count": int(_num(valid[0].get("universe_count"), 0) or 0),
-        "source": str(fallback.get("source") or "sm_stock_kline_equal_weight_a_share"),
+        "source": source,
         "is_current": latest_date == trade_date,
+    }
+
+
+def _fixed_market_tape(
+    rows: Iterable[Mapping[str, Any]], trade_date: str,
+) -> list[dict[str, Any]]:
+    minimum_count = int(load_market_state_config()["feature_fallbacks"]["minimum_daily_universe_count"])
+    tape = []
+    for row in rows:
+        day = str(row.get("trade_date") or "")
+        change = _num(row.get("market_change_pct"))
+        breadth = _num(row.get("breadth_pct"))
+        count = _num(row.get("universe_count"))
+        root = str(row.get("daily_partition_root") or "")
+        if (
+            not day or normalize_trade_date(day) != day
+            or change is None or breadth is None or not 0 <= breadth <= 100
+            or count is None or not count.is_integer() or count < minimum_count
+            or re.fullmatch(r"[0-9a-f]{64}", root) is None
+        ):
+            raise ValueError("fixed market tape contains incomplete session evidence")
+        tape.append({
+            "trade_date": day, "market_change_pct": change, "breadth_pct": breadth,
+            "universe_count": int(count), "daily_partition_root": root,
+        })
+    days = [row["trade_date"] for row in tape]
+    if len(days) != _MARKET_TAPE_SESSIONS or days != sorted(set(days)) or days[-1] != trade_date:
+        raise ValueError("fixed market tape must cover 20 ordered sessions through the data trade date")
+    return tape
+
+
+def _fixed_previous_market_state(trade_date: str, cutoff: datetime) -> dict[str, Any] | None:
+    rows = _db_read(
+        """
+        SELECT /*+ MAX_EXECUTION_TIME(3000) */
+               m.trade_date, m.run_uid, m.input_hash, m.input_json,
+               m.candidate_state, m.final_state, m.candidate_streak,
+               m.state_days, m.cooldown_remaining, m.source_status,
+               r.finished_at AS known_at
+          FROM st_market_state_daily m
+          JOIN st_strategy_center_run r ON r.run_uid = m.run_uid
+         WHERE m.config_version = :config_version AND m.config_hash = :config_hash
+           AND m.trade_date < :trade_date AND r.trade_date = m.trade_date
+           AND m.source_status = 'fresh' AND r.status = 'done'
+           AND m.created_at <= r.finished_at AND r.finished_at <= :cutoff
+         ORDER BY m.trade_date DESC, m.created_at DESC, m.id DESC
+         LIMIT 1
+        """,
+        {
+            "config_version": load_market_state_config()["config_version"],
+            "config_hash": market_state_config_hash(),
+            "trade_date": trade_date,
+            "cutoff": cutoff,
+        },
+    )
+    if not rows:
+        return None
+    previous = dict(rows[0])
+    if _canonical_hash(_json_value(previous.pop("input_json"), None)) != previous["input_hash"]:
+        raise ValueError("fixed prior market state input hash differs")
+    previous["trade_date"] = str(previous["trade_date"])
+    previous["known_at"] = normalize_decision_at(previous["known_at"]).isoformat()
+    return previous
+
+
+def build_fixed_market_context(
+    *, trade_date: str, decision_known_at: datetime | str,
+    daily_input_window: Mapping[str, Any], daily_market_rows: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Seal aggregates from the same checked daily rows the scorer consumed."""
+    cutoff = normalize_decision_at(decision_known_at)
+    if (
+        daily_input_window.get("schema") != "probiga.strategy-daily-input-window.v1"
+        or normalize_decision_at(daily_input_window.get("decision_known_at")) != cutoff
+    ):
+        raise ValueError("fixed market tape cutoff differs from verified daily window")
+    sessions = daily_input_window["sessions"][-_MARKET_TAPE_SESSIONS:]
+    roots = daily_input_window["daily_partition_roots"]
+    tape = _fixed_market_tape(
+        ({**row, "daily_partition_root": roots.get(str(row.get("trade_date")))} for row in daily_market_rows),
+        trade_date,
+    )
+    if [row["trade_date"] for row in tape] != list(sessions) or cutoff.date().isoformat() < trade_date:
+        raise ValueError("fixed market tape sessions differ from verified daily window")
+    payload = {
+        "schema": _FIXED_MARKET_CONTEXT_SCHEMA,
+        "trade_date": trade_date,
+        "decision_known_at": cutoff.isoformat(),
+        "market_state_config_hash": market_state_config_hash(),
+        "tape": tape,
+        "previous_state": _fixed_previous_market_state(trade_date, cutoff),
+    }
+    return {**payload, "context_sha256": _canonical_hash(payload)}
+
+
+def _fixed_market_snapshot(
+    trade_date: str, context: Mapping[str, Any], decision_known_at: datetime | str,
+) -> dict[str, Any]:
+    cutoff = normalize_decision_at(decision_known_at)
+    payload = {key: value for key, value in context.items() if key != "context_sha256"}
+    if (
+        context.get("schema") != _FIXED_MARKET_CONTEXT_SCHEMA
+        or context.get("trade_date") != trade_date
+        or context.get("decision_known_at") != cutoff.isoformat()
+        or context.get("market_state_config_hash") != market_state_config_hash()
+        or context.get("context_sha256") != _canonical_hash(payload)
+    ):
+        raise ValueError("fixed market context identity or cutoff differs")
+    previous = context.get("previous_state")
+    if previous is not None and (
+        previous["trade_date"] >= trade_date or normalize_decision_at(previous["known_at"]) > cutoff
+    ):
+        raise ValueError("fixed prior market state was unavailable at the decision cutoff")
+    tape = _fixed_market_tape(context["tape"], trade_date)
+    kline = _market_tape_features(
+        list(reversed(tape)), trade_date, source="cutoff_verified_daily_equal_weight",
+    )
+    inputs = {key: kline[key] for key in load_market_state_config()["required_inputs"]}
+    if any(_num(value) is None for value in inputs.values()):
+        raise ValueError("fixed market tape cannot produce finite market-state inputs")
+    state = infer_market_state(kline, previous=previous)
+    state["previous_state"] = previous
+    state["previous_state_status"] = "AVAILABLE" if previous else "UNAVAILABLE_AS_OF"
+    state["input"] = inputs
+    state["as_of_context_sha256"] = context["context_sha256"]
+    state["as_of_cutoff"] = cutoff.isoformat()
+    state["optional_context_status"] = dict(_MARKET_OPTIONAL_AS_OF)
+    return {
+        **kline,
+        "trade_date": trade_date,
+        "source_status": "fresh",
+        "market_state": state["key"],
+        "state": state,
+        "long_term_trend": {"status": "UNAVAILABLE_AS_OF", "requested_date": trade_date},
     }
 
 
@@ -2637,8 +2939,14 @@ def _fuse_event_and_tape_risk(
 
 def load_market_snapshot(
     trade_date: str, *, use_cache: bool = True,
+    fixed_market_context: Mapping[str, Any] | None = None,
+    decision_known_at: datetime | str | None = None,
 ) -> dict[str, Any]:
-    """Combine current adapters with frozen, reproducible K-line fallbacks."""
+    """Read sealed inputs for fixed slots and live adapters for current views."""
+    if fixed_market_context is not None or decision_known_at is not None:
+        if fixed_market_context is None or decision_known_at is None:
+            raise ValueError("fixed market context and decision cutoff are both required")
+        return _fixed_market_snapshot(trade_date, fixed_market_context, decision_known_at)
     cache_ttl = 120 if trade_date == date.today().isoformat() else 600
     now_monotonic = time.monotonic()
     if use_cache:
@@ -2782,6 +3090,7 @@ def build_strategy_cards(market: dict[str, Any], candidates: list[dict[str, Any]
             {},
         )
         metric = metrics.get(key) or {}
+        metric_unavailable_as_of = bool((market.get("state") or {}).get("as_of_cutoff")) and not metric
         weight = effective_weight(key, state, configs.get(key), metric, 1.0 if market.get("source_status") == "fresh" else 0.75)
         cards.append({
             **item,
@@ -2789,14 +3098,17 @@ def build_strategy_cards(market: dict[str, Any], candidates: list[dict[str, Any]
             "version": (configs.get(key) or {}).get("version", 1),
             **weight,
             "today_signal_count": counts.get(key, 0),
-            "sample_count": int(_num(metric.get("sample_count"), 0) or 0),
+            "sample_count": None if metric_unavailable_as_of else int(_num(metric.get("sample_count"), 0) or 0),
             "return_pct": metric.get("return_pct"),
             "max_drawdown_pct": metric.get("max_drawdown_pct"),
             "win_rate_pct": metric.get("win_rate_pct"),
             "profit_factor": metric.get("profit_factor"),
             "avg_return_pct": metric.get("avg_return_pct"),
-            "metric_scope": metric.get("metric_scope") or "PERSISTED_STRATEGY_METRIC",
-            "performance_weight_eligible": metric.get("performance_weight_eligible", True),
+            "metric_scope": (
+                "UNAVAILABLE_AS_OF" if metric_unavailable_as_of
+                else metric.get("metric_scope") or "PERSISTED_STRATEGY_METRIC"
+            ),
+            "performance_weight_eligible": metric.get("performance_weight_eligible", not metric_unavailable_as_of),
             "metric_source": metric.get("source") or "暂无复盘样本",
             "metric_as_of_date": str(metric.get("as_of_date") or "")[:10],
             "metric_note": metric.get("metric_note") or "",
@@ -3775,6 +4087,10 @@ def _dynamic_execution_signals(
     configs: dict[str, dict[str, Any]],
     metrics: dict[str, dict[str, Any]],
     persist_receipts: bool = False,
+    prepare_shadow_execution: bool = True,
+    analysis_run_uid: str | None = None,
+    decision_known_at: str | None = None,
+    native_analysis_source: tuple[dict, dict] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Discover any number of code-backed dynamic strategy adapters."""
 
@@ -3800,7 +4116,12 @@ def _dynamic_execution_signals(
     signals: list[dict[str, Any]] = []
     statuses: list[dict[str, Any]] = []
     shadow_plan_groups: list[dict[str, Any]] = []
-    native_source_cache: dict[str, Any] = {}
+    native_source_cache: dict[tuple, Any] = {}
+    if decision_known_at is not None:
+        context["analysis_run_uid"] = analysis_run_uid
+        context["decision_known_at"] = decision_known_at
+        if native_analysis_source is not None:
+            native_source_cache[("analysis", trade_date, analysis_run_uid, decision_known_at)] = native_analysis_source
     governance_connection = (
         current_bound_sql_connection() if persist_receipts else None
     )
@@ -3892,7 +4213,7 @@ def _dynamic_execution_signals(
                     candidate_receipt=receipt,
                     candidates=execution.get("candidate_facts") or (),
                 )
-                if lifecycle == "SHADOW":
+                if prepare_shadow_execution and lifecycle == "SHADOW":
                     shadow_plan_set = (
                         create_dynamic_shadow_trial_plans_from_candidate_facts(
                             governance_connection,
@@ -3952,8 +4273,9 @@ def _dynamic_execution_signals(
                 "shadow_bootstrap_result": {
                     "status": (
                         "PENDING_GLOBAL_ROUND_ROBIN"
-                        if persist_receipts and lifecycle == "SHADOW"
-                        else "NOT_APPLICABLE_LIFECYCLE"
+                        if persist_receipts and prepare_shadow_execution and lifecycle == "SHADOW"
+                        else "NOT_APPLICABLE_LIFECYCLE" if prepare_shadow_execution
+                        else "FROZEN_POOL_REVISION_RESEARCH_ONLY"
                     ),
                     "paper_order_count": 0,
                     "real_order_count": 0,
@@ -3962,6 +4284,19 @@ def _dynamic_execution_signals(
                 },
             })
         except Exception as exc:
+            if (
+                decision_known_at is not None
+                and source_kind == "immutable_v3_sleeve"
+                and isinstance(exc, ValueError)
+                and str(exc) == "SHADOW_V3_COMPLETED_SOURCE_UNAVAILABLE_AS_OF"
+            ):
+                status.update({
+                    "status": "ADAPTER_SOURCE_BLOCKED",
+                    "status_label": "决策时点缺少V3原生来源",
+                    "reason": str(exc),
+                    "run_receipt_valid": False,
+                })
+                continue
             if persist_receipts:
                 raise
             status.update({
@@ -3971,7 +4306,7 @@ def _dynamic_execution_signals(
                 "run_receipt_valid": False,
             })
             _safe_fallback_log(logging.WARNING, "dynamic_adapter_runtime", exc)
-    if persist_receipts:
+    if persist_receipts and prepare_shadow_execution:
         from server.engine.shadow_capacity_queue import capacity_queue_for_run
         ordinal = _dynamic_shadow_trade_session_ordinal(governance_connection, trade_date=trade_date)
         queue = capacity_queue_for_run(governance_connection, registry=registry, groups=shadow_plan_groups,
@@ -4001,16 +4336,56 @@ def _dynamic_execution_signals(
 
 def build_strategy_center_snapshot(
     trade_date: str = "", limit: int = 200, *, fresh_market: bool = False,
+    fixed_market_context: Mapping[str, Any] | None = None,
+    decision_known_at: datetime | str | None = None,
+    analysis_run_uid: str | None = None,
+    prepared_analysis_publication: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    target = latest_recommendation_date(trade_date)
-    if not target:
-        target = normalize_trade_date(trade_date) or date.today().isoformat()
-    reference_pool = load_reference_candidate_pool(target)
-    market = load_market_snapshot(target, use_cache=not fresh_market)
-    configs = load_strategy_configs()
-    metrics = load_strategy_metrics(target)
-    rows = load_recommendation_rows(target, limit)
+    fixed_market = any(value is not None for value in (
+        fixed_market_context, decision_known_at, analysis_run_uid, prepared_analysis_publication,
+    ))
     external_market_overlay = _EXTERNAL_MARKET_OVERLAY_CONTEXT.get()
+    publication_proof = None
+    native_analysis_source = None
+    cutoff = None
+    if fixed_market:
+        if (
+            not trade_date or normalize_trade_date(trade_date) != trade_date
+            or fixed_market_context is None or decision_known_at is None
+            or re.fullmatch(r"[0-9a-f]{32}", analysis_run_uid or "") is None
+        ):
+            raise ValueError("fixed governance requires the exact trade date, market context, cutoff and analysis run")
+        if external_market_overlay is not None and (
+            prepared_analysis_publication is None
+            or not external_market_overlay.get("snapshot_id")
+            or normalize_decision_at(external_market_overlay.get("captured_at")) > normalize_decision_at(decision_known_at)
+        ):
+            raise ValueError("live external market overlay is unavailable in fixed-slot governance")
+        target, reference_pool = trade_date, None
+        cutoff = normalize_decision_at(decision_known_at).isoformat()
+        market = load_market_snapshot(
+            target, fixed_market_context=fixed_market_context,
+            decision_known_at=cutoff,
+        )
+        bound = current_bound_sql_connection()
+        with (nullcontext(bound) if bound is not None else get_engine().connect()) as connection:
+            with bind_sql_connection(connection):
+                rows, publication_proof, native_analysis_source = _load_fixed_recommendation_inputs(
+                    connection, trade_date=target, analysis_run_uid=analysis_run_uid,
+                    cutoff=cutoff, market_context_sha256=market["state"]["as_of_context_sha256"],
+                    **({"prepared_analysis_publication": prepared_analysis_publication}
+                       if prepared_analysis_publication is not None else {}),
+                )
+                metrics = load_strategy_metrics(target, decision_known_at=cutoff)
+    else:
+        target = latest_recommendation_date(trade_date)
+        if not target:
+            target = normalize_trade_date(trade_date) or date.today().isoformat()
+        reference_pool = load_reference_candidate_pool(target)
+        market = load_market_snapshot(target, use_cache=not fresh_market)
+        metrics = load_strategy_metrics(target)
+        rows = load_recommendation_rows(target, limit)
+    configs = load_strategy_configs()
     if external_market_overlay is not None:
         rows = apply_external_market_score_overlay(
             rows,
@@ -4022,14 +4397,20 @@ def build_strategy_center_snapshot(
             "key", market.get("market_state")
         ),
     }
-    dynamic_signals, dynamic_adapter_statuses = _dynamic_execution_signals(
-        trade_date=target,
-        recommendation_rows=rows,
-        market=normalized_market,
-        configs=configs,
-        metrics=metrics,
-        persist_receipts=fresh_market,
-    )
+    dynamic_signals, dynamic_adapter_statuses = [], []
+    if not fixed_market or publication_proof.get("status") == "COMPLETED":
+        dynamic_signals, dynamic_adapter_statuses = _dynamic_execution_signals(
+            trade_date=target,
+            recommendation_rows=rows,
+            market=normalized_market,
+            configs=configs,
+            metrics=metrics,
+            persist_receipts=fresh_market,
+            **({"prepare_shadow_execution": False} if prepared_analysis_publication is not None else {}),
+            analysis_run_uid=analysis_run_uid,
+            decision_known_at=cutoff,
+            native_analysis_source=native_analysis_source,
+        )
     candidates, conflicts = aggregate_candidates(
         rows,
         normalized_market,
@@ -4043,6 +4424,7 @@ def build_strategy_center_snapshot(
         candidates,
         reference_pool=reference_pool,
         dynamic_adapter_statuses=dynamic_adapter_statuses,
+        fixed_publication_proof=publication_proof,
     )
     strategy_counts = _strategy_discovery_counts(
         configs, dynamic_adapter_statuses,
@@ -4088,7 +4470,11 @@ def build_strategy_center_snapshot(
         "is_stale": bool(reference_pool) or market.get("source_status") != "fresh",
         "data_sources": [
             "st_recommended_stocks" if not reference_pool else "dated_reference_pool",
-            "sm_stock_snapshot/sm_stock_kline" if reference_pool else "existing_market_adapters+sm_stock_kline",
+            (
+                "cutoff_verified_daily_equal_weight" if fixed_market
+                else "sm_stock_snapshot/sm_stock_kline" if reference_pool
+                else "existing_market_adapters+sm_stock_kline"
+            ),
             *(
                 ["st_external_market_context"]
                 if external_market_overlay is not None
@@ -4128,6 +4514,7 @@ def build_strategy_center_snapshot(
             "stock_manifest_hash": stock_manifest_hash(),
             "market_state_config_version": load_market_state_config()["config_version"],
             "market_state_config_hash": market_state_config_hash(),
+            **({"strategy_policy_basis": "CURRENT_OPERATIONAL_POLICY"} if fixed_market else {}),
             "automatic_order_submission": False,
         },
         "reference_pool": reference_meta,
@@ -4253,6 +4640,8 @@ def persist_strategy_center_snapshot(
         "trade_date": snapshot.get("trade_date"),
         "long_term_market_trend_hash": trend_observation_hash,
     }
+    if state.get("as_of_context_sha256"):
+        state_payload["as_of_context_sha256"] = state["as_of_context_sha256"]
     input_hash = hashlib.sha256(
         json.dumps(
             state_payload,

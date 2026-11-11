@@ -124,6 +124,7 @@ def _canonical_governance_buy_receipt(
         # allocation, stock plan, pools, market routes and decision hash before
         # a BUY may consume the row.
         from server.engine.strategy_governance import (
+            FROZEN_POOL_REVISION_EXECUTION_DISPOSITION,
             STATISTICAL_DECISION_CONTRACT,
             _canonical_governance_result_from_row,
         )
@@ -131,6 +132,8 @@ def _canonical_governance_buy_receipt(
         result = _canonical_governance_result_from_row(ledger)
     except (RuntimeError, TypeError, ValueError, json.JSONDecodeError):
         return None, "GOVERNANCE_CANONICAL_REPLAY_INVALID"
+    if result.get("execution_disposition") == FROZEN_POOL_REVISION_EXECUTION_DISPOSITION:
+        return None, "GOVERNANCE_FROZEN_REVISION_RESEARCH_ONLY"
     if (
         result.get("input_ready") is not True
         or result.get("automatic_real_order_submission") is not False

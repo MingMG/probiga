@@ -8,6 +8,7 @@ import logging
 import math
 import re
 import uuid
+from contextlib import nullcontext
 from datetime import date, datetime
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
@@ -221,7 +222,7 @@ def _exact_canonical_governance_readback(
     ):
         raise RuntimeError("治理运行器没有返回可精确回读的canonical身份")
     try:
-        with engine.connect() as connection:
+        with (nullcontext(engine) if hasattr(engine, "execute") else engine.connect()) as connection:
             rows = connection.execute(text("""
                 SELECT run_uid, trade_date, input_hash, decision_hash,
                        build_commit_sha, status, is_canonical,
@@ -263,6 +264,82 @@ def _exact_canonical_governance_readback(
         or str(readback.get("build_commit_sha") or "") != runner_build_sha
     ):
         raise RuntimeError("canonical治理完整回读与运行器回执不一致")
+    return readback
+
+
+def _fixed_governance_inputs(fixed_scoring: dict[str, Any], target: str) -> dict[str, Any]:
+    fields = ("fixed_market_context", "decision_known_at", "analysis_run_uid")
+    if fixed_scoring.get("trade_date") != target or not all(fixed_scoring.get(field) for field in fields):
+        raise ValueError("fixed governance scoring identity differs from the target session")
+    return {field: fixed_scoring[field] for field in fields}
+
+
+def persist_frozen_governance_revision(
+    connection,
+    *,
+    fixed_scoring: dict[str, Any],
+    prepared_analysis_publication: dict[str, Any],
+    expected_prior_governance_run_uid: str,
+    operator: str = "scheduled_frozen_pool_revision",
+    strategy_limit: int = 500,
+    expected_build_sha: str = "",
+) -> dict[str, Any]:
+    """Validate and persist governance without committing the caller's transaction.
+
+    The caller stages the exact score first and must publish its receipt using
+    this same connection. Any error must escape the enclosing writer scope.
+    """
+    from server.engine.strategy_governance import (
+        FROZEN_POOL_REVISION_EXECUTION_DISPOSITION,
+        _require_governance_write_transaction,
+        governance_snapshot,
+    )
+
+    _require_governance_write_transaction(connection)
+    target = str(fixed_scoring.get("trade_date") or "")
+    if date.fromisoformat(target).isoformat() != target:
+        raise ValueError("frozen governance revision trade date is invalid")
+    inputs = _fixed_governance_inputs(fixed_scoring, target)
+    score_root = str(prepared_analysis_publication.get("score_snapshot_sha256") or "")
+    publication_build = str(prepared_analysis_publication.get("build_sha") or "")
+    if (
+        prepared_analysis_publication.get("trade_date") != target
+        or prepared_analysis_publication.get("run_uid") != inputs["analysis_run_uid"]
+        or not _HASH_PATTERN.fullmatch(score_root)
+        or not re.fullmatch(r"[0-9a-f]{40}", publication_build)
+        or publication_build == "0" * 40
+        or (expected_build_sha and publication_build != expected_build_sha)
+    ):
+        raise ValueError("prepared score publication identity differs from the governance revision")
+    result = governance_snapshot(
+        trade_date=target,
+        persist=True,
+        operator=operator,
+        strategy_limit=max(1, min(500, int(strategy_limit))),
+        _governance_connection=connection,
+        prepared_analysis_publication=prepared_analysis_publication,
+        expected_prior_governance_run_uid=expected_prior_governance_run_uid,
+        **inputs,
+    )
+    readback = _exact_canonical_governance_readback(
+        connection, runner_result=result, target_trade_date=target,
+        expected_build_sha=publication_build,
+    )
+    proof = (readback.get("candidate_source") or {}).get("publication_proof") or {}
+    if (
+        readback.get("supersedes_run_uid") != expected_prior_governance_run_uid
+        or readback.get("run_uid") == expected_prior_governance_run_uid
+        or result.get("idempotent_replay") is not False
+        or readback.get("execution_disposition") != FROZEN_POOL_REVISION_EXECUTION_DISPOSITION
+        or proof.get("status") != "COMPLETED"
+        or proof.get("publisher_run_uid") != inputs["analysis_run_uid"]
+        or proof.get("analysis_score_snapshot_sha256") != score_root
+    ):
+        raise RuntimeError("frozen governance successor readback differs from its parent or staged score")
+    validate_governance_completion_contract(
+        readback, target_trade_date=target, expected_build_sha=publication_build,
+    )
+    validate_governance_safety_contract(readback)
     return readback
 
 
@@ -535,6 +612,7 @@ def orchestrate_strategy_governance(
     governance_runner: Callable[..., dict[str, Any]] | None = None,
     process_preflight: Callable[[], Any] | None = None,
     ensure_build_commit_sha: str = "",
+    fixed_scoring: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run exact-date input capture and governance through one shared path.
 
@@ -772,6 +850,21 @@ def orchestrate_strategy_governance(
         # current canonical already belongs to this build, the branch above is
         # the idempotent NOT_DUE path and no extra revision is created.
 
+    if fixed_scoring is not None and fixed_scoring.get("error"):
+        return _blocked_result(
+            database,
+            orchestration_status=NOT_READY,
+            error_class="NOT_READY",
+            retryable=True,
+            reason_code="FROZEN_SCORING_UNAVAILABLE",
+            blocking_stage="GOVERNANCE_INPUT",
+            reason=str(fixed_scoring["error"]),
+            operator=operator,
+            target_trade_date=target,
+            requested_trade_date=requested,
+            input_trade_date=target,
+        )
+
     capture = industry_capture or capture_industry_history
     try:
         industry = capture(database, trade_date=target)
@@ -828,12 +921,16 @@ def orchestrate_strategy_governance(
     )
     if governance_runner is None:
         governance_runner = governance_snapshot
+    fixed_inputs = {}
+    if fixed_scoring is not None:
+        fixed_inputs = _fixed_governance_inputs(fixed_scoring, target)
     try:
         result = governance_runner(
             trade_date=target,
             persist=True,
             operator=operator,
             strategy_limit=max(1, min(500, int(strategy_limit))),
+            **fixed_inputs,
         )
     except Exception as exc:
         from server.engine.strategy_governance import GovernanceEvidenceNotReady
@@ -998,6 +1095,7 @@ __all__ = [
     "canonical_unavailable_context",
     "orchestrate_strategy_governance",
     "persist_blocked_attempt",
+    "persist_frozen_governance_revision",
     "validate_governance_completion_contract",
     "validate_governance_safety_contract",
 ]

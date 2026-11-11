@@ -747,6 +747,132 @@ def test_daily_result_with_date_exposes_authoritative_closed_session(
     assert result["authoritative_closed_trade_date"] == authoritative.isoformat()
 
 
+@pytest.mark.parametrize("candidate_count", [0, 1])
+def test_explicit_archive_replays_sealed_prior_release_without_current_acceptance(monkeypatch, candidate_count):
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    from server.common import component_release_ledger as ledger, daily_delivery_control as control
+    from server.common.component_release import build_component_release
+
+    selected = date(2026, 11, 10)
+    day = selected.isoformat()
+    engine = create_engine("sqlite://")
+    control.privileged_migrate_daily_delivery_schema(engine)
+    original = "b" * 40
+    run_uid = "c" * 32
+    pool_root = "d" * 64
+    key = Ed25519PrivateKey.generate()
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "development")
+    manifest = build_component_release(
+        linux_build_sha=original, windows_build_sha=original, contract_build_sha=original,
+        parent_linux_build_sha="e" * 40, contract_sha256="1" * 64,
+        scope="COORDINATED", created_at="2026-11-10T08:00:00Z",
+    )
+    manifest_json, signature = ledger.sign_component_manifest(manifest, key)
+    monkeypatch.setattr(ledger, "load_component_ledger_public_key", lambda _conn: ledger.signing_public_key(key))
+    control.start_daily_stage_attempt(
+        engine, scheduler_run_uid="a" * 32, stage_name="strategy_governance_daily",
+        trade_date=day, release_id=original, strategy_release_id="2" * 64, lease_owner="old-linux",
+    )
+    with engine.begin() as conn:
+        conn.exec_driver_sql("ATTACH DATABASE ':memory:' AS probiga")
+        conn.exec_driver_sql("CREATE TABLE probiga.st_component_release_manifest (linux_build_sha TEXT, manifest_json TEXT, signature TEXT)")
+        conn.execute(text("INSERT INTO probiga.st_component_release_manifest VALUES (:build,:manifest,:signature)"), {
+            "build": original, "manifest": manifest_json, "signature": signature,
+        })
+        session = control.ensure_daily_delivery_session(
+            conn, trade_date=day, release_id=original, strategy_release_id="2" * 64,
+        )
+        control.finish_daily_stage_attempt(conn, scheduler_run_uid="a" * 32, status="success")
+        legacy = {
+            "analysis_run_uid": "3" * 32, "governance_run_uid": run_uid,
+            "base_data_receipt_root_sha256": "4" * 64, "score_snapshot_sha256": "5" * 64,
+            "strategy_pool_status": "ACTIVE" if candidate_count else "EMPTY",
+            "ticket_pool_status": "EMPTY", "governance_result_sha256": pool_root,
+            "canonical_pool_sha256": "6" * 64, "recommendation_count": 0, "executable_count": 0,
+            "status": "VERIFIED_DELIVERED" if candidate_count else "VERIFIED_EMPTY",
+            "base_data_receipts": [
+                {"task_type": stage, "run_uid": "7" * 32, "evidence_sha256": "8" * 64,
+                 "input_receipt_root_sha256": "9" * 64}
+                for stage in ("qmt_stock_daily_canonical", "target_turnover_snapshot", "stock_finance", "qmt_announcement_pit")
+            ],
+        }
+        receipt = control.persist_terminal_delivery_receipt(conn, receipt=control.build_terminal_delivery_receipt(
+            session=session, scheduler_run_uid="a" * 32, stage_name="strategy_governance_daily",
+            status="PASS", strategy_release_id="2" * 64, legacy_receipt=legacy,
+        ))
+    pool = {
+        **_daily_empty_pool(trade_date=day, build_sha=original),
+        "run_uid": run_uid, "canonical_result_hash": pool_root, "real_order_authority": False,
+    }
+    if candidate_count:
+        pool["pool_status"] = "READY"
+        pool["items"] = [{
+            "stock_code": "600001", "stock_name": "测试候选", "is_strategy_candidate": True,
+            "actionability": "BUY_ZONE", "action_plan": {
+                "actionability": "BUY_ZONE", "buy_range": {"min": 10, "max": 11},
+                "sell_range": {"min": 12, "max": 13}, "protective_stop": 9,
+            },
+        }]
+        pool["summary"].update(stock_count=1, strategy_candidate_count=1)
+    canonical = {
+        "pool": pool, "snapshot": {
+            "is_canonical": True, "input_ready": True, "result_mode": "CANONICAL_PERSISTED",
+            "automatic_real_order_submission": False, "real_order_authority": False,
+            "trade_date": day, "run_uid": run_uid, "canonical_result_hash": pool_root,
+            "build_commit_sha": original,
+        },
+    }
+
+    class Repository:
+        pass
+
+    Repository.engine = engine
+    monkeypatch.delenv("PROBIGA_STRATEGY_GOVERNANCE_MODE", raising=False)
+    monkeypatch.setattr(trading_v3, "_repo", Repository)
+    monkeypatch.setattr(trading_v3, "authoritative_closed_trade_date", lambda _engine: selected)
+    monkeypatch.setattr(trading_v3, "canonical_governance_decision", lambda *_a, **_k: canonical)
+    _patch_daily_release_identity(monkeypatch, execution_session_date=date(2026, 11, 11))
+    monkeypatch.setattr(trading_v3, "_daily_real_trading_safety", lambda *_a: _verified_daily_real_trading_safety())
+    trading_v3._DAILY_RESULT_CACHE.clear()
+
+    strict = trading_v3.daily_result(selected, force=True)["data"]
+    assert strict["reason_code"] == "DAILY_RESULT_CANONICAL_BUILD_MISMATCH"
+    assert strict["acceptance"]["accepted"] is False
+    assert "archive" not in strict
+
+    archived = trading_v3.daily_result(selected, archive=True)["data"]
+    assert archived["delivery_status"] == "ARCHIVED"
+    assert archived["archive"] == {
+        "producer_build_sha": original, "contract_release_id": original,
+        "receipt_uid": receipt["receipt_uid"], "receipt_sha256": receipt["receipt_sha256"],
+    }
+    assert archived["acceptance"]["accepted"] is False
+    assert archived["acceptance"]["release_build_identity_matches"] is False
+    assert archived["context"]["historical_read_only"] is True
+    assert archived["context"]["paper_order_authority"] == "NONE"
+    assert archived["stock_pool"]["historical_read_only"] is True
+    assert archived["stock_pool"]["real_order_authority"] is False
+    assert archived["stock_pool"]["summary"]["strategy_candidate_count"] == candidate_count
+    if candidate_count:
+        item = archived["stock_pool"]["items"][0]
+        assert item["stock_code"] == "600001"
+        assert item["actionability"] == "RESEARCH_ONLY"
+        assert item["action_plan"]["buy_range"] is None
+        assert item["action_plan"]["sell_range"] is None
+        assert item["action_plan"]["protective_stop"] is None
+    assert trading_v3.daily_result(selected)["data"]["delivery_status"] == "DATA_BLOCKED"
+    assert trading_v3.daily_result(archive=True)["data"]["delivery_status"] == "DATA_BLOCKED"
+
+    with engine.begin() as conn:
+        conn.exec_driver_sql("UPDATE probiga.st_component_release_manifest SET signature='invalid'")
+    assert trading_v3.daily_result(selected, archive=True, force=True)["data"]["delivery_status"] == "DATA_BLOCKED"
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE probiga.st_component_release_manifest SET signature=:signature"), {"signature": signature})
+        conn.execute(text(f"UPDATE {control.RECEIPT_TABLE} SET receipt_sha256=:bad"), {"bad": "0" * 64})
+    assert trading_v3.daily_result(selected, archive=True, force=True)["data"]["delivery_status"] == "DATA_BLOCKED"
+
+
 def test_daily_result_blocks_when_execution_session_cannot_be_mapped(
     monkeypatch,
 ):

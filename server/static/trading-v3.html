@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>ProBigA · 持仓与策略工作台</title>
   <script>if(window.parent!==window||new URLSearchParams(location.search).get('embedded')==='1')document.documentElement.classList.add('v3-embedded');</script>
-  <link rel="stylesheet" href="/static/css/trading-v3.css?v=16">
+  <link rel="stylesheet" href="/static/css/trading-v3.css?v=17">
   <script src="/static/js/auth.js?v=2"></script>
 </head>
 <body>
@@ -203,6 +203,18 @@
             <div class="candidate-pager" id="candidateReconstructionPager"><button type="button" id="candidateReconstructionPrev">上一页</button><span id="candidateReconstructionPageStatus">第 1 / 1 页</span><button type="button" id="candidateReconstructionNext">下一页</button></div>
           </section>
           <div id="candidateDailyNotice" class="candidate-daily-notice" role="status"></div>
+          <section id="candidateRevisionComparison" class="candidate-revision-comparison" aria-labelledby="candidateRevisionTitle" hidden>
+            <header><h3 id="candidateRevisionTitle">票池版本比较</h3><span class="badge">只读</span></header>
+            <p id="candidateRevisionStatus" class="note" role="status"></p>
+            <div id="candidateRevisionDetails" hidden>
+              <p id="candidateRevisionMeta" class="note"></p>
+              <div class="candidate-revision-changes">
+                <section aria-labelledby="candidateRevisionAddedTitle"><h4 id="candidateRevisionAddedTitle">新增</h4><ul id="candidateRevisionAdded"></ul></section>
+                <section aria-labelledby="candidateRevisionRemovedTitle"><h4 id="candidateRevisionRemovedTitle">移除</h4><ul id="candidateRevisionRemoved"></ul></section>
+              </div>
+              <details id="candidateRevisionPrevious"><summary id="candidateRevisionPreviousTitle">上一版名单</summary><ul id="candidateRevisionPreviousRows"></ul></details>
+            </div>
+          </section>
           <div id="candidateAuctionNotice" class="candidate-auction-notice" role="status"></div>
           <div id="candidateStrategyRuns" class="candidate-strategy-runs" aria-label="每日策略执行情况"></div>
           <div id="candidatePoolStats" class="candidate-pool-stats" aria-label="策略池汇总"><span><b>—</b>研究候选</span><span><b>—</b>今日新入</span><span><b>—</b>连续保留</span><span><b>—</b>等待触发</span><span><b>—</b>研究目标（不可直接下单）</span><span><b>—</b>明确拒绝</span></div>
@@ -446,6 +458,6 @@
       <div id="positionDetailBody" class="position-detail-body"></div>
     </section>
   </div>
-  <script src="/static/js/trading-v3.js?v=9f6d6a1a2a045ca6"></script>
+  <script src="/static/js/trading-v3.js?v=2b3890d912224cd6"></script>
 </body>
 </html>

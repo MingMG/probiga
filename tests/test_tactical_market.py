@@ -212,3 +212,20 @@ def test_tactical_reversal_enters_observation_pool_without_trend_gates():
     assert all(row["signal_status"] == "WATCH" for row in rows)
     assert all("PANIC_REBOUND" in row["sources"] for row in rows)
     assert all(row["recommend_status"] == "SUSPENDED" for row in rows)
+
+def test_missing_minute_and_index_evidence_does_not_raise_tactical_score():
+    from biz.analysis.tactical_market import attach_intraday_tactical_features
+
+    base = pd.DataFrame([{
+        "stock_code": "600001", "tactical_candidate": True,
+        "tactical_score": 63.0, "close": 10.0, "low": 9.5, "high": 10.5,
+    }])
+    unavailable = pd.DataFrame([{
+        "stock_code": "600001", "minute_available": False,
+        "minute_close_vs_vwap_pct": 4.0,
+    }])
+    result = attach_intraday_tactical_features(
+        base, intraday=unavailable,
+        index_stability={"status": "DATA_BLOCKED", "stable": True},
+    )
+    assert result.loc[0, "intraday_tactical_score"] == 63.0
