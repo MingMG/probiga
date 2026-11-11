@@ -5731,7 +5731,7 @@ def _load_certified_initial_event_selection(
         or receipt["window_start"] != (data_date - timedelta(days=30)).isoformat()
         or receipt["window_end"] != data_date.isoformat()
         or not data_date == cutoff.date() == window_end
-        or decision != datetime.combine(data_date, STRATEGY_POOL_INITIAL_TIME)
+        or decision < datetime.combine(data_date, STRATEGY_POOL_INITIAL_TIME)
         or not cutoff <= received <= completion <= decision
     ):
         raise ValueError("initial announcement source or completion scope differs")

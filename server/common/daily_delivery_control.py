@@ -301,8 +301,8 @@ def _read_signed_announcement_completion(
     if decision_at.tzinfo is not None:
         decision_at = decision_at.astimezone(CONTROL_TIMEZONE).replace(tzinfo=None)
     if batch is None:
-        if decision_at != datetime.combine(session, STRATEGY_POOL_INITIAL_TIME):
-            raise ValueError("initial announcement selection requires its exact fixed slot")
+        if decision_at < datetime.combine(session, STRATEGY_POOL_INITIAL_TIME):
+            raise ValueError("initial announcement selection precedes its scheduled slot")
         not_before = datetime.combine(session, time.min)
     else:
         received = _datetime_value(batch.get("received_at"))
@@ -410,7 +410,7 @@ def load_signed_announcement_source(
 def select_frozen_initial_announcement_source(
     engine, *, trade_date: str, decision_at: datetime,
 ) -> FrozenInitialAnnouncement | None:
-    """Choose the latest original nightly batch already certified by 22:20."""
+    """Choose the latest original nightly batch certified by the input cutoff."""
     return _read_signed_announcement_completion(
         engine, target=_normalized_trade_date(trade_date), decision_at=decision_at, batch=None,
     )
@@ -1756,14 +1756,14 @@ def validate_frozen_pool_decision(
         raise ValueError("frozen pool decision is invalid")
     target = date.fromisoformat(_normalized_trade_date(trade_date))
     execution = date.fromisoformat(_normalized_trade_date(value["execution_session_date"]))
-    scheduled = datetime.fromisoformat(str(value["cutoff_at"]))
+    cutoff = datetime.fromisoformat(str(value["cutoff_at"]))
     evaluated = datetime.fromisoformat(str(value["evaluated_at"]))
     if (
         execution <= target
-        or scheduled.utcoffset() is None or evaluated.utcoffset() is None
-        or scheduled.astimezone(PRODUCTION_TIMEZONE).isoformat(timespec="seconds") != value["cutoff_at"]
+        or cutoff.utcoffset() is None or evaluated.utcoffset() is None
+        or cutoff.astimezone(PRODUCTION_TIMEZONE).isoformat(timespec="seconds") != value["cutoff_at"]
         or evaluated.astimezone(PRODUCTION_TIMEZONE).isoformat(timespec="seconds") != value["evaluated_at"]
-        or evaluated < scheduled
+        or evaluated < cutoff
     ):
         raise ValueError("frozen pool decision time identity differs")
     phase = value["phase"]
@@ -1780,7 +1780,7 @@ def validate_frozen_pool_decision(
             raise ValueError("premarket frozen pool requires the prior receipt and stock changes")
     else:
         raise ValueError("frozen pool decision phase is invalid")
-    if scheduled != expected:
+    if cutoff < expected or (phase == "PREMARKET_REVISION" and cutoff != expected):
         raise ValueError("frozen pool decision cutoff differs from its scheduled slot")
     return dict(value)
 
@@ -1800,25 +1800,27 @@ def bind_frozen_pool_decision(
         raise ValueError("frozen pool decision requires a verified delivery receipt")
     if "frozen_pool_decision" in core:
         raise ValueError("frozen pool decision is already bound")
-    scheduled = slot.scheduled_at.astimezone(PRODUCTION_TIMEZONE)
-    actual = slot.evaluated_at.astimezone(PRODUCTION_TIMEZONE)
+    input_cutoff = slot.input_cutoff_at or slot.scheduled_at
     if (
         slot.scheduled_at.utcoffset() is None or slot.evaluated_at.utcoffset() is None
-        or actual < scheduled
+        or input_cutoff.utcoffset() is None or input_cutoff.microsecond
+        or not slot.scheduled_at <= input_cutoff <= slot.evaluated_at
         or core.get("trade_date") != slot.data_trade_date
         or score_snapshot.get("trade_date") != slot.data_trade_date
         or SHA64_RE.fullmatch(str(core.get("score_snapshot_id") or "")) is None
         or core.get("score_snapshot_id") != score_snapshot.get("payload_sha256")
     ):
         raise ValueError("frozen pool decision does not match the score snapshot")
-    cutoff = scheduled.replace(tzinfo=None).isoformat(timespec="seconds")
+    cutoff_at = input_cutoff.astimezone(PRODUCTION_TIMEZONE)
+    actual = slot.evaluated_at.astimezone(PRODUCTION_TIMEZONE)
+    cutoff = cutoff_at.replace(tzinfo=None).isoformat(timespec="seconds")
     if any(score_snapshot.get(key) != cutoff for key in ("decision_at", "input_decision_at")):
         raise ValueError("frozen pool score input cutoff differs from its slot")
     core["frozen_pool_decision"] = validate_frozen_pool_decision({
         "schema": "probiga.frozen-pool-decision.v1",
         "phase": slot.phase,
         "execution_session_date": slot.execution_session_date,
-        "cutoff_at": scheduled.isoformat(timespec="seconds"),
+        "cutoff_at": cutoff_at.isoformat(timespec="seconds"),
         "evaluated_at": actual.isoformat(timespec="seconds"),
         "parent_receipt_uid": parent_receipt_uid or None,
         "diff_sha256": diff_sha256 or None,
@@ -1897,6 +1899,12 @@ def load_frozen_initial_announcement_parent(engine, trade_date, release_id):
         """), {"session_uid": session_uid, "source_run": source_run, "stage": stage}))
         if attempt is None:
             raise DailyDeliveryControlError("initial frozen announcement attempt is unavailable")
+        cutoff = datetime.fromisoformat(str(phase["cutoff_at"])).replace(tzinfo=None)
+        finished = _datetime_value(attempt["finished_at"])
+        if finished is not None and finished.utcoffset() is not None:
+            finished = finished.astimezone(CONTROL_TIMEZONE).replace(tzinfo=None)
+        if finished is None or finished > cutoff:
+            raise DailyDeliveryControlError("initial frozen announcement completion exceeds its input cutoff")
         evidence = _validated_completed_stage_checkpoint(
             attempt, session=session, stage_name=stage, engine=connection,
         )

@@ -4524,6 +4524,16 @@ def _strategy_pipeline_dependencies_ready(
                     )
             except Exception as exc:
                 return False, f"qmt_stock_daily_canonical:{type(exc).__name__}"
+        if ready and task_type == "analysis_fast":
+            # Only these exact, validated terminal histories decide whether the
+            # planned cutoff was missed. A newer optional collector is irrelevant.
+            inputs_ready_at = max(
+                _coerce_datetime(latest_histories[dependency]["finished_at"])
+                for dependency in evidence_dependencies
+            )
+            if inputs_ready_at > now.replace(microsecond=0):
+                return False, "formal_pool_inputs_waiting_for_cutoff_second"
+            row["_strategy_inputs_ready_at"] = inputs_ready_at
         return ready, reason
     return evaluate_strategy_pipeline_dependencies(task_type, task_rows, now=now)
 
@@ -4660,6 +4670,9 @@ def _scheduler_task_sort_key(row: dict, *, now: datetime) -> tuple[int, float, i
         # local-data proof.  Do not let repeated optional release catch-ups
         # consume a single scheduler worker indefinitely ahead of it.
         return (0, -9 * 24 * 60 * 60.0, int(row.get("id") or 0))
+    if task_type == "analysis_fast" and row.get("_dependency_recovery_due") is True:
+        # The validated prerequisites are checked again before dispatch.
+        return (0, -8.5 * 24 * 60 * 60.0, int(row.get("id") or 0))
     bounded_acquisition_repair = task_type in {
         "linux_recent_data_gap_repair",
         "notice_eastmoney_historical_repair",
@@ -6055,7 +6068,13 @@ def _task_argument_row(
             if current < cutoff:
                 raise RuntimeError("formal strategy pool initial cutoff has not arrived")
             result["_scheduler_dispatch_time"] = bound
-            bound = cutoff.isoformat(timespec="seconds")
+            inputs_ready_at = row.get("_strategy_inputs_ready_at")
+            if inputs_ready_at is not None and inputs_ready_at > current.replace(microsecond=0):
+                raise RuntimeError("formal strategy pool inputs are not yet available")
+            # Keep the planned cutoff for on-time inputs. Late inputs use the
+            # first eligible dispatch time so the score never backdates.
+            if inputs_ready_at is None or inputs_ready_at <= cutoff:
+                bound = cutoff.isoformat(timespec="seconds")
             result["_scheduler_execution_time"] = bound
             result["_scheduler_pipeline_phase"] = "INITIAL"
         result["_scheduler_pipeline_decision_at"] = bound
@@ -8752,12 +8771,23 @@ def _build_daily_result_delivery_receipt(
     publication = load_published_analysis_receipt(
         connection, target, run_uid=producer_run_uid, capture_score=decoded_score.append,
     )
-    score_cutoff = f"{target}T{ANALYSIS_DAILY_PIPELINE_DECISION_TIME}"
+    planned_cutoff = f"{target}T{ANALYSIS_DAILY_PIPELINE_DECISION_TIME}"
     scoring_snapshot = publication["score_snapshot"]
-    is_fixed_initial = all(scoring_snapshot.get(field) == score_cutoff for field in ("decision_at", "input_decision_at"))
+    score_cutoff = scoring_snapshot.get("decision_at")
+    score_proof = decoded_score[0] if len(decoded_score) == 1 else {}
+    is_frozen_initial = (
+        score_cutoff == planned_cutoff
+        or "frozen_announcement_source" in score_proof
+        or "frozen_core_inputs" in score_proof
+    )
     frozen_announcement = frozen_core_inputs = None
-    if is_fixed_initial:
-        if len(decoded_score) != 1:
+    if is_frozen_initial:
+        if (
+            len(decoded_score) != 1
+            or not isinstance(score_cutoff, str)
+            or score_cutoff < planned_cutoff
+            or scoring_snapshot.get("input_decision_at") != score_cutoff
+        ):
             raise RuntimeError("daily delivery frozen score proof is unavailable")
         frozen_announcement = decoded_score[0].get("frozen_announcement_source")
         frozen_core_inputs = decoded_score[0].get("frozen_core_inputs")
@@ -9052,7 +9082,7 @@ def _build_daily_result_delivery_receipt(
             "score_snapshot_id": score_snapshot_identity(core),
         }
     )
-    if is_fixed_initial:
+    if is_frozen_initial:
         producer_started = _coerce_datetime(producer.get("started_at"))
         if producer_started is None:
             raise RuntimeError("daily delivery frozen score start time is unavailable")
@@ -9832,6 +9862,7 @@ def _task_history_finish(
                         data_trade_date=str(session["trade_date"])[:10],
                         phase="INITIAL",
                         evaluated_at=datetime.fromisoformat(str(frozen_score["evaluated_at"])),
+                        input_cutoff_at=datetime.fromisoformat(str(frozen_score["decision_at"])),
                     )
                     control_receipt = bind_frozen_pool_decision(
                         control_receipt, slot=slot, score_snapshot=frozen_score,
@@ -11277,7 +11308,10 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                     release_catchup_due
                     and row.get("task_type") == "target_turnover_snapshot"
                 )
-                if not release_recovery_requested and not turnover_release_catchup:
+                if not turnover_release_catchup and (
+                    not release_recovery_requested
+                    or row.get("_release_analysis_research_mode") is not True
+                ):
                     dependency_ready, dependency_reason = (
                         _strategy_pipeline_dependencies_ready(row, engine, now)
                     )
@@ -11406,13 +11440,16 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                         if (
                             owner == SCHEDULER_OWNER_LINUX
                             and row.get("task_type") == "analysis_fast"
-                            and release_recovery_requested
+                            and (
+                                release_recovery_requested
+                                or row.get("_dependency_recovery_due") is True
+                            )
                             and row.get("_release_analysis_research_mode") is not True
                             and uses_exclusive_lane
                             and (_running_task_ids - _alert_lane_running_task_ids)
                         ):
-                            # The ready request already ranks first. Let existing
-                            # workers finish instead of refilling the queue under it.
+                            # The ready formal pool ranks first. Drain active
+                            # workers without refilling the queue under it.
                             formal_recovery_draining = True
                             logger.info(
                                 "Formal analysis recovery waiting for existing non-alert workers"

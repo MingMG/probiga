@@ -9,7 +9,7 @@ import math
 import os
 import re
 import sys
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -335,15 +335,29 @@ def _load_fixed_initial_scoring(engine, target: str, build_sha: str) -> dict:
         receipt = load_published_analysis_receipt(engine, target, capture_score=snapshots.append)
     except DailyDeliveryControlError:
         return {"error": "正式评分尚未完成"}
+    if len(snapshots) != 1:
+        return {"error": "正式评分尚未完成"}
     snapshot = snapshots[0]
-    cutoff = f"{target}T{STRATEGY_POOL_INITIAL_TIME.isoformat()}"
+    cutoff = snapshot.get("decision_at")
+    try:
+        decision = datetime.fromisoformat(str(cutoff))
+        earliest = datetime.combine(date.fromisoformat(target), STRATEGY_POOL_INITIAL_TIME)
+    except ValueError:
+        return {"error": "正式首版评分的决策时间无效"}
+    announcement = snapshot.get("frozen_announcement_source")
+    core_inputs = snapshot.get("frozen_core_inputs")
     if (
-        receipt.get("build_sha") != build_sha
-        or snapshot.get("decision_at") != cutoff
+        receipt.get("trade_date") != target
+        or receipt.get("publisher_task_type") != "analysis_fast"
+        or receipt.get("build_sha") != build_sha
         or snapshot.get("input_decision_at") != cutoff
+        or decision.tzinfo is not None
+        or decision < earliest
+        or not isinstance(announcement, dict)
+        or not isinstance(core_inputs, dict)
         or not isinstance(snapshot.get("fixed_market_context"), dict)
     ):
-        return {"error": "正式评分与晚间固定截点或当前版本不匹配"}
+        return {"error": "正式首版评分与已封存输入或当前版本不匹配"}
     return {
         "trade_date": target,
         "decision_known_at": cutoff,

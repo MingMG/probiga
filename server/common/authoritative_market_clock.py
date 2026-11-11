@@ -31,6 +31,7 @@ class StrategyPoolDecisionSlot:
     execution_session_date: str
     scheduled_at: datetime
     evaluated_at: datetime
+    input_cutoff_at: datetime | None = None
 
 
 def resolve_strategy_pool_decision_slot(
@@ -39,11 +40,12 @@ def resolve_strategy_pool_decision_slot(
     data_trade_date: str,
     phase: StrategyPoolDecisionPhase,
     evaluated_at: datetime,
+    input_cutoff_at: datetime | None = None,
 ) -> StrategyPoolDecisionSlot:
-    """Resolve the fixed slot and record when its evaluation actually occurs.
+    """Resolve the scheduled slot and the cutoff used by this evaluation.
 
-    Naive scheduler timestamps use Shanghai time. A delayed evaluation keeps
-    its actual timestamp and the original scheduled timestamp.
+    Naive scheduler timestamps use Shanghai time. Initial scoring can freeze
+    inputs after its planned slot once all required sources are available.
     """
     if phase not in ("INITIAL", "PREMARKET_REVISION"):
         raise ValueError("unknown strategy pool decision phase")
@@ -85,7 +87,18 @@ def resolve_strategy_pool_decision_slot(
         )
     if actual < scheduled_at:
         raise ValueError("evaluation precedes the scheduled strategy pool decision slot")
-    return StrategyPoolDecisionSlot(phase, data_trade_date, execution_session_date, scheduled_at, actual)
+    cutoff = None
+    if input_cutoff_at is not None:
+        if not isinstance(input_cutoff_at, datetime) or input_cutoff_at.microsecond:
+            raise ValueError("strategy pool input cutoff requires a whole-second datetime")
+        cutoff = (
+            input_cutoff_at.replace(tzinfo=PRODUCTION_TIMEZONE)
+            if input_cutoff_at.utcoffset() is None
+            else input_cutoff_at.astimezone(PRODUCTION_TIMEZONE)
+        )
+        if not scheduled_at <= cutoff <= actual or (phase == "PREMARKET_REVISION" and cutoff != scheduled_at):
+            raise ValueError("strategy pool input cutoff differs from its scheduled slot or evaluation")
+    return StrategyPoolDecisionSlot(phase, data_trade_date, execution_session_date, scheduled_at, actual, cutoff)
 
 
 def authoritative_elapsed_trade_date(engine, now: datetime | None = None) -> str:

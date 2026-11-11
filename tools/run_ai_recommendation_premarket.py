@@ -383,6 +383,7 @@ def main() -> int:
     parser.add_argument("--refresh-realtime", action="store_true", help="Refresh realtime quote/flow/index data before screening")
     parser.add_argument("--strict-prev-trade-day", action="store_true")
     parser.add_argument("--execution-time", default="")
+    parser.add_argument("--pool-decision-phase", choices=("INITIAL",))
     parser.add_argument("--min-kline-coverage", type=float, default=0.80)
     parser.add_argument("--auto-repair-missing-kline", action="store_true")
     parser.add_argument("--auto-repair-missing-data", action="store_true", help="Repair K-line, historical capital flow and snapshot coverage before screening")
@@ -691,6 +692,8 @@ def main() -> int:
                     "--use-intraday-current requires a screening engine that supports intraday inputs"
                 )
             batch_kwargs["use_intraday_current"] = True
+        if args.pool_decision_phase is not None:
+            batch_kwargs["pool_decision_phase"] = args.pool_decision_phase
         stats = run_batch(
             **batch_kwargs,
         )

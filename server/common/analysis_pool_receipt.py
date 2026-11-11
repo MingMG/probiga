@@ -412,8 +412,9 @@ def _validate_frozen_announcement_source(
     }
     if not isinstance(source, Mapping) or set(source) != expected_fields:
         raise ValueError("ANALYSIS_SCORE_FROZEN_ANNOUNCEMENT_MISMATCH")
-    cutoff = datetime.combine(date.fromisoformat(trade_date), STRATEGY_POOL_INITIAL_TIME)
+    target = date.fromisoformat(trade_date)
     try:
+        cutoff = datetime.fromisoformat(decision_at)
         timestamps = tuple(datetime.fromisoformat(source[field]) for field in (
             "fact_cutoff_at", "received_at", "finished_at",
         ))
@@ -423,9 +424,10 @@ def _validate_frozen_announcement_source(
     if (
         source["schema"] != FROZEN_INITIAL_ANNOUNCEMENT_SCHEMA
         or source["task_type"] != "qmt_announcement_pit" or source["trade_date"] != trade_date
-        or cutoff.isoformat(timespec="seconds") != decision_at
+        or cutoff.tzinfo is not None or cutoff.isoformat(timespec="seconds") != decision_at
+        or cutoff < datetime.combine(target, STRATEGY_POOL_INITIAL_TIME)
         or any(value.tzinfo is not None for value in timestamps)
-        or fact_cutoff.date() != cutoff.date()
+        or fact_cutoff.date() != target
         or not fact_cutoff <= received <= finished <= cutoff
         or source["source"] not in {"qmt.announcement", "cninfo.announcement", "eastmoney.announcement"}
         or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", str(source["batch_id"]))

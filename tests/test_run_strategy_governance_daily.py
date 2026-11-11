@@ -555,8 +555,15 @@ def test_daily_release_argument_forces_exact_build_orchestration(
 
     def load_score(_engine, target, *, capture_score):
         assert target == "2026-08-21"
-        capture_score({"decision_at": cutoff, "input_decision_at": cutoff, "fixed_market_context": market_context})
-        return {"build_sha": expected_sha, "run_uid": "b" * 32}
+        capture_score({
+            "decision_at": cutoff, "input_decision_at": cutoff, "fixed_market_context": market_context,
+            "frozen_announcement_source": {"scheduler_run_uid": "1" * 32, "trade_date": target},
+            "frozen_core_inputs": {"announcement": {"dataset_id": "1" * 32, "root": "2" * 64}},
+        })
+        return {
+            "build_sha": expected_sha, "run_uid": "b" * 32,
+            "trade_date": target, "publisher_task_type": "analysis_fast",
+        }
 
     monkeypatch.setattr(daily_delivery_control, "load_published_analysis_receipt", load_score)
 

@@ -556,6 +556,15 @@ def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: s
         if not _has_option(args, "--date"):
             args.extend(["--date", today])
         _bind_analysis_execution_time(args, row)
+        phase = row.get("_scheduler_pipeline_phase")
+        if _has_option(args, "--pool-decision-phase"):
+            raise ValueError("strategy pool decision phase is scheduler-owned")
+        if phase is not None:
+            if phase != "INITIAL" or _analysis_execution_time(row) != _analysis_pipeline_decision_at(
+                row, target_date=today
+            ):
+                raise ValueError("formal analysis initial decision identity differs")
+            args.extend(["--pool-decision-phase", phase])
         return args
     if task_type == "analysis_morning_strict" and release_catchup:
         if "--strict-prev-trade-day" not in args:

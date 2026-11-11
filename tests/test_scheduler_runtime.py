@@ -7511,6 +7511,37 @@ def test_release_current_snapshot_prelaunch_block_is_retryable_blocked_history()
     assert history_finish.call_args.kwargs["status"] == "blocked"
 
 
+def test_formal_pool_claim_uses_late_ready_inputs_without_backdating():
+    import pytest
+
+    target = "2026-11-11"
+    row = {
+        "task_type": "analysis_fast",
+        "script_path": "tools/run_ai_recommendation_premarket.py",
+        "script_args": "--top-n 80 --min-score 62 --json",
+        "_trigger_source": "scheduled",
+        "_scheduler_target_trade_date": target,
+        "_dependency_recovery_due": True,
+        "_strategy_inputs_ready_at": datetime(2026, 11, 12, 0, 7, 31, 250000),
+    }
+    with pytest.raises(RuntimeError, match="inputs are not yet available"):
+        scheduler_runtime._task_argument_row(
+            row, now=datetime(2026, 11, 12, 0, 7, 31, 500000), target_date=target,
+        )
+
+    claim = datetime(2026, 11, 12, 0, 7, 34)
+    bound = scheduler_runtime._task_argument_row(row, now=claim, target_date=target)
+    args = scheduler_runtime._build_task_args(bound, row["script_path"], target)
+    assert args[args.index("--date") + 1] == target
+    assert args[args.index("--execution-time") + 1] == "2026-11-12T00:07:34"
+    assert args[args.index("--pool-decision-phase") + 1] == "INITIAL"
+    assert scheduler_runtime._scheduler_task_sort_key(row, now=claim) < (
+        scheduler_runtime._scheduler_task_sort_key(
+            {"task_type": "health_check", "interval_minutes": 1}, now=claim,
+        )
+    )
+
+
 def test_release_date_bound_task_inventory_is_explicit_and_complete():
     from tools.ensure_quality_gate import TASKS, TRADING_V3_TASKS
 

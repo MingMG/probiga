@@ -5961,6 +5961,7 @@ def run_batch(
     publisher_task_type: str = "",
     publisher_build_sha: str = "",
     allow_degraded_inputs: bool = False,
+    pool_decision_phase: StrategyPoolDecisionPhase | None = None,
 ) -> BatchStats:
     publication_identity = (
         str(publication_run_uid or "").strip().lower(),
@@ -5995,6 +5996,21 @@ def run_batch(
             raise RuntimeError(
                 "formal analysis cannot publish before its decision cutoff"
             )
+    formal_initial = publish and task_type == "analysis_fast" and not allow_degraded_inputs
+    if production and formal_initial and pool_decision_phase != "INITIAL":
+        raise RuntimeError("formal analysis requires its explicit initial decision phase")
+    if pool_decision_phase is not None:
+        if not formal_initial or pool_decision_phase != "INITIAL":
+            raise RuntimeError("analysis initial decision phase is invalid for this publisher")
+        try:
+            target = date.fromisoformat(str(trade_date or ""))
+        except ValueError as exc:
+            raise RuntimeError("formal analysis target session date is invalid") from exc
+        if (
+            target.isoformat() != trade_date
+            or exact_decision_at < datetime.combine(target, STRATEGY_POOL_INITIAL_TIME)
+        ):
+            raise RuntimeError("formal analysis decision cutoff differs from its target session")
     if auto_repair_missing_kline and (
         production
     ):
@@ -6063,12 +6079,7 @@ def run_batch(
             ),
             return_scored=True,
             allow_degraded_inputs=allow_degraded_inputs,
-            pool_decision_phase=(
-                "INITIAL"
-                if publish and task_type == "analysis_fast"
-                and exact_decision_at.time() == STRATEGY_POOL_INITIAL_TIME
-                and not allow_degraded_inputs else None
-            ),
+            pool_decision_phase=pool_decision_phase,
             event_checkpoint_path=(
                 Path(os.environ.get("PROBIGA_JOB_LOG_ROOT") or "/var/lib/probiga/jobs")
                 / "analysis-event-coverage.sqlite"
@@ -6392,6 +6403,7 @@ def main() -> int:
     parser.add_argument("--min-score", type=float, default=62.0, help="Minimum AI score for recommendation eligibility")
     parser.add_argument("--strict-prev-trade-day", action="store_true", help="Use only the previous trading day of execution time and fail if data is incomplete")
     parser.add_argument("--execution-time", default="", help="Execution timestamp/date used by --strict-prev-trade-day, default today")
+    parser.add_argument("--pool-decision-phase", choices=("INITIAL",))
     parser.add_argument("--min-kline-coverage", type=float, default=0.80, help="Minimum K-line coverage ratio for strict runs")
     parser.add_argument("--auto-repair-missing-kline", action="store_true", help="For strict runs, first repair the target day full-market K-line from Guojin QMT when missing")
     parser.add_argument("--json", action="store_true", help="Print JSON summary")
@@ -6457,6 +6469,7 @@ def main() -> int:
             publication_run_uid=publication_run_uid,
             publisher_task_type=publisher_task_type,
             publisher_build_sha=publisher_build_sha,
+            pool_decision_phase=args.pool_decision_phase,
         )
         if history_prebound:
             _finish_direct_publication_history(
