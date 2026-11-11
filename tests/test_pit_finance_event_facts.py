@@ -2617,8 +2617,14 @@ def _mysql_seal_transport(engine, *, corrupt=None):
             return self.connection.begin()
 
         def execute(self, statement, params):
-            sql = str(statement).replace(" FORCE INDEX (idx_pit_coverage_decision)", "")
-            return self.connection.execute(statement if sql == str(statement) else text(sql), params)
+            sql = statement.text.replace(" FORCE INDEX (idx_pit_coverage_decision)", "")
+            if "row_ids" in statement._bindparams:
+                sql = sql.replace(" FORCE INDEX (PRIMARY)", "")
+            if sql != statement.text:
+                statement = text(sql).bindparams(*statement._bindparams.values()).execution_options(
+                    **statement.get_execution_options()
+                )
+            return self.connection.execute(statement, params)
 
     return SimpleNamespace(connect=MysqlConnection)
 
@@ -2677,21 +2683,26 @@ def test_finance_nonfiling_uses_bounded_compressed_reads_without_changing_eviden
                 assert load_finance_expected_unavailable(mysql_reader, **kwargs) == expected
             finally:
                 event.remove(engine, "before_cursor_execute", record)
-            assert [bound_codes for _, _, _, bound_codes, _ in queries] == [
+            assert [bound_codes for _, _, _, bound_codes, _ in queries if bound_codes] == [
                 codes[:40], codes[40:80], codes[80:],
             ]
             connection, transaction, *_ = queries[0]
             assert transaction is not None
             assert all(
                 current is connection and active is transaction
-                and "COMPRESS(payload_json)" in sql and "OCTET_LENGTH(payload_json)" in sql
                 and "MAX_EXECUTION_TIME(60000)" in sql
                 and streaming is True
                 for current, active, sql, _, streaming in queries
             )
+            assert all(sql.split(" FROM ", 1)[0].rsplit("*/", 1)[-1].strip() == "coverage_id"
+                       for _, _, sql, bound_codes, _ in queries if bound_codes)
+            payload_sql = [sql for _, _, sql, _, _ in queries if "COMPRESS(payload_json)" in sql]
+            assert payload_sql and all("OCTET_LENGTH(payload_json)" in sql for sql in payload_sql)
             queries.clear()
         times = iter((0, 0, 1801))
         monkeypatch.setattr(pit_module, "monotonic", lambda: next(times))
+        from server.common import qmt_announcement_pit as announcement_module
+        monkeypatch.setattr(announcement_module, "monotonic", lambda: 0)
         with pytest.raises(TimeoutError, match="finance_nonfiling: read deadline after 40 codes"):
             load_finance_expected_unavailable(mysql_reader, **kwargs)
     finally:
@@ -3338,11 +3349,15 @@ def test_empty_coverage_chunks_keep_complete_evidence_and_invalid_metadata(monke
             queries.clear()
             assert pit_module._authoritative_empty_coverage(mysql_reader, **kwargs) == expected
             assert [codes for _, codes, _ in queries] == [["000001"], ["002731"]]
-        assert all(
-            "COMPRESS(payload_json)" in sql and "OCTET_LENGTH(payload_json)" in sql
-            and streaming is True
-            for sql, _, streaming in queries
-        )
+        assert all(streaming is True for _, _, streaming in queries)
+        if kind == "finance":
+            assert all(sql.split(" FROM ", 1)[0].rsplit("*/", 1)[-1].strip() == "coverage_id"
+                       for sql, _, _ in queries)
+        else:
+            assert all(
+                "COMPRESS(payload_json)" in sql and "OCTET_LENGTH(payload_json)" in sql
+                for sql, _, _ in queries
+            )
         queries.clear()
         wider_codes = kwargs["codes"] + [f"300{index:03d}" for index in range(39)]
         wider_scope = {**kwargs, "codes": wider_codes}

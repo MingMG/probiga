@@ -1951,6 +1951,7 @@ def load_finance(
     decision_at: datetime | str | None,
     fact_cutoff_at: datetime | str | None = None,
     stock_codes: list[str],
+    progress_callback: ProgressCallback | None = None,
 ) -> pd.DataFrame:
     """Load strategy finance only from immutable as-known revisions."""
 
@@ -1969,12 +1970,20 @@ def load_finance(
                 for code in codes
             ]
         )
+    def finance_progress(completed: int, total: int) -> None:
+        _emit_progress(
+            progress_callback, stage="load_finance", percent=14,
+            step=f"财务修订已读取 {completed}/{total} 只", done=completed,
+            total=total, trade_date=trade_date,
+        )
+
     batch = load_finance_facts(
         engine,
         codes=codes,
         decision_at=decision_at,
         fact_cutoff_at=fact_cutoff_at,
         as_of_date=trade_date,
+        **({"read_progress": finance_progress} if progress_callback is not None else {}),
     )
     rows: list[dict[str, Any]] = []
     for code in codes:
@@ -5477,6 +5486,7 @@ def _prepare_batch_outputs(
             decision_at=reader_decision_at,
             fact_cutoff_at=fact_cutoff_at,
             stock_codes=feature_codes,
+            progress_callback=progress_callback,
         ),
         scoped_codes,
     )
