@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from datetime import date, datetime, timedelta
 import json
 import hashlib
@@ -2606,6 +2607,9 @@ def _mysql_seal_transport(engine, *, corrupt=None):
         def __exit__(self, *args):
             return self.connection.__exit__(*args)
 
+        def connect(self):
+            return nullcontext(self)
+
         def get_isolation_level(self):
             return "REPEATABLE READ"
 
@@ -3482,6 +3486,245 @@ def test_finance_revision_chunks_validate_old_report_chains(monkeypatch):
     assert result.status_by_code["000001"] == PIT_AVAILABLE
     assert result.status_by_code["000002"] == PIT_DATA_BLOCKED
     assert result.reason_by_code["000002"].startswith("PIT_FINANCE_BAD_CHAIN:")
+    engine.dispose()
+
+
+def _append_finance_coverage_capture(
+    engine, code, *, known, window_end="2026-08-30", row=None, revision=None,
+):
+    return append_source_coverage(
+        engine, fact_kind="finance", stock_code=code, window_start="1900-01-01",
+        window_end=window_end, known_at=known, covered_through_at=known,
+        watermark_kind="CAPTURED_AT", watermark_evidence={"source_call": "success"},
+        source_rows=[row] if row is not None else [],
+        fact_bindings=[{
+            "revision_id": revision.revision_id, "content_hash": revision.content_hash,
+        }] if revision is not None else [],
+        source="adata.finance.core_index", batch_id=f"coverage-{code}-{known}",
+    )
+
+
+def _record_finance_coverage_reads(engine):
+    inventories = []
+    payload_ids = set()
+    size_ids = set()
+
+    def record(_connection, _cursor, sql, _parameters, context, _many):
+        if f"FROM {SOURCE_COVERAGE_TABLE}" not in sql:
+            return
+        params = context.compiled_parameters[0]
+        if "ORDER BY stock_code, scope_hash, revision_no" in sql and "source" not in params:
+            inventories.append(sql)
+        if "OCTET_LENGTH(payload_json)" in sql:
+            ids = {
+                value for key, value in params.items()
+                if key.startswith("row_ids_")
+            }
+            (payload_ids if "COMPRESS(payload_json)" in sql else size_ids).update(ids)
+
+    event.listen(engine, "before_cursor_execute", record)
+    return inventories, payload_ids, size_ids
+
+
+def test_finance_facts_omit_unused_nonempty_coverage_bodies_from_real_queries():
+    engine = _engine()
+    codes = ["000001", "000002"]
+    decision = datetime(2026, 8, 30, 1, 11)
+    cutoff = datetime(2026, 8, 30, 1, 10)
+    old_ids = set()
+    source_detail = hashlib.shake_256(b"large finance source capture").hexdigest(80_000)
+    for code in codes:
+        row = {
+            "stock_code": code, "report_date": "2026-06-30", "report_type": "Q2",
+            "notice_date": "2026-08-29 18:00:00", "roe_wtd": 12.5,
+            "provider_detail": source_detail,
+        }
+        revision = append_finance_revision(engine, row, known_at="2026-08-29 19:00:00")
+        for minute in range(13):
+            receipt = _append_finance_coverage_capture(
+                engine, code, known=f"2026-08-29 20:{minute:02d}:00",
+                window_end="2026-08-29", row=row, revision=revision,
+            )
+            old_ids.add(receipt.coverage_id)
+    with engine.connect() as connection:
+        count, raw_bytes, empty_count = connection.execute(text(
+            f"SELECT COUNT(*), SUM(LENGTH(CAST(payload_json AS BLOB))), "
+            f"SUM(result_count=0) FROM {SOURCE_COVERAGE_TABLE}"
+        )).one()
+    assert count == len(old_ids) == 26
+    assert raw_bytes > 4_000_000
+    assert empty_count == 0
+
+    kwargs = dict(codes=codes, decision_at=decision, fact_cutoff_at=cutoff, as_of_date=cutoff.date())
+    expected = load_finance_facts(engine, **kwargs)
+    assert set(expected.facts) == set(codes)
+    assert expected.coverage_by_code == {}
+
+    mysql_reader = _mysql_seal_transport(engine)
+    inventories, payload_ids, size_ids = _record_finance_coverage_reads(engine)
+    # The original unscoped reader executes both PK reads for all 26 bodies.
+    assert pit_module._authoritative_empty_coverage(
+        mysql_reader, fact_kind="finance", codes=codes, decision_at=decision,
+        fact_cutoff_at=cutoff, start_date=date(1900, 1, 1), end_date=cutoff.date(),
+    ) == ({}, {})
+    assert payload_ids == size_ids == old_ids
+    inventories.clear()
+    payload_ids.clear()
+    size_ids.clear()
+
+    actual = load_finance_facts(mysql_reader, **kwargs)
+    assert actual == expected
+    assert payload_ids == size_ids == set()
+    assert len(inventories) == 1
+    projection = inventories[0].split(" FROM ", 1)[0].rsplit("*/", 1)[-1].strip()
+    assert set(projection.split(",")) == {
+        "coverage_id", "stock_code", "scope_hash", "revision_no", "coverage_status", "result_count",
+    }
+    assert "known_at<=" in inventories[0] and "received_at<=" in inventories[0]
+    engine.dispose()
+
+
+def test_finance_coverage_pruning_preserves_empty_proof_and_required_chain_checks():
+    engine = _engine()
+    for code in ("000001", "000002", "000005"):
+        row = {
+            "stock_code": code, "report_date": "2026-06-30", "report_type": "Q2",
+            "notice_date": "2026-08-29 18:00:00", "roe_wtd": 12.5,
+        }
+        revision = append_finance_revision(engine, row, known_at="2026-08-29 19:00:00")
+        if code == "000001":
+            predecessor = _append_finance_coverage_capture(
+                engine, code, known="2026-08-30 01:08:00", row=row, revision=revision,
+            )
+            empty_head = _append_finance_coverage_capture(engine, code, known="2026-08-30 01:10:00")
+            future_head = _append_finance_coverage_capture(
+                engine, code, known="2026-08-30 01:12:00", row=row, revision=revision,
+            )
+        elif code == "000002":
+            obsolete_empty = _append_finance_coverage_capture(engine, code, known="2026-08-30 01:10:00")
+            nonempty_head = _append_finance_coverage_capture(
+                engine, code, known="2026-08-30 01:10:30", row=row, revision=revision,
+            )
+    stale = _append_finance_coverage_capture(
+        engine, "000003", known="2026-08-29 20:00:00", window_end="2026-08-29",
+    )
+    append_finance_revision(engine, {
+        "stock_code": "000003", "report_date": "2026-06-30", "report_type": "Q2",
+        "notice_date": "2026-08-29 18:00:00", "roe_wtd": 12.5,
+    }, known_at="2026-08-30 01:12:00")
+    old_revision = append_finance_revision(engine, {
+        "stock_code": "000005", "report_date": "2026-03-31", "report_type": "Q1",
+        "notice_date": "2026-04-29 18:00:00", "roe_wtd": 10.0,
+    }, known_at="2026-04-29 19:00:00")
+    append_finance_revision(engine, {
+        "stock_code": "002731", "report_date": "2025-09-30", "report_type": "Q3",
+        "notice_date": "2025-10-30 18:30:00", "roe_wtd": 1.0,
+    }, known_at="2026-08-30 01:05:00")
+    nonfiling = append_finance_expected_unavailable(
+        engine, stock_code="002731", expected_report_date="2026-03-31",
+        known_at="2026-08-30 01:06:35", official_evidence=_nonfiling_evidence(),
+        batch_id="official-nonfiling",
+    )
+    with engine.begin() as connection:
+        connection.execute(text("DROP TRIGGER trg_pit_source_coverage_immutable_bu"))
+        connection.execute(text(
+            f"UPDATE {SOURCE_COVERAGE_TABLE} SET payload_json='{{}}', result_count=1 "
+            "WHERE coverage_id=:stale"
+        ), {"stale": stale.coverage_id})
+        connection.execute(text(
+            f"UPDATE {SOURCE_COVERAGE_TABLE} SET payload_json='{{}}' WHERE coverage_id=:obsolete_empty"
+        ), {"obsolete_empty": obsolete_empty.coverage_id})
+        connection.execute(text("DROP TRIGGER trg_pit_finance_revision_immutable_bu"))
+        connection.execute(text(
+            f"UPDATE {FINANCE_REVISION_TABLE} SET payload_json='{{}}' WHERE revision_id=:revision"
+        ), {"revision": old_revision.revision_id})
+
+    kwargs = dict(
+        codes=["000001", "000002", "000003", "000004", "000005", "002731"],
+        decision_at="2026-08-30 01:11:00", fact_cutoff_at="2026-08-30 01:10:00", as_of_date="2026-08-30",
+    )
+    expected = load_finance_facts(engine, **kwargs)
+    assert set(expected.facts) == {"000001", "000002"}
+    assert expected.coverage_by_code["000001"]["coverage_id"] == empty_head.coverage_id
+    assert "000002" not in expected.coverage_by_code
+    assert expected.status_for("000003") == PIT_DATA_BLOCKED
+    assert expected.reason_for("000003").startswith("PIT_FINANCE_BAD_COVERAGE_CHAIN:")
+    assert expected.status_for("000004") == PIT_NO_ROWS
+    assert expected.status_for("000005") == PIT_DATA_BLOCKED
+    assert expected.reason_for("000005").startswith("PIT_FINANCE_BAD_CHAIN:")
+    assert expected.reason_for("002731") == "PIT_FINANCE_EXPECTED_UNAVAILABLE"
+    assert expected.coverage_by_code["002731"]["coverage_id"] == nonfiling.coverage_id
+    prior_manifest = expected.manifest_hash
+
+    mysql_reader = _mysql_seal_transport(engine)
+    _, payload_ids, size_ids = _record_finance_coverage_reads(engine)
+    assert load_finance_facts(mysql_reader, **kwargs) == expected
+    assert payload_ids == size_ids == {
+        predecessor.coverage_id, empty_head.coverage_id, stale.coverage_id, nonfiling.coverage_id,
+    }
+    assert not {obsolete_empty.coverage_id, nonempty_head.coverage_id, future_head.coverage_id} & payload_ids
+
+    # Invalid empty predecessor or official nonfiling evidence cannot resolve coverage.
+    with engine.begin() as connection:
+        connection.execute(text(
+            f"UPDATE {SOURCE_COVERAGE_TABLE} SET payload_json='{{}}' "
+            "WHERE coverage_id IN (:predecessor, :nonfiling)"
+        ), {"predecessor": predecessor.coverage_id, "nonfiling": nonfiling.coverage_id})
+    expected = load_finance_facts(engine, **kwargs)
+    assert expected.status_for("000001") == PIT_AVAILABLE
+    assert expected.facts["002731"]["finance_report_date"] == "2025-09-30"
+    assert expected.coverage_by_code == {}
+    assert expected.manifest_hash != prior_manifest
+    assert load_finance_facts(mysql_reader, **kwargs) == expected
+    engine.dispose()
+
+
+@pytest.mark.parametrize("phase", ["empty-coverage", "nonfiling"])
+@pytest.mark.parametrize("full_deadline", [False, True])
+def test_finance_coverage_read_honors_shared_deadline_after_revision_success(
+    monkeypatch, phase, full_deadline,
+):
+    from server.common import qmt_announcement_pit as announcement_module
+
+    engine, kwargs = _finance_revision_chunk_case()
+    expected = load_finance_facts(engine, **kwargs)
+    mysql_reader = _mysql_seal_transport(engine)
+    clock = [100.0]
+    monkeypatch.setattr(pit_module, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(announcement_module, "monotonic", lambda: clock[0])
+    elapsed = (
+        pit_module.FINANCE_REVISION_MYSQL_DEADLINE_SECONDS if full_deadline
+        else announcement_module.LIVE_ANNOUNCEMENT_BATCH_QUERY_TIMEOUT_MS / 1000
+    )
+    observed = []
+    revision_progress = []
+
+    def advance_after_query(_connection, _cursor, sql, _parameters, context, _many):
+        if (f"FROM {SOURCE_COVERAGE_TABLE}" in sql
+                and "ORDER BY stock_code, scope_hash, revision_no" in sql):
+            source_filter = "source" in context.compiled_parameters[0]
+            if source_filter == (phase == "nonfiling"):
+                observed.append(sql)
+                clock[0] += elapsed
+
+    event.listen(engine, "after_cursor_execute", advance_after_query)
+    try:
+        actual = load_finance_facts(
+            mysql_reader, **kwargs, read_progress=lambda done, total: revision_progress.append((done, total)),
+        )
+    finally:
+        event.remove(engine, "after_cursor_execute", advance_after_query)
+    assert len(observed) == 1
+    assert revision_progress == [(2, 2)]
+    if full_deadline:
+        assert actual.global_status == pit_module.PIT_SCHEMA_UNAVAILABLE
+        assert actual.facts == actual.coverage_by_code == {}
+        for code in kwargs["codes"]:
+            assert actual.status_for(code) == pit_module.PIT_SCHEMA_UNAVAILABLE
+            assert f"finance-{phase}-inventory" in actual.reason_for(code)
+            assert announcement_module.LIVE_ANNOUNCEMENT_BATCH_VALIDATION_DEADLINE in actual.reason_for(code)
+    else:
+        assert actual == expected
     engine.dispose()
 
 
