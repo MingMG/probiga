@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 import sys
 from datetime import date
@@ -480,6 +481,15 @@ def main() -> int:
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             print(f"invalid:{type(exc).__name__}", file=sys.stderr)
             return 2
+    if os.environ.get("PROBIGA_SCHEDULER_TASK_TYPE") == "strategy_governance_daily":
+        scheduler_build_sha = os.environ.get("PROBIGA_SCHEDULER_BUILD_SHA", "").strip().lower()
+        if (
+            re.fullmatch(r"[0-9a-f]{40}", scheduler_build_sha) is None
+            or scheduler_build_sha == "0" * 40
+            or (expected_build_sha and expected_build_sha != scheduler_build_sha)
+        ):
+            parser.error("治理任务构建版本与调度记录不一致")
+        expected_build_sha = scheduler_build_sha
     _load_project_env()
     output, process_exit = run_daily_governance(
         requested_trade_date=str(args.trade_date or "").strip(),

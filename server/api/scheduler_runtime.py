@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from datetime import date, datetime, time as datetime_time, timedelta
 from socket import gethostname
 from pathlib import Path
@@ -5997,7 +5998,7 @@ def _task_argument_row(
                 or not datetime_time(9, 8) <= current.time() < datetime_time(9, 30)):
             raise RuntimeError("premarket theme publication requires today's registered 09:08 window")
         return {**row, "_scheduler_target_trade_date": target_date}
-    if task_type in {"free_index_daily_canonical", "north_flow_daily"}:
+    if task_type in {"free_index_daily_canonical", "north_flow_daily", "strategy_governance_daily"}:
         return {**row, "_scheduler_target_trade_date": target_date}
     trigger_source = str(row.get("_trigger_source") or "").strip()
     if task_type == "qmt_announcement_pit" and trigger_source == "release_catchup":
@@ -8567,6 +8568,32 @@ def _daily_delivery_runtime_health(
     }
 
 
+def _require_governance_frozen_score(
+    connection, *, governance_row: Mapping[str, object], analysis_run_uid: str,
+    score_snapshot: Mapping[str, object],
+) -> None:
+    raw_proof = connection.execute(text("""
+        SELECT /*+ MAX_EXECUTION_TIME(3000) */
+               JSON_EXTRACT(result_json, '$.candidate_source.publication_proof')
+        FROM st_strategy_governance_run
+        WHERE run_uid=:run_uid AND result_hash=:result_hash
+    """), {
+        "run_uid": governance_row["run_uid"], "result_hash": governance_row["result_hash"],
+    }).scalar_one_or_none()
+    try:
+        proof = json.loads(raw_proof) if isinstance(raw_proof, (str, bytes)) else raw_proof
+    except ValueError as exc:
+        raise RuntimeError("daily delivery governance frozen score proof is invalid") from exc
+    if not isinstance(proof, Mapping) or any(proof.get(key) != value for key, value in {
+        "status": "COMPLETED",
+        "publisher_run_uid": analysis_run_uid,
+        "build_sha": governance_row["build_commit_sha"],
+        "analysis_score_snapshot_sha256": score_snapshot["payload_sha256"],
+        "decision_known_at": score_snapshot["input_decision_at"],
+    }.items()):
+        raise RuntimeError("daily delivery governance did not consume the exact frozen score")
+
+
 def _build_daily_result_delivery_receipt(
     connection,
     *,
@@ -8741,6 +8768,10 @@ def _build_daily_result_delivery_receipt(
             or (frozen_core_inputs.get("announcement") or {}).get("root") != frozen_announcement["evidence_sha256"]
         ):
             raise RuntimeError("daily delivery score's exact frozen sources are unavailable")
+        _require_governance_frozen_score(
+            connection, governance_row=governance_row, analysis_run_uid=producer_run_uid,
+            score_snapshot=scoring_snapshot,
+        )
     manifest = read_persisted_pool_manifest(connection, target, score_snapshot=publication["score_snapshot"])
     membership_proofs = manifest.get("membership_proofs")
     analysis_count = int(manifest.get("analysis_count") or 0)

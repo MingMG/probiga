@@ -545,9 +545,20 @@ def test_deploy_validator_binds_success_to_exact_expected_build_sha(
 def test_daily_release_argument_forces_exact_build_orchestration(
     monkeypatch, capsys,
 ):
+    from server.common import daily_delivery_control
+
     engine = _CalendarEngine("2026-08-21")
     expected_sha = "c" * 40
+    cutoff = "2026-08-21T22:20:00"
+    market_context = {"context_sha256": "d" * 64}
     captured = {}
+
+    def load_score(_engine, target, *, capture_score):
+        assert target == "2026-08-21"
+        capture_score({"decision_at": cutoff, "input_decision_at": cutoff, "fixed_market_context": market_context})
+        return {"build_sha": expected_sha, "run_uid": "b" * 32}
+
+    monkeypatch.setattr(daily_delivery_control, "load_published_analysis_receipt", load_score)
 
     def orchestrate(**kwargs):
         captured.update(kwargs)
@@ -585,6 +596,10 @@ def test_daily_release_argument_forces_exact_build_orchestration(
     payload = json.loads(capsys.readouterr().out)
     assert captured["ensure_build_commit_sha"] == expected_sha
     assert captured["allow_revision"] is False
+    assert captured["fixed_scoring"] == {
+        "trade_date": "2026-08-21", "decision_known_at": cutoff,
+        "analysis_run_uid": "b" * 32, "fixed_market_context": market_context,
+    }
     assert payload["build_commit_sha"] == expected_sha
     assert payload["automatic_real_order_submission"] is False
 
