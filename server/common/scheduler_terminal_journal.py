@@ -21,7 +21,7 @@ MAX_BYTES = 32 * 1024 * 1024
 _FAILED_CLOSES = []
 _LOCK = threading.RLock()
 _UID = re.compile(r"[0-9a-f]{32}")
-_NAME = re.compile(r"(?:OBSERVED|REJECTED|FAILED_FINALIZATION|COMMITTED|PREPARED\.[0-9a-f]{64})")
+_NAME = re.compile(r"(?:OBSERVED|REJECTED|FAILED_FINALIZATION|COMMITTED|FROZEN_INPUT|PREPARED\.[0-9a-f]{64})")
 
 
 class TerminalJournalError(RuntimeError):

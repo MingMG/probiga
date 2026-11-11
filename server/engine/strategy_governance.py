@@ -18,7 +18,8 @@ import threading
 import time
 import uuid
 from collections import defaultdict
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 from typing import Any, Callable, Iterable, Mapping
@@ -154,6 +155,10 @@ GOVERNANCE_TABLE_NAMES = (
     "st_strategy_governance_audit",
 )
 GOVERNANCE_SCHEMA_COLLATION = "utf8mb4_unicode_ci"
+FROZEN_POOL_REVISION_EXECUTION_DISPOSITION = "FROZEN_POOL_REVISION_RESEARCH_ONLY"
+_GOVERNANCE_WRITE_CONNECTION: ContextVar[Any | None] = ContextVar(
+    "probiga_governance_write_connection", default=None,
+)
 
 
 class GovernanceEvidenceNotReady(RuntimeError):
@@ -973,7 +978,11 @@ def _require_authoritative_closed_trade_date(target: str) -> str:
 
 
 def _db_read(sql: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-    return read_sql_rows(get_engine(), sql, params, context="strategy_governance", stringify_datetime=True)
+    connection = _GOVERNANCE_WRITE_CONNECTION.get()
+    database = connection if connection is not None and connection is current_bound_sql_connection() else get_engine()
+    return read_sql_rows(
+        database, sql, params, context="strategy_governance", stringify_datetime=True,
+    )
 
 
 def _db_write(sql: str, params: dict[str, Any] | None = None) -> None:
@@ -26813,6 +26822,16 @@ def _validate_canonical_governance_result(result: dict[str, Any]) -> None:
         "candidate_industry_snapshot"
     )
     funding_manifest = result.get("funding_checkpoint_manifest")
+    shadow_queue = result.get("shadow_capacity_queue") or {}
+    if "execution_disposition" in result and (
+        result["execution_disposition"] != FROZEN_POOL_REVISION_EXECUTION_DISPOSITION
+        or not isinstance(transition_plan, dict)
+        or transition_plan.get("transitions") != []
+        or result.get("lifecycle_transitions") != []
+        or not isinstance(shadow_queue, dict)
+        or shadow_queue.get("authorized_plan_ids")
+    ):
+        raise RuntimeError("frozen pool revision contains lifecycle or execution authority")
     if (
         result.get("status") != "ok"
         or result.get("input_ready") is not True
@@ -27366,6 +27385,72 @@ def load_canonical_governance_snapshot(
     return _canonical_governance_result_from_row(rows[0])
 
 
+def load_completed_governance_revision_pair(
+    prior_run_uid: str, next_run_uid: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Read one exact, sealed direct-successor pair, including demoted history."""
+    if (
+        prior_run_uid == next_run_uid
+        or any(
+            not re.fullmatch(r"[0-9a-f]{32}", uid) or uid == "0" * 32
+            for uid in (prior_run_uid, next_run_uid)
+        )
+    ):
+        raise ValueError("two distinct governance run UIDs are required")
+    rows = _db_read(
+        "SELECT run_uid, trade_date, run_revision, supersedes_run_uid, "
+        "status, is_canonical, input_ready, source_status, finished_at, "
+        "input_hash, decision_hash, result_json, result_hash, "
+        "observation_count, confirmation_count, tradable_count "
+        "FROM st_strategy_governance_run "
+        "WHERE run_uid IN (:prior_run_uid, :next_run_uid) LIMIT 3",
+        {"prior_run_uid": prior_run_uid, "next_run_uid": next_run_uid},
+    )
+    by_uid = {row["run_uid"]: row for row in rows}
+    if len(rows) > len(by_uid):
+        raise RuntimeError("governance revision identity is ambiguous")
+    if set(by_uid) != {prior_run_uid, next_run_uid} or any(
+        row["status"] != "COMPLETED" or row["finished_at"] is None
+        for row in rows
+    ):
+        raise LookupError("completed governance revision is unavailable")
+
+    prior = by_uid[prior_run_uid]
+    successor = by_uid[next_run_uid]
+    if (
+        prior["trade_date"] != successor["trade_date"]
+        or prior["is_canonical"] != 0
+        or successor["supersedes_run_uid"] != prior_run_uid
+        or _int(prior["run_revision"], 0) < 1
+        or _int(successor["run_revision"], 0) != _int(prior["run_revision"], 0) + 1
+    ):
+        raise ValueError("governance revisions are not a same-date direct successor pair")
+
+    results = []
+    for row in (prior, successor):
+        result = _canonical_governance_result_from_row(row)
+        source = result.get("candidate_source")
+        if (
+            result.get("run_revision") != row["run_revision"]
+            or result.get("supersedes_run_uid") != row["supersedes_run_uid"]
+            or row["input_ready"] != 1
+            or row["source_status"] != "fresh"
+            or result.get("source_status") != "fresh"
+            or not isinstance(source, dict)
+            or source.get("status") != "COMPLETED"
+            or source.get("query_completed") is not True
+            or source.get("trade_date") != result["trade_date"]
+            or source.get("data_date") != result["trade_date"]
+        ):
+            raise RuntimeError("governance revision lineage or source evidence differs")
+        for level in ("observation", "confirmation", "tradable"):
+            pool = result["pools"].get(level)
+            if not isinstance(pool, list) or len(pool) != row[f"{level}_count"]:
+                raise RuntimeError("governance revision pool membership is incomplete")
+        results.append({**result, "finished_at": row["finished_at"]})
+    return results[0], results[1]
+
+
 def _governance_build_commit_sha() -> str:
     value = str(os.getenv("PROBIGA_BUILD_COMMIT_SHA") or "").strip()
     return value[:64] if value else "WORKTREE_UNVERSIONED"
@@ -27426,20 +27511,12 @@ def _governance_source_input_hash(
     return _digest(payload)
 
 
-def governance_snapshot(
-    *, trade_date: str = "", strategy_snapshot: dict[str, Any] | None = None,
-    persist: bool = False, operator: str = "daily_governance",
-    strategy_limit: int = 500, _governance_connection=None,
-) -> dict[str, Any]:
-    if persist and _governance_connection is None:
-        ensure_and_seed_governance()
-        from server.engine.strategy_center import ensure_strategy_center_tables
-
-        ensure_strategy_center_tables()
-    elif not _table_exists("st_strategy_registry"):
-        raise RuntimeError("策略治理表尚未由部署流程创建，读取接口不会现场建表")
-    if persist and _governance_connection is None:
-        connection = get_engine().connect()
+@contextmanager
+def governance_write_transaction(engine=None):
+    """Hold the existing governance writer lock across one database commit."""
+    if _GOVERNANCE_WRITE_CONNECTION.get() is not None:
+        raise RuntimeError("governance write transactions cannot be nested")
+    with (engine if engine is not None else get_engine()).connect() as connection:
         acquired = False
         try:
             acquired = int(connection.execute(text(
@@ -27448,40 +27525,121 @@ def governance_snapshot(
             connection.commit()
             if not acquired:
                 raise RuntimeError("治理日终单写者锁获取超时")
-            connection = connection.execution_options(
-                isolation_level="REPEATABLE READ",
-            )
-            with connection.begin():
-                with bind_sql_connection(connection):
-                    return governance_snapshot(
-                        trade_date=trade_date,
-                        strategy_snapshot=strategy_snapshot,
-                        persist=True,
-                        operator=operator,
-                        strategy_limit=strategy_limit,
-                        _governance_connection=connection,
-                    )
+            connection = connection.execution_options(isolation_level="REPEATABLE READ")
+            with connection.begin(), bind_sql_connection(connection):
+                token = _GOVERNANCE_WRITE_CONNECTION.set(connection)
+                try:
+                    yield connection
+                finally:
+                    _GOVERNANCE_WRITE_CONNECTION.reset(token)
         finally:
             if connection.in_transaction():
                 connection.rollback()
             if acquired:
-                connection.execute(text(
-                    "SELECT RELEASE_LOCK('probiga_strategy_governance_daily_v1')"
-                ))
+                connection.execute(text("SELECT RELEASE_LOCK('probiga_strategy_governance_daily_v1')"))
                 connection.commit()
-            connection.close()
+
+
+def _require_governance_write_transaction(connection) -> None:
+    if (
+        connection is None or _GOVERNANCE_WRITE_CONNECTION.get() is not connection
+        or current_bound_sql_connection() is not connection or not connection.in_transaction()
+    ):
+        raise RuntimeError("frozen governance revision requires its caller-owned governance transaction")
+
+
+def _locked_canonical_governance_parent(
+    connection, *, trade_date: str, expected_run_uid: str | None = None,
+) -> Mapping[str, Any] | None:
+    rows = connection.execute(text(
+        "SELECT run_uid, run_revision FROM st_strategy_governance_run "
+        "WHERE trade_date=:trade_date AND status='COMPLETED' AND is_canonical=1 "
+        "ORDER BY run_revision DESC, created_at DESC, run_uid DESC LIMIT 2 FOR UPDATE"
+    ), {"trade_date": trade_date}).mappings().all()
+    if len(rows) > 1:
+        raise RuntimeError("同一交易日存在多条canonical治理结果，拒绝继续写入")
+    previous = rows[0] if rows else None
+    if expected_run_uid is not None and (previous is None or previous["run_uid"] != expected_run_uid):
+        raise GovernanceEvidenceNotReady("FROZEN_GOVERNANCE_PARENT_CHANGED")
+    return previous
+
+
+def _materialize_governance_shadow_orders(connection, payload: dict[str, Any]) -> None:
+    if payload.get("execution_disposition") == FROZEN_POOL_REVISION_EXECUTION_DISPOSITION:
+        return
+    from server.trading_v3.paper_execution import materialize_dynamic_shadow_bootstrap_orders
+
+    queue = payload.get("shadow_capacity_queue") or {}
+    materialize_dynamic_shadow_bootstrap_orders(
+        connection, plan_ids=queue.get("authorized_plan_ids") or [],
+        governance_run_uid=payload["run_uid"],
+    )
+
+
+def governance_snapshot(
+    *, trade_date: str = "", strategy_snapshot: dict[str, Any] | None = None,
+    persist: bool = False, operator: str = "daily_governance",
+    strategy_limit: int = 500, _governance_connection=None,
+    fixed_market_context: dict[str, Any] | None = None,
+    decision_known_at: datetime | str | None = None,
+    analysis_run_uid: str | None = None,
+    prepared_analysis_publication: dict[str, Any] | None = None,
+    expected_prior_governance_run_uid: str | None = None,
+) -> dict[str, Any]:
+    revision = expected_prior_governance_run_uid is not None or prepared_analysis_publication is not None
+    if revision:
+        if (
+            not persist or not isinstance(prepared_analysis_publication, dict)
+            or not re.fullmatch(r"[0-9a-f]{32}", expected_prior_governance_run_uid or "")
+            or expected_prior_governance_run_uid == "0" * 32
+            or fixed_market_context is None or decision_known_at is None or analysis_run_uid is None
+        ):
+            raise ValueError("frozen governance revision requires an exact parent and prepared score publication")
+        _require_governance_write_transaction(_governance_connection)
+    if persist and _governance_connection is None:
+        ensure_and_seed_governance()
+        from server.engine.strategy_center import ensure_strategy_center_tables
+
+        ensure_strategy_center_tables()
+    elif not _table_exists("st_strategy_registry"):
+        raise RuntimeError("策略治理表尚未由部署流程创建，读取接口不会现场建表")
+    if persist and _governance_connection is None:
+        with governance_write_transaction() as connection:
+            return governance_snapshot(
+                trade_date=trade_date,
+                strategy_snapshot=strategy_snapshot,
+                persist=True,
+                operator=operator,
+                strategy_limit=strategy_limit,
+                _governance_connection=connection,
+                fixed_market_context=fixed_market_context,
+                decision_known_at=decision_known_at,
+                analysis_run_uid=analysis_run_uid,
+            )
+    fixed_fields = (fixed_market_context, decision_known_at, analysis_run_uid)
+    if any(value is not None for value in fixed_fields):
+        if any(value is None for value in fixed_fields) or strategy_snapshot is not None:
+            raise ValueError("fixed governance requires one exact score, cutoff, and market context")
     persist_built_strategy_snapshot = strategy_snapshot is None and persist
     if strategy_snapshot is None:
         from server.engine.strategy_center import (
             build_strategy_center_snapshot,
         )
 
+        fixed_inputs = ({
+            "fixed_market_context": fixed_market_context,
+            "decision_known_at": decision_known_at,
+            "analysis_run_uid": analysis_run_uid,
+        } if fixed_market_context is not None else {})
+        if revision:
+            fixed_inputs["prepared_analysis_publication"] = prepared_analysis_publication
         strategy_snapshot = build_strategy_center_snapshot(
             trade_date,
             # Compatibility bound for candidate-stock source rows only.
             # load_registry() below remains complete and unbounded by it.
             limit=max(1, min(500, int(strategy_limit))),
             fresh_market=persist,
+            **fixed_inputs,
         )
     target = _trade_date(strategy_snapshot.get("trade_date") or trade_date)
     input_ready, input_reason = governance_input_ready(strategy_snapshot)
@@ -27637,12 +27795,12 @@ def governance_snapshot(
             expected_session_rows=strategy_expected_confirmation_sessions,
         )
         row["recommended_status"] = recommended
-        row["projected_status"] = recommended
+        row["projected_status"] = current_status if revision else recommended
         row["recommended_status_label"] = LIFECYCLE_LABELS[recommended]
         row["recommendation_reason"] = reason
         row["confirmation_guard"] = confirmation_guard
         row["paper_allocation_eligible"] = bool(
-            recommended in {"ACTIVE", "REDUCE"}
+            row["projected_status"] in {"ACTIVE", "REDUCE"}
             and row["profit_gate_passed"]
             and confirmation_guard.get("passed") is True
             and row.get("execution_adapter_executable") is True
@@ -27651,7 +27809,7 @@ def governance_snapshot(
         row["funding_gate_hash"] = _finalize_funding_gate_hash(
             row, entity_type="STRATEGY",
         )
-        if persist and recommended != current_status:
+        if persist and not revision and recommended != current_status:
             transition_plans.append({
                 "entity_type": "STRATEGY",
                 "entity_key": row["strategy_key"],
@@ -27810,12 +27968,12 @@ def governance_snapshot(
             expected_session_rows=combination_expected_confirmation_sessions,
         )
         row["recommended_status"] = recommended
-        row["projected_status"] = recommended
+        row["projected_status"] = current_status if revision else recommended
         row["recommended_status_label"] = LIFECYCLE_LABELS[recommended]
         row["recommendation_reason"] = reason
         row["confirmation_guard"] = confirmation_guard
         row["paper_allocation_eligible"] = bool(
-            recommended in {"ACTIVE", "REDUCE"}
+            row["projected_status"] in {"ACTIVE", "REDUCE"}
             and row["profit_gate_passed"]
             and confirmation_guard.get("passed") is True
             and (row.get("combination_recipe_ref") or {}).get(
@@ -27828,7 +27986,7 @@ def governance_snapshot(
         row["funding_gate_hash"] = _finalize_funding_gate_hash(
             row, entity_type="COMBINATION",
         )
-        if persist and recommended != current_status:
+        if persist and not revision and recommended != current_status:
             transition_plans.append({
                 "entity_type": "COMBINATION",
                 "entity_key": row["combination_key"],
@@ -28202,6 +28360,7 @@ def governance_snapshot(
     payload = {
         "status": "ok",
         "result_mode": "PERSIST_CANDIDATE" if persist else "PREVIEW_REALTIME",
+        **({"execution_disposition": FROZEN_POOL_REVISION_EXECUTION_DISPOSITION} if revision else {}),
         "run_uid": run_uid,
         "run_revision": 0,
         "supersedes_run_uid": "",
@@ -28326,7 +28485,7 @@ def governance_snapshot(
                     "WHERE decision_hash=:decision_hash "
                     "AND status='COMPLETED' LIMIT 1"
                 ), {"decision_hash": decision_hash}).mappings().first()
-                if existing is not None:
+                if existing is not None and not revision:
                     if not bool(_int(existing.get("is_canonical"))):
                         raise ValueError(
                             "该决定哈希仅存在于已被替代的历史修订；"
@@ -28347,17 +28506,11 @@ def governance_snapshot(
                     raise ValueError(
                         f"历史日期{target}早于当前治理日期{latest_day}，只能回看不能修改当前生命周期"
                     )
-                canonical_rows = connection.execute(text(
-                    "SELECT run_uid, run_revision "
-                    "FROM st_strategy_governance_run "
-                    "WHERE trade_date=:trade_date AND status='COMPLETED' "
-                    "AND is_canonical=1 "
-                    "ORDER BY run_revision DESC, created_at DESC, run_uid DESC "
-                    "FOR UPDATE"
-                ), {"trade_date": target}).mappings().all()
-                if len(canonical_rows) > 1:
-                    raise RuntimeError("同一交易日存在多条canonical治理结果，拒绝继续写入")
-                previous_canonical = canonical_rows[0] if canonical_rows else None
+                previous_canonical = _locked_canonical_governance_parent(
+                    connection, trade_date=target, expected_run_uid=expected_prior_governance_run_uid,
+                )
+                if revision and existing is not None:
+                    raise GovernanceEvidenceNotReady("FROZEN_GOVERNANCE_DECISION_ALREADY_EXISTS")
                 payload["run_revision"] = (
                     _int(previous_canonical.get("run_revision"), 0) + 1
                     if previous_canonical else 1
@@ -28405,13 +28558,11 @@ def governance_snapshot(
                 )
                 # Canonical capacity authority exists before any new research
                 # order. Both the immutable run and orders commit atomically.
-                from server.trading_v3.paper_execution import materialize_dynamic_shadow_bootstrap_orders
-                queue = payload.get("shadow_capacity_queue") or {}
-                materialize_dynamic_shadow_bootstrap_orders(
-                    connection, plan_ids=queue.get("authorized_plan_ids") or [],
-                    governance_run_uid=run_uid,
-                )
+                _materialize_governance_shadow_orders(connection, payload)
         except IntegrityError:
+            if revision:
+                # The caller must roll back the staged score and all governance writes.
+                raise
             existing = _db_read(
                 "SELECT run_uid, run_revision, supersedes_run_uid, "
                 "is_canonical, trade_date, input_hash, decision_hash, "
