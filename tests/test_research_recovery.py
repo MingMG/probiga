@@ -49,9 +49,14 @@ def recovery(tmp_path, monkeypatch):
     success = {"status": "COMPLETE", "request_id": str(uuid4()), "messages_sha256": core._hash(messages),
         "raw_response": raw, "raw_sha256": core._body_hash(raw), "provider_receipt": {
             "transport": "live_http", "raw_sha256": core._body_hash(raw), "messages_sha256": core._hash(messages),
-            "source": "deepseek_api", "endpoint": "https://api.deepseek.com/v1/chat/completions",
+            "source": "deepseek_api", "endpoint": core.DEEPSEEK_ENDPOINT,
             "provider_response_id": "offline-unit", "model": core.DEEPSEEK_RESEARCH_POLICY["model"],
             "request_policy": deepcopy(core.DEEPSEEK_RESEARCH_POLICY)}}
+    wire = core._deepseek_request(messages, schema, core.DEEPSEEK_RESEARCH_POLICY)
+    success["provider_receipt"].update(response_schema_sha256=core._hash(schema), response_status="tool_calls",
+        wire_request_sha256=core._hash(wire), wire_schema_sha256=core._hash(wire["tools"][0]["function"]["parameters"]),
+        provider_arguments_sha256=core._body_hash('{"report":' + raw + '}'),
+        provider_arguments_prefix='{"report":', provider_arguments_suffix='}')
     prior = {"status": "FAILED", "request_id": request_id, "messages_sha256": core._hash(messages),
              "error_type": "ResearchBridgeError", "error": "ResearchBridgeError"}
     checkpoint = {"run_id": str(uuid4()), "generation_started_at": NOW.isoformat(),
@@ -162,6 +167,21 @@ def test_other_active_job_blocks_recovery_and_original_row_is_never_reset(recove
         assert row["status"] == "failed" and row["attempts"] == 1
 
 
+@pytest.mark.parametrize("network_evidence", [True, False])
+def test_wrapped_native_process_failure_requires_independent_network_evidence(recovery, network_evidence):
+    with recovery["engine"].begin() as connection:
+        connection.execute(update(ai_bridge_job).where(
+            ai_bridge_job.c.request_uid == recovery["payload"]["request_id"]).values(
+            error_message="RESEARCH_FAILED stage=codex reason=process_or_stdin_failed"))
+    if network_evidence:
+        assert cli.inspect_recovery(recovery["engine"], recovery["source"], **recovery["kwargs"])["proof"]["network_error_observed"]
+    else:
+        cli._atomic(recovery["worker_dir"] / "events.jsonl",
+                    b'{"type":"error","message":"process exited"}\n', raw=True)
+        with pytest.raises(RuntimeError, match="transport_error_evidence_required"):
+            cli.inspect_recovery(recovery["engine"], recovery["source"], **recovery["kwargs"])
+
+
 def test_recovery_cannot_be_chained_through_a_new_directory(recovery, tmp_path):
     target = cli.prepare_recovery(recovery["engine"], recovery["source"], output_dir=tmp_path / "recovered", **recovery["kwargs"])
     receipt = cli._read_json(target / "run_receipt.json")
@@ -237,7 +257,7 @@ def test_codex_final_recovery_rebuilds_the_editor_request_from_both_drafts_and_p
                         "deepseek_review": {"raw_response": "DS peer review"},
                         "codex_review": {"raw_response": "CX peer review"}}}
     parsed = {"DS peer review": {"findings": [{"id": "DS"}]}, "CX peer review": {"findings": [{"id": "CX"}]}}
-    parser = Mock(side_effect=lambda raw, target, facts: parsed[raw])
+    parser = Mock(side_effect=lambda raw, target, facts, **kwargs: parsed[raw])
     editor = Mock(return_value=([{"role": "user", "content": "canonical editor request"}], {"type": "object"}))
     monkeypatch.setattr(core, "_parse_review", parser)
     monkeypatch.setattr(core, "_final_request", editor)
@@ -245,6 +265,7 @@ def test_codex_final_recovery_rebuilds_the_editor_request_from_both_drafts_and_p
     assert result == editor.return_value
     assert parser.call_args_list[0].args == ("DS peer review", core._body_hash("original CX draft"), packet)
     assert parser.call_args_list[1].args == ("CX peer review", core._body_hash("original DS draft"), packet)
+    assert all(call.kwargs == {"rules": "unchanged rules"} for call in parser.call_args_list)
     assert editor.call_args.args == (packet, "unchanged rules", {"deepseek": "original DS draft", "codex": "original CX draft"},
                                     {"deepseek_review": parsed["DS peer review"], "codex_review": parsed["CX peer review"]})
     assert cli.RECOVERY_STAGES == ("codex_draft", "codex_review", "codex_final", "codex_arbitration")
