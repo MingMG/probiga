@@ -65,6 +65,9 @@ FINANCE_ATOMIC_BATCH_INCREMENTAL_SCHEMA = (
 FINANCE_ATOMIC_BATCH_HISTORY_LIMIT = 20
 FINANCE_ATOMIC_BATCH_QUERY_CODE_LIMIT = 100
 COMMON_FACT_CUTOFF_QUERY_CODE_LIMIT = 500
+FINANCE_REVISION_MYSQL_CODE_LIMIT = 40
+FINANCE_REVISION_MYSQL_PAYLOAD_ROW_LIMIT = 480
+FINANCE_REVISION_MYSQL_DEADLINE_SECONDS = 30 * 60
 LIVE_EVENT_COVERAGE_READ_DEADLINE_SECONDS = 60 * 60
 EMPTY_COVERAGE_MYSQL_CODE_LIMIT = 40
 FINANCE_NONFILING_MYSQL_CODE_LIMIT = 40
@@ -2442,6 +2445,80 @@ def _latest_revision_for_fact_cutoff(
     return eligible, reason
 
 
+def _read_finance_payload_rows(
+    connection: Connection, *, table_name: str, statement: Any,
+    parameters: Mapping[str, Any], deadline: float, stage_prefix: str,
+) -> list[dict[str, Any]]:
+    from server.common.qmt_announcement_pit import (
+        _bounded_announcement_payload_keys, _live_announcement_read_hint,
+        _live_announcement_reply_budget,
+    )
+
+    def read(query, values, stage):
+        try:
+            with _live_announcement_reply_budget(connection, deadline=deadline, stage=stage):
+                with connection.execute(query.execution_options(stream_results=True), values) as result:
+                    return [dict(row) for row in result.mappings()]
+        except Exception as exc:
+            setattr(exc, "_pit_read_stage", stage)
+            raise
+
+    def invalid(message, stage):
+        exc = ValueError(message)
+        setattr(exc, "_pit_read_stage", stage)
+        return exc
+
+    id_column = {
+        FINANCE_REVISION_TABLE: "revision_id", SOURCE_COVERAGE_TABLE: "coverage_id",
+    }.get(table_name)
+    if id_column is None:
+        raise ValueError("finance payload table differs")
+    if str(connection.get_isolation_level() or "").upper() not in {"REPEATABLE READ", "SERIALIZABLE"}:
+        raise ValueError("finance revisions require a repeatable-read snapshot")
+    inventory_stage = stage_prefix + "-inventory"
+    inventory = read(statement, parameters, inventory_stage)
+    expected = {row[id_column]: row for row in inventory}
+    if (len(expected) != len(inventory)
+            or any(set(row) != {id_column} for row in inventory)
+            or any(not _HASH_RE.fullmatch(str(key)) for key in expected)):
+        raise invalid("finance inventory identity differs", inventory_stage)
+    packed_by_id = {}
+    ordered_ids = list(expected)
+    metadata_columns = ",".join(sorted(_REQUIRED_COLUMNS[table_name] - {"payload_json"}))
+    for offset in range(0, len(ordered_ids), FINANCE_REVISION_MYSQL_PAYLOAD_ROW_LIMIT):
+        revision_ids = ordered_ids[offset:offset + FINANCE_REVISION_MYSQL_PAYLOAD_ROW_LIMIT]
+        stage = f"{stage_prefix}-size:{offset}"
+        hint = _live_announcement_read_hint(mysql=True, deadline=deadline, stage=stage)
+        sizes_query = text(
+            f"SELECT {hint}{id_column},OCTET_LENGTH(payload_json) AS payload_json_bytes "
+            f"FROM {table_name} FORCE INDEX (PRIMARY) WHERE {id_column} IN :row_ids"
+        ).bindparams(bindparam("row_ids", expanding=True)).execution_options(stream_results=True)
+        size_rows = read(sizes_query, {"row_ids": revision_ids}, stage)
+        sizes = {row[id_column]: row["payload_json_bytes"] for row in size_rows}
+        if len(size_rows) != len(revision_ids) or sizes.keys() != set(revision_ids):
+            raise invalid("finance payload size inventory differs", stage)
+        for batch in _bounded_announcement_payload_keys(
+            [(key, sizes[key]) for key in revision_ids], max_rows=FINANCE_REVISION_MYSQL_PAYLOAD_ROW_LIMIT,
+        ):
+            batch_ids = [key for key, _ in batch]
+            stage = f"{stage_prefix}-payload:{offset}"
+            hint = _live_announcement_read_hint(mysql=True, deadline=deadline, stage=stage)
+            payload_query = text(
+                f"SELECT {hint}{metadata_columns},OCTET_LENGTH(payload_json) AS payload_json_bytes,"
+                "COMPRESS(payload_json) AS payload_json_compressed "
+                f"FROM {table_name} FORCE INDEX (PRIMARY) WHERE {id_column} IN :row_ids"
+            ).bindparams(bindparam("row_ids", expanding=True)).execution_options(stream_results=True)
+            packed = read(payload_query, {"row_ids": batch_ids}, stage)
+            actual = {row[id_column]: row for row in packed}
+            if len(packed) != len(batch_ids) or actual.keys() != set(batch_ids):
+                raise invalid("finance payload membership differs", stage)
+            for key, payload_bytes in batch:
+                if actual[key]["payload_json_bytes"] != payload_bytes:
+                    raise invalid("finance payload size differs", stage)
+                packed_by_id[key] = actual[key]
+    return [packed_by_id[row[id_column]] for row in inventory]
+
+
 def _query_revisions(
     engine: Engine | Connection,
     *,
@@ -2452,6 +2529,7 @@ def _query_revisions(
     end_date: date,
     source: str = "",
     batch_id: str = "",
+    read_deadline: float | None = None,
 ) -> list[dict[str, Any]]:
     if table_name == EVENT_REVISION_TABLE:
         identity_params: dict[str, Any] = {
@@ -2526,12 +2604,33 @@ def _query_revisions(
     if start_date is not None:
         date_filter += f"AND {date_column}>=:start_date "
         params["start_date"] = start_date
-    statement = text(
-        f"SELECT * FROM {table_name} WHERE stock_code IN :codes "
-        f"AND known_at<=:decision_at AND received_at<=:decision_at "
-        f"{date_filter}ORDER BY stock_code, identity_hash, revision_no"
-    ).bindparams(bindparam("codes", expanding=True))
     with (nullcontext(engine) if isinstance(engine, Connection) else engine.connect()) as connection:
+        mysql_finance = connection.dialect.name == "mysql" and table_name == FINANCE_REVISION_TABLE
+        columns, hint = "*", ""
+        if mysql_finance:
+            from server.common.qmt_announcement_pit import _live_announcement_read_hint
+
+            if read_deadline is None:
+                read_deadline = monotonic() + FINANCE_REVISION_MYSQL_DEADLINE_SECONDS
+            columns = "revision_id"
+            hint = _live_announcement_read_hint(
+                mysql=True, deadline=read_deadline, stage="finance-revision-inventory",
+            )
+        statement = text(
+            f"SELECT {hint}{columns} FROM {table_name} WHERE stock_code IN :codes "
+            f"AND known_at<=:decision_at AND received_at<=:decision_at "
+            f"{date_filter}ORDER BY stock_code, identity_hash, revision_no"
+        ).bindparams(bindparam("codes", expanding=True))
+        if mysql_finance:
+            packed = _read_finance_payload_rows(
+                connection, table_name=FINANCE_REVISION_TABLE, statement=statement, parameters=params,
+                deadline=read_deadline, stage_prefix="finance-revision",
+            )
+            try:
+                return [_coverage_payload_row(row, mysql=True, stage="finance-revision-decode") for row in packed]
+            except ValueError as exc:
+                setattr(exc, "_pit_read_stage", "finance-revision-decode")
+                raise
         return [dict(row) for row in connection.execute(statement, params).mappings()]
 
 
@@ -2971,6 +3070,7 @@ def _authoritative_empty_coverage(
     batch_id: str = "",
     verified_event_batch: Mapping[str, Any] | None = None,
     event_completion_at: datetime | None = None,
+    read_deadline: float | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
     """Resolve complete zero-result receipts without crossing their watermark."""
 
@@ -2993,6 +3093,7 @@ def _authoritative_empty_coverage(
             indexed_event = bool(
                 mysql and fact_kind == "event" and batch_id and source in AUTHORITATIVE_EVENT_SOURCES
             )
+            indexed_finance = mysql and fact_kind == "finance"
             snapshot_budget = nullcontext()
             if indexed_event:
                 from server.common.qmt_announcement_pit import (
@@ -3002,6 +3103,12 @@ def _authoritative_empty_coverage(
                 deadline = monotonic() + LIVE_EVENT_COVERAGE_READ_DEADLINE_SECONDS
                 snapshot_budget = _live_announcement_reply_budget(
                     connection, deadline=deadline, stage="event-empty-coverage-isolation",
+                )
+            elif indexed_finance:
+                from server.common.qmt_announcement_pit import _live_announcement_read_hint
+
+                deadline = read_deadline if read_deadline is not None else (
+                    monotonic() + FINANCE_REVISION_MYSQL_DEADLINE_SECONDS
                 )
             with snapshot_budget:
                 if mysql and str(
@@ -3013,8 +3120,15 @@ def _authoritative_empty_coverage(
             batch_size = max(1, int(COMMON_FACT_CUTOFF_QUERY_CODE_LIMIT))
             if mysql:
                 batch_size = min(batch_size, EMPTY_COVERAGE_MYSQL_CODE_LIMIT)
+            columns = (
+                "coverage_id"
+                if indexed_finance else _coverage_payload_columns(mysql)
+            )
+            hint = _live_announcement_read_hint(
+                mysql=True, deadline=deadline, stage="finance-empty-coverage-inventory",
+            ) if indexed_finance else ""
             statement = text(
-                f"SELECT {_coverage_payload_columns(mysql)} FROM {SOURCE_COVERAGE_TABLE} "
+                f"SELECT {hint}{columns} FROM {SOURCE_COVERAGE_TABLE} "
                 "WHERE fact_kind=:fact_kind AND stock_code IN :codes "
                 "AND known_at<=:decision_at AND received_at<=:decision_at "
                 f"{source_filter} "
@@ -3028,15 +3142,21 @@ def _authoritative_empty_coverage(
                     by_code_scope: dict[
                         str, dict[str, list[dict[str, Any]]]
                     ] = defaultdict(lambda: defaultdict(list))
-                    rows = (
-                        nullcontext(_read_indexed_event_coverage_rows(
+                    if indexed_event:
+                        rows = nullcontext(_read_indexed_event_coverage_rows(
                             connection, codes=code_batch, source=source, decision_at=decision_at,
                             deadline=deadline, stage=f"event-empty-coverage:{offset}",
                         ))
-                        if indexed_event else connection.execute(statement, {**params, "codes": code_batch})
-                    )
+                    elif indexed_finance:
+                        rows = nullcontext(_read_finance_payload_rows(
+                            connection, table_name=SOURCE_COVERAGE_TABLE, statement=statement,
+                            parameters={**params, "codes": code_batch}, deadline=deadline,
+                            stage_prefix="finance-empty-coverage",
+                        ))
+                    else:
+                        rows = connection.execute(statement, {**params, "codes": code_batch})
                     with rows as result:
-                        for raw in result if indexed_event else result.mappings():
+                        for raw in result if indexed_event or indexed_finance else result.mappings():
                             row = dict(raw)
                             by_code_scope[str(row.get("stock_code") or "").zfill(6)][
                                 str(row.get("scope_hash") or "")
@@ -3125,6 +3245,7 @@ def load_finance_expected_unavailable(
     decision_at: datetime | str,
     expected_report_date: date | str | None = None,
     known_after: datetime | str | None = None,
+    read_deadline: float | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
     """Resolve valid official non-filing dispositions for governance."""
 
@@ -3139,7 +3260,9 @@ def load_finance_expected_unavailable(
     report_date = _date_value(expected_report_date, required=False)
 
     def code_chains():
-        deadline = monotonic() + FINANCE_NONFILING_MYSQL_DEADLINE_SECONDS
+        deadline = read_deadline if read_deadline is not None else (
+            monotonic() + FINANCE_NONFILING_MYSQL_DEADLINE_SECONDS
+        )
         with engine.connect() as connection:
             mysql = connection.dialect.name == "mysql"
             batch_size = len(normalized_codes)
@@ -3153,8 +3276,12 @@ def load_finance_expected_unavailable(
                     connection = connection.execution_options(
                         isolation_level="REPEATABLE READ"
                     )
+            columns = (
+                "coverage_id"
+                if mysql else _coverage_payload_columns(False)
+            )
             statement = text(
-                f"SELECT {timeout_hint}{_coverage_payload_columns(mysql)} "
+                f"SELECT {timeout_hint}{columns} "
                 f"FROM {SOURCE_COVERAGE_TABLE} "
                 "WHERE fact_kind='finance' AND source=:source "
                 "AND stock_code IN :codes "
@@ -3171,13 +3298,21 @@ def load_finance_expected_unavailable(
                         raise TimeoutError(
                             f"finance_nonfiling: read deadline after {offset} codes"
                         )
-                    with connection.execute(statement, {
+                    parameters = {
                         "source": CNINFO_FINANCE_NONFILING_SOURCE,
                         "codes": normalized_codes[offset:offset + batch_size],
                         "decision_at": decision,
-                    }) as rows:
+                    }
+                    rows = (
+                        nullcontext(_read_finance_payload_rows(
+                            connection, table_name=SOURCE_COVERAGE_TABLE, statement=statement,
+                            parameters=parameters, deadline=deadline, stage_prefix="finance-nonfiling",
+                        ))
+                        if mysql else connection.execute(statement, parameters)
+                    )
+                    with rows as result:
                         for code, code_rows in groupby(
-                            rows.mappings(),
+                            result if mysql else result.mappings(),
                             key=lambda row: str(row["stock_code"] or "").zfill(6),
                         ):
                             by_scope: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -5822,6 +5957,7 @@ def load_finance_facts(
     decision_at: datetime | str,
     fact_cutoff_at: datetime | str | None = None,
     as_of_date: date | str | None = None,
+    read_progress: Callable[[int, int], None] | None = None,
 ) -> PITFactBatch:
     normalized_codes = sorted({str(code).strip().zfill(6) for code in codes if str(code).strip()})
     fact_cutoff, decision = _fact_and_decision_times(
@@ -5847,13 +5983,31 @@ def load_finance_facts(
                 else "PIT_FINANCE_EXCLUSION_MANIFEST_INVALID:"
             ) + type(exc).__name__,
         )
+    read_deadline = monotonic() + FINANCE_REVISION_MYSQL_DEADLINE_SECONDS
     revision_errors: list[str] = []
+
+    def read_failure(exc: Exception) -> str:
+        diagnostic = type(exc).__name__
+        stage = getattr(exc, "_pit_read_stage", "") or getattr(exc, "detail", "")
+        if re.fullmatch(
+            r"finance-(revision|empty-coverage|nonfiling)-(inventory|decode|size:[0-9]+|payload:[0-9]+)",
+            str(stage),
+        ):
+            diagnostic += f":stage={stage}"
+        reason = str(getattr(exc, "reason_code", "") or "")
+        if reason in {
+            "QMT_ANNOUNCEMENT_LIVE_BATCH_VALIDATION_DEADLINE",
+            "QMT_ANNOUNCEMENT_LIVE_BATCH_REPLY_DEADLINE",
+            "QMT_ANNOUNCEMENT_LIVE_BATCH_REPLY_FAILED",
+        }:
+            diagnostic += f":reason={reason}"
+        return diagnostic
 
     def revision_groups():
         # One historical finance scan held 264k rows (214 MiB of JSON) and
         # exceeded 980 MiB RSS. Keep all report/revision identities for a code
         # together, process it unchanged, then release the code chunk.
-        batch_size = max(1, int(COMMON_FACT_CUTOFF_QUERY_CODE_LIMIT))
+        batch_size = max(1, min(int(COMMON_FACT_CUTOFF_QUERY_CODE_LIMIT), FINANCE_REVISION_MYSQL_CODE_LIMIT))
         try:
             with engine.connect() as connection:
                 if connection.dialect.name == "mysql" and str(
@@ -5867,6 +6021,7 @@ def load_finance_facts(
                             connection, table_name=FINANCE_REVISION_TABLE,
                             codes=code_batch, decision_at=decision,
                             start_date=None, end_date=end_date,
+                            read_deadline=read_deadline,
                         )
                         by_code_identity: dict[
                             str, dict[str, list[dict[str, Any]]]
@@ -5879,8 +6034,10 @@ def load_finance_facts(
                             yield code, by_code_identity.get(code, {})
                         rows.clear()
                         by_code_identity.clear()
+                        if read_progress is not None:
+                            read_progress(offset + len(code_batch), len(normalized_codes))
         except Exception as exc:
-            revision_errors.append(type(exc).__name__)
+            revision_errors.append(read_failure(exc))
 
     try:
         empty_coverage, coverage_errors = _authoritative_empty_coverage(
@@ -5891,11 +6048,12 @@ def load_finance_facts(
             decision_at=decision,
             start_date=date(1900, 1, 1),
             end_date=end_date,
+            read_deadline=read_deadline,
         )
     except Exception as exc:
         empty_coverage = {}
         coverage_errors = {
-            code: f"PIT_FINANCE_COVERAGE_SCHEMA_UNAVAILABLE:{type(exc).__name__}"
+            code: f"PIT_FINANCE_COVERAGE_SCHEMA_UNAVAILABLE:{read_failure(exc)}"
             for code in normalized_codes
         }
     required_report_date = finance_disclosure_gate(end_date).minimum_report_date
@@ -5906,6 +6064,7 @@ def load_finance_facts(
                 codes=normalized_codes,
                 decision_at=decision,
                 expected_report_date=required_report_date,
+                read_deadline=read_deadline,
             )
         )
     except Exception as exc:
@@ -5913,7 +6072,7 @@ def load_finance_facts(
         unavailable_errors = {
             code: (
                 "PIT_FINANCE_UNAVAILABLE_SCHEMA_UNAVAILABLE:"
-                f"{type(exc).__name__}"
+                f"{read_failure(exc)}"
             )
             for code in normalized_codes
         }

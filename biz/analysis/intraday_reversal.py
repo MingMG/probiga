@@ -284,6 +284,8 @@ def load_intraday_evidence(
     codes = sorted({str(code).zfill(6) for code in stock_codes})
     if not codes:
         return pd.DataFrame()
+    target = date.fromisoformat(trade_date)
+    next_day = (target + timedelta(days=1)).isoformat()
     statement = text(
         """
         SELECT /*+ MAX_EXECUTION_TIME(30000) */
@@ -292,6 +294,8 @@ def load_intraday_evidence(
         FROM sm_stock_minute
         WHERE trade_date=:trade_date
           AND stock_code IN :stock_codes
+          AND trade_time>=:trade_date
+          AND trade_time<:next_day
           AND price IS NOT NULL
           AND price > 0
         ORDER BY stock_code, trade_time
@@ -299,11 +303,12 @@ def load_intraday_evidence(
     ).bindparams(bindparam("stock_codes", expanding=True))
     frames = []
     with engine.connect() as connection:
-        for offset in range(0, len(codes), 200):
-            batch = codes[offset:offset + 200]
+        # Keep full-day replies bounded as well as the indexed scan.
+        for offset in range(0, len(codes), 40):
+            batch = codes[offset:offset + 40]
             rows = connection.execute(
                 statement,
-                {"trade_date": trade_date, "stock_codes": batch},
+                {"trade_date": trade_date, "next_day": next_day, "stock_codes": batch},
             ).mappings().all()
             if rows:
                 frames.append(pd.DataFrame(rows))
