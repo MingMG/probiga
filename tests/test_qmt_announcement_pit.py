@@ -2089,7 +2089,7 @@ def test_live_batch_validates_full_inventory_with_bounded_compressed_primary_key
                     "coverage_id, OCTET_LENGTH(payload_json) + 1",
                 )
         return sql.replace(" FORCE INDEX (PRIMARY)", "").replace(
-            " FORCE INDEX (idx_pit_coverage_decision)", "",
+            " FORCE INDEX (idx_pit_coverage_batch_stock)", "",
         ), parameters
 
     event.listen(engine, "before_cursor_execute", record, retval=True)
@@ -2128,7 +2128,7 @@ def test_live_batch_validates_full_inventory_with_bounded_compressed_primary_key
         for _, params in inventory
     ] == inventory_ranges[:stopped_range_count]
     assert all(
-        "FORCE INDEX (idx_pit_coverage_decision)" in sql and "MAX_EXECUTION_TIME" in sql
+        "FORCE INDEX (idx_pit_coverage_batch_stock)" in sql and "MAX_EXECUTION_TIME" in sql
         and "known_at" not in sql and "stock_code IN" not in sql
         and ("stock_code>=" in sql) == ("lower_code" in params)
         and ("stock_code<" in sql) == ("upper_code" in params)

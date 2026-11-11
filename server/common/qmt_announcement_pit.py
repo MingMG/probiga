@@ -2346,7 +2346,8 @@ def _load_live_announcement_batch_inventory(
     mysql = connection.dialect.name == "mysql"
     codes = sorted(catalog_codes)
     inventory_limit = VALIDATION_INVENTORY_CODE_LIMIT if mysql else max(1, len(codes))
-    index_hint = " FORCE INDEX (idx_pit_coverage_decision)" if mysql else ""
+    from server.common.pit_source_coverage_index import PIT_SOURCE_COVERAGE_BATCH_INDEX_NAME
+    index_hint = f" FORCE INDEX ({PIT_SOURCE_COVERAGE_BATCH_INDEX_NAME})" if mysql else ""
     keys = []
     for offset in range(0, max(1, len(codes)), inventory_limit):
         end = offset + inventory_limit
