@@ -7716,6 +7716,27 @@ def _validate_requirement(
         where_parts.append(f"{quote_identifier(requirement.date_col)} < :target_end")
         params.update({"target_start": start_date, "target_end": end_date})
 
+    where_sql = " WHERE " + " AND ".join(where_parts) if where_parts else ""
+    if (
+        requirement.min_rows == 1
+        and not requirement.distinct_col
+        and not requirement.date_col
+        and not requirement.require_fresh
+        and requirement.where_sql
+    ):
+        # This threshold only asks whether a qualifying row exists. Counting the
+        # entire history (or computing its latest timestamp) cannot establish
+        # the current run's coverage; the task-specific receipt below does that.
+        row = _read_one(
+            engine,
+            f"SELECT /*+ MAX_EXECUTION_TIME(3500) */ 1 AS found "
+            f"FROM {quote_identifier(requirement.table)}{where_sql} LIMIT 1",
+            params,
+        )
+        if not row.get("found"):
+            return False, f"{requirement.table}: only 0 rows, expected >= 1"
+        return True, f"{requirement.table}: at least one qualifying row"
+
     select_parts = ["COUNT(*) AS row_count"]
     if requirement.distinct_col:
         if requirement.distinct_col not in columns:
@@ -7727,7 +7748,6 @@ def _validate_requirement(
     if requirement.date_col:
         select_parts.append(f"MAX({quote_identifier(requirement.date_col)}) AS max_data_time")
 
-    where_sql = " WHERE " + " AND ".join(where_parts) if where_parts else ""
     row = _read_one(
         engine,
         f"SELECT {', '.join(select_parts)} FROM {quote_identifier(requirement.table)}{where_sql}",
