@@ -58,6 +58,7 @@ def test_frozen_qmt_host_sets_are_exact_and_disjoint():
         "qmt_intraday_realtime",
         "qmt_membership_snapshot",
         "qmt_announcement_pit",
+        "qmt_announcement_premarket_prepare",
         "qmt_local_gap_repair_execute",
         "qmt_local_history_2024",
         "qmt_reference_incremental",

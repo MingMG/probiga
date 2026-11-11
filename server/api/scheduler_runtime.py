@@ -36,9 +36,12 @@ from server.api.routers._engine import get_engine
 from server.common.authoritative_market_clock import (
     PRODUCTION_TIMEZONE,
     STOCK_MINUTE_CAPTURE_READY_TIME,
+    STRATEGY_POOL_PREMARKET_PUBLICATION_DEADLINE,
+    STRATEGY_POOL_PREMARKET_REVISION_TIME,
     authoritative_closed_trade_date,
     authoritative_elapsed_trade_date,
     authoritative_stock_minute_trade_date,
+    resolve_strategy_pool_decision_slot,
 )
 from server.common.config import get_api_mysql_pool_config, get_mysql_url, get_scheduler_runtime_config
 from server.common.engine_factory import create_pooled_engine
@@ -48,6 +51,7 @@ from server.common.daily_delivery_control import (
     analysis_publication_reference,
     analysis_publication_degradations,
     bind_analysis_publication_checkpoint,
+    bind_frozen_pool_decision,
     build_terminal_delivery_receipt,
     completed_data_stage_status,
     daily_session_identity,
@@ -58,9 +62,12 @@ from server.common.daily_delivery_control import (
     score_snapshot_identity,
     start_daily_stage_attempt,
     strategy_release_identity,
+    validate_frozen_pool_decision,
 )
 from server.common.analysis_pool_receipt import (
     ANALYSIS_POOL_PUBLISHER_TASK_TYPES,
+    ANALYSIS_SCORE_PUBLICATION_TASK_TYPES,
+    PREMARKET_POOL_TASK,
     canonical_sha256,
     read_persisted_pool_manifest,
     research_only_publication_is_safe,
@@ -99,6 +106,12 @@ from server.common.scheduler_runtime_health import (
 from server.common.scheduler_script_policy import (
     SchedulerScriptPolicyError,
     resolve_scheduler_script,
+)
+from biz.market_context.external_market import PREMARKET_EXTERNAL_CAPTURE_TIME, PREMARKET_EXTERNAL_TASK_TYPE
+from tools.qmt_announcement_task_contract import (
+    PREMARKET_ANNOUNCEMENT_DECISION_TIME,
+    PREMARKET_ANNOUNCEMENT_SOURCE_TIME,
+    PREMARKET_ANNOUNCEMENT_TASK_TYPE,
 )
 from server.common.scheduler_args import (
     ANALYSIS_DAILY_EVIDENCE_TASK_TYPES,
@@ -246,6 +259,12 @@ EARLY_BRIEFING_CRON_CATCHUP_WINDOW_SECONDS = int(
 CRITICAL_CRON_CATCHUP_TASK_TYPES = {"analysis_fast", "qmt_local_history_2024"}
 CRITICAL_CRON_CATCHUP_TASK_TYPES.add("trading_v3_research_pool")
 CRITICAL_CRON_CATCHUP_TASK_TYPES.add("strategy_external_overlay")
+_FROZEN_SOURCE_STAGE_TYPES = frozenset({PREMARKET_ANNOUNCEMENT_TASK_TYPE, PREMARKET_EXTERNAL_TASK_TYPE})
+_FROZEN_SCHEDULED_TASK_TYPES = _FROZEN_SOURCE_STAGE_TYPES | {PREMARKET_POOL_TASK}
+CRITICAL_CRON_CATCHUP_TASK_TYPES.update(_FROZEN_SOURCE_STAGE_TYPES)
+_DAILY_CONTROL_STAGE_TYPES = DAILY_RESULT_RECOVERY_TASK_TYPES | _FROZEN_SCHEDULED_TASK_TYPES
+_DAILY_CONTROL_NONTERMINAL_TYPES = DAILY_RESULT_NONTERMINAL_TASK_TYPES | _FROZEN_SCHEDULED_TASK_TYPES
+
 CRITICAL_CRON_CATCHUP_TASK_TYPES.add("sim_trade_signal_prepare")
 CRITICAL_CRON_CATCHUP_TASK_TYPES.add(FINAL_POOL_WECOM_DELIVERY_TASK_TYPE)
 CRITICAL_CRON_CATCHUP_TASK_TYPES.update(
@@ -473,6 +492,8 @@ NON_TRADING_DAY_SKIP_TYPES = {
     "sector_heat_east",
     "qmt_membership_snapshot",
     "qmt_announcement_pit",
+    PREMARKET_ANNOUNCEMENT_TASK_TYPE,
+    PREMARKET_EXTERNAL_TASK_TYPE,
     "qmt_local_gap_repair_execute",
     "qmt_local_history_2024",
     "qmt_reference_incremental",
@@ -1385,6 +1406,14 @@ def _validated_daily_recovery_session(raw_row: dict) -> dict[str, object]:
         raise RuntimeError(
             "daily-result delivery session receipt JSON is invalid"
         )
+    if "frozen_pool_decision" in receipt:
+        try:
+            validate_frozen_pool_decision(
+                receipt["frozen_pool_decision"], trade_date=trade_date_value,
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("daily-result frozen decision slot differs") from exc
+        expected_receipt_keys.add("frozen_pool_decision")
     supplied_hash = str(receipt.pop("receipt_sha256", "")).strip().lower()
     stored_hash = str(row.get("stored_receipt_sha256") or "").strip().lower()
     receipt_status = str(receipt.get("status") or "").strip().upper()
@@ -3005,8 +3034,20 @@ def _qmt_daily_finality_recovery_allowed(row: dict, *, now: datetime) -> bool:
     return now >= datetime.combine(target, ready_time)
 
 
+def _frozen_scheduler_window_open(task_type: str, now: datetime) -> bool:
+    cutoff = STRATEGY_POOL_PREMARKET_REVISION_TIME
+    start, end = {
+        PREMARKET_ANNOUNCEMENT_TASK_TYPE: (datetime_time.fromisoformat(PREMARKET_ANNOUNCEMENT_SOURCE_TIME), cutoff),
+        PREMARKET_EXTERNAL_TASK_TYPE: (PREMARKET_EXTERNAL_CAPTURE_TIME, cutoff),
+        PREMARKET_POOL_TASK: (cutoff, STRATEGY_POOL_PREMARKET_PUBLICATION_DEADLINE),
+    }[task_type]
+    return start <= now.time() < end
+
+
 def _critical_cron_catchup_allowed(row: dict, *, now: datetime, cron_time: str) -> bool:
     task_type = str(row.get("task_type") or "").strip()
+    if task_type in _FROZEN_SCHEDULED_TASK_TYPES and not _frozen_scheduler_window_open(task_type, now):
+        return False
     if task_type == "analysis_premarket_external" and not datetime_time(9, 8) <= now.time() < datetime_time(9, 30):
         return False
     if (
@@ -3167,6 +3208,8 @@ def _cron_due(row: dict, *, now: datetime) -> bool:
     if row.get("_research_pool_target_complete") is True:
         return False
     task_type = str(row.get("task_type") or "").strip()
+    if task_type in _FROZEN_SCHEDULED_TASK_TYPES and not _frozen_scheduler_window_open(task_type, now):
+        return False
     if task_type == "analysis_premarket_external" and not datetime_time(9, 8) <= now.time() < datetime_time(9, 30):
         return False
     cron_min = _parse_hhmm(str(row.get("cron_time") or "17:10"))
@@ -4490,6 +4533,15 @@ def _task_timeout_minutes(
     now: datetime | None = None,
 ) -> int | None:
     task_type = str(row.get("task_type") or "").strip()
+    if task_type in _FROZEN_SCHEDULED_TASK_TYPES:
+        current = now or _now_shanghai_naive()
+        if current.tzinfo is not None:
+            current = current.astimezone(PRODUCTION_TIMEZONE).replace(tzinfo=None)
+        deadline = datetime.combine(
+            current.date(), STRATEGY_POOL_PREMARKET_PUBLICATION_DEADLINE if task_type == PREMARKET_POOL_TASK
+            else datetime_time.fromisoformat(PREMARKET_ANNOUNCEMENT_DECISION_TIME),
+        )
+        return max(1, int((deadline - current).total_seconds() // 60))
     if task_type == "analysis_premarket_external":
         current = now or _now_shanghai_naive()
         deadline = datetime.combine(current.date(), datetime_time(9, 30))
@@ -5843,6 +5895,11 @@ def _task_dispatch_date(
         if parsed_scheduler_target.isoformat() != scheduler_target:
             raise RuntimeError("scheduler target trade date is invalid")
         return scheduler_target
+    if task_type in _FROZEN_SCHEDULED_TASK_TYPES:
+        target = authoritative_elapsed_trade_date(engine, now=current)
+        if not target:
+            raise RuntimeError("premarket announcement prior exchange session is unavailable")
+        return target
     if task_type == "north_flow_daily":
         from server.common.northbound_disclosure import NORTHBOUND_CLOSE_READY_TIME
 
@@ -5896,6 +5953,39 @@ def _task_argument_row(
     task_type = str(row.get("task_type") or "").strip()
     if task_type == "analysis_morning_strict":
         raise RuntimeError("retired analysis task has no publication authority")
+    if task_type in {PREMARKET_EXTERNAL_TASK_TYPE, PREMARKET_POOL_TASK}:
+        if engine is None or str(row.get("_trigger_source") or "scheduled") != "scheduled":
+            raise RuntimeError("premarket pool input requires its scheduled owner")
+        slot = resolve_strategy_pool_decision_slot(
+            engine, data_trade_date=target_date,
+            phase="INITIAL" if task_type == PREMARKET_EXTERNAL_TASK_TYPE else "PREMARKET_REVISION",
+            evaluated_at=now,
+        )
+        if slot.execution_session_date != slot.evaluated_at.date().isoformat():
+            raise RuntimeError("premarket pool input targets a different exchange session")
+        return {**row, "_scheduler_target_trade_date": target_date,
+                "_scheduler_premarket_execution_session": slot.execution_session_date}
+    if task_type == PREMARKET_ANNOUNCEMENT_TASK_TYPE:
+        if engine is None or str(row.get("_trigger_source") or "scheduled") != "scheduled":
+            raise RuntimeError("premarket announcement requires its scheduled producer")
+        prior = resolve_strategy_pool_decision_slot(
+            engine, data_trade_date=target_date, phase="INITIAL", evaluated_at=now,
+        )
+        current = prior.evaluated_at
+        start = datetime.combine(
+            current.date(), datetime_time.fromisoformat(PREMARKET_ANNOUNCEMENT_SOURCE_TIME), PRODUCTION_TIMEZONE,
+        )
+        stop = datetime.combine(
+            current.date(), datetime_time.fromisoformat(PREMARKET_ANNOUNCEMENT_DECISION_TIME), PRODUCTION_TIMEZONE,
+        )
+        if prior.execution_session_date != current.date().isoformat() or not start <= current < stop:
+            raise RuntimeError("premarket announcement is outside the next exchange session's capture window")
+        return {
+            **row,
+            "_scheduler_target_trade_date": target_date,
+            "_scheduler_premarket_source_cutoff": start.isoformat(timespec="seconds"),
+            "_scheduler_premarket_decision_cutoff": stop.isoformat(timespec="seconds"),
+        }
     if task_type == "analysis_premarket_external":
         if row.get("script_path") != "tools/run_premarket_theme_forecast.py":
             raise RuntimeError("retired analysis task has no publication authority")
@@ -5957,6 +6047,16 @@ def _task_argument_row(
         "_scheduler_execution_time": bound,
     }
     if daily_pipeline:
+        if task_type == "analysis_fast" and row.get("_release_analysis_research_mode") is not True:
+            cutoff = datetime.combine(
+                parsed_target, datetime_time.fromisoformat(ANALYSIS_DAILY_PIPELINE_DECISION_TIME),
+            )
+            if current < cutoff:
+                raise RuntimeError("formal strategy pool initial cutoff has not arrived")
+            result["_scheduler_dispatch_time"] = bound
+            bound = cutoff.isoformat(timespec="seconds")
+            result["_scheduler_execution_time"] = bound
+            result["_scheduler_pipeline_phase"] = "INITIAL"
         result["_scheduler_pipeline_decision_at"] = bound
         result["_scheduler_pipeline_target_date"] = exact_target
 
@@ -7880,10 +7980,11 @@ def _activate_analysis_strategy_pool(
     task_type: str,
     publication_receipt: dict | None,
     allow_failed_parent: bool = False,
+    decision_known_at: datetime | None = None,
 ) -> dict[str, object]:
     """Activate one validated pool in the scheduler-success transaction."""
 
-    if task_type not in ANALYSIS_POOL_PUBLISHER_TASK_TYPES:
+    if task_type not in ANALYSIS_SCORE_PUBLICATION_TASK_TYPES:
         return {}
     from server.common.analysis_pool_receipt import publication_receipt_is_valid, publication_is_complete_empty
     if publication_receipt is not None and (
@@ -7975,7 +8076,7 @@ def _activate_analysis_strategy_pool(
     membership_binding = resolve_analysis_industry_membership_binding(
         connection.engine,
         trade_date=trade_date,
-        decision_known_at=datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None),
+        decision_known_at=decision_known_at or datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None),
     )
     if (
         membership_binding.get("snapshot_date") != trade_date
@@ -8607,7 +8708,7 @@ def _build_daily_result_delivery_receipt(
         SELECT run_uid, trade_date, build_sha, status, total, passed,
                executable_count, canonical_pool_sha256,
                membership_snapshot_date, membership_snapshot_source,
-               membership_proof_sha256, published_at
+               membership_proof_sha256, started_at, published_at
         FROM st_recommended_run_history
         WHERE trade_date=:trade_date AND build_sha=:build_sha
           AND status='done'
@@ -8620,7 +8721,26 @@ def _build_daily_result_delivery_receipt(
     producer_run_uid = str(producer.get("run_uid") or "").strip().lower()
     from server.common.daily_delivery_control import load_published_analysis_receipt
     from server.common.analysis_pool_receipt import publication_is_complete_empty
-    publication = load_published_analysis_receipt(connection, target, run_uid=producer_run_uid)
+    decoded_score = []
+    publication = load_published_analysis_receipt(
+        connection, target, run_uid=producer_run_uid, capture_score=decoded_score.append,
+    )
+    score_cutoff = f"{target}T{ANALYSIS_DAILY_PIPELINE_DECISION_TIME}"
+    scoring_snapshot = publication["score_snapshot"]
+    is_fixed_initial = all(scoring_snapshot.get(field) == score_cutoff for field in ("decision_at", "input_decision_at"))
+    frozen_announcement = frozen_core_inputs = None
+    if is_fixed_initial:
+        if len(decoded_score) != 1:
+            raise RuntimeError("daily delivery frozen score proof is unavailable")
+        frozen_announcement = decoded_score[0].get("frozen_announcement_source")
+        frozen_core_inputs = decoded_score[0].get("frozen_core_inputs")
+        if (
+            not isinstance(frozen_announcement, Mapping)
+            or not isinstance(frozen_core_inputs, Mapping)
+            or (frozen_core_inputs.get("announcement") or {}).get("dataset_id") != frozen_announcement["scheduler_run_uid"]
+            or (frozen_core_inputs.get("announcement") or {}).get("root") != frozen_announcement["evidence_sha256"]
+        ):
+            raise RuntimeError("daily delivery score's exact frozen sources are unavailable")
     manifest = read_persisted_pool_manifest(connection, target, score_snapshot=publication["score_snapshot"])
     membership_proofs = manifest.get("membership_proofs")
     analysis_count = int(manifest.get("analysis_count") or 0)
@@ -8727,6 +8847,22 @@ def _build_daily_result_delivery_receipt(
         component_build_shas=component_build_shas,
         completed_stock_finance_history=finance_history,
     )
+    if frozen_announcement is not None:
+        exact_announcements = [
+            row for row in dependency_rows if row["task_type"] == "qmt_announcement_pit"
+            and row["run_uid"] == frozen_announcement["scheduler_run_uid"]
+        ]
+        if len(exact_announcements) != 1:
+            raise RuntimeError("daily delivery frozen announcement task identity differs")
+        exact_row = exact_announcements[0]
+        exact_evidence = _history_validation_evidence(exact_row.get("output")) or {}
+        if (
+            exact_evidence.get("evidence_sha256") != frozen_announcement["evidence_sha256"]
+            or exact_evidence.get("input_receipt_root_sha256") != frozen_announcement["input_receipt_root_sha256"]
+            or exact_row.get("build_sha") != frozen_announcement["producer_build_sha"]
+        ):
+            raise RuntimeError("daily delivery frozen announcement evidence differs")
+        latest_by_type["qmt_announcement_pit"] = exact_row
     selected = [
         latest_by_type[task_type]
         for task_type in required_dependencies
@@ -8885,6 +9021,17 @@ def _build_daily_result_delivery_receipt(
             "score_snapshot_id": score_snapshot_identity(core),
         }
     )
+    if is_fixed_initial:
+        producer_started = _coerce_datetime(producer.get("started_at"))
+        if producer_started is None:
+            raise RuntimeError("daily delivery frozen score start time is unavailable")
+        core["frozen_score_snapshot"] = {
+            **{field: scoring_snapshot[field] for field in (
+                "trade_date", "decision_at", "input_decision_at", "payload_sha256",
+            )},
+            "evaluated_at": producer_started.isoformat(timespec="seconds"),
+            "core_inputs": frozen_core_inputs,
+        }
     return {
         **core,
         "delivery_receipt_sha256": canonical_sha256(core),
@@ -9109,9 +9256,9 @@ def _terminal_observe(engine, uid, *, status, duration, exit_code, output,
             if row["scheduler_instance_id"] != _scheduler_instance_id:
                 raise RuntimeError("scheduler terminal original owner differs")
             identity = _terminal_run_identity(row)
-            if task_type in DAILY_RESULT_RECOVERY_TASK_TYPES:
+            if task_type in _DAILY_CONTROL_STAGE_TYPES:
                 stage = _terminal_stage_identity(_terminal_stage_row(connection, uid))
-    elif (prior is None and task_type in DAILY_RESULT_RECOVERY_TASK_TYPES
+    elif (prior is None and task_type in _DAILY_CONTROL_STAGE_TYPES
             and stage is None):
         # A lost start-stage COMMIT response can leave the RAM cache empty
         # while the actual original attempt exists. None is not absence proof.
@@ -9209,7 +9356,7 @@ def _terminal_validate_observation(value, uid):
 
 def _terminal_snapshot(connection, uid, intent):
     history = _terminal_values(_terminal_history_row(connection, uid))
-    daily = intent["outcome"]["task_type"] in DAILY_RESULT_RECOVERY_TASK_TYPES
+    daily = intent["outcome"]["task_type"] in _DAILY_CONTROL_STAGE_TYPES
     stage, session, receipts, activation = None, None, [], None
     if daily:
         from server.common.daily_delivery_control import RECEIPT_TABLE
@@ -9220,7 +9367,7 @@ def _terminal_snapshot(connection, uid, intent):
             f"SELECT * FROM {RECEIPT_TABLE} WHERE scheduler_run_uid=:uid ORDER BY receipt_uid"
         ), {"uid": uid}).mappings().all()]
     if (intent["outcome"]["status"] == "success"
-            and intent["outcome"]["task_type"] in ANALYSIS_POOL_PUBLISHER_TASK_TYPES):
+            and intent["outcome"]["task_type"] in ANALYSIS_SCORE_PUBLICATION_TASK_TYPES):
         # The run publication and activation receipt in history are immutable
         # originals. Later legal publications may change the live ACTIVE pool;
         # that mutable projection is not evidence against an earlier COMMIT.
@@ -9235,7 +9382,7 @@ def _terminal_snapshot(connection, uid, intent):
 
 
 def _terminal_check_running(connection, uid, intent, *, for_update=False):
-    daily = intent["outcome"]["task_type"] in DAILY_RESULT_RECOVERY_TASK_TYPES
+    daily = intent["outcome"]["task_type"] in _DAILY_CONTROL_STAGE_TYPES
     if daily and for_update and intent["stage_identity"] is not None:
         # Same session-first order as daily claim/renew/finish. Only the exact
         # original session is a lock target; a changed stage is rejected below.
@@ -9292,7 +9439,7 @@ def _terminal_expired_publication(connection, journal, uid, intent):
     owner_expired = task_owner_lease_expired(
         _terminal_history_row(connection, uid), now=_now_shanghai_naive())
     if not owner_expired:
-        if intent["outcome"]["task_type"] not in DAILY_RESULT_RECOVERY_TASK_TYPES:
+        if intent["outcome"]["task_type"] not in _DAILY_CONTROL_STAGE_TYPES:
             return intent
         stage = _terminal_stage_row(connection, uid)
         if stage is None:
@@ -9374,6 +9521,47 @@ def _terminal_update_projection(connection, intent, output):
         raise _TerminalPersistencePending("scheduler terminal current projection CAS lost")
 
 
+def _premarket_work_reference(output: object) -> dict:
+    from server.common.frozen_strategy_pool_work import PREMARKET_POOL_WORK_REF_SCHEMA
+    from server.common.scheduler_validation import _single_nested_machine_payload
+
+    evidence = _history_validation_evidence(output)
+    reference = _single_nested_machine_payload(
+        str((evidence or {}).get("replay_output") or output), schema=PREMARKET_POOL_WORK_REF_SCHEMA,
+    )
+    if not isinstance(reference, dict):
+        raise RuntimeError("premarket pool prepared score reference is unavailable")
+    return reference
+
+
+def _premarket_publication_context(engine, journal, run_uid, output):
+    from sqlalchemy.exc import SQLAlchemyError
+    from server.common.daily_delivery_control import (
+        load_frozen_premarket_announcement, load_frozen_premarket_external_context,
+    )
+    from server.common.frozen_strategy_pool_work import read_frozen_pool_work
+
+    reference = _premarket_work_reference(output)
+    work = read_frozen_pool_work(
+        journal, reference, run_uid=run_uid, build_sha=_scheduler_build_commit_sha(),
+        trade_date=str(reference["trade_date"]),
+    )
+    slot = resolve_strategy_pool_decision_slot(
+        engine, data_trade_date=work["trade_date"], phase="PREMARKET_REVISION",
+        evaluated_at=datetime.fromisoformat(work["scoring"]["evaluated_at"]),
+    )
+    contract = runtime_contract_build_sha(expected_build_sha=work["build_sha"])
+    source = load_frozen_premarket_announcement(engine, work["trade_date"], contract, slot)
+    if source is None or source.receipt["stage_evidence_sha256"] != work["source_evidence_sha256"]:
+        raise RuntimeError("prepared premarket announcement stage changed")
+    try:
+        external = load_frozen_premarket_external_context(engine, work["trade_date"], contract, slot)
+    except (ValueError, RuntimeError, SQLAlchemyError) as exc:
+        logger.warning("Premarket optional external snapshot unavailable: %s", type(exc).__name__)
+        external = None
+    return work, slot, external
+
+
 def _task_history_finish(
     engine,
     run_uid: str | None,
@@ -9395,7 +9583,7 @@ def _task_history_finish(
         status, publication_receipt = "failed", None
         output = "TASK_OWNER_LEASE_LOST: exact run ownership could not be renewed.\n" + str(output or "")
     normalized_task_type = str(task_type or "").strip()
-    daily_control_required = normalized_task_type in DAILY_RESULT_RECOVERY_TASK_TYPES
+    daily_control_required = normalized_task_type in _DAILY_CONTROL_STAGE_TYPES
     journal = intent = None
     try:
         journal, intent, fresh_observation = _terminal_observe(engine, run_uid, status=status,
@@ -9439,7 +9627,27 @@ def _task_history_finish(
                 _refresh_daily_stage_lease_for_publication(engine, stage_attempt=stage)
         if status == "success" and normalized_task_type == "strategy_governance_daily":
             runtime_health = _daily_delivery_runtime_health(output, engine=engine)
-        with engine.begin() as conn:
+        revision_context = None
+        transaction = engine.begin
+        if status == "success" and normalized_task_type == PREMARKET_POOL_TASK:
+            from contextlib import contextmanager
+            from biz.analysis.sync_analysis_fast import _analysis_execution_lock
+            from server.common.frozen_strategy_pool_work import require_premarket_publication_window
+            from server.engine.strategy_governance import governance_write_transaction
+
+            revision_context = _premarket_publication_context(engine, journal, run_uid, output)
+
+            @contextmanager
+            def transaction():
+                work, slot, _ = revision_context
+                with _analysis_execution_lock(engine, work["trade_date"]) as verify_owner:
+                    with governance_write_transaction(engine) as connection:
+                        verify_owner()
+                        yield connection
+                        if status == "success":
+                            verify_owner()
+                            require_premarket_publication_window(slot)
+        with transaction() as conn:
             if not _terminal_check_running(conn, run_uid, intent, for_update=True):
                 raise _TerminalPersistencePending("scheduler terminal run changed before transaction")
             intent = _terminal_expired_publication(conn, journal, run_uid, intent)
@@ -9459,6 +9667,21 @@ def _task_history_finish(
             )
             history_evidence = _history_validation_evidence(output)
             stage_checkpoint = history_evidence
+            if revision_context is not None and status == "success":
+                from server.common.daily_delivery_control import analysis_publication_reference
+                from server.common.frozen_strategy_pool_work import publish_prepared_premarket_pool
+
+                publication_receipt, activation_receipt, control_receipt = publish_prepared_premarket_pool(
+                    conn, run_uid=run_uid, work=revision_context[0],
+                    slot=revision_context[1], external_context=revision_context[2],
+                    activate_analysis_pool=_activate_analysis_strategy_pool,
+                )
+                amended = {key: value for key, value in history_evidence.items() if key != "evidence_sha256"}
+                replay = amended["replay_output"] + "\n" + json.dumps(analysis_publication_reference(publication_receipt))
+                amended.update(replay_output=replay, replay_output_sha256=_history_digest(replay),
+                               input_receipt_root_sha256=_history_digest(replay))
+                history_evidence = {**amended, "evidence_sha256": canonical_sha256(amended)}
+                output = json.dumps(history_evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
             if publication_receipt is not None and status == "success":
                 stage_checkpoint = bind_analysis_publication_checkpoint(
                     history_evidence or {}, publication_receipt,
@@ -9473,7 +9696,7 @@ def _task_history_finish(
                         str(run_uid or "").strip().lower()
                         if status == "success"
                         and normalized_task_type
-                        in ANALYSIS_POOL_PUBLISHER_TASK_TYPES
+                        in ANALYSIS_SCORE_PUBLICATION_TASK_TYPES
                         else None
                     ),
                     input_root_sha256=(
@@ -9518,7 +9741,7 @@ def _task_history_finish(
                 )
             if (
                 stage_attempt is not None
-                and normalized_task_type not in DAILY_RESULT_NONTERMINAL_TASK_TYPES
+                and normalized_task_type not in _DAILY_CONTROL_NONTERMINAL_TYPES
                 and str(stage_attempt.get("status") or "") != "SUPERSEDED"
                 and (
                     status != "success"
@@ -9543,6 +9766,7 @@ def _task_history_finish(
                     if status == "success" and delivery_receipt
                     else "BLOCKED"
                 )
+                frozen_score = delivery_receipt.get("frozen_score_snapshot")
                 control_receipt = build_terminal_delivery_receipt(
                     session=session,
                     scheduler_run_uid=str(run_uid or "").strip().lower(),
@@ -9553,6 +9777,7 @@ def _task_history_finish(
                     status=control_status,
                     strategy_release_id=strategy_release_id,
                     legacy_receipt=(delivery_receipt or None),
+                    exact_core_inputs=(frozen_score.get("core_inputs") if isinstance(frozen_score, dict) else None),
                     degradations=delivery_receipt.get("degradations") or [],
                     retryable=(
                         bool(blocking.get("retryable"))
@@ -9570,10 +9795,22 @@ def _task_history_finish(
                         else None
                     ),
                 )
+                if isinstance(frozen_score, dict):
+                    slot = resolve_strategy_pool_decision_slot(
+                        conn,
+                        data_trade_date=str(session["trade_date"])[:10],
+                        phase="INITIAL",
+                        evaluated_at=datetime.fromisoformat(str(frozen_score["evaluated_at"])),
+                    )
+                    control_receipt = bind_frozen_pool_decision(
+                        control_receipt, slot=slot, score_snapshot=frozen_score,
+                    )
                 control_receipt = persist_terminal_delivery_receipt(
                     conn,
                     receipt=control_receipt,
                 )
+            if revision_context is not None and status == "success":
+                control_receipt = persist_terminal_delivery_receipt(conn, receipt=control_receipt)
             normalized_exit_code = None
             if exit_code is not None:
                 normalized_exit_code = int(exit_code)
@@ -9881,7 +10118,7 @@ def _run_task_impl(
     dispatch_now = None
     dispatch_date = None
     stage_attempt: dict[str, object] | None = None
-    if task_type in DAILY_RESULT_RECOVERY_TASK_TYPES:
+    if task_type in _DAILY_CONTROL_STAGE_TYPES:
         if not re.fullmatch(r"[0-9a-f]{32}", exact_history_uid):
             raise RuntimeError(
                 "scheduler child launch requires an exact 32-hex audit identity"
@@ -9904,7 +10141,7 @@ def _run_task_impl(
             # can be reused and emits a receipt bound to that attestation.
             # A prior stage checkpoint cannot prove this dispatch's inputs.
             reuse_completed_stage=False,
-            preserve_session_status=(task_type in DAILY_RESULT_NONTERMINAL_TASK_TYPES),
+            preserve_session_status=(task_type in _DAILY_CONTROL_NONTERMINAL_TYPES),
         )
         with _running_lock:
             _terminal_stage_identities[exact_history_uid] = _terminal_stage_identity(stage_attempt)
@@ -10395,6 +10632,11 @@ def launch_scheduler_task(
     target_trade_date = str(target_trade_date or "").strip()
     if trigger_source not in {"manual", "release_catchup"}:
         raise ValueError("scheduler launch trigger source is invalid")
+    if row.get("task_type") in _FROZEN_SCHEDULED_TASK_TYPES:
+        return {
+            "accepted": False, "status": "scheduled_source_only", "task_id": task_id,
+            "task_name": task_name, "job_id": "",
+        }
     if row.get("_limit_ladder_only") is True and (
         trigger_source != "manual"
         or row.get("task_type") != "market_overview_daily"

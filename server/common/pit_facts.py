@@ -44,6 +44,7 @@ from server.common.finance_nonfiling_evidence import (
 from server.common.pit_event_coverage_checkpoint import EventCoverageCheckpoint
 
 if TYPE_CHECKING:
+    from server.common.daily_delivery_control import FrozenInitialAnnouncement, FrozenPremarketAnnouncement
     from server.common.qmt_announcement_pit import HistoricalAnnouncementSelection
 
 logger = logging.getLogger(__name__)
@@ -450,12 +451,208 @@ def _cninfo_cutoff_partition_valid(
     return True
 
 
+def _cninfo_shard_manifest_details(
+    manifest: Any, *, stock_code: str, requested_start_time: str,
+    requested_end_time: str, max_pages: int,
+) -> tuple[int, int, list[str], str] | None:
+    """Validate an exhausted, contiguous raw date tree and derive its audit totals."""
+    if not isinstance(manifest, list) or not 1 <= len(manifest) <= max_pages:
+        return None
+    try:
+        start_date = datetime.strptime(requested_start_time[:8], "%Y%m%d").date()
+        end_date = datetime.strptime(requested_end_time[:8], "%Y%m%d").date()
+    except (TypeError, ValueError):
+        return None
+    cursor = start_date.toordinal()
+    total = 0
+    query_count = 2 * len(manifest) - 1
+    page_hashes: list[str] = []
+    for leaf in manifest:
+        if not isinstance(leaf, Mapping) or set(leaf) != {
+            "window_start", "window_end", "capture_mode", "result_count",
+            "provider_reported_totalpages", "provider_page_count",
+            "page_sha256", "last_page_has_more",
+        }:
+            return None
+        try:
+            leaf_start = date.fromisoformat(leaf["window_start"])
+            leaf_end = date.fromisoformat(leaf["window_end"])
+        except (TypeError, ValueError):
+            return None
+        count = leaf["result_count"]
+        pages = leaf["provider_page_count"]
+        reported_pages = leaf["provider_reported_totalpages"]
+        page_hash = leaf["page_sha256"]
+        if (
+            leaf["window_start"] != leaf_start.isoformat()
+            or leaf["window_end"] != leaf_end.isoformat()
+            or leaf_start.toordinal() != cursor
+            or not leaf_start <= leaf_end <= end_date
+            or type(count) is not int or count < 0
+            or type(reported_pages) is not int or reported_pages != count // 30
+            or type(pages) is not int or pages != max(1, (count + 29) // 30)
+            or pages > max_pages
+            or leaf["last_page_has_more"] is not False
+            or leaf["capture_mode"] != ("SINGLE_PAGE" if pages == 1 else "DENSE_DAY_COMPLETE_SWEEP")
+            or (pages > 1 and leaf_start != leaf_end)
+            or not isinstance(page_hash, str) or not _HASH_RE.fullmatch(page_hash)
+        ):
+            return None
+        cursor = leaf_end.toordinal() + 1
+        total += count
+        query_count += pages - 1
+        page_hashes.append(page_hash)
+    if cursor != end_date.toordinal() + 1:
+        return None
+    manifest_hash = canonical_hash({
+        "schema": "probiga.cninfo-date-shard-manifest.v1",
+        "stock_code": stock_code,
+        "requested_start_time": requested_start_time,
+        "requested_end_time": requested_end_time,
+        "shards": manifest,
+    })
+    return total, query_count, page_hashes, manifest_hash
+
+
+def _cninfo_shard_rounds_valid(
+    receipt: Mapping[str, Any], *, round_count: int, query_count: int,
+    final_tree_queries: int, retained_count: int, raw_count: int, max_pages: int,
+) -> bool:
+    raw_hashes = receipt.get("pagination_complete_round_sha256")
+    if (
+        round_count < 2
+        or not isinstance(raw_hashes, list)
+        or len(raw_hashes) != round_count
+        or not all(isinstance(value, str) and _HASH_RE.fullmatch(value) for value in raw_hashes)
+        or query_count > max_pages
+    ):
+        return False
+    if "pagination_frozen_proof" not in receipt:
+        # These immutable receipts attested an identical full raw result set.
+        return (
+            raw_hashes[-1] == raw_hashes[-2]
+            and receipt.get("date_shard_recheck_sha256") == receipt.get("date_shard_manifest_sha256")
+            and receipt.get("quality_status") == "EXACT_STOCK_DATE_SHARDS_DOUBLE_ATTESTED"
+            and 2 * final_tree_queries <= query_count
+        )
+
+    proof = receipt["pagination_frozen_proof"]
+    if (
+        not isinstance(proof, Mapping)
+        or set(proof) != {"schema", "complete_rounds"}
+        or proof.get("schema") != "probiga.cninfo-frozen-pagination.v1"
+        or receipt.get("quality_status") != "EXACT_STOCK_DATE_SHARDS_FROZEN_CUTOFF_DOUBLE_ATTESTED"
+        or receipt.get("data_version") != canonical_hash("probiga.cninfo-per-stock-announcement.v2")
+    ):
+        return False
+    rounds = proof["complete_rounds"]
+    if not isinstance(rounds, list) or len(rounds) != round_count:
+        return False
+
+    start = receipt["requested_start_time"]
+    end = receipt["requested_end_time"]
+    complete_queries = 0
+    for sweep in rounds:
+        if not isinstance(sweep, Mapping) or set(sweep) != {
+            "raw_manifest", "raw_manifest_sha256", "raw_count",
+            "query_count", "frozen_sha256", "retained_count",
+        }:
+            return False
+        manifest = sweep["raw_manifest"]
+        total, frozen_count, queries, frozen_hash = (
+            sweep["raw_count"], sweep["retained_count"],
+            sweep["query_count"], sweep["frozen_sha256"],
+        )
+        if (
+            any(type(value) is not int for value in (total, frozen_count, queries))
+            or not 0 <= frozen_count <= total <= max_pages * 30
+            or not 1 <= queries <= max_pages
+            or (end.endswith("235959") and frozen_count != total)
+            or not isinstance(frozen_hash, str) or not _HASH_RE.fullmatch(frozen_hash)
+        ):
+            return False
+        details = _cninfo_shard_manifest_details(
+            manifest, stock_code=receipt["stock_code"], requested_start_time=start,
+            requested_end_time=end, max_pages=max_pages,
+        )
+        if details is None or (details[0], details[1], details[3]) != (
+            total, queries, sweep["raw_manifest_sha256"],
+        ):
+            return False
+        complete_queries += queries
+    prior, final = rounds[-2:]
+    invalid_round_count = receipt["pagination_invalid_round_count"]
+    return (
+        prior["frozen_sha256"] == final["frozen_sha256"]
+        and prior["retained_count"] == final["retained_count"] == retained_count
+        and prior["raw_manifest_sha256"] == receipt.get("date_shard_recheck_sha256")
+        and final["raw_manifest_sha256"] == receipt.get("date_shard_manifest_sha256")
+        and final["raw_count"] == raw_count
+        and final["query_count"] == final_tree_queries
+        and complete_queries + invalid_round_count <= query_count
+        and (invalid_round_count > 0 or complete_queries == query_count)
+    )
+
+
+def _fallback_announcement_delta_parts(
+    evidence: Mapping[str, Any], source_rows: Iterable[Mapping[str, Any]],
+    *, stock_code: str,
+) -> tuple[list[Mapping[str, Any]], list[Mapping[str, Any]]]:
+    """Validate the exact source window and split a merged fallback response."""
+    chain = evidence.get("incremental_proof")
+    if not isinstance(chain, Mapping) or chain.get("mode") != "DELTA_OVER_PARENT":
+        raise ValueError("fallback announcement delta proof is missing")
+    coverage_start = date.fromisoformat(chain["coverage_window_start"])
+    capture_start = date.fromisoformat(chain["capture_window_start"])
+    cutoff = normalize_decision_at(evidence["fact_cutoff_at"])
+    if (
+        chain.get("schema") != "probiga.qmt-announcement-incremental-chain.v1"
+        or coverage_start.isoformat() != evidence.get("window_start")
+        or capture_start.isoformat() != chain.get("capture_window_start")
+        or cutoff.date().isoformat() != chain.get("window_end")
+        or chain.get("window_end") != evidence.get("window_end")
+        or cutoff.strftime("%Y%m%d%H%M%S") != evidence.get("query_end_time")
+        or not coverage_start < capture_start <= cutoff.date()
+        or not chain.get("parent_batch_id")
+        or not all(_HASH_RE.fullmatch(str(chain.get(field) or "")) for field in (
+            "parent_batch_root_hash", "delta_root_hash", "prefix_root_hash",
+        ))
+        or normalize_decision_at(chain["parent_received_at"]) >= cutoff
+        or chain.get("result_batch_root_hash") != evidence.get("global_batch_root_hash")
+        or canonical_hash({key: value for key, value in chain.items() if key != "chain_root_hash"})
+        != chain.get("chain_root_hash")
+    ):
+        raise ValueError("fallback announcement delta evidence differs")
+    start_at = datetime.combine(coverage_start, datetime.min.time())
+    capture_at = datetime.combine(capture_start, datetime.min.time())
+    prefix: list[Mapping[str, Any]] = []
+    delta: list[Mapping[str, Any]] = []
+    seen = set()
+    for row in source_rows:
+        if not isinstance(row, Mapping) or row.get("stock_code") != stock_code:
+            raise ValueError("fallback announcement delta stock differs")
+        event_key = row.get("event_key")
+        raw_published_at = row.get("published_at")
+        published_at, _, _ = normalize_published_at(raw_published_at)
+        if (
+            not isinstance(event_key, str) or not event_key or event_key in seen
+            or published_at is None or raw_published_at != _dt_text(published_at)
+            or published_at.date().isoformat() != row.get("event_date")
+            or not start_at <= published_at <= cutoff
+        ):
+            raise ValueError("fallback announcement delta publication differs")
+        seen.add(event_key)
+        (prefix if published_at < capture_at else delta).append(row)
+    return prefix, delta
+
+
 def _fallback_event_receipt_valid(
     evidence: Mapping[str, Any],
     *,
     source: str,
     stock_code: str,
     result_count: int,
+    source_rows: list[Mapping[str, Any]] | None = None,
 ) -> bool:
     """Recheck fallback evidence at the immutable coverage write boundary."""
 
@@ -472,10 +669,18 @@ def _fallback_event_receipt_valid(
         else "probiga.announcement-provider-receipt.v1"
     )
     qmt_code = str(receipt.get("qmt_code") or "")
-    requested_start = (
-        str(evidence.get("window_start") or "").replace("-", "")
-        + "000000"
-    )
+    requested_start_date = str(evidence.get("window_start") or "")
+    chain = evidence.get("incremental_proof")
+    if isinstance(chain, Mapping) and chain.get("mode") == "DELTA_OVER_PARENT":
+        if source_rows is None or len(source_rows) != result_count:
+            return False
+        try:
+            _, delta = _fallback_announcement_delta_parts(evidence, source_rows, stock_code=stock_code)
+        except (KeyError, TypeError, ValueError):
+            return False
+        requested_start_date = chain["capture_window_start"]
+        result_count = len(delta)
+    requested_start = requested_start_date.replace("-", "") + "000000"
     if (
         receipt.get("schema") != schema
         or receipt.get("status") != "COMPLETE"
@@ -546,6 +751,8 @@ def _fallback_event_receipt_valid(
     }
     if "excluded_after_cutoff" in receipt:
         pagination_payload["excluded_after_cutoff"] = receipt["excluded_after_cutoff"]
+    if "pagination_frozen_proof" in receipt:
+        pagination_payload["pagination_frozen_proof"] = receipt["pagination_frozen_proof"]
     date_shard_manifest = receipt.get("date_shard_manifest")
     date_shard_manifest_hash = str(
         receipt.get("date_shard_manifest_sha256") or ""
@@ -637,112 +844,18 @@ def _fallback_event_receipt_valid(
         and complete_round_hashes in (None, [])
         and complete_round_attempts in (None, [])
         and split_version == ""
+        and "pagination_frozen_proof" not in receipt
     )
     shard_proof_valid = False
     if shard_mode:
-        try:
-            requested_start_date = datetime.strptime(
-                requested_start[:8], "%Y%m%d"
-            ).date()
-            requested_end_date = datetime.strptime(
-                str(evidence.get("query_end_time") or "")[:8], "%Y%m%d"
-            ).date()
-        except (TypeError, ValueError):
-            return False
-        if isinstance(date_shard_manifest, list) and date_shard_manifest:
-            cursor = requested_start_date
-            shard_total = 0
-            tree_query_count = 2 * len(date_shard_manifest) - 1
-            shard_hashes: list[str] = []
-            normalized_shards: list[dict[str, Any]] = []
-            required_shard_fields = {
-                "window_start", "window_end", "capture_mode", "result_count",
-                "provider_reported_totalpages", "provider_page_count",
-                "page_sha256", "last_page_has_more",
-            }
-            for raw_shard in date_shard_manifest:
-                if (
-                    not isinstance(raw_shard, Mapping)
-                    or set(raw_shard) != required_shard_fields
-                ):
-                    normalized_shards = []
-                    break
-                try:
-                    shard_start = datetime.strptime(
-                        str(raw_shard.get("window_start") or ""), "%Y-%m-%d"
-                    ).date()
-                    shard_end = datetime.strptime(
-                        str(raw_shard.get("window_end") or ""), "%Y-%m-%d"
-                    ).date()
-                    shard_count = int(raw_shard.get("result_count"))
-                    shard_reported_pages = int(
-                        raw_shard.get("provider_reported_totalpages")
-                    )
-                    shard_page_count = int(
-                        raw_shard.get("provider_page_count")
-                    )
-                except (TypeError, ValueError, OverflowError):
-                    normalized_shards = []
-                    break
-                capture_mode = str(raw_shard.get("capture_mode") or "")
-                shard_hash = str(raw_shard.get("page_sha256") or "")
-                expected_physical_pages = max(1, (shard_count + 29) // 30)
-                if (
-                    shard_start != cursor
-                    or shard_start > shard_end
-                    or shard_end > requested_end_date
-                    or shard_count < 0
-                    or shard_reported_pages != shard_count // 30
-                    or shard_page_count != expected_physical_pages
-                    or shard_page_count > max_pages
-                    or _HASH_RE.fullmatch(shard_hash) is None
-                    or raw_shard.get("last_page_has_more") is not False
-                    or (capture_mode == "SINGLE_PAGE" and shard_count > 30)
-                    or (
-                        capture_mode == "DENSE_DAY_COMPLETE_SWEEP"
-                        and not (
-                            shard_start == shard_end
-                            and shard_count > 30
-                            and shard_page_count > 1
-                        )
-                    )
-                    or capture_mode not in {
-                        "SINGLE_PAGE", "DENSE_DAY_COMPLETE_SWEEP"
-                    }
-                ):
-                    normalized_shards = []
-                    break
-                normalized_shards.append({
-                    "window_start": shard_start.isoformat(),
-                    "window_end": shard_end.isoformat(),
-                    "capture_mode": capture_mode,
-                    "result_count": shard_count,
-                    "provider_reported_totalpages": shard_reported_pages,
-                    "provider_page_count": shard_page_count,
-                    "page_sha256": shard_hash,
-                    "last_page_has_more": False,
-                })
-                shard_hashes.append(shard_hash)
-                shard_total += shard_count
-                tree_query_count += shard_page_count - 1
-                cursor = shard_end + timedelta(days=1)
-            expected_shard_hash = canonical_hash({
-                "schema": "probiga.cninfo-date-shard-manifest.v1",
-                "stock_code": stock_code,
-                "requested_start_time": requested_start,
-                "requested_end_time": evidence.get("query_end_time"),
-                "shards": normalized_shards,
-            })
-            round_hashes_valid = bool(
-                isinstance(complete_round_hashes, list)
-                and len(complete_round_hashes) == pagination_round_count
-                and all(
-                    _HASH_RE.fullmatch(str(value or ""))
-                    for value in complete_round_hashes
-                )
-                and pagination_round_count >= 2
-                and complete_round_hashes[-1] == complete_round_hashes[-2]
-            )
+        details = _cninfo_shard_manifest_details(
+            date_shard_manifest, stock_code=stock_code,
+            requested_start_time=requested_start,
+            requested_end_time=str(evidence.get("query_end_time") or ""),
+            max_pages=max_pages,
+        )
+        if details is not None:
+            shard_total, tree_query_count, shard_hashes, expected_shard_hash = details
             round_attempts_valid = bool(
                 isinstance(complete_round_attempts, list)
                 and len(complete_round_attempts) == pagination_round_count
@@ -756,19 +869,13 @@ def _fallback_event_receipt_valid(
                 == pagination_attempt_count - 1
             )
             shard_proof_valid = bool(
-                normalized_shards
-                and cursor == requested_end_date + timedelta(days=1)
-                and normalized_shards == date_shard_manifest
-                and date_shard_count == len(normalized_shards)
+                date_shard_count == len(shard_hashes)
                 and page_count == date_shard_count
                 and expected_pages == date_shard_count
                 and page_hashes == shard_hashes
                 and shard_total == total
                 and date_shard_manifest_hash == expected_shard_hash
-                and date_shard_recheck_hash == expected_shard_hash
                 and split_version == CNINFO_DATE_SHARD_SPLIT_VERSION
-                and receipt.get("quality_status")
-                == "EXACT_STOCK_DATE_SHARDS_DOUBLE_ATTESTED"
                 and 2 <= pagination_round_count
                 <= CNINFO_DATE_SHARD_MAX_CAPTURE_ROUNDS
                 and 2 <= pagination_attempt_count
@@ -777,9 +884,12 @@ def _fallback_event_receipt_valid(
                 < pagination_attempt_count
                 and pagination_attempt_count
                 == pagination_round_count + pagination_invalid_round_count
-                and round_hashes_valid
                 and round_attempts_valid
-                and 2 * tree_query_count <= pagination_query_count <= max_pages
+                and _cninfo_shard_rounds_valid(
+                    receipt, round_count=pagination_round_count, query_count=pagination_query_count,
+                    final_tree_queries=tree_query_count, retained_count=result_count,
+                    raw_count=total, max_pages=max_pages,
+                )
                 and first_page_recheck == ""
             )
     return bool(
@@ -1698,6 +1808,7 @@ def _prepare_source_coverage(
             source=source_name,
             stock_code=code,
             result_count=len(normalized_rows),
+            source_rows=normalized_rows,
         )
         if (
             provider_name != source_name
@@ -1825,7 +1936,6 @@ def _write_source_coverage_chunk(
     lock = " FOR UPDATE" if mysql else ""
     columns = ", ".join(_SOURCE_COVERAGE_RECEIPT_COLUMNS)
     single = len(prepared) == 1
-    latest_columns = f"{columns}, payload_json" if single else columns
     scopes = sorted(by_scope)
     if mysql and not single:
         # Lock each scope's newest revision (or the missing prefix) without
@@ -1834,7 +1944,7 @@ def _write_source_coverage_chunk(
         latest_query = text(
             f"SELECT latest.* FROM JSON_TABLE(:scope_json, '$[*]' "
             "COLUMNS (scope_hash CHAR(64) PATH '$')) AS requested "
-            f"JOIN LATERAL (SELECT {latest_columns} FROM {SOURCE_COVERAGE_TABLE} "
+            f"JOIN LATERAL (SELECT {columns} FROM {SOURCE_COVERAGE_TABLE} "
             "FORCE INDEX (uk_pit_coverage_scope_revision) "
             "WHERE scope_hash = requested.scope_hash COLLATE utf8mb4_bin "
             "ORDER BY scope_hash DESC, revision_no DESC LIMIT 1 FOR UPDATE"
@@ -1845,7 +1955,7 @@ def _write_source_coverage_chunk(
         index = " FORCE INDEX (uk_pit_coverage_scope_revision)" if mysql else ""
         limit = " LIMIT 1" if single else ""
         latest_query = text(
-            f"SELECT {latest_columns} FROM {SOURCE_COVERAGE_TABLE}{index} "
+            f"SELECT {columns} FROM {SOURCE_COVERAGE_TABLE}{index} "
             "WHERE scope_hash IN :scopes ORDER BY scope_hash, revision_no DESC"
             f"{limit}{lock}"
         ).bindparams(bindparam("scopes", expanding=True))
@@ -1857,21 +1967,24 @@ def _write_source_coverage_chunk(
             latest.setdefault(str(row["scope_hash"]), dict(row))
 
     matching_scopes: set[str] = set()
-    if single:
-        matching_scopes = {
-            scope for scope, row in latest.items()
-            if str(row["payload_json"] or "") == by_scope[scope]["payload_json"]
-        }
-    elif latest:
-        # Only newest rows can short-circuit by exact payload equality. Avoid
-        # reading payloads from prior revisions during the prefix lock scan.
+    # These values are part of the canonical payload. A mismatch rules out an
+    # exact replay without transferring the previous response body.
+    possible_replays = [
+        row["coverage_id"] for scope, row in latest.items()
+        if _row_datetime(row["covered_through_at"]) == by_scope[scope]["covered_through_at"]
+        and row["source_response_hash"] == by_scope[scope]["source_response_hash"]
+        and row["fact_set_hash"] == by_scope[scope]["fact_set_hash"]
+    ]
+    if possible_replays:
+        # Matching metadata is only a prefilter. Compare the actual payload
+        # bytes, including the capture evidence and original timestamps.
         latest_payload_query = text(
             f"SELECT scope_hash, payload_json FROM {SOURCE_COVERAGE_TABLE} "
             f"WHERE coverage_id IN :ids{lock}"
         ).bindparams(bindparam("ids", expanding=True))
         with connection.execute(
             latest_payload_query.execution_options(stream_results=True),
-            {"ids": [row["coverage_id"] for row in latest.values()]},
+            {"ids": possible_replays},
         ) as result:
             for row in result.mappings():
                 scope = str(row["scope_hash"])
@@ -2946,6 +3059,7 @@ def _validate_coverage_chain(
                 source=row_source,
                 stock_code=str(row.get("stock_code") or "").zfill(6),
                 result_count=len(source_rows),
+                source_rows=source_rows,
             )
             historical = watermark_kind == "HISTORICAL_RECONSTRUCTION"
             reconstruction = evidence.get("reconstruction_provenance")
@@ -5409,6 +5523,12 @@ class _LiveEventSelection:
 
 
 @dataclass(frozen=True)
+class _SignedLiveEventSelection(_LiveEventSelection):
+    completion_at: datetime
+    bindings: Mapping[str, tuple[Mapping[str, str], ...]]
+
+
+@dataclass(frozen=True)
 class HistoricalEventRead:
     """In-run authoritative event proof and the exact cutoff it resolved."""
 
@@ -5440,6 +5560,123 @@ def _announcement_batch_read_reason(error: Exception) -> str:
     return reason or f"PIT_QMT_EVENT_BATCH_UNAVAILABLE:{type(error).__name__}"
 
 
+def _bind_signed_live_event_selection(
+    engine: Engine, receipt: Mapping[str, Any], *, codes: list[str],
+    decision: datetime, cutoff: datetime, completion: datetime,
+    window_start: date, window_end: date, phase: str,
+) -> _SignedLiveEventSelection:
+    from server.common.qmt_announcement_pit import (
+        QMT_ANNOUNCEMENT_TASK_SCHEMA,
+        validate_complete_qmt_announcement_batch,
+    )
+
+    source = receipt["source"]
+    if (
+        receipt["schema"] != QMT_ANNOUNCEMENT_TASK_SCHEMA or receipt["status"] != "COMPLETE"
+        or source not in {QMT_EVENT_SOURCE, CNINFO_EVENT_SOURCE}
+        or not receipt["batch_id"] or not _HASH_RE.fullmatch(str(receipt["batch_root_hash"]))
+        or not _HASH_RE.fullmatch(str(receipt["stage_evidence_sha256"]))
+        or not _HASH_RE.fullmatch(str(receipt["stage_attempt_uid"]))
+    ):
+        raise ValueError("signed announcement stage identity differs")
+    captured: list[dict[str, tuple[dict[str, Any], list[dict[str, str]]]]] = []
+    batch = validate_complete_qmt_announcement_batch(
+        engine, codes=codes, decision_at=decision, fact_cutoff_at=cutoff,
+        window_start=window_start, window_end=window_end, source=source,
+        _required_batch_id=receipt["batch_id"], _capture_bound_members=captured.append,
+    )
+    if len(captured) != 1 or any(
+        batch.get(field) != receipt[field] for field in (
+            "batch_id", "batch_root_hash", "source", "fact_cutoff_at", "received_at",
+            "window_start", "window_end", "capture_window_start", "incremental_chain_root_hash",
+            "parent_batch_id", "parent_batch_root_hash", "catalog_batch_id",
+            "catalog_manifest_hash", "catalog_member_set_hash", "fallback_reason",
+        )
+    ) or batch.get("catalog_member_count") != receipt.get("stock_count"):
+        raise ValueError("announcement durable batch differs from its signed stage receipt")
+    members = captured[0]
+    return _SignedLiveEventSelection(
+        engine=engine, decision_at=decision, window_start=window_start, window_end=window_end,
+        batch=MappingProxyType({
+            **batch, f"{phase}_stage": {
+                "attempt_uid": receipt["stage_attempt_uid"],
+                "evidence_sha256": receipt["stage_evidence_sha256"],
+                "completed_at": _dt_text(completion),
+            },
+        }),
+        members=MappingProxyType({
+            code: (MappingProxyType(row), True) for code, (row, _) in members.items()
+        }),
+        completion_at=completion,
+        bindings=MappingProxyType({
+            code: tuple(MappingProxyType(binding) for binding in bindings)
+            for code, (_, bindings) in members.items()
+        }),
+    )
+
+
+def _load_certified_initial_event_selection(
+    engine: Engine, required: FrozenInitialAnnouncement, *, codes: list[str],
+    decision: datetime, data_date: date, window_start: date, window_end: date,
+) -> _SignedLiveEventSelection:
+    from server.common.authoritative_market_clock import STRATEGY_POOL_INITIAL_TIME
+    from server.common.daily_delivery_control import FrozenInitialAnnouncement
+
+    if not isinstance(required, FrozenInitialAnnouncement):
+        raise ValueError("initial announcement requires a verified stage receipt")
+    receipt = required.receipt
+    cutoff = _row_datetime(receipt["fact_cutoff_at"])
+    received = _row_datetime(receipt["received_at"])
+    completion = _row_datetime(receipt["stage_finished_at"])
+    if (
+        receipt.get("mode")
+        or receipt["window_start"] != (data_date - timedelta(days=30)).isoformat()
+        or receipt["window_end"] != data_date.isoformat()
+        or not data_date == cutoff.date() == window_end
+        or decision != datetime.combine(data_date, STRATEGY_POOL_INITIAL_TIME)
+        or not cutoff <= received <= completion <= decision
+    ):
+        raise ValueError("initial announcement source or completion scope differs")
+    return _bind_signed_live_event_selection(
+        engine, receipt, codes=codes, decision=decision, cutoff=cutoff, completion=completion,
+        window_start=window_start, window_end=window_end, phase="initial",
+    )
+
+
+def _load_certified_premarket_event_selection(
+    engine: Engine, required: FrozenPremarketAnnouncement, *, codes: list[str],
+    decision: datetime, data_date: date, window_start: date, window_end: date,
+) -> _SignedLiveEventSelection:
+    from server.common.daily_delivery_control import FrozenPremarketAnnouncement
+
+    if not isinstance(required, FrozenPremarketAnnouncement):
+        raise ValueError("premarket announcement requires a verified stage receipt")
+    receipt = required.receipt
+    stage = receipt["premarket_source"]
+    cutoff = _row_datetime(receipt["fact_cutoff_at"])
+    received = _row_datetime(receipt["received_at"])
+    published = _row_datetime(receipt["publish_completed_at"])
+    completion = _row_datetime(receipt["stage_finished_at"])
+    if (
+        stage["data_trade_date"] != data_date.isoformat()
+        or receipt["coverage_target_date"] != data_date.isoformat()
+        or stage["execution_session_date"] != window_end.isoformat()
+        or receipt["window_end"] != window_end.isoformat()
+        or not data_date < cutoff.date() == window_end == decision.date()
+        or cutoff != _row_datetime(stage["source_cutoff_at"])
+        or decision != _row_datetime(stage["decision_cutoff_at"])
+        or not cutoff <= received <= published <= completion <= decision
+        or receipt["parent_batch_id"] != stage["parent_batch_id"]
+        or receipt["parent_batch_root_hash"] != stage["parent_batch_root_hash"]
+        or receipt["source"] != stage["parent_source"]
+    ):
+        raise ValueError("premarket announcement source or completion scope differs")
+    return _bind_signed_live_event_selection(
+        engine, receipt, codes=codes, decision=decision, cutoff=cutoff, completion=completion,
+        window_start=window_start, window_end=window_end, phase="premarket",
+    )
+
+
 def resolve_common_fact_cutoff(
     engine: Engine,
     *,
@@ -5454,6 +5691,9 @@ def resolve_common_fact_cutoff(
     capture_historical_selection: Callable[[HistoricalEventRead], None] | None = None,
     event_checkpoint_path: Path | None = None,
     event_progress: Callable[[int, int], None] | None = None,
+    required_premarket_announcement: FrozenPremarketAnnouncement | None = None,
+    required_initial_announcement: FrozenInitialAnnouncement | None = None,
+    _dataset_cutoffs: bool = False,
 ) -> dict[str, Any]:
     """Resolve one immutable COMPLETE-coverage cutoff (T) for a live batch (E)."""
 
@@ -5480,6 +5720,17 @@ def resolve_common_fact_cutoff(
     }
     if not normalized_codes:
         return {**blocked, "reason": "PIT_COMMON_CUTOFF_EMPTY_SCOPE"}
+    if required_initial_announcement is not None and required_premarket_announcement is not None:
+        return {**blocked, "reason": "PIT_SIGNED_ANNOUNCEMENT_SCOPE_CONFLICT"}
+    signed_source = required_initial_announcement
+    signed_phase = "INITIAL"
+    read_signed_selection = _load_certified_initial_event_selection
+    if required_premarket_announcement is not None:
+        signed_source = required_premarket_announcement
+        signed_phase = "PREMARKET"
+        read_signed_selection = _load_certified_premarket_event_selection
+    if signed_source is not None and not (_dataset_cutoffs and require_qmt_event_batch and include_event_facts):
+        return {**blocked, "reason": f"PIT_{signed_phase}_ANNOUNCEMENT_SCOPE_REQUIRED"}
     for kind, (start, end) in windows.items():
         if start is None or end is None or start > end:
             raise ValueError(f"{kind} coverage window is invalid")
@@ -5507,7 +5758,17 @@ def resolve_common_fact_cutoff(
     event_batch: dict[str, Any] = {}
     historical_selections: list[HistoricalAnnouncementSelection] = []
     reusable_live_batch: list[bool] = []
-    if require_qmt_event_batch and include_event_facts:
+    signed_live_selection = None
+    if signed_source is not None:
+        try:
+            signed_live_selection = read_signed_selection(
+                engine, signed_source, codes=normalized_codes, decision=decision,
+                data_date=windows["finance"][1], window_start=windows["event"][0], window_end=windows["event"][1],
+            )
+            event_batch = dict(signed_live_selection.batch)
+        except Exception as exc:
+            return {**blocked, "reason": f"PIT_{signed_phase}_ANNOUNCEMENT_INVALID:" + _announcement_batch_read_reason(exc)}
+    elif require_qmt_event_batch and include_event_facts:
         try:
             from server.common.qmt_announcement_pit import (
                 validate_complete_announcement_batch,
@@ -5532,7 +5793,8 @@ def resolve_common_fact_cutoff(
                 "reason": _announcement_batch_read_reason(exc),
             }
     historical_selection = next(iter(historical_selections), None)
-    scan_event = include_event_facts and historical_selection is None
+    exact_event_selection = signed_live_selection or historical_selection
+    scan_event = include_event_facts and exact_event_selection is None
     event_filter = ""
     query_params: dict[str, Any] = {
         "codes": normalized_codes,
@@ -5675,16 +5937,15 @@ def resolve_common_fact_cutoff(
             read_errors.append(f"{reason}:{detail}" if compressed and reason else type(exc).__name__)
 
     candidates: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
-    if historical_selection is not None:
-        # These exact batch members have already passed the full scope-chain,
-        # catalog and batch-root checks at this decision time.
-        for code, (row, _) in historical_selection.members.items():
+    if exact_event_selection is not None:
+        # The exact validator already checked the chosen batch and bound members.
+        for code, (row, _) in exact_event_selection.members.items():
             candidates[("event", code)].append(dict(row))
     live_scope_heads: set[str] = set()
     required_finance_report = finance_disclosure_gate(
         windows["finance"][1]
     ).minimum_report_date
-    chains = () if historical_selection is not None and finance_batch else coverage_chains()
+    chains = () if exact_event_selection is not None and finance_batch else coverage_chains()
     for (kind, code, _scope), chain, compressed, verified in chains:
         try:
             if compressed:
@@ -5793,16 +6054,26 @@ def resolve_common_fact_cutoff(
             **blocked,
             "reason": "PIT_COMMON_CUTOFF_INCOMPLETE:" + ",".join(missing),
         }
-    fact_cutoff = min(
-        _row_datetime(
-            row.get("_effective_covered_through_at")
-            or row.get("covered_through_at")
+    def covered_through(row: Mapping[str, Any]) -> datetime:
+        return _row_datetime(
+            row.get("_effective_covered_through_at") or row.get("covered_through_at")
         )
-        for row in selected
-    )
-    _, event_completion_at = _late_cninfo_completion(
-        engine, event_batch, fact_cutoff_at=fact_cutoff, decision_at=decision,
-    )
+
+    source_cutoffs = {
+        kind: min(covered_through(row) for row in selected if row["fact_kind"] == kind)
+        for kind in required_kinds
+    }
+    fact_cutoff = min(source_cutoffs.values())
+
+    def cutoff_for(row: Mapping[str, Any]) -> datetime:
+        return source_cutoffs[row["fact_kind"]] if _dataset_cutoffs else fact_cutoff
+
+    event_completion_at = None
+    if signed_live_selection is None:
+        _, event_completion_at = _late_cninfo_completion(
+            engine, event_batch, fact_cutoff_at=source_cutoffs.get("event", fact_cutoff)
+            if _dataset_cutoffs else fact_cutoff, decision_at=decision,
+        )
     retrospective_batch_id = (
         str(event_batch.get("batch_id") or "")
         if event_batch.get("mode") == "HISTORICAL_RECONSTRUCTION"
@@ -5818,12 +6089,19 @@ def resolve_common_fact_cutoff(
             == "HISTORICAL_RECONSTRUCTION"
             and _row_datetime(row.get("known_at")) <= decision
         )
+        and not (
+            signed_live_selection is not None
+            and row.get("fact_kind") == "event"
+            and row.get("batch_id") == event_batch["batch_id"]
+            and cutoff_for(row) == _row_datetime(event_batch["fact_cutoff_at"])
+            <= _row_datetime(row["known_at"]) <= signed_live_selection.completion_at <= decision
+        )
         and not _verified_cninfo_coverage_known(
-            row, event_batch, fact_cutoff_at=fact_cutoff, decision_at=decision,
+            row, event_batch, fact_cutoff_at=cutoff_for(row), decision_at=decision,
             completion_known_at=event_completion_at,
         )
         and not _live_capture_allowed(
-                fact_cutoff_at=fact_cutoff,
+                fact_cutoff_at=cutoff_for(row),
                 decision_at=decision,
                 known_at=_row_datetime(row.get("known_at")),
             )
@@ -5872,6 +6150,11 @@ def resolve_common_fact_cutoff(
         },
         "receipts": receipts,
     }
+    if _dataset_cutoffs:
+        root_payload["schema"] = "probiga.strategy-pit-source-cutoffs.v1"
+        root_payload["source_cutoff_at"] = {
+            kind: _dt_text(cutoff) for kind, cutoff in source_cutoffs.items()
+        }
     if event_batch:
         root_payload["qmt_event_batch"] = event_batch
     if finance_batch:
@@ -5888,6 +6171,8 @@ def resolve_common_fact_cutoff(
         "receipt_root_hash": canonical_hash(root_payload),
         "receipts": receipts,
     }
+    if _dataset_cutoffs:
+        result["source_cutoff_at"] = root_payload["source_cutoff_at"]
     if event_batch:
         result["qmt_event_batch"] = event_batch
     if finance_batch:
@@ -5904,7 +6189,7 @@ def resolve_common_fact_cutoff(
             )
         })
     if capture_historical_selection is not None:
-        event_selection = historical_selection
+        event_selection = exact_event_selection
         if event_selection is None and reusable_live_batch:
             event_selection = _LiveEventSelection(
                 engine, decision, windows["event"][0], windows["event"][1],
@@ -5916,8 +6201,15 @@ def resolve_common_fact_cutoff(
                 }),
             )
         if event_selection is not None:
-            capture_historical_selection(HistoricalEventRead(event_selection, fact_cutoff))
+            event_cutoff = source_cutoffs["event"] if _dataset_cutoffs else fact_cutoff
+            capture_historical_selection(HistoricalEventRead(event_selection, event_cutoff))
     return result
+
+
+
+def resolve_strategy_fact_cutoffs(engine: Engine, **inputs: Any) -> dict[str, Any]:
+    """Seal each consumed source at its own proven frontier under one decision time."""
+    return resolve_common_fact_cutoff(engine, _dataset_cutoffs=True, **inputs)
 
 
 def load_finance_data_exclusions(
@@ -6516,6 +6808,78 @@ def load_finance_history_facts(
     )
 
 
+def _query_signed_bound_event_revisions(
+    engine: Engine, selection: _SignedLiveEventSelection,
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """Resolve only identities committed to the exact signed coverage receipt."""
+    from server.common.qmt_announcement_pit import (
+        LIVE_ANNOUNCEMENT_BATCH_VALIDATION_BUDGET_SECONDS, _live_announcement_reply_budget,
+    )
+
+    deadline = monotonic() + LIVE_ANNOUNCEMENT_BATCH_VALIDATION_BUDGET_SECONDS
+    expected = {}
+    for code, bindings in selection.bindings.items():
+        for binding in bindings:
+            revision_id = binding["revision_id"]
+            if revision_id in expected:
+                raise ValueError("signed announcement fact binding is duplicated")
+            expected[revision_id] = (code, binding["content_hash"])
+    if not expected:
+        return [], {}
+    selected = {}
+    histories = []
+    params = {
+        "known": _row_datetime(selection.batch["received_at"]),
+        "source": selection.batch["source"],
+    }
+    with engine.connect() as connection:
+        bound_statement = text(f"""
+            SELECT /*+ MAX_EXECUTION_TIME(15000) */ revision_id,content_hash,identity_hash,
+                   stock_code,event_date,published_at,revision_no
+            FROM {EVENT_REVISION_TABLE}
+            WHERE revision_id IN :ids AND source=:source
+              AND known_at<=:known AND received_at<=:known
+        """).bindparams(bindparam("ids", expanding=True))
+        ids = sorted(expected)
+        limit = COMMON_FACT_CUTOFF_QUERY_CODE_LIMIT
+        for offset in range(0, len(ids), limit):
+            requested = ids[offset:offset + limit]
+            with _live_announcement_reply_budget(connection, deadline=deadline, stage="signed-announcement-bound-revisions"):
+                observed = connection.execute(
+                    bound_statement, {**params, "ids": requested},
+                ).mappings().all()
+            if {item["revision_id"] for item in observed} != set(requested):
+                raise ValueError("signed announcement bound revision is missing")
+            for row in observed:
+                if (row["stock_code"], row["content_hash"]) != expected[row["revision_id"]]:
+                    raise ValueError("signed announcement bound content differs")
+                day = (
+                    _row_datetime(row["published_at"]).date()
+                    if row["published_at"] is not None else _date_value(row["event_date"], required=True)
+                )
+                if selection.window_start <= day <= selection.window_end:
+                    identity = row["identity_hash"]
+                    if identity in selected:
+                        raise ValueError("signed announcement identity has conflicting bindings")
+                    selected[identity] = row["revision_id"], int(row["revision_no"])
+        history_statement = text(f"""
+            SELECT /*+ MAX_EXECUTION_TIME(15000) */ * FROM {EVENT_REVISION_TABLE}
+            WHERE identity_hash IN :ids AND source=:source
+              AND known_at<=:known AND received_at<=:known
+            ORDER BY stock_code,identity_hash,revision_no
+        """).bindparams(bindparam("ids", expanding=True))
+        identities = sorted(selected)
+        for offset in range(0, len(identities), limit):
+            requested = identities[offset:offset + limit]
+            with _live_announcement_reply_budget(connection, deadline=deadline, stage="signed-announcement-bound-history"):
+                for row in connection.execute(history_statement, {**params, "ids": requested}).mappings():
+                    if row["revision_no"] <= selected[row["identity_hash"]][1]:
+                        histories.append(dict(row))
+    if set(selected) != {row["identity_hash"] for row in histories}:
+        raise ValueError("signed announcement bound revision history is missing")
+    return histories, {identity: binding[0] for identity, binding in selected.items()}
+
+
 def load_event_facts(
     engine: Engine,
     *,
@@ -6606,13 +6970,17 @@ def load_event_facts(
                 reason="PIT_EVENT_LATE_PUBLICATION_NOT_COMPLETED_AT_CUTOFF",
                 status=PIT_DATA_BLOCKED,
             )
+    bound_ids = {}
     try:
-        rows = _query_revisions(
-            engine, table_name=EVENT_REVISION_TABLE, codes=normalized_codes,
-            decision_at=decision, start_date=start, end_date=end,
-            source=(str(event_batch.get("source") or "") if event_batch else ""),
-            batch_id=str(event_batch.get("batch_id") or ""),
-        )
+        if isinstance(selection, _SignedLiveEventSelection):
+            rows, bound_ids = _query_signed_bound_event_revisions(engine, selection)
+        else:
+            rows = _query_revisions(
+                engine, table_name=EVENT_REVISION_TABLE, codes=normalized_codes,
+                decision_at=decision, start_date=start, end_date=end,
+                source=(str(event_batch.get("source") or "") if event_batch else ""),
+                batch_id=str(event_batch.get("batch_id") or ""),
+            )
     except Exception as exc:
         return _blocked_batch(
             table_name=EVENT_REVISION_TABLE, codes=normalized_codes,
@@ -6651,7 +7019,10 @@ def load_event_facts(
                     row, fact_cutoff_at=fact_cutoff, decision_at=decision,
                 )
                 for code, (row, is_scope_head) in selection.members.items()
-                if is_scope_head and int(row["result_count"]) == 0
+                if is_scope_head and (
+                    (not by_code_identity.get(code) if isinstance(selection, _SignedLiveEventSelection)
+                     else int(row["result_count"]) == 0)
+                )
             }
     except Exception as exc:
         empty_coverage = {}
@@ -6682,13 +7053,18 @@ def load_event_facts(
         selected_rows: list[dict[str, Any]] = []
         blocked_reasons: list[str] = []
         try:
-            for chain in identities.values():
+            for identity, chain in identities.items():
                 selected, selection_reason = _latest_revision_for_fact_cutoff(
                     chain,
                     fact_kind="event",
                     fact_cutoff_at=fact_cutoff,
                     decision_at=decision,
                 )
+                if isinstance(selection, _SignedLiveEventSelection) and (
+                    selected is None or selected["revision_id"] != bound_ids.get(identity)
+                ):
+                    blocked_reasons.append("PIT_EVENT_BOUND_REVISION_NOT_ELIGIBLE")
+                    continue
                 if selected is None:
                     if selection_reason:
                         blocked_reasons.append(selection_reason)

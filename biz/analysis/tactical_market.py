@@ -10,13 +10,15 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import asdict, dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Mapping
 
 import numpy as np
 import pandas as pd
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+
+from server.common.pit_facts import normalize_decision_at
 
 
 MODE_DEFENSIVE = "DEFENSIVE"
@@ -278,11 +280,22 @@ def load_tactical_context(
     *,
     trade_date: str,
     frame: pd.DataFrame,
+    decision_known_at: datetime | str | None = None,
 ) -> dict[str, Any]:
     current = market_snapshot(frame, trade_date)
-    previous = load_previous_snapshot(
-        engine, trade_date=trade_date, frame=frame
-    )
+    if decision_known_at is None:
+        previous = load_previous_snapshot(engine, trade_date=trade_date, frame=frame)
+    else:
+        window = frame.attrs.get("qmt_daily_input_window") or {}
+        previous = frame.attrs.get("tactical_previous_market")
+        known_at = window.get("decision_known_at")
+        if (
+            not isinstance(previous, MarketSnapshot)
+            or previous.trade_date != _previous_session(trade_date, frame)
+            or not known_at
+            or normalize_decision_at(known_at) != normalize_decision_at(decision_known_at)
+        ):
+            raise RuntimeError("DATA_BLOCKED: tactical prior market snapshot differs from fixed cutoff")
     return classify_mode(current, previous)
 
 
@@ -433,7 +446,7 @@ def attach_intraday_tactical_features(
                 out[column], errors="coerce"
             ).fillna(default)
 
-    stable = bool((index_stability or {}).get("stable"))
+    stable = (index_stability or {}).get("status") == "AVAILABLE" and bool((index_stability or {}).get("stable"))
     candidate = out.get(
         "tactical_candidate", pd.Series(False, index=out.index)
     ).fillna(False).astype(bool)
@@ -455,14 +468,14 @@ def attach_intraday_tactical_features(
     daily_score = pd.to_numeric(
         out.get("tactical_score", 0.0), errors="coerce"
     ).fillna(0.0)
-    intraday_bonus = (
+    minute_bonus = (
         available.astype(float) * 4.0
         + rebound.clip(0.0, 22.0) / 22.0 * 18.0
         + close_vs_vwap.clip(-5.0, 5.0).add(5.0) / 10.0 * 10.0
         + hold.clip(0.0, 120.0) / 120.0 * 12.0
         - open_count.clip(0.0, 5.0) * 3.0
-        + (5.0 if stable else 0.0)
-    )
+    ).where(available, 0.0)
+    intraday_bonus = minute_bonus + (5.0 if stable else 0.0)
     out["intraday_tactical_score"] = (
         daily_score + intraday_bonus
     ).clip(0.0, 100.0).where(candidate, 0.0).round(2)

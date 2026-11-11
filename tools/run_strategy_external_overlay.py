@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""Capture the 08:30 external market and revise strategy governance scores."""
+"""Prepare one frozen next-session strategy pool without replacing the first."""
 from __future__ import annotations
 
 import argparse
@@ -12,126 +11,99 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from sqlalchemy import text
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from biz.analysis.sync_analysis_fast import previous_trade_date
-from biz.market_context.external_market import (
-    EXTERNAL_MARKET_SYMBOLS,
-    fetch_external_market_snapshot,
-    store_external_market_snapshot,
+from biz.analysis.sync_analysis_fast import prepare_frozen_strategy_pool_scoring
+from server.common.authoritative_market_clock import (
+    PRODUCTION_TIMEZONE, STRATEGY_POOL_PREMARKET_PUBLICATION_DEADLINE,
+    authoritative_elapsed_trade_date, resolve_strategy_pool_decision_slot,
 )
-from server.common.authoritative_market_clock import PRODUCTION_TIMEZONE
 from server.common.batch_db import create_batch_engine
-from server.engine.strategy_center import external_market_score_adjustment
-from tools.run_strategy_governance_daily import (
-    _load_project_env,
-    run_daily_governance,
-)
+from server.common.component_release import runtime_contract_build_sha
+from server.common.daily_delivery_control import load_frozen_premarket_announcement, read_daily_delivery
+from server.common.frozen_strategy_pool_work import PREMARKET_POOL_TASK, stage_frozen_pool_work
+from server.common.scheduler_terminal_journal import TerminalJournal
+from tools.run_strategy_governance_daily import _load_project_env
 
 
-def _now_shanghai_naive() -> datetime:
-    return datetime.now(PRODUCTION_TIMEZONE).replace(
-        tzinfo=None,
-        microsecond=0,
+def _exact_running_audit(engine, *, run_uid: str, build_sha: str, task_id: str) -> None:
+    if (
+        re.fullmatch(r"[0-9a-f]{32}", run_uid) is None
+        or re.fullmatch(r"[0-9a-f]{40}", build_sha) is None
+        or not task_id.isdecimal() or int(task_id) <= 0
+        or os.environ.get("PROBIGA_SCHEDULER_TASK_TYPE") != PREMARKET_POOL_TASK
+    ):
+        raise RuntimeError("premarket pool requires its exact scheduled audit")
+    with engine.connect() as connection:
+        audit = connection.execute(text("""
+            SELECT task_id, task_type, status, build_sha, trigger_source
+              FROM st_scheduled_task_history WHERE run_uid=:uid
+        """), {"uid": run_uid}).mappings().one_or_none()
+    if audit is None or dict(audit) != {
+        "task_id": int(task_id), "task_type": PREMARKET_POOL_TASK, "status": "running",
+        "build_sha": build_sha, "trigger_source": "scheduled",
+    }:
+        raise RuntimeError("premarket pool scheduler claim differs")
+
+
+def prepare_revision(engine, journal: TerminalJournal, *, run_uid: str, build_sha: str, task_id: str):
+    _exact_running_audit(engine, run_uid=run_uid, build_sha=build_sha, task_id=task_id)
+    now = datetime.now(PRODUCTION_TIMEZONE)
+    target = authoritative_elapsed_trade_date(engine, now=now)
+    slot = resolve_strategy_pool_decision_slot(
+        engine, data_trade_date=target, phase="PREMARKET_REVISION", evaluated_at=now,
     )
-
-
-def _neutral_external_context(reason: str) -> dict:
-    return {
-        "snapshot_id": "",
-        "captured_at": _now_shanghai_naive().isoformat(sep=" "),
-        "external_market_status": "UNKNOWN",
-        "external_market_score": 50.0,
-        "external_market_data_quality": "UNKNOWN",
-        "available_count": 0,
-        "expected_count": len(EXTERNAL_MARKET_SYMBOLS),
-        "source_warnings": [str(reason or "external market unavailable")[:300]],
-        "acquisition_status": "FAILED",
-        "missing_symbols": [symbol for symbol, _name in EXTERNAL_MARKET_SYMBOLS],
-    }
-
-
-def capture_external_context(engine) -> dict:
-    """Make one bounded fetch attempt; any failure becomes a neutral factor."""
-
-    try:
-        snapshot = fetch_external_market_snapshot(as_of=_now_shanghai_naive())
-    except Exception as exc:
-        logging.warning(
-            "External market capture failed; continuing neutral: %s",
-            type(exc).__name__,
-        )
-        return _neutral_external_context(type(exc).__name__)
-    try:
-        return store_external_market_snapshot(engine, snapshot)
-    except Exception as exc:
-        logging.warning(
-            "External market storage failed; continuing neutral: %s",
-            type(exc).__name__,
-        )
-        return _neutral_external_context(f"storage:{type(exc).__name__}")
+    if slot.execution_session_date != now.date().isoformat() or now.time() >= STRATEGY_POOL_PREMARKET_PUBLICATION_DEADLINE:
+        raise RuntimeError("premarket pool is outside the next session's evaluation window")
+    contract = runtime_contract_build_sha(expected_build_sha=build_sha)
+    initial = (read_daily_delivery(engine, trade_date=target, release_id=contract, attempt_limit=1) or {}).get("receipt")
+    decision = (initial or {}).get("frozen_pool_decision") or {}
+    if decision.get("phase") != "INITIAL" or decision.get("execution_session_date") != slot.execution_session_date:
+        return None, target, "PREMARKET_INITIAL_POOL_UNAVAILABLE"
+    source = load_frozen_premarket_announcement(engine, target, contract, slot)
+    if source is None:
+        return None, target, "PREMARKET_ANNOUNCEMENT_UNAVAILABLE_AT_SLOT"
+    scoring = prepare_frozen_strategy_pool_scoring(
+        engine, data_trade_date=target, phase="PREMARKET_REVISION",
+        run_uid=run_uid, build_sha=build_sha, required_premarket_announcement=source,
+    )
+    return stage_frozen_pool_work(
+        journal, run_uid=run_uid, build_sha=build_sha,
+        parent_receipt_uid=initial["receipt_uid"],
+        source_evidence_sha256=str(source.receipt["stage_evidence_sha256"]), scoring=scoring,
+    ), target, ""
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="08:30外围市场评分修正并更新正式策略治理票池"
-    )
-    parser.add_argument("--date", default="", help="默认使用上一完整交易日")
+    parser = argparse.ArgumentParser(description="08:30正式策略票池复核与修订")
     parser.add_argument("--json", action="store_true")
-    args = parser.parse_args()
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s - %(message)s",
-    )
+    parser.parse_args()
+    logging.basicConfig(level=logging.INFO)
     _load_project_env()
+    run_uid = os.environ.get("PROBIGA_SCHEDULER_HISTORY_RUN_UID", "")
+    build_sha = os.environ.get("PROBIGA_SCHEDULER_BUILD_SHA", "")
+    task_id = os.environ.get("PROBIGA_SCHEDULER_TASK_ID", "")
+    log_root = Path(os.environ.get("PROBIGA_JOB_LOG_ROOT") or "/var/lib/probiga/jobs")
     engine = create_batch_engine()
     try:
-        now = _now_shanghai_naive()
-        target = str(args.date or "").strip()[:10] or previous_trade_date(
-            engine,
-            now.isoformat(sep=" "),
+        work, target, reason = prepare_revision(
+            engine, TerminalJournal(log_root), run_uid=run_uid, build_sha=build_sha, task_id=task_id,
         )
-        external_context = capture_external_context(engine)
     finally:
         engine.dispose()
-
-    build_sha = str(
-        os.environ.get("PROBIGA_SCHEDULER_BUILD_SHA") or ""
-    ).strip().lower()
-    if build_sha and re.fullmatch(r"[0-9a-f]{40}", build_sha) is None:
-        raise RuntimeError("scheduler build SHA is invalid")
-    governance, process_exit = run_daily_governance(
-        requested_trade_date=target,
-        strategy_limit=500,
-        expected_build_sha=build_sha,
-        external_market_context=external_context,
-    )
-    completed = (
-        process_exit == 0
-        and governance.get("status") == "ok"
-        and governance.get("orchestration_status") == "COMPLETED"
-        and governance.get("automatic_real_order_submission") is False
-        and governance.get("real_order_authority") is False
-    )
-    payload = {
-        "status": "ok" if completed else "blocked",
-        "trade_date": target,
-        "external_market": external_context,
-        "acquisition_status": external_context.get("acquisition_status", "FAILED"),
-        "missing_symbols": external_context.get("missing_symbols", []),
-        "source_errors": external_context.get("source_warnings", []),
-        "score_adjustment": external_market_score_adjustment(
-            external_context
-        ),
-        "governance": governance,
-        "automatic_real_order_submission": False,
-        "real_order_authority": False,
-    }
-    print(json.dumps(payload, ensure_ascii=False, default=str))
-    return 0 if completed else (process_exit or 2)
+    if work is None:
+        print(json.dumps({
+            "schema": "probiga.premarket-pool-skipped.v1", "status": "blocked",
+            "trade_date": target, "reason_code": reason,
+            "automatic_real_order_submission": False, "real_order_authority": False,
+        }, ensure_ascii=False))
+        return 2
+    print(json.dumps(work, ensure_ascii=False))
+    return 0
 
 
 if __name__ == "__main__":

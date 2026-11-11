@@ -68,56 +68,41 @@ def test_0830_external_overlay_scheduler_contract_is_enabled():
     assert "QMT" in task["description"]
 
 
-def test_overlay_capture_failure_becomes_neutral(monkeypatch):
-    monkeypatch.setattr(
-        overlay,
-        "fetch_external_market_snapshot",
-        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("offline")),
-    )
-    result = overlay.capture_external_context(object())
-    assert result["external_market_score"] == 50.0
-    assert result["external_market_data_quality"] == "UNKNOWN"
-    assert result["acquisition_status"] == "FAILED"
-    assert result["expected_count"] == len(result["missing_symbols"]) == 41
-
-
-def test_overlay_main_passes_exact_snapshot_to_governance(monkeypatch, capsys):
+def test_overlay_emits_only_staged_work_reference(monkeypatch, capsys, tmp_path):
     engine = SimpleNamespace(dispose=lambda: None)
-    context = {
-        "snapshot_id": "snapshot-2",
-        "captured_at": "2026-08-31 08:30:05",
-        "external_market_data_quality": "PASS",
-        "external_market_status": "SUPPORT",
-        "external_market_score": 60.0,
-        "acquisition_status": "PARTIAL",
-        "missing_symbols": ["taiwan_semiconductor"],
-        "source_warnings": ["taiwan_semiconductor unavailable"],
-    }
-    governance = {
-        "status": "ok",
-        "orchestration_status": "COMPLETED",
-        "automatic_real_order_submission": False,
-        "real_order_authority": False,
-    }
+    reference = {"schema": "probiga.premarket-pool-work-reference.v1", "trade_date": "2026-08-28"}
     captured = {}
+    monkeypatch.setenv("PROBIGA_JOB_LOG_ROOT", str(tmp_path))
+    monkeypatch.setenv("PROBIGA_SCHEDULER_HISTORY_RUN_UID", "a" * 32)
+    monkeypatch.setenv("PROBIGA_SCHEDULER_BUILD_SHA", "b" * 40)
+    monkeypatch.setenv("PROBIGA_SCHEDULER_TASK_ID", "128")
     monkeypatch.setattr(overlay, "_load_project_env", lambda: None)
     monkeypatch.setattr(overlay, "create_batch_engine", lambda: engine)
-    monkeypatch.setattr(overlay, "previous_trade_date", lambda *_args: "2026-08-28")
-    monkeypatch.setattr(overlay, "capture_external_context", lambda _engine: context)
 
-    def run_governance(**kwargs):
-        captured.update(kwargs)
-        return governance, 0
+    def stage(_engine, journal, **identity):
+        captured.update(identity)
+        assert journal.root.parent == tmp_path
+        return reference, "2026-08-28", ""
 
-    monkeypatch.setattr(overlay, "run_daily_governance", run_governance)
+    monkeypatch.setattr(overlay, "prepare_revision", stage)
     monkeypatch.setattr(sys, "argv", ["run_strategy_external_overlay.py", "--json"])
-
     assert overlay.main() == 0
+    assert captured == {"run_uid": "a" * 32, "build_sha": "b" * 40, "task_id": "128"}
+    assert json.loads(capsys.readouterr().out) == reference
+
+
+def test_overlay_missing_source_has_explicit_terminal_result(monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("PROBIGA_JOB_LOG_ROOT", str(tmp_path))
+    monkeypatch.setattr(overlay, "_load_project_env", lambda: None)
+    monkeypatch.setattr(overlay, "create_batch_engine", lambda: SimpleNamespace(dispose=lambda: None))
+    monkeypatch.setattr(
+        overlay, "prepare_revision", lambda *_args, **_kw: (
+            None, "2026-08-28", "PREMARKET_ANNOUNCEMENT_UNAVAILABLE_AT_SLOT",
+        ),
+    )
+    monkeypatch.setattr(sys, "argv", ["run_strategy_external_overlay.py", "--json"])
+    assert overlay.main() == 2
     payload = json.loads(capsys.readouterr().out)
-    assert captured["requested_trade_date"] == "2026-08-28"
-    assert captured["external_market_context"] is context
-    assert payload["score_adjustment"] == 1.5
-    assert payload["status"] == "ok"
-    assert payload["acquisition_status"] == "PARTIAL"
-    assert payload["missing_symbols"] == ["taiwan_semiconductor"]
-    assert payload["source_errors"] == ["taiwan_semiconductor unavailable"]
+    assert payload["status"] == "blocked"
+    assert payload["trade_date"] == "2026-08-28"
+    assert payload["real_order_authority"] is False

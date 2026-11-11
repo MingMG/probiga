@@ -41,6 +41,7 @@ from server.common.qmt_datadir_result import (  # noqa: E402
     persisted_fingerprint,
 )
 from server.common.qmt_index_minute_grid import index_minute_grids  # noqa: E402
+from server.common.qmt_minute_publication_scope import seal_minute_security_publication  # noqa: E402
 from server.common.qmt_trade_calendar import (  # noqa: E402
     load_trade_calendar_receipt,
 )
@@ -481,6 +482,7 @@ def main(argv: list[str] | None = None) -> int:
             history,
             dataset=dataset,
             trade_date=day,
+            include_security_fingerprints=dataset == "index_minute",
         )
         with engine.begin() as connection:
             _write_receipt(
@@ -495,6 +497,10 @@ def main(argv: list[str] | None = None) -> int:
                 row_count=fingerprint["row_count"],
                 row_hash=fingerprint["row_hash"],
             )
+            if dataset == "index_minute":
+                seal_minute_security_publication(
+                    connection, dataset=dataset, trade_date=day, fingerprints=fingerprint,
+                )
     payload = _task_result(engine, dataset=dataset, sessions=sessions)
     print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
     return 0

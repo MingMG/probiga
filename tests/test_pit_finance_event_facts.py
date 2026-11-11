@@ -3509,6 +3509,35 @@ def test_finance_revision_chunks_preserve_nonfiling_with_single_connection_pool(
     assert engine.pool.checkedout() == 0
     engine.dispose()
 
+def test_strategy_cutoff_preserves_independently_verified_event_frontier():
+    engine = _engine()
+    cutoffs = {
+        "finance": ("1900-01-01", "2026-08-05 22:10:00"),
+        "event": ("2026-07-22", "2026-08-05 22:30:00"),
+    }
+    for kind, (start, observed) in cutoffs.items():
+        append_source_coverage(
+            engine, fact_kind=kind, stock_code="000001", window_start=start,
+            window_end="2026-08-05", known_at=observed, covered_through_at=observed,
+            watermark_kind="CAPTURED_AT", watermark_evidence={"source_call": "success"},
+            source_rows=[], fact_bindings=[], source=f"test.{kind}", batch_id=f"frozen-{kind}",
+        )
+    inputs = dict(
+        codes=["000001"], decision_at="2026-08-05 22:35:00",
+        finance_start_date="1900-01-01", finance_end_date="2026-08-05",
+        event_start_date="2026-07-22", event_end_date="2026-08-05",
+    )
+    common = resolve_common_fact_cutoff(engine, **inputs)
+    frozen = pit_module.resolve_strategy_fact_cutoffs(engine, **inputs)
+    assert common["status"] == frozen["status"] == PIT_AVAILABLE
+    assert frozen["source_cutoff_at"] == {
+        kind: observed.replace(" ", "T") + ".000000"
+        for kind, (_, observed) in cutoffs.items()
+    }
+    assert frozen["receipt_root_hash"] != common["receipt_root_hash"]
+    assert frozen["receipts"] == common["receipts"]
+
+
 def test_complete_late_cninfo_batch_is_visible_only_after_actual_receipt(tmp_path, monkeypatch):
     from server.common.announcement_provider import CninfoMarketAnnouncementProvider, ProviderBackedAnnouncementAdapter
     from server.common.qmt_announcement_pit import CNINFO_ANNOUNCEMENT_SOURCE, synchronize_qmt_announcements
@@ -3609,3 +3638,126 @@ def test_complete_late_cninfo_batch_is_visible_only_after_actual_receipt(tmp_pat
     assert result.status_for(codes[1]) == PIT_AVAILABLE
     assert result.facts[codes[0]]
     assert result.facts[codes[1]] == []
+
+
+def test_premarket_announcement_uses_only_completed_signed_batch_members(tmp_path):
+    from types import MappingProxyType
+    from server.common.daily_delivery_control import FrozenInitialAnnouncement, FrozenPremarketAnnouncement
+    from server.common.qmt_announcement_pit import synchronize_qmt_announcements
+    from tests.test_qmt_announcement_pit import _Clock, _XtData, _catalog, _frame, _install_catalog
+
+    engine = _engine()
+    codes = ["000001", "000002"]
+    data_date = date(2026, 8, 25)
+    start = data_date - timedelta(days=30)
+    source_cutoff = datetime(2026, 8, 26, 7)
+    decision = datetime(2026, 8, 26, 8, 30)
+    _install_catalog(engine, _catalog(*((code, f"{code}.SZ") for code in codes)))
+    for code in codes:
+        finance = {
+            "stock_code": code, "report_date": "2026-03-31", "report_type": "Q1",
+            "notice_date": "2026-04-25", "roe_wtd": 12.5,
+        }
+        revision = append_finance_revision(engine, finance, known_at="2026-08-25 18:01:00")
+        append_source_coverage(
+            engine, fact_kind="finance", stock_code=code, window_start="1900-01-01",
+            window_end=data_date, known_at="2026-08-25 18:01:00",
+            covered_through_at="2026-08-25 18:01:00", watermark_kind="CAPTURED_AT",
+            watermark_evidence={"source_call": "success"}, source_rows=[finance],
+            fact_bindings=[{"revision_id": revision.revision_id, "content_hash": revision.content_hash}],
+            source="adata.finance.core_index", batch_id="finance-first",
+        )
+    append_finance_atomic_batch_seal(engine, as_of_date=data_date, completed_known_at="2026-08-25 18:22:00")
+
+    import pandas as pd
+
+    def capture(frame, **options):
+        return synchronize_qmt_announcements(
+            engine, xtdata=_XtData({"000001.SZ": frame, "000002.SZ": pd.DataFrame()}),
+            checkpoint_root=tmp_path, **options,
+        )
+
+    parent = capture(_frame("000001", "2026-08-21 10:00:00"), now_fn=_Clock(datetime(2026, 8, 25, 18, 20)))
+    newer_evening = capture(
+        _frame("000001", "2026-08-25 19:00:00").assign(announcement_id="not-in-signed-initial"),
+        now_fn=_Clock(datetime(2026, 8, 25, 19, 5)), resume=False,
+    )
+    assert newer_evening["status"] == "COMPLETE"
+    initial_receipt = FrozenInitialAnnouncement(MappingProxyType({
+        **parent, "stage_finished_at": "2026-08-25T18:22:00+08:00",
+        "stage_attempt_uid": "c" * 64, "stage_evidence_sha256": "d" * 64,
+    }), MappingProxyType({}))
+    initial_cutoff = datetime(2026, 8, 25, 22, 20)
+    selected_initial = []
+    initial = pit_module.resolve_strategy_fact_cutoffs(
+        engine, codes=codes, decision_at=initial_cutoff, finance_start_date="1900-01-01",
+        finance_end_date=data_date, event_start_date=start, event_end_date=data_date,
+        require_qmt_event_batch=True, required_initial_announcement=initial_receipt,
+        capture_historical_selection=selected_initial.append,
+    )
+    assert initial["status"] == PIT_AVAILABLE, initial["reason"]
+    assert initial["qmt_event_batch"]["batch_id"] == parent["batch_id"]
+    initial_facts = load_event_facts(
+        engine, codes=codes, start_date=start, end_date=data_date,
+        decision_at=initial_cutoff, fact_cutoff_at=parent["fact_cutoff_at"],
+        require_qmt_complete_batch=True, historical_selection=selected_initial[0],
+    )
+    assert {item["event_key"] for item in initial_facts.facts[codes[0]]} == {"qmt:A-000001"}
+    signed_parent = {key: parent[key] for key in (
+        "batch_id", "batch_root_hash", "source", "fallback_reason", "received_at",
+        "window_start", "window_end", "fact_cutoff_at",
+    )}
+    signed_batch = capture(
+        _frame("000001", "2026-08-26 06:59:59").assign(announcement_id="signed-event"),
+        now_fn=_Clock(datetime(2026, 8, 26, 7, 45)), coverage_target_date=data_date,
+        capture_fact_cutoff_at=source_cutoff, completion_deadline_at=decision,
+        require_exact_capture_cutoff=True, required_incremental_parent=signed_parent,
+    )
+    assert signed_batch["status"] == "COMPLETE"
+    assert signed_batch["parent_batch_id"] == parent["batch_id"]
+    other_batch = capture(
+        _frame("000001", "2026-08-26 06:59:58").assign(announcement_id="not-signed"),
+        now_fn=_Clock(datetime(2026, 8, 26, 8, 5)),
+        capture_fact_cutoff_at=datetime(2026, 8, 26, 7, 55),
+        coverage_target_date=data_date, resume=False,
+    )
+    assert other_batch["status"] == "COMPLETE"
+    receipt = {
+        **signed_batch,
+        "premarket_source": {
+            "data_trade_date": data_date.isoformat(), "execution_session_date": decision.date().isoformat(),
+            "source_cutoff_at": source_cutoff.isoformat(), "decision_cutoff_at": decision.isoformat(),
+            "parent_batch_id": parent["batch_id"], "parent_batch_root_hash": parent["batch_root_hash"],
+            "parent_source": parent["source"],
+        },
+        "stage_finished_at": "2026-08-26T07:46:00+08:00",
+        "stage_attempt_uid": "a" * 64, "stage_evidence_sha256": "b" * 64,
+    }
+    inputs = {
+        "codes": codes, "decision_at": decision, "finance_start_date": "1900-01-01",
+        "finance_end_date": data_date, "event_start_date": start,
+        "event_end_date": decision.date(), "require_qmt_event_batch": True,
+    }
+    assert pit_module.resolve_strategy_fact_cutoffs(
+        engine, **inputs, required_premarket_announcement=receipt,
+    )["status"] == PIT_DATA_BLOCKED
+    late = FrozenPremarketAnnouncement(MappingProxyType({**receipt, "stage_finished_at": "2026-08-26T08:31:00+08:00"}))
+    assert pit_module.resolve_strategy_fact_cutoffs(
+        engine, **inputs, required_premarket_announcement=late,
+    )["status"] == PIT_DATA_BLOCKED
+    selections = []
+    proof = pit_module.resolve_strategy_fact_cutoffs(
+        engine, **inputs, required_premarket_announcement=FrozenPremarketAnnouncement(MappingProxyType(receipt)),
+        capture_historical_selection=selections.append,
+    )
+    assert proof["status"] == PIT_AVAILABLE, proof["reason"]
+    assert proof["source_cutoff_at"]["event"] == signed_batch["fact_cutoff_at"]
+    assert proof["qmt_event_batch"]["batch_id"] == signed_batch["batch_id"]
+    facts = load_event_facts(
+        engine, codes=codes, start_date=start, end_date=decision.date(),
+        decision_at=decision, fact_cutoff_at=source_cutoff,
+        require_qmt_complete_batch=True, historical_selection=selections[0],
+    )
+    assert {item["event_key"] for item in facts.facts[codes[0]]} == {"qmt:A-000001", "qmt:signed-event"}
+    assert facts.status_for(codes[1]) == PIT_AVAILABLE and facts.facts[codes[1]] == []
+    engine.dispose()
