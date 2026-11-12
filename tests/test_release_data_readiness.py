@@ -859,19 +859,25 @@ def test_concept_flow_is_a_checked_persisted_release_surface():
         connection.execute(text("""
             CREATE TABLE sm_concept_capital_flow_east (
                 index_code TEXT NOT NULL,
+                days_type INTEGER NOT NULL,
                 snapshot_at DATETIME NOT NULL
             )
         """))
         connection.execute(
             text("""
                 INSERT INTO sm_concept_capital_flow_east
-                (index_code, snapshot_at) VALUES (:code, :snapshot_at)
+                (index_code, days_type, snapshot_at) VALUES (:code, 1, :snapshot_at)
             """),
             [
                 {"code": code, "snapshot_at": "2026-08-26 00:00:00"}
                 for code in codes
             ],
         )
+        connection.execute(text("""
+            INSERT INTO sm_concept_capital_flow_east VALUES
+                ('BK099', 1, '2026-08-25 00:00:00'),
+                ('BK099', 5, '2026-08-26 00:00:00')
+        """))
     manifest = {
         "schema": "probiga.eastmoney-concept-flow-manifest.v1",
         "provider": "eastmoney.datacenter-web",
@@ -912,9 +918,11 @@ def test_concept_flow_is_a_checked_persisted_release_surface():
     assert result.checked is True
     assert result.ok is True
     with engine.begin() as connection:
-        connection.execute(text(
-            "DELETE FROM sm_concept_capital_flow_east WHERE index_code='BK099'"
-        ))
+        connection.execute(text("""
+            DELETE FROM sm_concept_capital_flow_east
+            WHERE index_code='BK099' AND days_type=1
+              AND snapshot_at='2026-08-26 00:00:00'
+        """))
     rejected = scheduler_validation.validate_scheduler_task_result(
         {"task_type": "eastmoney_concept_flow_snapshot"},
         engine=engine,

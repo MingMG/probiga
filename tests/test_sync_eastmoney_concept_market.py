@@ -398,6 +398,132 @@ def test_blocked_cli_receipt_keeps_target_and_directory_counts(
     assert "BK0002.high is not numeric" in receipt["reason"]
 
 
+@pytest.mark.parametrize("dataset", ["current", "kline"])
+@pytest.mark.parametrize("conflicting_existing_row", [False, True])
+def test_same_day_midnight_empty_quote_preserves_verified_closed_partition(
+    monkeypatch, tmp_path, dataset, conflicting_existing_row,
+):
+    from server.common import scheduler_validation as validation, sector_heatmap_store
+
+    engine = _atomic_engine()
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE si_trade_calendar (trade_date TEXT, trade_status INTEGER)"))
+        connection.execute(text("INSERT INTO si_trade_calendar VALUES (:d,1)"), {"d": TARGET})
+        connection.execute(text(
+            "INSERT INTO sm_concept_east_kline SELECT 'BK0099','2026-08-25 00:00:00',"
+            "'2026-08-25',k_type,open,close,high,low,volume,amount,`change`,change_pct,etl_sync_at "
+            "FROM sm_concept_east_kline WHERE index_code='BKOLD'"
+        ))
+        if conflicting_existing_row:
+            connection.execute(text(f"UPDATE {market.DATASET_TABLE[dataset]} SET index_code='BK0100' WHERE index_code='BKOLD'"))
+    tmp_path.chmod(0o700)
+    monkeypatch.setattr(sector_heatmap_store, "journal_runtime_root", lambda: tmp_path)
+    connection_factory = market._publication_connection
+    monkeypatch.setattr(market, "_publication_connection", lambda db, **_: connection_factory(
+        db, use_mysql_lock=False,
+    ))
+    eligible_codes = [f"BK{i:04}" for i in range(100)]
+    pending = _item("BK0100", source_time=SHANGHAI_CLOSE.replace(hour=0, minute=0))
+    pending.update({field: "-" for field in ("f2", "f3", "f4", "f5", "f6", "f15", "f16", "f17")})
+    provider = _Provider([*map(_item, eligible_codes), pending])
+    seen = []
+    empty = {"rc": 0, "data": {"code": "BK0100", "market": 90, "klines": []}}
+
+    def exact_empty(code, start, end):
+        seen.append((code, start, end))
+        return empty
+
+    provider.fetch_daily = exact_empty
+    if conflicting_existing_row:
+        with pytest.raises(market.DataBlocked, match="conflicts with persisted close row"):
+            market.run_publisher(
+                engine, provider, datasets=[dataset], trade_date=TARGET, now=RUN_TIME,
+                history_engine=engine,
+            )
+        with engine.connect() as connection:
+            retained = connection.execute(text(
+                f"SELECT index_code FROM {market.DATASET_TABLE[dataset]} WHERE trade_date=:d"
+            ), {"d": TARGET}).scalar_one()
+        assert retained == "BK0100"
+        assert seen == [("BK0100", TARGET, TARGET)]
+        engine.dispose()
+        return
+    result = market.run_publisher(
+        engine, provider, datasets=[dataset], trade_date=TARGET, now=RUN_TIME,
+        history_engine=engine,
+    )
+    receipt = market.build_receipt(
+        status="PASS", datasets=[dataset], started_at=RUN_TIME, finished_at=RUN_TIME,
+        requested_trade_date=TARGET, result=result,
+    )
+    assert seen == [("BK0100", TARGET, TARGET)]
+    assert receipt["status"] == "DEGRADED" and receipt["published"] is True
+    assert receipt["directory_count"] == 101
+    directory = dict(receipt["directory"])
+    assert directory.pop("manifest_sha256") == market._digest(directory)
+    assert directory["code_set_sha256"] == market._code_set_hash([*eligible_codes, "BK0100"])
+    assert directory["first_source_time"].startswith(f"{TARGET}T00:00:00")
+    coverage = directory["session_coverage"]
+    assert coverage["eligible_count"] == 100 and coverage["excluded_count"] == 1
+    assert coverage["exclusions"] == [{
+        "code": "BK0100", "source_time": f"{TARGET}T00:00:00+08:00",
+        "reason": "NATIVE_DAILY_BAR_UNAVAILABLE", "history_url": market.DAILY_URL,
+        "history_response_sha256": market._digest(empty),
+    }]
+    evidence = receipt["dataset_results"][dataset]
+    assert evidence["row_count"] == 100
+    assert evidence["code_set_sha256"] == coverage["eligible_code_set_sha256"]
+    if dataset == "kline":
+        source = evidence["source_evidence"]
+        assert source["directory_manifest_sha256"] == receipt["directory"]["manifest_sha256"]
+        assert source["first_source_time"] == coverage["first_eligible_source_time"]
+    with engine.connect() as connection:
+        rows = connection.execute(text(
+            f"SELECT index_code FROM {market.DATASET_TABLE[dataset]} "
+            "WHERE trade_date=:d ORDER BY index_code"
+        ), {"d": TARGET}).scalars().all()
+        prior = connection.execute(text(
+            "SELECT index_code FROM sm_concept_east_kline WHERE trade_date='2026-08-25'"
+        )).scalar_one()
+    assert rows == eligible_codes and prior == "BK0099"
+    names = sector_heatmap_store.read_concept_names(TARGET, now=RUN_TIME.replace(tzinfo=None))
+    assert [row["index_code"] for row in names] == rows
+    output = json.dumps(receipt)
+    task_type = f"eastmoney_concept_{dataset}"
+    monkeypatch.setattr(validation, "routed_read_engine", lambda _sql, db: db)
+    assert validation._eastmoney_concept_market_output_status(task_type, output, return_code=0) == "degraded"
+    valid, reason = validation._validate_eastmoney_concept_market_receipt(
+        engine, task_type=task_type, output=output,
+        started_at=RUN_TIME.replace(tzinfo=None), now=RUN_TIME.replace(tzinfo=None, second=40),
+    )
+    assert valid, reason
+    engine.dispose()
+
+
+@pytest.mark.parametrize("mismatch", ["partial_quote", "intraday", "wrong_code", "missing_response", "native_bar"])
+def test_only_exact_midnight_no_bar_evidence_permits_degraded_publication(monkeypatch, calendar_engine, mismatch):
+    monkeypatch.setattr(market, "MIN_DIRECTORY_CODES", 2)
+    midnight = SHANGHAI_CLOSE.replace(hour=0, minute=0)
+    pending = _item("BK0003", source_time=midnight)
+    pending.update({field: "-" for field in ("f2", "f3", "f4", "f5", "f6", "f15", "f16", "f17")})
+    data = {"code": "BK0003", "market": 90, "klines": []}
+    if mismatch == "partial_quote":
+        pending["f2"] = 100
+    elif mismatch == "intraday":
+        pending["f124"] = int(midnight.replace(hour=10).timestamp())
+    elif mismatch == "wrong_code":
+        data["code"] = "BK9000"
+    elif mismatch == "native_bar":
+        data["klines"] = [_daily_line(TARGET)]
+    provider = _Provider([_item("BK0001"), _item("BK0002"), pending])
+    provider.fetch_daily = lambda *_args: {"rc": 0, "data": None if mismatch == "missing_response" else data}
+    monkeypatch.setattr(market, "publish_frames_atomically", lambda *_a, **_k: pytest.fail("must not publish"))
+    with pytest.raises(market.DataBlocked, match="before market close|exact no-bar evidence differs"):
+        market.run_publisher(
+            calendar_engine, provider, datasets=["kline"], trade_date=TARGET, now=RUN_TIME,
+        )
+
+
 def test_native_closed_daily_is_exact_quote_projection_without_history_requests(monkeypatch):
     monkeypatch.setattr(market, "MIN_DIRECTORY_CODES", 2)
     provider = _Provider([_item("BK0001"), _item("BK0002")])

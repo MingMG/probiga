@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pandas as pd
 import pytest
+from sqlalchemy import create_engine, text
 
+from server.api.routers import market_home
 from server.common.qmt_attestation_contract import canonical_digest
 from server.common.scheduler_validation import (
     scheduler_output_status,
@@ -82,9 +84,112 @@ def test_publisher_stamps_source_date_not_capture_date(monkeypatch):
     concept_flow.fetch_concept_flow()
 
     assert len(writes) == 1
-    assert {
-        value.strftime("%Y-%m-%d") for value in writes[0]["snapshot_at"]
-    } == {"2026-08-21"}
+    assert set(writes[0]["snapshot_at"]) == {"2026-08-21 00:00:00"}
+
+
+def test_daily_publisher_preserves_other_partitions_and_heatmap_reads_both_days(
+    monkeypatch, tmp_path, capsys
+):
+    engine = create_engine("sqlite://")
+    with engine.begin() as connection:
+        for ddl in (
+            """CREATE TABLE sm_concept_capital_flow_east (
+                id INTEGER PRIMARY KEY, days_type INTEGER, index_code TEXT,
+                index_name TEXT CHECK (index_name <> 'invalid'), change_pct REAL,
+                main_net_inflow REAL, main_net_inflow_rate REAL,
+                max_net_inflow REAL, max_net_inflow_rate REAL,
+                lg_net_inflow REAL, lg_net_inflow_rate REAL,
+                mid_net_inflow REAL, mid_net_inflow_rate REAL,
+                sm_net_inflow REAL, sm_net_inflow_rate REAL,
+                stock_code TEXT, stock_name TEXT, snapshot_at DATETIME, etl_sync_at DATETIME
+            )""",
+            "CREATE INDEX idx_sccf_days_snap ON sm_concept_capital_flow_east (days_type, snapshot_at)",
+            "CREATE TABLE si_trade_calendar (trade_date TEXT, trade_status INTEGER)",
+            """CREATE TABLE sm_concept_east_kline (index_code TEXT, trade_date TEXT,
+                trade_time TEXT, k_type INTEGER, change_pct REAL, close REAL,
+                `change` REAL, etl_sync_at DATETIME)""",
+            """CREATE TABLE st_hot_concept_ths_daily (plate_type INTEGER, concept_name TEXT,
+                concept_code TEXT, snapshot_date TEXT, change_pct REAL,
+                hot_tag TEXT, etl_sync_at DATETIME)""",
+            "INSERT INTO si_trade_calendar VALUES ('2026-11-11',1), ('2026-11-12',1)",
+            """INSERT INTO sm_concept_capital_flow_east (days_type,index_code,index_name,snapshot_at)
+                VALUES (5,'BK0001','five-day','2026-11-12 00:00:00')""",
+        ):
+            connection.execute(text(ddl))
+
+    now = datetime.fromisoformat("2026-11-13T07:00:00+08:00")
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz) if tz is not None else now.replace(tzinfo=None)
+
+    calendar = SimpleNamespace(batch_id="qmt-calendar", manifest_hash="a" * 64, session_set_hash="b" * 64)
+    monkeypatch.setenv("PROBIGA_JOB_LOG_ROOT", str(tmp_path))
+    monkeypatch.setattr(concept_flow, "datetime", FrozenDateTime)
+    monkeypatch.setattr(concept_flow, "create_batch_engine", lambda: engine)
+    monkeypatch.setattr(
+        concept_flow, "_authoritative_closed_session",
+        lambda _engine, *, now, requested_trade_date: (requested_trade_date, calendar),
+    )
+    monkeypatch.setattr(market_home, "get_engine", lambda: engine)
+    monkeypatch.setattr(market_home, "get_kline_engine", lambda: engine)
+
+    def publish(day, *, inflow, source_day=None, invalid_name=False):
+        rows = [
+            {
+                "BOARD_CODE": f"BK{index:04d}",
+                "BOARD_NAME": "invalid" if invalid_name else f"{day} concept {index}",
+                "TRADE_DATE": source_day or day,
+                "SUPERDEAL_NET": inflow + index,
+                "SUPERDEAL_NET_RATIO": 1.0,
+                "BIGDEAL_NET": inflow,
+                "BIGDEAL_NET_RATIO": 1.0,
+                "MAX_NETINFLOW_SEC": "",
+            }
+            for index in range(100)
+        ]
+        monkeypatch.setattr(
+            concept_flow, "_fetch_page",
+            lambda _date, _page: {"data": rows, "pages": 1, "count": len(rows)},
+        )
+        exit_code = concept_flow.main(["--strict-authority", "--trade-date", day, "--json"])
+        result = json.loads(capsys.readouterr().out.splitlines()[-1])
+        return exit_code, result
+
+    assert publish("2026-11-11", inflow=100)[1]["status"] == "COMPLETE"
+    assert publish("2026-11-12", inflow=200)[1]["status"] == "COMPLETE"
+    exit_code, result = publish("2026-11-12", inflow=300)
+    assert exit_code == 0
+    assert result["db_verified_rows"] == 100
+
+    exit_code, result = publish("2026-11-12", inflow=500, source_day="2026-11-11")
+    assert exit_code == 3
+    assert result["status"] == "BLOCKED"
+    exit_code, result = publish("2026-11-12", inflow=500, invalid_name=True)
+    assert exit_code == 2
+    assert result["status"] == "FAILED"
+
+    with engine.connect() as connection:
+        partitions = connection.execute(text("""
+            SELECT days_type, snapshot_at, COUNT(*), MAX(main_net_inflow)
+            FROM sm_concept_capital_flow_east
+            GROUP BY days_type, snapshot_at ORDER BY days_type, snapshot_at
+        """)).all()
+    assert partitions == [
+        (1, "2026-11-11 00:00:00", 100, 299),
+        (1, "2026-11-12 00:00:00", 100, 699),
+        (5, "2026-11-12 00:00:00", 1, None),
+    ]
+    for day, expected_flow in (("2026-11-11", 299), ("2026-11-12", 699)):
+        payload = market_home.build_sector_heatmap(
+            date.fromisoformat(day), now=now.replace(tzinfo=None, minute=1)
+        )
+        assert payload["trade_date"] == day
+        flow = payload["concept"]["net_inflow"]
+        assert flow["status"] == "available"
+        assert flow["rows"][0]["code"] == "BK0099"
+        assert flow["rows"][0]["value"] == expected_flow
 
 
 def test_partial_snapshot_is_blocked_before_atomic_replacement(monkeypatch):

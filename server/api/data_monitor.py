@@ -530,8 +530,9 @@ class Observer:
                    "alist_info": validation._eastmoney_alist_payload,
                    "concept": validation._eastmoney_concept_market_payload,
                    "hot_ths": validation._ths_hot_payload}
+        completed = "status IN ('success','degraded')" if spec.key == "concept" else "status='success'"
         history = self.read("business", "SELECT id,run_uid,build_sha,run_at,finished_at,output "
-            "FROM st_scheduled_task_history WHERE task_type=:task AND status='success' "
+            f"FROM st_scheduled_task_history WHERE task_type=:task AND {completed} "
             "AND exit_code=0 AND finished_at IS NOT NULL AND run_at>=:day AND finished_at<=:now "
             "ORDER BY run_at DESC,id DESC LIMIT 500", {"task": spec.task_type, "day": day, "now": current})
         for row in history:
@@ -620,6 +621,16 @@ class Observer:
                 raise ValueError("invalid concept receipt")
             # Native directory membership/hash rather than a QMT concept count.
             expected_count, match = self._concept_proof(payload, day)
+            coverage = payload["directory"].get("session_coverage")
+            if match and coverage:
+                excluded = coverage["excluded_count"]
+                total = expected_count + excluded
+                return dict(base, expected_count=total, actual_count=expected_count,
+                            missing_count=excluded, coverage_ratio=expected_count / total,
+                            status="partial", reason="其余概念板块已核验，列出的板块无源端收盘行情",
+                            missing_total=excluded, invalid_count=0,
+                            missing=[{"stock_code": item["code"], "missing_count": 1,
+                                      "reason": "源端未返回当日收盘行情"} for item in coverage["exclusions"]])
         elif spec.key == "hot":
             from server.common.hot_rank_source_contract import validate_persisted_hot_rank_receipt
             if payload.get("task_type") != spec.task_type:
@@ -653,7 +664,7 @@ class Observer:
         from tools import sync_eastmoney_concept_market as source
         from server.common.scheduler_validation import _eastmoney_concept_market_output_status
         import hashlib
-        if _eastmoney_concept_market_output_status("eastmoney_concept_kline", json.dumps(payload), return_code=0) != "success":
+        if _eastmoney_concept_market_output_status("eastmoney_concept_kline", json.dumps(payload), return_code=0) not in {"success", "degraded"}:
             raise ValueError("invalid concept publication")
         expected = payload["dataset_results"]["kline"]
         # Recheck historical content without requiring it to be today's latest session.
@@ -662,8 +673,12 @@ class Observer:
             "FROM sm_concept_east_kline WHERE trade_date=:day AND k_type=1 ORDER BY index_code,trade_time", {"day": day})
         codes = sorted({str(r["index_code"]) for r in rows})
         digest = hashlib.sha256("\n".join(codes).encode("utf-8")).hexdigest()
+        coverage = payload["directory"].get("session_coverage") or {}
+        excluded = {item["code"] for item in coverage.get("exclusions", [])}
+        full_digest = hashlib.sha256("\n".join(sorted(set(codes) | excluded)).encode("utf-8")).hexdigest()
         match = (len(rows) == int(expected["row_count"]) == len(codes)
-                 and digest == expected["code_set_sha256"] == payload["directory"]["code_set_sha256"]
+                 and digest == expected["code_set_sha256"] and not set(codes) & excluded
+                 and full_digest == payload["directory"]["code_set_sha256"]
                  and source.daily_content_hash(rows) == expected["content_sha256"])
         return int(expected["row_count"]), match
 

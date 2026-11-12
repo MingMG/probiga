@@ -178,6 +178,58 @@ def test_fixed_initial_does_not_reuse_preliminary_without_its_exact_source_contr
         )
 
 
+@pytest.mark.parametrize("source", ["finance", "event"])
+def test_formal_scoring_stops_on_global_pit_source_failure(source, monkeypatch, caplog):
+    from server.common.pit_facts import PITFactBatch, PIT_SCHEMA_UNAVAILABLE
+
+    codes = ["600001", "600002"]
+    trade_date = "2026-11-11"
+    reason = f"PIT_{source.upper()}_SCHEMA_UNAVAILABLE"
+    stage = f"{source}-revision-payload:80"
+    boundary = "QMT_ANNOUNCEMENT_LIVE_BATCH_REPLY_DEADLINE"
+    public_reason = f"{reason}:stage={stage}:reason={boundary}"
+    batch = PITFactBatch(
+        global_status=PIT_SCHEMA_UNAVAILABLE,
+        reason_by_code=dict.fromkeys(codes, f"{reason}:driver detail must stay private:stage={stage}:reason={boundary}"),
+    )
+    reader, load = (
+        ("load_finance_facts", analysis.load_finance)
+        if source == "finance" else ("load_event_facts", analysis.load_notice_features)
+    )
+    monkeypatch.setattr(analysis, reader, lambda *_args, **_kwargs: batch)
+    args = dict(engine=object(), trade_date=trade_date, stock_codes=codes, decision_at=f"{trade_date}T22:20:00")
+    with caplog.at_level("INFO", logger=analysis.logger.name):
+        with pytest.raises(RuntimeError, match=f"ANALYSIS_{source.upper()}_SOURCE_UNAVAILABLE:{public_reason}"):
+            load(**args, require_complete_source=True)
+    assert f"source={source} trade_date={trade_date}" in caplog.text
+    assert f"('{public_reason}', 2)" in caplog.text
+    assert "driver detail" not in caplog.text
+    assert len(load(**args)) == len(codes)
+
+
+def test_formal_scoring_keeps_sealed_exclusions_and_empty_announcement(monkeypatch):
+    from server.common.pit_facts import PITFactBatch, PIT_DATA_BLOCKED
+
+    args = dict(engine=object(), trade_date="2026-11-11", stock_codes=["600001", "600002"],
+                decision_at="2026-11-11T22:20:00", require_complete_source=True)
+    exclusion = {"coverage_status": "DATA_EXCLUDED", "coverage_id": "1" * 64}
+    finance = PITFactBatch(
+        status_by_code={"600001": PIT_DATA_BLOCKED, "600002": analysis.PIT_AVAILABLE},
+        reason_by_code={"600001": "PIT_FINANCE_DATA_EXCLUDED:PROVEN_EXCEPTION"},
+        coverage_by_code={"600001": exclusion},
+    )
+    event = PITFactBatch(
+        reason_by_code={"600001": "PIT_EVENT_AUTHORITATIVE_EMPTY"},
+        coverage_by_code={"600001": {"coverage_id": "2" * 64}},
+    )
+    monkeypatch.setattr(analysis, "load_finance_facts", lambda *_args, **_kwargs: finance)
+    monkeypatch.setattr(analysis, "load_event_facts", lambda *_args, **_kwargs: event)
+    assert analysis.load_finance(**args).iloc[0]["finance_data_exclusion"] == exclusion
+    notices = analysis.load_notice_features(**args)
+    assert notices.iloc[0]["event_pit_status"] == analysis.PIT_AVAILABLE
+    assert bool(notices.iloc[0]["event_authoritative_empty"])
+
+
 def test_initial_scoring_serializes_rows_with_frozen_announcement_evidence(monkeypatch):
     trade_date = "2026-11-11"
     cutoff = "2026-11-12T07:39:50"

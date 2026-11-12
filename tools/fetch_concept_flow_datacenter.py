@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 import requests
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
 ROOT = Path(__file__).resolve().parents[1]
 _ROOT_STR = str(ROOT)
@@ -31,6 +32,7 @@ RESULT_SCHEMA = "probiga.eastmoney-concept-flow-result.v1"
 MANIFEST_SCHEMA = "probiga.eastmoney-concept-flow-manifest.v1"
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 CONCEPT_FLOW_CLOSE_READY_TIME = datetime_time(15, 10)
+_DAILY_SNAPSHOT_SCOPE = "days_type=1 AND snapshot_at=:snapshot_at"
 
 _SESSION = requests.Session()
 _SESSION.headers.update({
@@ -329,31 +331,27 @@ def _strict_provider_snapshot(
     return frame, source_date, evidence, calendar
 
 
-def _verify_strict_publish(
+def read_persisted_concept_flow_codes(
     engine,
     *,
-    source_date: str,
-    expected_codes: list[str],
-) -> int:
+    source_date: date,
+    expected_count: int,
+) -> list[str]:
     with engine.connect() as connection:
-        rows = connection.execute(text("""
-            SELECT index_code, snapshot_at
-            FROM sm_concept_capital_flow_east
-            ORDER BY index_code
-        """)).mappings().all()
-    observed_codes = [str(row.get("index_code") or "").strip() for row in rows]
-    observed_dates = {
-        pd.Timestamp(row.get("snapshot_at")).date().isoformat() for row in rows
-    }
-    if (
-        observed_codes != sorted(expected_codes)
-        or len(observed_codes) != len(set(observed_codes))
-        or observed_dates != {source_date}
-    ):
-        raise RuntimeError(
-            "DATA_BLOCKED: concept-flow database verification differs from provider manifest"
-        )
-    return len(rows)
+        codes = connection.execute(
+            text(f"""
+                SELECT /*+ MAX_EXECUTION_TIME(3000) */ index_code
+                FROM sm_concept_capital_flow_east
+                WHERE {_DAILY_SNAPSHOT_SCOPE}
+                ORDER BY index_code
+                LIMIT :row_limit
+            """),
+            {
+                "snapshot_at": f"{source_date.isoformat()} 00:00:00",
+                "row_limit": expected_count + 1,
+            },
+        ).scalars().all()
+    return [str(code or "").strip() for code in codes]
 
 
 def fetch_concept_flow(
@@ -406,10 +404,10 @@ def fetch_concept_flow(
     df["stock_code"] = df["stock_name"].map(lambda n: name_to_code.get(n, ""))
 
     now = datetime.now(_SHANGHAI).replace(tzinfo=None, microsecond=0)
+    source_day = date.fromisoformat(source_date)
+    snapshot_at = f"{source_day.isoformat()} 00:00:00"
     df["days_type"] = 1
-    df["snapshot_at"] = datetime.combine(
-        date.fromisoformat(source_date), datetime_time.min
-    )
+    df["snapshot_at"] = snapshot_at
     df["etl_sync_at"] = now
 
     out_cols = [
@@ -428,24 +426,37 @@ def fetch_concept_flow(
 
     df = df[out_cols].replace({np.nan: None, pd.NaT: None})
 
-    replace_table_rows(
-        df,
-        "sm_concept_capital_flow_east",
-        engine,
-        chunksize=500,
-        method="multi",
-    )
+    try:
+        replace_table_rows(
+            df,
+            "sm_concept_capital_flow_east",
+            engine,
+            where_sql=_DAILY_SNAPSHOT_SCOPE,
+            params={"snapshot_at": snapshot_at},
+            chunksize=500,
+            method="multi",
+        )
+    except (SQLAlchemyError, pd.errors.DatabaseError) as exc:
+        raise RuntimeError(
+            "concept-flow database publication failed: "
+            f"source_date={source_date}, error={type(exc).__name__}"
+        ) from exc
 
     print(f"写入完成: sm_concept_capital_flow_east, 共 {len(df)} 行")
 
     codes = sorted(df["index_code"].astype(str).tolist())
     verified_rows = len(df)
     if strict_authority:
-        verified_rows = _verify_strict_publish(
+        persisted_codes = read_persisted_concept_flow_codes(
             engine,
-            source_date=source_date,
-            expected_codes=codes,
+            source_date=source_day,
+            expected_count=len(codes),
         )
+        if persisted_codes != codes:
+            raise RuntimeError(
+                "DATA_BLOCKED: concept-flow database verification differs from provider manifest"
+            )
+        verified_rows = len(persisted_codes)
     manifest = {
         "schema": MANIFEST_SCHEMA,
         "provider": "eastmoney.datacenter-web",

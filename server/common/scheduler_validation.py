@@ -2466,7 +2466,57 @@ def _eastmoney_concept_market_output_status(
         date_count = int(dataset_result["date_count"])
     except (KeyError, TypeError, ValueError, OverflowError):
         return "failed"
-    expected_rows = directory_count * (240 if dataset == "minute" else 1)
+    coverage = directory.get("session_coverage")
+    eligible_count = directory_count
+    eligible_hash = directory.get("code_set_sha256")
+    source_first = directory.get("first_source_time")
+    source_last = directory.get("last_source_time")
+    if coverage is not None:
+        from tools.sync_eastmoney_concept_market import DAILY_URLS
+
+        if not isinstance(coverage, Mapping):
+            return "failed"
+        exclusions = coverage.get("exclusions")
+        eligible_count = coverage.get("eligible_count")
+        eligible_hash = coverage.get("eligible_code_set_sha256")
+        source_first = coverage.get("first_eligible_source_time")
+        source_last = coverage.get("last_eligible_source_time")
+        eligible_first = _shanghai_machine_timestamp(source_first)
+        eligible_last = _shanghai_machine_timestamp(source_last)
+        if (
+            dataset not in {"current", "kline"}
+            or payload.get("reason") != "NATIVE_DAILY_BAR_UNAVAILABLE"
+            or coverage.get("schema") != "probiga.eastmoney-concept-session-coverage.v1"
+            or type(eligible_count) is not int or not 100 <= eligible_count < directory_count
+            or not _is_hex(eligible_hash, 64)
+            or not isinstance(exclusions, list) or len(exclusions) != directory_count - eligible_count
+            or coverage.get("excluded_count") != len(exclusions)
+            or first_source_time is None or first_source_time.time() != datetime.min.time()
+            or eligible_first is None or eligible_last is None
+            or eligible_first.date() != target or eligible_last.date() != target
+            or eligible_first.hour < 15 or not eligible_first <= eligible_last == last_source_time
+        ):
+            return "failed"
+        excluded_codes = []
+        for item in exclusions:
+            if not isinstance(item, Mapping):
+                return "failed"
+            stamp = _shanghai_machine_timestamp(item.get("source_time"))
+            code = item.get("code")
+            if (
+                not isinstance(code, str) or re.fullmatch(r"BK\d+", code) is None
+                or stamp is None or stamp.date() != target or stamp.time() != datetime.min.time()
+                or item.get("reason") != "NATIVE_DAILY_BAR_UNAVAILABLE"
+                or item.get("history_url") not in DAILY_URLS
+                or not _is_hex(item.get("history_response_sha256"), 64)
+            ):
+                return "failed"
+            excluded_codes.append(code)
+        if len(set(excluded_codes)) != len(excluded_codes) or (
+            _notice_code_set_hash(excluded_codes) != coverage.get("excluded_code_set_sha256")
+        ):
+            return "failed"
+    expected_rows = eligible_count * (240 if dataset == "minute" else 1)
     expected_table = {
         "current": "sm_concept_east_current",
         "kline": "sm_concept_east_kline",
@@ -2487,15 +2537,15 @@ def _eastmoney_concept_market_output_status(
             or source.get("source_filter") != DIRECTORY_FILTER
             or source.get("field_map") != CLOSED_DAILY_FIELD_MAP
             or source.get("source_date") != target.isoformat()
-            or source.get("first_source_time") != directory.get("first_source_time")
-            or source.get("last_source_time") != directory.get("last_source_time")
+            or source.get("first_source_time") != source_first
+            or source.get("last_source_time") != source_last
             or source.get("directory_manifest_sha256") != directory_manifest
             or not _is_hex(source.get("raw_quote_rows_sha256"), 64)
         ):
             return "failed"
     valid = bool(
         int(return_code) == 0
-        and payload.get("status") == "PASS"
+        and payload.get("status") == ("DEGRADED" if coverage is not None else "PASS")
         and payload.get("provider") == "eastmoney_public_market"
         and payload.get("datasets") == [dataset]
         and payload.get("requested_trade_date")
@@ -2527,9 +2577,9 @@ def _eastmoney_concept_market_output_status(
         and last_source_time is not None
         and first_source_time.date() == target
         and last_source_time.date() == target
-        and first_source_time.time() >= datetime.strptime(
+        and (coverage is not None or first_source_time.time() >= datetime.strptime(
             "15:00", "%H:%M"
-        ).time()
+        ).time())
         and first_source_time <= last_source_time
         and last_source_time <= finished_at + timedelta(minutes=5)
         and _is_hex(directory.get("code_set_sha256"), 64)
@@ -2537,19 +2587,18 @@ def _eastmoney_concept_market_output_status(
         and dataset_result.get("dataset") == dataset
         and dataset_result.get("table") == expected_table
         and dataset_result.get("provider") == "eastmoney_public_market"
-        and code_count == directory_count
+        and code_count == eligible_count
         and date_count == 1
         and row_count == expected_rows
         and dataset_result.get("first_date") == target.isoformat()
         and dataset_result.get("last_date") == target.isoformat()
-        and dataset_result.get("code_set_sha256")
-        == directory.get("code_set_sha256")
+        and dataset_result.get("code_set_sha256") == eligible_hash
         and _is_hex(dataset_result.get("content_sha256"), 64)
         and int(database.get("row_count") or -1) == row_count
         and int(database.get("code_count") or -1) == code_count
         and int(database.get("date_count") or -1) == date_count
     )
-    return "success" if valid else "failed"
+    return ("degraded" if coverage is not None else "success") if valid else "failed"
 
 
 def _sector_heat_east_output_status(
@@ -5296,7 +5345,10 @@ def validate_scheduler_task_result(
             payload = _eastmoney_concept_flow_payload(output)
             try:
                 from server.common.qmt_attestation_contract import canonical_digest
-                from tools.fetch_concept_flow_datacenter import validate_task_result
+                from tools.fetch_concept_flow_datacenter import (
+                    read_persisted_concept_flow_codes,
+                    validate_task_result,
+                )
 
                 if payload is None or validate_task_result(
                     dict(payload),
@@ -5330,20 +5382,17 @@ def validate_scheduler_task_result(
                     raise ValueError(
                         "receipt/source date differs from release target"
                     )
-                with engine.connect() as connection:
-                    rows = connection.execute(text("""
-                        SELECT index_code, snapshot_at
-                          FROM sm_concept_capital_flow_east
-                         ORDER BY index_code
-                    """)).mappings().all()
-                codes = [str(row.get("index_code") or "").strip() for row in rows]
-                dates = {str(row.get("snapshot_at") or "")[:10] for row in rows}
+                expected_count = int(manifest["row_count"])
+                codes = read_persisted_concept_flow_codes(
+                    engine,
+                    source_date=source_date,
+                    expected_count=expected_count,
+                )
                 if (
-                    len(rows) != int(manifest.get("row_count") or 0)
+                    len(codes) != expected_count
                     or len(codes) != len(set(codes))
                     or any(not code for code in codes)
                     or codes != sorted(codes)
-                    or dates != {source_date.isoformat()}
                     or canonical_digest(codes) != manifest.get("code_set_hash")
                 ):
                     raise ValueError("persisted concept-flow snapshot differs")
@@ -5358,7 +5407,7 @@ def validate_scheduler_task_result(
                 )
             messages.append(
                 "eastmoney_concept_flow_snapshot exact persisted coverage "
-                f"verified: date={source_date.isoformat()} rows={len(rows)}"
+                f"verified: date={source_date.isoformat()} rows={len(codes)}"
             )
         if task_type in {"hot_rank_ths", "hot_concept"}:
             ok, message = _validate_ths_hot_receipt(
@@ -5867,7 +5916,7 @@ def _validate_eastmoney_concept_market_receipt(
             output,
             return_code=0,
         )
-        != "success"
+        not in {"success", "degraded"}
     ):
         return False, f"{task_type}: exact PASS receipt is missing or invalid"
     receipt_started = _shanghai_machine_timestamp(payload.get("started_at"))
@@ -5943,7 +5992,15 @@ def _validate_eastmoney_concept_market_receipt(
         # Both providers deliberately use the same newline-delimited set hash.
         return False, f"{task_type}: persisted code/date set differs from receipt"
     directory = payload["directory"]
-    if expected.get("code_set_sha256") != directory.get("code_set_sha256"):
+    coverage = directory.get("session_coverage")
+    if coverage is None:
+        full_codes = codes
+    else:
+        excluded_codes = {item["code"] for item in coverage["exclusions"]}
+        if set(codes) & excluded_codes:
+            return False, f"{task_type}: excluded source rows were persisted"
+        full_codes = sorted(set(codes) | excluded_codes)
+    if _notice_code_set_hash(full_codes) != directory.get("code_set_sha256"):
         return False, f"{task_type}: dataset and directory identities differ"
     for row in rows:
         etl_sync_at = _coerce_datetime(row.get("etl_sync_at"))

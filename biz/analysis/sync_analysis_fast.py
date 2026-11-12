@@ -21,13 +21,14 @@ import re
 import subprocess
 import sys
 import time
+from collections import Counter
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import date, datetime, time as datetime_time, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from io import StringIO
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -68,12 +69,15 @@ from server.common.pit_facts import (
     HistoricalEventRead,
     PIT_AVAILABLE,
     PIT_DATA_BLOCKED,
+    PITFactBatch,
     load_event_facts,
     load_finance_facts,
     normalize_decision_at,
     resolve_common_fact_cutoff,
     resolve_strategy_fact_cutoffs,
 )
+if TYPE_CHECKING:
+    from server.common.pit_facts import SealedFinanceInputs
 from server.common.authoritative_market_clock import (
     STRATEGY_POOL_INITIAL_TIME,
     StrategyPoolDecisionPhase,
@@ -1982,6 +1986,37 @@ def _load_kline_features_from_snapshot(
     return result
 
 
+def _require_formal_pit_source(batch: PITFactBatch, *, source: str, trade_date: str, codes: list[str]) -> None:
+    reasons: Counter[str] = Counter()
+    available = excluded = 0
+    for code in codes:
+        raw_reason = batch.reason_for(code) or ""
+        reason = re.match(r"[A-Z][A-Z0-9_]{1,79}(?=:|$)", raw_reason)
+        status = batch.status_for(code)
+        available += status == PIT_AVAILABLE
+        excluded += raw_reason.startswith("PIT_FINANCE_DATA_EXCLUDED:")
+        label = reason.group() if reason else status
+        if batch.global_status != PIT_AVAILABLE:
+            stage = re.search(r":stage=([a-z][a-z0-9-]{0,63}(?::[0-9]{1,8})?)(?=:|$)", raw_reason)
+            boundary = re.search(r":reason=([A-Z][A-Z0-9_]{1,79})(?=:|$)", raw_reason)
+            if stage:
+                label += ":stage=" + stage.group(1)
+            if boundary:
+                label += ":reason=" + boundary.group(1)
+        reasons[label] += 1
+    summary = reasons.most_common(8)
+    logger.info(
+        "Formal PIT source read: source=%s trade_date=%s status=%s total=%s available=%s "
+        "blocked=%s excluded=%s reasons=%s other=%s",
+        source, trade_date, batch.global_status, len(codes), available,
+        len(codes) - available - excluded, excluded, summary,
+        len(codes) - sum(count for _, count in summary),
+    )
+    if batch.global_status != PIT_AVAILABLE:
+        reason = summary[0][0] if summary else batch.global_status
+        raise RuntimeError(f"ANALYSIS_{source.upper()}_SOURCE_UNAVAILABLE:{reason}")
+
+
 def load_finance(
     engine: Engine,
     trade_date: str,
@@ -1990,6 +2025,8 @@ def load_finance(
     fact_cutoff_at: datetime | str | None = None,
     stock_codes: list[str],
     progress_callback: ProgressCallback | None = None,
+    require_complete_source: bool = False,
+    sealed_finance_inputs: SealedFinanceInputs | None = None,
 ) -> pd.DataFrame:
     """Load strategy finance only from immutable as-known revisions."""
 
@@ -2022,7 +2059,10 @@ def load_finance(
         fact_cutoff_at=fact_cutoff_at,
         as_of_date=trade_date,
         **({"read_progress": finance_progress} if progress_callback is not None else {}),
+        **({"sealed_finance_inputs": sealed_finance_inputs} if sealed_finance_inputs is not None else {}),
     )
+    if require_complete_source:
+        _require_formal_pit_source(batch, source="finance", trade_date=trade_date, codes=codes)
     rows: list[dict[str, Any]] = []
     for code in codes:
         raw = dict(batch.facts.get(code) or {})
@@ -2529,6 +2569,7 @@ def load_notice_features(
     stock_codes: list[str],
     historical_selection: HistoricalEventRead | None = None,
     event_window_end: date | str | None = None,
+    require_complete_source: bool = False,
 ) -> pd.DataFrame:
     codes = _normalize_stock_codes(stock_codes) or []
     if not codes:
@@ -2566,6 +2607,8 @@ def load_notice_features(
         require_qmt_complete_batch=True,
         historical_selection=historical_selection,
     )
+    if require_complete_source:
+        _require_formal_pit_source(batch, source="event", trade_date=trade_date, codes=codes)
     records: dict[str, dict[str, Any]] = {}
     for code in codes:
         status = batch.status_for(code)
@@ -5476,7 +5519,9 @@ def _prepare_batch_outputs(
             progress_callback=progress_callback,
         )
     historical_event_reads: list[HistoricalEventRead] = []
+    finance_reads: list[SealedFinanceInputs] = []
     initial_announcement = None
+    require_complete_pit_sources = pool_decision_phase is not None and not allow_degraded_inputs
     common_cutoff: dict[str, Any] = {
         "status": PIT_DATA_BLOCKED,
         "reason": "PIT_COMMON_CUTOFF_EXACT_DECISION_TIME_REQUIRED",
@@ -5534,6 +5579,7 @@ def _prepare_batch_outputs(
             capture_historical_selection=historical_event_reads.append,
             event_checkpoint_path=event_checkpoint_path,
             event_progress=announcement_progress if event_checkpoint_path is not None else None,
+            **({"capture_finance_selection": finance_reads.append} if require_complete_pit_sources else {}),
             **({"required_premarket_announcement": required_premarket_announcement}
                if required_premarket_announcement is not None else {}),
             **({"required_initial_announcement": initial_announcement}
@@ -5568,6 +5614,8 @@ def _prepare_batch_outputs(
             fact_cutoff_at=finance_cutoff,
             stock_codes=feature_codes,
             progress_callback=progress_callback,
+            require_complete_source=require_complete_pit_sources,
+            sealed_finance_inputs=next(iter(finance_reads), None),
         ),
         scoped_codes,
     )
@@ -5626,6 +5674,7 @@ def _prepare_batch_outputs(
             stock_codes=feature_codes,
             event_window_end=event_window_end,
             historical_selection=next(iter(historical_event_reads), None),
+            require_complete_source=require_complete_pit_sources,
         ),
         scoped_codes,
     )

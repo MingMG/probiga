@@ -1754,8 +1754,10 @@ def _release_history_evidence_valid(row: dict, build_sha: str) -> bool:
         is not None
         and str(evidence.get("replay_output_sha256") or "").lower()
         == _history_digest(replay_output)
-        and completed_data_stage_status(
-            row.get("task_type"), row.get("_release_terminal_status")
+        and (
+            completed_data_stage_status(row.get("task_type"), row.get("_release_terminal_status"))
+            or (row.get("task_type") in {"eastmoney_concept_current", "eastmoney_concept_kline"}
+                and row.get("_release_terminal_status") == "degraded")
         )
         and str(row.get("_release_terminal_build_sha") or "").lower()
         == build_sha

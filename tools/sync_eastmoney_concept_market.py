@@ -3,10 +3,11 @@
 """Strict Eastmoney-only publisher for concept current/daily/minute market data.
 
 The live Eastmoney directory is fetched with complete pagination and is the
-only code universe accepted by this publisher.  Every requested dataset must
-cover that exact universe and its exact source date/time grid before any DML
-runs.  Collection never falls back to adata, QMT, cached rows, or another
-provider, and publication performs no runtime DDL.
+only code universe accepted by this publisher. Each dataset must cover its
+exact dated source scope before DML. The completed quote and daily datasets
+can retain the verified close rows when the directory also lists boards with
+an exact, independently observed absence of a daily bar. Collection uses only
+Eastmoney and publication performs no runtime DDL.
 """
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
@@ -30,7 +32,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -49,6 +51,8 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 PROVIDER_ID = "eastmoney_public_market"
 RECEIPT_SCHEMA = "probiga.eastmoney-concept-market-result.v1"
 DIRECTORY_SCHEMA = "probiga.eastmoney-concept-directory.v1"
+SESSION_COVERAGE_SCHEMA = "probiga.eastmoney-concept-session-coverage.v1"
+NATIVE_DAILY_BAR_UNAVAILABLE = "NATIVE_DAILY_BAR_UNAVAILABLE"
 DIRECTORY_URL = "https://push2delay.eastmoney.com/api/qt/clist/get"
 DAILY_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
 MINUTE_URL = "https://push2delay.eastmoney.com/api/qt/stock/kline/get"
@@ -75,6 +79,11 @@ CLOSED_DAILY_FIELD_MAP = {
     "close": "f2", "high": "f15", "low": "f16", "volume": "f5",
     "amount": "f6", "change": "f4", "change_pct": "f3",
 }
+_CLOSE_QUOTE_VALUE_FIELDS = tuple(
+    field for name, field in CLOSED_DAILY_FIELD_MAP.items()
+    if name not in {"index_code", "source_time"}
+)
+_CLOSE_EXCLUSION_DEADLINE_SECONDS = 120
 EASTMONEY_TOKEN = "b2884a393a59ad64002292a3e90d46a5"
 EASTMONEY_RESOLVED_EDGE_IP = os.environ.get(
     "PROBIGA_EASTMONEY_PUSH2DELAY_EDGE_IP",
@@ -160,6 +169,7 @@ class DirectorySnapshot:
     items: tuple[dict[str, Any], ...]
     codes: tuple[str, ...]
     evidence: dict[str, Any]
+    full_manifest_sha256: str | None = None
 
 
 def _canonical_json(value: Any) -> str:
@@ -513,6 +523,7 @@ def validate_directory_target(
     target_date: str,
     *,
     observed_at: datetime | None = None,
+    require_post_close: bool = True,
 ) -> None:
     target = _iso_date(target_date, field="target date")
     evidence = snapshot.evidence
@@ -527,7 +538,7 @@ def validate_directory_target(
             "DATA_BLOCKED: Eastmoney directory is not an exact target-date inventory"
         )
     first_source_time = datetime.fromisoformat(str(evidence["first_source_time"]))
-    if first_source_time.astimezone(SHANGHAI).time() < datetime_time(15, 0):
+    if require_post_close and first_source_time.astimezone(SHANGHAI).time() < datetime_time(15, 0):
         raise DataBlocked(
             "DATA_BLOCKED: Eastmoney directory source time is before market close"
         )
@@ -541,6 +552,101 @@ def validate_directory_target(
             raise DataBlocked(
                 "DATA_BLOCKED: Eastmoney directory source time is in the future"
             )
+
+
+def _closed_session_directory(
+    provider: EastmoneyConceptProvider,
+    snapshot: DirectorySnapshot,
+    *,
+    target_date: str,
+    observed_at: datetime,
+    workers: int,
+) -> tuple[DirectorySnapshot, dict[str, Any]]:
+    """Separate exact close quotes from same-day entries with no native bar."""
+    validate_directory_target(snapshot, target_date, observed_at=observed_at, require_post_close=False)
+    eligible = []
+    pending = []
+    for code, item in zip(snapshot.codes, snapshot.items, strict=True):
+        stamp = _eastmoney_source_time(item.get("f124"))
+        if stamp.time() >= datetime_time(15):
+            eligible.append((code, item, stamp))
+        elif (
+            stamp.time() == datetime_time.min
+            and re.fullmatch(r"BK[0-9]{4,8}", code)
+            and all(item.get(field) == "-" for field in _CLOSE_QUOTE_VALUE_FIELDS)
+        ):
+            pending.append((code, stamp))
+        else:
+            raise DataBlocked("DATA_BLOCKED: Eastmoney directory source time is before market close")
+    if not pending:
+        return snapshot, snapshot.evidence
+    if len(eligible) < MIN_DIRECTORY_CODES:
+        raise DataBlocked("DATA_BLOCKED: Eastmoney directory has too few verified close quotes")
+
+    def check_no_daily_bar(code: str, stamp: datetime) -> dict[str, str]:
+        payload = provider.fetch_daily(code, target_date, target_date)
+        data = payload.get("data") if isinstance(payload, Mapping) else None
+        if (
+            not isinstance(data, Mapping)
+            or type(payload.get("rc")) is not int or payload["rc"] != 0
+            or data.get("code") != code
+            or type(data.get("market")) is not int or data["market"] != 90
+            or data.get("klines") != []
+        ):
+            raise DataBlocked(f"DATA_BLOCKED: Eastmoney exact no-bar evidence differs for {code}")
+        return {
+            "code": code, "source_time": stamp.isoformat(),
+            "reason": NATIVE_DAILY_BAR_UNAVAILABLE, "history_url": DAILY_URL,
+            "history_response_sha256": _digest(payload),
+        }
+
+    exclusions = []
+    with ThreadPoolExecutor(max_workers=max(1, min(int(workers), DEFAULT_WORKERS))) as pool:
+        checks = [pool.submit(check_no_daily_bar, code, stamp) for code, stamp in pending]
+        try:
+            for check in as_completed(checks, timeout=_CLOSE_EXCLUSION_DEADLINE_SECONDS):
+                exclusions.append(check.result())
+        except TimeoutError as exc:
+            raise DataBlocked("DATA_BLOCKED: Eastmoney exact no-bar verification deadline expired") from exc
+        finally:
+            for check in checks:
+                check.cancel()
+    exclusions.sort(key=lambda item: item["code"])
+    eligible_codes = tuple(code for code, _item, _stamp in eligible)
+    close_times = [stamp for _code, _item, stamp in eligible]
+    source_times = {
+        "first_source_time": min(close_times).isoformat(),
+        "last_source_time": max(close_times).isoformat(),
+    }
+    eligible_code_hash = _code_set_hash(eligible_codes)
+    coverage = {
+        "schema": SESSION_COVERAGE_SCHEMA,
+        "eligible_count": len(eligible_codes),
+        "eligible_code_set_sha256": eligible_code_hash,
+        "excluded_count": len(exclusions),
+        "excluded_code_set_sha256": _code_set_hash(item["code"] for item in exclusions),
+        "exclusions": exclusions,
+        "first_eligible_source_time": source_times["first_source_time"],
+        "last_eligible_source_time": source_times["last_source_time"],
+    }
+    directory = {**snapshot.evidence, "session_coverage": coverage}
+    directory.pop("manifest_sha256")
+    directory["manifest_sha256"] = _digest(directory)
+    # Project the verified close rows for frame construction. The receipt keeps
+    # the full page proof and binds these rows to it, including exclusions.
+    close_directory = {
+        **snapshot.evidence,
+        **source_times,
+        "reported_count": len(eligible_codes),
+        "observed_count": len(eligible_codes),
+        "code_set_sha256": eligible_code_hash,
+    }
+    close_directory.pop("manifest_sha256")
+    close_directory["manifest_sha256"] = _digest(close_directory)
+    return DirectorySnapshot(
+        tuple(item for _code, item, _stamp in eligible), eligible_codes, close_directory,
+        full_manifest_sha256=directory["manifest_sha256"],
+    ), directory
 
 
 def build_current_frame(
@@ -624,7 +730,7 @@ def build_closed_daily_frame(
         "source_date": target_date,
         "first_source_time": snapshot.evidence["first_source_time"],
         "last_source_time": snapshot.evidence["last_source_time"],
-        "directory_manifest_sha256": snapshot.evidence["manifest_sha256"],
+        "directory_manifest_sha256": snapshot.full_manifest_sha256 or snapshot.evidence["manifest_sha256"],
         "raw_quote_rows_sha256": _digest(list(snapshot.items)),
     }
     return result
@@ -1016,6 +1122,7 @@ def publish_frames_atomically(
     start_date: str,
     end_date: str,
     use_mysql_lock: bool = True,
+    excluded_close_codes: Sequence[str] = (),
 ) -> dict[str, dict[str, int]]:
     """Replace every requested full range in one transaction, with DML only."""
 
@@ -1041,6 +1148,15 @@ def publish_frames_atomically(
                 table = quote_identifier(DATASET_TABLE[dataset])
                 predicate, params = _scope_predicate(dataset)
                 params.update({"start_date": start_date, "end_date": end_date})
+                if excluded_close_codes and dataset in {"current", "kline"}:
+                    scope = predicate or " WHERE trade_date BETWEEN :start_date AND :end_date"
+                    existing_bar = connection.execute(text(
+                        f"SELECT 1 FROM {table}{scope} AND index_code IN :codes LIMIT 1"
+                    ).bindparams(bindparam("codes", expanding=True)), {
+                        **params, "codes": list(excluded_close_codes),
+                    }).first()
+                    if existing_bar is not None:
+                        raise DataBlocked("DATA_BLOCKED: Eastmoney absent native bar conflicts with persisted close row")
                 connection.execute(text(f"DELETE FROM {table}{predicate}"), params)
                 columns = DATASET_COLUMNS[dataset]
                 column_sql = ", ".join(quote_identifier(column) for column in columns)
@@ -1122,7 +1238,7 @@ def _publish_current_concept_names(
         })
     return {
         "status": "COMPLETE",
-        "directory_manifest_sha256": snapshot.evidence["manifest_sha256"],
+        "directory_manifest_sha256": snapshot.full_manifest_sha256 or snapshot.evidence["manifest_sha256"],
         **publish_concept_names(target_date, rows),
     }
 
@@ -1157,6 +1273,7 @@ def run_publisher(
         raise DataBlocked("DATA_BLOCKED: concept minute publisher accepts one target day only")
 
     snapshot: DirectorySnapshot | None = None
+    directory: dict[str, Any] = {}
     frames: dict[str, pd.DataFrame] = {}
 
     def partial_result() -> dict[str, Any]:
@@ -1168,7 +1285,7 @@ def run_publisher(
             "range_end": range_end,
             "open_date_count": len(open_dates),
             "open_dates_sha256": _digest(list(open_dates)),
-            "directory": snapshot.evidence if snapshot is not None else {},
+            "directory": directory,
             "dataset_results": {
                 dataset: _dataset_evidence(frame, dataset)
                 for dataset, frame in frames.items()
@@ -1182,7 +1299,13 @@ def run_publisher(
         if current.tzinfo is not None:
             current = current.astimezone(SHANGHAI)
         snapshot = fetch_complete_directory(provider)
-        validate_directory_target(snapshot, range_end, observed_at=current)
+        directory = snapshot.evidence
+        if range_start == range_end and "minute" not in requested:
+            snapshot, directory = _closed_session_directory(
+                provider, snapshot, target_date=range_end, observed_at=current, workers=workers,
+            )
+        else:
+            validate_directory_target(snapshot, range_end, observed_at=current)
         ingested_at = current.replace(tzinfo=None, microsecond=0)
         if "current" in requested:
             frames["current"] = build_current_frame(
@@ -1213,9 +1336,13 @@ def run_publisher(
                 frames,
                 start_date=range_start,
                 end_date=range_end,
+                excluded_close_codes=tuple(
+                    exclusion["code"]
+                    for exclusion in (directory.get("session_coverage") or {}).get("exclusions", ())
+                ),
             )
             result["published"] = True
-            if "current" in frames:
+            if "current" in frames or "kline" in frames:
                 try:
                     result["concept_names"] = _publish_current_concept_names(
                         snapshot, range_end, now or datetime.now(SHANGHAI),
@@ -1270,6 +1397,9 @@ def build_receipt(
     }
     if isinstance(result, Mapping):
         directory = result.get("directory")
+        if payload["status"] == "PASS" and isinstance(directory, Mapping) and directory.get("session_coverage"):
+            payload["status"] = "DEGRADED"
+            reason = reason or NATIVE_DAILY_BAR_UNAVAILABLE
         payload.update(
             {
                 "datasets": list(result.get("datasets") or payload["datasets"]),

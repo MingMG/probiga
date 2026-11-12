@@ -1186,15 +1186,37 @@ class ProductionPartitionInspector:
             )
         codes = [str(row.get("index_code") or "") for row in rows]
         if receipt is not None:
+            coverage = directory.get("session_coverage")
+            expected_code_hash = directory.get("code_set_sha256")
+            if coverage is not None:
+                exclusions = coverage["exclusions"]
+                excluded_codes = {item["code"] for item in exclusions}
+                if (
+                    receipt.get("status") != "DEGRADED"
+                    or coverage.get("eligible_count") != len(codes)
+                    or set(codes) & excluded_codes
+                    or len(codes) + len(excluded_codes) != directory.get("observed_count")
+                    or concept._code_set_hash(set(codes) | excluded_codes) != expected_code_hash
+                ):
+                    raise LinuxGapRepairBlocked("DATA_BLOCKED: persisted concept exclusion scope differs")
+                expected_code_hash = coverage["eligible_code_set_sha256"]
             if (
                 int(dataset.get("row_count") or 0) != len(rows)
-                or int(dataset.get("code_count") or 0) != len(codes)
+                or int(dataset.get("code_count") or 0) != len(set(codes))
                 or dataset.get("code_set_sha256") != concept._code_set_hash(codes)
-                or dataset.get("code_set_sha256") != directory.get("code_set_sha256")
+                or dataset.get("code_set_sha256") != expected_code_hash
                 or dataset.get("content_sha256") != concept.daily_content_hash(rows)
             ):
                 raise LinuxGapRepairBlocked(
                     "DATA_BLOCKED: persisted concept K-line differs from exact directory receipt"
+                )
+            if coverage is not None:
+                # The repair ledger counts only complete partitions. Keep the
+                # verified subset readable through the source's own receipt.
+                raise LinuxGapRepairBlocked(
+                    "DATA_BLOCKED: concept partition is partially available "
+                    f"(verified={len(codes)}, {concept.NATIVE_DAILY_BAR_UNAVAILABLE}={len(excluded_codes)}, "
+                    f"source_receipt_sha256={receipt['result_sha256']})"
                 )
             authority = {
                 "source_receipt_sha256": receipt["result_sha256"],
@@ -1838,7 +1860,7 @@ class ProductionPartitionPublisher:
             self.concept_receipt_sink(partition, receipt)
         return {
             "source_schema": concept.RECEIPT_SCHEMA,
-            "source_status": "PASS",
+            "source_status": receipt["status"],
             "source_receipt_sha256": receipt["result_sha256"],
             "automatic_order_submission": False,
         }

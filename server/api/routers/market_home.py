@@ -742,6 +742,39 @@ def _read_sector_store(reader, selected: str, now: datetime) -> list[dict]:
         return []
 
 
+def _concept_close_coverage(selected: str, now: datetime, codes: set[str], deadline: float) -> dict | None:
+    if not codes:
+        return None
+    rows = _sector_read(get_engine, """
+        SELECT /*+ MAX_EXECUTION_TIME(1000) */ output
+        FROM st_scheduled_task_history
+        WHERE task_type='eastmoney_concept_kline' AND status IN ('success','degraded')
+          AND exit_code=0 AND run_at>=:selected AND finished_at<=:now
+        ORDER BY id DESC LIMIT :limit
+    """, {"selected": selected, "now": now}, deadline=deadline, limit=6,
+        stage="concept close coverage")
+    from server.common.scheduler_validation import (
+        _eastmoney_concept_market_output_status, _eastmoney_concept_market_payload,
+        _notice_code_set_hash,
+    )
+    for row in rows:
+        output = row.get("output")
+        receipt = _eastmoney_concept_market_payload(output)
+        if not receipt or receipt.get("target_trade_date") != selected:
+            continue
+        if _eastmoney_concept_market_output_status("eastmoney_concept_kline", output, return_code=0) != "degraded":
+            return None
+        directory = receipt["directory"]
+        coverage = directory["session_coverage"]
+        excluded = {item["code"] for item in coverage["exclusions"]}
+        if (not codes & excluded and _notice_code_set_hash(codes) == coverage["eligible_code_set_sha256"]
+                and _notice_code_set_hash(codes | excluded) == directory["code_set_sha256"]):
+            return {"observed_count": directory["observed_count"], "eligible_count": len(codes),
+                    "excluded_count": len(excluded), "reason": "NATIVE_DAILY_BAR_UNAVAILABLE"}
+        return None
+    return None
+
+
 def build_sector_heatmap(day: date, *, now: datetime) -> dict:
     selected = day.isoformat()
     concept = {"change": _sector_rank([], _HEATMAP_CONCEPT_SOURCE),
@@ -814,6 +847,13 @@ def build_sector_heatmap(day: date, *, now: datetime) -> dict:
                                    "value": float(row["main_net_inflow"]), "source": _HEATMAP_INDUSTRY_FLOW_SOURCE})
     industry["net_inflow"] = _sector_rank(industry_flows, _HEATMAP_INDUSTRY_FLOW_SOURCE)
     closes = {row["code"]: _number(row["close"]) for row in changes if str(row["session"])[:10] == selected}
+    coverage = _concept_close_coverage(selected, now, set(closes), deadline)
+    if coverage:
+        note = (f"收盘行情已核验 {coverage['eligible_count']}/{coverage['observed_count']} 个板块，"
+                f"{coverage['excluded_count']} 个未返回收盘行情")
+        for metric in ("change", "five_day_return"):
+            concept[metric]["coverage"] = coverage
+            concept[metric]["note"] += f" · {note}"
     _concept_minute_curves(concept["change"], closes, selected, now, deadline)
     return result
 

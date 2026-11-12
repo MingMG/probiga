@@ -33,12 +33,48 @@ def test_concept_publisher_binds_same_history_database_as_inspector(monkeypatch)
         seen.update(kwargs)
         return {}
     monkeypatch.setattr(concept, "run_publisher", publish)
-    monkeypatch.setattr(concept, "build_receipt", lambda **_kwargs: {"result_sha256": "a" * 64})
+    monkeypatch.setattr(concept, "build_receipt", lambda **_kwargs: {
+        "result_sha256": "a" * 64, "status": "DEGRADED",
+    })
     publisher = repair.ProductionPartitionPublisher(
         primary, history, minute, expected_build_sha=BUILD_SHA, now=NOW,
     )
-    publisher(repair.PartitionRef("2026-08-26", "concept_kline"))
+    result = publisher(repair.PartitionRef("2026-08-26", "concept_kline"))
     assert seen["datasets"] == ("kline",)
+    assert result["source_status"] == "DEGRADED"
+
+
+def test_gap_inspector_does_not_report_partial_close_receipt_as_full():
+    from tools import sync_eastmoney_concept_market as concept
+    from tests.test_sync_eastmoney_concept_market import _atomic_engine
+
+    engine = _atomic_engine()
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE sm_concept_east_kline SET index_code='BK0001'"))
+        row = dict(connection.execute(text("SELECT * FROM sm_concept_east_kline")).mappings().one())
+    inspector = repair.ProductionPartitionInspector(
+        engine, engine, minute_engine=engine, decision_time=NOW, expected_build_sha=BUILD_SHA,
+    )
+    partition = repair.PartitionRef("2026-08-26", "concept_kline")
+    eligible = concept._code_set_hash(["BK0001"])
+    receipt = {
+        "status": "DEGRADED", "result_sha256": "a" * 64,
+        "directory": {
+            "observed_count": 2, "code_set_sha256": concept._code_set_hash(["BK0001", "BK0002"]),
+            "session_coverage": {
+                "eligible_count": 1, "eligible_code_set_sha256": eligible,
+                "exclusions": [{"code": "BK0002"}],
+            },
+        },
+        "dataset_results": {"kline": {
+            "row_count": 1, "code_count": 1, "code_set_sha256": eligible,
+            "content_sha256": concept.daily_content_hash([row]),
+        }},
+    }
+    inspector.record_concept_receipt(partition, receipt)
+    with pytest.raises(repair.LinuxGapRepairBlocked, match="verified=1, NATIVE_DAILY_BAR_UNAVAILABLE=1"):
+        inspector._concept_kline(partition)
+    engine.dispose()
 
 
 def _window(*sessions: str) -> repair.AuthorityWindow:

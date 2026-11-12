@@ -354,6 +354,18 @@ class PITFactBatch:
         return self.reason_by_code.get(str(stock_code).zfill(6), "")
 
 
+@dataclass(frozen=True)
+class SealedFinanceInputs:
+    engine: Engine
+    decision_at: datetime
+    fact_cutoff_at: datetime
+    as_of_date: date
+    seal_id: str
+    batch_root_sha256: str
+    members: Mapping[str, Mapping[str, Any]]
+    exclusions: Mapping[str, Mapping[str, Any]]
+
+
 def _json_safe(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, bool)):
         return value
@@ -4055,6 +4067,26 @@ def _finance_new_listing_empty_valid(
     )
 
 
+def _finance_strategy_prefix_binding(source_rows: Iterable[Mapping[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    rows = [dict(row) for row in source_rows if isinstance(row, dict)]
+    report_dates = sorted({_date_value(row.get("report_date"), required=True) for row in rows},
+                          reverse=True)[:FINANCE_ATOMIC_BATCH_HISTORY_LIMIT]
+    strategy_rows = [row for row in rows if _date_value(row.get("report_date"), required=True) in report_dates]
+    if not strategy_rows:
+        raise ValueError("finance strategy prefix is empty")
+    return strategy_rows, {
+        "history_limit": FINANCE_ATOMIC_BATCH_HISTORY_LIMIT,
+        "report_date_count": len(report_dates),
+        "content_row_count": len(strategy_rows),
+        "latest_report_date": report_dates[0].isoformat(),
+        "oldest_report_date": report_dates[-1].isoformat(),
+        "content_root_sha256": canonical_hash({
+            "schema": "probiga.pit-finance-strategy-prefix.v1",
+            "rows": sorted(strategy_rows, key=canonical_json),
+        }),
+    }
+
+
 def _select_finance_atomic_batch_members(
     engine: Engine,
     *,
@@ -4341,33 +4373,9 @@ def _select_finance_atomic_batch_members(
                         # legally exist; no finance fact is manufactured.
                         pass
                     else:
-                        source_rows = [
-                            dict(source_row)
-                            for source_row in payload.get("source_rows") or ()
-                            if isinstance(source_row, dict)
-                        ]
-                        report_dates = sorted(
-                            {
-                                _date_value(
-                                    source_row.get("report_date"),
-                                    required=True,
-                                )
-                                for source_row in source_rows
-                            },
-                            reverse=True,
-                        )[:FINANCE_ATOMIC_BATCH_HISTORY_LIMIT]
-                        strategy_rows = [
-                            source_row
-                            for source_row in source_rows
-                            if _date_value(
-                                source_row.get("report_date"), required=True
-                            )
-                            in report_dates
-                        ]
-                        if not strategy_rows:
-                            raise ValueError(
-                                "finance strategy prefix is empty"
-                            )
+                        strategy_rows, prefix = _finance_strategy_prefix_binding(
+                            payload.get("source_rows") or (),
+                        )
                         publication_instants: list[datetime] = []
                         for source_row in strategy_rows:
                             exact_published = source_row.get("published_at")
@@ -4386,31 +4394,7 @@ def _select_finance_atomic_batch_members(
                         compact["_latest_publication_at"] = max(
                             publication_instants
                         )
-                        compact["_strategy_prefix_binding"] = {
-                            "history_limit": (
-                                FINANCE_ATOMIC_BATCH_HISTORY_LIMIT
-                            ),
-                            "report_date_count": len(report_dates),
-                            "content_row_count": len(strategy_rows),
-                            "latest_report_date": (
-                                report_dates[0].isoformat()
-                            ),
-                            "oldest_report_date": (
-                                report_dates[-1].isoformat()
-                            ),
-                            "content_root_sha256": canonical_hash(
-                                {
-                                    "schema": (
-                                        "probiga.pit-finance-strategy-"
-                                        "prefix.v1"
-                                    ),
-                                    "rows": sorted(
-                                        strategy_rows,
-                                        key=canonical_json,
-                                    ),
-                                }
-                            ),
-                        }
+                        compact["_strategy_prefix_binding"] = prefix
                     member_source_cutoff = known
                     if compact.get("_incremental_discovery_binding"):
                         # The original full-history receipt remains immutable.
@@ -6081,6 +6065,7 @@ def resolve_common_fact_cutoff(
     require_qmt_event_batch: bool = False,
     include_event_facts: bool = True,
     capture_historical_selection: Callable[[HistoricalEventRead], None] | None = None,
+    capture_finance_selection: Callable[[SealedFinanceInputs], None] | None = None,
     event_checkpoint_path: Path | None = None,
     event_progress: Callable[[int, int], None] | None = None,
     required_premarket_announcement: FrozenPremarketAnnouncement | None = None,
@@ -6592,6 +6577,17 @@ def resolve_common_fact_cutoff(
                 "data_excluded_codes", "data_excluded_reasons", "data_exclusions",
             )
         })
+        if capture_finance_selection is not None and _dataset_cutoffs:
+            exclusions = _finance_data_exclusions_from_baseline(
+                finance_batch, codes=normalized_codes, target=windows["finance"][1],
+            )
+            capture_finance_selection(SealedFinanceInputs(
+                engine=engine, decision_at=decision, fact_cutoff_at=source_cutoffs["finance"],
+                as_of_date=windows["finance"][1], seal_id=finance_batch["seal_coverage_id"],
+                batch_root_sha256=finance_batch["batch_root_sha256"],
+                members=MappingProxyType({code: MappingProxyType(member) for code, member in finance_batch["members"].items()}),
+                exclusions=MappingProxyType({code: MappingProxyType(item) for code, item in exclusions.items()}),
+            ))
     if capture_historical_selection is not None:
         event_selection = exact_event_selection
         if event_selection is None and reusable_live_batch:
@@ -6648,6 +6644,51 @@ def _finance_data_exclusions_from_baseline(
     }
 
 
+def _finance_feature_fact(
+    selected: Mapping[str, Any], *, fact_cutoff: datetime, decision: datetime,
+) -> dict[str, Any]:
+    newest_report = _date_value(selected.get("report_date"), required=True)
+    payload = _parse_payload(selected)
+    exact_publication = bool(
+        selected.get("publication_time_status") == TIME_VERIFIED
+        and selected.get("published_at") is not None
+    )
+    published_text = (
+        _dt_text(_row_datetime(selected["published_at"]))
+        if exact_publication
+        else str(selected.get("source_published_text") or "")
+    )
+    known_text = _dt_text(_row_datetime(selected["known_at"]))
+    payload.update(
+        {
+            "finance_report_date": newest_report.isoformat(),
+            "finance_published_at": published_text,
+            "finance_known_at": known_text,
+            "finance_publication_precision": (
+                "EXACT_TIME" if exact_publication else "DATE_ONLY"
+            ),
+            "finance_publication_time_verified": exact_publication,
+            "finance_observed_available_at": known_text,
+            "finance_fact_cutoff_at": _dt_text(fact_cutoff),
+            "finance_decision_at": _dt_text(decision),
+            "finance_publication_reason": (
+                "" if exact_publication
+                else "DATE_ONLY_USABLE_FROM_RECEIVED_AT"
+            ),
+            # Compatibility names consumed by the frozen production V6
+            # PIT advisory.  They carry the same exact timestamps; no
+            # date-only value is manufactured here.
+            "finance_notice_date": published_text,
+            "finance_knowledge_at": known_text,
+            "finance_revision_id": str(selected["revision_id"]),
+            "finance_content_hash": str(selected["content_hash"]),
+            "finance_source": str(selected.get("source") or ""),
+            "finance_pit_verified": True,
+        }
+    )
+    return payload
+
+
 def load_finance_facts(
     engine: Engine,
     *,
@@ -6656,6 +6697,7 @@ def load_finance_facts(
     fact_cutoff_at: datetime | str | None = None,
     as_of_date: date | str | None = None,
     read_progress: Callable[[int, int], None] | None = None,
+    sealed_finance_inputs: SealedFinanceInputs | None = None,
 ) -> PITFactBatch:
     normalized_codes = sorted({str(code).strip().zfill(6) for code in codes if str(code).strip()})
     fact_cutoff, decision = _fact_and_decision_times(
@@ -6667,6 +6709,14 @@ def load_finance_facts(
             manifest_hash=canonical_hash([]), decision_at=_dt_text(decision),
             fact_cutoff_at=_dt_text(fact_cutoff),
             table_name=FINANCE_REVISION_TABLE,
+        )
+    if sealed_finance_inputs is not None:
+        from server.common.pit_sealed_finance_read import load_sealed_finance_facts
+
+        return load_sealed_finance_facts(
+            engine, selection=sealed_finance_inputs, codes=normalized_codes,
+            decision_at=decision, fact_cutoff_at=fact_cutoff, as_of_date=end_date,
+            read_progress=read_progress,
         )
     try:
         data_exclusions = load_finance_data_exclusions(
@@ -6899,45 +6949,7 @@ def load_finance_facts(
             statuses[code] = PIT_AVAILABLE
             reasons[code] = "PIT_FINANCE_EXPECTED_UNAVAILABLE"
             continue
-        payload = _parse_payload(selected)
-        exact_publication = bool(
-            selected.get("publication_time_status") == TIME_VERIFIED
-            and selected.get("published_at") is not None
-        )
-        published_text = (
-            _dt_text(_row_datetime(selected["published_at"]))
-            if exact_publication
-            else str(selected.get("source_published_text") or "")
-        )
-        known_text = _dt_text(_row_datetime(selected["known_at"]))
-        payload.update(
-            {
-                "finance_report_date": newest_report.isoformat(),
-                "finance_published_at": published_text,
-                "finance_known_at": known_text,
-                "finance_publication_precision": (
-                    "EXACT_TIME" if exact_publication else "DATE_ONLY"
-                ),
-                "finance_publication_time_verified": exact_publication,
-                "finance_observed_available_at": known_text,
-                "finance_fact_cutoff_at": _dt_text(fact_cutoff),
-                "finance_decision_at": _dt_text(decision),
-                "finance_publication_reason": (
-                    "" if exact_publication
-                    else "DATE_ONLY_USABLE_FROM_RECEIVED_AT"
-                ),
-                # Compatibility names consumed by the frozen production V6
-                # PIT advisory.  They carry the same exact timestamps; no
-                # date-only value is manufactured here.
-                "finance_notice_date": published_text,
-                "finance_knowledge_at": known_text,
-                "finance_revision_id": str(selected["revision_id"]),
-                "finance_content_hash": str(selected["content_hash"]),
-                "finance_source": str(selected.get("source") or ""),
-                "finance_pit_verified": True,
-            }
-        )
-        facts[code] = payload
+        facts[code] = _finance_feature_fact(selected, fact_cutoff=fact_cutoff, decision=decision)
         statuses[code] = PIT_AVAILABLE
         reasons[code] = ""
     manifest = {
