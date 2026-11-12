@@ -1,5 +1,5 @@
 """Real SQLite daily DDL and ordinary-user job-log recovery, never production."""
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta
 import json
 from types import SimpleNamespace
@@ -347,6 +347,115 @@ def test_raw_retention_failure_keeps_worker_ownership(case,monkeypatch):
     assert case.uid in runtime._terminal_worker_exited
     assert not runtime._pending_terminal_writes[case.uid]["_durable"]
     runtime._running_task_ids.discard(127)
+
+
+def test_validated_analysis_keeps_owner_until_same_run_terminal_retry(case, monkeypatch):
+    from server.common import scheduler_task_lease
+    from tests.score_snapshot_helpers import scored_publication
+
+    case.start(task_type="analysis_fast")
+    identity = {**runtime._terminal_run_identities[case.uid], "host_name": runtime.gethostname()}
+    marker = scheduler_task_lease.encode(identity, case.now)
+    with case.engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE st_scheduled_task_history SET host_name=:host, output=:marker
+            WHERE run_uid=:uid
+        """), {"host": identity["host_name"], "marker": marker, "uid": case.uid})
+        conn.execute(text("""
+            CREATE TABLE st_recommended_run_history (run_uid TEXT PRIMARY KEY, publication_state TEXT)
+        """))
+        conn.execute(text("INSERT INTO st_recommended_run_history VALUES (:uid, 'STAGED')"), {"uid": case.uid})
+    runtime._terminal_run_identities[case.uid] = identity
+
+    now = case.now
+    owner_losses = []
+    owner = scheduler_task_lease.TaskOwnerLease(
+        case.engine, identity, marker, clock=lambda: now, on_lost=lambda: owner_losses.append(case.uid),
+    )
+    monkeypatch.setattr(runtime, "_task_owner_leases", {case.uid: owner})
+    monkeypatch.setattr(runtime, "_running_task_ids", {case.task_id})
+    monkeypatch.setattr(runtime, "_task_lane_semaphore", lambda _row: nullcontext())
+
+    monkeypatch.setattr(runtime, "_scheduler_build_commit_sha", lambda: identity["build_sha"])
+    monkeypatch.setattr(runtime, "runtime_contract_build_sha", lambda **_: identity["build_sha"])
+    row = dict(id=case.task_id, task_name="analysis_fast", task_type="analysis_fast",
+               _history_started=True, _history_run_uid=case.uid, _scheduler_target_trade_date="2026-09-30")
+    receipt = scored_publication(trade_date="2026-09-30", run_uid=case.uid, build_sha=identity["build_sha"])
+    evidence = runtime._build_history_validation_evidence(
+        row, run_uid=case.uid, machine_output=json.dumps(receipt), status="success", exit_code=0,
+        started_at=case.now, validation_message="DATA_VALIDATION_OK",
+    )
+    validated_runs = []
+
+    def successful_analysis(_row, _root, _engine, *, history_run_uid):
+        validated_runs.append(history_run_uid)
+        finish(case, output=evidence, publication_receipt=receipt)
+
+    monkeypatch.setattr(runtime, "_run_task_impl", successful_analysis)
+
+    def activate(conn, *, run_uid, task_type, publication_receipt):
+        assert run_uid == case.uid and task_type == "analysis_fast" and publication_receipt == receipt
+        changed = conn.execute(text("""
+            UPDATE st_recommended_run_history SET publication_state='SUCCESS'
+            WHERE run_uid=:uid AND publication_state='STAGED'
+        """), {"uid": run_uid})
+        assert changed.rowcount == 1
+        return {"schema": "MODEL-activation-receipt", "run_uid": run_uid}
+
+    monkeypatch.setattr(runtime, "_activate_analysis_strategy_pool", activate)
+    transient_failures = []
+
+    def disconnect_terminal_update(_conn, _cursor, statement, parameters, _context, _many):
+        if statement.startswith("UPDATE st_scheduled_task_history SET finished_at=") and len(transient_failures) < 2:
+            transient_failures.append(parameters)
+            raise OperationalError("terminal MODEL", {}, ConnectionError("MySQL 2013 MODEL"))
+
+    def candidate_state():
+        with case.engine.connect() as conn:
+            return conn.execute(text("""
+                SELECT publication_state FROM st_recommended_run_history WHERE run_uid=:uid
+            """), {"uid": case.uid}).scalar_one()
+
+    event.listen(case.engine, "before_cursor_execute", disconnect_terminal_update)
+    try:
+        runtime._run_task_async(row, case.jobs, case.engine)
+
+        journal = runtime._terminal_journal()
+        original = journal.read(case.uid, "OBSERVED")
+        assert original is not None and json.loads(original)["outcome"]["status"] == "success"
+        for expected_failures in (1, 2):
+            assert len(transient_failures) == expected_failures
+            assert runtime._pending_terminal_writes[case.uid]["_durable"]
+            assert runtime._running_history_uids == {case.task_id: case.uid}
+            assert runtime._running_task_ids == {case.task_id}
+            assert runtime._task_owner_leases[case.uid] is owner
+            assert owner.thread.is_alive() and not owner.stop_event.is_set()
+            assert rows(case)[0]["status"] == "running" and rows(case)[1]["status"] == "RUNNING"
+            assert candidate_state() == "STAGED"
+            assert journal.read(case.uid, "OBSERVED") == original
+            assert journal.read(case.uid, "COMMITTED") is None
+
+            now += timedelta(seconds=10)
+            previous = owner.output
+            assert owner.renew() and owner.output != previous and owner.authorized()
+            assert rows(case)[0]["output"] == owner.output
+            monkeypatch.setattr(runtime, "_last_terminal_retry", 0.0)
+            runtime._retry_pending_terminal_writes(case.engine)
+
+        history, stage, task = rows(case)
+        assert validated_runs == [case.uid]
+        assert (history["status"], stage["status"], task["last_run_status"]) == ("success", "SUCCESS", "success")
+        assert history["run_uid"] == stage["output_dataset_id"] == case.uid
+        assert "DATA_VALIDATION_OK" in history["output"] and "MODEL-activation-receipt" in history["output"]
+        assert candidate_state() == "SUCCESS"
+        assert journal.read(case.uid, "OBSERVED") == original and journal.read(case.uid, "COMMITTED") is not None
+        assert case.uid not in runtime._pending_terminal_writes
+        assert case.uid not in runtime._task_owner_leases
+        assert case.task_id not in runtime._running_history_uids and case.task_id not in runtime._running_task_ids
+        assert owner.stop_event.is_set() and not owner.thread.is_alive() and not owner_losses
+    finally:
+        owner.stop()
+        event.remove(case.engine, "before_cursor_execute", disconnect_terminal_update)
 
 
 @pytest.mark.parametrize("path",["outer","script_policy","missing_script"])

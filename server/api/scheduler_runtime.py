@@ -9493,13 +9493,15 @@ def _terminal_check_running(connection, uid, intent, *, for_update=False):
     return True
 
 
-def _terminal_expired_publication(connection, journal, uid, intent):
+def _terminal_expired_publication(connection, journal, uid, intent, *, owner_lost=False):
     """Known publication rejection under the already held original daily locks."""
     if intent["outcome"]["status"] not in {"success", "degraded"}:
         return intent
     owner_expired = task_owner_lease_expired(
         _terminal_history_row(connection, uid), now=_now_shanghai_naive())
     if not owner_expired:
+        if owner_lost:
+            raise _TerminalPersistencePending("original task ownership was lost before publication")
         if intent["outcome"]["task_type"] not in _DAILY_CONTROL_STAGE_TYPES:
             return intent
         stage = _terminal_stage_row(connection, uid)
@@ -9667,6 +9669,7 @@ def _task_history_finish(
     with _running_lock:
         _pending_terminal_writes[run_uid] = dict(values, _durable=True)
     runtime_health: dict[str, object] = {}
+    terminal_step = "verify_original"
     try:
         # COMMIT may have succeeded before the connection failed. Read exact
         # prior prepared history+stage+receipt originals before any side effect.
@@ -9679,6 +9682,7 @@ def _task_history_finish(
                 _pending_terminal_writes.pop(run_uid, None)
             return
         if fresh_observation and daily_control_required and status in {"success", "degraded"}:
+            terminal_step = "refresh_stage_lease"
             with engine.connect() as connection:
                 stage = _terminal_stage_row(connection, run_uid)
             if stage is not None:
@@ -9687,6 +9691,7 @@ def _task_history_finish(
                 # already expired publication lease backwards.
                 _refresh_daily_stage_lease_for_publication(engine, stage_attempt=stage)
         if status == "success" and normalized_task_type == "strategy_governance_daily":
+            terminal_step = "verify_governance_runtime"
             runtime_health = _daily_delivery_runtime_health(output, engine=engine)
         revision_context = None
         transaction = engine.begin
@@ -9708,10 +9713,14 @@ def _task_history_finish(
                         if status == "success":
                             verify_owner()
                             require_premarket_publication_window(slot)
+        terminal_step = "commit_terminal_audit"
         with transaction() as conn:
             if not _terminal_check_running(conn, run_uid, intent, for_update=True):
                 raise _TerminalPersistencePending("scheduler terminal run changed before transaction")
-            intent = _terminal_expired_publication(conn, journal, run_uid, intent)
+            intent = _terminal_expired_publication(
+                conn, journal, run_uid, intent,
+                owner_lost=owner_lease is not None and owner_lease.lost.is_set(),
+            )
             values = intent["outcome"]
             status, duration, exit_code, output, publication_receipt = (
                 values["status"], values["duration"], values["exit_code"],
@@ -9787,6 +9796,7 @@ def _task_history_finish(
                 status == "success"
                 and normalized_task_type in ANALYSIS_POOL_PUBLISHER_TASK_TYPES
             ):
+                terminal_step = "activate_score_pool"
                 activation_receipt = _activate_analysis_strategy_pool(
                     conn,
                     run_uid=str(run_uid or "").strip().lower(),
@@ -9794,6 +9804,7 @@ def _task_history_finish(
                     publication_receipt=publication_receipt,
                 )
             if status == "success" and normalized_task_type == "strategy_governance_daily":
+                terminal_step = "build_delivery_receipt"
                 delivery_receipt = _build_daily_result_delivery_receipt(
                     conn,
                     scheduler_run_uid=str(run_uid or "").strip().lower(),
@@ -9907,6 +9918,7 @@ def _task_history_finish(
                         separators=(",", ":"),
                     )
                 )
+            terminal_step = "commit_terminal_audit"
             identity = intent["identity"]
             predicates = " AND ".join(
                 f"({name}=:{name} OR ({name} IS NULL AND :{name} IS NULL))"
@@ -9937,6 +9949,7 @@ def _task_history_finish(
                 intent_sha256=digest(canonical(intent)),
                 snapshot=_terminal_snapshot(conn, run_uid, intent))
             journal.preserve(run_uid, "PREPARED." + digest(canonical(prepared)), prepared)
+        terminal_step = "confirm_commit"
         if not _terminal_confirm(engine, journal, run_uid, intent):
             raise _TerminalPersistencePending("scheduler terminal post-commit readback differs")
         with _running_lock:
@@ -9964,7 +9977,12 @@ def _task_history_finish(
             _invalidate_mysql_pool_after_transport_failure(engine)
         if isinstance(exc, (DBAPIError, OSError, TerminalJournalError,
                             _TerminalPersistencePending, DailyDeliveryFenceLost)):
-            logger.warning("Scheduler terminal database transaction pending for %s", run_uid)
+            db_error = getattr(getattr(exc, "orig", None), "args", ())
+            db_code = db_error[0] if db_error and type(db_error[0]) is int else None
+            logger.warning(
+                "Scheduler terminal database transaction pending for %s: step=%s error=%s db_code=%s",
+                run_uid, terminal_step, type(exc).__name__, db_code,
+            )
             return  # DB failure is not a new failed child outcome.
         # A known non-DB rejection is not automatically replayable. Preserve
         # it before allowing the caller's explicit failed-finalization result;
@@ -9996,6 +10014,16 @@ def _task_history_finish(
                 "daily stage finalization/terminal audit failed"
             ) from exc
         logger.warning("Failed to finish scheduler history %s: %s", run_uid, exc)
+
+
+def _owns_pending_pool_publication(task_type: str, task_id: int, run_uid: str) -> bool:
+    """Caller holds _running_lock. Keep the live Linux owner until replay commits."""
+    return (
+        task_type in {"analysis_fast", "strategy_governance_daily"}
+        and _running_history_uids.get(task_id) == run_uid
+        and run_uid in _task_owner_leases
+        and run_uid in _pending_terminal_writes
+    )
 
 
 def _retry_pending_terminal_writes(engine) -> None:
@@ -10044,13 +10072,26 @@ def _retry_pending_terminal_writes(engine) -> None:
     for run_uid, values in pending:
         _task_history_finish(engine, run_uid,
             **{key: value for key, value in values.items() if key != "_durable"})
+        owner_to_stop = None
         with _running_lock:
             retained = _pending_terminal_writes.get(run_uid)
-            if run_uid in _terminal_worker_exited and (retained is None or retained.get("_durable")):
+            if run_uid in _terminal_worker_exited:
                 for task_id, uid in tuple(_running_history_uids.items()):
-                    if uid == run_uid:
-                        _release_task_registry(task_id, run_uid)
-                _terminal_worker_exited.discard(run_uid)
+                    if uid != run_uid:
+                        continue
+                    if retained is not None and (
+                        not retained.get("_durable") or _owns_pending_pool_publication(
+                            str(values.get("task_type") or ""), task_id, run_uid
+                        )
+                    ):
+                        break
+                    if str(values.get("task_type") or "") in {"analysis_fast", "strategy_governance_daily"}:
+                        owner_to_stop = _task_owner_leases.get(run_uid)
+                    _release_task_registry(task_id, run_uid)
+                    _terminal_worker_exited.discard(run_uid)
+                    break
+        if owner_to_stop is not None:
+            owner_to_stop.stop()
 
 
 
@@ -10127,7 +10168,11 @@ def _run_task(row: dict, root: Path, engine) -> None:
         )
         logger.exception("Scheduler task %s failed before completion", row.get("task_name"))
     finally:
-        if owner_lease is not None:
+        with _running_lock:
+            retained_for_publication = _owns_pending_pool_publication(
+                task_type, int(row["id"]), history_run_uid
+            )
+        if owner_lease is not None and not retained_for_publication:
             owner_lease.stop()
 
 
@@ -10663,7 +10708,11 @@ def _run_task_async(row: dict, root: Path, engine) -> None:
                 if _shutdown_owned_runs is not None and history_run_uid:
                     _shutdown_owned_runs[task_id] = history_run_uid
                 pending = _pending_terminal_writes.get(history_run_uid)
-                if pending is not None and not pending.get("_durable"):
+                if pending is not None and (
+                    not pending.get("_durable") or _owns_pending_pool_publication(
+                        str(row.get("task_type") or ""), task_id, history_run_uid
+                    )
+                ):
                     _terminal_worker_exited.add(history_run_uid)
                 else:
                     _release_task_registry(task_id, history_run_uid)
