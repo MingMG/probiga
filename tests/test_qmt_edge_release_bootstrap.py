@@ -13,7 +13,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 
 from integrations.bigqmt import release_identity
 from integrations.bigqmt.release_identity import (
@@ -211,63 +211,79 @@ def test_recent_verified_reference_capture_is_reused_across_app_builds(
     assert summary["source_captured_at"] == CAPTURED_AT.isoformat(sep=" ")
 
 
-def test_expired_reference_capture_is_not_reused(
+def test_persisted_release_receipt_outlives_its_reference_reuse_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Production 2026-10-14: the reuse window measured the bootstrap instant.
+    from server.common.qmt_stock_catalog import insert_catalog_batch
+    from server.common.qmt_trade_calendar import calendar_source_batch_id, insert_trade_calendar_receipt
+    from tests.test_qmt_reference_bulk_publication import _catalog_arguments, _sqlite_engine
 
-    Bootstrap receipts at 15:02, 15:15, 15:46, 15:50, 17:15 and 20:22 each
-    reported a ``captured_at`` equal to their own run time while pointing at the
-    2026-10-13 19:48:54 catalog, so the window never expired and a universe of
-    any age stayed reusable.  The window belongs to the snapshot's own capture.
-    """
+    reference_at = datetime(2026, 11, 11, 15, 43, 11)
+    bootstrap_at = datetime(2026, 11, 13, 2, 41, 17)
+    current = datetime(2026, 11, 13, 5, 10, 23)
+    requested_at = bootstrap_at - timedelta(minutes=10)
+    batch_id = f"qmt_rel_{OTHER_BUILD_SHA}_20261111153826"
+    calendar_range = {"start_date": "1990-01-01", "end_date": "2027-12-31"}
+    calendar_sessions = ["2026-11-11", "2026-11-12", "2026-11-13"]
+    catalog_args = {**_catalog_arguments(2), "batch_id": batch_id, "captured_at": reference_at}
+    engine = _sqlite_engine()
 
-    expired = datetime.now().replace(microsecond=0) - timedelta(hours=48)
-    previous = _release_receipt(
-        requested_at=REQUESTED_AT,
-        captured_at=datetime.now().replace(microsecond=0),
-    )
+    class CurrentClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return current.replace(tzinfo=tz)
 
-    class Rows:
-        @staticmethod
-        def mappings():
-            return Rows()
+    monkeypatch.delenv("QMT_REFERENCE_REUSE_MAX_HOURS", raising=False)
+    try:
+        with engine.begin() as connection:
+            _install_release_ledger(connection)
+            catalog = insert_catalog_batch(connection, **catalog_args)
+            calendar = insert_trade_calendar_receipt(
+                connection, batch_id=batch_id, known_at=reference_at,
+                source_batch_id=calendar_source_batch_id(**calendar_range, sessions=calendar_sessions),
+                sessions=calendar_sessions, **calendar_range,
+            )
+            previous = _release_receipt(
+                requested_at=requested_at, captured_at=bootstrap_at, reference_batch_id=batch_id,
+                catalog_manifest_hash=catalog["manifest_hash"], calendar_manifest_hash=calendar["manifest_hash"],
+            )
+            receipt_contract.insert_qmt_edge_release_request(connection, receipt_contract.build_qmt_edge_release_request(
+                build_sha=BUILD_SHA, requested_at=requested_at,
+            ))
+            row = receipt_contract.insert_qmt_edge_release_receipt(connection, previous)
+            future_receipt = _release_receipt(
+                requested_at=requested_at, captured_at=current + timedelta(seconds=1), reference_batch_id=batch_id,
+                catalog_manifest_hash=catalog["manifest_hash"], calendar_manifest_hash=calendar["manifest_hash"],
+            )
 
-        @staticmethod
-        def all():
-            return [{"output": json.dumps(previous)}]
+        monkeypatch.setattr(receipt_contract, "datetime", CurrentClock)
+        reference_reads = []
 
-    class Connection:
-        @staticmethod
-        def execute(*_args, **_kwargs):
-            return Rows()
+        @event.listens_for(engine, "before_cursor_execute")
+        def observe_reference_frontier(_connection, _cursor, sql, _params, context, _many):
+            if "FROM qmt_stock_catalog_batch" in sql or "FROM qmt_trade_calendar_batch" in sql:
+                reference_reads.append(context.compiled_parameters[0]["decision_known_at"])
 
-    monkeypatch.setattr(
-        receipt_contract,
-        "load_stock_catalog",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            manifest_hash="c" * 64,
-            captured_at=expired.isoformat(sep=" "),
-        ),
-    )
-    monkeypatch.setattr(
-        receipt_contract,
-        "load_trade_calendar_receipt",
-        lambda *_args, **_kwargs: SimpleNamespace(manifest_hash="d" * 64),
-    )
-    monkeypatch.setattr(
-        receipt_contract,
-        "load_qmt_edge_release_request",
-        lambda *_args, **_kwargs: {
-            "request_run_uid": previous["request_run_uid"],
-            "requested_at": previous["requested_at"],
-        },
-    )
-
-    assert bootstrap._load_reusable_reference_capture(
-        Connection(),
-        now=datetime.now(),
-    ) is None
+        with engine.connect() as connection:
+            persisted = connection.execute(text(
+                "SELECT output FROM st_scheduled_task_history WHERE run_uid=:run_uid"
+            ), {"run_uid": row["run_uid"]}).scalar_one()
+            verified = receipt_contract.validate_qmt_edge_release_receipt(
+                connection, persisted, expected_build_sha=BUILD_SHA,
+                expected_host_name=HOST_NAME, expected_scheduler_instance_id=INSTANCE_ID,
+            )
+            assert verified == {**previous, "catalog_captured_at": reference_at.isoformat(sep=" ")}
+            assert reference_reads == [bootstrap_at.isoformat(sep=" ")] * 2
+            assert bootstrap._load_reusable_reference_capture(connection, now=current) is None
+            assert reference_reads == [bootstrap_at.isoformat(sep=" ")] * 4
+            with pytest.raises(receipt_contract.QmtEdgeReleaseReceiptError, match="release receipt capture is in the future"):
+                receipt_contract.validate_qmt_edge_release_receipt(
+                    connection, future_receipt, expected_build_sha=BUILD_SHA,
+                    expected_host_name=HOST_NAME, expected_scheduler_instance_id=INSTANCE_ID,
+                )
+            assert reference_reads == [bootstrap_at.isoformat(sep=" ")] * 4
+    finally:
+        engine.dispose()
 
 
 def test_reference_snapshot_minted_by_a_previous_build_certifies_a_release(
@@ -281,7 +297,7 @@ def test_reference_snapshot_minted_by_a_previous_build_certifies_a_release(
     the minting revision differed, and the receipt is bound to the new build.
     """
 
-    captured = datetime.now().replace(microsecond=0) - timedelta(hours=1)
+    captured = datetime(2026, 8, 24, 19, 48, 54)
     value = _release_receipt(reference_batch_id=OLDER_REFERENCE_BATCH_ID)
     monkeypatch.setattr(
         receipt_contract,
@@ -510,6 +526,8 @@ def _release_receipt(
     requested_at: datetime = REQUESTED_AT,
     captured_at: datetime = CAPTURED_AT,
     reference_batch_id: str = REFERENCE_BATCH_ID,
+    catalog_manifest_hash: str = "c" * 64,
+    calendar_manifest_hash: str = "d" * 64,
 ) -> dict[str, Any]:
     return receipt_contract.build_qmt_edge_release_receipt(
         build_sha=BUILD_SHA,
@@ -520,9 +538,9 @@ def _release_receipt(
         host_name=HOST_NAME,
         scheduler_instance_id=INSTANCE_ID,
         catalog_batch_id=reference_batch_id,
-        catalog_manifest_hash="c" * 64,
+        catalog_manifest_hash=catalog_manifest_hash,
         calendar_batch_id=reference_batch_id,
-        calendar_manifest_hash="d" * 64,
+        calendar_manifest_hash=calendar_manifest_hash,
         calendar_start_date="1990-01-01",
         calendar_end_date="2027-12-31",
         local_history_schema_hash="e" * 64,
@@ -1109,8 +1127,9 @@ def test_bigqmt_strategy_release_proof_fails_closed_on_drift(drift: str):
 def test_release_receipt_binds_request_sha_instance_and_reference_batch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.delenv("QMT_REFERENCE_REUSE_MAX_HOURS", raising=False)
     value = _release_receipt()
-    captured = datetime.now().replace(microsecond=0) - timedelta(hours=1)
+    captured = CAPTURED_AT
     monkeypatch.setattr(
         receipt_contract,
         "load_stock_catalog",
@@ -1178,6 +1197,26 @@ def test_release_receipt_binds_request_sha_instance_and_reference_batch(
             expected_host_name=HOST_NAME,
             expected_scheduler_instance_id=INSTANCE_ID,
         )
+
+    for hash_override, message in (
+        ({"catalog_manifest_hash": "1" * 64}, "catalog immutable receipt differs"),
+        ({"calendar_manifest_hash": "1" * 64}, "calendar immutable receipt differs"),
+    ):
+        with pytest.raises(receipt_contract.QmtEdgeReleaseReceiptError, match=message):
+            receipt_contract.validate_qmt_edge_release_receipt(
+                object(), _release_receipt(**hash_override), expected_build_sha=BUILD_SHA,
+                expected_host_name=HOST_NAME, expected_scheduler_instance_id=INSTANCE_ID,
+            )
+
+    for captured, message in (
+        (CAPTURED_AT + timedelta(seconds=1), "reference capture is in the future"),
+        (CAPTURED_AT - timedelta(hours=36, seconds=1), "outside its validity period at bootstrap"),
+    ):
+        with pytest.raises(receipt_contract.QmtEdgeReleaseReceiptError, match=message):
+            receipt_contract.validate_qmt_edge_release_receipt(
+                object(), value, expected_build_sha=BUILD_SHA,
+                expected_host_name=HOST_NAME, expected_scheduler_instance_id=INSTANCE_ID,
+            )
 
 
 def test_release_receipt_rejects_request_or_reference_identity_drift() -> None:
@@ -2083,23 +2122,27 @@ def test_forward_same_target_renewal_still_has_bounded_depth():
         )
 
 
+def _install_release_ledger(connection):
+    connection.execute(text(
+        "CREATE TABLE st_scheduled_tasks (id INTEGER PRIMARY KEY, task_type TEXT)"
+    ))
+    connection.execute(text(
+        "INSERT INTO st_scheduled_tasks VALUES (7, 'qmt_reference_incremental')"
+    ))
+    connection.execute(text(
+        "CREATE TABLE st_scheduled_task_history (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "run_uid TEXT UNIQUE NOT NULL, task_id INTEGER, task_name TEXT, task_type TEXT, "
+        "run_at TEXT, finished_at TEXT, status TEXT, duration INTEGER, exit_code INTEGER, "
+        "output TEXT, host_name TEXT, scheduler_instance_id TEXT, build_sha TEXT, trigger_source TEXT)"
+    ))
+
+
 @pytest.fixture
 def forward_reader_engine(monkeypatch):
     """Exercise immutable ledger readers without production or native access."""
     engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
     with engine.begin() as connection:
-        connection.execute(text(
-            "CREATE TABLE st_scheduled_tasks (id INTEGER PRIMARY KEY, task_type TEXT)"
-        ))
-        connection.execute(text(
-            "INSERT INTO st_scheduled_tasks VALUES (7, 'qmt_reference_incremental')"
-        ))
-        connection.execute(text(
-            "CREATE TABLE st_scheduled_task_history (id INTEGER PRIMARY KEY AUTOINCREMENT, "
-            "run_uid TEXT UNIQUE NOT NULL, task_id INTEGER, task_name TEXT, task_type TEXT, "
-            "run_at TEXT, finished_at TEXT, status TEXT, duration INTEGER, exit_code INTEGER, "
-            "output TEXT, host_name TEXT, scheduler_instance_id TEXT, build_sha TEXT, trigger_source TEXT)"
-        ))
+        _install_release_ledger(connection)
     monkeypatch.setattr(bootstrap, "gethostname", lambda: HOST_NAME)
     try:
         yield engine

@@ -55,6 +55,7 @@ from server.common.qmt_edge_release_receipt import (
     load_existing_qmt_edge_release_request,
     load_latest_qmt_edge_release_quiescence_hold,
     load_qmt_edge_release_request,
+    qmt_reference_validity_hours,
     validate_qmt_edge_release_receipt,
 )
 from server.common.qmt_history_coverage import validate_coverage_schema
@@ -260,7 +261,7 @@ def _load_reusable_reference_capture(
                 str(verified["catalog_captured_at"])
             )
             age_hours = (now - reference_captured_at).total_seconds() / 3600.0
-            if age_hours < -0.1:
+            if not 0 <= age_hours <= qmt_reference_validity_hours():
                 continue
             batch_id = str(verified["catalog_batch_id"])
             catalog = {"batch_id": batch_id}

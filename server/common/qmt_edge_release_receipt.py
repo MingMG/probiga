@@ -17,6 +17,7 @@ from typing import Any, Mapping
 
 from sqlalchemy import text
 
+from server.common.authoritative_market_clock import PRODUCTION_TIMEZONE
 from server.common.qmt_attestation_contract import canonical_digest
 from server.common.qmt_stock_catalog import load_stock_catalog
 from server.common.qmt_trade_calendar import load_trade_calendar_receipt
@@ -50,10 +51,9 @@ QMT_EDGE_RELEASE_ACTIVATION_TASK_NAME = (
     "QMT Windows edge release activation grant"
 )
 
-# A verified reference snapshot certifies a release for as long as its own
-# capture stays inside this window.  The repository revision that happened to
-# mint the batch name is audit evidence, not a validity condition: an unrelated
-# application commit must not force an identical reference recapture.
+# A release may reuse a reference snapshot captured within this window at
+# bootstrap. The receipt proves that bootstrap against its original snapshot.
+# Daily data consumers validate their own as-of reference requirements.
 QMT_REFERENCE_VALIDITY_HOURS_ENV = "QMT_REFERENCE_REUSE_MAX_HOURS"
 QMT_REFERENCE_VALIDITY_HOURS_DEFAULT = 36.0
 
@@ -286,7 +286,10 @@ def validate_qmt_edge_release_receipt(
             "release receipt does not match the immutable request"
         )
 
-    decision_known_at = datetime.now().replace(microsecond=0)
+    decision_known_at = _reference_captured_at(rebuilt["captured_at"])
+    current_time = datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None, microsecond=0)
+    if decision_known_at > current_time:
+        raise QmtEdgeReleaseReceiptError("release receipt capture is in the future")
     catalog = load_stock_catalog(
         connection,
         batch_id=rebuilt["catalog_batch_id"],
@@ -301,7 +304,7 @@ def validate_qmt_edge_release_receipt(
         decision_known_at - reference_captured_at
     ).total_seconds() > qmt_reference_validity_hours() * 3600.0:
         raise QmtEdgeReleaseReceiptError(
-            "reference capture is outside its validity period"
+            "reference capture was outside its validity period at bootstrap"
         )
     calendar = load_trade_calendar_receipt(
         connection,

@@ -118,6 +118,8 @@ def _missed_windows_runtime_release(
     "server/common/qmt_datadir_minute_coverage.py",
     "server/common/qmt_announcement_pit.py",
     "tools/sync_qmt_announcement_pit.py",
+    "server/common/qmt_edge_release_receipt.py",
+    "tools/run_qmt_windows_edge_release_bootstrap.py",
 ])
 def test_deployed_windows_base_catches_a_runtime_change_already_in_linux(repo, path):
     windows, linux, target = _missed_windows_runtime_release(repo, path)
@@ -322,7 +324,10 @@ def test_contract_declaration_change_is_coordinated(repo, path):
     repo.write(path, "CONTRACT_REVISION = 2\n")
     result = repo.classify(repo.commit(), base=first)
     assert result["scope"] == "COORDINATED"
-    assert result["reason_codes"] == ["schema_contract_changed"]
+    expected_reasons = ["schema_contract_changed"]
+    if path in policy._WINDOWS_RUNTIME_FILES:
+        expected_reasons.append("windows_runtime_changed")
+    assert result["reason_codes"] == expected_reasons
 
 
 def test_contract_binding_addition_and_removal_are_coordinated(repo):

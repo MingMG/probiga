@@ -267,6 +267,9 @@ _WINDOWS_RUNTIME_FILES = (
     # The Windows scheduler launches this producer and its full-market validator.
     "tools/sync_qmt_announcement_pit.py",
     "server/common/qmt_announcement_pit.py",
+    # The Windows scheduler validates its active release and captures bootstrap evidence.
+    "server/common/qmt_edge_release_receipt.py",
+    "tools/run_qmt_windows_edge_release_bootstrap.py",
 )
 
 # The export list is packaging, not a runtime contract with the other endpoint.

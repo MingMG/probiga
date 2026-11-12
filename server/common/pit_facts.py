@@ -2485,6 +2485,7 @@ def _latest_revision_for_fact_cutoff(
     fact_kind: str,
     fact_cutoff_at: datetime,
     decision_at: datetime,
+    signed_event_received_at: datetime | None = None,
 ) -> tuple[dict[str, Any] | None, str]:
     """Select the latest revision eligible for market cutoff T and decision E."""
 
@@ -2535,10 +2536,19 @@ def _latest_revision_for_fact_cutoff(
                 if fact_cutoff_at == decision_at
                 else f"PIT_{fact_kind.upper()}_PUBLISHED_AFTER_FACT_CUTOFF"
             )
-        elif not _live_capture_allowed(
-            fact_cutoff_at=fact_cutoff_at,
-            decision_at=decision_at,
-            known_at=known,
+        elif not (
+            _live_capture_allowed(
+                fact_cutoff_at=fact_cutoff_at, decision_at=decision_at, known_at=known,
+            )
+            or (
+                # A signed CNINFO day-end reconstruction proves the provider's
+                # date and the actual knowledge time, without inventing a time.
+                fact_kind == "event"
+                and row.get("source") == CNINFO_EVENT_SOURCE
+                and signed_event_received_at is not None
+                and datetime.combine(source_date, datetime.max.time()) <= fact_cutoff_at
+                and known <= signed_event_received_at <= decision_at
+            )
         ):
             reason = f"PIT_{fact_kind.upper()}_LIVE_CAPTURE_WINDOW_EXCEEDED"
         elif (
@@ -7446,11 +7456,24 @@ def load_event_facts(
                 status=PIT_DATA_BLOCKED,
             )
     bound_ids = {}
-    signed_bindings = historical_selection.signed_historical_bindings if historical_selection is not None else None
+    signed_bindings = historical_selection.signed_historical_bindings if selection is not None else None
     if isinstance(selection, _SignedLiveEventSelection):
         signed_bindings = selection.bindings
+    signed_event_received_at = None
     try:
         if signed_bindings is not None:
+            if set(signed_bindings) != set(normalized_codes):
+                raise ValueError("signed announcement bound stock scope differs")
+            if (
+                not isinstance(selection, _SignedLiveEventSelection)
+                and event_batch.get("mode") == "HISTORICAL_RECONSTRUCTION"
+                and event_batch.get("source") == CNINFO_EVENT_SOURCE
+            ):
+                received = _row_datetime(event_batch.get("received_at"))
+                completed = _row_datetime(event_batch["initial_stage"]["completed_at"])
+                if not fact_cutoff <= received <= completed <= decision:
+                    raise ValueError("signed historical announcement knowledge frontier differs")
+                signed_event_received_at = received
             rows, bound_ids = _query_signed_bound_event_revisions(engine, selection, signed_bindings)
         else:
             rows = _query_revisions(
@@ -7513,7 +7536,7 @@ def load_event_facts(
                 )
                 for code, (row, is_scope_head) in selection.members.items()
                 if is_scope_head and (
-                    (not by_code_identity.get(code) if isinstance(selection, _SignedLiveEventSelection)
+                    (not by_code_identity.get(code) if signed_bindings is not None
                      else int(row["result_count"]) == 0)
                 )
             }
@@ -7552,6 +7575,7 @@ def load_event_facts(
                     fact_kind="event",
                     fact_cutoff_at=fact_cutoff,
                     decision_at=decision,
+                    signed_event_received_at=signed_event_received_at,
                 )
                 if signed_bindings is not None and (
                     selected is None or selected["revision_id"] != bound_ids.get(identity)

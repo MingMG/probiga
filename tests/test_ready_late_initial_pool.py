@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
@@ -211,7 +212,7 @@ def test_signed_cninfo_reconstruction_is_usable_only_after_actual_completion(
         synchronize_historical_cninfo_announcements,
         validate_task_result,
     )
-    from tests.test_announcement_provider_fallback import _Client, _historical_authority_v3, _master, _row_on_date
+    from tests.test_announcement_provider_fallback import _Client, _historical_authority_v3, _master, _row_at, _row_on_date
     from tests.test_qmt_announcement_pit import _catalog, _install_catalog
 
     engine = pool_calendar
@@ -219,11 +220,15 @@ def test_signed_cninfo_reconstruction_is_usable_only_after_actual_completion(
     pit_facts.ensure_pit_fact_schema(engine)
     target = date.fromisoformat(TARGET)
     start = target - timedelta(days=30)
+    scoring_start = target - timedelta(days=14)
     catalog = _install_catalog(
-        engine, _catalog(("000001", "000001.SZ"), ("600519", "600519.SH")),
+        engine, _catalog(
+            ("000001", "000001.SZ"), ("000002", "000002.SZ"), ("000003", "000003.SZ"),
+            ("600000", "600000.SH"), ("600519", "600519.SH"),
+        ),
         captured_at=f"{TARGET} 15:30:00",
     )
-    started = datetime(2026, 11, 11, 0, 20)
+    started = datetime(2026, 11, 11, 1, 20)
     received = started + timedelta(seconds=20)
     finished = received + timedelta(seconds=5, microseconds=250_000)
     source_cutoff = datetime.combine(target, datetime.max.time())
@@ -242,11 +247,26 @@ def test_signed_cninfo_reconstruction_is_usable_only_after_actual_completion(
         watermark_evidence={"provider": pit_facts.CNINFO_EVENT_SOURCE}, source_rows=[], fact_bindings=[],
         source=pit_facts.CNINFO_EVENT_SOURCE, batch_id="prior-cninfo-coverage",
     )
+    date_only = datetime.combine(target, datetime.min.time())
+    pit_facts.append_event_revision(
+        engine, {
+            "stock_code": "000003", "event_key": f"cninfo:event-000003-{target:%Y%m%d}-000",
+            "event_date": TARGET, "published_at": None, "source_published_text": TARGET,
+            "title": "Earlier content with the same publication date",
+        }, known_at=datetime.combine(target, datetime.min.time()) + timedelta(hours=21),
+        source=pit_facts.CNINFO_EVENT_SOURCE, batch_id="prior-cninfo-event",
+    )
 
     master = _master(*catalog.codes)
     client = _Client(
         masters=[master, master],
-        rows_by_code={"000001": [_row_on_date("000001", 0, target)], "600519": []},
+        rows_by_code={
+            "000001": [_row_on_date("000001", 0, target)],
+            "000002": [_row_at("000002", 0, date_only)],
+            "000003": [_row_at("000003", 0, date_only)],
+            "600000": [_row_on_date("600000", 0, scoring_start - timedelta(days=1))],
+            "600519": [],
+        },
     )
     provider = CninfoMarketAnnouncementProvider(
         client=client, minimum_request_interval=0, now_fn=lambda: started + timedelta(seconds=10),
@@ -276,7 +296,7 @@ def test_signed_cninfo_reconstruction_is_usable_only_after_actual_completion(
     )
     assert validate_task_result(batch, 0) == "complete"
     assert batch["mode"] == "HISTORICAL_RECONSTRUCTION"
-    assert batch["coverage_count"] == 2 and batch["event_count"] == batch["empty_stock_count"] == 1
+    assert batch["coverage_count"] == 5 and batch["event_count"] == 4 and batch["empty_stock_count"] == 1
     assert datetime.fromisoformat(batch["fact_cutoff_at"]) == source_cutoff
     assert datetime.fromisoformat(batch["received_at"]) == received
 
@@ -312,7 +332,7 @@ def test_signed_cninfo_reconstruction_is_usable_only_after_actual_completion(
     assert signed.score_binding["received_at"] == received.isoformat(timespec="microseconds")
     assert signed.score_binding["finished_at"] == finished.isoformat(timespec="microseconds")
 
-    selection_scope = dict(codes=list(catalog.codes), data_date=target, window_start=start, window_end=target)
+    selection_scope = dict(codes=list(catalog.codes), data_date=target, window_start=scoring_start, window_end=target)
     with pytest.raises(ValueError, match="completion scope differs"):
         pit_facts._load_certified_initial_event_selection(
             engine, signed, decision=finished.replace(microsecond=0), **selection_scope,
@@ -359,28 +379,46 @@ def test_signed_cninfo_reconstruction_is_usable_only_after_actual_completion(
     progress = []
     resolved = pit_facts.resolve_strategy_fact_cutoffs(
         engine, codes=catalog.codes, decision_at=cutoff, finance_start_date="1900-01-01",
-        finance_end_date=target, event_start_date=start, event_end_date=target, require_qmt_event_batch=True,
+        finance_end_date=target, event_start_date=scoring_start, event_end_date=target, require_qmt_event_batch=True,
         required_initial_announcement=signed, capture_historical_selection=event_reads.append,
         event_progress=lambda done, total: progress.append((done, total)),
     )
     assert resolved["status"] == pit_facts.PIT_AVAILABLE, resolved.get("reason")
     assert resolved["qmt_event_batch"]["batch_root_hash"] == batch["batch_root_hash"]
     assert len(event_reads) == 1
-    assert progress == [(0, 4), (2, 4), (4, 4)]
-    facts = pit_facts.load_event_facts(
-        engine, codes=catalog.codes, decision_at=cutoff, fact_cutoff_at=resolved["source_cutoff_at"]["event"],
-        start_date=start, end_date=target, require_qmt_complete_batch=True,
-        historical_selection=event_reads[0],
-    )
+    assert progress == [(0, 10), (5, 10), (10, 10)]
+
+    def read_facts(selection, fact_cutoff=resolved["source_cutoff_at"]["event"]):
+        return pit_facts.load_event_facts(
+            engine, codes=catalog.codes, decision_at=cutoff, fact_cutoff_at=fact_cutoff,
+            start_date=scoring_start, end_date=target, require_qmt_complete_batch=True,
+            historical_selection=selection,
+        )
+
+    facts = read_facts(event_reads[0])
+    assert selected.members["600000"][0]["result_count"] == 1
+    assert selected.members["600000"][1] is True
+    assert facts.status_for("600000") == pit_facts.PIT_AVAILABLE
+    assert facts.reason_for("600000") == "PIT_EVENT_AUTHORITATIVE_EMPTY"
+    assert facts.facts["600000"] == []
+    assert facts.coverage_by_code["600000"]["coverage_id"] == selected.members["600000"][0]["coverage_id"]
     assert facts.status_for("000001") == facts.status_for("600519") == pit_facts.PIT_AVAILABLE
     assert len(facts.facts["000001"]) == 1 and facts.facts["600519"] == []
     assert facts.facts["000001"][0]["event_key"] == f"cninfo:event-000001-{target:%Y%m%d}-000"
     assert facts.coverage_by_code["600519"]["coverage_batch_id"] == batch["batch_id"]
+    assert facts.status_for("000002") == pit_facts.PIT_AVAILABLE
+    date_only_event, = facts.facts["000002"]
+    assert date_only_event["event_publication_precision"] == "DATE_ONLY"
+    assert date_only_event["event_publication_time_verified"] is False
+    assert date_only_event["event_published_at"][:10] == TARGET
+    assert date_only_event["event_observed_available_at"] == received.isoformat(timespec="microseconds")
+    assert facts.status_for("000003") == pit_facts.PIT_DATA_BLOCKED
+    assert facts.reason_for("000003") == "PIT_EVENT_BOUND_REVISION_NOT_ELIGIBLE"
 
     fixture = decode_score_snapshot(scored_publication([
         {"stock_code": code,
-         "event_revision_ids": [item["event_revision_id"] for item in facts.facts[code]],
-         "event_content_hashes": [item["event_content_hash"] for item in facts.facts[code]]}
+         "event_revision_ids": [item["event_revision_id"] for item in facts.facts.get(code, [])],
+         "event_content_hashes": [item["event_content_hash"] for item in facts.facts.get(code, [])]}
         for code in catalog.codes
     ], trade_date=TARGET)["score_snapshot"])
     core = {
@@ -400,12 +438,42 @@ def test_signed_cninfo_reconstruction_is_usable_only_after_actual_completion(
     assert decoded["frozen_announcement_source"] == signed.score_binding
     assert decoded["input_decision_at"] == cutoff.isoformat()
 
+    before_bound_publication = datetime.combine(target, datetime.min.time())
+    blocked = read_facts(
+        replace(event_reads[0], fact_cutoff_at=before_bound_publication), fact_cutoff=before_bound_publication,
+    )
+    assert blocked.status_for("000001") == pit_facts.PIT_DATA_BLOCKED
+    assert blocked.reason_for("000001") == "PIT_EVENT_BOUND_REVISION_NOT_ELIGIBLE"
+    assert "000001" not in blocked.coverage_by_code
+    assert blocked.status_for("000002") == pit_facts.PIT_DATA_BLOCKED
+    assert blocked.reason_for("000002") == "PIT_EVENT_BOUND_REVISION_NOT_ELIGIBLE"
+    assert "000002" not in blocked.coverage_by_code
+
+    missing_id = date_only_event["event_revision_id"]
+
+    def omit_bound_revision(_connection, _cursor, sql, parameters, _context, _many):
+        if "FROM st_pit_event_revision" in sql and "WHERE revision_id IN" in sql and missing_id in parameters:
+            return sql + " AND revision_id<>?", (*parameters, missing_id)
+        return sql, parameters
+
+    event.listen(engine, "before_cursor_execute", omit_bound_revision, retval=True)
+    try:
+        missing = read_facts(event_reads[0])
+    finally:
+        event.remove(engine, "before_cursor_execute", omit_bound_revision)
+    assert missing.status_for("000002") == pit_facts.PIT_SCHEMA_UNAVAILABLE
+    assert missing.reason_for("000002").startswith("PIT_EVENT_SCHEMA_UNAVAILABLE:")
+    assert "000002" not in missing.coverage_by_code
+
     pit_facts.append_source_coverage(
-        engine, fact_kind="event", stock_code="600519", window_start=start, window_end=target,
+        engine, fact_kind="event", stock_code="600000", window_start=start, window_end=target,
         known_at=received, covered_through_at=received, watermark_kind="CAPTURED_AT",
         watermark_evidence={"provider": batch["source"]}, source_rows=[], fact_bindings=[],
         source=batch["source"], batch_id="same-frontier-cninfo-coverage",
     )
     selected = pit_facts._load_certified_initial_event_selection(engine, signed, decision=cutoff, **selection_scope)
-    assert selected.members["600519"][0]["batch_id"] == batch["batch_id"]
-    assert selected.members["600519"][1] is False
+    assert selected.members["600000"][0]["batch_id"] == batch["batch_id"]
+    assert selected.members["600000"][1] is False
+    not_head = read_facts(replace(event_reads[0], selection=selected))
+    assert not_head.status_for("600000") == pit_facts.PIT_NO_ROWS
+    assert "600000" not in not_head.coverage_by_code

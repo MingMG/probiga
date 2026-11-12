@@ -5071,7 +5071,11 @@ def save_outputs(
         ):
             raise RuntimeError(
                 "analysis publication has neither a four-gate executable "
-                "strategy pool nor a sealed research-only pool"
+                "strategy pool nor a sealed research-only pool "
+                f"(scored={manifest.get('score_stock_count')}, "
+                f"blocked={manifest.get('score_data_blocked_count')}, "
+                f"excluded={manifest.get('score_data_excluded_count')}, "
+                f"recommendations={manifest.get('recommendation_count')})"
             )
         membership_proofs = manifest.get("membership_proofs")
         membership = (
