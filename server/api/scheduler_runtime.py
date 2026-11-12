@@ -4538,6 +4538,10 @@ def _strategy_pipeline_dependencies_ready(
     return evaluate_strategy_pipeline_dependencies(task_type, task_rows, now=now)
 
 
+def _is_formal_initial_analysis(row: dict) -> bool:
+    return row.get("task_type") == "analysis_fast" and row.get("_scheduler_pipeline_phase") == "INITIAL"
+
+
 def _task_timeout_minutes(
     row: dict,
     *,
@@ -4562,8 +4566,9 @@ def _task_timeout_minutes(
         # attempt must terminate and release its claim so automatic recovery
         # can continue the remaining work instead of renewing RUNNING forever.
         return max(1, DEFAULT_TASK_TIMEOUT_MINUTES)
-    # Selection must finish on its evidence, not an elapsed-time deadline.
-    # Process ownership, explicit stops and renewable stage leases still apply.
+    if _is_formal_initial_analysis(row):
+        return max(1, LONG_TASK_TIMEOUT_MINUTES)
+    # Other selection tasks retain their existing ownership and lease policy.
     if task_type in UNLIMITED_SELECTION_TASK_TYPES or task_type in DAILY_RESULT_RECOVERY_TASK_TYPES:
         return None
     script_path = str(row.get("script_path") or "").replace("\\", "/").strip()
@@ -4722,6 +4727,91 @@ def _scheduler_task_sort_key(row: dict, *, now: datetime) -> tuple[int, float, i
     return (0, -float(overdue_seconds), int(row.get("id") or 0))
 
 
+class _FormalAnalysisProgressTimeout(subprocess.TimeoutExpired):
+    def __init__(self, reason: str, seconds: float, stage: str, done: int, total: int):
+        super().__init__("analysis_fast", seconds)
+        self.audit_message = f"{reason}: stage={stage} done={done}/{total} budget_seconds={int(seconds)}"
+
+
+def _read_formal_analysis_progress(
+    path: Path, *, run_uid: str, trade_date: str,
+) -> tuple[str, int, int, int] | None:
+    try:
+        if not stat.S_ISREG(path.lstat().st_mode):
+            return None
+        with path.open("rb") as stream:
+            raw = stream.read(16 * 1024 + 1)
+        if len(raw) > 16 * 1024:
+            return None
+        value = json.loads(raw)
+    except (OSError, ValueError):
+        return None
+    if (
+        not isinstance(value, dict)
+        or value.get("schema") != "probiga.analysis-execution-progress.v1"
+        or value.get("run_uid") != run_uid
+        or value.get("trade_date") not in (None, trade_date)
+    ):
+        return None
+    stage = value.get("stage")
+    percent = value.get("percent")
+    if (
+        not isinstance(stage, str) or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", stage) is None
+        or type(percent) is not int or not 0 <= percent <= 100
+    ):
+        return None
+    done_key, total_key = {
+        "load_kline_chunk": ("kline_feature_chunk", "kline_feature_chunk_count"),
+        "build_execution_risk": ("execution_risk_done", "execution_risk_total"),
+        "validate_turnover_inputs": ("turnover_validation_done", "turnover_validation_total"),
+    }.get(stage, ("done", "total"))
+    done, total = value.get(done_key), value.get(total_key)
+    if type(done) is not int or type(total) is not int or not 0 <= done <= total:
+        done = total = 0
+    return stage, percent, done, total
+
+
+def _wait_for_formal_analysis_child(
+    proc: subprocess.Popen, *, progress_path: Path, run_uid: str,
+    trade_date: str, timeout_seconds: float, clock=time.monotonic,
+) -> tuple[str, str]:
+    stall_seconds = 30 * 60
+    began = last_advance = clock()
+    stage, done, total = "starting", 0, 0
+    highest_percent = -1
+    seen: dict[str, tuple[int, int]] = {}
+    while True:
+        marker = _read_formal_analysis_progress(progress_path, run_uid=run_uid, trade_date=trade_date)
+        current = clock()
+        if marker is not None:
+            observed_stage, percent, observed_done, observed_total = marker
+            prior = seen.get(observed_stage)
+            advanced = (
+                percent > highest_percent
+                or (percent == highest_percent and (
+                    prior is None
+                    or (observed_done > prior[0] and prior[1] in (0, observed_total))
+                ))
+            )
+            if advanced:
+                highest_percent = percent
+                seen[observed_stage] = observed_done, observed_total
+                stage, done, total = observed_stage, observed_done, observed_total
+                last_advance = current
+        remaining = began + timeout_seconds - current
+        stall_remaining = last_advance + stall_seconds - current
+        if remaining <= 0:
+            raise _FormalAnalysisProgressTimeout("FORMAL_ANALYSIS_OVERALL_DEADLINE", timeout_seconds, stage, done, total)
+        if stall_remaining <= 0:
+            raise _FormalAnalysisProgressTimeout("FORMAL_ANALYSIS_NO_PROGRESS", stall_seconds, stage, done, total)
+        try:
+            return proc.communicate(timeout=min(15, remaining, stall_remaining))
+        except subprocess.TimeoutExpired:
+            # communicate() preserves output across timed waits. A heartbeat or
+            # an unchanged progress file cannot extend the exact child's budget.
+            continue
+
+
 def _terminate_process(proc: subprocess.Popen | None) -> None:
     if not proc or proc.poll() is not None:
         return
@@ -4759,6 +4849,24 @@ def _terminate_process_and_confirm(
         )
         return False
     return proc.poll() is not None
+
+
+def _drain_exited_formal_analysis_child(proc: subprocess.Popen) -> tuple[str, str]:
+    if proc.poll() is None:
+        raise RuntimeError("formal analysis child exit is unconfirmed")
+    try:
+        return proc.communicate(timeout=2)
+    except subprocess.TimeoutExpired as exc:
+        # A descendant may still hold an inherited pipe after the exact child
+        # exited. POSIX communicate uses no background readers; close our ends.
+        if os.name != "nt":
+            for stream in (proc.stdout, proc.stderr):
+                if stream is not None:
+                    stream.close()
+        return tuple(
+            value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value or ""
+            for value in (exc.output, exc.stderr)
+        )
 
 
 def _task_stop_requested(task_id: int) -> bool:
@@ -10074,6 +10182,28 @@ def _retry_pending_terminal_writes(engine) -> None:
     pending = [(uid, values) for uid, values in pending.items()
                if uid not in active_runs or uid in exited][:8]
     for run_uid, values in pending:
+        pending_exit = values.get("_formal_analysis_pending_exit")
+        if pending_exit is not None:
+            proc, stop_stage_lease, start_t, task_id = pending_exit
+            if proc.poll() is None:
+                continue
+            stdout, stderr = _drain_exited_formal_analysis_child(proc)
+            stop_stage_lease()
+            stopped = _task_stop_requested(task_id)
+            message = _task_stop_message(task_id) if stopped else values["output"]
+            values = {
+                **{key: value for key, value in values.items() if key != "_formal_analysis_pending_exit"},
+                "status": "stopped" if stopped else "timeout",
+                "duration": int((datetime.now() - start_t).total_seconds()),
+                "exit_code": proc.returncode,
+                "output": message + "\n" + _redact_history_output(stdout + "\n---STDERR---\n" + stderr),
+            }
+            with _running_lock:
+                if _running_procs.get(task_id) is proc and _running_history_uids.get(task_id) == run_uid:
+                    _running_procs.pop(task_id, None)
+                    _pending_terminal_writes[run_uid] = values
+                else:
+                    continue
         task_type = str(values.get("task_type") or "")
         try:
             _task_history_finish(engine, run_uid,
@@ -10405,6 +10535,7 @@ def _run_task_impl(
     ):
         return
     try:
+        formal_initial = _is_formal_initial_analysis(argument_row)
         timeout_seconds = (
             None if task_timeout_minutes is None
             else max(60, task_timeout_minutes * 60)
@@ -10432,7 +10563,8 @@ def _run_task_impl(
                 raise SchedulerOwnerLeaseLost("task_owner_lease_lost_before_child_launch")
             proc = subprocess.Popen(cmd, **popen_kwargs)
             _running_procs[task_id] = proc
-            _running_timeout_minutes[task_id] = task_timeout_minutes
+            # The formal watchdog owns this child's exact deadline and audit.
+            _running_timeout_minutes[task_id] = None if formal_initial else task_timeout_minutes
             scheduler_diagnostic_stream = None
             if (
                 task_type == "analysis_fast"
@@ -10488,10 +10620,39 @@ def _run_task_impl(
             )
             lease_thread.start()
         try:
-            stdout, stderr = proc.communicate(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
-            _terminate_process(proc)
-            stdout, stderr = proc.communicate()
+            if formal_initial:
+                stdout, stderr = _wait_for_formal_analysis_child(
+                    proc, progress_path=Path(child_env["PROBIGA_ANALYSIS_DIAGNOSTICS_ROOT"])
+                    / f"{exact_history_uid}.progress.json",
+                    run_uid=exact_history_uid, trade_date=dispatch_date,
+                    timeout_seconds=timeout_seconds,
+                )
+            else:
+                stdout, stderr = proc.communicate(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired as exc:
+            if isinstance(exc, _FormalAnalysisProgressTimeout):
+                if scheduler_diagnostic_stream is not None:
+                    faulthandler.cancel_dump_traceback_later()
+                    scheduler_diagnostic_stream.close()
+                _terminate_process_and_confirm(proc, timeout_seconds=5)
+                if proc.poll() is None:
+                    # Return from this bounded attempt while keeping the exact
+                    # registry and both leases. The normal owner stop path can
+                    # still act, and replay may finish only after proven exit.
+                    with _running_lock:
+                        _pending_terminal_writes[exact_history_uid] = {
+                            "status": "timeout", "duration": 0, "exit_code": None,
+                            "output": exc.audit_message, "task_type": task_type,
+                            "publication_receipt": None, "_durable": False,
+                            "_formal_analysis_pending_exit": (proc, stop_stage_lease, start_t, int(task_id)),
+                        }
+                    logger.error("Formal analysis child termination unconfirmed: run_uid=%s %s",
+                                 exact_history_uid, exc.audit_message)
+                    return
+                stdout, stderr = _drain_exited_formal_analysis_child(proc)
+            else:
+                _terminate_process(proc)
+                stdout, stderr = proc.communicate()
             with _running_lock:
                 if _running_procs.get(task_id) is proc:
                     _running_procs.pop(task_id, None)
@@ -10505,8 +10666,9 @@ def _run_task_impl(
                 )
             else:
                 output = (
-                    f"任务执行超过 {task_timeout_minutes} 分钟，已自动终止。\n"
-                    + _redact_history_output((stdout or "") + "\n---STDERR---\n" + (stderr or ""))
+                    (exc.audit_message if isinstance(exc, _FormalAnalysisProgressTimeout)
+                     else f"任务执行超过 {task_timeout_minutes} 分钟，已自动终止。")
+                    + "\n" + _redact_history_output((stdout or "") + "\n---STDERR---\n" + (stderr or ""))
                 )
             logger.warning("任务 %s 超时终止 (%ds)", task_name, duration)
             _task_history_finish(

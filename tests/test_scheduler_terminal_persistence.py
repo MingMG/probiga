@@ -554,9 +554,15 @@ def test_resumable_linux_collector_always_has_a_positive_attempt_budget(
     assert runtime._task_timeout_minutes({"task_type": task_type}) == max(1, configured)
 
 
-@pytest.mark.parametrize("task_type", ["notice_eastmoney", "stock_finance"])
-def test_collector_timeout_terminates_real_child_and_releases_only_its_exact_run(
-    case, monkeypatch, task_type,
+@pytest.mark.parametrize(("task_type", "termination"), [
+    ("notice_eastmoney", "confirmed"),
+    ("stock_finance", "confirmed"),
+    ("analysis_fast", "confirmed"),
+    ("analysis_fast", "inherited_pipes"),
+    ("analysis_fast", "deferred_confirmation"),
+])
+def test_timeout_terminates_real_child_and_releases_only_its_exact_run(
+    case, monkeypatch, task_type, termination,
 ):
     """Scale only the wait; exercise the real kill, lease and terminal writes."""
     import subprocess
@@ -601,7 +607,7 @@ def test_collector_timeout_terminates_real_child_and_releases_only_its_exact_run
     monkeypatch.setattr(runtime, "_task_argument_row", lambda row, **kw: row)
     monkeypatch.setattr(runtime, "_bind_release_validation_target", lambda row, *a, **kw: row)
     monkeypatch.setattr(runtime, "_build_task_args", lambda *a: [])
-    monkeypatch.setattr(runtime, "build_child_env", lambda *a, **kw: {})
+    monkeypatch.setattr(runtime, "build_child_env", lambda *a, **kw: {"PROBIGA_JOB_LOG_ROOT": str(case.jobs)})
     monkeypatch.setattr(runtime, "_try_revalidate_existing_notice_receipt", lambda *a, **kw: False)
     monkeypatch.setattr(runtime, "_renew_daily_stage_lease_until_stopped", lambda **kw: kw["stop_event"].wait(2))
     validate = MagicMock(side_effect=AssertionError("a timed-out child cannot publish success"))
@@ -628,6 +634,13 @@ def test_collector_timeout_terminates_real_child_and_releases_only_its_exact_run
         saved = dict(rows=[], captured_at="2026-09-30T18:05:00", page_count=1, total_hits=0)
         checkpoint.save("000001", saved)
         checkpoint_path = checkpoint._path("000001")
+    elif task_type == "analysis_fast":
+        from tools.run_ai_recommendation_premarket import _write_analysis_progress
+
+        diagnostic_root = case.jobs / "analysis-execution-diagnostics"
+        monkeypatch.setenv("PROBIGA_ANALYSIS_DIAGNOSTICS_ROOT", str(diagnostic_root))
+        checkpoint_path = diagnostic_root / f"{case.uid}.progress.json"
+        _write_analysis_progress(case.uid, {"stage": "load_kline", "percent": 5, "trade_date": "2026-09-30"})
     else:
         from biz.stock_finance import sync_finance as collector
         checkpoint_path = case.jobs / "stock-finance-daily-v2.json"
@@ -641,6 +654,14 @@ def test_collector_timeout_terminates_real_child_and_releases_only_its_exact_run
     monkeypatch.setattr(runtime, "resolve_scheduler_script", lambda *a: script)
     spawn = subprocess.Popen
     children, budgets = [], []
+    formal = task_type == "analysis_fast"
+    elapsed = 0
+    if formal:
+        wait = runtime._wait_for_formal_analysis_child
+        monkeypatch.setattr(runtime, "_wait_for_formal_analysis_child",
+                            lambda *args, **kwargs: wait(*args, **kwargs, clock=lambda: elapsed))
+    if termination == "deferred_confirmation":
+        monkeypatch.setattr(runtime, "_terminate_process_and_confirm", lambda *a, **kw: False)
 
     class ScaledDeadline:
         def __init__(self, proc):
@@ -650,10 +671,19 @@ def test_collector_timeout_terminates_real_child_and_releases_only_its_exact_run
             return getattr(self.proc, name)
 
         def communicate(self, timeout=None):
+            nonlocal elapsed
             if not budgets:
                 budgets.append(timeout)
-                assert timeout == 180 * 60
-                return self.proc.communicate(timeout=0.05)
+                assert timeout == (15 if formal else 180 * 60)
+                try:
+                    return self.proc.communicate(timeout=0.05)
+                finally:
+                    elapsed = 30 * 60
+            if termination == "inherited_pipes":
+                assert timeout == 2 and self.proc.poll() is not None
+                raise runtime.subprocess.TimeoutExpired(
+                    "inherited pipe", timeout, output=b"ORIGINAL PARTIAL STDOUT", stderr=b"ORIGINAL PARTIAL STDERR",
+                )
             return self.proc.communicate(timeout=5)
 
     def launch(*args, **kwargs):
@@ -665,8 +695,23 @@ def test_collector_timeout_terminates_real_child_and_releases_only_its_exact_run
     row = dict(id=127, task_name=task_type, task_type=task_type,
                script_path="tools/blocked_collector.py", _history_started=True,
                _history_run_uid=case.uid)
+    if formal:
+        row["_scheduler_pipeline_phase"] = "INITIAL"
     try:
         runtime._run_task_async(row, case.jobs, case.engine)
+        if termination == "deferred_confirmation":
+            assert children[0].poll() is None
+            assert case.uid in runtime._pending_terminal_writes and case.uid in runtime._terminal_worker_exited
+            assert runtime._running_history_uids[case.task_id] == case.uid
+            assert runtime._task_owner_leases[case.uid] is owner and owner.authorized()
+            assert rows(case)[0]["status"] == "running" and rows(case)[1]["status"] == "RUNNING"
+            monkeypatch.setattr(runtime, "_last_terminal_retry", 0.0)
+            runtime._retry_pending_terminal_writes(case.engine)
+            assert rows(case)[0]["status"] == "running"
+            children[0].kill()
+            children[0].wait(timeout=5)
+            monkeypatch.setattr(runtime, "_last_terminal_retry", 0.0)
+            runtime._retry_pending_terminal_writes(case.engine)
     finally:
         for child in children:
             if child.poll() is None:
@@ -698,8 +743,55 @@ def test_collector_timeout_terminates_real_child_and_releases_only_its_exact_run
             window_end=date(2026, 10, 1), batch_id="e" * 64, finished_at=case.now,
         )
         assert restored.captured_at == datetime(2026, 9, 30, 18, 5) and restored_rows == []
+    elif formal:
+        assert "FORMAL_ANALYSIS_NO_PROGRESS: stage=load_kline done=0/0 budget_seconds=1800" in history["output"]
+        if termination == "inherited_pipes":
+            assert "ORIGINAL PARTIAL STDOUT" in history["output"]
+            assert "ORIGINAL PARTIAL STDERR" in history["output"]
     else:
         assert collector._checkpoint_payload(checkpoint_path) == saved
+
+
+@pytest.mark.parametrize("overall", [False, True], ids=["repeated_progress", "overall_deadline"])
+def test_formal_analysis_progress_counts_real_steps_but_has_an_overall_deadline(
+    tmp_path, monkeypatch, overall,
+):
+    from tools.run_ai_recommendation_premarket import _write_analysis_progress
+
+    uid = "f" * 32
+    target = "2026-09-30"
+    monkeypatch.setenv("PROBIGA_ANALYSIS_DIAGNOSTICS_ROOT", str(tmp_path))
+    path = tmp_path / f"{uid}.progress.json"
+    elapsed = 0
+    completed = 0
+    _write_analysis_progress(uid, {"stage": "load_kline", "percent": 5, "trade_date": target})
+
+    class StillRunning:
+        def communicate(self, timeout):
+            nonlocal elapsed, completed
+            elapsed += timeout
+            if elapsed in (900, 1770) or (overall and elapsed % 60 == 0):
+                completed += 1
+            if completed:
+                # The writer replaces the file each time. Only advancing a
+                # real chunk, even at the same percent, should reset the clock.
+                _write_analysis_progress(uid, {
+                    "stage": "load_kline_chunk", "percent": 5, "trade_date": target,
+                    "kline_feature_chunk": completed, "kline_feature_chunk_count": 100,
+                })
+            raise runtime.subprocess.TimeoutExpired("analysis_fast", timeout)
+
+    budget = 2000 if overall else 360 * 60
+    with pytest.raises(runtime._FormalAnalysisProgressTimeout) as stopped:
+        runtime._wait_for_formal_analysis_child(
+            StillRunning(), progress_path=path, run_uid=uid, trade_date=target,
+            timeout_seconds=budget, clock=lambda: elapsed,
+        )
+    assert elapsed == (2000 if overall else 1770 + 1800)
+    assert stopped.value.audit_message.startswith(
+        "FORMAL_ANALYSIS_OVERALL_DEADLINE:" if overall else "FORMAL_ANALYSIS_NO_PROGRESS:"
+    )
+    assert f"stage=load_kline_chunk done={completed}/100" in stopped.value.audit_message
 
 
 def test_late_terminal_wall_clock_does_not_replace_original_claim_stamp(case,monkeypatch):
