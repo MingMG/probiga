@@ -6,6 +6,7 @@ privileged table metadata, so ordinary runtime DML cannot forge an identity.
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import text
@@ -15,6 +16,9 @@ from server.common.scheduler_runtime_health import (
     LINUX_STANDALONE_ROLE,
     _classify_current_heartbeats,
 )
+
+
+_MAX_ANNOUNCEMENT_RECEIPT_PARENT_LINKS = 16
 
 
 def _build(value: object) -> str:
@@ -51,6 +55,55 @@ def require_compatible_component_build(
         if producer["contract_sha256"] != current["contract_sha256"]:
             raise RuntimeError("component producer contract differs")
     return producer
+
+
+def require_compatible_announcement_receipt_build(
+    connection: Any,
+    *,
+    producer_build_sha: str,
+    producer_contract_build_sha: str,
+    current_contract_build_sha: str,
+) -> None:
+    """Authorize reuse of a completed announcement receipt across equal contracts."""
+    producer_build = _build(producer_build_sha)
+    original_contract = _build(producer_contract_build_sha)
+    current_contract = _build(current_contract_build_sha)
+    current = load_component_attestation(connection, current_contract)
+    original = (
+        current if original_contract == current_contract
+        else load_component_attestation(connection, original_contract)
+    )
+    if (
+        original["scope"] != "COORDINATED"
+        or original["contract_build_sha"] != original_contract
+        or original["windows_build_sha"] != producer_build
+        or current["scope"] != "COORDINATED"
+        or current["contract_build_sha"] != current_contract
+        or original["contract_sha256"] != current["contract_sha256"]
+    ):
+        raise RuntimeError("announcement receipt component contract differs")
+    if original_contract == current_contract:
+        return
+
+    child = current
+    seen = {current_contract}
+    for _ in range(_MAX_ANNOUNCEMENT_RECEIPT_PARENT_LINKS):
+        parent_sha = child["parent_linux_build_sha"]
+        if parent_sha in seen:
+            raise RuntimeError("announcement receipt component lineage contains a cycle")
+        parent = (
+            original if parent_sha == original_contract
+            else load_component_attestation(connection, parent_sha)
+        )
+        if parent["contract_sha256"] != current["contract_sha256"]:
+            raise RuntimeError("announcement receipt component contract differs")
+        if datetime.fromisoformat(parent["created_at"]) > datetime.fromisoformat(child["created_at"]):
+            raise RuntimeError("announcement receipt component lineage is out of order")
+        if parent_sha == original_contract:
+            return
+        seen.add(parent_sha)
+        child = parent
+    raise RuntimeError("announcement receipt component lineage exceeds its bound")
 
 
 def resolve_active_linux_component(

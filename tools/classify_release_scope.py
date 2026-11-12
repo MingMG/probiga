@@ -270,6 +270,9 @@ _WINDOWS_RUNTIME_FILES = (
     # The Windows scheduler validates its active release and captures bootstrap evidence.
     "server/common/qmt_edge_release_receipt.py",
     "tools/run_qmt_windows_edge_release_bootstrap.py",
+    # Windows premarket publication resolves the original signed announcement parent.
+    "server/common/daily_delivery_control.py",
+    "server/common/component_release_attestation.py",
 )
 
 # The export list is packaging, not a runtime contract with the other endpoint.

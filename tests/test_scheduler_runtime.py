@@ -6684,6 +6684,30 @@ def test_daily_dependency_recovery_uses_upstream_completion_not_start_time():
     assert downstream["_dependency_recovery_due"] is False
 
 
+def test_initial_recovery_uses_certified_original_announcement_after_recheck_blocked():
+    target = "2026-11-12"
+    now = datetime(2026, 11, 13, 6, 35)
+    finished = datetime(2026, 11, 13, 4, 4)
+    upstreams = [
+        {"id": index, "task_type": kind, "enabled": 1,
+         "last_triggered_at": finished, "last_run_status": "success",
+         "last_run_output": json.dumps({"target_trade_date": target})}
+        for index, kind in enumerate(readiness_contract.DAILY_RESULT_RECOVERY_DEPENDENCIES["analysis_fast"], 1)
+    ]
+    announcement = next(item for item in upstreams if item["task_type"] == "qmt_announcement_pit")
+    announcement.update(last_run_status="blocked", last_triggered_at=datetime(2026, 11, 13, 6, 33))
+    downstream = {"task_type": "analysis_fast", "_scheduler_target_available": True,
+                  "_scheduler_target_trade_date": target, "last_run_status": "failed"}
+
+    scheduler_runtime._attach_daily_dependency_recovery([*upstreams, downstream], now=now)
+    assert not downstream.get("_dependency_recovery_due")
+
+    downstream["_certified_initial_announcement_history"] = {"task_id": announcement["id"], "finished_at": finished}
+    scheduler_runtime._attach_daily_dependency_recovery([*upstreams, downstream], now=now)
+    assert downstream["_dependency_recovery_due"] is True
+    assert downstream["_dependency_latest_at"] == finished
+
+
 def test_final_pool_sender_is_target_bound_and_wakes_only_after_governance():
     target = "2026-09-02"
     receipt = json.dumps({"target_trade_date": target})
@@ -8147,6 +8171,24 @@ def test_daily_analysis_dag_binds_immutable_run_build_date_and_input_root(
             expected_trade_date="2026-08-27", expected_build_sha=build_sha,
         )
         assert ready, reason
+
+        announcement = next(item for item in histories if item["task_type"] == "qmt_announcement_pit")
+        original_core = json.loads(announcement["output"])
+        original_core.pop("evidence_sha256")
+        original_core["build_sha"] = "b" * 40
+        old_history = {**announcement, "build_sha": original_core["build_sha"], "output": json.dumps({
+            **original_core, "evidence_sha256": scheduler_runtime._history_digest(json.dumps(
+                original_core, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str,
+            )),
+        })}
+        options = dict(now=now, expected_trade_date="2026-08-27", expected_build_sha=build_sha)
+        selected = [old_history if item is announcement else item for item in histories]
+        assert scheduler_runtime.evaluate_immutable_daily_dependency_histories(
+            downstream_type, selected, **options,
+        ) == (False, "qmt_announcement_pit:history_identity_mismatch")
+        assert scheduler_runtime.evaluate_immutable_daily_dependency_histories(
+            downstream_type, selected, certified_initial_announcement_history=old_history, **options,
+        ) == (True, "ready")
 
     for notice_status in ("failed", "running"):
         notice = {

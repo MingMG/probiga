@@ -54,9 +54,25 @@ def test_initial_cutoff_may_follow_the_plan_but_revision_cutoff_is_fixed(pool_ca
         )
 
 
-def test_late_signed_source_obeys_actual_availability_and_round_trips_sealed_pool(pool_calendar, monkeypatch):
+@pytest.mark.parametrize("cross_session", [False, True], ids=["same-session", "compatible-prior-session"])
+def test_late_signed_source_obeys_actual_availability_and_round_trips_sealed_pool(pool_calendar, monkeypatch, cross_session):
+    from server.common import component_release_attestation
+
     engine = pool_calendar
     monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "development")
+    source_release = "c" * 40 if cross_session else BUILD_SHA
+    contract_digest = "a" * 64
+    manifests = {
+        sha: {
+            "scope": "COORDINATED", "contract_build_sha": sha, "windows_build_sha": sha,
+            "contract_sha256": contract_digest, "parent_linux_build_sha": source_release,
+            "created_at": created_at,
+        }
+        for sha, created_at in (
+            (source_release, "2026-11-09T01:00:00"), (BUILD_SHA, "2026-11-10T01:00:00"),
+        )
+    }
+    monkeypatch.setattr(component_release_attestation, "load_component_attestation", lambda _connection, sha: manifests[sha])
     stage, source_uid, pool_uid = "qmt_announcement_pit", "1" * 32, "2" * 32
     finished = SCHEDULED + timedelta(minutes=1, microseconds=250_000)
     received = SCHEDULED - timedelta(minutes=1)
@@ -77,7 +93,8 @@ def test_late_signed_source_obeys_actual_availability_and_round_trips_sealed_poo
     digest = hashlib.sha256(replay.encode()).hexdigest()
     evidence = {
         "schema": control.SCHEDULER_VALIDATION_EVIDENCE_SCHEMA,
-        "run_uid": source_uid, "task_type": stage, "build_sha": BUILD_SHA,
+        "run_uid": source_uid, "task_type": stage, "build_sha": source_release,
+        "contract_release_id": source_release,
         "status": "success", "exit_code": 0, "validation_checked": True, "validation_ok": True,
         "replay_output": replay, "replay_output_sha256": digest,
         "input_receipt_root_sha256": digest, "target_trade_date": TARGET,
@@ -85,7 +102,7 @@ def test_late_signed_source_obeys_actual_availability_and_round_trips_sealed_poo
     monkeypatch.setattr(control, "_control_now", lambda: finished - timedelta(seconds=30))
     control.start_daily_stage_attempt(
         engine, scheduler_run_uid=source_uid, stage_name=stage, trade_date=TARGET,
-        release_id=BUILD_SHA, strategy_release_id=STRATEGY_RELEASE_ID, lease_owner="windows-fixture",
+        release_id=source_release, strategy_release_id=STRATEGY_RELEASE_ID, lease_owner="windows-fixture",
     )
     with engine.begin() as connection:
         control.finish_daily_stage_attempt(
@@ -99,6 +116,30 @@ def test_late_signed_source_obeys_actual_availability_and_round_trips_sealed_poo
     selected = control.select_frozen_initial_announcement_source(engine, trade_date=TARGET, decision_at=cutoff)
     assert selected.receipt["batch_id"] == source_receipt["batch_id"]
     assert selected.score_binding["finished_at"] == finished.isoformat(timespec="microseconds")
+    exact = {"trade_date": TARGET, "decision_at": cutoff, "consumer_release_id": BUILD_SHA}
+    assert control.select_frozen_initial_announcement_source(engine, required_run_uid=source_uid, **exact) == selected
+    assert control.select_frozen_initial_announcement_source(engine, required_run_uid="9" * 32, **exact) is None
+    assert selected.score_binding["contract_release_id"] == source_release
+    assert selected.score_binding["producer_build_sha"] == source_release
+    assert selected.score_binding["input_receipt_root_sha256"] == digest
+    replay_uid = "3" * 32
+    replay_finished = finished + timedelta(minutes=1)
+    replay_evidence = {**evidence, "run_uid": replay_uid, "build_sha": BUILD_SHA, "contract_release_id": BUILD_SHA}
+    monkeypatch.setattr(control, "_control_now", lambda: replay_finished - timedelta(seconds=30))
+    control.start_daily_stage_attempt(
+        engine, scheduler_run_uid=replay_uid, stage_name=stage, trade_date=TARGET,
+        release_id=BUILD_SHA, strategy_release_id=STRATEGY_RELEASE_ID, lease_owner="windows-fixture",
+    )
+    with engine.begin() as connection:
+        control.finish_daily_stage_attempt(
+            connection, scheduler_run_uid=replay_uid, status="success", input_root_sha256=digest,
+            checkpoint={**replay_evidence, "evidence_sha256": control.canonical_sha256(replay_evidence)},
+            now=replay_finished,
+        )
+    assert control.select_frozen_initial_announcement_source(engine, **exact) == selected
+    assert control.select_frozen_initial_announcement_source(
+        engine, required_run_uid=replay_uid, **exact,
+    ).score_binding["scheduler_run_uid"] == replay_uid
     fixture = decode_score_snapshot(scored_publication(trade_date=TARGET)["score_snapshot"])
     core_inputs = {
         "kline": {"stage": "qmt_stock_daily_canonical", "dataset_id": "daily", "root": "1" * 64},
@@ -156,6 +197,12 @@ def test_late_signed_source_obeys_actual_availability_and_round_trips_sealed_poo
     }
     assert control.read_daily_delivery(engine, trade_date=TARGET, release_id=BUILD_SHA)["receipt"] == persisted
     assert control.load_frozen_initial_announcement_parent(engine, TARGET, BUILD_SHA)["batch_id"] == source_receipt["batch_id"]
+    if cross_session:
+        manifests[BUILD_SHA]["contract_sha256"] = "0" * 64
+        assert control.select_frozen_initial_announcement_source(engine, required_run_uid=source_uid, **exact) is None
+        with pytest.raises(control.DailyDeliveryControlError, match="result differs"):
+            control.load_frozen_initial_announcement_parent(engine, TARGET, BUILD_SHA)
+        manifests[BUILD_SHA]["contract_sha256"] = contract_digest
 
     with engine.begin() as connection:
         connection.execute(text(f"UPDATE {control.ATTEMPT_TABLE} SET finished_at=:finished WHERE scheduler_run_uid=:run"),

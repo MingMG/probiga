@@ -40,6 +40,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from server.common.batch_db import create_batch_engine
+from server.common.component_release import runtime_contract_build_sha
 from server.common.kline_data import get_kline_engine
 from server.common.minute_data import get_minute_engine
 from server.common.strategy_daily_input_window import (
@@ -5500,8 +5501,11 @@ def _prepare_batch_outputs(
         }
     elif decision_at is not None:
         if pool_decision_phase == "INITIAL":
+            signed_scope = {}
+            if str(os.environ.get("PROBIGA_DEPLOYMENT_MODE") or "").strip().lower() == "production":
+                signed_scope["consumer_release_id"] = runtime_contract_build_sha(expected_build_sha=publisher_build_sha)
             initial_announcement = select_frozen_initial_announcement_source(
-                engine, trade_date=trade_date, decision_at=decision_at,
+                engine, trade_date=trade_date, decision_at=decision_at, **signed_scope,
             )
             if initial_announcement is None:
                 raise RuntimeError("ANALYSIS_INITIAL_SIGNED_ANNOUNCEMENT_UNAVAILABLE")

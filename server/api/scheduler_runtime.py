@@ -61,6 +61,7 @@ from server.common.daily_delivery_control import (
     persist_terminal_delivery_receipt,
     renew_daily_stage_lease,
     score_snapshot_identity,
+    select_frozen_initial_announcement_source,
     start_daily_stage_attempt,
     strategy_release_identity,
     validate_frozen_pool_decision,
@@ -2598,6 +2599,12 @@ def _release_catchup_dependencies_ready(
         upstream = matches[0]
         if dependency == "stock_finance" and finance_history is not None:
             continue
+        if (
+            dependency == "qmt_announcement_pit"
+            and row.get("_certified_initial_announcement_history") is not None
+            and downstream_target == row.get("_scheduler_target_trade_date")
+        ):
+            continue
         if not _release_history_evidence_valid(upstream, _task_component_build_sha(
             dependency, build_sha, component_build_shas=component_build_shas,
         )):
@@ -3855,6 +3862,44 @@ def _load_completed_stock_finance_history(
     return history if durable is not None else None
 
 
+def _load_certified_initial_announcement_history(
+    connection, *, target: str, linux_build_sha: str, decision_at: datetime,
+    required_run_uid: str | None = None,
+) -> dict | None:
+    """Read the exact terminal audit paired with a compatible source receipt."""
+    if not target or not _daily_delivery_requires_production_runtime():
+        return None
+    source = select_frozen_initial_announcement_source(
+        connection, trade_date=target, decision_at=decision_at,
+        required_run_uid=required_run_uid,
+        consumer_release_id=runtime_contract_build_sha(expected_build_sha=linux_build_sha),
+    )
+    if source is None:
+        return None
+    binding = source.score_binding
+    row = connection.execute(text("""
+        SELECT id AS history_id, task_id, run_uid, task_type, run_at, finished_at,
+               status, exit_code, output, build_sha
+        FROM st_scheduled_task_history
+        WHERE run_uid=:run_uid AND task_type='qmt_announcement_pit'
+          AND status='success' AND exit_code=0
+    """), {"run_uid": binding["scheduler_run_uid"]}).mappings().one_or_none()
+    if row is None:
+        return None
+    evidence = _history_validation_evidence(row["output"]) or {}
+    run_at = _coerce_datetime(row["run_at"])
+    finished_at = _coerce_datetime(row["finished_at"])
+    if (
+        evidence.get("evidence_sha256") != binding["evidence_sha256"]
+        or evidence.get("input_receipt_root_sha256") != binding["input_receipt_root_sha256"]
+        or row["build_sha"] != binding["producer_build_sha"]
+        or evidence.get("target_trade_date") != target
+        or run_at is None or finished_at is None or not run_at <= finished_at <= decision_at
+    ):
+        raise RuntimeError("certified initial announcement audit differs")
+    return dict(row)
+
+
 def _attach_completed_stock_finance_target(engine, rows: list[dict], *, now: datetime) -> None:
     for row in rows:
         target = str(row.get("_release_expected_target_date") or "")
@@ -3885,6 +3930,7 @@ def _latest_daily_histories_for_target(
     expected_build_sha: str,
     component_build_shas: dict[str, str] | None = None,
     completed_stock_finance_history: dict | None = None,
+    certified_initial_announcement_history: dict | None = None,
 ) -> dict[str, dict]:
     """Pick the latest self-verified history per task for one target/build.
 
@@ -3920,6 +3966,8 @@ def _latest_daily_histories_for_target(
         selected[task_type] = history
     if completed_stock_finance_history is not None:
         selected["stock_finance"] = completed_stock_finance_history
+    if certified_initial_announcement_history is not None:
+        selected["qmt_announcement_pit"] = certified_initial_announcement_history
     return selected
 
 
@@ -3932,6 +3980,7 @@ def evaluate_immutable_daily_dependency_histories(
     expected_build_sha: str,
     component_build_shas: dict[str, str] | None = None,
     completed_stock_finance_history: dict | None = None,
+    certified_initial_announcement_history: dict | None = None,
 ) -> tuple[bool, str]:
     """Bind the daily DAG to immutable validated run identities and inputs."""
 
@@ -3964,8 +4013,11 @@ def evaluate_immutable_daily_dependency_histories(
         producer_build_sha = _task_component_build_sha(
             dependency, build_sha, component_build_shas=component_build_shas,
         )
-        if dependency == "stock_finance" and upstream is completed_stock_finance_history:
-            # This original history was bound to the signed same-contract stage and seal.
+        if (
+            (dependency == "stock_finance" and upstream is completed_stock_finance_history)
+            or (dependency == "qmt_announcement_pit" and upstream is certified_initial_announcement_history)
+        ):
+            # The durable source proof retains its original audit identity.
             producer_build_sha = str(upstream.get("build_sha") or "").strip().lower()
         run_uid = str(upstream.get("run_uid") or "").strip().lower()
         run_at = _coerce_datetime(upstream.get("run_at"))
@@ -4152,6 +4204,27 @@ def _attach_daily_recovery_targets(
                 "Canonical daily truth is not ready for %s: %s",
                 row["_scheduler_target_trade_date"], type(exc).__name__,
             )
+    if _scheduler_executor_role("standalone") == SCHEDULER_OWNER_LINUX and _daily_delivery_requires_production_runtime():
+        histories = {}
+        for row in selected:
+            if row.get("task_type") not in {"analysis_fast", "strategy_governance_daily"}:
+                continue
+            row.pop("_certified_initial_announcement_history", None)
+            target = row.get("_scheduler_target_trade_date")
+            if not target:
+                continue
+            if target not in histories:
+                try:
+                    with engine.connect() as connection:
+                        histories[target] = _load_certified_initial_announcement_history(
+                            connection, target=target, linux_build_sha=_scheduler_build_commit_sha(),
+                            decision_at=current,
+                        )
+                except Exception as exc:
+                    logger.warning("Certified initial announcement lookup failed: %s", type(exc).__name__)
+                    histories[target] = None
+            if histories[target] is not None:
+                row["_certified_initial_announcement_history"] = histories[target]
     _attach_daily_dependency_recovery(rows, now=current)
     return authorities_available
 
@@ -4282,6 +4355,10 @@ def _attach_daily_dependency_recovery(
                 upstream_ready = False
                 break
             upstream = matches[0]
+            certified = downstream.get("_certified_initial_announcement_history")
+            if dependency == "qmt_announcement_pit" and certified and certified["task_id"] == upstream.get("id"):
+                upstream_times.append(_coerce_datetime(certified["finished_at"]))
+                continue
             triggered = _coerce_datetime(upstream.get("last_triggered_at"))
             if (
                 int(upstream.get("enabled") or 0) != 1
@@ -4396,6 +4473,7 @@ def _strategy_pipeline_dependencies_ready(
         row.get("_scheduler_target_trade_date") or ""
     ).strip()
     finance_history = None
+    announcement_history = row.get("_certified_initial_announcement_history")
     if evidence_dependencies is not None:
         try:
             parsed_expected_trade_date = date.fromisoformat(
@@ -4428,6 +4506,11 @@ def _strategy_pipeline_dependencies_ready(
                     finance_history = _load_completed_stock_finance_history(
                         connection, target=expected_trade_date,
                         current_linux_build_sha=component_build_shas["linux"], decision_at=now,
+                    )
+                if announcement_history is None and task_type in {"analysis_fast", "strategy_governance_daily"}:
+                    announcement_history = _load_certified_initial_announcement_history(
+                        connection, target=expected_trade_date,
+                        linux_build_sha=component_build_shas["linux"], decision_at=now,
                     )
                 history_rows = [
                     dict(item)
@@ -4485,6 +4568,11 @@ def _strategy_pipeline_dependencies_ready(
             for item in task_rows
         ):
             return False, "stock_finance:history_task_mismatch"
+        if announcement_history and not any(
+            item.get("task_type") == "qmt_announcement_pit" and item.get("id") == announcement_history["task_id"]
+            for item in task_rows
+        ):
+            return False, "qmt_announcement_pit:history_task_mismatch"
         expected_build_sha = _scheduler_build_commit_sha()
         latest_histories = _latest_daily_histories_for_target(
             history_rows,
@@ -4492,6 +4580,7 @@ def _strategy_pipeline_dependencies_ready(
             expected_build_sha=expected_build_sha,
             component_build_shas=component_build_shas,
             completed_stock_finance_history=finance_history,
+            certified_initial_announcement_history=announcement_history,
         )
         downstream_history = latest_histories.get(task_type)
         selected_histories = [
@@ -4509,7 +4598,10 @@ def _strategy_pipeline_dependencies_ready(
             expected_build_sha=expected_build_sha,
             component_build_shas=component_build_shas,
             completed_stock_finance_history=finance_history,
+            certified_initial_announcement_history=announcement_history,
         )
+        if ready and announcement_history is not None:
+            row["_certified_initial_announcement_history"] = announcement_history
         if ready and "qmt_stock_daily_canonical" in evidence_dependencies:
             try:
                 current = now
@@ -9009,6 +9101,7 @@ def _build_daily_result_delivery_receipt(
         connection, target=target,
         current_linux_build_sha=component_build_shas["linux"], decision_at=scheduler_run_at,
     )
+    certified_announcement_history = None
     latest_by_type = _latest_daily_histories_for_target(
         dependency_rows,
         expected_trade_date=target,
@@ -9031,6 +9124,14 @@ def _build_daily_result_delivery_receipt(
             or exact_row.get("build_sha") != frozen_announcement["producer_build_sha"]
         ):
             raise RuntimeError("daily delivery frozen announcement evidence differs")
+        if exact_row["build_sha"] != component_build_shas["windows"]:
+            certified_announcement_history = _load_certified_initial_announcement_history(
+                connection, target=target, linux_build_sha=build_sha, decision_at=scheduler_run_at,
+                required_run_uid=str(frozen_announcement["scheduler_run_uid"]),
+            )
+            if certified_announcement_history is None:
+                raise RuntimeError("daily delivery original announcement contract differs")
+            exact_row = certified_announcement_history
         latest_by_type["qmt_announcement_pit"] = exact_row
     selected = [
         latest_by_type[task_type]
@@ -9045,6 +9146,7 @@ def _build_daily_result_delivery_receipt(
         expected_build_sha=build_sha,
         component_build_shas=component_build_shas,
         completed_stock_finance_history=finance_history,
+        certified_initial_announcement_history=certified_announcement_history,
     )
     if not ready:
         raise RuntimeError(f"daily delivery base data differs: {reason}")

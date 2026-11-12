@@ -120,6 +120,8 @@ def _missed_windows_runtime_release(
     "tools/sync_qmt_announcement_pit.py",
     "server/common/qmt_edge_release_receipt.py",
     "tools/run_qmt_windows_edge_release_bootstrap.py",
+    "server/common/daily_delivery_control.py",
+    "server/common/component_release_attestation.py",
 ])
 def test_deployed_windows_base_catches_a_runtime_change_already_in_linux(repo, path):
     windows, linux, target = _missed_windows_runtime_release(repo, path)

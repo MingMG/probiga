@@ -328,6 +328,7 @@ def signed_initial_announcement_window_matches(
 
 def _read_signed_announcement_completion(
     engine, *, target: str, decision_at: datetime, batch: Mapping[str, Any] | None,
+    required_run_uid: str | None = None, consumer_release_id: str | None = None,
 ) -> FrozenInitialAnnouncement | None:
     from server.common.analysis_pool_receipt import FROZEN_INITIAL_ANNOUNCEMENT_SCHEMA
     from server.common.qmt_announcement_pit import QMT_ANNOUNCEMENT_TASK_SCHEMA, validate_task_result
@@ -346,16 +347,27 @@ def _read_signed_announcement_completion(
         if fact_cutoff is None or received is None or not fact_cutoff <= received <= decision_at:
             return None
         not_before = received
+    run_clause = ""
+    params = {"target": target, "stage": stage, "not_before": not_before, "decision": decision_at}
+    if required_run_uid is not None:
+        if not isinstance(required_run_uid, str) or RUN_UID_RE.fullmatch(required_run_uid) is None:
+            raise ValueError("announcement completion run identity is invalid")
+        run_clause = "AND a.scheduler_run_uid=:required_run_uid"
+        params["required_run_uid"] = required_run_uid
+    if consumer_release_id is not None:
+        consumer_release_id = _normalized_release_id(consumer_release_id)
     with (nullcontext(engine) if hasattr(engine, "execute") else engine.connect()) as connection:
+        hint = "/*+ MAX_EXECUTION_TIME(3000) */ " if _dialect_name(connection) == "mysql" else ""
         attempts = connection.execute(text(f"""
-            SELECT a.*, s.trade_date, s.release_id
+            SELECT {hint}a.*, s.trade_date, s.release_id
             FROM {ATTEMPT_TABLE} a JOIN {SESSION_TABLE} s ON s.session_uid=a.session_uid
             WHERE s.trade_date=:target AND a.stage_name=:stage AND a.status='SUCCESS'
               AND a.finished_at BETWEEN :not_before AND :decision
+              {run_clause}
             ORDER BY a.finished_at DESC, a.id DESC LIMIT 12
-        """), {
-            "target": target, "stage": stage, "not_before": not_before, "decision": decision_at,
-        }).mappings().all()
+        """), params).mappings().all()
+    selected: FrozenInitialAnnouncement | None = None
+    selected_frontier: tuple[datetime, timedelta] | None = None
     for attempt in attempts:
         try:
             checkpoint = _validated_completed_stage_checkpoint(
@@ -417,6 +429,18 @@ def _read_signed_announcement_completion(
             if batch is None:
                 continue
             raise DailyDeliveryControlError("announcement completion receipt differs") from exc
+        if consumer_release_id is not None:
+            from server.common.component_release_attestation import require_compatible_announcement_receipt_build
+
+            try:
+                with (nullcontext(engine) if hasattr(engine, "execute") else engine.connect()) as connection:
+                    require_compatible_announcement_receipt_build(
+                        connection, producer_build_sha=checkpoint["build_sha"],
+                        producer_contract_build_sha=attempt["release_id"],
+                        current_contract_build_sha=consumer_release_id,
+                    )
+            except RuntimeError:
+                continue
         binding = {
             "schema": FROZEN_INITIAL_ANNOUNCEMENT_SCHEMA, "task_type": stage,
             "trade_date": target, "scheduler_run_uid": str(attempt["scheduler_run_uid"]),
@@ -429,14 +453,22 @@ def _read_signed_announcement_completion(
             "received_at": received.isoformat(timespec="microseconds"),
             "finished_at": finished.isoformat(timespec="microseconds"),
         }
-        return FrozenInitialAnnouncement(
+        candidate = FrozenInitialAnnouncement(
             MappingProxyType({
                 **item, "stage_finished_at": finished.replace(tzinfo=CONTROL_TIMEZONE).isoformat(),
                 "stage_attempt_uid": attempt["attempt_uid"], "stage_evidence_sha256": checkpoint["evidence_sha256"],
             }),
             MappingProxyType(binding),
         )
-    return None
+        if consumer_release_id is None or required_run_uid is not None:
+            return candidate
+        # A validation in another release preserves the first successful
+        # availability time of the same source snapshot.
+        frontier = (received, datetime.max - finished)
+        if selected_frontier is None or frontier > selected_frontier:
+            selected = candidate
+            selected_frontier = frontier
+    return selected
 
 
 def load_signed_announcement_source(
@@ -451,10 +483,12 @@ def load_signed_announcement_source(
 
 def select_frozen_initial_announcement_source(
     engine, *, trade_date: str, decision_at: datetime,
+    required_run_uid: str | None = None, consumer_release_id: str | None = None,
 ) -> FrozenInitialAnnouncement | None:
-    """Choose the latest signed batch available by the actual initial cutoff."""
+    """Choose the compatible source snapshot at the actual initial cutoff."""
     return _read_signed_announcement_completion(
         engine, target=_normalized_trade_date(trade_date), decision_at=decision_at, batch=None,
+        required_run_uid=required_run_uid, consumer_release_id=consumer_release_id,
     )
 
 
@@ -1916,8 +1950,6 @@ def load_frozen_initial_delivery(connection, session_uid: str) -> dict[str, obje
 
 def load_frozen_initial_announcement_parent(engine, trade_date, release_id):
     """Resolve the actual signed source batch used by the current frozen first pool."""
-    from server.common.qmt_announcement_pit import QMT_ANNOUNCEMENT_TASK_SCHEMA, validate_task_result
-
     identity = daily_session_identity(trade_date, release_id)
     target, session_uid = identity["trade_date"], identity["session_uid"]
     with engine.connect() as connection:
@@ -1935,10 +1967,11 @@ def load_frozen_initial_announcement_parent(engine, trade_date, release_id):
         if stage != "qmt_announcement_pit" or RUN_UID_RE.fullmatch(str(source_run or "")) is None:
             raise DailyDeliveryControlError("initial frozen announcement source identity differs")
         attempt = _one_mapping(connection.execute(text(f"""
-            SELECT * FROM {ATTEMPT_TABLE}
-            WHERE session_uid=:session_uid AND scheduler_run_uid=:source_run
-              AND stage_name=:stage AND status='SUCCESS'
-        """), {"session_uid": session_uid, "source_run": source_run, "stage": stage}))
+            SELECT a.session_uid, a.finished_at
+            FROM {ATTEMPT_TABLE} a JOIN {SESSION_TABLE} s ON s.session_uid=a.session_uid
+            WHERE a.scheduler_run_uid=:source_run AND a.stage_name=:stage
+              AND a.status='SUCCESS' AND s.trade_date=:target
+        """), {"source_run": source_run, "stage": stage, "target": target}))
         if attempt is None:
             raise DailyDeliveryControlError("initial frozen announcement attempt is unavailable")
         cutoff = datetime.fromisoformat(str(phase["cutoff_at"])).replace(tzinfo=None)
@@ -1947,26 +1980,20 @@ def load_frozen_initial_announcement_parent(engine, trade_date, release_id):
             finished = finished.astimezone(CONTROL_TIMEZONE).replace(tzinfo=None)
         if finished is None or finished > cutoff:
             raise DailyDeliveryControlError("initial frozen announcement completion exceeds its input cutoff")
-        evidence = _validated_completed_stage_checkpoint(
-            attempt, session=session, stage_name=stage, engine=connection,
+        cross_session = attempt["session_uid"] != session_uid
+        selected = select_frozen_initial_announcement_source(
+            connection, trade_date=target, decision_at=cutoff, required_run_uid=source_run,
+            consumer_release_id=identity["release_id"] if cross_session else None,
         )
-    if evidence.get("evidence_sha256") != announcement.get("root"):
-        raise DailyDeliveryControlError("initial frozen announcement evidence root differs")
-    matches = []
-    for line in str(evidence.get("replay_output") or "").splitlines():
-        try:
-            item = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(item, dict) and item.get("schema") == QMT_ANNOUNCEMENT_TASK_SCHEMA:
-            matches.append(item)
-    if (
-        len(matches) != 1 or validate_task_result(matches[0], 0) != "complete"
-        or matches[0].get("window_end") != target
-    ):
+    if selected is None:
         raise DailyDeliveryControlError("initial frozen announcement result differs")
-    result = matches[0]
-    return {key: result[key] for key in (
+    if selected.score_binding["evidence_sha256"] != announcement.get("root"):
+        raise DailyDeliveryControlError("initial frozen announcement evidence root differs")
+    if (cross_session or announcement.get("input_root") is not None) and (
+        selected.score_binding["batch_root_hash"] != announcement.get("input_root")
+    ):
+        raise DailyDeliveryControlError("initial frozen announcement batch root differs")
+    return {key: selected.receipt[key] for key in (
         "batch_id", "batch_root_hash", "source", "fallback_reason", "received_at",
         "window_start", "window_end", "fact_cutoff_at",
     )}

@@ -21,13 +21,14 @@ LINUX = "b" * 40
 PRIOR_LINUX = "c" * 40
 
 
-def manifest(linux=LINUX, *, anchor=WINDOWS, digest="d" * 64):
+def manifest(linux=LINUX, *, anchor=WINDOWS, digest="d" * 64,
+             parent=None, created_at="2026-09-19T03:00:00Z"):
     return build_component_release(
         linux_build_sha=linux, windows_build_sha=anchor,
         contract_build_sha=anchor, contract_sha256=digest,
-        parent_linux_build_sha=anchor,
+        parent_linux_build_sha=anchor if parent is None else parent,
         scope="COORDINATED" if linux == anchor else "LINUX",
-        created_at="2026-09-19T03:00:00Z",
+        created_at=created_at,
     )
 
 
@@ -129,6 +130,73 @@ def test_linux_release_cannot_move_the_windows_contract_anchor():
     })
     with pytest.raises(RuntimeError, match="producer contract differs"):
         attest.require_compatible_component_build(connection, WINDOWS, LINUX)
+
+
+@pytest.fixture
+def announcement_lineage():
+    return {
+        WINDOWS: manifest(WINDOWS),
+        PRIOR_LINUX: manifest(PRIOR_LINUX, created_at="2026-09-19T03:01:00Z"),
+        LINUX: manifest(
+            LINUX, anchor=LINUX, parent=PRIOR_LINUX,
+            created_at="2026-09-19T03:02:00Z",
+        ),
+    }
+
+
+@pytest.mark.parametrize("current", [WINDOWS, LINUX])
+def test_completed_announcement_reuses_only_its_compatible_receipt(current, announcement_lineage):
+    connection = Connection(announcement_lineage)
+    attest.require_compatible_announcement_receipt_build(
+        connection, producer_build_sha=WINDOWS,
+        producer_contract_build_sha=WINDOWS, current_contract_build_sha=current,
+    )
+    if current != WINDOWS:
+        with pytest.raises(RuntimeError, match="component producer contract differs"):
+            attest.resolve_active_linux_component(connection, WINDOWS, expected_poll_seconds=60)
+
+
+@pytest.mark.parametrize(("changed", "replacement", "reason"), [
+    (WINDOWS, manifest(WINDOWS, digest="e" * 64), "component contract differs"),
+    (PRIOR_LINUX, manifest(PRIOR_LINUX, digest="e" * 64), "component contract differs"),
+    (PRIOR_LINUX, manifest(PRIOR_LINUX, parent=LINUX), "lineage contains a cycle"),
+    (PRIOR_LINUX, manifest(PRIOR_LINUX, parent="e" * 40), "identity is unavailable"),
+    (PRIOR_LINUX, manifest(PRIOR_LINUX, created_at="2026-09-19T03:03:00Z"), "lineage is out of order"),
+])
+def test_completed_announcement_rejects_invalid_signed_lineage(
+    announcement_lineage, changed, replacement, reason,
+):
+    announcement_lineage[changed] = replacement
+    with pytest.raises(RuntimeError, match=reason):
+        attest.require_compatible_announcement_receipt_build(
+            Connection(announcement_lineage), producer_build_sha=WINDOWS,
+            producer_contract_build_sha=WINDOWS, current_contract_build_sha=LINUX,
+        )
+
+
+@pytest.mark.parametrize(("producer", "original", "current"), [
+    (PRIOR_LINUX, WINDOWS, LINUX),
+    (WINDOWS, PRIOR_LINUX, LINUX),
+    (WINDOWS, WINDOWS, PRIOR_LINUX),
+    (LINUX, LINUX, WINDOWS),
+])
+def test_completed_announcement_requires_original_windows_and_current_contract_anchors(
+    announcement_lineage, producer, original, current,
+):
+    with pytest.raises(RuntimeError):
+        attest.require_compatible_announcement_receipt_build(
+            Connection(announcement_lineage), producer_build_sha=producer,
+            producer_contract_build_sha=original, current_contract_build_sha=current,
+        )
+
+
+def test_completed_announcement_parent_walk_is_bounded(announcement_lineage, monkeypatch):
+    monkeypatch.setattr(attest, "_MAX_ANNOUNCEMENT_RECEIPT_PARENT_LINKS", 1)
+    with pytest.raises(RuntimeError, match="lineage exceeds its bound"):
+        attest.require_compatible_announcement_receipt_build(
+            Connection(announcement_lineage), producer_build_sha=WINDOWS,
+            producer_contract_build_sha=WINDOWS, current_contract_build_sha=LINUX,
+        )
 
 
 def test_windows_resolves_protected_linux_build_without_claiming_it_as_own():

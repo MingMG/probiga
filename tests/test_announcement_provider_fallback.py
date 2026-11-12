@@ -1623,6 +1623,60 @@ def test_historical_reconstruction_uses_target_cutoff_and_actual_known_time(
         )
     assert compressed_proof == proof
 
+    from server.common import daily_delivery_control
+    from tests.test_qmt_announcement_pit import _install_authoritative_calendar
+    from tools import sync_qmt_announcement_pit as replay_tool
+
+    window_start = target - timedelta(days=30)
+    _install_authoritative_calendar(
+        engine, target_date=target.isoformat(), start_date=window_start.isoformat(),
+    )
+    replay_at = reconstructed + timedelta(minutes=1)
+    replay_build = "4" * 40
+    replay_run = "3" * 32
+
+    def select_signed_source(_connection, *, trade_date, decision_at, consumer_release_id):
+        assert (trade_date, decision_at, consumer_release_id) == (
+            target.isoformat(), replay_at, replay_build,
+        )
+        return daily_delivery_control.FrozenInitialAnnouncement(result, {})
+
+    def forbid_history_rescan(*_args, **_kwargs):
+        pytest.fail("exact signed receipt must avoid a historical payload scan")
+
+    with monkeypatch.context() as replay:
+        replay.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+        replay.setattr(daily_delivery_control, "select_frozen_initial_announcement_source", select_signed_source)
+        replay.setattr(replay_tool, "runtime_contract_build_sha", lambda **kwargs: kwargs["expected_build_sha"])
+        replay.setattr(replay_tool, "_load_historical_reconstruction_authority", lambda *_a, **_k: (catalog, {}))
+        replay.setattr(replay_tool, "validate_complete_historical_reconstruction_batch", forbid_history_rescan)
+        validation = replay_tool.validate_existing_complete_qmt_announcement_batch(
+            engine, now=replay_at, expected_trade_date=target.isoformat(),
+            validation_run_uid=replay_run, validation_build_sha=replay_build,
+        )
+        assert validation["mode"] == "HISTORICAL_RECONSTRUCTION_EXISTING"
+        assert validation["database_writes"] is False
+        assert validation["validation_run_uid"] == replay_run
+        assert validation["validation_build_sha"] == replay_build
+        for key in ("batch_id", "batch_root_hash", "received_at", "fact_cutoff_at", "reconstruction_provenance"):
+            assert validation[key] == result[key]
+        assert replay_tool.validate_existing_task_result(
+            validation, 0, expected_trade_date=target.isoformat(),
+            expected_scheduler_run_uid=replay_run, expected_build_sha=replay_build,
+        ) == "complete"
+
+        replay.setattr(
+            daily_delivery_control, "select_frozen_initial_announcement_source",
+            lambda *_args, **_kwargs: daily_delivery_control.FrozenInitialAnnouncement(
+                {**result, "batch_root_hash": "f" * 64}, {},
+            ),
+        )
+        with pytest.raises(QMTAnnouncementBlocked, match="EXISTING_SIGNED_RECONSTRUCTION_DIFFERS"):
+            replay_tool.validate_existing_complete_qmt_announcement_batch(
+                engine, now=replay_at, expected_trade_date=target.isoformat(),
+                validation_run_uid=replay_run, validation_build_sha=replay_build,
+            )
+
     from server.common import qmt_announcement_pit as announcement
 
     validate_live_batch = announcement.validate_complete_qmt_announcement_batch

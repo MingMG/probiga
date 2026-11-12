@@ -998,6 +998,86 @@ def _existing_live_batch_inventory(
         ) from None
 
 
+def _reuse_signed_historical_reconstruction(
+    connection, *, catalog: AnnouncementCatalog, target: date,
+    window_start: date, decision_at: datetime, consumer_release_id: str,
+) -> Mapping[str, object] | None:
+    """Reconfirm an already signed reconstruction by its exact durable root."""
+    from server.common.daily_delivery_control import select_frozen_initial_announcement_source
+    from server.common.qmt_announcement_pit import (
+        _live_announcement_reply_budget,
+        _load_live_announcement_batch_inventory,
+        _read_live_announcement_payload_rows,
+    )
+
+    proof = select_frozen_initial_announcement_source(
+        connection, trade_date=target.isoformat(), decision_at=decision_at,
+        consumer_release_id=consumer_release_id,
+    )
+    if proof is None or proof.receipt.get("mode") not in {
+        "HISTORICAL_RECONSTRUCTION", "HISTORICAL_RECONSTRUCTION_EXISTING",
+    }:
+        return None
+    receipt = proof.receipt
+    source = CNINFO_ANNOUNCEMENT_SOURCE
+    batch_id = receipt["batch_id"]
+    root = receipt["batch_root_hash"]
+    known = _exact_datetime(receipt["received_at"], field="received_at")
+    cutoff = _exact_datetime(receipt["fact_cutoff_at"], field="fact_cutoff_at")
+    provenance = receipt["reconstruction_provenance"]
+    codes = sorted(catalog.codes)
+    try:
+        if (
+            receipt["source"] != source or receipt["window_start"] != window_start.isoformat()
+            or receipt["window_end"] != target.isoformat()
+            or not cutoff < known <= decision_at
+            or cutoff != datetime.combine(target, datetime.max.time())
+            or receipt["catalog_batch_id"] != catalog.batch_id
+            or receipt["catalog_manifest_hash"] != catalog.manifest_hash
+            or receipt["catalog_member_set_hash"] != catalog.member_set_hash
+            or receipt["stock_count"] != len(codes)
+            or provenance["catalog_codes_sha256"] != canonical_hash(codes)
+        ):
+            raise ValueError("signed reconstruction scope differs")
+
+        deadline = time.monotonic() + 120
+        mysql = connection.dialect.name == "mysql"
+        if mysql:
+            with _live_announcement_reply_budget(connection, deadline=deadline, stage="signed-reconstruction-isolation"):
+                if connection.get_isolation_level() not in {"REPEATABLE READ", "SERIALIZABLE"}:
+                    raise ValueError("signed reconstruction requires a repeatable-read snapshot")
+        inventory = _load_live_announcement_batch_inventory(
+            connection, source=source, batch_id=batch_id, catalog_codes=codes, deadline=deadline,
+        )
+        # The original terminal proof already verified all content. Verify the
+        # exact durable scope and corroborate its signed root on bounded rows.
+        if not inventory or len(inventory) != receipt["coverage_count"]:
+            raise ValueError("signed reconstruction coverage differs")
+        sample_indices = sorted({0, len(inventory) // 2, len(inventory) - 1})
+        sample_ids = [inventory[index][0] for index in sample_indices]
+        sampled = _read_live_announcement_payload_rows(
+            connection, source=source, batch_id=batch_id, coverage_ids=sample_ids,
+            deadline=deadline, stage="signed-reconstruction-root",
+        )
+        if {row["coverage_id"] for row in sampled} != set(sample_ids) or any(
+            row["coverage_status"] != "COMPLETE"
+            or row["watermark_kind"] != "HISTORICAL_RECONSTRUCTION"
+            or _iso_date(row["window_start"]) != window_start
+            or _iso_date(row["window_end"]) != target
+            or _exact_datetime(row["known_at"], field="known_at") != known
+            or _exact_datetime(row["received_at"], field="received_at") != known
+            or _exact_datetime(row["covered_through_at"], field="covered_through_at") != cutoff
+            or json.loads(row["payload_json"])["watermark"]["evidence"]["global_batch_root_hash"] != root
+            for row in sampled
+        ):
+            raise ValueError("signed reconstruction root differs")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise QMTAnnouncementBlocked(
+            "QMT_ANNOUNCEMENT_EXISTING_SIGNED_RECONSTRUCTION_DIFFERS", str(exc),
+        ) from exc
+    return receipt
+
+
 def validate_existing_complete_qmt_announcement_batch(
     engine,
     *,
@@ -1245,14 +1325,25 @@ def validate_existing_complete_qmt_announcement_batch(
                 decision_known_at=decision_at,
                 existing_batch_only=True,
             )
-            historical = validate_complete_historical_reconstruction_batch(
-                engine,
-                codes=catalog.codes,
-                decision_at=decision_at,
-                window_start=required_start,
-                window_end=target,
-                expected_trade_date=target,
-            )
+            historical = None
+            if (
+                validation_identity_declared and window_days == DEFAULT_WINDOW_DAYS
+                and os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip().lower() == "production"
+            ):
+                historical = _reuse_signed_historical_reconstruction(
+                    connection, catalog=catalog, target=target, window_start=required_start,
+                    decision_at=decision_at,
+                    consumer_release_id=runtime_contract_build_sha(expected_build_sha=exact_validation_build_sha),
+                )
+            if historical is None:
+                historical = validate_complete_historical_reconstruction_batch(
+                    engine,
+                    codes=catalog.codes,
+                    decision_at=decision_at,
+                    window_start=required_start,
+                    window_end=target,
+                    expected_trade_date=target,
+                )
             provenance = dict(
                 historical.get("reconstruction_provenance") or {}
             )
