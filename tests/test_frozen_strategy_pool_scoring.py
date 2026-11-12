@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta
 import hashlib
 import json
+from types import MappingProxyType
 
 import pandas as pd
 import pytest
@@ -175,3 +176,69 @@ def test_fixed_initial_does_not_reuse_preliminary_without_its_exact_source_contr
             news_cutoff_time="2026-11-10T22:20:00", publisher_build_sha="2" * 40,
             reuse_preliminary_snapshot=True, pool_decision_phase="INITIAL",
         )
+
+
+def test_initial_scoring_serializes_rows_with_frozen_announcement_evidence(monkeypatch):
+    trade_date = "2026-11-11"
+    cutoff = "2026-11-12T07:39:50"
+    binding = MappingProxyType({
+        "scheduler_run_uid": "1" * 32,
+        "evidence_sha256": "2" * 64,
+        "batch_root_hash": "3" * 64,
+    })
+    announcement = control.FrozenInitialAnnouncement(MappingProxyType({}), binding)
+    kline = pd.DataFrame([{"stock_code": "600001", "pre_close": 10.0}])
+    kline.attrs["qmt_daily_input_window"] = {
+        "daily_truth_sha256": "4" * 64,
+        "daily_partition_roots": {trade_date: "5" * 64},
+    }
+    kline.attrs["frozen_daily_market_rows"] = []
+    scored = pd.DataFrame([{
+        "stock_code": "600001", "short_name": "样本",
+        "recommend_status": "BLOCK", "signal_status": "BLOCK", "event_risk_level": "LOW",
+        "amount": 100_000_000, "entry_score": 0.0, "final_trade_score": 0.0,
+    }])
+    for name in (
+        "load_finance", "load_notice_features", "load_confidence_features",
+        "load_recommendation_history", "load_failure_features", "load_sector_rotation_features",
+        "load_intraday_evidence",
+    ):
+        monkeypatch.setattr(analysis, name, lambda *a, **kw: pd.DataFrame())
+    monkeypatch.setattr(analysis, "load_kline_features", lambda *a, **kw: kline)
+    monkeypatch.setattr(analysis, "load_hot_rank", lambda *a, **kw: (pd.DataFrame(), trade_date))
+    monkeypatch.setattr(analysis, "load_flow_features", lambda *a, **kw: (pd.DataFrame(), trade_date))
+    monkeypatch.setattr(analysis, "_verify_full_market_turnover_inputs", lambda *a, **kw: {
+        "turnover_snapshot_run_id": "turnover",
+        "turnover_full_market_proof_root_sha256": "6" * 64,
+    })
+    monkeypatch.setattr(analysis, "validate_exact_daily_flow_coverage", lambda *a, **kw: {
+        "flow_input_root_sha256": "7" * 64, "flow_input_count": 1,
+        "flow_input_min_etl_sync_at": cutoff, "flow_input_max_etl_sync_at": cutoff,
+        "flow_input_decision_at": cutoff,
+    })
+    monkeypatch.setattr(analysis, "select_frozen_initial_announcement_source", lambda *a, **kw: announcement)
+    monkeypatch.setattr(analysis, "resolve_strategy_fact_cutoffs", lambda *a, **kw: {
+        "status": analysis.PIT_AVAILABLE,
+        "finance_atomic_batch": {"seal_coverage_id": "finance", "batch_root_sha256": "8" * 64},
+    })
+    monkeypatch.setattr(analysis, "merge_event_features", lambda notices, news: notices)
+    monkeypatch.setattr(analysis, "compute_market_mood", lambda frame: 50.0)
+    monkeypatch.setattr(analysis, "load_tactical_context", lambda *a, **kw: {"mode": "UNKNOWN"})
+    monkeypatch.setattr(analysis, "attach_daily_tactical_features", lambda frame, **kw: frame)
+    monkeypatch.setattr(analysis, "tactical_candidate_codes", lambda frame: [])
+    monkeypatch.setattr(analysis, "get_kline_engine", object)
+    monkeypatch.setattr(analysis, "load_index_stability", lambda *a, **kw: {})
+    monkeypatch.setattr(analysis, "compute_scores", lambda **kw: scored)
+    monkeypatch.setattr(analysis, "_build_text_fields", lambda frame, **kw: frame)
+    monkeypatch.setattr("server.engine.strategy_center.build_fixed_market_context", lambda **kw: {})
+
+    rows, recommendations, _, _, _, scored_with_evidence = analysis._prepare_batch_outputs(
+        engine=object(), trade_date=trade_date, min_score=62, top_n=80,
+        news_cutoff_time=cutoff, pool_decision_phase="INITIAL", refresh_upper_limit=False,
+        return_scored=True,
+    )
+    assert [row["stock_code"] for row in rows] == ["600001"]
+    assert recommendations == []
+    assert scored_with_evidence.to_dict("records")[0]["stock_code"] == "600001"
+    assert scored_with_evidence.attrs["frozen_announcement_source"] == binding
+    assert scored_with_evidence.attrs["frozen_core_inputs"]["announcement"]["root"] == binding["evidence_sha256"]

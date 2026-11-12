@@ -5774,7 +5774,8 @@ def _prepare_batch_outputs(
     if pool_decision_phase is not None:
         daily_window = kline_all.attrs["qmt_daily_input_window"]
         if initial_announcement is not None:
-            frozen_announcement_source = initial_announcement.score_binding
+            # Pandas deep-copies attrs when converting scored columns to rows.
+            frozen_announcement_source = dict(initial_announcement.score_binding)
             scored.attrs["frozen_announcement_source"] = frozen_announcement_source
             event_input = {
                 "stage": "qmt_announcement_pit",
