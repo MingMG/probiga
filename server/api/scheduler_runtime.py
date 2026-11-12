@@ -9180,6 +9180,10 @@ class _TerminalPersistencePending(RuntimeError):
     pass
 
 
+class _TerminalPublicationRejected(RuntimeError):
+    pass
+
+
 def _terminal_values(value):
     if isinstance(value, datetime):
         return value.isoformat()
@@ -9999,18 +10003,18 @@ def _task_history_finish(
             status == "success"
             and normalized_task_type in ANALYSIS_POOL_PUBLISHER_TASK_TYPES
         ):
-            raise RuntimeError(
+            raise _TerminalPublicationRejected(
                 "validated analysis pool activation/terminal audit failed"
             ) from exc
         if (
             status == "success"
             and normalized_task_type == "strategy_governance_daily"
         ):
-            raise RuntimeError(
+            raise _TerminalPublicationRejected(
                 "validated daily delivery finalization/terminal audit failed"
             ) from exc
         if daily_control_required:
-            raise RuntimeError(
+            raise _TerminalPublicationRejected(
                 "daily stage finalization/terminal audit failed"
             ) from exc
         logger.warning("Failed to finish scheduler history %s: %s", run_uid, exc)
@@ -10070,8 +10074,18 @@ def _retry_pending_terminal_writes(engine) -> None:
     pending = [(uid, values) for uid, values in pending.items()
                if uid not in active_runs or uid in exited][:8]
     for run_uid, values in pending:
-        _task_history_finish(engine, run_uid,
-            **{key: value for key, value in values.items() if key != "_durable"})
+        task_type = str(values.get("task_type") or "")
+        try:
+            _task_history_finish(engine, run_uid,
+                **{key: value for key, value in values.items() if key != "_durable"})
+        except _TerminalPublicationRejected as exc:
+            if task_type not in {"analysis_fast", "strategy_governance_daily"}:
+                raise
+            _task_history_finish(
+                engine, run_uid, status="failed", duration=values["duration"], exit_code=None,
+                output=f'{values["output"]}\nDAILY_DELIVERY_FINALIZATION_FAILED: {exc}',
+                task_type=task_type,
+            )
         owner_to_stop = None
         with _running_lock:
             retained = _pending_terminal_writes.get(run_uid)
@@ -10081,11 +10095,11 @@ def _retry_pending_terminal_writes(engine) -> None:
                         continue
                     if retained is not None and (
                         not retained.get("_durable") or _owns_pending_pool_publication(
-                            str(values.get("task_type") or ""), task_id, run_uid
+                            task_type, task_id, run_uid
                         )
                     ):
                         break
-                    if str(values.get("task_type") or "") in {"analysis_fast", "strategy_governance_daily"}:
+                    if task_type in {"analysis_fast", "strategy_governance_daily"}:
                         owner_to_stop = _task_owner_leases.get(run_uid)
                     _release_task_registry(task_id, run_uid)
                     _terminal_worker_exited.discard(run_uid)

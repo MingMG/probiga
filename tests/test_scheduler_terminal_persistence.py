@@ -349,7 +349,8 @@ def test_raw_retention_failure_keeps_worker_ownership(case,monkeypatch):
     runtime._running_task_ids.discard(127)
 
 
-def test_validated_analysis_keeps_owner_until_same_run_terminal_retry(case, monkeypatch):
+@pytest.mark.parametrize("reject_activation", [False, True], ids=["success", "definite-rejection"])
+def test_validated_analysis_keeps_owner_until_same_run_terminal_retry(case, monkeypatch, reject_activation):
     from server.common import scheduler_task_lease
     from tests.score_snapshot_helpers import scored_publication
 
@@ -392,9 +393,13 @@ def test_validated_analysis_keeps_owner_until_same_run_terminal_retry(case, monk
         finish(case, output=evidence, publication_receipt=receipt)
 
     monkeypatch.setattr(runtime, "_run_task_impl", successful_analysis)
+    activation_attempts = []
 
     def activate(conn, *, run_uid, task_type, publication_receipt):
         assert run_uid == case.uid and task_type == "analysis_fast" and publication_receipt == receipt
+        activation_attempts.append(run_uid)
+        if reject_activation and len(activation_attempts) == 2:
+            raise ValueError("MODEL exact activation evidence rejected")
         changed = conn.execute(text("""
             UPDATE st_recommended_run_history SET publication_state='SUCCESS'
             WHERE run_uid=:uid AND publication_state='STAGED'
@@ -425,7 +430,14 @@ def test_validated_analysis_keeps_owner_until_same_run_terminal_retry(case, monk
         assert original is not None and json.loads(original)["outcome"]["status"] == "success"
         for expected_failures in (1, 2):
             assert len(transient_failures) == expected_failures
-            assert runtime._pending_terminal_writes[case.uid]["_durable"]
+            pending = runtime._pending_terminal_writes[case.uid]
+            assert pending["_durable"]
+            if reject_activation and expected_failures == 2:
+                assert pending["status"] == "failed"
+                assert journal.read(case.uid, "REJECTED") is not None
+                assert journal.read(case.uid, "FAILED_FINALIZATION") is not None
+            else:
+                assert pending["status"] == "success"
             assert runtime._running_history_uids == {case.task_id: case.uid}
             assert runtime._running_task_ids == {case.task_id}
             assert runtime._task_owner_leases[case.uid] is owner
@@ -444,10 +456,19 @@ def test_validated_analysis_keeps_owner_until_same_run_terminal_retry(case, monk
 
         history, stage, task = rows(case)
         assert validated_runs == [case.uid]
-        assert (history["status"], stage["status"], task["last_run_status"]) == ("success", "SUCCESS", "success")
-        assert history["run_uid"] == stage["output_dataset_id"] == case.uid
-        assert "DATA_VALIDATION_OK" in history["output"] and "MODEL-activation-receipt" in history["output"]
-        assert candidate_state() == "SUCCESS"
+        assert history["run_uid"] == case.uid
+        if reject_activation:
+            assert activation_attempts == [case.uid, case.uid]
+            assert (history["status"], stage["status"], task["last_run_status"]) == ("failed", "FAILED", "failed")
+            assert stage["output_dataset_id"] is None
+            assert candidate_state() == "STAGED"
+            assert "MODEL-activation-receipt" not in history["output"]
+        else:
+            assert activation_attempts == [case.uid, case.uid, case.uid]
+            assert (history["status"], stage["status"], task["last_run_status"]) == ("success", "SUCCESS", "success")
+            assert stage["output_dataset_id"] == case.uid
+            assert "DATA_VALIDATION_OK" in history["output"] and "MODEL-activation-receipt" in history["output"]
+            assert candidate_state() == "SUCCESS"
         assert journal.read(case.uid, "OBSERVED") == original and journal.read(case.uid, "COMMITTED") is not None
         assert case.uid not in runtime._pending_terminal_writes
         assert case.uid not in runtime._task_owner_leases
