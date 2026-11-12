@@ -3,7 +3,7 @@ import hashlib
 import json
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import event, text
 
 from server.common import daily_delivery_control as control
 from server.common import pit_facts
@@ -235,6 +235,13 @@ def test_signed_cninfo_reconstruction_is_usable_only_after_actual_completion(
         engine, scheduler_run_uid=signed_uid, stage_name=stage, trade_date=TARGET,
         release_id=BUILD_SHA, strategy_release_id=STRATEGY_RELEASE_ID, lease_owner="windows-fixture",
     )
+    prior = started - timedelta(minutes=1)
+    unrelated_coverage = pit_facts.append_source_coverage(
+        engine, fact_kind="event", stock_code="000001", window_start=start, window_end=target,
+        known_at=prior, covered_through_at=prior, watermark_kind="CAPTURED_AT",
+        watermark_evidence={"provider": pit_facts.CNINFO_EVENT_SOURCE}, source_rows=[], fact_bindings=[],
+        source=pit_facts.CNINFO_EVENT_SOURCE, batch_id="prior-cninfo-coverage",
+    )
 
     master = _master(*catalog.codes)
     client = _Client(
@@ -321,8 +328,21 @@ def test_signed_cninfo_reconstruction_is_usable_only_after_actual_completion(
             known_at=cutoff, received_at=cutoff, source=batch["source"], batch_id="other-cninfo-batch",
         )
 
-    selected = pit_facts._load_certified_initial_event_selection(engine, signed, decision=cutoff, **selection_scope)
+    coverage_reads = []
+
+    def record_coverage_read(connection, cursor, statement, parameters, context, executemany):
+        if "SELECT * FROM st_pit_source_coverage" in statement:
+            coverage_reads.append(parameters)
+
+    event.listen(engine, "before_cursor_execute", record_coverage_read)
+    try:
+        selected = pit_facts._load_certified_initial_event_selection(engine, signed, decision=cutoff, **selection_scope)
+    finally:
+        event.remove(engine, "before_cursor_execute", record_coverage_read)
     assert selected.batch["batch_root_hash"] == batch["batch_root_hash"]
+    bound_coverage_ids = {row["coverage_id"] for row, _ in selected.members.values()}
+    assert {value for params in coverage_reads for value in params} == {batch["source"], batch["batch_id"], *bound_coverage_ids}
+    assert selected.members["000001"][0]["supersedes_coverage_id"] == unrelated_coverage.coverage_id
     bad_receipt = control.FrozenInitialAnnouncement(
         {**signed.receipt, "batch_root_hash": "9" * 64}, signed.score_binding,
     )
@@ -336,14 +356,17 @@ def test_signed_cninfo_reconstruction_is_usable_only_after_actual_completion(
             source="test.finance", batch_id="finance-fixture",
         )
     event_reads = []
+    progress = []
     resolved = pit_facts.resolve_strategy_fact_cutoffs(
         engine, codes=catalog.codes, decision_at=cutoff, finance_start_date="1900-01-01",
         finance_end_date=target, event_start_date=start, event_end_date=target, require_qmt_event_batch=True,
         required_initial_announcement=signed, capture_historical_selection=event_reads.append,
+        event_progress=lambda done, total: progress.append((done, total)),
     )
     assert resolved["status"] == pit_facts.PIT_AVAILABLE, resolved.get("reason")
     assert resolved["qmt_event_batch"]["batch_root_hash"] == batch["batch_root_hash"]
     assert len(event_reads) == 1
+    assert progress == [(0, 4), (2, 4), (4, 4)]
     facts = pit_facts.load_event_facts(
         engine, codes=catalog.codes, decision_at=cutoff, fact_cutoff_at=resolved["source_cutoff_at"]["event"],
         start_date=start, end_date=target, require_qmt_complete_batch=True,
@@ -376,3 +399,13 @@ def test_signed_cninfo_reconstruction_is_usable_only_after_actual_completion(
     decoded = decode_score_snapshot(score, trade_date=TARGET)
     assert decoded["frozen_announcement_source"] == signed.score_binding
     assert decoded["input_decision_at"] == cutoff.isoformat()
+
+    pit_facts.append_source_coverage(
+        engine, fact_kind="event", stock_code="600519", window_start=start, window_end=target,
+        known_at=received, covered_through_at=received, watermark_kind="CAPTURED_AT",
+        watermark_evidence={"provider": batch["source"]}, source_rows=[], fact_bindings=[],
+        source=batch["source"], batch_id="same-frontier-cninfo-coverage",
+    )
+    selected = pit_facts._load_certified_initial_event_selection(engine, signed, decision=cutoff, **selection_scope)
+    assert selected.members["600519"][0]["batch_id"] == batch["batch_id"]
+    assert selected.members["600519"][1] is False
