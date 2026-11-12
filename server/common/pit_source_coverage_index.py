@@ -1,4 +1,4 @@
-"""Nonunique physical access index, separate from logical PIT contracts."""
+"""Nonunique physical access indexes, separate from logical PIT contracts."""
 from __future__ import annotations
 
 from sqlalchemy import text
@@ -13,8 +13,17 @@ PIT_SOURCE_COVERAGE_BATCH_INDEX_DDL = (
     "ALGORITHM=INPLACE, LOCK=NONE"
 )
 
+PIT_SOURCE_COVERAGE_DATE_INDEX_NAME = "idx_pit_coverage_source_known_batch"
+PIT_SOURCE_COVERAGE_DATE_INDEX_COLUMNS = ("fact_kind", "source", "watermark_kind", "known_at", "batch_id")
+PIT_SOURCE_COVERAGE_DATE_INDEX_DDL = (
+    "ALTER TABLE `st_pit_source_coverage` "
+    "ADD INDEX `idx_pit_coverage_source_known_batch` "
+    "(`fact_kind`,`source`,`watermark_kind`,`known_at`,`batch_id`), "
+    "ALGORITHM=INPLACE, LOCK=NONE"
+)
 
-def _index_rows(connection):
+
+def _index_rows(connection, index_name: str):
     return connection.execute(text(
         "SELECT INDEX_NAME AS index_name, NON_UNIQUE AS non_unique, "
         "SEQ_IN_INDEX AS seq_in_index, COLUMN_NAME AS column_name, SUB_PART AS sub_part, "
@@ -24,11 +33,11 @@ def _index_rows(connection):
         "ORDER BY SEQ_IN_INDEX"
     ), {
         "table_name": PIT_SOURCE_COVERAGE_TABLE,
-        "index_name": PIT_SOURCE_COVERAGE_BATCH_INDEX_NAME,
+        "index_name": index_name,
     }).mappings().all()
 
 
-def _validate_index(rows) -> None:
+def _validate_index(rows, index_name: str, columns: tuple[str, ...], label: str) -> None:
     try:
         actual = [
             (
@@ -39,16 +48,16 @@ def _validate_index(rows) -> None:
             for row in rows
         ]
     except (KeyError, TypeError, ValueError) as exc:
-        raise RuntimeError("PIT source coverage batch index metadata differs") from exc
+        raise RuntimeError(f"PIT source coverage {label} metadata differs") from exc
     expected = [
-        (PIT_SOURCE_COVERAGE_BATCH_INDEX_NAME, 1, ordinal, column, None, "BTREE", "YES", None, "A")
-        for ordinal, column in enumerate(PIT_SOURCE_COVERAGE_BATCH_INDEX_COLUMNS, 1)
+        (index_name, 1, ordinal, column, None, "BTREE", "YES", None, "A")
+        for ordinal, column in enumerate(columns, 1)
     ]
     if actual != expected:
-        raise RuntimeError("PIT source coverage batch index shape differs")
+        raise RuntimeError(f"PIT source coverage {label} shape differs")
 
 
-def ensure_pit_source_coverage_batch_index(engine) -> dict:
+def _ensure_index(engine, index_name: str, columns: tuple[str, ...], ddl: str, label: str) -> dict:
     """Run only inside the existing privileged, fenced schema prepare stage.
 
     The migrator already bounds metadata locks to 120 seconds and complete
@@ -58,8 +67,8 @@ def ensure_pit_source_coverage_batch_index(engine) -> dict:
     """
     detail = {
         "table": PIT_SOURCE_COVERAGE_TABLE,
-        "index": PIT_SOURCE_COVERAGE_BATCH_INDEX_NAME,
-        "columns": list(PIT_SOURCE_COVERAGE_BATCH_INDEX_COLUMNS),
+        "index": index_name,
+        "columns": list(columns),
         "unique": False,
         "created": False,
         "verified": False,
@@ -67,10 +76,24 @@ def ensure_pit_source_coverage_batch_index(engine) -> dict:
     if engine.dialect.name != "mysql":
         return {**detail, "not_applicable": True}
     with engine.begin() as connection:
-        rows = _index_rows(connection)
+        rows = _index_rows(connection, index_name)
         if not rows:
-            connection.execute(text(PIT_SOURCE_COVERAGE_BATCH_INDEX_DDL))
+            connection.execute(text(ddl))
             detail["created"] = True
-            rows = _index_rows(connection)
-        _validate_index(rows)
+            rows = _index_rows(connection, index_name)
+        _validate_index(rows, index_name, columns, label)
     return {**detail, "verified": True}
+
+
+def ensure_pit_source_coverage_batch_index(engine) -> dict:
+    return _ensure_index(
+        engine, PIT_SOURCE_COVERAGE_BATCH_INDEX_NAME, PIT_SOURCE_COVERAGE_BATCH_INDEX_COLUMNS,
+        PIT_SOURCE_COVERAGE_BATCH_INDEX_DDL, "batch index",
+    )
+
+
+def ensure_pit_source_coverage_date_index(engine) -> dict:
+    return _ensure_index(
+        engine, PIT_SOURCE_COVERAGE_DATE_INDEX_NAME, PIT_SOURCE_COVERAGE_DATE_INDEX_COLUMNS,
+        PIT_SOURCE_COVERAGE_DATE_INDEX_DDL, "date index",
+    )

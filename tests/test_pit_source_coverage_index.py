@@ -36,7 +36,7 @@ class MysqlIndexConnection:
         if "information_schema.statistics" in sql.lower():
             assert parameters == {
                 "table_name": "st_pit_source_coverage",
-                "index_name": INDEX_NAME,
+                "index_name": self.fixture.name,
             }
             rows = self.fixture.reflect_index(self.connection)
             for row in rows:
@@ -51,7 +51,7 @@ class MysqlIndexConnection:
                 sql,
             )
             assert match is not None
-            assert match.group(1) == INDEX_NAME
+            assert match.group(1) == self.fixture.name
             columns = tuple(item.strip().strip("`") for item in match.group(2).split(","))
             if self.fixture.ddl_outcome == "missing":
                 return MetadataRows([])
@@ -65,8 +65,9 @@ class MysqlIndexConnection:
 class MysqlIndexFixture:
     dialect = SimpleNamespace(name="mysql")
 
-    def __init__(self, storage, *, ddl_outcome="correct", metadata_overrides=None):
+    def __init__(self, storage, *, name=INDEX_NAME, ddl_outcome="correct", metadata_overrides=None):
         self.storage = storage
+        self.name = name
         self.ddl_calls = 0
         self.ddl_outcome = ddl_outcome
         self.metadata_overrides = metadata_overrides or {}
@@ -86,18 +87,18 @@ class MysqlIndexFixture:
         quoted_columns = ",".join(f'"{column}"' for column in columns)
         unique_sql = "UNIQUE " if unique else ""
         connection.execute(text(
-            f'CREATE {unique_sql}INDEX "{INDEX_NAME}" ON "st_pit_source_coverage" ({quoted_columns})'
+            f'CREATE {unique_sql}INDEX "{self.name}" ON "st_pit_source_coverage" ({quoted_columns})'
         ))
 
     def reflect_index(self, connection):
         indexes = connection.exec_driver_sql('PRAGMA index_list("st_pit_source_coverage")').mappings()
-        selected = next((row for row in indexes if row["name"] == INDEX_NAME), None)
+        selected = next((row for row in indexes if row["name"] == self.name), None)
         if selected is None:
             return []
-        columns = connection.exec_driver_sql(f'PRAGMA index_xinfo("{INDEX_NAME}")').mappings()
+        columns = connection.exec_driver_sql(f'PRAGMA index_xinfo("{self.name}")').mappings()
         return [
             {
-                "index_name": INDEX_NAME,
+                "index_name": self.name,
                 "non_unique": 0 if selected["unique"] else 1,
                 "seq_in_index": row["seqno"] + 1,
                 "column_name": row["name"],
@@ -114,7 +115,7 @@ class MysqlIndexFixture:
         with self.storage.connect() as connection:
             return connection.execute(text(
                 "SELECT sql FROM sqlite_master WHERE type='index' AND name=:name"
-            ), {"name": INDEX_NAME}).scalar_one_or_none()
+            ), {"name": self.name}).scalar_one_or_none()
 
 
 @pytest.fixture
@@ -228,3 +229,20 @@ def test_sqlite_call_does_not_apply_mysql_index(storage):
 def test_batch_index_contract_is_exact():
     assert migration.PIT_SOURCE_COVERAGE_BATCH_INDEX_NAME == INDEX_NAME
     assert migration.PIT_SOURCE_COVERAGE_BATCH_INDEX_COLUMNS == INDEX_COLUMNS
+
+
+def test_dated_batch_index_is_managed_without_changing_pit_contract(storage):
+    name = migration.PIT_SOURCE_COVERAGE_DATE_INDEX_NAME
+    columns = ("fact_kind", "source", "watermark_kind", "known_at", "batch_id")
+    fixture = MysqlIndexFixture(storage, name=name)
+    original = source_rows(storage)
+    before = pit_facts.pit_fact_schema_health(storage)
+
+    first = migration.ensure_pit_source_coverage_date_index(fixture)
+    assert first == {"table": "st_pit_source_coverage", "index": name, "columns": list(columns),
+                     "unique": False, "created": True, "verified": True}
+    second = migration.ensure_pit_source_coverage_date_index(fixture)
+    assert second == {**first, "created": False}
+    assert fixture.ddl_calls == 1
+    assert source_rows(storage) == original
+    assert pit_facts.pit_fact_schema_health(storage) == before

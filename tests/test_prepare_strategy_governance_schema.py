@@ -4618,6 +4618,15 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
         ),
     )
     monkeypatch.setattr(
+        pit_source_coverage_index,
+        "ensure_pit_source_coverage_date_index",
+        lambda engine: (
+            calls.append("pit-announcement-date-index-off")
+            or (engine is migrator_engine or pytest.fail("date index used the runtime engine"))
+            and {"created": False, "verified": True}
+        ),
+    )
+    monkeypatch.setattr(
         qmt_reference,
         "attest_prepared_reference_schema",
         lambda _engine: {
@@ -4850,7 +4859,11 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
     assert detail["runtime_least_privilege_verified"] is True
     assert detail["pit_fact_batch_index"] == {"created": False, "verified": True}
     assert calls.count("pit-batch-index-off") == 1
-    assert calls.index("pit-schema-off") < calls.index("pit-batch-index-off") < calls.index("governance-schema-base")
+    assert calls.index("pit-schema-off") < calls.index("pit-batch-index-off")
+    assert detail["pit_fact_announcement_date_index"] == {"created": False, "verified": True}
+    assert calls.count("pit-announcement-date-index-off") == 1
+    assert calls.index("pit-batch-index-off") < calls.index("pit-announcement-date-index-off")
+    assert calls.index("pit-announcement-date-index-off") < calls.index("governance-schema-base")
     assert [
         call.get("base_schema_only") for call in governance_schema_calls
     ] == [True, None]

@@ -20,6 +20,7 @@ import time
 import uuid
 
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
 
 logger = logging.getLogger(__name__)
@@ -930,6 +931,73 @@ def _load_historical_reconstruction_authority(
     return catalog, authority
 
 
+def _existing_live_batch_inventory(
+    connection, *, source: str, target: date, decision_at: datetime,
+    capture_deadline: datetime | None,
+) -> list[dict]:
+    """Read candidate metadata for the exact acceptance window."""
+    from server.common.pit_source_coverage_index import PIT_SOURCE_COVERAGE_DATE_INDEX_NAME
+
+    mysql = connection.dialect.name == "mysql"
+    query_budget = "/*+ MAX_EXECUTION_TIME(10000) */ " if mysql else ""
+    index_hint = f" FORCE INDEX (`{PIT_SOURCE_COVERAGE_DATE_INDEX_NAME}`)" if mysql else ""
+    # The indexed date comes from the observed timestamp, so legacy batch IDs
+    # and existing ambiguity/envelope checks retain their original meaning.
+    statement = text(
+        f"SELECT {query_budget}batch_id, MIN(stock_code) AS sample_stock_code, "
+        "MIN(known_at) AS min_known_at, "
+        "MAX(known_at) AS max_known_at, "
+        "MIN(received_at) AS min_received_at, "
+        "MAX(received_at) AS max_received_at, "
+        "MIN(covered_through_at) AS min_fact_cutoff_at, "
+        "MAX(covered_through_at) AS max_fact_cutoff_at, "
+        "MIN(window_start) AS min_window_start, "
+        "MAX(window_start) AS max_window_start, "
+        "MIN(window_end) AS min_window_end, "
+        "MAX(window_end) AS max_window_end, "
+        "COUNT(*) AS coverage_row_count, "
+        "COUNT(DISTINCT stock_code) AS distinct_stock_count, "
+        "SUM(CASE WHEN coverage_status='COMPLETE' THEN 0 "
+        "ELSE 1 END) AS invalid_coverage_count, "
+        "SUM(CASE WHEN result_count<0 THEN 1 ELSE 0 END) "
+        "AS invalid_result_count, "
+        "SUM(result_count) AS event_count, "
+        "SUM(CASE WHEN result_count=0 THEN 1 ELSE 0 END) "
+        "AS empty_stock_count "
+        f"FROM st_pit_source_coverage{index_hint} "
+        "WHERE fact_kind='event' AND source=:source "
+        "AND watermark_kind='QUERY_CUTOFF' "
+        "AND batch_id LIKE :batch_pattern "
+        "AND known_at>=:known_from AND known_at<=:decision_at "
+        "AND (:capture_deadline IS NULL "
+        "OR known_at<:capture_deadline) "
+        "GROUP BY batch_id "
+        "HAVING SUM(CASE WHEN coverage_status='COMPLETE' THEN 0 "
+        "ELSE 1 END)=0 "
+        "ORDER BY max_known_at DESC, batch_id DESC LIMIT 2"
+    )
+    try:
+        return [
+            dict(row)
+            for row in connection.execute(statement, {
+                "source": source,
+                "batch_pattern": _FULL_MARKET_BATCH_PREFIX[source] + "%",
+                "known_from": datetime.combine(target, datetime.min.time()),
+                "decision_at": decision_at,
+                "capture_deadline": capture_deadline,
+            }).mappings()
+        ]
+    except SQLAlchemyError as exc:
+        driver_args = getattr(getattr(exc, "orig", None), "args", ())
+        error_number = driver_args[0] if driver_args and type(driver_args[0]) is int else None
+        error_type = type(exc).__name__
+        error_detail = f":errno={error_number}" if error_number is not None else ""
+        raise QMTAnnouncementBlocked(
+            "QMT_ANNOUNCEMENT_EXISTING_BATCH_INVENTORY_FAILED",
+            f"{source}:{error_type}{error_detail}",
+        ) from None
+
+
 def validate_existing_complete_qmt_announcement_batch(
     engine,
     *,
@@ -1031,60 +1099,13 @@ def validate_existing_complete_qmt_announcement_batch(
         # Provider identity is shared with narrower consumers such as the
         # holdings risk watch. Only full-market producer batches may win this
         # selection. Historical reconstructions use a separate watermark.
-        batch_statement = text(
-                    "SELECT batch_id, MIN(stock_code) AS sample_stock_code, "
-                    "MIN(known_at) AS min_known_at, "
-                    "MAX(known_at) AS max_known_at, "
-                    "MIN(received_at) AS min_received_at, "
-                    "MAX(received_at) AS max_received_at, "
-                    "MIN(covered_through_at) AS min_fact_cutoff_at, "
-                    "MAX(covered_through_at) AS max_fact_cutoff_at, "
-                    "MIN(window_start) AS min_window_start, "
-                    "MAX(window_start) AS max_window_start, "
-                    "MIN(window_end) AS min_window_end, "
-                    "MAX(window_end) AS max_window_end, "
-                    "COUNT(*) AS coverage_row_count, "
-                    "COUNT(DISTINCT stock_code) AS distinct_stock_count, "
-                    "SUM(CASE WHEN coverage_status='COMPLETE' THEN 0 "
-                    "ELSE 1 END) AS invalid_coverage_count, "
-                    "SUM(CASE WHEN result_count<0 THEN 1 ELSE 0 END) "
-                    "AS invalid_result_count, "
-                    "SUM(result_count) AS event_count, "
-                    "SUM(CASE WHEN result_count=0 THEN 1 ELSE 0 END) "
-                    "AS empty_stock_count "
-                    "FROM st_pit_source_coverage "
-                    "WHERE fact_kind='event' AND source=:source "
-                    "AND watermark_kind='QUERY_CUTOFF' "
-                    "AND batch_id LIKE :batch_pattern "
-                    "AND known_at<=:decision_at "
-                    "AND DATE(known_at)>=:target_trade_date "
-                    "AND DATE(known_at)<=:decision_date "
-                    "AND (:capture_deadline IS NULL "
-                    "OR known_at<:capture_deadline) "
-                    "GROUP BY batch_id "
-                    "HAVING SUM(CASE WHEN coverage_status='COMPLETE' THEN 0 "
-                    "ELSE 1 END)=0 "
-                    "ORDER BY max_known_at DESC, batch_id DESC LIMIT 2"
-                )
         selected_source = ""
         batches: list[dict] = []
         for candidate_source in AUTHORITATIVE_ANNOUNCEMENT_SOURCES:
-            batches = [
-                dict(row)
-                for row in connection.execute(
-                    batch_statement,
-                    {
-                        "source": candidate_source,
-                        "batch_pattern": (
-                            _FULL_MARKET_BATCH_PREFIX[candidate_source] + "%"
-                        ),
-                        "decision_at": decision_at,
-                        "target_trade_date": target.isoformat(),
-                        "decision_date": decision_at.date().isoformat(),
-                        "capture_deadline": capture_deadline,
-                    },
-                ).mappings()
-            ]
+            batches = _existing_live_batch_inventory(
+                connection, source=candidate_source, target=target, decision_at=decision_at,
+                capture_deadline=capture_deadline,
+            )
             if batches:
                 if candidate_source == QMT_ANNOUNCEMENT_SOURCE:
                     latest_qmt = batches[0]

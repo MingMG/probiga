@@ -400,7 +400,7 @@ CUTOVER_DIAGNOSTIC_STAGES = frozenset({
     "stock_dividend_schema", "stock_dividend_task_identity",
     "runtime_stock_dividend_validation", "runtime_stock_dividend_task_validation",
     "qmt_reference_schema", "qmt_history_coverage_schema", "qmt_attestation_schema",
-    "v4_triggers", "pit_fact_schema", "legacy_completed_run_binding",
+    "v4_triggers", "pit_fact_schema", "pit_fact_announcement_date_index", "legacy_completed_run_binding",
     "governance_base_schema",
     "supporting_triggers", "runtime_schema_bundle_validation",
     "governance_triggers", "governance_schema_seal", "qmt_reference_attestation",
@@ -5558,7 +5558,10 @@ def _cutover_schema(
             validate_dynamic_shadow_ledger_schema,
         )
         from server.common.pit_facts import ensure_pit_fact_schema
-        from server.common.pit_source_coverage_index import ensure_pit_source_coverage_batch_index
+        from server.common.pit_source_coverage_index import (
+            ensure_pit_source_coverage_batch_index,
+            ensure_pit_source_coverage_date_index,
+        )
         from server.common.scheduler_runtime_schema import (
             migrate_scheduler_runtime_heartbeat,
             validate_scheduler_runtime_heartbeat_schema,
@@ -5746,6 +5749,8 @@ def _cutover_schema(
             trigger_ddl_executor=trigger_ddl_executor,
         )
         pit_fact_batch_index = ensure_pit_source_coverage_batch_index(boundary.migrator_engine)
+        cutover_substage = "pit_fact_announcement_date_index"
+        pit_fact_announcement_date_index = ensure_pit_source_coverage_date_index(boundary.migrator_engine)
         cutover_substage = "legacy_completed_run_binding"
         legacy_binding = apply_legacy_completed_run_binding(
             boundary.migrator_engine
@@ -5907,6 +5912,7 @@ def _cutover_schema(
             "dynamic_shadow_schema": dynamic_shadow_schema,
             "pit_fact_schema": pit_fact_schema,
             "pit_fact_batch_index": pit_fact_batch_index,
+            "pit_fact_announcement_date_index": pit_fact_announcement_date_index,
             "qmt_reference_schema": {
                 **qmt_reference_schema,
                 **qmt_reference_seal,
