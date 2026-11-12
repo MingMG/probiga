@@ -1,3 +1,4 @@
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -201,6 +202,44 @@ process.stdout.write(JSON.stringify({{status:'PASS'}}));
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node.js unavailable")
+def test_formal_pool_link_keeps_the_exact_requested_date_when_clock_default_matches():
+    script = (ROOT / "server/static/js/app.js").read_text(encoding="utf-8")
+    loader = script[script.index("    function loadTradingModulePage("):script.index("    function renderTradingDesk(")]
+    route = script[script.index("    function routeDecisionDateFromLocation("):script.index("    window.addEventListener('popstate'")]
+    harness = r"""
+const assert = require('node:assert/strict');
+const date = '2026-11-06';
+const next = '2026-11-09';
+const item = {id:'trading-v3-candidates',tradingView:'candidates',label:'正式策略票池'};
+const window = {location:{search:'?tab=trading-v3-candidates&trade_date=' + date},history:{state:null}};
+const document = {getElementById() {return null;}};
+const escHtml = String, escAttr = String;
+const currentDateValue = () => date;
+const recommendationDateValue = () => next;
+const tradingModuleDateMode = value => value === date ? 'DEFAULT' : 'EXPLICIT_HISTORICAL';
+const MARKET_CLOCK = {recommendation_trade_date:date};
+const localDateString = () => '2026-11-08';
+""" + route + loader + r"""
+const container = {};
+const fromLink = () => normalizedTradingRouteDate(routeDecisionDateFromLocation(), item.id);
+loadTradingModulePage(container, item, fromLink());
+assert.match(container.innerHTML, /data-requested-date="2026-11-06" data-date-mode="EXPLICIT_HISTORICAL"/);
+window.history.state = {autoTradeDate:date};
+loadTradingModulePage(container, item, fromLink());
+assert.match(container.innerHTML, /data-requested-date="2026-11-09" data-date-mode="DEFAULT"/);
+window.history.state = null;
+for (const exact of ['2026-11-07', '2026-11-09']) {
+    window.location.search = '?tab=trading-v3-candidates&trade_date=' + exact;
+    assert.equal(fromLink(), exact);
+    loadTradingModulePage(container, item, fromLink());
+    assert.match(container.innerHTML, new RegExp('data-requested-date="' + exact + '" data-date-mode="EXPLICIT_HISTORICAL"'));
+}
+process.stdout.write(JSON.stringify({status:'PASS'}));
+"""
+    assert _node(harness) == {"status": "PASS"}
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js unavailable")
 def test_strategy_center_only_promotes_exact_verified_canonical_pool():
     script = (ROOT / "server/static/js/app.js").read_text(encoding="utf-8")
     start = script.index("    function strategyGovernancePoolTruth(governance, requestedDate, latestFormalDate)")
@@ -242,5 +281,6 @@ def test_strategy_pool_javascript_cache_versions_are_advanced():
     trading = (ROOT / "server/static/trading-v3.html").read_text(encoding="utf-8")
     assert int(re.search(r'style\.css\?v=(\d+)', index).group(1)) >= 48
     assert re.search(r'app\.js\?v=[0-9a-f]{16}"', index)
-    assert int(re.search(r'trading-v3\.js\?v=(\d+)', trading).group(1)) >= 43
+    digest = hashlib.sha256((ROOT / "server/static/js/trading-v3.js").read_bytes()).hexdigest()[:16]
+    assert f'/static/js/trading-v3.js?v={digest}"' in trading
     assert "旧日期、未验证、DEFERRED 或 RESEARCH_ONLY" in trading

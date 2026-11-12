@@ -14,6 +14,8 @@
     };
     const periods = [['daily', '日线'], ['weekly', '周线'], ['monthly', '月线']];
     const horizons = [5, 10, 20];
+    const reversalBreadth = ['advancing_pct', 'above_ma20_pct', 'above_ma60_pct',
+        'new_low_20d_pct', 'new_low_60d_pct', 'above_ma20_change_5d_pp'];
     const activeLoads = new WeakMap();
 
     function escape(value) {
@@ -62,6 +64,13 @@
         }).join('')}</div></section>`;
     }
 
+    function hasReversalBreadth(snapshot) {
+        const breadth = snapshot?.breadth;
+        return breadth?.quality_status === 'VERIFIED' && typeof breadth.available_at === 'string' &&
+            typeof snapshot.trade_date === 'string' && breadth.trade_date === snapshot.trade_date &&
+            reversalBreadth.every(key => Number.isFinite(breadth[key]));
+    }
+
     function renderBreadth(snapshot) {
         const breadth = snapshot.breadth;
         const metrics = [
@@ -73,22 +82,24 @@
             ['跌停股票占比', breadth?.limit_down_pct, '%'],
             ['20日线上占比近5日变化', breadth?.above_ma20_change_5d_pp, ' 个百分点']
         ];
+        const confirmation = hasReversalBreadth(snapshot)
+            ? '' : warning('所选交易日缺少反转确认所需的完整市场广度证据，反转确认不可核验。');
         return '<section class="ms-panel"><h3>市场广度与风险</h3>' + (breadth
             ? `<div class="ms-grid">${metrics.map(([label, value, suffix]) => `<article class="ms-card"><h4>${label}</h4><strong>${format(value, 1, suffix)}</strong></article>`).join('')}</div>`
-            : warning('本次没有可核验的市场广度，相关结论采用降级证据。')) + '</section>';
+            : '') + confirmation + '</section>';
     }
 
     function renderCurrent(data, requestedDate) {
         const snapshot = data?.snapshot;
+        const mode = data?.evidence_mode === 'CURRENT_OBSERVATION' ? '当前观测' :
+            data?.evidence_mode === 'VERIFIED_PUBLICATION' ? (snapshot ? '已核验发布时点' : '历史时点核验') : null;
         if (!snapshot) return '<section class="ms-panel">' + warning(data?.reason || '所选交易日暂无可核验的市场阶段数据。') +
-            meta([['请求交易日', requestedDate || data?.trade_date], ['数据来源', data?.source], ['模型版本', data?.model_version]]) + '</section>';
+            meta([['请求交易日', requestedDate || data?.trade_date], ['数据来源', data?.source], ['证据口径', mode], ['模型版本', data?.model_version]]) + '</section>';
         const sections = [
             ['判断依据', snapshot.evidence], ['进一步确认条件', snapshot.confirmation_conditions],
             ['信号失效条件', snapshot.invalidation_conditions], ['风险情景', snapshot.risk_scenarios],
             ['不确定性', snapshot.uncertainties]
         ];
-        const mode = data.evidence_mode === 'CURRENT_OBSERVATION' ? '当前观测' :
-            data.evidence_mode === 'VERIFIED_PUBLICATION' ? '已核验发布时点' : null;
         return '<section class="ms-panel"><h3>综合判断</h3><strong>' + stateChip(snapshot.state) + '</strong>' +
             meta([['数据交易日', snapshot.trade_date || data.trade_date], ['证据截止', snapshot.as_of],
                 ['数据来源', data.source], ['证据口径', mode], ['模型版本', snapshot.model_version || data.model_version]]) +
@@ -120,9 +131,11 @@
         if (!replay) return warning(data?.reason || '暂无可核验的市场阶段回放。');
         const groups = replay.summary?.[horizon];
         const rows = Array.isArray(replay.rows) ? replay.rows.slice().reverse() : [];
+        const breadthMissing = rows.some(({assessment}) => assessment?.status === 'READY' && !hasReversalBreadth(assessment));
         return meta([['判断起日', replay.start_date], ['判断止日', replay.end_date], ['结果观察截止', replay.outcome_as_of],
             ['数据来源', data.source], ['模型版本', data.model_version]]) +
             `<p class="ms-note">历史回放使用当时可见的输入。未来${horizon}个交易日的数据仅用于评价，未走满观察期的结果显示为待观察。</p>` +
+            (breadthMissing ? warning('回放包含市场广度证据不全的判断日，后续反转确认只统计证据完整的观察期。') : '') +
             (Array.isArray(groups) && groups.length ? table('按市场阶段汇总', ['市场阶段', '判断样本', '完整观察期', '平均指数收益', '再次创新低', '后续反转确认', '平均局部低点偏移（交易日）'],
                 groups.map(group => cells([stateChip(group.state), format(group.assessment_count, 0), format(group.matured_count, 0),
                     format(group.mean_return_pct, 2, '%'), observedCount(group.new_low_count, group.new_low_evaluated_count),
@@ -142,7 +155,7 @@
                 })) : warning(data.reason || '回放区间暂无有效观察。'));
     }
 
-    function load(tradeDate, container, request) {
+    function load(tradeDate, container, request, onLatest) {
         const query = tradeDate ? '?trade_date=' + encodeURIComponent(tradeDate) : '';
         const ticket = {};
         activeLoads.set(container, ticket);
@@ -160,7 +173,10 @@
         const horizon = container.querySelector('[data-ms-horizon]');
         const isActive = () => activeLoads.get(container) === ticket && container.contains(current);
         let replay;
-        container.querySelector('[data-ms-latest]').addEventListener('click', () => load('', container, request));
+        container.querySelector('[data-ms-latest]').addEventListener('click', () => {
+            onLatest?.();
+            return load('', container, request, onLatest);
+        });
         horizon.addEventListener('change', () => {
             if (isActive() && replay) history.innerHTML = renderReplay(replay, Number(horizon.value));
         });

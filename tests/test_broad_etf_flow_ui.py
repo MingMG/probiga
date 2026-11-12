@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
 from pathlib import Path
+import shutil
+import subprocess
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -47,3 +51,28 @@ def test_broad_etf_flow_styles_are_scoped_and_responsive():
     assert "#tab-broad-etf-flow .bef-chart-wrap" in style
     assert "@media (max-width: 1180px)" in style
     assert "@media (max-width: 768px)" in style
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js unavailable")
+def test_benchmark_coverage_names_missing_funds_without_filling_aggregate():
+    script = _text("server/static/js/app.js")
+    functions = script[script.index("    function broadEtfFinite("):script.index("    function initBroadEtfFlowChart(")]
+    harness = r"""
+const assert = require('node:assert/strict');
+const escHtml = String, escAttr = String;
+function initBroadEtfFlowChart() {}
+""" + functions + r"""
+const container = {};
+renderBroadEtfFlowPage(container, {scope_label:'8个基准 · 16只跟踪宽基 ETF', benchmarks:[{
+    benchmark:'中证A500', expected_etf_codes:['563360','563800'], available_etf_codes:['563360'],
+    missing_etf_codes:['563800'], net_1d:null, net_3d:null, net_5d:null, net_20d:null, positive_count:1, total_count:1
+}]});
+assert.match(container.innerHTML, /8个基准 · 16只跟踪宽基 ETF/);
+assert.match(container.innerHTML, /产品覆盖/);
+const row = container.innerHTML.split('<strong>中证A500</strong>')[1].split('</tr>')[0];
+assert.match(row, /1 \/ 2<small>缺 563800<\/small>/);
+assert.doesNotMatch(row, /0\.00/);
+"""
+    result = subprocess.run([shutil.which("node"), "-"], input=harness, encoding="utf-8",
+                            capture_output=True, timeout=10)
+    assert result.returncode == 0, result.stderr

@@ -1,0 +1,18 @@
+:root { color: #1e293b; background: #f2f6fb; font: 15px/1.5 system-ui, sans-serif; }
+body { margin: 0; }
+main { max-width: 1100px; margin: 0 auto; padding: 24px; }
+header, section { background: white; border: 1px solid #dae4ef; border-radius: 12px; padding: 20px; }
+h1 { margin: 8px 0; }
+p { margin: 0; }
+a { color: #185a9d; }
+form, nav { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+form, #status { margin: 14px 0; }
+input, select, button { color: inherit; font: inherit; padding: 6px 10px; background: white; border: 1px solid #8ea9c6; border-radius: 5px; }
+button:not(:disabled) { cursor: pointer; }
+button:disabled { opacity: .5; }
+.table-scroll { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; text-align: left; }
+th, td { padding: 8px; border-bottom: 1px solid #e4ecf3; white-space: nowrap; }
+th { background: #eff5fc; }
+nav { margin-top: 12px; }
+@media (max-width: 640px) { main, header, section { padding: 12px; } }

@@ -442,6 +442,20 @@ body.market-home-active .main-content > .content {
     min-height: 5px;
 }
 
+.market-home .mh-ladder-tier { border-bottom: 1px solid var(--mh-line); }
+.market-home .mh-ladder-tier > summary { border-bottom: 0; cursor: pointer; list-style: none; }
+.market-home .mh-ladder-tier > summary::-webkit-details-marker { display: none; }
+.market-home .mh-ladder-toggle::before { content: '▸'; }
+.market-home .mh-ladder-tier[open] .mh-ladder-toggle::before { content: '▾'; }
+.market-home .mh-ladder-tier > ul {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 10px;
+    margin: 2px 0 8px;
+    padding: 0;
+    list-style: none;
+}
+
 .market-home .mh-table-wrap {
     max-width: 100%;
     overflow-x: auto;

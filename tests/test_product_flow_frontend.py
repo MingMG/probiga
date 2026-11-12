@@ -552,10 +552,10 @@ assert.deepStrictEqual(calls,[['portfolio',false]]);
     assert result.returncode == 0, result.stderr
 
 
-def test_navigation_preserves_original_research_and_portfolio_labels():
+def test_navigation_labels_the_formal_pool_and_preserves_research_and_portfolio_routes():
     script = _script()
     layout = script.split("var APP_NAV = [", 1)[1].split("var sidebarRouteByTab", 1)[0]
-    for text in ("策略选股结果", "我的持仓", "条件选股（研究）", "策略研究与竞技", "交易与复盘"):
+    for text in ("正式策略票池", "每日研究票池", "我的持仓", "条件选股（研究）", "策略研究与竞技", "交易与复盘"):
         assert text in layout
     for tab in ("trading-v3-candidates", "screen", "strategy-center", "portfolio"):
         assert "id:'" + tab + "'" in layout

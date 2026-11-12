@@ -68,3 +68,15 @@ def test_future_time_is_not_an_availability_claim():
     cutoff = datetime(2026, 11, 8, 0, 50, tzinfo=timezone.utc)
     assert exporter._time("2026-11-08 09:00:00", cutoff) is None
     assert exporter._time("2026-11-08 08:40:00", cutoff) == "2026-11-08T08:40:00+08:00"
+
+
+def test_ladder_projection_keeps_exact_verified_stock_names():
+    day = "2026-11-06"
+    ladder = {"trade_date": day, "source": "东财收盘涨停池 · QMT 收盘价复核", "receipt_sha256": "a" * 64,
+              "rows": [{"streak": 5, "count": 2, "stocks": ["梯队股票甲", "梯队股票乙"]}]}
+    output = exporter._market_board({"trade_date": day, "limit_ladder": ladder})["limit_ladder"]
+    assert output["source"] == ladder["source"]
+    assert output["receipt_sha256"] == ladder["receipt_sha256"]
+    assert output["rows"] == [{"streak": 5, "count": 2,
+                               "stocks": [{"short_name": "梯队股票甲"}, {"short_name": "梯队股票乙"}]}]
+    assert not exporter._market_board({"trade_date": "2026-11-05", "limit_ladder": ladder})["limit_ladder"]["rows"]

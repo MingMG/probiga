@@ -213,8 +213,12 @@
         const max = Math.max(1, ...ladder.map(item => item.count));
         const meta = exact ? [notes.trade_date, notes.scope, notes.source].filter(Boolean).map(escape).join(' · ') : snapshotMeta(snapshot);
         const captured = exact && notes.available_at ? `证据可用 ${escape(notes.available_at)} · ` : '';
-        return panel('涨停梯队', meta, (ladder.length ? '<div class="mh-list">' + ladder.slice(0, 8).map(item =>
-            `<div class="mh-row"><b>${item.streak}板</b><span class="mh-breadth-bar" aria-hidden="true"><span class="mh-breadth-part mh-up" style="width:${100 * item.count / max}%"></span></span><span>${item.count}只</span></div>`).join('') + '</div>' :
+        return panel('涨停梯队', meta, (ladder.length ? '<div class="mh-list">' + ladder.map(item => {
+            const names = rows(item.stocks).filter(name => typeof name === 'string' && name.trim());
+            const tier = `<b>${item.streak}板</b><span class="mh-breadth-bar" aria-hidden="true"><span class="mh-breadth-part mh-up" style="width:${100 * item.count / max}%"></span></span><span>${item.count}只</span>`;
+            return names.length ? `<details class="mh-ladder-tier"><summary class="mh-row">${tier}<span class="mh-ladder-toggle" aria-hidden="true"></span></summary><ul aria-label="${item.streak}板个股">${names.map(name => `<li>${escape(name)}</li>`).join('')}</ul></details>` :
+                `<div class="mh-row">${tier}</div>`;
+        }).join('') + '</div>' :
             empty(exact && notes.count === 0 ? '东财收录样本为 0 只' : '暂无可核验的连续涨停梯队')) + `<p class="mh-meta">${captured}封板率 ${metric(ladder.length ? notes.seal_rate_pct : null, '%', 1)} · ${link('intraday-alert', '查看盘中播报')}</p>`);
     }
 
@@ -269,7 +273,8 @@
     function renderEvents(snapshot, requested) {
         const events = rows(snapshot?.events).filter(item => day(item.snapshot_at) === requested && requested);
         const heading = escape(requested || '日期待核验');
-        if (!events.length) return panel('监控中心', heading, empty('所选交易日的异动事件证据待核验') + link('market-radar', '查看异动雷达'), 'mh-third');
+        const timeline = day(requested) ? `<a class="mh-link" href="/static/market-event-timeline.html?date=${day(requested)}">查看当日事件时间线</a>` : '';
+        if (!events.length) return panel('监控中心', heading, empty('所选交易日的异动事件证据待核验') + timeline + link('market-radar', '查看异动雷达'), 'mh-third');
         const limitLabels = {TOUCH:'触及涨停', SEAL:'涨停封板', RESEAL:'涨停回封', BREAK:'涨停开板'};
         return panel('监控中心', heading, '<div class="mh-list">' + events.slice(0, 8).map(item => {
             const detail = item.detail_json || {};
@@ -281,7 +286,7 @@
             return `<div class="mh-row"><span>${name}<small class="mh-meta">${escape(provider)}</small></span>` +
                 `<span class="mh-badge ${tone}">${label}</span>` +
                 `<span class="mh-meta">${escape(item.snapshot_at)}${item.available_at ? `<small class="mh-meta">记录 ${escape(item.available_at)}</small>` : ''}</span></div>`;
-        }).join('') + '</div>', 'mh-third');
+        }).join('') + '</div>' + timeline, 'mh-third');
     }
 
     function renderRanking(snapshot, key, title, field, unit) {
@@ -317,8 +322,10 @@
         const boardPhase = {qmt_snapshot: '盘中快照', exchange_close: '收盘观察'}[snapshot?.as_of_basis] || '数据待核验';
         const phase = !market ? boardPhase : market.trade_date < requested ? '历史回退' : labels[market.freshness_status] || '已存行情';
         const stamp = market?.data_time || market?.trade_date || snapshot?.as_of;
+        const poolUrl = '/?tab=trading-v3-candidates' + (day(requested) ? '&amp;trade_date=' + day(requested) : '');
         const markup = '<section class="market-home" aria-label="市场看板"><header class="mh-head"><div><span class="mh-eyebrow">PROBIGA · A股</span>' +
-            '<h2>市场看板</h2><span class="mh-badge">' + phase + '</span>' + link('market-context', '市场环境') + '</div>' +
+            '<h2>市场看板</h2><span class="mh-badge">' + phase + '</span>' + link('market-context', '市场环境') +
+            `<a class="mh-link" href="${poolUrl}">正式策略票池</a></div>` +
             `<div class="mh-head-actions"><span class="mh-meta">请求 ${escape(requested || '日期待核验')} · 行情 ${escape(stamp || '待核验')}${observationLag(market, clock, requested)}</span>` +
             '<button type="button" class="mh-retry" data-mh-refresh>重载</button></div></header>';
         return markup + renderIndexStrip(requested, market, state.trend, snapshot) + renderMetrics(market, snapshot) +

@@ -91,16 +91,19 @@ def _time(value, captured_at):
 
 def _market_board(raw):
     ladder = raw.get("limit_ladder") or {}
+    if not isinstance(ladder, dict) or ladder.get("trade_date") != raw.get("trade_date") or not ladder.get("receipt_sha256"):
+        ladder = {}
     tiers = [
         {**_fields(row, "streak count"),
-         "stocks": _rows(row.get("stocks"), "stock_code short_name", 50)}
+         "stocks": [{"short_name": name} for name in row["stocks"][:50] if isinstance(name, str) and name.strip()]
+         if isinstance(row.get("stocks"), list) else []}
         for row in (ladder.get("rows") or [])[:12] if isinstance(row, dict)
     ]
     return {
         **_fields(raw, "sample_size price_sample_size"),
         "distribution": _rows(raw.get("distribution"), "key label lower upper count", 15),
         "indices": _rows(raw.get("indices"), "index_code index_name price change_pct amount as_of", 15),
-        "limit_ladder": {**_fields(ladder, "count limit_up_count max_streak available_at"), "rows": tiers},
+        "limit_ladder": {**_fields(ladder, "trade_date source scope receipt_sha256 count limit_up_count max_streak available_at"), "rows": tiers},
         "events": _rows(raw.get("events"), "event_type event_family stock_code snapshot_at available_at data_source", 20),
         "unavailable_fields": [field for field in (raw.get("unavailable_fields") or [])[:20]
                                if isinstance(field, str)],

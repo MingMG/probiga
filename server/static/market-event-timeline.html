@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>盘中事件时间线 · ProBigA</title>
+    <link rel="stylesheet" href="/static/css/market-event-timeline.css?v=1">
+    <script src="/static/js/market-event-timeline.js?v=1" defer></script>
+</head>
+<body>
+<main>
+    <header>
+        <a id="board" href="/?tab=workbench">返回市场看板</a>
+        <h1>盘中事件时间线</h1>
+        <p>按交易日查看已落库的 QMT 事件。发生、采集和记录时间均为北京时间。全天采集覆盖未核验。</p>
+        <p>翻页沿用首次读取的时间和记录编号上限。重新读取可检查迟到记录。</p>
+    </header>
+    <form id="filters">
+        <label>交易日 <input id="trade-date" type="date" required></label>
+        <label>事件来源
+            <select id="stream">
+                <option value="limit_up">国金 QMT 涨停生命周期</option>
+                <option value="radar">QMT 五档异动</option>
+            </select>
+        </label>
+        <button type="submit">读取 / 刷新</button>
+    </form>
+    <p id="status" role="status" aria-live="polite">请选择交易日。</p>
+    <section aria-label="已记录事件">
+        <div class="table-scroll">
+            <table>
+                <thead><tr><th>发生</th><th>采集</th><th>记录可用</th><th>事件</th><th>标的</th><th>方向</th></tr></thead>
+                <tbody id="events"></tbody>
+            </table>
+        </div>
+        <nav aria-label="时间线分页">
+            <button id="previous" type="button" disabled>上一页</button>
+            <span id="page-number"></span>
+            <button id="next" type="button" disabled>下一页</button>
+        </nav>
+    </section>
+</main>
+</body>
+</html>
