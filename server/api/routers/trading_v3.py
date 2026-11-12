@@ -30,7 +30,7 @@ from server.common.component_release import runtime_component_build_sha
 from server.common.component_release_attestation import (
     load_component_attestation, require_compatible_component_build,
 )
-from server.common.daily_delivery_control import read_daily_delivery
+from server.common.daily_delivery_control import DELIVERY_RECEIPT_SCHEMA, read_daily_delivery
 from server.common.readiness_snapshot import ReadinessSnapshot
 from server.common.authoritative_market_clock import (
     authoritative_closed_trade_date,
@@ -2668,6 +2668,38 @@ def _archived_daily_result_receipt(
         return None
 
 
+def _blocked_historical_delivery_context(
+    engine: Any, trade_date: date, context: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Use the sealed terminal status for an earlier session without a pool."""
+    day = trade_date.isoformat()
+    try:
+        delivery = read_daily_delivery(engine, trade_date=day, attempt_limit=1)
+    except (AttributeError, SQLAlchemyError, RuntimeError, ValueError):
+        return None
+    if delivery is None or delivery["session"].get("status") != "BLOCKED":
+        return None
+    receipt = delivery.get("receipt")
+    if (
+        not isinstance(receipt, Mapping)
+        or receipt.get("schema") != DELIVERY_RECEIPT_SCHEMA
+        or receipt.get("trade_date") != day
+        or receipt.get("status") != "BLOCKED"
+    ):
+        return None
+    reason = str(receipt.get("error_code") or "HISTORICAL_DAILY_DELIVERY_BLOCKED")
+    return {
+        **context,
+        "context_mode": "DAILY_DELIVERY",
+        "run_status": "DATA_BLOCKED",
+        "data_status": "DATA_BLOCKED",
+        "decision_status": "BLOCKED",
+        "decision_integrity_reason": reason,
+        "blocking_stage": receipt.get("blocking_stage"),
+        "reason_codes": [reason],
+    }
+
+
 def _daily_context_from_pool(
     pool: Mapping[str, Any],
     *,
@@ -3237,8 +3269,18 @@ def daily_result(
     context = pool_context
 
     if canonical is None and context.get("decision_integrity_verified") is not True:
-        runtime = _analysis_runtime_context(
-            getattr(repository, "engine", None),
+        engine = getattr(repository, "engine", None)
+        historical_block = None
+        if (
+            archive_requested and resolved_trade_date is not None
+            and authoritative_trade_date is not None
+            and resolved_trade_date < authoritative_trade_date
+        ):
+            historical_block = _blocked_historical_delivery_context(
+                engine, resolved_trade_date, pool_context,
+            )
+        runtime = historical_block or _analysis_runtime_context(
+            engine,
             requested_date=resolved_trade_date,
         )
         if runtime is not None:

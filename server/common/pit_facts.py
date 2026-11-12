@@ -5632,6 +5632,7 @@ class HistoricalEventRead:
 
     selection: HistoricalAnnouncementSelection | _LiveEventSelection
     fact_cutoff_at: datetime
+    signed_historical_bindings: Mapping[str, tuple[Mapping[str, str], ...]] | None = None
 
 
 def _announcement_batch_read_reason(error: Exception) -> str:
@@ -5651,7 +5652,7 @@ def _announcement_batch_read_reason(error: Exception) -> str:
         r"snapshot-isolation|candidate-discovery(?::[0-9]{1,8})?|first-member-(?:inventory|payload)|"
         r"stock-catalog|batch-verified|batch-inventory(?::[0-9]{1,8})?|"
         r"batch-payload(?:-size)?:[0-9]{1,8}|"
-        r"incremental-parent|candidate-read",
+        r"incremental-parent|candidate-read|signed-historical-bindings:[0-9]{1,8}",
         detail,
     ):
         return f"{reason}:{detail}"
@@ -5716,9 +5717,11 @@ def _bind_signed_live_event_selection(
 def _load_certified_initial_event_selection(
     engine: Engine, required: FrozenInitialAnnouncement, *, codes: list[str],
     decision: datetime, data_date: date, window_start: date, window_end: date,
-) -> _SignedLiveEventSelection:
+) -> _SignedLiveEventSelection | HistoricalAnnouncementSelection:
     from server.common.authoritative_market_clock import STRATEGY_POOL_INITIAL_TIME
-    from server.common.daily_delivery_control import FrozenInitialAnnouncement
+    from server.common.daily_delivery_control import (
+        FrozenInitialAnnouncement, signed_initial_announcement_window_matches,
+    )
 
     if not isinstance(required, FrozenInitialAnnouncement):
         raise ValueError("initial announcement requires a verified stage receipt")
@@ -5727,17 +5730,76 @@ def _load_certified_initial_event_selection(
     received = _row_datetime(receipt["received_at"])
     completion = _row_datetime(receipt["stage_finished_at"])
     if (
-        receipt.get("mode")
-        or receipt["window_start"] != (data_date - timedelta(days=30)).isoformat()
-        or receipt["window_end"] != data_date.isoformat()
+        not signed_initial_announcement_window_matches(receipt, data_date)
         or not data_date == cutoff.date() == window_end
         or decision < datetime.combine(data_date, STRATEGY_POOL_INITIAL_TIME)
         or not cutoff <= received <= completion <= decision
     ):
         raise ValueError("initial announcement source or completion scope differs")
+    if receipt.get("mode") in {"HISTORICAL_RECONSTRUCTION", "HISTORICAL_RECONSTRUCTION_EXISTING"}:
+        return _bind_signed_historical_event_selection(
+            engine, receipt, codes=codes, decision=decision, received=received, completion=completion,
+            window_start=window_start, window_end=window_end,
+        )
     return _bind_signed_live_event_selection(
         engine, receipt, codes=codes, decision=decision, cutoff=cutoff, completion=completion,
         window_start=window_start, window_end=window_end, phase="initial",
+    )
+
+
+def _bind_signed_historical_event_selection(
+    engine: Engine, receipt: Mapping[str, Any], *, codes: list[str],
+    decision: datetime, received: datetime, completion: datetime,
+    window_start: date, window_end: date,
+) -> HistoricalAnnouncementSelection:
+    from dataclasses import replace
+
+    from server.common.qmt_announcement_pit import (
+        QMT_ANNOUNCEMENT_TASK_SCHEMA, validate_complete_historical_reconstruction_batch,
+    )
+
+    if (
+        receipt.get("schema") != QMT_ANNOUNCEMENT_TASK_SCHEMA
+        or receipt.get("status") != "COMPLETE"
+        or receipt.get("source") != CNINFO_EVENT_SOURCE
+        or not _HASH_RE.fullmatch(str(receipt.get("stage_evidence_sha256") or ""))
+        or not _HASH_RE.fullmatch(str(receipt.get("stage_attempt_uid") or ""))
+    ):
+        raise ValueError("signed historical announcement stage identity differs")
+    captured: list[HistoricalAnnouncementSelection] = []
+    # Certify the immutable batch at its original availability frontier. A
+    # newer reconstruction must not replace the stage receipt's selection.
+    batch = validate_complete_historical_reconstruction_batch(
+        engine, codes=codes, decision_at=received, window_start=window_start,
+        window_end=window_end, expected_trade_date=window_end,
+        capture_historical_selection=captured.append,
+    )
+    if (
+        len(captured) != 1
+        or any(batch.get(field) != receipt.get(field) for field in (
+            "source", "primary_source", "fallback_reason", "batch_id", "batch_root_hash",
+            "window_start", "window_end", "catalog_batch_id", "catalog_manifest_hash",
+            "catalog_member_set_hash", "coverage_count", "event_count", "empty_stock_count",
+            "reconstruction_provenance", "reconstruction_sha256",
+        ))
+        or batch["catalog_member_count"] != receipt.get("stock_count")
+        or batch["capture_window_start"] != receipt.get("capture_window_start", receipt["window_start"])
+        or ("incremental_chain_root_hash" in receipt
+            and batch["incremental_chain_root_hash"] != receipt["incremental_chain_root_hash"])
+        or any(_row_datetime(batch[field]) != _row_datetime(receipt[field]) for field in (
+            "fact_cutoff_at", "source_query_cutoff_at", "decision_at", "received_at", "reconstructed_at",
+        ))
+    ):
+        raise ValueError("historical announcement durable batch differs from its signed stage receipt")
+    return replace(
+        captured[0], decision_at=decision,
+        batch=MappingProxyType({
+            **batch, "initial_stage": {
+                "attempt_uid": receipt["stage_attempt_uid"],
+                "evidence_sha256": receipt["stage_evidence_sha256"],
+                "completed_at": _dt_text(completion),
+            },
+        }),
     )
 
 
@@ -5856,14 +5918,16 @@ def resolve_common_fact_cutoff(
     event_batch: dict[str, Any] = {}
     historical_selections: list[HistoricalAnnouncementSelection] = []
     reusable_live_batch: list[bool] = []
-    signed_live_selection = None
+    signed_selection = signed_historical_bindings = None
     if signed_source is not None:
         try:
-            signed_live_selection = read_signed_selection(
+            signed_selection = read_signed_selection(
                 engine, signed_source, codes=normalized_codes, decision=decision,
                 data_date=windows["finance"][1], window_start=windows["event"][0], window_end=windows["event"][1],
             )
-            event_batch = dict(signed_live_selection.batch)
+            event_batch = dict(signed_selection.batch)
+            if capture_historical_selection is not None and not isinstance(signed_selection, _SignedLiveEventSelection):
+                signed_historical_bindings = _read_signed_historical_event_bindings(engine, signed_selection)
         except Exception as exc:
             return {**blocked, "reason": f"PIT_{signed_phase}_ANNOUNCEMENT_INVALID:" + _announcement_batch_read_reason(exc)}
     elif require_qmt_event_batch and include_event_facts:
@@ -5891,7 +5955,8 @@ def resolve_common_fact_cutoff(
                 "reason": _announcement_batch_read_reason(exc),
             }
     historical_selection = next(iter(historical_selections), None)
-    exact_event_selection = signed_live_selection or historical_selection
+    exact_event_selection = signed_selection or historical_selection
+    signed_live_selection = signed_selection if isinstance(signed_selection, _SignedLiveEventSelection) else None
     scan_event = include_event_facts and exact_event_selection is None
     event_filter = ""
     query_params: dict[str, Any] = {
@@ -6300,7 +6365,9 @@ def resolve_common_fact_cutoff(
             )
         if event_selection is not None:
             event_cutoff = source_cutoffs["event"] if _dataset_cutoffs else fact_cutoff
-            capture_historical_selection(HistoricalEventRead(event_selection, event_cutoff))
+            capture_historical_selection(HistoricalEventRead(
+                event_selection, event_cutoff, signed_historical_bindings,
+            ))
     return result
 
 
@@ -6935,8 +7002,54 @@ def load_finance_history_facts(
     )
 
 
+def _read_signed_historical_event_bindings(
+    engine: Engine, selection: HistoricalAnnouncementSelection,
+) -> Mapping[str, tuple[Mapping[str, str], ...]]:
+    from server.common.qmt_announcement_pit import (
+        LIVE_ANNOUNCEMENT_BATCH_VALIDATION_BUDGET_SECONDS, VALIDATION_READ_BATCH_SIZE,
+        _live_announcement_read_hint, _live_announcement_reply_budget,
+    )
+
+    by_id = {row["coverage_id"]: (code, row) for code, (row, _) in selection.members.items()}
+    if len(by_id) != len(selection.members):
+        raise ValueError("historical announcement bound coverage identity is duplicated")
+    deadline = monotonic() + LIVE_ANNOUNCEMENT_BATCH_VALIDATION_BUDGET_SECONDS
+    result = {}
+    with engine.connect() as connection:
+        mysql = connection.dialect.name == "mysql"
+        ids = sorted(by_id)
+        for offset in range(0, len(ids), VALIDATION_READ_BATCH_SIZE):
+            selected_ids = ids[offset:offset + VALIDATION_READ_BATCH_SIZE]
+            stage = f"signed-historical-bindings:{offset}"
+            hint = _live_announcement_read_hint(mysql=mysql, deadline=deadline, stage=stage)
+            statement = text(
+                f"SELECT {hint}coverage_id, JSON_EXTRACT(payload_json, '$.fact_bindings') AS bindings "
+                f"FROM {SOURCE_COVERAGE_TABLE} WHERE coverage_id IN :ids"
+            ).bindparams(bindparam("ids", expanding=True))
+            with _live_announcement_reply_budget(connection, deadline=deadline, stage=stage):
+                rows = connection.execute(statement, {"ids": selected_ids}).mappings().all()
+            if len(rows) != len(selected_ids) or {row["coverage_id"] for row in rows} != set(selected_ids):
+                raise ValueError("historical announcement bound coverage is unavailable")
+            for row in rows:
+                code, expected = by_id[row["coverage_id"]]
+                bindings = json.loads(row["bindings"])
+                if (
+                    not isinstance(bindings, list) or len(bindings) != expected["result_count"]
+                    or any(not isinstance(item, dict) or set(item) != {"revision_id", "content_hash"}
+                           or any(not isinstance(value, str) or not _HASH_RE.fullmatch(value)
+                                  for value in item.values())
+                           for item in bindings)
+                    or canonical_hash({"schema": "probiga.pit-event-fact-set.v1", "bindings": bindings})
+                    != expected["fact_set_hash"]
+                ):
+                    raise ValueError("historical announcement bound fact set differs")
+                result[code] = tuple(MappingProxyType(item) for item in bindings)
+    return MappingProxyType(result)
+
+
 def _query_signed_bound_event_revisions(
-    engine: Engine, selection: _SignedLiveEventSelection,
+    engine: Engine, selection: _SignedLiveEventSelection | HistoricalAnnouncementSelection,
+    bindings_by_code: Mapping[str, tuple[Mapping[str, str], ...]],
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
     """Resolve only identities committed to the exact signed coverage receipt."""
     from server.common.qmt_announcement_pit import (
@@ -6945,7 +7058,7 @@ def _query_signed_bound_event_revisions(
 
     deadline = monotonic() + LIVE_ANNOUNCEMENT_BATCH_VALIDATION_BUDGET_SECONDS
     expected = {}
-    for code, bindings in selection.bindings.items():
+    for code, bindings in bindings_by_code.items():
         for binding in bindings:
             revision_id = binding["revision_id"]
             if revision_id in expected:
@@ -7098,9 +7211,12 @@ def load_event_facts(
                 status=PIT_DATA_BLOCKED,
             )
     bound_ids = {}
+    signed_bindings = historical_selection.signed_historical_bindings if historical_selection is not None else None
+    if isinstance(selection, _SignedLiveEventSelection):
+        signed_bindings = selection.bindings
     try:
-        if isinstance(selection, _SignedLiveEventSelection):
-            rows, bound_ids = _query_signed_bound_event_revisions(engine, selection)
+        if signed_bindings is not None:
+            rows, bound_ids = _query_signed_bound_event_revisions(engine, selection, signed_bindings)
         else:
             rows = _query_revisions(
                 engine, table_name=EVENT_REVISION_TABLE, codes=normalized_codes,
@@ -7202,7 +7318,7 @@ def load_event_facts(
                     fact_cutoff_at=fact_cutoff,
                     decision_at=decision,
                 )
-                if isinstance(selection, _SignedLiveEventSelection) and (
+                if signed_bindings is not None and (
                     selected is None or selected["revision_id"] != bound_ids.get(identity)
                 ):
                     blocked_reasons.append("PIT_EVENT_BOUND_REVISION_NOT_ELIGIBLE")

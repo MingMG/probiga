@@ -1579,6 +1579,79 @@ def test_daily_result_exposes_upstream_data_block_without_empty_pool(
     assert result["data"]["acceptance"]["accepted"] is False
 
 
+def test_archived_daily_result_prefers_sealed_block_over_stale_analysis_progress(monkeypatch):
+    from server.common import daily_delivery_control as control
+
+    selected = date(2026, 11, 11)
+    latest = date(2026, 11, 12)
+    day = selected.isoformat()
+    engine = create_engine("sqlite://")
+    control.privileged_migrate_daily_delivery_schema(engine)
+    with engine.begin() as conn:
+        conn.exec_driver_sql("""
+            CREATE TABLE st_recommended_run_history (
+                id INTEGER PRIMARY KEY, run_uid TEXT, trade_date TEXT, status TEXT,
+                progress_percent INTEGER, message TEXT, error TEXT, started_at TEXT,
+                finished_at TEXT, duration_seconds INTEGER, updated_at TEXT
+            )
+        """)
+        conn.execute(text("""
+            INSERT INTO st_recommended_run_history
+                (run_uid, trade_date, status, progress_percent, message, started_at)
+            VALUES (:stale_run, :day, 'running', 90, 'stale progress', :started_at),
+                   (:live_run, :latest, 'running', 20, 'live progress', :live_started_at)
+        """), {
+            "stale_run": "a" * 32, "day": day, "started_at": f"{day} 22:30:00",
+            "live_run": "b" * 32, "latest": latest.isoformat(),
+            "live_started_at": f"{latest.isoformat()} 22:30:00",
+        })
+
+    stage = {
+        "trade_date": day,
+        "release_id": "c" * 40,
+        "strategy_release_id": "d" * 64,
+        "stage_name": "analysis_fast",
+        "lease_owner": "linux",
+    }
+    control.start_daily_stage_attempt(engine, scheduler_run_uid="a" * 32, **stage)
+    with engine.begin() as conn:
+        session = control.ensure_daily_delivery_session(
+            conn, trade_date=day, release_id=stage["release_id"],
+            strategy_release_id=stage["strategy_release_id"],
+        )
+        control.finish_daily_stage_attempt(conn, scheduler_run_uid="a" * 32, status="failed")
+        control.persist_terminal_delivery_receipt(conn, receipt=control.build_terminal_delivery_receipt(
+            session=session, scheduler_run_uid="a" * 32, stage_name="analysis_fast",
+            status="BLOCKED", strategy_release_id=stage["strategy_release_id"],
+            error_code="ANALYSIS_PUBLICATION_FAILED", retryable=True,
+        ))
+
+    class Repository:
+        pass
+
+    Repository.engine = engine
+    monkeypatch.setattr(trading_v3, "_repo", Repository)
+    monkeypatch.setattr(trading_v3, "canonical_governance_decision", lambda *_a, **_k: None)
+    monkeypatch.setattr(trading_v3, "authoritative_closed_trade_date", lambda _engine: latest)
+    monkeypatch.setattr(trading_v3, "_daily_real_trading_safety", lambda *_a: _verified_daily_real_trading_safety())
+    _patch_daily_release_identity(monkeypatch, execution_session_date=latest)
+    trading_v3._DAILY_RESULT_CACHE.clear()
+
+    result = trading_v3.daily_result(selected, archive=True, force=True)["data"]
+
+    assert result["delivery_status"] == "DATA_BLOCKED"
+    assert result["reason_code"] == "ANALYSIS_PUBLICATION_FAILED"
+    assert result["context"]["blocking_stage"] == "analysis_fast"
+    assert result["stock_pool"]["pool_readable"] is False
+    assert result["acceptance"]["accepted"] is False
+    assert "archive" not in result
+    assert trading_v3.daily_result(latest, archive=True, force=True)["data"]["delivery_status"] == "LOADING"
+
+    control.start_daily_stage_attempt(engine, scheduler_run_uid="e" * 32, **stage)
+
+    assert trading_v3.daily_result(selected, archive=True, force=True)["data"]["delivery_status"] == "LOADING"
+
+
 def test_daily_result_never_promotes_native_v3_run_to_canonical(monkeypatch):
     selected = date(2026, 9, 1)
 

@@ -290,6 +290,42 @@ class FrozenInitialAnnouncement:
     score_binding: Mapping[str, object]
 
 
+def signed_initial_announcement_window_matches(
+    receipt: Mapping[str, Any], target: date,
+) -> bool:
+    """Check the source window without confusing its cutoff with availability."""
+    from server.common.qmt_announcement_pit import (
+        CNINFO_ANNOUNCEMENT_SOURCE,
+        QMT_ANNOUNCEMENT_SCHEDULER_RECOVERY_ORIGIN,
+    )
+
+    cutoff = _datetime_value(receipt.get("fact_cutoff_at"))
+    if (
+        cutoff is None or cutoff.date() != target
+        or receipt.get("window_start") != (target - timedelta(days=30)).isoformat()
+        or receipt.get("window_end") != target.isoformat()
+        or not receipt.get("catalog_batch_id")
+        or any(SHA64_RE.fullmatch(str(receipt.get(key) or "")) is None for key in (
+            "catalog_manifest_hash", "catalog_member_set_hash",
+        ))
+    ):
+        return False
+    mode = receipt.get("mode")
+    if not mode:
+        return True
+    provenance = receipt.get("reconstruction_provenance")
+    return (
+        mode in ("HISTORICAL_RECONSTRUCTION", "HISTORICAL_RECONSTRUCTION_EXISTING")
+        and receipt.get("trade_date") == target.isoformat()
+        and receipt.get("source") == CNINFO_ANNOUNCEMENT_SOURCE
+        and receipt.get("execution_origin") == QMT_ANNOUNCEMENT_SCHEDULER_RECOVERY_ORIGIN
+        and isinstance(provenance, Mapping)
+        and provenance.get("execution_origin") == QMT_ANNOUNCEMENT_SCHEDULER_RECOVERY_ORIGIN
+        and cutoff.time() == time.max
+        and _datetime_value(receipt.get("source_query_cutoff_at")) == cutoff
+    )
+
+
 def _read_signed_announcement_completion(
     engine, *, target: str, decision_at: datetime, batch: Mapping[str, Any] | None,
 ) -> FrozenInitialAnnouncement | None:
@@ -354,14 +390,7 @@ def _read_signed_announcement_completion(
                 item.get("window_end") != target or validate_task_result(item, 0) != "complete"
                 or fact_cutoff is None or received is None or finished is None
                 or not fact_cutoff <= received <= finished <= decision_at
-                or (batch is None and (
-                    item.get("mode") or fact_cutoff.date() != session
-                    or item.get("window_start") != (session - timedelta(days=30)).isoformat()
-                    or not item.get("catalog_batch_id")
-                    or any(SHA64_RE.fullmatch(str(item.get(key) or "")) is None for key in (
-                        "catalog_manifest_hash", "catalog_member_set_hash",
-                    ))
-                ))
+                or (batch is None and not signed_initial_announcement_window_matches(item, session))
                 or (batch is not None and (
                     item.get("source") != batch["source"]
                     or item.get("batch_root_hash") != batch["batch_root_hash"]
@@ -371,6 +400,19 @@ def _read_signed_announcement_completion(
                 ))
             ):
                 raise ValueError("nightly announcement completion differs")
+            if batch is None and item.get("mode"):
+                validation_uid = str(attempt["scheduler_run_uid"])
+                validation_build = checkpoint["build_sha"]
+                provenance = item["reconstruction_provenance"]
+                if (
+                    item.get("validation_run_uid") != validation_uid
+                    or item.get("validation_build_sha") != validation_build
+                    or (item["mode"] == "HISTORICAL_RECONSTRUCTION" and (
+                        provenance.get("scheduler_run_uid") != validation_uid
+                        or provenance.get("build_sha") != validation_build
+                    ))
+                ):
+                    raise ValueError("historical announcement scheduler identity differs")
         except (TypeError, ValueError) as exc:
             if batch is None:
                 continue
@@ -410,7 +452,7 @@ def load_signed_announcement_source(
 def select_frozen_initial_announcement_source(
     engine, *, trade_date: str, decision_at: datetime,
 ) -> FrozenInitialAnnouncement | None:
-    """Choose the latest original nightly batch certified by the input cutoff."""
+    """Choose the latest signed batch available by the actual initial cutoff."""
     return _read_signed_announcement_completion(
         engine, target=_normalized_trade_date(trade_date), decision_at=decision_at, batch=None,
     )

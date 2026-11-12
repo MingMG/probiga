@@ -196,3 +196,183 @@ def test_late_cutoff_reads_the_bound_durable_event_batch(tmp_path):
     assert facts.status_for(code) == pit_facts.PIT_AVAILABLE
     assert {item["event_key"] for item in facts.facts[code]} == {"qmt:A-000001"}
     engine.dispose()
+
+@pytest.mark.parametrize("mismatch_run", [False, True], ids=["signed", "wrong-scheduler-run"])
+def test_signed_cninfo_reconstruction_is_usable_only_after_actual_completion(
+    pool_calendar, tmp_path, monkeypatch, mismatch_run,
+):
+    from server.common.announcement_provider import (
+        CninfoMarketAnnouncementProvider,
+        ProviderBackedAnnouncementAdapter,
+    )
+    from server.common.qmt_announcement_pit import (
+        HistoricalReconstructionContext,
+        QMT_ANNOUNCEMENT_SCHEDULER_RECOVERY_ORIGIN,
+        synchronize_historical_cninfo_announcements,
+        validate_task_result,
+    )
+    from tests.test_announcement_provider_fallback import _Client, _historical_authority_v3, _master, _row_on_date
+    from tests.test_qmt_announcement_pit import _catalog, _install_catalog
+
+    engine = pool_calendar
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "development")
+    pit_facts.ensure_pit_fact_schema(engine)
+    target = date.fromisoformat(TARGET)
+    start = target - timedelta(days=30)
+    catalog = _install_catalog(
+        engine, _catalog(("000001", "000001.SZ"), ("600519", "600519.SH")),
+        captured_at=f"{TARGET} 15:30:00",
+    )
+    started = datetime(2026, 11, 11, 0, 20)
+    received = started + timedelta(seconds=20)
+    finished = received + timedelta(seconds=5, microseconds=250_000)
+    source_cutoff = datetime.combine(target, datetime.max.time())
+    producer_uid = "1" * 32
+    signed_uid = "2" * 32 if mismatch_run else producer_uid
+    stage = "qmt_announcement_pit"
+    monkeypatch.setattr(control, "_control_now", lambda: started)
+    control.start_daily_stage_attempt(
+        engine, scheduler_run_uid=signed_uid, stage_name=stage, trade_date=TARGET,
+        release_id=BUILD_SHA, strategy_release_id=STRATEGY_RELEASE_ID, lease_owner="windows-fixture",
+    )
+
+    master = _master(*catalog.codes)
+    client = _Client(
+        masters=[master, master],
+        rows_by_code={"000001": [_row_on_date("000001", 0, target)], "600519": []},
+    )
+    provider = CninfoMarketAnnouncementProvider(
+        client=client, minimum_request_interval=0, now_fn=lambda: started + timedelta(seconds=10),
+    )
+    from time import monotonic
+
+    # The provider's deadline normally uses the real wall clock. Preserve a
+    # bounded request budget while the fixture supplies historical timestamps.
+    monkeypatch.setattr(
+        ProviderBackedAnnouncementAdapter, "bind_capture_deadline",
+        lambda adapter, **_: setattr(adapter, "_deadline_monotonic", monotonic() + 30),
+    )
+    times = iter((started, received))
+    batch = synchronize_historical_cninfo_announcements(
+        engine,
+        adapter=ProviderBackedAnnouncementAdapter(provider, workers=1),
+        checkpoint_root=tmp_path,
+        catalog=catalog,
+        context=HistoricalReconstructionContext(
+            target_trade_date=target, source_query_cutoff_at=source_cutoff,
+            reconstruction_started_at=started, scheduler_run_uid=producer_uid, build_sha=BUILD_SHA,
+            authority=_historical_authority_v3(catalog, target),
+            execution_origin=QMT_ANNOUNCEMENT_SCHEDULER_RECOVERY_ORIGIN,
+        ),
+        now_fn=lambda: next(times, received + timedelta(seconds=1)),
+        batch_size=2,
+    )
+    assert validate_task_result(batch, 0) == "complete"
+    assert batch["mode"] == "HISTORICAL_RECONSTRUCTION"
+    assert batch["coverage_count"] == 2 and batch["event_count"] == batch["empty_stock_count"] == 1
+    assert datetime.fromisoformat(batch["fact_cutoff_at"]) == source_cutoff
+    assert datetime.fromisoformat(batch["received_at"]) == received
+
+    replay = json.dumps(batch)
+    digest = hashlib.sha256(replay.encode()).hexdigest()
+    evidence = {
+        "schema": control.SCHEDULER_VALIDATION_EVIDENCE_SCHEMA,
+        "run_uid": signed_uid, "task_type": stage, "build_sha": BUILD_SHA,
+        "status": "success", "exit_code": 0, "validation_checked": True, "validation_ok": True,
+        "replay_output": replay, "replay_output_sha256": digest,
+        "input_receipt_root_sha256": digest, "target_trade_date": TARGET,
+    }
+    with engine.begin() as connection:
+        control.finish_daily_stage_attempt(
+            connection, scheduler_run_uid=signed_uid, status="success", input_root_sha256=digest,
+            checkpoint={**evidence, "evidence_sha256": control.canonical_sha256(evidence)}, now=finished,
+        )
+
+    def select(at):
+        return control.select_frozen_initial_announcement_source(engine, trade_date=TARGET, decision_at=at)
+
+    assert select(SCHEDULED) is None
+    assert select(received) is None
+    assert select(finished.replace(microsecond=0)) is None
+    cutoff = finished.replace(microsecond=0) + timedelta(seconds=1)
+    signed = select(cutoff)
+    if mismatch_run:
+        assert signed is None
+        return
+    assert signed is not None
+    assert signed.receipt["batch_id"] == batch["batch_id"]
+    assert signed.score_binding["scheduler_run_uid"] == producer_uid
+    assert signed.score_binding["received_at"] == received.isoformat(timespec="microseconds")
+    assert signed.score_binding["finished_at"] == finished.isoformat(timespec="microseconds")
+
+    selection_scope = dict(codes=list(catalog.codes), data_date=target, window_start=start, window_end=target)
+    with pytest.raises(ValueError, match="completion scope differs"):
+        pit_facts._load_certified_initial_event_selection(
+            engine, signed, decision=finished.replace(microsecond=0), **selection_scope,
+        )
+    # Another provider observation can contain a distinct event within the
+    # original date window. It is visible by the later scoring decision, but
+    # did not belong to the completed announcement batch selected for scoring.
+    for code in catalog.codes:
+        pit_facts.append_event_revision(
+            engine,
+            {"stock_code": code, "event_key": f"cninfo:unrelated-{code}",
+             "event_date": TARGET, "published_at": f"{TARGET} 20:00:00", "title": "Unrelated observation"},
+            known_at=cutoff, received_at=cutoff, source=batch["source"], batch_id="other-cninfo-batch",
+        )
+
+    selected = pit_facts._load_certified_initial_event_selection(engine, signed, decision=cutoff, **selection_scope)
+    assert selected.batch["batch_root_hash"] == batch["batch_root_hash"]
+    bad_receipt = control.FrozenInitialAnnouncement(
+        {**signed.receipt, "batch_root_hash": "9" * 64}, signed.score_binding,
+    )
+    with pytest.raises(ValueError, match="durable batch differs"):
+        pit_facts._load_certified_initial_event_selection(engine, bad_receipt, decision=cutoff, **selection_scope)
+    for code in catalog.codes:
+        pit_facts.append_source_coverage(
+            engine, fact_kind="finance", stock_code=code, window_start="1900-01-01", window_end=target,
+            known_at=source_cutoff, covered_through_at=source_cutoff, watermark_kind="CAPTURED_AT",
+            watermark_evidence={"provider": "test.finance"}, source_rows=[], fact_bindings=[],
+            source="test.finance", batch_id="finance-fixture",
+        )
+    event_reads = []
+    resolved = pit_facts.resolve_strategy_fact_cutoffs(
+        engine, codes=catalog.codes, decision_at=cutoff, finance_start_date="1900-01-01",
+        finance_end_date=target, event_start_date=start, event_end_date=target, require_qmt_event_batch=True,
+        required_initial_announcement=signed, capture_historical_selection=event_reads.append,
+    )
+    assert resolved["status"] == pit_facts.PIT_AVAILABLE, resolved.get("reason")
+    assert resolved["qmt_event_batch"]["batch_root_hash"] == batch["batch_root_hash"]
+    assert len(event_reads) == 1
+    facts = pit_facts.load_event_facts(
+        engine, codes=catalog.codes, decision_at=cutoff, fact_cutoff_at=resolved["source_cutoff_at"]["event"],
+        start_date=start, end_date=target, require_qmt_complete_batch=True,
+        historical_selection=event_reads[0],
+    )
+    assert facts.status_for("000001") == facts.status_for("600519") == pit_facts.PIT_AVAILABLE
+    assert len(facts.facts["000001"]) == 1 and facts.facts["600519"] == []
+    assert facts.facts["000001"][0]["event_key"] == f"cninfo:event-000001-{target:%Y%m%d}-000"
+    assert facts.coverage_by_code["600519"]["coverage_batch_id"] == batch["batch_id"]
+
+    fixture = decode_score_snapshot(scored_publication([
+        {"stock_code": code,
+         "event_revision_ids": [item["event_revision_id"] for item in facts.facts[code]],
+         "event_content_hashes": [item["event_content_hash"] for item in facts.facts[code]]}
+        for code in catalog.codes
+    ], trade_date=TARGET)["score_snapshot"])
+    core = {
+        "kline": {"stage": "qmt_stock_daily_canonical", "dataset_id": "daily", "root": "1" * 64},
+        "turnover": {"stage": "target_turnover_snapshot", "dataset_id": "turnover", "root": "2" * 64},
+        "financial": {"stage": "stock_finance", "dataset_id": "finance", "root": "3" * 64},
+        "announcement": {"stage": stage, "dataset_id": producer_uid,
+                         "root": signed.score_binding["evidence_sha256"], "input_root": batch["batch_root_hash"]},
+    }
+    score = build_score_snapshot(
+        trade_date=TARGET, decision_at=cutoff, run_uid="3" * 32, build_sha=BUILD_SHA,
+        analysis_rows=fixture["analysis_rows"],
+        scored_rows=[{**row, "flow_input_decision_at": cutoff.isoformat()} for row in fixture["scored_rows"]],
+        frozen_announcement_source=signed.score_binding, frozen_core_inputs=core,
+    )
+    decoded = decode_score_snapshot(score, trade_date=TARGET)
+    assert decoded["frozen_announcement_source"] == signed.score_binding
+    assert decoded["input_decision_at"] == cutoff.isoformat()
