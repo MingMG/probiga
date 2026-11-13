@@ -20,6 +20,46 @@ EXECUTION = "2026-11-11"
 SCHEDULED = datetime(2026, 11, 10, 22, 20)
 
 
+@pytest.mark.parametrize("change,accepted", [("clock", True), ("title", False), ("url", False), ("two_seconds", False)])
+def test_signed_cninfo_accepts_only_unchanged_disclosure_with_source_clock_correction(change, accepted):
+    engine = _engine()
+    pit_facts.ensure_pit_fact_schema(engine)
+    cutoff = datetime.fromisoformat(TARGET + "T23:59:59.999999")
+    received = cutoff + timedelta(hours=3)
+    previous_time = datetime.fromisoformat(TARGET + "T19:26:27")
+    current_time = previous_time - timedelta(seconds=2 if change == "two_seconds" else 1)
+    event_id, code = "1225667697", "301678"
+    source = pit_facts.CNINFO_EVENT_SOURCE
+    for number, (published, known) in enumerate(((previous_time, previous_time + timedelta(minutes=1)),
+                                                 (current_time, received)), start=1):
+        title = "Changed title" if number == 2 and change == "title" else "Original title"
+        url_date = "2026-11-09" if number == 2 and change == "url" else TARGET
+        stamp = published.isoformat(timespec="microseconds")
+        raw_hash = str(number) * 64
+        payload = {
+            "stock_code": code, "event_date": TARGET, "event_key": f"cninfo:{event_id}",
+            "published_at": stamp, "source_published_text": TARGET, "source_event_id": event_id,
+            "title": title, "source_row_hash": raw_hash,
+            "source_fields": {
+                "announcementTime": round(published.replace(tzinfo=PRODUCTION_TIMEZONE).timestamp() * 1000),
+                "announcement_id": event_id, "provider": source, "stock_code": code, "title": title,
+                "detail_url": f"https://static.cninfo.com.cn/finalpage/{url_date}/{event_id}.PDF",
+                "published_at": stamp, "source_row_hash": raw_hash,
+            },
+        }
+        pit_facts.append_event_revision(engine, payload, known_at=known, source=source, batch_id="fixture")
+    with engine.connect() as connection:
+        rows = [dict(row) for row in connection.execute(text(
+            "SELECT * FROM st_pit_event_revision ORDER BY revision_no"
+        )).mappings()]
+    args = dict(fact_kind="event", fact_cutoff_at=cutoff, decision_at=received)
+    selected, reason = pit_facts._latest_revision_for_fact_cutoff(rows, **args, signed_event_received_at=received)
+    assert selected["revision_id"] == rows[int(accepted)]["revision_id"]
+    assert reason == ("" if accepted else "PIT_EVENT_REVISION_PUBLICATION_NOT_ADVANCED")
+    unsigned, _ = pit_facts._latest_revision_for_fact_cutoff(rows, **args)
+    assert unsigned["revision_id"] == rows[0]["revision_id"]
+
+
 @pytest.fixture
 def pool_calendar():
     engine = _engine()

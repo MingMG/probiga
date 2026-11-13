@@ -2491,6 +2491,49 @@ def _validate_chain(rows: list[dict[str, Any]], fact_kind: str) -> None:
         previous_known = known
 
 
+def _signed_cninfo_clock_correction(
+    previous: Mapping[str, Any], current: Mapping[str, Any],
+    *, received: datetime | None, decision: datetime,
+) -> bool:
+    if (
+        received is None or not _row_datetime(current["known_at"]) <= received <= decision
+        or previous.get("source") != CNINFO_EVENT_SOURCE or current.get("source") != CNINFO_EVENT_SOURCE
+        or previous.get("publication_time_status") != TIME_VERIFIED or previous.get("published_at") is None
+    ):
+        return False
+    before, after = (_row_datetime(item["published_at"]) for item in (previous, current))
+    if before.date() != after.date() or not timedelta(0) < before - after <= timedelta(seconds=1):
+        return False
+    old, new = (_parse_payload(item) for item in (previous, current))
+    event_id = str(new.get("source_event_id") or "")
+    if not re.fullmatch(r"\d{6,20}", event_id) or new.get("event_key") != f"cninfo:{event_id}":
+        return False
+    ignore = {"published_at", "source_row_hash", "source_fields"}
+    if {k: v for k, v in old.items() if k not in ignore} != {k: v for k, v in new.items() if k not in ignore}:
+        return False
+    time_fields = {"announcementTime", "published_at", "source_row_hash"}
+    retained = []
+    for payload, published in ((old, before), (new, after)):
+        fields = payload.get("source_fields")
+        if not isinstance(fields, dict):
+            return False
+        raw_time = fields.get("announcementTime")
+        url = str(fields.get("detail_url") or "")
+        if (
+            type(raw_time) is not int
+            or raw_time != round(published.replace(tzinfo=SHANGHAI).timestamp() * 1000)
+            or fields.get("provider") != CNINFO_EVENT_SOURCE or fields.get("announcement_id") != event_id
+            or not re.fullmatch(r"https://static\.cninfo\.com\.cn/finalpage/\d{4}-\d{2}-\d{2}/" + event_id + r"\.pdf", url, re.IGNORECASE)
+            or not _HASH_RE.fullmatch(str(payload.get("source_row_hash") or ""))
+            or fields.get("source_row_hash") != payload.get("source_row_hash")
+            or _row_datetime(payload.get("published_at")) != published
+            or _row_datetime(fields.get("published_at")) != published
+        ):
+            return False
+        retained.append({k: v for k, v in fields.items() if k not in time_fields})
+    return retained[0] == retained[1]
+
+
 def _latest_revision_for_fact_cutoff(
     rows: list[dict[str, Any]],
     *,
@@ -2526,6 +2569,13 @@ def _latest_revision_for_fact_cutoff(
                 and known > fact_cutoff_at
                 and previous_publication is not None
                 and published <= previous_publication
+                and not (
+                    fact_kind == "event" and signed_event_received_at is not None
+                    and eligible is rows[index - 1]
+                    and _signed_cninfo_clock_correction(
+                        rows[index - 1], row, received=signed_event_received_at, decision=decision_at,
+                    )
+                )
             ):
                 # Changed content reusing the original publication timestamp is
                 # not a historically published amendment.  Keep the prior
