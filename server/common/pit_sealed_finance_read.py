@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import date, datetime
+import json
 from time import monotonic
 from typing import TYPE_CHECKING, Any, Callable, Iterable
 
@@ -97,10 +98,31 @@ def load_sealed_finance_facts(
         by_coverage_id = {str(member["coverage_id"]): code for code, member in members.items()}
         if len(by_coverage_id) != len(members) or any(not pit._HASH_RE.fullmatch(key) for key in by_coverage_id):
             raise ValueError("PIT_SEALED_FINANCE_COVERAGE_IDS_DIFFER")
+        special_ids = {
+            coverage_id for coverage_id, code in by_coverage_id.items()
+            if members[code]["coverage_status"] != "COMPLETE" or members[code].get("legal_no_data_binding")
+        }
         coverage_rows = read_payloads(
             connection, table=pit.SOURCE_COVERAGE_TABLE, id_column="coverage_id",
-            keys=set(by_coverage_id), stage="finance-sealed-coverage",
+            keys=special_ids, stage="finance-sealed-special-coverage",
         )
+        ordinary_ids = sorted(by_coverage_id.keys() - special_ids)
+        for offset in range(0, len(ordinary_ids), 15):
+            ids = ordinary_ids[offset:offset + 15]
+            rows = read_rows(
+                connection,
+                "coverage_id,scope_hash,stock_code,fact_kind,source,coverage_status,result_count,"
+                "known_at,received_at,covered_through_at,source_response_hash,fact_set_hash,"
+                "watermark_hash,revision_no,supersedes_coverage_id,coverage_fingerprint_hash,"
+                "JSON_EXTRACT(payload_json, '$.fact_bindings') AS bindings",
+                pit.SOURCE_COVERAGE_TABLE,
+                "coverage_id IN :keys AND known_at<=:cutoff AND received_at<=:cutoff",
+                {"keys": ids, "cutoff": fact_cutoff},
+                stage=f"finance-sealed-coverage-bindings:{offset}", index="PRIMARY",
+            )
+            if len(rows) != len(ids) or {row["coverage_id"] for row in rows} != set(ids):
+                raise ValueError("PIT_SEALED_FINANCE_COVERAGE_MEMBERSHIP_DIFFERS")
+            coverage_rows.update({row["coverage_id"]: row for row in rows})
         predecessor_ids = {
             str(row["supersedes_coverage_id"]) for row in coverage_rows.values()
             if row["supersedes_coverage_id"]
@@ -113,7 +135,7 @@ def load_sealed_finance_facts(
             {"keys": sorted(predecessor_ids)}, stage="finance-sealed-coverage-links", index="PRIMARY",
         ) if predecessor_ids else []
         predecessor_by_id = {row["coverage_id"]: row for row in predecessors}
-        bindings: dict[str, tuple[str, str, str]] = {}
+        bound_reports: dict[str, tuple[str, str]] = {}
         for coverage_id, row in coverage_rows.items():
             code = by_coverage_id[coverage_id]
             member = members[code]
@@ -129,12 +151,27 @@ def load_sealed_finance_facts(
 
             previous_id = row["supersedes_coverage_id"]
             parent = predecessor_by_id.get(previous_id)
-            if int(row["revision_no"]) > 1 and (
+            revision_no = int(row["revision_no"])
+            known = pit._row_datetime(row["known_at"])
+            if (
+                revision_no < 1
+                or (revision_no == 1 and previous_id is not None)
+                or pit._row_datetime(row["received_at"]) > known
+                or pit._row_datetime(row["covered_through_at"]) > known
+                or not pit._HASH_RE.fullmatch(str(row["coverage_fingerprint_hash"]))
+                or coverage_id != pit.canonical_hash({
+                    "schema": "probiga.pit-source-coverage-id.v1", "scope_hash": row["scope_hash"],
+                    "coverage_fingerprint_hash": row["coverage_fingerprint_hash"],
+                })
+            ):
+                raise ValueError(f"PIT_SEALED_FINANCE_COVERAGE_LINK_DIFFERS:{code}")
+            if revision_no > 1 and (
                 not parent
                 or parent["scope_hash"] != row["scope_hash"]
-                or int(parent["revision_no"]) != int(row["revision_no"]) - 1
+                or int(parent["revision_no"]) != revision_no - 1
                 or parent["coverage_status"] not in {"COMPLETE", pit.FINANCE_EXPECTED_UNAVAILABLE_STATUS}
                 or not pit._HASH_RE.fullmatch(str(parent["coverage_fingerprint_hash"]))
+                or pit._row_datetime(parent["known_at"]) > known
                 or pit._row_datetime(parent["received_at"]) > pit._row_datetime(parent["known_at"])
                 or pit._row_datetime(parent["covered_through_at"]) > pit._row_datetime(parent["known_at"])
                 or previous_id != pit.canonical_hash({
@@ -143,14 +180,35 @@ def load_sealed_finance_facts(
                 })
             ):
                 raise ValueError(f"PIT_SEALED_FINANCE_COVERAGE_LINK_DIFFERS:{code}")
+            statuses[code] = pit.PIT_AVAILABLE
+            if coverage_id not in special_ids:
+                if row["source"] not in pit.AUTHORITATIVE_FINANCE_SOURCES:
+                    raise ValueError(f"PIT_SEALED_FINANCE_COVERAGE_DISPOSITION_DIFFERS:{code}")
+                bindings = json.loads(row["bindings"] or "null")
+                if (
+                    not isinstance(bindings, list)
+                    or not bindings
+                    or len(bindings) != int(row["result_count"])
+                    or any(not isinstance(item, dict) or set(item) != {"revision_id", "content_hash"}
+                           or any(not isinstance(value, str) or not pit._HASH_RE.fullmatch(value)
+                                  for value in item.values()) for item in bindings)
+                    or pit.canonical_hash({"schema": "probiga.pit-finance-fact-set.v1", "bindings": bindings})
+                    != member["fact_set_hash"]
+                ):
+                    raise ValueError(f"PIT_SEALED_FINANCE_FACT_SET_DIFFERS:{code}")
+                for binding in bindings:
+                    revision_id = binding["revision_id"]
+                    if revision_id in bound_reports:
+                        raise ValueError(f"PIT_SEALED_FINANCE_REVISION_BINDING_DIFFERS:{code}")
+                    bound_reports[revision_id] = (code, binding["content_hash"])
+                continue
             pit._validate_coverage_chain(
-                [row], first_revision=int(row["revision_no"]),
+                [row], first_revision=revision_no,
                 previous_id=parent["coverage_id"] if parent else None,
                 previous_known=pit._row_datetime(parent["known_at"]) if parent else None,
             )
             payload = pit._parse_payload(row)
             receipt = pit._empty_coverage_receipt(row, fact_cutoff_at=fact_cutoff, decision_at=decision)
-            statuses[code] = pit.PIT_AVAILABLE
             if row["coverage_status"] == pit.FINANCE_EXPECTED_UNAVAILABLE_STATUS:
                 evidence = payload["official_evidence"]
                 if (
@@ -176,49 +234,67 @@ def load_sealed_finance_facts(
                 coverage[code] = {**receipt, **member["legal_no_data_binding"]}
                 reasons[code] = "PIT_FINANCE_AUTHORITATIVE_EMPTY"
                 continue
-            if row["source"] not in pit.AUTHORITATIVE_FINANCE_SOURCES or not source_rows:
-                raise ValueError(f"PIT_SEALED_FINANCE_COVERAGE_DISPOSITION_DIFFERS:{code}")
-            _, prefix = pit._finance_strategy_prefix_binding(source_rows)
-            if prefix != member["strategy_prefix_binding"]:
-                raise ValueError(f"PIT_SEALED_FINANCE_PREFIX_DIFFERS:{code}")
-            reports = [
-                (pit._date_value(source["report_date"], required=True), source)
-                for source in source_rows
-            ]
-            eligible = [(report, source) for report, source in reports if report <= target]
-            if not eligible or any(str(source["stock_code"]).zfill(6) != code for source in source_rows):
-                raise ValueError(f"PIT_SEALED_FINANCE_REPORT_SCOPE_DIFFERS:{code}")
-            latest = max(report for report, _ in eligible)
-            binding_by_content = defaultdict(list)
-            for binding in payload["fact_bindings"]:
-                binding_by_content[binding["content_hash"]].append(binding["revision_id"])
-            for report, source in eligible:
-                if report != latest:
-                    continue
-                content = pit.canonical_hash({"schema": "probiga.pit-finance-payload.v1", "payload": source})
-                revision_ids = binding_by_content[content]
-                identity = pit.canonical_hash({"schema": "probiga.pit-finance-identity.v1", "stock_code": code,
-                    "report_date": report.isoformat(), "report_type": str(source.get("report_type") or "").strip()[:64]})
-                if len(revision_ids) != 1 or identity in bindings:
-                    raise ValueError(f"PIT_SEALED_FINANCE_REVISION_BINDING_DIFFERS:{code}")
-                bindings[identity] = (code, revision_ids[0], content)
+            raise ValueError(f"PIT_SEALED_FINANCE_COVERAGE_DISPOSITION_DIFFERS:{code}")
 
-        if not bindings:
+        if not bound_reports:
             return
-        chain_inventory = read_rows(
-            connection, "revision_id,identity_hash,revision_no", pit.FINANCE_REVISION_TABLE,
-            "identity_hash IN :keys AND known_at<=:cutoff AND received_at<=:cutoff",
-            {"keys": sorted(bindings), "cutoff": fact_cutoff}, stage="finance-sealed-revision-links",
-        )
-        bound_revision_numbers = {
-            row["identity_hash"]: int(row["revision_no"]) for row in chain_inventory
-            if row["revision_id"] == bindings[row["identity_hash"]][1]
-        }
-        if bound_revision_numbers.keys() != bindings.keys():
+        report_dates = {}
+        codes_by_report = defaultdict(list)
+        for code in sorted({code for code, _ in bound_reports.values()}):
+            latest = pit._date_value(members[code]["strategy_prefix_binding"].get("latest_report_date"), required=True)
+            if latest > target:
+                raise ValueError(f"PIT_SEALED_FINANCE_REPORT_SCOPE_DIFFERS:{code}")
+            report_dates[code] = latest
+            codes_by_report[latest].append(code)
+        # This index starts with the exact issuer/report pair. The same narrow
+        # inventory supplies predecessor IDs for each chosen report identity.
+        chain_inventory = []
+        metadata_limit = pit.FINANCE_REVISION_MYSQL_CODE_LIMIT
+        for report_date, report_codes in sorted(codes_by_report.items()):
+            for offset in range(0, len(report_codes), metadata_limit):
+                codes_for_query = report_codes[offset:offset + metadata_limit]
+                metadata = read_rows(
+                    connection, "revision_id,identity_hash,stock_code,report_date,report_type,content_hash,revision_no",
+                    pit.FINANCE_REVISION_TABLE,
+                    "stock_code IN :keys AND report_date=:report AND known_at<=:cutoff AND received_at<=:cutoff",
+                    {"keys": codes_for_query, "report": report_date, "cutoff": fact_cutoff},
+                    stage=f"finance-sealed-report-metadata:{report_date}:{offset}", index="idx_pit_finance_decision",
+                )
+                if any(
+                    row["stock_code"] not in codes_for_query
+                    or pit._date_value(row["report_date"], required=True) != report_date
+                    for row in metadata
+                ):
+                    raise ValueError("PIT_SEALED_FINANCE_REPORT_MEMBERSHIP_DIFFERS")
+                chain_inventory.extend(metadata)
+        if len(chain_inventory) != len({row["revision_id"] for row in chain_inventory}):
+            raise ValueError("PIT_SEALED_FINANCE_REPORT_MEMBERSHIP_DIFFERS")
+        selected_bindings: dict[str, tuple[str, str, str]] = {}
+        bound_revision_numbers = {}
+        for row in chain_inventory:
+            revision_id = row["revision_id"]
+            if revision_id not in bound_reports:
+                continue
+            code, content = bound_reports[revision_id]
+            report_date = pit._date_value(row["report_date"], required=True)
+            identity = pit.canonical_hash({
+                "schema": "probiga.pit-finance-identity.v1", "stock_code": code,
+                "report_date": report_date.isoformat(), "report_type": row["report_type"],
+            })
+            if (
+                (row["stock_code"], row["content_hash"], row["identity_hash"]) != (code, content, identity)
+                or report_date != report_dates[code]
+                or identity in selected_bindings
+            ):
+                raise ValueError(f"PIT_SEALED_FINANCE_REPORT_BINDING_DIFFERS:{code}")
+            selected_bindings[identity] = (code, revision_id, content)
+            bound_revision_numbers[identity] = int(row["revision_no"])
+        if {code for code, _, _ in selected_bindings.values()} != report_dates.keys():
             raise ValueError("PIT_SEALED_FINANCE_BOUND_REVISION_MISSING")
         revision_ids = {
             row["revision_id"] for row in chain_inventory
-            if int(row["revision_no"]) <= bound_revision_numbers[row["identity_hash"]]
+            if row["identity_hash"] in bound_revision_numbers
+            and int(row["revision_no"]) <= bound_revision_numbers[row["identity_hash"]]
         }
         revision_rows = read_payloads(
             connection, table=pit.FINANCE_REVISION_TABLE, id_column="revision_id",
@@ -228,23 +304,70 @@ def load_sealed_finance_facts(
         for row in revision_rows.values():
             chains[row["identity_hash"]].append(row)
         candidates = defaultdict(list)
-        for identity, (code, revision_id, content) in bindings.items():
+        date_only_reports = {}
+        for identity, (code, revision_id, content) in selected_bindings.items():
             chain = sorted(chains[identity], key=lambda row: int(row["revision_no"]))
             selected, reason = pit._latest_revision_for_fact_cutoff(
                 chain, fact_kind="finance", fact_cutoff_at=fact_cutoff, decision_at=decision,
             )
-            if not selected or (
-                selected["stock_code"] != code or selected["revision_id"] != revision_id
-                or selected["content_hash"] != content
+            bound = chain[-1]
+            if bound["stock_code"] != code or bound["revision_id"] != revision_id or bound["content_hash"] != content:
+                raise ValueError(f"PIT_SEALED_FINANCE_REVISION_BINDING_DIFFERS:{code}")
+            if reason == "PIT_FINANCE_PUBLICATION_DATE_MISSING" and (
+                bound["published_at"] is None and not bound["source_published_text"]
             ):
+                # The immutable payload, validated by the revision chain above,
+                # retains the vendor date when nullable enrichment masked it.
+                raw = pit._parse_payload(bound)
+                notice_date = pit._date_value(raw.get("notice_date"), required=False)
+                update_date = pit._date_value(raw.get("source_update_date"), required=False)
+                if (
+                    raw.get("published_at") in (None, "")
+                    and notice_date is not None and notice_date <= target
+                    and datetime.combine(notice_date, datetime.max.time()) <= fact_cutoff
+                    and (update_date is None or update_date <= target)
+                    and pit._row_datetime(bound["known_at"]) <= fact_cutoff
+                ):
+                    selected = bound
+                    date_only_reports[revision_id] = notice_date.isoformat()
+            if not selected or selected["revision_id"] != revision_id:
                 raise ValueError(f"PIT_SEALED_FINANCE_REVISION_DIFFERS:{code}:{reason}")
             candidates[code].append(selected)
+
+        late_date_only_ids = {
+            members[code]["coverage_id"] for code, rows in candidates.items()
+            if pit._row_datetime(members[code]["known_at"]).date() > target
+            and any(row["revision_id"] in date_only_reports for row in rows)
+        }
+        late_ids = sorted(late_date_only_ids)
+        for offset in range(0, len(late_ids), 15):
+            ids = late_ids[offset:offset + 15]
+            rows = read_rows(
+                connection, "coverage_id,JSON_EXTRACT(payload_json, '$.watermark') AS watermark",
+                pit.SOURCE_COVERAGE_TABLE, "coverage_id IN :keys",
+                {"keys": ids}, stage="finance-sealed-date-only-watermarks", index="PRIMARY",
+            )
+            if len(rows) != len(ids) or {row["coverage_id"] for row in rows} != set(ids):
+                raise ValueError("PIT_SEALED_FINANCE_WATERMARK_MEMBERSHIP_DIFFERS")
+            for row in rows:
+                code = by_coverage_id[row["coverage_id"]]
+                watermark = json.loads(row["watermark"] or "null")
+                if not isinstance(watermark, dict) or pit.canonical_hash(watermark) != members[code]["watermark_hash"]:
+                    raise ValueError(f"PIT_SEALED_FINANCE_WATERMARK_DIFFERS:{code}")
+                guard = watermark["evidence"].get("source_timestamp_guard")
+                if not isinstance(guard, dict) or guard.get("status") != "PASS" or guard.get("as_of_date") != target.isoformat():
+                    raise ValueError(f"PIT_SEALED_FINANCE_DATE_ONLY_TARGET_GUARD_DIFFERS:{code}")
+
         for code, rows in candidates.items():
             selected = max(rows, key=lambda row: (
                 pit._row_datetime(row["published_at"] or row["known_at"]),
                 pit._row_datetime(row["known_at"]), int(row["revision_no"]), row["identity_hash"],
             ))
-            facts[code] = pit._finance_feature_fact(selected, fact_cutoff=fact_cutoff, decision=decision)
+            fact = pit._finance_feature_fact(selected, fact_cutoff=fact_cutoff, decision=decision)
+            source_date = date_only_reports.get(selected["revision_id"])
+            if source_date:
+                fact.update(finance_published_at=source_date, finance_notice_date=source_date)
+            facts[code] = fact
             reasons[code] = ""
 
     for code in requested:
