@@ -18,10 +18,12 @@ import zlib
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from email.utils import parsedate_to_datetime
+from time import monotonic
 from typing import Any, Iterable, Mapping
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 
 from server.common.analysis_output_schema import (
     ANALYSIS_COLUMN_CONTRACT,
@@ -53,6 +55,8 @@ PRELIMINARY_ANALYSIS_SNAPSHOT_MAX_BYTES = 12 * 1024 * 1024
 # for the publication envelope and scheduler validation evidence.
 SCORE_SNAPSHOT_MAX_BYTES = 14 * 1024 * 1024 + 512 * 1024
 _SNAPSHOT_WIRE_MAX_BYTES = 128 * 1024 * 1024
+_ANALYSIS_READBACK_PAGE_SIZE = 200
+_ANALYSIS_READBACK_DEADLINE_SECONDS = 8 * 60
 SCORE_SNAPSHOT_SCHEMA = "probiga.analysis-score-snapshot.v1"
 TURNOVER_DIRECT_FORMULA = "EASTMONEY_PUSH2HIS_F61_PERCENT"
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -1576,6 +1580,60 @@ def build_pool_manifest(
     }
 
 
+def _read_persisted_analysis_rows(connection: Any, trade_date: str, columns: str) -> list:
+    if connection.dialect.name != "mysql":
+        return connection.execute(
+            text(f"SELECT {columns} FROM stock_analysis_result "
+                 "WHERE analysis_date=:trade_date ORDER BY stock_code"),
+            {"trade_date": trade_date},
+        ).mappings().all()
+
+    from server.common.qmt_announcement_pit import (
+        QMTAnnouncementBlocked,
+        _live_announcement_read_hint,
+        _live_announcement_reply_budget,
+    )
+
+    rows = []
+    last_code = ""
+    deadline = monotonic() + _ANALYSIS_READBACK_DEADLINE_SECONDS
+    while True:
+        stage = f"analysis-pool-readback:{last_code or 'start'}"
+        cursor_filter = "AND stock_code>:last_code " if last_code else ""
+        try:
+            hint = _live_announcement_read_hint(mysql=True, deadline=deadline, stage=stage)
+            statement = text(
+                f"SELECT {hint}{columns} FROM stock_analysis_result "
+                f"WHERE analysis_date=:trade_date {cursor_filter}ORDER BY stock_code LIMIT :page_limit"
+            )
+            with _live_announcement_reply_budget(connection, deadline=deadline, stage=stage):
+                page = connection.execute(statement, {
+                    "trade_date": trade_date, "last_code": last_code,
+                    "page_limit": _ANALYSIS_READBACK_PAGE_SIZE + 1,
+                }).mappings().all()
+        except QMTAnnouncementBlocked as exc:
+            # Terminal replay retries database transport errors and retains the
+            # first immutable publication. A read deadline is not a rejection.
+            cause = getattr(exc.__cause__, "orig", None) or exc
+            raise OperationalError(
+                f"ANALYSIS_POOL_READBACK_FAILED: {stage}", None, cause,
+                connection_invalidated=bool(getattr(connection, "invalidated", False)),
+            ) from exc
+        # Read one extra row to detect an invalid duplicate at the cursor
+        # boundary before using a strict keyset comparison on the next page.
+        previous = last_code
+        for row in page:
+            code = row["stock_code"]
+            if not isinstance(code, str) or re.fullmatch(r"[0-9]{6}", code) is None or code <= previous:
+                raise ValueError(f"ANALYSIS_POOL_READBACK_STOCK_ORDER_DIFFERS: {stage}")
+            previous = code
+        if len(page) <= _ANALYSIS_READBACK_PAGE_SIZE:
+            rows.extend(page)
+            return rows
+        rows.extend(page[:_ANALYSIS_READBACK_PAGE_SIZE])
+        last_code = rows[-1]["stock_code"]
+
+
 def read_persisted_pool_manifest(connection: Any, trade_date: str, *, score_snapshot: Mapping[str, Any] | None = None) -> dict[str, Any]:
     analysis_columns = ", ".join(f"`{name}`" for name in CANONICAL_ANALYSIS_COLUMNS)
     recommendation_read_columns = (
@@ -1587,13 +1645,7 @@ def read_persisted_pool_manifest(connection: Any, trade_date: str, *, score_snap
     recommendation_columns = ", ".join(
         f"`{name}`" for name in recommendation_read_columns
     )
-    analysis_rows = connection.execute(
-        text(
-            f"SELECT {analysis_columns} FROM stock_analysis_result "
-            "WHERE analysis_date=:trade_date ORDER BY stock_code"
-        ),
-        {"trade_date": trade_date},
-    ).mappings().all()
+    analysis_rows = _read_persisted_analysis_rows(connection, trade_date, analysis_columns)
     recommendation_rows = connection.execute(
         text(
             f"SELECT {recommendation_columns} FROM st_recommended_stocks "

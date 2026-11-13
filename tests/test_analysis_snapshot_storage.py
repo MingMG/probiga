@@ -5,9 +5,12 @@ import hashlib
 import json
 from pathlib import Path
 from random import Random
+from types import SimpleNamespace
 import zlib
 
 import pytest
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import OperationalError
 
 from server.common import analysis_pool_receipt as receipts
 from server.common.daily_delivery_control import (
@@ -134,3 +137,65 @@ def test_formal_score_above_preliminary_cap_fits_complete_checkpoint(historical)
         decoder("score")({**envelope, "payload_base64": encoded[:-4]})
     with pytest.raises(ValueError, match="ANALYSIS_SCORE_SNAPSHOT_SIZE_INVALID"):
         decoder("score")({**envelope, "payload_base64": "A" * (receipts.SCORE_SNAPSHOT_MAX_BYTES + 4)})
+
+
+def test_mysql_analysis_manifest_pages_preserve_exact_rows_and_hash(monkeypatch):
+    engine = create_engine("sqlite://")
+    analysis_columns = ", ".join(f"`{name}` TEXT" for name in receipts.CANONICAL_ANALYSIS_COLUMNS)
+    recommendation_columns = ", ".join(
+        f"`{name}` TEXT" for name in (
+            *receipts.CANONICAL_RECOMMENDATION_COLUMNS,
+            "recommend_status", "ordinary_buy_eligible", "publication_status",
+        )
+    )
+    target = "2026-11-12"
+    with engine.begin() as connection:
+        connection.execute(text(f"CREATE TABLE stock_analysis_result ({analysis_columns})"))
+        connection.execute(text(f"CREATE TABLE st_recommended_stocks ({recommendation_columns})"))
+        connection.execute(text("""
+            INSERT INTO stock_analysis_result (stock_code, analysis_date, model_version)
+            VALUES ('000001', :target, 'v1'), ('000002', :target, 'v1'),
+                   ('000003', :target, 'v1'), ('000004', :target, 'v1'),
+                   ('000005', :target, 'v1'), ('000006', '2026-11-11', 'v1')
+        """), {"target": target})
+
+        queries = []
+
+        def execute(statement, parameters):
+            if "stock_analysis_result" in statement.text:
+                assert "MAX_EXECUTION_TIME" in statement.text
+                queries.append((parameters["last_code"], parameters["page_limit"]))
+            return connection.execute(statement, parameters)
+
+        monkeypatch.setattr(receipts, "_ANALYSIS_READBACK_PAGE_SIZE", 2)
+        mysql = SimpleNamespace(dialect=SimpleNamespace(name="mysql"), execute=execute)
+        expected = receipts.read_persisted_pool_manifest(connection, target)
+        actual = receipts.read_persisted_pool_manifest(mysql, target)
+        assert actual == expected
+        assert actual["analysis_count"] == 5
+        assert queries == [("", 3), ("000002", 3), ("000004", 3)]
+
+        connection.execute(text("""
+            UPDATE stock_analysis_result SET model_version='changed' WHERE stock_code='000004'
+        """))
+        changed = receipts.read_persisted_pool_manifest(mysql, target)
+        assert changed["analysis_count"] == actual["analysis_count"]
+        assert changed["analysis_sha256"] != actual["analysis_sha256"]
+
+        connection.execute(text("""
+            INSERT INTO stock_analysis_result (stock_code, analysis_date)
+            VALUES ('000002', :target)
+        """), {"target": target})
+        with pytest.raises(ValueError, match="ANALYSIS_POOL_READBACK_STOCK_ORDER_DIFFERS"):
+            receipts.read_persisted_pool_manifest(mysql, target)
+
+
+def test_mysql_analysis_readback_timeout_is_retryable_transport():
+    from server.common.qmt_announcement_pit import QMTAnnouncementBlocked
+
+    def execute(_statement, _parameters):
+        raise QMTAnnouncementBlocked("QMT_ANNOUNCEMENT_LIVE_BATCH_REPLY_DEADLINE", "analysis-pool-readback:start")
+
+    mysql = SimpleNamespace(dialect=SimpleNamespace(name="mysql"), execute=execute)
+    with pytest.raises(OperationalError, match="ANALYSIS_POOL_READBACK_FAILED.*start"):
+        receipts.read_persisted_pool_manifest(mysql, "2026-11-12")
