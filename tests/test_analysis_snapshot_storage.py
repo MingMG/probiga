@@ -4,11 +4,16 @@ from copy import deepcopy
 import hashlib
 import json
 from pathlib import Path
+from random import Random
 import zlib
 
 import pytest
 
 from server.common import analysis_pool_receipt as receipts
+from server.common.daily_delivery_control import (
+    analysis_publication_reference,
+    bind_analysis_publication_checkpoint,
+)
 
 
 @pytest.fixture
@@ -96,6 +101,36 @@ def test_historical_encodings_preserve_their_original_distinct_size_domains(hist
 @pytest.mark.parametrize("kind", ["preliminary", "score"])
 def test_storage_capacity_failure_reports_sizes(historical, monkeypatch, kind):
     payload = decoder(kind)(historical[kind])
-    monkeypatch.setattr(receipts, "PRELIMINARY_ANALYSIS_SNAPSHOT_MAX_BYTES", 1)
+    limit = "SCORE_SNAPSHOT_MAX_BYTES" if kind == "score" else "PRELIMINARY_ANALYSIS_SNAPSHOT_MAX_BYTES"
+    monkeypatch.setattr(receipts, limit, 1)
     with pytest.raises(ValueError, match=r"encoded_bytes=\d+, raw_bytes=\d+, limit_bytes=1"):
         rebuild(kind, payload)
+
+
+def test_formal_score_above_preliminary_cap_fits_complete_checkpoint(historical):
+    payload = decoder("score")(historical["score"])
+    evidence = base64.b64encode(Random(20261112).randbytes(9_750_000)).decode("ascii")
+    payload["scored_rows"][0]["source_evidence"] = evidence
+    envelope = rebuild("score", payload)
+    encoded = envelope["payload_base64"]
+    assert receipts.PRELIMINARY_ANALYSIS_SNAPSHOT_MAX_BYTES < len(encoded) <= receipts.SCORE_SNAPSHOT_MAX_BYTES
+    restored = decoder("score")(envelope)
+    assert restored == payload
+    assert receipts.canonical_sha256(restored) == envelope["payload_sha256"]
+
+    publication = receipts.build_publication_receipt(
+        manifest={"schema": receipts.ANALYSIS_POOL_RECEIPT_SCHEMA, "trade_date": payload["trade_date"],
+                  "score_snapshot_sha256": envelope["payload_sha256"]},
+        run_uid=payload["run_uid"], build_sha=payload["build_sha"], publisher_task_type="analysis_fast",
+        published_at=payload["decision_at"], score_snapshot=envelope,
+    )
+    checkpoint = bind_analysis_publication_checkpoint(
+        {"replay_output": json.dumps(analysis_publication_reference(publication))}, publication,
+    )
+    assert checkpoint["publication_receipt"]["score_snapshot"] == envelope
+    assert len(json.dumps(checkpoint).encode("utf-8")) < 15 * 1024 * 1024
+
+    with pytest.raises(ValueError, match="ANALYSIS_SCORE_SNAPSHOT_INVALID"):
+        decoder("score")({**envelope, "payload_base64": encoded[:-4]})
+    with pytest.raises(ValueError, match="ANALYSIS_SCORE_SNAPSHOT_SIZE_INVALID"):
+        decoder("score")({**envelope, "payload_base64": "A" * (receipts.SCORE_SNAPSHOT_MAX_BYTES + 4)})

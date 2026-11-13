@@ -49,6 +49,9 @@ PRELIMINARY_ANALYSIS_SNAPSHOT_SCHEMA = (
 _HISTORICAL_SNAPSHOT_ENCODING = "zlib-base64-canonical-json-v1"
 PRELIMINARY_ANALYSIS_SNAPSHOT_ENCODING = SNAPSHOT_DICTIONARY_ENCODING
 PRELIMINARY_ANALYSIS_SNAPSHOT_MAX_BYTES = 12 * 1024 * 1024
+# Daily delivery caps the complete checkpoint at 15 MiB. Reserve 512 KiB
+# for the publication envelope and scheduler validation evidence.
+SCORE_SNAPSHOT_MAX_BYTES = 14 * 1024 * 1024 + 512 * 1024
 _SNAPSHOT_WIRE_MAX_BYTES = 128 * 1024 * 1024
 SCORE_SNAPSHOT_SCHEMA = "probiga.analysis-score-snapshot.v1"
 TURNOVER_DIRECT_FORMULA = "EASTMONEY_PUSH2HIS_F61_PERCENT"
@@ -383,11 +386,11 @@ def _snapshot_expand(compressed: bytes, encoding: str, *, historical_preliminary
 
 def _score_snapshot_envelope(payload: dict, raw: bytes, compressed: bytes, *, encoding: str = PRELIMINARY_ANALYSIS_SNAPSHOT_ENCODING) -> dict[str, Any]:
     encoded = base64.b64encode(compressed).decode("ascii")
-    if len(encoded) > PRELIMINARY_ANALYSIS_SNAPSHOT_MAX_BYTES:
+    if len(encoded) > SCORE_SNAPSHOT_MAX_BYTES:
         raise ValueError(
             "ANALYSIS_SCORE_SNAPSHOT_TOO_LARGE: "
             f"encoded_bytes={len(encoded)}, raw_bytes={len(raw)}, "
-            f"limit_bytes={PRELIMINARY_ANALYSIS_SNAPSHOT_MAX_BYTES}"
+            f"limit_bytes={SCORE_SNAPSHOT_MAX_BYTES}"
         )
     return {
         "schema": SCORE_SNAPSHOT_SCHEMA, "encoding": encoding,
@@ -510,7 +513,7 @@ def decode_score_snapshot(value: Mapping[str, Any], *, trade_date: str | None = 
     if not isinstance(value, Mapping) or value.get("schema") != SCORE_SNAPSHOT_SCHEMA or value.get("encoding") not in {PRELIMINARY_ANALYSIS_SNAPSHOT_ENCODING, _HISTORICAL_SNAPSHOT_ENCODING}:
         raise ValueError("ANALYSIS_SCORE_SNAPSHOT_MISSING")
     encoded = str(value.get("payload_base64") or "")
-    if not encoded or len(encoded) > PRELIMINARY_ANALYSIS_SNAPSHOT_MAX_BYTES:
+    if not encoded or len(encoded) > SCORE_SNAPSHOT_MAX_BYTES:
         raise ValueError("ANALYSIS_SCORE_SNAPSHOT_SIZE_INVALID")
     try:
         compressed = base64.b64decode(encoded, validate=True)
