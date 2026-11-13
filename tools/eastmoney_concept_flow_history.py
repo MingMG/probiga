@@ -227,8 +227,12 @@ def capture_history(primary, source_date, now):
 
 
 def content_hash(rows):
+    def stored_number(value):
+        rounded = _market_decimal(value).quantize(Decimal("0.01"))
+        # MySQL DECIMAL stores one zero value, regardless of the provider sign.
+        return format(rounded.copy_abs() if rounded.is_zero() else rounded, "f")
+
     return canonical_digest([{
         "index_code": row["index_code"], "index_name": row["index_name"],
-        **{field: format(_market_decimal(row[field]).quantize(Decimal("0.01")), "f")
-           for field in FLOW_COLUMNS},
+        **{field: stored_number(row[field]) for field in FLOW_COLUMNS},
     } for row in rows])

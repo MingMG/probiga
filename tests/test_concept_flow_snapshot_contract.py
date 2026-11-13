@@ -444,7 +444,8 @@ def test_native_history_accepts_only_authoritative_empty_and_preserves_exact_par
 
     def fetch(_self, code):
         calls.append(code)
-        rows = [f"{session},73386080,-232441344,157103376,-100645712,174031792,0.58,-1.83,1.24,-0.79,1.37,23106.04,-0.57,0,0"
+        small_rate = "-0.00" if code == "BK0000" else "-1.83"
+        rows = [f"{session},73386080,-232441344,157103376,-100645712,174031792,0.58,{small_rate},1.24,-0.79,1.37,23106.04,-0.57,0,0"
                 for session in ("2026-11-05", day, "2026-11-09") if code != "BK0100" or session != day]
         return {"rc": 0, "data": {"code": code, "market": 90, "name": f"东财{code}", "klines": rows}}
 
@@ -485,6 +486,7 @@ def test_native_history_accepts_only_authoritative_empty_and_preserves_exact_par
         assert native_flow.content_hash(rows) == proof["database_content_hash"]
         assert rows[0]["index_name"] == "东财BK0000"
         assert rows[0]["main_net_inflow"] == 73386080
+        assert str(rows[0]["sm_net_inflow_rate"]) == "0.0"
         assert rows[0]["stock_name"] == rows[0]["stock_code"] == ""
         assert connection.execute(text("SELECT COUNT(*) FROM sm_concept_capital_flow_east")).scalar_one() == 102
 
