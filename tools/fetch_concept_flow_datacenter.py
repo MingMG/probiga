@@ -5,6 +5,7 @@ push2.eastmoney.com 被服务器 IP 封了，改用 datacenter-web API。
 """
 
 import argparse
+from contextlib import nullcontext
 import hashlib
 import json
 import re
@@ -58,7 +59,8 @@ _FIELD_MAP = {
 
 
 from server.common.authoritative_market_clock import authoritative_closed_trade_date
-from server.common.batch_db import create_batch_engine, replace_table_rows
+from server.common.batch_db import create_batch_engine, replace_table_rows, write_frame
+from server.common.mysql_lock import mysql_named_lock
 from server.common.qmt_attestation_contract import canonical_digest
 from server.common.qmt_trade_calendar import (
     load_trade_calendar_receipt,
@@ -86,6 +88,8 @@ def _fetch_page(date_str: str, page: int, page_size: int = 500) -> dict | None:
             j = r.json()
             if j.get("success") and j.get("result"):
                 return j["result"]
+            if j.get("code") == 9201 and j.get("result") is None:
+                return {"data": [], "authoritative_empty": True}
             return None
         except Exception as e:
             if attempt < 2:
@@ -135,6 +139,7 @@ def _fetch_all_for_date_capture(date_str: str) -> tuple[pd.DataFrame, dict]:
             "provider_row_count": 0,
             "observed_row_count": 0,
             "pagination_complete": False,
+            "authoritative_empty": bool(result and result.get("authoritative_empty") is True),
         }
 
     all_rows = list(result["data"])
@@ -315,6 +320,18 @@ def _strict_provider_snapshot(
     )
     frame, evidence = _fetch_all_for_date_capture(source_date)
     if frame is None or frame.empty:
+        if requested_trade_date and evidence.get("authoritative_empty") is True:
+            from tools import eastmoney_concept_flow_history as history
+
+            local_now = now.astimezone(_SHANGHAI).replace(tzinfo=None) if now.tzinfo else now
+            rows, native = history.capture_history(engine, source_date, local_now)
+            if rows and native["missing_count"] <= history.MAX_MISSING_DETAILS:
+                return pd.DataFrame(rows), source_date, {"native_history": native}, calendar
+            raise RuntimeError(
+                "DATA_BLOCKED: native Eastmoney history coverage is insufficient: "
+                f"source_date={source_date}, verified={len(rows)}, "
+                f"missing={native['missing_count']}, roster={native['roster_count']}"
+            )
         raise RuntimeError(
             "DATA_BLOCKED: Eastmoney concept-flow has no rows for authoritative session "
             + source_date
@@ -352,6 +369,45 @@ def read_persisted_concept_flow_codes(
             },
         ).scalars().all()
     return [str(code or "").strip() for code in codes]
+
+
+def read_native_concept_flow(connection, *, source_date: date, expected_count: int):
+    from tools.eastmoney_concept_flow_history import FLOW_COLUMNS
+
+    columns = ", ".join(("index_code", "index_name", *FLOW_COLUMNS, "stock_code", "stock_name"))
+    return connection.execute(text(f"""
+        SELECT /*+ MAX_EXECUTION_TIME(3000) */ {columns}
+        FROM sm_concept_capital_flow_east WHERE {_DAILY_SNAPSHOT_SCOPE}
+        ORDER BY index_code LIMIT :row_limit
+    """), {"snapshot_at": f"{source_date.isoformat()} 00:00:00",
+            "row_limit": expected_count + 1}).mappings().all()
+
+
+def _concept_flow_lock(engine, source_day):
+    if engine.dialect.name == "mysql":
+        return mysql_named_lock(engine, f"probiga:east-concept-flow:{source_day}", timeout_seconds=10)
+    return nullcontext()
+
+
+def _publish_native_history(df, engine, source_day, evidence):
+    from tools.eastmoney_concept_flow_history import content_hash
+
+    codes = sorted(df["index_code"].tolist())
+    expected = content_hash(df.sort_values("index_code").to_dict("records"))
+    with engine.begin() as connection:
+        previous = read_native_concept_flow(connection, source_date=source_day, expected_count=len(codes))
+        if not previous:
+            write_frame(df, "sm_concept_capital_flow_east", connection, chunksize=500, method="multi")
+        try:
+            persisted = read_native_concept_flow(connection, source_date=source_day, expected_count=len(codes))
+            same = ([row["index_code"] for row in persisted] == codes
+                    and all(not row["stock_code"] and not row["stock_name"] for row in persisted)
+                    and content_hash(persisted) == expected)
+        except (ArithmeticError, ValueError):
+            same = False
+        if not same:
+            raise RuntimeError("DATA_BLOCKED: native history differs from existing exact-date concept flow")
+    evidence["database_content_hash"] = expected
 
 
 def fetch_concept_flow(
@@ -426,16 +482,23 @@ def fetch_concept_flow(
 
     df = df[out_cols].replace({np.nan: None, pd.NaT: None})
 
+    native = evidence.get("native_history")
     try:
-        replace_table_rows(
-            df,
-            "sm_concept_capital_flow_east",
-            engine,
-            where_sql=_DAILY_SNAPSHOT_SCOPE,
-            params={"snapshot_at": snapshot_at},
-            chunksize=500,
-            method="multi",
-        )
+        with _concept_flow_lock(engine, source_day) if strict_authority else nullcontext():
+            if native is not None:
+                _publish_native_history(df, engine, source_day, native)
+            else:
+                replace_table_rows(
+                    df,
+                    "sm_concept_capital_flow_east",
+                    engine,
+                    where_sql=_DAILY_SNAPSHOT_SCOPE,
+                    params={"snapshot_at": snapshot_at},
+                    chunksize=500,
+                    method="multi",
+                )
+    except TimeoutError as exc:
+        raise RuntimeError("DATA_BLOCKED: concept-flow publication lock unavailable") from exc
     except (SQLAlchemyError, pd.errors.DatabaseError) as exc:
         raise RuntimeError(
             "concept-flow database publication failed: "
@@ -446,7 +509,7 @@ def fetch_concept_flow(
 
     codes = sorted(df["index_code"].astype(str).tolist())
     verified_rows = len(df)
-    if strict_authority:
+    if strict_authority and native is None:
         persisted_codes = read_persisted_concept_flow_codes(
             engine,
             source_date=source_day,
@@ -457,10 +520,17 @@ def fetch_concept_flow(
                 "DATA_BLOCKED: concept-flow database verification differs from provider manifest"
             )
         verified_rows = len(persisted_codes)
+    provider = "eastmoney.datacenter-web"
+    report_name = REPORT_NAME
+    if native is not None:
+        from tools.eastmoney_concept_flow_history import PROVIDER, SOURCE_URL
+
+        provider = PROVIDER
+        report_name = SOURCE_URL
     manifest = {
         "schema": MANIFEST_SCHEMA,
-        "provider": "eastmoney.datacenter-web",
-        "report_name": REPORT_NAME,
+        "provider": provider,
+        "report_name": report_name,
         "source_date": source_date,
         "row_count": len(df),
         "verified_row_count": verified_rows,
@@ -476,7 +546,7 @@ def fetch_concept_flow(
         "provider_page_count": int(evidence.get("page_count") or 0),
         "provider_reported_row_count": int(
             evidence.get("provider_row_count") or len(df)
-        ),
+        ) if native is None else None,
         "provider_pagination_complete": (
             evidence.get("pagination_complete") is True
             if strict_authority else None
@@ -485,11 +555,13 @@ def fetch_concept_flow(
         "calendar_manifest_hash": getattr(calendar, "manifest_hash", None),
         "calendar_session_set_hash": getattr(calendar, "session_set_hash", None),
     }
+    if native is not None:
+        manifest["native_history"] = native
     return {
         "schema": RESULT_SCHEMA,
-        "status": "COMPLETE",
+        "status": "DEGRADED" if native is not None else "COMPLETE",
         "source_date": source_date,
-        "provider": "eastmoney.datacenter-web",
+        "provider": provider,
         "strict_authority": bool(strict_authority),
         "written_rows": len(df),
         "db_verified_rows": verified_rows,
@@ -533,17 +605,14 @@ def validate_task_result(
             raise ValueError(
                 "Eastmoney concept-flow receipt differs from release target expected session"
             )
+    native = manifest.get("native_history")
     if (
         int(return_code) != 0
-        or payload.get("status") != "COMPLETE"
+        or payload.get("status") != ("DEGRADED" if native is not None else "COMPLETE")
         or payload.get("strict_authority") is not True
         or manifest.get("schema") != MANIFEST_SCHEMA
         or manifest.get("strict_authority") is not True
         or payload.get("source_date") != manifest.get("source_date")
-        or manifest.get("provider_pagination_complete") is not True
-        or not re.fullmatch(
-            r"[0-9a-f]{64}", str(manifest.get("provider_code_set_hash") or "")
-        )
         or not str(manifest.get("calendar_batch_id") or "")
         or not re.fullmatch(
             r"[0-9a-f]{64}", str(manifest.get("calendar_manifest_hash") or "")
@@ -553,13 +622,60 @@ def validate_task_result(
         )
         or row_count < 100
         or int(manifest.get("code_count") or 0) != row_count
-        or int(manifest.get("provider_reported_row_count") or 0) != row_count
         or int(payload.get("written_rows") or 0) != row_count
         or int(payload.get("db_verified_rows") or 0) != row_count
         or canonical_digest(manifest) != payload.get("manifest_hash")
     ):
         raise ValueError("Eastmoney concept-flow exact result proof differs")
+    if native is not None:
+        _validate_native_history(payload, manifest, native, row_count)
+        return "degraded"
+    if (manifest.get("provider_pagination_complete") is not True
+            or not re.fullmatch(r"[0-9a-f]{64}", str(manifest.get("provider_code_set_hash") or ""))
+            or int(manifest.get("provider_reported_row_count") or 0) != row_count):
+        raise ValueError("Eastmoney concept-flow exact result proof differs")
     return "complete"
+
+
+def _validate_native_history(payload, manifest, native, row_count):
+    from tools import eastmoney_concept_flow_history as history
+
+    def hash_format(value, length=64):
+        return isinstance(value, str) and re.fullmatch(rf"[0-9a-f]{{{length}}}", value)
+
+    if not isinstance(native, dict):
+        raise ValueError("Eastmoney native history proof differs")
+    missing = native.get("missing")
+    roster = native.get("roster_receipt")
+    if (payload.get("provider") != history.PROVIDER or manifest.get("provider") != history.PROVIDER
+            or manifest.get("report_name") != history.SOURCE_URL
+            or native.get("source_url") != history.SOURCE_URL
+            or native.get("roster_source") != history.ROSTER_SOURCE
+            or native.get("available_count") != row_count
+            or not isinstance(missing, list) or len(missing) > history.MAX_MISSING_DETAILS
+            or len(missing) != native.get("missing_count")
+            or native.get("roster_count") != row_count + len(missing)
+            or native["roster_count"] > history.MAX_ROSTER_COUNT
+            or not isinstance(roster, dict) or type(roster.get("history_id")) is not int
+            or roster["history_id"] <= 0
+            or not hash_format(roster.get("run_uid"), 32) or not hash_format(roster.get("receipt_id"), 32)
+            or not hash_format(roster.get("result_hash"))
+            or native.get("name_source") not in {"exact_date_concept_names", "eastmoney_history_response"}
+            or native.get("top_stock_available") is not False
+            or any(not hash_format(native.get(field)) for field in (
+                "roster_code_set_hash", "roster_content_hash", "source_rows_hash", "database_content_hash",
+            ))):
+        raise ValueError("Eastmoney native history proof differs")
+    codes = []
+    for item in missing:
+        if (not isinstance(item, dict) or not isinstance(item.get("code"), str)
+                or not re.fullmatch(r"BK[0-9]{4,8}", item["code"])
+                or item.get("reason") not in history.MISSING_REASONS
+                or ("response_hash" in item and not hash_format(item["response_hash"]))):
+            raise ValueError("Eastmoney native history missing evidence differs")
+        codes.append(item["code"])
+    if codes != sorted(set(codes)) or native.get("missing_hash") != canonical_digest(missing):
+        raise ValueError("Eastmoney native history missing inventory differs")
 
 
 def main(argv=None) -> int:

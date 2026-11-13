@@ -750,8 +750,8 @@ def _concept_close_coverage(selected: str, now: datetime, codes: set[str], deadl
         FROM st_scheduled_task_history
         WHERE task_type='eastmoney_concept_kline' AND status IN ('success','degraded')
           AND exit_code=0 AND run_at>=:selected AND finished_at<=:now
-        ORDER BY id DESC LIMIT :limit
-    """, {"selected": selected, "now": now}, deadline=deadline, limit=6,
+        ORDER BY id DESC LIMIT :receipt_limit
+    """, {"selected": selected, "now": now, "receipt_limit": 6}, deadline=deadline, limit=6,
         stage="concept close coverage")
     from server.common.scheduler_validation import (
         _eastmoney_concept_market_output_status, _eastmoney_concept_market_payload,
@@ -772,6 +772,41 @@ def _concept_close_coverage(selected: str, now: datetime, codes: set[str], deadl
             return {"observed_count": directory["observed_count"], "eligible_count": len(codes),
                     "excluded_count": len(excluded), "reason": "NATIVE_DAILY_BAR_UNAVAILABLE"}
         return None
+    return None
+
+
+def _concept_flow_history_coverage(selected: str, now: datetime, codes: set[str], deadline: float) -> dict | None:
+    if not codes:
+        return None
+    rows = _sector_read(get_engine, """
+        SELECT /*+ MAX_EXECUTION_TIME(1000) */ output
+        FROM st_scheduled_task_history
+        WHERE task_type='eastmoney_concept_flow_snapshot' AND status IN ('success','degraded')
+          AND exit_code=0 AND run_at>=:selected AND finished_at<=:now
+          AND (output LIKE :compact_date OR output LIKE :spaced_date)
+        ORDER BY id DESC LIMIT :receipt_limit
+    """, {"selected": selected, "now": now, "receipt_limit": 12,
+          "compact_date": f'%"source_date":"{selected}"%',
+          "spaced_date": f'%"source_date": "{selected}"%'}, deadline=deadline, limit=12,
+        stage="historical concept flow coverage")
+    from server.common.scheduler_validation import _eastmoney_concept_flow_payload
+    from tools.fetch_concept_flow_datacenter import validate_task_result
+
+    for row in rows:
+        receipt = _eastmoney_concept_flow_payload(row.get("output"))
+        if not receipt or receipt.get("source_date") != selected:
+            continue
+        try:
+            if validate_task_result(dict(receipt), 0, expected_session=selected) != "degraded":
+                return None
+            manifest = receipt["manifest"]
+            if manifest["code_set_hash"] != canonical_digest(sorted(codes)):
+                return None
+            native = manifest["native_history"]
+            return {"observed_count": native["roster_count"], "eligible_count": native["available_count"],
+                    "excluded_count": native["missing_count"], "source": "eastmoney.push2his"}
+        except (KeyError, TypeError, ValueError):
+            return None
     return None
 
 
@@ -854,6 +889,16 @@ def build_sector_heatmap(day: date, *, now: datetime) -> dict:
         for metric in ("change", "five_day_return"):
             concept[metric]["coverage"] = coverage
             concept[metric]["note"] += f" · {note}"
+    flow_coverage = _concept_flow_history_coverage(selected, now, {row["code"] for row in flow_rows}, deadline)
+    if flow_coverage:
+        metric = concept["net_inflow"]
+        metric["coverage"] = flow_coverage
+        metric["note"] = (f"东财历史日资金流 · 已核验 {flow_coverage['eligible_count']}/"
+                          f"{flow_coverage['observed_count']} 个当日板块")
+        if flow_coverage["excluded_count"]:
+            metric["note"] += f"，{flow_coverage['excluded_count']} 个未返回可核验数据"
+        for row in metric["rows"]:
+            row["source"] = "东财历史日资金流"
     _concept_minute_curves(concept["change"], closes, selected, now, deadline)
     return result
 

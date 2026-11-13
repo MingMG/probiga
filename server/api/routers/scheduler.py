@@ -576,7 +576,15 @@ def run_task_now(task_id: int, trade_date: date | None = None, index_codes: str 
         exact_overview = (task_type == "market_overview_daily" and not index_codes
                           and task.get("script_path") == "tools/refresh_market_overview_daily.py"
                           and not str(task.get("script_args") or "").strip())
-        if trade_date is None or task.get("date_param") or not (exact_index or exact_overview):
+        exact_concept_flow = (
+            task_type == "eastmoney_concept_flow_snapshot" and not index_codes and not full_overview
+            and task.get("script_path") == "tools/fetch_concept_flow_datacenter.py"
+            and str(task.get("script_args") or "").split() == ["--strict-authority", "--json"]
+        )
+        if (
+            trade_date is None or task.get("date_param")
+            or not (exact_index or exact_overview or exact_concept_flow)
+        ):
             raise HTTPException(422, "该任务不支持指定的交易日和采集范围")
         target = trade_date.isoformat()
         with engine.connect() as connection:
@@ -589,7 +597,7 @@ def run_task_now(task_id: int, trade_date: date | None = None, index_codes: str 
         task["_scheduler_target_trade_date"] = target
         if exact_index:
             task["_index_repair_codes"] = tuple(codes)
-        elif not full_overview:
+        elif exact_overview and not full_overview:
             task["_limit_ladder_only"] = True
     root = Path(__file__).resolve().parents[3]
     return launch_scheduler_task(task, root=root, engine=engine)

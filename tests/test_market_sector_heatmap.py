@@ -122,6 +122,28 @@ def test_missing_or_nontrading_day_does_not_relabel_an_earlier_snapshot(heatmap_
                    for section in (payload["concept"], payload["industry"]) for metric in section.values())
 
 
+def test_historical_fund_flow_reports_verified_coverage(heatmap_db, monkeypatch):
+    with heatmap_db.begin() as connection:
+        connection.execute(text("""
+            INSERT INTO sm_concept_capital_flow_east VALUES
+                ('BK0120','历史概念名称',1,'2026-11-06 00:00:00',-120,-80,-40,'2026-11-08 08:00:00')
+        """))
+    observed = {}
+
+    def coverage(day, now, codes, deadline):
+        observed.update(day=day, codes=codes)
+        return {"observed_count": 101, "eligible_count": 100, "excluded_count": 1,
+                "source": "eastmoney.push2his"}
+
+    monkeypatch.setattr(market_home, "_concept_flow_history_coverage", coverage)
+    metric = market_home.build_sector_heatmap(date.fromisoformat(DAY), now=NOW)["concept"]["net_inflow"]
+    assert observed == {"day": DAY, "codes": {"BK0120"}}
+    assert metric["status"] == "available"
+    assert "100/101" in metric["note"] and "1 个未返回可核验数据" in metric["note"]
+    assert metric["rows"][0]["source"] == "东财历史日资金流"
+    assert metric["rows"][0]["value"] == -120
+
+
 def test_private_flow_partition_is_idempotent_and_preserves_last_valid_publication(heatmap_db):
     first = publish_industry_flow(DAY, [_flow("BK1201", "计算机", 0)])
     reused = publish_industry_flow(DAY, [{**_flow("BK1201", "计算机", 0), "etl_sync_at": "2026-11-08 08:00:00"}])

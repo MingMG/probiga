@@ -3501,6 +3501,8 @@ def scheduler_output_status(
             disposition = validate_task_result(dict(payload), int(return_code))
         except (ImportError, TypeError, ValueError, OverflowError):
             return "failed"
+        if disposition == "degraded":
+            return "degraded"
         return "success" if disposition == "complete" else "blocked"
     if task_type == "strategy_governance_daily":
         # Use the exact same completed/not-due/blocked contract as the deploy
@@ -5346,11 +5348,12 @@ def validate_scheduler_task_result(
             try:
                 from server.common.qmt_attestation_contract import canonical_digest
                 from tools.fetch_concept_flow_datacenter import (
+                    read_native_concept_flow,
                     read_persisted_concept_flow_codes,
                     validate_task_result,
                 )
 
-                if payload is None or validate_task_result(
+                disposition = validate_task_result(
                     dict(payload),
                     0,
                     expected_session=(
@@ -5358,8 +5361,9 @@ def validate_scheduler_task_result(
                         if release_target_date is not None
                         else ""
                     ),
-                ) != "complete":
-                    raise ValueError("exact COMPLETE receipt is missing")
+                ) if payload is not None else None
+                if disposition not in {"complete", "degraded"}:
+                    raise ValueError("exact concept-flow receipt is missing")
                 manifest = payload.get("manifest")
                 if not isinstance(manifest, Mapping):
                     raise ValueError("result manifest is missing")
@@ -5383,11 +5387,32 @@ def validate_scheduler_task_result(
                         "receipt/source date differs from release target"
                     )
                 expected_count = int(manifest["row_count"])
-                codes = read_persisted_concept_flow_codes(
-                    engine,
-                    source_date=source_date,
-                    expected_count=expected_count,
-                )
+                if disposition == "degraded":
+                    from tools.eastmoney_concept_flow_history import content_hash, published_roster
+
+                    native = manifest["native_history"]
+                    roster, roster_content_hash, roster_receipt = published_roster(
+                        engine, source_date.isoformat(), now, history_id=native["roster_receipt"]["history_id"],
+                    )
+                    with engine.connect() as connection:
+                        rows = read_native_concept_flow(
+                            connection, source_date=source_date, expected_count=expected_count,
+                        )
+                    codes = [row["index_code"] for row in rows]
+                    missing = {row["code"] for row in native["missing"]}
+                    if (
+                        canonical_digest(roster) != native["roster_code_set_hash"]
+                        or roster_content_hash != native["roster_content_hash"]
+                        or roster_receipt != native["roster_receipt"]
+                        or set(roster) != set(codes) | missing or set(codes) & missing
+                        or any(row["stock_code"] or row["stock_name"] for row in rows)
+                        or content_hash(rows) != native["database_content_hash"]
+                    ):
+                        raise ValueError("persisted native concept-flow evidence differs")
+                else:
+                    codes = read_persisted_concept_flow_codes(
+                        engine, source_date=source_date, expected_count=expected_count,
+                    )
                 if (
                     len(codes) != expected_count
                     or len(codes) != len(set(codes))

@@ -16,6 +16,8 @@ from server.common.scheduler_validation import (
     validate_scheduler_task_result,
 )
 from tools import fetch_concept_flow_datacenter as concept_flow
+from tools import eastmoney_concept_flow_history as native_flow
+from tools import sync_eastmoney_concept_market as concept_market
 
 
 def test_latest_snapshot_keeps_the_actual_provider_date(monkeypatch):
@@ -391,3 +393,113 @@ def test_concept_flow_cli_forwards_release_trade_date(monkeypatch, capsys):
         "trade_date": "2026-08-26",
     }
     assert json.loads(capsys.readouterr().out)["status"] == "COMPLETE"
+
+
+def test_native_history_accepts_only_authoritative_empty_and_preserves_exact_partitions(monkeypatch):
+    day = "2026-11-06"
+    closed = datetime.fromisoformat(day + "T15:40:00+08:00")
+    started = datetime.fromisoformat(day + "T18:00:00+08:00")
+    now = datetime.fromisoformat("2026-11-13T07:00:00+08:00")
+    calendar = SimpleNamespace(batch_id="qmt-calendar", manifest_hash="a" * 64, session_set_hash="b" * 64)
+    engine = create_engine("sqlite://")
+    codes = [f"BK{index:04d}" for index in range(101)]
+    items = tuple({"f2": 101.2, "f3": 1.1, "f4": 1.2, "f5": 1000, "f6": 2000,
+                   "f12": code, "f14": code, "f15": 103.0, "f16": 99.0, "f17": 100.0,
+                   "f124": int(closed.timestamp())} for code in codes)
+    provider = SimpleNamespace(fetch_directory_page=lambda page, size: {
+        "data": {"total": len(items), "diff": list(items[(page-1)*size:page*size])}
+    })
+    directory = concept_market.fetch_complete_directory(provider)
+    daily = concept_market.build_closed_daily_frame(
+        directory, target_date=day, ingested_at=started.replace(tzinfo=None)
+    )
+    kline_evidence = concept_market._dataset_evidence(daily, "kline")
+    receipt = concept_market.build_receipt(status="PASS", datasets=["kline"], started_at=started,
+        finished_at=started, requested_trade_date=day,
+        result={"datasets": ["kline"], "target_trade_date": day, "range_start": day, "range_end": day,
+                "open_date_count": 1, "open_dates_sha256": concept_market._digest([day]),
+                "directory": directory.evidence, "dataset_results": {"kline": kline_evidence},
+                "db_metrics": {"kline": {"row_count": 101, "code_count": 101, "date_count": 1}},
+                "published": True})
+    with engine.begin() as connection:
+        daily.to_sql("sm_concept_east_kline", connection, index=False)
+        connection.execute(text("""CREATE TABLE st_scheduled_task_history (
+            id INTEGER, run_uid TEXT, task_type TEXT, status TEXT, exit_code INTEGER,
+            run_at TEXT, finished_at TEXT, output TEXT)"""))
+        connection.execute(text("""INSERT INTO st_scheduled_task_history VALUES (
+            101,:run_uid,'eastmoney_concept_kline','success',0,:started,:started,:output)"""),
+            {"run_uid": "c" * 32, "started": started.isoformat(sep=" "), "output": json.dumps(receipt)})
+        connection.execute(text("""CREATE TABLE sm_concept_capital_flow_east (
+            days_type INTEGER, index_code TEXT, index_name TEXT,
+            snapshot_at TEXT, etl_sync_at DATETIME, stock_code TEXT, stock_name TEXT,
+            change_pct REAL, main_net_inflow REAL, main_net_inflow_rate REAL,
+            max_net_inflow REAL, max_net_inflow_rate REAL, lg_net_inflow REAL, lg_net_inflow_rate REAL,
+            mid_net_inflow REAL, mid_net_inflow_rate REAL, sm_net_inflow REAL, sm_net_inflow_rate REAL)"""))
+        connection.execute(text("""INSERT INTO sm_concept_capital_flow_east
+            (days_type,index_code,index_name,snapshot_at) VALUES
+            (5,'BK0001','five-day','2026-11-06 00:00:00'),
+            (1,'BK0001','another-day','2026-11-09 00:00:00')"""))
+
+    calls = []
+
+    def fetch(_self, code):
+        calls.append(code)
+        rows = [f"{session},73386080,-232441344,157103376,-100645712,174031792,0.58,-1.83,1.24,-0.79,1.37,23106.04,-0.57,0,0"
+                for session in ("2026-11-05", day, "2026-11-09") if code != "BK0100" or session != day]
+        return {"rc": 0, "data": {"code": code, "market": 90, "name": f"东财{code}", "klines": rows}}
+
+    monkeypatch.setattr(concept_flow, "create_batch_engine", lambda: engine)
+    monkeypatch.setattr(concept_flow, "_authoritative_closed_session", lambda *_a, **_kw: (day, calendar))
+    monkeypatch.setattr(native_flow, "get_kline_engine", lambda: engine)
+    monkeypatch.setattr(native_flow, "read_concept_names", lambda *_a, **_kw: [{"index_code": "BK0001", "index_name": "unproven name"}])
+    monkeypatch.setattr(native_flow._HistoryProvider, "fetch", fetch)
+    monkeypatch.setattr(concept_flow, "_fetch_page", lambda *_a: None)
+    with pytest.raises(RuntimeError, match="no rows"):
+        concept_flow.fetch_concept_flow(strict_authority=True, now=now, trade_date=day)
+    assert not calls
+
+    monkeypatch.setattr(concept_flow, "_fetch_page", lambda *_a: {"data": [], "authoritative_empty": True})
+    output = concept_flow.fetch_concept_flow(strict_authority=True, now=now, trade_date=day)
+    assert concept_flow.validate_task_result(output, 0, expected_session=day) == "degraded"
+    task = {"task_type": "eastmoney_concept_flow_snapshot", "_scheduler_target_trade_date": day}
+    assert scheduler_output_status(task, json.dumps(output), return_code=0) == "degraded"
+    verification = validate_scheduler_task_result(
+        task, engine=engine, output=json.dumps(output),
+        started_at=now.replace(tzinfo=None), now=now.replace(tzinfo=None),
+    )
+    assert verification.checked and verification.ok, verification.message
+    assert sorted(calls) == codes
+    proof = output["manifest"]["native_history"]
+    assert proof["roster_receipt"]["history_id"] == 101
+    roster = native_flow.published_roster(engine, day, now.replace(tzinfo=None), history_id=101)
+    assert roster == (codes, proof["roster_content_hash"], proof["roster_receipt"])
+    with pytest.raises(RuntimeError, match="no exact Eastmoney K-line roster receipt matches"):
+        native_flow.published_roster(engine, day, now.replace(tzinfo=None), history_id=102)
+    assert proof["roster_count"] == 101 and proof["available_count"] == 100
+    assert proof["missing"] == [{"code": "BK0100", "reason": "EXACT_FLOW_ROW_MISSING",
+                                  "response_hash": proof["missing"][0]["response_hash"]}]
+    assert proof["name_source"] == "eastmoney_history_response"
+    assert proof["top_stock_available"] is False
+    with engine.connect() as connection:
+        rows = concept_flow.read_native_concept_flow(connection, source_date=date.fromisoformat(day), expected_count=100)
+        assert native_flow.content_hash(rows) == proof["database_content_hash"]
+        assert rows[0]["index_name"] == "东财BK0000"
+        assert rows[0]["main_net_inflow"] == 73386080
+        assert rows[0]["stock_name"] == rows[0]["stock_code"] == ""
+        assert connection.execute(text("SELECT COUNT(*) FROM sm_concept_capital_flow_east")).scalar_one() == 102
+
+    assert concept_flow.fetch_concept_flow(strict_authority=True, now=now, trade_date=day)["db_verified_rows"] == 100
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE sm_concept_capital_flow_east SET main_net_inflow=9 WHERE days_type=1 AND snapshot_at=:day AND index_code='BK0000'"), {"day": day + " 00:00:00"})
+    with pytest.raises(RuntimeError, match="differs from existing exact-date"):
+        concept_flow.fetch_concept_flow(strict_authority=True, now=now, trade_date=day)
+    with engine.connect() as connection:
+        rows = concept_flow.read_native_concept_flow(connection, source_date=date.fromisoformat(day), expected_count=100)
+        assert rows[0]["main_net_inflow"] == 9
+
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE sm_concept_east_kline SET close=123 WHERE index_code='BK0000'"))
+    calls.clear()
+    with pytest.raises(RuntimeError, match="no exact Eastmoney K-line roster receipt matches"):
+        concept_flow.fetch_concept_flow(strict_authority=True, now=now, trade_date=day)
+    assert not calls
