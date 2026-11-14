@@ -8,6 +8,7 @@ from __future__ import annotations
 import datetime as dt
 from decimal import Decimal
 from pathlib import Path
+import json
 
 import numpy as np
 import pytest
@@ -28,9 +29,13 @@ from integrations.qmt.datadir import (
 )
 from integrations.qmt.datadir_import import (
     SOURCE,
+    Universe,
+    UniverseMember,
     existing_sources,
     plan,
 )
+from server.common.qmt_datadir_result import validate_task_result
+from tools import import_qmt_datadir_daily as daily_import
 
 SESSION = dt.date(2026, 10, 14)
 GRID = frozenset(
@@ -60,6 +65,44 @@ def _write(path: Path, records) -> Path:
     body = np.array(records, dtype="<u4").tobytes()
     path.write_bytes(DAT_HEADER + body)
     return path
+
+
+def test_stale_whole_market_dat_blocks_daily_import_before_listing_lookup(tmp_path, monkeypatch, capsys):
+    target = SESSION + dt.timedelta(days=1)
+    members = {
+        f"{code}.SH": UniverseMember(f"{code}.SH", "SH", code)
+        for code in (f"{600000 + i:06d}" for i in range(41))
+    }
+    universe = Universe(members, {member.qmt_code: (SESSION.isoformat(), None)
+                                  for member in members.values()})
+    for member in members.values():
+        _write(tmp_path / "SH" / DAILY_PERIOD / f"{member.code}.DAT",
+               [_record("15:00", 9600, 9700, 9500, 9650, 100, 96000, 9590)])
+
+    build = "a" * 40
+    monkeypatch.setenv("PROBIGA_SCHEDULER_BUILD_SHA", build)
+    monkeypatch.setattr(daily_import, "load_project_env", lambda: None)
+    monkeypatch.setattr(daily_import, "create_batch_engine", object)
+    monkeypatch.setattr(daily_import, "_sessions", lambda *args: [target])
+    monkeypatch.setattr(daily_import, "load_universe", lambda *args, **kwargs: universe)
+    monkeypatch.setattr(daily_import, "_short_names", lambda engine: {})
+    monkeypatch.setattr(daily_import, "_existing_sources", lambda *args: [])
+    monkeypatch.setattr(daily_import, "_reusable_partition", lambda *args, **kwargs: None)
+    monkeypatch.setattr(daily_import, "_coverage_manifest",
+                        lambda *args, **kwargs: pytest.fail("entered per-stock coverage with stale DAT files"))
+    monkeypatch.setattr(daily_import, "_publish",
+                        lambda *args, **kwargs: pytest.fail("published a missing partition"))
+
+    rc = daily_import.main(["--start", target.isoformat(), "--end", target.isoformat(),
+                            "--datadir-root", str(tmp_path), "--apply", "--json"])
+    out = capsys.readouterr()
+    receipt = json.loads(out.out)
+    assert receipt["target_trade_date"] == target.isoformat()
+    assert receipt["reason_code"] == (
+        f"QMT_NATIVE_DAILY_SOURCE_EMPTY target={target} expected_codes=41 exact_codes=0"
+    )
+    assert validate_task_result("qmt_stock_daily_canonical", receipt, return_code=rc,
+                                expected_build_sha=build) == "blocked"
 
 
 def test_read_dat_rejects_a_foreign_header(tmp_path):

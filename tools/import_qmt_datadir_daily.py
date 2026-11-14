@@ -52,6 +52,7 @@ from server.common.qmt_trade_calendar import (  # noqa: E402
 )
 from server.common.qmt_datadir_result import (  # noqa: E402
     build_result,
+    build_unavailable_result,
     load_receipt,
     partition_from_receipt,
     persisted_fingerprint,
@@ -801,7 +802,7 @@ def main(argv: list[str] | None = None) -> int:
     universe = load_universe(engine, start=start, end=end)
     short_names = _short_names(engine)
     results = []
-    failures = 0
+    unavailable = {}
     for position, session in enumerate(sessions, 1):
         if repair:
             print(f"Daily repair {position}/{len(sessions)} {session}: validating DAT and authority", file=sys.stderr)
@@ -839,6 +840,17 @@ def main(argv: list[str] | None = None) -> int:
                                       timeout_seconds=min(75, budget))
             harvested = _with_public_bars(harvested, public, session=session)
         eligible = universe.eligible_codes(session)
+        if not harvested["codes"]:
+            # A closed session with no matching bars cannot be published. In
+            # particular, an empty or stale DAT cache is not per-stock IPO or
+            # suspension evidence and must not launch those lookups.
+            reason = (
+                "QMT_NATIVE_DAILY_SOURCE_EMPTY "
+                f"target={session.isoformat()} expected_codes={eligible} exact_codes=0"
+            )
+            unavailable[session] = reason
+            results.append({"session": session.isoformat(), "status": "BLOCKED", "reason": reason})
+            continue
         run_id = new_run_id()
         coverage_manifest = None
         if exact_repair or (historical_documents is None and sources == [SOURCE]):
@@ -900,15 +912,26 @@ def main(argv: list[str] | None = None) -> int:
         "source": SOURCE,
         "datadir_root": str(root),
         "applied": bool(args.apply),
-        "failures": failures,
+        "failures": len(unavailable),
         "results": results,
     }
     if not args.apply or repair:
         print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
-        return 0 if not failures else 1
+        return 1 if unavailable else 0
+    if unavailable:
+        for reason in unavailable.values():
+            print(reason, file=sys.stderr)
+        task_result = build_unavailable_result(
+            dataset=DATASET,
+            sessions=[session.isoformat() for session in unavailable],
+            reason=next(iter(unavailable.values())),
+            build_sha=_build_sha(),
+        )
+        print(json.dumps(task_result, ensure_ascii=False, separators=(",", ":")))
+        return 3
     task_result = _task_result(engine, sessions=sessions)
     print(json.dumps(task_result, ensure_ascii=False, separators=(",", ":")))
-    return 0 if not failures else 1
+    return 0
 
 
 if __name__ == "__main__":
