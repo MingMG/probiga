@@ -21,7 +21,7 @@ TRADED = "600000"
 def authorities():
     codes = sorted((*SUSPENDED, IPO, TRADED))
     catalog = SimpleNamespace(batch_id="catalog", manifest_hash="a" * 64,
-                              member_set_hash="b" * 64, eligible_codes=lambda day: codes)
+                              member_set_hash="b" * 64, eligible_codes=lambda day: codes, members=())
     calendar = SimpleNamespace(batch_id="calendar", manifest_hash="c" * 64, session_set_hash="d" * 64,
                                sessions_between=lambda start, end: [DAY])
     return catalog, calendar
@@ -89,11 +89,10 @@ def test_after_midnight_envelope_reuses_target_day_native_suspensions():
 
 
 @pytest.mark.parametrize("observed,generated", [
-    ("2026-11-03 01:50:00", "2026-11-03 01:50:26"),
     ("2026-11-02 20:54:09", "2026-11-02 20:54:08"),
     ("2026-11-02 20:54:09", "2026-11-03 01:51:01"),
 ])
-def test_rewritten_envelope_rejects_wrong_day_acquisition_or_invalid_time_order(observed, generated):
+def test_rewritten_envelope_rejects_invalid_time_order(observed, generated):
     quotes = snapshot()
     quotes["generated_at"] = generated
     quotes["quotes"]["000831.SZ"]["_probiga_observed_at"] = observed
@@ -136,6 +135,35 @@ def database(monkeypatch):
     return engine
 
 
+def test_recovered_suspension_is_visible_only_after_real_native_observation(monkeypatch):
+    engine = database(monkeypatch)
+    catalog, calendar = authorities()
+    quotes = snapshot()
+    recovered_at = datetime(2026, 11, 3, 1, 51)
+    quotes["generated_at"] = "2026-11-03 01:50:26"
+    for tick in quotes["quotes"].values():
+        tick["time"] = int(datetime(2026, 11, 2, 15, 0, 2, tzinfo=coverage.CHINA).timestamp() * 1000)
+        tick["_probiga_observed_at"] = "2026-11-03 01:50:00"
+    claim = dict(catalog=catalog, calendar=calendar, day=DAY, rows=[bar()],
+                 run_id="recovered-qdd-day", listings=listing(), snapshot=quotes)
+    with pytest.raises(ValueError, match="suspension"):
+        coverage.build_manifest(**claim, captured_at=CUTOFF)
+    proof = coverage.build_manifest(**claim, captured_at=recovered_at)
+    with engine.begin() as connection:
+        connection.exec_driver_sql("DELETE FROM qmt_history_coverage_entity")
+        connection.exec_driver_sql("DELETE FROM qmt_history_coverage_manifest")
+        coverage.insert_manifest(connection, proof)
+    assert coverage.load_daily_manifest(engine, DAY, decision_known_at=CUTOFF) is None
+    assert coverage.load_daily_manifest(engine, DAY, decision_known_at=recovered_at) == proof
+
+    quotes["quotes"]["000831.SZ"]["time"] = int(
+        datetime(2026, 11, 2, 14, 59, 59, tzinfo=coverage.CHINA).timestamp() * 1000
+    )
+    with pytest.raises(ValueError, match="suspension"):
+        coverage.build_manifest(**claim, captured_at=recovered_at)
+    engine.dispose()
+
+
 def test_real_database_replay_rejects_mutated_bars_and_entity_partitions(monkeypatch):
     engine = database(monkeypatch)
     assert coverage.load_daily_manifest(engine, DAY, decision_known_at=CUTOFF)["status"] == "EXACT"
@@ -156,6 +184,30 @@ def historical_document(source_text, *, date="2026-11-02", identifier=1234):
             "observed_at": "2026-11-07T10:00:00+08:00", "source_text": source_text,
             "source_text_sha256": hashlib.sha256(source_text.encode()).hexdigest(),
             "official_document_sha256": "a" * 64}
+
+
+def test_first_exact_daily_manifest_covers_catalog_expiry_using_official_delisting():
+    code = "002731"
+    catalog, calendar = authorities()
+    catalog.eligible_codes = lambda day: sorted([TRADED, code])
+    catalog.members = ({"stock_code": code, "expire_date": DAY},)
+    source_text = "\u8bc1\u5238\u4ee3\u7801\uff1a002731\u3002\u516c\u53f8\u80a1\u7968\u7ec8\u6b62\u4e0a\u5e02\u66a8\u6458\u724c\u3002\u6458\u724c\u65e5\u671f\uff1a2026\u5e7411\u67082\u65e5\u3002"
+    document = historical_document(source_text)
+    document.update(
+        announcement_id="1234",
+        announcement_time_ms=int(datetime(2026, 11, 2, 9, tzinfo=coverage.CHINA).timestamp() * 1000),
+        source_row_sha256="c" * 64,
+    )
+    proof = coverage.build_manifest(catalog=catalog, calendar=calendar, day=DAY, rows=[bar()],
+                                    run_id="qdd-recovered", captured_at=datetime(2026, 11, 7, 10, 1),
+                                    daily_delisting_documents={code: [document]})
+    assert [(row["stock_code"], row["classification"]) for row in proof["entities"]] == [
+        (code, "DELISTED"), (TRADED, "TRADED"),
+    ]
+    assert coverage.validate_manifest(proof, catalog=catalog, calendar=calendar) == proof
+    catalog.members = ({"stock_code": code, "expire_date": "2026-11-03"},)
+    with pytest.raises(ValueError, match="catalog expiry"):
+        coverage.validate_manifest(proof, catalog=catalog, calendar=calendar)
 
 
 def test_historical_october_daily_append_replays_only_after_durable_completion(monkeypatch):
@@ -713,7 +765,7 @@ def test_post_close_daily_import_accepts_official_full_day_halt_when_native_stat
             scheduler_runtime, "_verified_linux_activation_build",
             lambda *args, **kwargs: (None, "linux_active_lease_unavailable"),
         )
-        with pytest.raises(RuntimeError, match="official daily suspension Linux reader is unavailable"):
+        with pytest.raises(RuntimeError, match="daily no-bar evidence Linux reader is unavailable"):
             importer._publish(
                 engine, session=date.fromisoformat(day), rows=harvested["rows"], covered_codes={TRADED},
                 short_names={}, run_id="qdd-exact", source_root=None, content_sha256="b" * 64,

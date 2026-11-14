@@ -43,6 +43,7 @@ from server.common.historical_daily_bar_evidence import (  # noqa: E402
 from server.common.mysql_lock import STOCK_KLINE_FREEZE_LOCK_NAME, mysql_named_lock  # noqa: E402
 from server.common.official_historical_daily_evidence import (  # noqa: E402
     DAILY_SUSPENSION_KIND,
+    load_daily_delisting_documents,
     load_daily_suspension_documents,
     load_historical_documents,
 )
@@ -253,6 +254,7 @@ def _coverage_manifest(engine, *, session, harvested, run_id, historical_documen
         )
     snapshot = {}
     unresolved = []
+    delisting_documents = {}
     if missing:
         from integrations.bigqmt.spool import read_snapshot
         try:
@@ -268,6 +270,13 @@ def _coverage_manifest(engine, *, session, harvested, run_id, historical_documen
                 suspension_evidence(snapshot, code, day, cutoff)
             except (ValueError, KeyError, TypeError, OverflowError):
                 unresolved.append(code)
+    if unresolved:
+        expirations = sorted(set(unresolved).intersection(
+            str(member["stock_code"]) for member in catalog.members if member.get("expire_date") == day
+        ))
+        if expirations:
+            delisting_documents = load_daily_delisting_documents(expirations, target_date=day)
+            unresolved = sorted(set(unresolved) - set(delisting_documents))
     listings = {}
     if unresolved:
         listings = retained_listing_evidence(
@@ -284,7 +293,7 @@ def _coverage_manifest(engine, *, session, harvested, run_id, historical_documen
     cutoff = dt.datetime.now(CST).replace(tzinfo=None, microsecond=0)
     return build_manifest(catalog=catalog, calendar=calendar, day=day, rows=rows,
                           run_id=run_id, captured_at=cutoff, snapshot=snapshot, listings=listings,
-                          daily_suspension_documents=suspensions)
+                          daily_suspension_documents=suspensions, daily_delisting_documents=delisting_documents)
 
 
 @contextmanager
@@ -499,6 +508,13 @@ def _publish(
     with _daily_transaction(engine) as connection:
         if os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip().lower() == "production" and any(
             entity["evidence"].get("kind") == DAILY_SUSPENSION_KIND
+            or (
+                not historical and (
+                    entity["classification"] == "DELISTED"
+                    or str((entity["evidence"].get("native_tick") or {}).get("_probiga_observed_at") or "")[:10]
+                    > session.isoformat()
+                )
+            )
             for entity in coverage_manifest["entities"]
         ):
             # The older DAT-only writer can start during Windows handoff.
@@ -512,7 +528,7 @@ def _publish(
                 expected_poll_seconds=int(get_scheduler_runtime_config()["poll_seconds"]),
             )
             if linux_sha is None:
-                raise RuntimeError(f"official daily suspension Linux reader is unavailable: {reason}")
+                raise RuntimeError(f"daily no-bar evidence Linux reader is unavailable: {reason}")
         previous = None
         if repair:
             missing, corrections, previous = _historical_append_plan(connection, day=session.isoformat(), proof=coverage_manifest)
