@@ -235,6 +235,15 @@ def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: s
 
     args = script_args_raw.split() if script_args_raw else []
     args.extend(_date_param_args(date_param_raw))
+    if task_type == "daily_pool":
+        if normalized_path != "tools/run_daily_pool.py" or not scheduler_target_bound:
+            raise ValueError("daily research pool requires an exact closed session")
+        configured_dates = _option_values(args, "--date")
+        if configured_dates and configured_dates != [today]:
+            raise ValueError("daily research pool date differs from scheduler target")
+        if not configured_dates:
+            args.extend(["--date", today])
+        return args
     if task_type == "north_flow_daily":
         if normalized_path != "tools/sync_north_flow_daily.py" or not scheduler_target_bound:
             raise ValueError("Northbound disclosure task requires an exact closed session")
