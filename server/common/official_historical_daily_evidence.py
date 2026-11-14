@@ -145,6 +145,16 @@ def official_daily_suspension_evidence(documents: list[dict], *, stock_code: str
     """Bind a definitive full-day notice to the issuer, session and observed availability."""
     ordered, texts = _validated_documents(documents, stock_code=stock_code, cutoff=cutoff)
     target = date.fromisoformat(day)
+    _validate_indexed_documents(ordered, texts, target)
+    if any(target in _dates(_SAME_DAY_RESUME, body) for _, body in texts):
+        raise ValueError("official evidence shows trading resumed on target session")
+    if not any(target in _dates(_FULL_DAY_SUSPEND, body) for _, body in texts):
+        raise ValueError("official full-day suspension is unproven for target session")
+    return {"kind": DAILY_SUSPENSION_KIND, "schema": DAILY_SUSPENSION_SCHEMA,
+            "stock_code": stock_code, "target_date": day, "documents": ordered}
+
+
+def _validate_indexed_documents(ordered, texts, target: date) -> None:
     for document, (published, _) in zip(ordered, texts):
         announcement_id = document.get("announcement_id")
         source_ms = document.get("announcement_time_ms")
@@ -152,16 +162,22 @@ def official_daily_suspension_evidence(documents: list[dict], *, stock_code: str
                 or document["source_url"].rsplit("/", 1)[-1].split(".")[0] != announcement_id
                 or type(source_ms) is not int or not 10**12 <= source_ms < 10**13
                 or not _HASH.fullmatch(str(document.get("source_row_sha256") or ""))):
-            raise ValueError("official daily suspension publication identity differs")
+            raise ValueError("official daily notice publication identity differs")
         source_at = datetime.fromtimestamp(source_ms / 1000, CHINA)
         if (source_at.date() != published or published > target
                 or source_at > datetime.fromisoformat(document["observed_at"])):
-            raise ValueError("official daily suspension publication time differs")
-    if any(target in _dates(_SAME_DAY_RESUME, body) for _, body in texts):
-        raise ValueError("official evidence shows trading resumed on target session")
-    if not any(target in _dates(_FULL_DAY_SUSPEND, body) for _, body in texts):
-        raise ValueError("official full-day suspension is unproven for target session")
-    return {"kind": DAILY_SUSPENSION_KIND, "schema": DAILY_SUSPENSION_SCHEMA,
+            raise ValueError("official daily notice publication time differs")
+
+
+def official_daily_delisting_evidence(documents: list[dict], *, stock_code: str, day: str,
+                                      cutoff: datetime) -> dict:
+    """Prove a delisting effective on the exact session from indexed issuer PDFs."""
+    ordered, texts = _validated_documents(documents, stock_code=stock_code, cutoff=cutoff)
+    target = date.fromisoformat(day)
+    _validate_indexed_documents(ordered, texts, target)
+    if _classification(texts, target) != "DELISTED":
+        raise ValueError("official delisting is unproven for target session")
+    return {"kind": "OFFICIAL_HISTORICAL_LIFECYCLE", "schema": SCHEMA,
             "stock_code": stock_code, "target_date": day, "documents": ordered}
 
 
@@ -196,7 +212,8 @@ def _validate_locators(locators: dict[str, list[str]]) -> None:
             _document_date(url)
 
 
-def _read_daily_suspension_documents(codes: list[str], target_date: str, timeout_seconds: float) -> dict:
+def _read_daily_documents(codes: list[str], target_date: str, timeout_seconds: float,
+                          *, delisting: bool = False) -> dict:
     from server.common.announcement_provider import CninfoMarketAnnouncementProvider
 
     target = date.fromisoformat(target_date)
@@ -206,14 +223,17 @@ def _read_daily_suspension_documents(codes: list[str], target_date: str, timeout
     result = {}
     provider = CninfoMarketAnnouncementProvider()
     try:
-        provider.bind_capture_deadline(remaining_seconds=_remaining(deadline, "suspension_inventory"))
+        provider.bind_capture_deadline(remaining_seconds=_remaining(deadline, "daily_notice_inventory"))
         with requests.Session() as session:
             session.headers.update({"User-Agent": "Mozilla/5.0", "Referer": BASE + "/"})
             for code in codes:
                 market = "SH" if code.startswith("6") else "BJ" if code.startswith(("4", "8", "9")) else "SZ"
                 inventory = provider.fetch(stock_code=code, qmt_code=f"{code}.{market}",
                                            requested_start_time=start, requested_end_time=end)
-                matches = [row for row in inventory.rows if any(term in row["title"] for term in ("停牌", "复牌"))]
+                if delisting:
+                    matches = [row for row in inventory.rows if "终止上市" in row["title"] and "摘牌" in row["title"]]
+                else:
+                    matches = [row for row in inventory.rows if "停牌" in row["title"] or "复牌" in row["title"]]
                 if not 1 <= len(matches) <= 4:
                     continue
                 documents = []
@@ -265,7 +285,7 @@ def load_historical_documents(locators: dict[str, list[str]], *, timeout_seconds
 def _validate_daily_codes(codes: list[str], target_date: str) -> None:
     date.fromisoformat(target_date)
     if not 1 <= len(codes) <= 20 or any(not re.fullmatch(r"[0-9]{6}", code) for code in codes):
-        raise ValueError("official daily suspension evidence request bounds differ")
+        raise ValueError("official daily notice evidence request bounds differ")
 
 
 def load_daily_suspension_documents(codes: list[str], *, target_date: str, timeout_seconds: float = 20) -> dict:
@@ -278,6 +298,16 @@ def load_daily_suspension_documents(codes: list[str], *, target_date: str, timeo
     return result
 
 
+def load_daily_delisting_documents(codes: list[str], *, target_date: str, timeout_seconds: float = 20) -> dict:
+    """Read indexed issuer notices only for unresolved catalog expirations."""
+    requested = sorted(set(codes))
+    _validate_daily_codes(requested, target_date)
+    result = _document_worker({"codes": requested, "target_date": target_date, "delisting": True}, timeout_seconds)
+    if set(result) - set(requested):
+        raise ValueError("official daily delisting worker inventory differs")
+    return result
+
+
 if __name__ == "__main__":
     sys.stdout.reconfigure(encoding="utf-8")
     args = json.load(sys.stdin)
@@ -286,5 +316,5 @@ if __name__ == "__main__":
         result = _read_documents(**args)
     else:
         _validate_daily_codes(args["codes"], args["target_date"])
-        result = _read_daily_suspension_documents(**args)
+        result = _read_daily_documents(**args)
     print(json.dumps(result, ensure_ascii=False))

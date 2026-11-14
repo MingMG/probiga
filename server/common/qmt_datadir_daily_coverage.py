@@ -20,6 +20,7 @@ from server.common.qmt_attestation_contract import canonical_digest
 from server.common.official_historical_daily_evidence import (
     DAILY_SUSPENSION_KIND,
     historical_daily_evidence,
+    official_daily_delisting_evidence,
     official_daily_suspension_evidence,
 )
 from server.common.historical_daily_bar_evidence import SINA_PROVIDER, SINA_QUALITY, verify_public_bar
@@ -65,13 +66,15 @@ def _native_post_close_tick(snapshot: Mapping[str, Any], code: str, day: str, cu
     observed = _stamp(raw.get("_probiga_observed_at"))
     event = datetime.fromtimestamp(float(raw["time"]) / 1000, CHINA).replace(tzinfo=None)
     closed = datetime.combine(datetime.fromisoformat(day).date(), time(15, 0))
-    # The bridge may serialize the same native observations after midnight.
-    # Acquisition time and native event date bind the suspension to its session;
-    # generated_at only dates the envelope containing those observations.
     if (not closed <= observed <= generated <= cutoff
-            or observed.date().isoformat() != day
             or event.date().isoformat() != day
             or raw.get("_probiga_acquisition_method") != "ContextInfo.get_full_tick"):
+        raise ValueError("target-day native post-close suspension is unproven: " + code)
+    # A later poll can return the previous session's final native event.
+    # Keep the real observation time so the receipt is unavailable before recovery.
+    if observed.date() != closed.date() and (
+        not closed <= event <= observed or not str(snapshot.get("batch_id") or "").strip()
+    ):
         raise ValueError("target-day native post-close suspension is unproven: " + code)
     return raw, generated
 
@@ -156,10 +159,19 @@ def validate_native_revision(old, new, correction, *, prior_hash, cutoff):
     return native_amount_correction(old, new) == correction
 
 
+def _delisting_evidence(catalog, documents: list[dict], *, code: str, day: str, cutoff: datetime) -> dict:
+    expiry_dates = {str(member.get("expire_date") or "") for member in catalog.members
+                    if member["stock_code"] == code}
+    if expiry_dates != {day}:
+        raise ValueError("daily delisting differs from catalog expiry: " + code)
+    return official_daily_delisting_evidence(documents, stock_code=code, day=day, cutoff=cutoff)
+
+
 def build_manifest(*, catalog, calendar, day: str, rows: Sequence[Mapping[str, Any]],
                    run_id: str, captured_at: datetime, snapshot: Mapping[str, Any] | None = None,
                    listings: Mapping[str, Any] | None = None,
                    daily_suspension_documents: Mapping[str, list[dict]] | None = None,
+                   daily_delisting_documents: Mapping[str, list[dict]] | None = None,
                    historical_documents: Mapping[str, list[dict]] | None = None,
                    historical_public_bars: Mapping[str, dict] | None = None,
                    previous_session: str = "") -> dict:
@@ -182,6 +194,10 @@ def build_manifest(*, catalog, calendar, day: str, rows: Sequence[Mapping[str, A
     if suspensions and (historical_documents is not None
                         or not set(suspensions) <= set(expected) - by_code.keys() - set(listings or {})):
         raise ValueError("official daily suspension inventory differs")
+    delistings = dict(daily_delisting_documents or {})
+    if delistings and (historical_documents is not None or not set(delistings) <=
+                       set(expected) - by_code.keys() - set(listings or {}) - set(suspensions)):
+        raise ValueError("official daily delisting inventory differs")
     public = dict(historical_public_bars or {})
     if public:
         if (historical_documents is None or not set(public) <= by_code.keys()
@@ -202,6 +218,9 @@ def build_manifest(*, catalog, calendar, day: str, rows: Sequence[Mapping[str, A
                 raise ValueError(f"historical daily lifecycle {day} {code}: {exc}") from exc
         elif code in (listings or {}):
             kind, evidence = "NOT_LISTED", listing_evidence(listings[code], code, day)
+        elif code in delistings:
+            kind = "DELISTED"
+            evidence = _delisting_evidence(catalog, delistings[code], code=code, day=day, cutoff=captured)
         elif code in suspensions:
             kind = "NO_TRADE"
             evidence = _official_suspension_with_native_tick(
@@ -296,6 +315,13 @@ def validate_manifest(manifest: Mapping[str, Any], *, catalog, calendar) -> dict
             proof = listing_evidence(entity["evidence"], entity["stock_code"], original["trade_date"])
             if proof != entity["evidence"]:
                 raise ValueError("daily listing evidence differs")
+        elif entity["classification"] == "DELISTED":
+            proof = _delisting_evidence(
+                catalog, entity["evidence"]["documents"], code=entity["stock_code"],
+                day=original["trade_date"], cutoff=_stamp(original["captured_at"]),
+            )
+            if proof != entity["evidence"]:
+                raise ValueError("daily delisting evidence differs")
         elif entity["classification"] != "NO_TRADE":
             raise ValueError("unresolved daily entity")
     if correction is not None:

@@ -5,10 +5,13 @@ on 2026-10-14, which the decoder was validated against row by row.
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
 import datetime as dt
 from decimal import Decimal
+from hashlib import sha256
 from pathlib import Path
 import json
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -35,6 +38,7 @@ from integrations.qmt.datadir_import import (
     plan,
 )
 from server.common.qmt_datadir_result import validate_task_result
+from server.common.official_historical_daily_evidence import official_daily_delisting_evidence
 from tools import import_qmt_datadir_daily as daily_import
 
 SESSION = dt.date(2026, 10, 14)
@@ -103,6 +107,80 @@ def test_stale_whole_market_dat_blocks_daily_import_before_listing_lookup(tmp_pa
     )
     assert validate_task_result("qmt_stock_daily_canonical", receipt, return_code=rc,
                                 expected_build_sha=build) == "blocked"
+
+
+def test_daily_recovery_routes_expired_missing_security_to_official_notice(monkeypatch):
+    target = dt.date(2026, 11, 13)
+    day = target.isoformat()
+    expired = "002731"
+    suspended = "000635"
+    traded = "600000"
+    catalog = SimpleNamespace(
+        members=[{"stock_code": expired, "expire_date": day}],
+        eligible_codes=lambda value: [expired, suspended, traded],
+    )
+    engine = SimpleNamespace(connect=lambda: nullcontext(None))
+    monkeypatch.setattr(daily_import, "load_stock_catalog", lambda *args, **kwargs: catalog)
+    monkeypatch.setattr(daily_import, "load_trade_calendar_receipt", lambda *args, **kwargs: object())
+    from integrations.bigqmt import spool
+    snapshot = {"source": "native"}
+    monkeypatch.setattr(spool, "read_snapshot", lambda *args, **kwargs: snapshot)
+
+    def native_suspension(snap, code, trade_date, cutoff):
+        assert snap is snapshot
+        assert trade_date == day
+        if code != suspended:
+            raise ValueError("no native tick")
+
+    def load_delisting(codes, *, target_date):
+        assert codes == [expired]
+        assert target_date == day
+        return {expired: [{"announcement_id": "1225669888"}]}
+
+    monkeypatch.setattr(daily_import, "suspension_evidence", native_suspension)
+    monkeypatch.setattr(daily_import, "load_daily_delisting_documents", load_delisting)
+    monkeypatch.setattr(daily_import, "retained_listing_evidence",
+                        lambda *args, **kwargs: pytest.fail("delisting was routed to listing lookup"))
+    monkeypatch.setattr(daily_import, "build_manifest", lambda **kwargs: kwargs)
+    args = daily_import._coverage_manifest(
+        engine, session=target, harvested={"rows": [], "codes": {traded}}, run_id="worker",
+    )
+    assert args["daily_delisting_documents"] == {expired: [{"announcement_id": "1225669888"}]}
+    assert args["daily_suspension_documents"] == {}
+
+
+def test_indexed_daily_delisting_checks_identity_effective_day_and_known_time():
+    target = dt.date(2026, 11, 13)
+    published = dt.datetime.combine(target, dt.time(), tzinfo=CST)
+    observed = published + dt.timedelta(days=1, hours=21)
+    body = "证券代码：002731。关于公司股票终止上市暨摘牌的公告。摘牌日期：2026年11月13日。"
+    document = {
+        "source_url": "https://static.cninfo.com.cn/finalpage/2026-11-13/1225669888.PDF",
+        "observed_at": observed.isoformat(),
+        "source_text": body,
+        "source_text_sha256": sha256(body.encode()).hexdigest(),
+        "official_document_sha256": "a" * 64,
+        "announcement_id": "1225669888",
+        "announcement_time_ms": int(published.timestamp() * 1000),
+        "source_row_sha256": "b" * 64,
+    }
+    proof = official_daily_delisting_evidence(
+        [document], stock_code="002731", day=target.isoformat(), cutoff=observed,
+    )
+    assert proof["documents"] == [document]
+    with pytest.raises(ValueError, match="unproven"):
+        official_daily_delisting_evidence(
+            [document], stock_code="002731", day="2026-11-16", cutoff=observed,
+        )
+    with pytest.raises(ValueError, match="publication identity"):
+        official_daily_delisting_evidence(
+            [{**document, "announcement_id": "1225669889"}],
+            stock_code="002731", day=target.isoformat(), cutoff=observed,
+        )
+    with pytest.raises(ValueError, match="identity or time"):
+        official_daily_delisting_evidence(
+            [document], stock_code="002731", day=target.isoformat(), cutoff=published,
+        )
 
 
 def test_read_dat_rejects_a_foreign_header(tmp_path):
