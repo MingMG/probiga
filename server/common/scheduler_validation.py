@@ -4804,6 +4804,17 @@ def validate_scheduler_task_result(
                 message=message,
             )
         release_target_date = _release_target_date_from_task(task)
+        flow_target_date = release_target_date
+        if (
+            task_type == _CAPITAL_FLOW_BATCH_TASK_TYPE
+            and task.get("_trigger_source") == "scheduled"
+            and task.get("_scheduler_target_available") is True
+            and task.get("_scheduler_historical_recovery") is True
+        ):
+            raw_target = str(task.get("_scheduler_target_trade_date") or "")
+            flow_target_date = date.fromisoformat(raw_target)
+            if flow_target_date.isoformat() != raw_target or flow_target_date >= started_at.date():
+                raise ValueError("capital_flow_batch_fast: scheduled historical target is invalid")
         capital_flow_payload = (
             _capital_flow_batch_payload(output)
             if task_type == _CAPITAL_FLOW_BATCH_TASK_TYPE
@@ -4846,7 +4857,7 @@ def validate_scheduler_task_result(
                 started_at=started_at,
                 now=now,
                 output=output,
-                target_date_override=release_target_date,
+                target_date_override=flow_target_date,
             )
             messages.append(message)
             if not ok:
@@ -4951,11 +4962,11 @@ def validate_scheduler_task_result(
                 )
             target_date = date.fromisoformat(str(payload["trade_date"]))
             if (
-                release_target_date is not None
-                and target_date != release_target_date
+                flow_target_date is not None
+                and target_date != flow_target_date
             ):
                 raise ValueError(
-                    "capital_flow_batch_fast: receipt date differs from release target"
+                    "capital_flow_batch_fast: receipt date differs from scheduler target"
                 )
             expected_build_sha = str(
                 task.get("_scheduler_expected_build_sha") or ""
@@ -5023,7 +5034,7 @@ def validate_scheduler_task_result(
                     )
             elif target_date < now.date():
                 if (
-                    trigger_source != "release_catchup"
+                    flow_target_date is None
                     or mode
                     not in {
                         _CAPITAL_FLOW_EXECUTION_VERIFIED_EXISTING,
@@ -5031,7 +5042,7 @@ def validate_scheduler_task_result(
                     }
                 ):
                     raise ValueError(
-                        "capital_flow_batch_fast: historical target requires release reuse"
+                        "capital_flow_batch_fast: historical target requires scheduler-bound reuse"
                     )
             else:
                 raise ValueError(
@@ -5053,7 +5064,7 @@ def validate_scheduler_task_result(
             | ANALYSIS_POOL_PUBLISHER_TASK_TYPES
         ):
             target_requirement = (requirements or ())[0]
-            target_date = release_target_date or _resolve_target_date(
+            target_date = flow_target_date or _resolve_target_date(
                 engine,
                 target_requirement,
                 started_at=started_at,
