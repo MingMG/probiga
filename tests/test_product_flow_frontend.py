@@ -767,12 +767,17 @@ const fetchRawJsonWithTimeout = async path => {
     calls.push(path);
     const requested = new URL(path, 'http://localhost').searchParams.get('daily_pool_date');
     if (requested === '2026-11-05') return {status:'degraded', error:'pool query failed'};
-    return {status:'ok', data:rows, selected_date:requested === 'latest' ? '2026-11-06' : requested, available_dates:availableDates};
+    return {status:'ok', data:rows, selected_date:requested === 'current' ? '2026-11-07' : requested, available_dates:availableDates};
 };
 """ + page + r"""
 const codes = html => [...html.matchAll(/>(\d{6})<\/a>/g)].map(match => match[1]);
 (async () => {
     const container = {};
+    await loadDailyPoolPage(null, container);
+    assert.deepEqual(codes(container.innerHTML), []);
+    assert.match(container.innerHTML, /2026-11-07/);
+    assert.match(container.innerHTML, /2026-11-06/);
+    window._dailyPoolDate = '2026-11-06';
     await loadDailyPoolPage(null, container);
     assert.deepEqual(codes(container.innerHTML), ['600941','600410','600406','600644']);
     assert.match(container.innerHTML, /2026-10-20/);
@@ -783,7 +788,8 @@ const codes = html => [...html.matchAll(/>(\d{6})<\/a>/g)].map(match => match[1]
     await loadDailyPoolPage(null, container);
     assert.match(container.innerHTML, /pool query failed/);
     assert.deepEqual(calls, [
-        '/api/screener/candidates?daily_pool_date=latest',
+        '/api/screener/candidates?daily_pool_date=current',
+        '/api/screener/candidates?daily_pool_date=2026-11-06',
         '/api/screener/candidates?daily_pool_date=2026-10-19',
         '/api/screener/candidates?daily_pool_date=2026-11-05',
     ]);

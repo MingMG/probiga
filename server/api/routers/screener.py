@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 
 from server.api.routers._engine import get_engine
+from server.common.authoritative_market_clock import authoritative_closed_trade_date
 from server.common.manual_scheduler_launch import launch_registered_scheduler_task
 from server.common.pit_facts import (
     PIT_AVAILABLE,
@@ -1810,9 +1811,9 @@ def screener_candidates(
     limit: int = Query(default=100, ge=1, le=500),
     daily_pool_date: str | None = None,
 ):
-    if daily_pool_date not in (None, "latest"):
+    if daily_pool_date not in (None, "current", "latest"):
         if _clean_date(daily_pool_date) != daily_pool_date or not daily_pool_date:
-            raise HTTPException(status_code=422, detail="daily_pool_date must be latest or YYYY-MM-DD")
+            raise HTTPException(status_code=422, detail="daily_pool_date must be current, latest, or YYYY-MM-DD")
     try:
         _ensure_tables()
         selection = {}
@@ -1829,7 +1830,9 @@ def screener_candidates(
             )
             available_dates = [_clean_date(row["as_of_date"]) for row in dates]
             selected_date = daily_pool_date
-            if daily_pool_date == "latest":
+            if daily_pool_date == "current":
+                selected_date = authoritative_closed_trade_date(get_engine()) or None
+            elif daily_pool_date == "latest":
                 selected_date = next(iter(available_dates), None)
             selection = {"available_dates": available_dates, "selected_date": selected_date}
             where = f"{scope} AND as_of_date = :selected_date"

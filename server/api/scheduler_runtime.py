@@ -6116,6 +6116,8 @@ def _task_dispatch_date(
         if not target:
             raise RuntimeError("premarket announcement prior exchange session is unavailable")
         return target
+    if task_type == "daily_pool":
+        return authoritative_closed_trade_date(engine, now=current)
     if task_type == "north_flow_daily":
         from server.common.northbound_disclosure import NORTHBOUND_CLOSE_READY_TIME
 
@@ -6213,7 +6215,7 @@ def _task_argument_row(
                 or not datetime_time(9, 8) <= current.time() < datetime_time(9, 30)):
             raise RuntimeError("premarket theme publication requires today's registered 09:08 window")
         return {**row, "_scheduler_target_trade_date": target_date}
-    if task_type in {"free_index_daily_canonical", "north_flow_daily", "strategy_governance_daily"}:
+    if task_type in {"daily_pool", "free_index_daily_canonical", "north_flow_daily", "strategy_governance_daily"}:
         return {**row, "_scheduler_target_trade_date": target_date}
     trigger_source = str(row.get("_trigger_source") or "").strip()
     if task_type == "qmt_announcement_pit" and trigger_source == "release_catchup":

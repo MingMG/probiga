@@ -6511,7 +6511,7 @@
     }
 
     function loadDailyPoolPage(d, c) {
-        var requested = window._dailyPoolDate || 'latest';
+        var requested = window._dailyPoolDate || 'current';
         var requestSeq = Number(window._dailyPoolRequestSeq || 0) + 1;
         window._dailyPoolRequestSeq = requestSeq;
         c.innerHTML = '<div class="loading">正在读取每日票池…</div>';
@@ -6543,19 +6543,21 @@
                 : '<span>暂无已发布研究候选</span></div>';
             h += '<div class="sc-table-note">研究用候选池：按收盘强度、流动性与主力资金排序，不构成交易指令，也不授予任何下单权限。</div>';
             h += '<div class="search-bar paged-table-toolbar">';
-            if (dates.length) {
+            if (selected || dates.length) {
                 h += '<label style="margin-right:8px">数据日 <select onchange="window.selectDailyPoolDate(this.value)">';
-                h += '<option value=""' + (requested === 'latest' ? ' selected' : '') + '>最近发布</option>';
+                h += '<option value=""' + (requested === 'current' ? ' selected' : '') + '>最近收盘交易日</option>';
                 dates.forEach(function (day) {
                     h += '<option value="' + escAttr(day) + '"'
-                        + (requested !== 'latest' && day === selected ? ' selected' : '') + '>' + escHtml(day) + '</option>';
+                        + (requested === day ? ' selected' : '') + '>' + escHtml(day) + '</option>';
                 });
                 h += '</select></label>';
             }
             h += '<button class="sc-btn" onclick="loadTab(\'daily-pool\')">刷新</button>';
             h += '<span class="sc-hint">点击代码可打开个股详情</span></div>';
             if (!view.length) {
-                c.innerHTML = h + '<div class="sc-table-note">该日期暂无已发布票池，可切换到其他已发布日期。</div></div>';
+                var note = selected ? escHtml(selected) + ' 的研究票池尚未发布。' : '交易日历暂不可用。';
+                if (dates.length) note += ' 最近已发布：' + escHtml(dates[0]) + '。';
+                c.innerHTML = h + '<div class="sc-table-note">' + note + '</div></div>';
                 return;
             }
             h += '<div class="sc-table-wrap"><table class="sc-table"><thead><tr>'

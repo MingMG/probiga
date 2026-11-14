@@ -27,6 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from server.common.authoritative_market_clock import authoritative_closed_trade_date
 from server.common.batch_db import create_batch_engine
 
 
@@ -148,30 +149,10 @@ def _bounded_session(connection) -> None:
 
 def resolve_data_date(connection, requested: str) -> date:
     _bounded_session(connection)
-    if requested:
-        parsed = date.fromisoformat(requested)
-        count = connection.execute(
-            text(
-                "SELECT COUNT(*) FROM sm_stock_kline "
-                "WHERE trade_date=:d AND k_type=1 AND adjust_type=0"
-            ),
-            {"d": parsed},
-        ).scalar_one()
-        if int(count or 0) < MIN_SESSION_ROWS:
-            raise DailyPoolBlocked(
-                "daily_kline", f"session_coverage={int(count or 0)}"
-            )
-        return parsed
-    value = connection.execute(
-        text(
-            "SELECT trade_date FROM sm_stock_kline "
-            "WHERE k_type=1 AND adjust_type=0 "
-            "ORDER BY trade_date DESC LIMIT 1"
-        )
-    ).scalar()
-    if value is None:
-        raise DailyPoolBlocked("daily_kline", "no_completed_session")
-    return value if isinstance(value, date) else date.fromisoformat(str(value))
+    target = requested or authoritative_closed_trade_date(connection)
+    if not target:
+        raise DailyPoolBlocked("session_date", "no_closed_exchange_session")
+    return date.fromisoformat(target)
 
 
 def read_session_rows(connection, data_date: date) -> list[dict[str, Any]]:
@@ -306,6 +287,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         }
     run_uid = uuid.uuid4().hex
     stage = "session_date"
+    data_date = None
     try:
         with engine.begin() as connection:
             data_date = resolve_data_date(connection, args.date)
@@ -313,7 +295,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             rows = read_session_rows(connection, data_date)
             if len(rows) < MIN_SESSION_ROWS:
                 raise DailyPoolBlocked(
-                    stage, f"session_coverage={len(rows)}"
+                    stage, f"session_coverage={len(rows)} required={MIN_SESSION_ROWS}"
                 )
             stage = "capital_flow"
             flow, flow_status = read_main_flow(connection, data_date)
@@ -364,6 +346,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "operation": "daily_pool",
             "run_uid": run_uid,
             "stage": exc.stage,
+            "target_trade_date": data_date.isoformat() if data_date else None,
             "reason": exc.reason,
             "duration_seconds": round(time.monotonic() - started, 3),
             "automatic_real_order_submission": False,
@@ -389,7 +372,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Deterministic daily research pool (not investment advice)"
     )
-    parser.add_argument("--date", default="", help="YYYY-MM-DD; empty=latest")
+    parser.add_argument("--date", default="", help="YYYY-MM-DD; empty=latest closed exchange session")
     parser.add_argument("--top", type=int, default=DEFAULT_TOP)
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--install-task", action="store_true")
