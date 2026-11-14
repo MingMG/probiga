@@ -1270,6 +1270,28 @@ def test_capital_flow_machine_receipt_and_release_target_are_strict(monkeypatch,
     assert validated.checked and validated.ok
     assert freshness_modes == [False]
 
+    scheduled = {
+        "task_type": "capital_flow_batch_fast",
+        "_trigger_source": "scheduled",
+        "_scheduler_target_available": True,
+        "_scheduler_historical_recovery": True,
+        "_scheduler_target_trade_date": TARGET,
+        "_scheduler_expected_build_sha": BUILD_SHA,
+    }
+    validation_args = {
+        "engine": object(),
+        "output": output,
+        "started_at": datetime(2026, 8, 27, 3, 5),
+        "now": datetime(2026, 8, 27, 3, 7),
+    }
+    assert scheduler_validation.validate_scheduler_task_result(scheduled, **validation_args).ok
+    for denied in (
+        {**scheduled, "_trigger_source": "manual"},
+        {**scheduled, "_scheduler_target_available": False},
+        {**scheduled, "_scheduler_target_trade_date": "2026-08-25"},
+    ):
+        assert not scheduler_validation.validate_scheduler_task_result(denied, **validation_args).ok
+
     mismatch = scheduler_validation.validate_scheduler_task_result(
         {**task, "_release_target_date": "2026-08-27"},
         engine=object(),
