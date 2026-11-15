@@ -1,8 +1,6 @@
-import copy
 from contextlib import nullcontext
 from datetime import date, datetime
 from decimal import Decimal
-import json
 
 import numpy as np
 import pandas as pd
@@ -14,33 +12,6 @@ from biz.analysis.formal_scoring_checkpoints import checkpoint_factor_frame
 from server.common.analysis_pool_receipt import canonical_sha256
 from server.common.formal_analysis_store import FormalAnalysisStore
 from server.db.formal_analysis_schema import privileged_migrate_formal_analysis_schema
-
-
-class CheckpointStore:
-    def __init__(self):
-        self.members = {}
-        self.artifacts = {}
-
-    def put_many(self, generation, stage, payloads):
-        return {key: self.put(generation, stage, key, payload) for key, payload in payloads.items()}
-
-    def put(self, generation, stage, key, payload):
-        sha256 = canonical_sha256(payload)
-        self.artifacts[sha256] = json.loads(json.dumps(payload, sort_keys=True, allow_nan=False))
-        member = (generation, stage, key)
-        assert self.members.get(member, sha256) == sha256
-        self.members[member] = sha256
-        return sha256
-
-    def get(self, generation, stage, key):
-        sha256 = self.members.get((generation, stage, key))
-        return self.load_artifact(sha256) if sha256 else None
-
-    def load_artifact(self, sha256):
-        return copy.deepcopy(self.artifacts[sha256])
-
-    def load_artifacts(self, hashes):
-        return {sha256: self.load_artifact(sha256) for sha256 in hashes}
 
 
 def test_factor_checkpoint_preserves_object_payload_and_pandas_dtypes(tmp_path):
@@ -79,7 +50,7 @@ def test_factor_checkpoint_preserves_object_payload_and_pandas_dtypes(tmp_path):
     assert np.signbit(restored.loc[7, "score"])
 
 
-def test_formal_kline_resumes_rows_and_preserves_full_market_features(monkeypatch):
+def test_formal_kline_reuses_only_unchanged_technical_factors_and_reranks(monkeypatch, tmp_path):
     days = list(pd.bdate_range(end="2026-11-13", periods=60).strftime("%Y-%m-%d"))
     catalog = {day: "catalog-" + day for day in days}
     roots = {day: canonical_sha256(day) for day in days}
@@ -88,7 +59,7 @@ def test_formal_kline_resumes_rows_and_preserves_full_market_features(monkeypatc
             "stock_code": code, "short_name": "A", "trade_date": date.fromisoformat(day),
             "open": 10, "high": 12, "low": 9,
             "close": 10 + (i % 4) / 10 + j / 10,
-            "pre_close": 10, "volume": 100_000 + i, "amount": 10_000_000 + i,
+            "pre_close": 10, "volume": 100_000 + i, "amount": 100_000_000 * (j + 1) + i,
             "change_pct": 14.5, "turnover_ratio": 2.0,
             "data_source": "qmt", "batch_id": catalog[day], "data_version": 1,
             "quality_status": "PASS", "permission_status": "GRANTED",
@@ -100,7 +71,6 @@ def test_formal_kline_resumes_rows_and_preserves_full_market_features(monkeypatc
     ])
     monkeypatch.setattr(analysis, "daily_input_snapshot", nullcontext)
     monkeypatch.setattr(analysis, "_kline_rolling_state_path", lambda: None)
-    monkeypatch.setattr(analysis, "_KLINE_TECHNICAL_STOCKS_PER_PART", 2)
     monkeypatch.setattr(analysis, "_attach_canonical_chase_risk_evidence", lambda frame, *_a, **_k: frame)
     monkeypatch.setenv("PROBIGA_KLINE_FEATURE_CHUNK_DAYS", "5")
     monkeypatch.setattr(analysis, "load_daily_input_window", lambda *_a, **_k: {
@@ -121,14 +91,16 @@ def test_formal_kline_resumes_rows_and_preserves_full_market_features(monkeypatc
     monkeypatch.setattr(analysis, "_read_kline_feature_frame", read)
     exact = datetime(2026, 11, 13, 18)
 
-    def run(**kwargs):
-        return analysis.load_kline_features(object(), days[-1], decision_known_at=exact, **kwargs)
+    def run(cutoff=exact, **kwargs):
+        return analysis.load_kline_features(object(), days[-1], decision_known_at=cutoff, **kwargs)
 
     reference = run()
     all_partitions = queried[:]
     queried.clear()
     interrupted = True
-    store = CheckpointStore()
+    artifact_engine = create_engine("sqlite:///" + str(tmp_path / "kline-checkpoint.sqlite"))
+    privileged_migrate_formal_analysis_schema(artifact_engine)
+    store = FormalAnalysisStore(artifact_engine)
     formal = {"formal_store": store, "formal_generation_sha256": "d" * 64}
     with pytest.raises(analysis.KlineFeatureDataBlocked, match="KLINE_FEATURE_CHUNK_READ_FAILED"):
         run(**formal)
@@ -162,7 +134,57 @@ def test_formal_kline_resumes_rows_and_preserves_full_market_features(monkeypatc
     assert resumed.attrs == reference.attrs
 
     queried.clear()
+    computed.clear()
     roots[days[7]] = "e" * 64
     later = run(**formal)
     assert queried == [all_partitions[1]]
+    assert computed == []
     assert later.attrs["qmt_daily_input_window"]["daily_partition_roots"][days[7]] == "e" * 64
+
+    # The revision sees a newly attested close and amount for only one security.
+    last = rows["trade_date"] == date.fromisoformat(days[-1])
+    revised = last & (rows["stock_code"] == "000001")
+    rows.loc[revised, "close"] = 10.8
+    rows.loc[revised, "amount"] = 400_000_000
+    renamed = last & (rows["stock_code"] == "688613")
+    rows.loc[renamed, "short_name"] = "Fresh target name"
+    roots[days[-1]] = "f" * 64
+    premarket_cutoff = datetime(2026, 11, 16, 8, 30)
+    premarket = {**formal, "formal_generation_sha256": "f" * 64}
+    broad_reference = run(cutoff=premarket_cutoff)
+    queried.clear()
+    computed.clear()
+    progress = []
+    revised_market = run(cutoff=premarket_cutoff, progress_callback=progress.append, **premarket)
+    assert queried == all_partitions
+    assert computed == [["000001"]]
+    assert progress[-1]["kline_technical_recomputed_code_count"] == 1
+    assert progress[-1]["kline_technical_reused_code_count"] == 2
+    assert revised_market.loc[revised_market.stock_code == "688613", "short_name"].item() == "Fresh target name"
+    pd.testing.assert_frame_equal(revised_market, broad_reference, check_exact=True)
+    assert revised_market.attrs == broad_reference.attrs
+
+    def ranked(frame):
+        scores = frame.assign(
+            ai_score=88, long_term_score=82, short_term_score=86,
+            quality_score=90, final_trade_score=89, entry_score=85, capital_score=84,
+            risk_reward_ratio=2.0, turnover_ratio=5.0, main_wave_score=80,
+            main_wave_signal="WATCH", signal_status="WATCH",
+            recommend_status="SUSPENDED", event_risk_level="LOW",
+        )
+        return [row["stock_code"] for row in analysis.build_recommendation_rows(
+            scores, days[-1], top_n=80, min_score=62,
+        )]
+
+    assert ranked(reference) == ["000005", "688613"]
+    assert ranked(revised_market) == ranked(broad_reference) == ["000001", "688613"]
+
+    queried.clear()
+    computed.clear()
+    progress.clear()
+    retried = run(cutoff=premarket_cutoff, progress_callback=progress.append, **premarket)
+    assert queried == computed == []
+    assert progress[-1]["kline_technical_recomputed_code_count"] == 0
+    assert progress[-1]["kline_technical_reused_code_count"] == 3
+    pd.testing.assert_frame_equal(retried, revised_market, check_exact=True)
+    artifact_engine.dispose()
