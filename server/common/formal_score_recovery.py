@@ -1,6 +1,7 @@
 """Adopt an exact frozen analysis when only its publication validation changed."""
 from __future__ import annotations
 
+import ast
 import math
 import os
 import re
@@ -52,6 +53,14 @@ _REQUIRED_INPUTS = frozenset({
 })
 _SHA40 = re.compile(r"[0-9a-f]{40}")
 _RUN_UID = re.compile(r"[0-9a-f]{32}")
+_SCHEDULER_RUNTIME = "server/api/scheduler_runtime.py"
+_MAX_COMPONENT_PARENT_LINKS = 8
+_MAX_RECOVERY_ATTEMPTS = 8
+_ABANDONED_PUBLICATION_MARKERS = frozenset({
+    "TASK_OWNER_LEASE_EXPIRED: exact run lease expired; original process result retained in OBSERVED; no publication retried.",
+    "DAILY_DELIVERY_FINALIZATION_FAILED: publication lease expired; original process result retained in OBSERVED; no publication retried.",
+})
+_SERVICE_STOP_MARKER = "调度服务停止；子进程已确认退出。"
 
 
 def _local_decision(value: str | datetime, *, whole_seconds: bool = True) -> datetime:
@@ -114,6 +123,16 @@ def _scorer_source(root: Path, relative: str) -> bytes:
         raise FormalScoreContractError("formal recovery retained scorer source is unavailable") from exc
 
 
+def _scheduler_outside_terminal_projection(source: bytes) -> str:
+    tree = ast.parse(source, filename=_SCHEDULER_RUNTIME)
+    snapshots = [node for node in tree.body
+                 if isinstance(node, ast.FunctionDef) and node.name == "_terminal_snapshot"]
+    if len(snapshots) != 1:
+        raise FormalScoreContractError("formal recovery scheduler terminal projection is unavailable")
+    snapshots[0].body = []
+    return ast.dump(tree)
+
+
 def _same_scorer(previous_build: str, current_build: str) -> bool:
     previous, current = _trusted_checkout(previous_build), _trusted_checkout(current_build)
     if Path(__file__).resolve().parents[2] != current:
@@ -124,17 +143,27 @@ def _same_scorer(previous_build: str, current_build: str) -> bool:
             or _git(root, "status", "--porcelain=v1", "-z", "--untracked-files=no")
         ):
             raise FormalScoreContractError("formal recovery checkout does not match its sealed build")
+    if previous == current:
+        return True
     changed = _git(current, "diff", "--name-only", "-z", "--no-renames", previous_build, current_build, "--")
     paths = changed.decode("utf-8").rstrip("\0").split("\0") if changed else []
-    if not paths or any(path not in _PERMITTED_VALIDATION_FILES and not path.startswith("tests/") for path in paths):
+    if not paths or any(
+        path != _SCHEDULER_RUNTIME and path not in _PERMITTED_VALIDATION_FILES and not path.startswith("tests/")
+        for path in paths
+    ):
+        return False
+    if _SCHEDULER_RUNTIME in paths and (
+        _scheduler_outside_terminal_projection(_scorer_source(previous, _SCHEDULER_RUNTIME))
+        != _scheduler_outside_terminal_projection(_scorer_source(current, _SCHEDULER_RUNTIME))
+    ):
         return False
     return all(_scorer_source(previous, name) == _scorer_source(current, name) for name in _SCORER_FILES)
 
 
 def _exact_prior_terminal(connection, *, run_uid: str, build_sha: str, trade_date: str,
-                          contract_build: str, strategy_release: str) -> tuple[dict, dict | None]:
+                          contract_build: str, strategy_release: str) -> dict:
     current = connection.execute(text("""
-        SELECT /*+ MAX_EXECUTION_TIME(3000) */ a.session_uid,
+        SELECT /*+ MAX_EXECUTION_TIME(3000) */ a.id AS stage_id, a.session_uid,
             a.status AS stage_status, a.started_at AS stage_started_at,
             h.status AS audit_status, h.task_type, h.build_sha,
             r.trade_date AS score_trade_date,r.min_score,r.top_n,r.execution_time
@@ -155,34 +184,49 @@ def _exact_prior_terminal(connection, *, run_uid: str, build_sha: str, trade_dat
         or str(current["score_trade_date"])[:10] != trade_date
     ):
         raise FormalScoreContractError("formal recovery is outside the exact current scheduler claim")
-    return dict(current), _terminal_in_session(connection, current["session_uid"], excluding=run_uid)
+    return dict(current)
 
 
-def _terminal_in_session(connection, session_uid: str, *, excluding: str | None = None,
-                         exact: str | None = None) -> dict | None:
-    row = connection.execute(text("""
-        SELECT /*+ MAX_EXECUTION_TIME(3000) */ a.scheduler_run_uid AS run_uid,
+def _attempts_in_session(connection, session_uid: str, *, excluding: str | None = None,
+                         exact: str | None = None) -> list[dict]:
+    rows = connection.execute(text("""
+        SELECT /*+ MAX_EXECUTION_TIME(3000) */ a.id AS stage_id, a.scheduler_run_uid AS run_uid,
             a.status AS stage_status, a.finished_at AS stage_finished_at,
-            h.status AS audit_status,h.finished_at,h.exit_code,h.build_sha,h.task_type,h.output,
+            h.status AS audit_status,h.finished_at,h.exit_code,h.build_sha,h.task_type,SUBSTR(h.output, 1, 60000) AS output,
             r.trade_date AS score_trade_date,r.min_score,r.top_n,r.execution_time,
             r.published_at,r.canonical_pool_sha256
         FROM st_daily_stage_attempt a
-        JOIN st_scheduled_task_history h ON h.run_uid=a.scheduler_run_uid
+        LEFT JOIN st_scheduled_task_history h ON h.run_uid=a.scheduler_run_uid
         LEFT JOIN st_recommended_run_history r ON r.run_uid=h.run_uid AND r.scheduler_job_id=h.run_uid
         WHERE a.session_uid=:session_uid AND a.stage_name='analysis_fast'
           AND (:excluding IS NULL OR a.scheduler_run_uid<>:excluding)
           AND (:exact IS NULL OR a.scheduler_run_uid=:exact)
-        ORDER BY a.id DESC LIMIT 1
-    """), {"session_uid": session_uid, "excluding": excluding, "exact": exact}).mappings().first()
-    return dict(row) if row is not None else None
+        ORDER BY a.id DESC LIMIT :limit
+    """), {"session_uid": session_uid, "excluding": excluding, "exact": exact,
+               "limit": 1 if exact is not None else _MAX_RECOVERY_ATTEMPTS}).mappings().all()
+    return [dict(row) for row in rows]
 
 
-def _unpublished_terminal_exit_zero(record: Mapping[str, Any] | None, builds: set[str]) -> bool:
-    return bool(
-        record is not None and record["stage_status"] == "FAILED" and record["audit_status"] == "failed"
-        and record["exit_code"] == 0 and record["build_sha"] in builds and record["task_type"] == "analysis_fast"
+def _unpublished_terminal(record: Mapping[str, Any], builds: set[str], trade_date: str) -> bool:
+    return (
+        record["build_sha"] in builds and record["task_type"] == "analysis_fast"
+        and str(record["score_trade_date"])[:10] == trade_date
         and record["finished_at"] is not None and record["stage_finished_at"] is not None
         and record["published_at"] is None and record["canonical_pool_sha256"] is None
+    )
+
+
+def _successful_child_failed_publication(record: Mapping[str, Any]) -> bool:
+    return record["stage_status"] == "FAILED" and record["audit_status"] == "failed" and record["exit_code"] == 0
+
+
+def _abandoned_without_publication(record: Mapping[str, Any]) -> bool:
+    lines = (record["output"] or "").splitlines()
+    if record["stage_status"] == "FAILED" and record["audit_status"] == "failed":
+        return record["exit_code"] is None and any(line in _ABANDONED_PUBLICATION_MARKERS for line in lines)
+    return (
+        record["stage_status"] == "STOPPED" and record["audit_status"] == "stopped"
+        and record["exit_code"] != 0 and lines[:1] == [_SERVICE_STOP_MARKER]
     )
 
 
@@ -209,6 +253,31 @@ def _verify_component_lineage(connection, runtime: Mapping[str, str]) -> dict[st
     return require_compatible_component_build(connection, parent, build_sha)
 
 
+def _compatible_recovery_builds(connection, runtime: Mapping[str, str]) -> set[str]:
+    builds = {runtime["linux_build_sha"]}
+    parent_sha = runtime["parent_linux_build_sha"]
+    parent = _verify_component_lineage(connection, runtime)
+    for _ in range(_MAX_COMPONENT_PARENT_LINKS):
+        if (
+            parent_sha in builds or parent["linux_build_sha"] != parent_sha
+            or parent["contract_build_sha"] != runtime["contract_build_sha"]
+            or parent["windows_build_sha"] != runtime["windows_build_sha"]
+        ):
+            raise FormalScoreContractError("formal recovery component parent scope differs")
+        builds.add(parent_sha)
+        if parent_sha == runtime["contract_build_sha"]:
+            if parent["scope"] != "COORDINATED":
+                raise FormalScoreContractError("formal recovery coordinated component anchor differs")
+            return builds
+        if parent["scope"] != "LINUX" or parent["contract_sha256"] != runtime["contract_sha256"]:
+            raise FormalScoreContractError("formal recovery component parent contract differs")
+        parent_sha = parent["parent_linux_build_sha"]
+        if parent_sha in builds:
+            raise FormalScoreContractError("formal recovery component lineage contains a cycle")
+        parent = load_component_attestation(connection, parent_sha)
+    raise FormalScoreContractError("formal recovery component lineage exceeds its bound")
+
+
 def _candidate(
     engine, *, trade_date: str, proposed_cutoff: str | datetime, run_uid: str,
     build_sha: str, min_score: float | None, top_n: int | None, model_version: str,
@@ -229,43 +298,53 @@ def _candidate(
         raise FormalScoreContractError("formal recovery runtime build differs")
     if runtime["scope"] != "LINUX":
         return None
-    parent = runtime["parent_linux_build_sha"]
     with engine.connect() as connection:
-        verified_parent = _verify_component_lineage(connection, runtime)
-        if (
-            verified_parent["linux_build_sha"] != parent
-            or verified_parent["contract_build_sha"] != runtime["contract_build_sha"]
-            or verified_parent["windows_build_sha"] != runtime["windows_build_sha"]
-        ):
-            raise FormalScoreContractError("formal recovery component parent scope differs")
-        current, prior = _exact_prior_terminal(
+        current = _exact_prior_terminal(
             connection, run_uid=run_uid, build_sha=build_sha, trade_date=trade_date,
             contract_build=runtime["contract_build_sha"], strategy_release=strategy_release_identity(),
         )
-    if not _unpublished_terminal_exit_zero(prior, {parent, build_sha}):
-        return None
+        attempts = _attempts_in_session(connection, current["session_uid"], excluding=run_uid)
+        if not attempts:
+            return None
+        builds = _compatible_recovery_builds(connection, runtime)
     current_started = _local_decision(current["stage_started_at"], whole_seconds=False)
-    if any(_local_decision(prior[field], whole_seconds=False) > current_started for field in (
-        "stage_finished_at", "finished_at",
-    )):
-        raise FormalScoreContractError("formal recovery newest discarded attempt is not earlier")
+    for prior in attempts:
+        if prior["stage_id"] >= current["stage_id"] or not _unpublished_terminal(prior, builds, trade_date):
+            return None
+        if any(_local_decision(prior[field], whole_seconds=False) > current_started for field in (
+            "stage_finished_at", "finished_at",
+        )):
+            raise FormalScoreContractError("formal recovery discarded attempt is not earlier")
+        if _successful_child_failed_publication(prior):
+            break
+        if not _abandoned_without_publication(prior):
+            return None
+    else:
+        return None
+
     latest = _single_nested_machine_payload(prior["output"], schema=FORMAL_SCORE_WORK_SCHEMA)
     if not latest:
-        return None
-    if not _same_scorer(parent, build_sha):
         return None
 
     store = FormalAnalysisStore(engine)
     verify_initial_selection(store, latest, run_uid=prior["run_uid"], build_sha=prior["build_sha"], trade_date=trade_date)
     origin = _read_score_manifest(latest["score_snapshot"], trade_date=trade_date, store=store)["origin"]
-    if origin["build_sha"] != parent:
+    origin_build = origin["build_sha"]
+    if origin_build not in builds or not _same_scorer(origin_build, build_sha):
         return None
     if prior["run_uid"] == origin["run_uid"]:
         original = latest
     else:
         with engine.connect() as connection:
-            original_record = _terminal_in_session(connection, current["session_uid"], exact=origin["run_uid"])
-        if not _unpublished_terminal_exit_zero(original_record, {parent}):
+            original_records = _attempts_in_session(connection, current["session_uid"], exact=origin["run_uid"])
+        if not original_records:
+            raise FormalScoreContractError("formal recovery original scheduler audit is unavailable")
+        original_record = original_records[0]
+        if (
+            original_record["stage_id"] >= prior["stage_id"]
+            or not _unpublished_terminal(original_record, {origin_build}, trade_date)
+            or not _successful_child_failed_publication(original_record)
+        ):
             raise FormalScoreContractError("formal recovery original scheduler audit is unavailable")
         original = _single_nested_machine_payload(original_record["output"], schema=FORMAL_SCORE_WORK_SCHEMA)
         if not original or any(latest.get(field) != original.get(field) for field in (
@@ -273,7 +352,7 @@ def _candidate(
         )):
             raise FormalScoreContractError("formal recovery failed rebind has different original evidence")
         prior = original_record
-    if prior["build_sha"] != parent or prior["run_uid"] != origin["run_uid"]:
+    if prior["build_sha"] != origin_build or prior["run_uid"] != origin["run_uid"]:
         raise FormalScoreContractError("formal recovery manifest origin differs from its scheduler audit")
 
     try:
@@ -297,19 +376,19 @@ def _candidate(
         if float(prior["min_score"]) != score or int(prior["top_n"]) != quota:
             return None
         source_runs = frozen_initial_source_runs(
-            engine, trade_date=trade_date, decision_at=original_cutoff, build_sha=parent,
+            engine, trade_date=trade_date, decision_at=original_cutoff, build_sha=origin_build,
         )
         if set(source_runs) != _REQUIRED_INPUTS:
             raise FormalScoreContractError("formal recovery original input scope differs")
         generation = canonical_sha256({
             "schema": "probiga.initial-selection-generation.v1", "trade_date": trade_date,
-            "decision_at": original_cutoff.isoformat(timespec="seconds"), "build_sha": parent,
+            "decision_at": original_cutoff.isoformat(timespec="seconds"), "build_sha": origin_build,
             "model_version": model_version, "source_runs_sha256": canonical_sha256(source_runs),
             "min_score": score, "top_n": quota,
         })
         if generation != original.get("generation_sha256"):
             raise FormalScoreContractError("formal recovery exact original input generation differs")
-        verify_initial_selection(store, original, run_uid=prior["run_uid"], build_sha=parent, trade_date=trade_date)
+        verify_initial_selection(store, original, run_uid=prior["run_uid"], build_sha=origin_build, trade_date=trade_date)
         metadata = _read_score_manifest(original["score_snapshot"], trade_date=trade_date, store=store)["metadata"]
         if (
             metadata.get("decision_at") != original.get("decision_at")
