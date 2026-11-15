@@ -70,11 +70,12 @@ def prepare_revision(engine, journal: TerminalJournal, *, run_uid: str, build_sh
     scoring = prepare_frozen_strategy_pool_scoring(
         engine, data_trade_date=target, phase="PREMARKET_REVISION",
         run_uid=run_uid, build_sha=build_sha, required_premarket_announcement=source,
+        parent_receipt_uid=initial["receipt_uid"],
     )
     return stage_frozen_pool_work(
         journal, run_uid=run_uid, build_sha=build_sha,
         parent_receipt_uid=initial["receipt_uid"],
-        source_evidence_sha256=str(source.receipt["stage_evidence_sha256"]), scoring=scoring,
+        source_evidence_sha256=str(source.receipt["stage_evidence_sha256"]), scoring=scoring, engine=engine,
     ), target, ""
 
 

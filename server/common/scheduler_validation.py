@@ -2908,6 +2908,10 @@ def scheduler_output_status(
     same-day retries.  ``blocked`` accurately represents both conditions.
     """
     task_type = str(task.get("task_type") or "").strip()
+    if task_type == "analysis_fast" and _single_nested_machine_payload(
+        output, schema="probiga.formal-initial-score-blocked.v1",
+    ) and return_code != 0:
+        return "blocked"
     if task_type == "strategy_external_overlay":
         from server.common.frozen_strategy_pool_work import PREMARKET_POOL_WORK_REF_SCHEMA
 
@@ -4007,6 +4011,7 @@ def _validate_analysis_strategy_pool(
     scheduler_run_uid: str,
     expected_build_sha: str,
     output: str | None,
+    expected_initial_cutoff: str | None = None,
 ) -> tuple[bool, str]:
     """Verify the latest exact-build canonical producer of the daily pool."""
     from server.common.analysis_pool_receipt import publication_is_complete_empty
@@ -4035,9 +4040,23 @@ def _validate_analysis_strategy_pool(
                     return False, "analysis publication reference hash differs"
             except Exception:
                 return False, "analysis publication reference is unavailable"
+        elif expected_initial_cutoff:
+            from server.common.formal_analysis_store import FormalAnalysisStore, FormalAnalysisStoreError
+            from server.common.formal_score_publication import FORMAL_SCORE_WORK_SCHEMA, verify_initial_selection
+
+            prepared = _single_nested_machine_payload(output, schema=FORMAL_SCORE_WORK_SCHEMA)
+            try:
+                if not prepared or prepared.get("decision_at") != expected_initial_cutoff:
+                    raise ValueError("prepared score cutoff differs")
+                verify_initial_selection(
+                    FormalAnalysisStore(engine), prepared, run_uid=run_uid, build_sha=build_sha, trade_date=target,
+                )
+            except (ValueError, KeyError, FormalAnalysisStoreError) as exc:
+                return False, f"initial strategy score could not be verified: {exc}"
+            return True, f"durable formal scores sealed: date={target} stocks={prepared['analysis_count']}"
     if (
         current_receipt is None
-        or not publication_receipt_is_valid(current_receipt)
+        or not publication_receipt_is_valid(current_receipt, engine=engine)
     ):
         return False, "analysis strategy pool exact publication receipt is missing"
 
@@ -5112,6 +5131,10 @@ def validate_scheduler_task_result(
                     task.get("_scheduler_expected_build_sha") or ""
                 ),
                 output=output,
+                expected_initial_cutoff=(
+                    task.get("_scheduler_pipeline_decision_at")
+                    if task.get("_scheduler_pipeline_phase") == "INITIAL" else None
+                ),
             )
             messages.append(message)
             if not ok:

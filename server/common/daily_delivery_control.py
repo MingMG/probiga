@@ -151,11 +151,11 @@ class DailyDeliveryControlError(RuntimeError):
 ANALYSIS_PUBLICATION_REFERENCE_SCHEMA = "probiga.analysis-publication-reference.v1"
 
 
-def analysis_publication_reference(receipt: Mapping[str, object]) -> dict[str, object]:
+def analysis_publication_reference(receipt: Mapping[str, object], *, engine=None) -> dict[str, object]:
     """Bounded history identity; the full publication belongs to its checkpoint."""
     from server.common.analysis_pool_receipt import publication_receipt_is_valid
 
-    if not publication_receipt_is_valid(receipt):
+    if not publication_receipt_is_valid(receipt, engine=engine):
         raise DailyDeliveryControlError("analysis publication receipt is invalid")
     return {
         "schema": ANALYSIS_PUBLICATION_REFERENCE_SCHEMA,
@@ -165,11 +165,13 @@ def analysis_publication_reference(receipt: Mapping[str, object]) -> dict[str, o
     }
 
 
-def analysis_publication_degradations(receipt: Mapping[str, object]) -> list[dict[str, object]]:
+def analysis_publication_degradations(receipt: Mapping[str, object], *, engine=None) -> list[dict[str, object]]:
     """Report exclusions from this score snapshot even after a source refresh."""
     from server.common.analysis_pool_receipt import decode_score_snapshot
 
-    snapshot = decode_score_snapshot(receipt.get("score_snapshot"), trade_date=str(receipt.get("trade_date")))
+    snapshot = decode_score_snapshot(
+        receipt.get("score_snapshot"), trade_date=str(receipt.get("trade_date")), engine=engine,
+    )
     exclusions = {row["stock_code"]: row["finance_data_exclusion"]
                   for row in snapshot["scored_rows"] if row.get("finance_data_exclusion")}
     result = []
@@ -189,9 +191,9 @@ def analysis_publication_degradations(receipt: Mapping[str, object]) -> list[dic
 
 
 def bind_analysis_publication_checkpoint(
-    checkpoint: Mapping[str, object], receipt: Mapping[str, object],
+    checkpoint: Mapping[str, object], receipt: Mapping[str, object], *, engine=None,
 ) -> dict[str, object]:
-    reference = analysis_publication_reference(receipt)
+    reference = analysis_publication_reference(receipt, engine=engine)
     replay = str(checkpoint.get("replay_output") or "")
     references = _publication_references(replay)
     if reference not in references:
@@ -510,7 +512,9 @@ def load_published_analysis_receipt(
     An invalid newest publication fails closed. Older mutable projections never
     substitute for its immutable, complete scoring universe.
     """
-    from server.common.analysis_pool_receipt import PREMARKET_POOL_TASK, decode_score_snapshot
+    from server.common.analysis_pool_receipt import (
+        PREMARKET_POOL_TASK, decode_score_snapshot, read_score_snapshot_header,
+    )
 
     target = _normalized_trade_date(target_date)
     cutoff = decision_at or _control_now()
@@ -538,8 +542,9 @@ def load_published_analysis_receipt(
     try:
         checkpoint = _validated_completed_stage_checkpoint(row, session=row, stage_name=str(row["stage_name"]), engine=engine)
         receipt = dict(checkpoint.get("publication_receipt") or {})
-        reference = analysis_publication_reference(receipt)
-        snapshot = decode_score_snapshot(receipt.get("score_snapshot"), trade_date=target)
+        reference = analysis_publication_reference(receipt, engine=engine)
+        read_snapshot = decode_score_snapshot if capture_score is not None else read_score_snapshot_header
+        snapshot = read_snapshot(receipt.get("score_snapshot"), trade_date=target, engine=engine)
         published = datetime.fromisoformat(str(receipt.get("published_at")))
         if (receipt["trade_date"] != target or receipt["build_sha"] != checkpoint["build_sha"]
                 or receipt["publisher_task_type"] != row["stage_name"]

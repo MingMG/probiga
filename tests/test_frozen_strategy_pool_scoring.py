@@ -11,16 +11,24 @@ from biz.analysis import sync_analysis_fast as analysis
 from server.common.analysis_pool_receipt import build_score_snapshot, decode_score_snapshot
 from server.common import daily_delivery_control as control
 from server.common.daily_delivery_control import FrozenPremarketAnnouncement
+from server.common.formal_analysis_store import FormalAnalysisStore
+from server.common.frozen_strategy_pool_work import (
+    _load_prepared_score_rows, read_frozen_pool_work, stage_frozen_pool_work,
+)
+from server.common.scheduler_terminal_journal import TerminalJournal
+from server.db.formal_analysis_schema import privileged_migrate_formal_analysis_schema
 from tests.score_snapshot_helpers import scored_publication
 
 
-def test_two_frozen_scores_keep_the_initial_input_boundary_after_a_late_event(monkeypatch):
+def test_two_frozen_scores_keep_the_initial_input_boundary_after_a_late_event(monkeypatch, tmp_path):
     target = "2026-11-10"
     universe = [{"stock_code": "600001"}, {"stock_code": "600002"}]
     fixture = decode_score_snapshot(
         scored_publication(universe, trade_date=target)["score_snapshot"]
     )
     engine = create_engine("sqlite://")
+    privileged_migrate_formal_analysis_schema(engine)
+    calls = []
     with engine.begin() as conn:
         conn.exec_driver_sql("CREATE TABLE si_trade_calendar (trade_date TEXT, trade_status INTEGER)")
         conn.exec_driver_sql("INSERT INTO si_trade_calendar VALUES ('2026-11-10',1),('2026-11-11',1)")
@@ -30,6 +38,7 @@ def test_two_frozen_scores_keep_the_initial_input_boundary_after_a_late_event(mo
         conn.exec_driver_sql("INSERT INTO st_recommended_stocks VALUES ('600001')")
 
     def score_at_cutoff(*, engine, trade_date, news_cutoff_time, **_):
+        calls.append(news_cutoff_time)
         with engine.connect() as conn:
             late = conn.execute(text(
                 "SELECT stock_code FROM notice_fixture WHERE available_at<=:cutoff"
@@ -52,18 +61,38 @@ def test_two_frozen_scores_keep_the_initial_input_boundary_after_a_late_event(mo
     initial = analysis.prepare_frozen_strategy_pool_scoring(
         **common, phase="INITIAL", run_uid="1" * 32,
     )
-    revised = analysis.prepare_frozen_strategy_pool_scoring(
-        **common, phase="PREMARKET_REVISION", run_uid="3" * 32,
-        required_premarket_announcement=FrozenPremarketAnnouncement({}),
-    )
+    source = FrozenPremarketAnnouncement({"stage_evidence_sha256": "9" * 64})
+    premarket = {
+        **common, "phase": "PREMARKET_REVISION", "parent_receipt_uid": "a" * 64,
+        "required_premarket_announcement": source,
+    }
+    revised = analysis.prepare_frozen_strategy_pool_scoring(**premarket, run_uid="3" * 32)
+    resumed = analysis.prepare_frozen_strategy_pool_scoring(**premarket, run_uid="4" * 32)
     assert initial["cutoff_at"] == "2026-11-10T22:20:00+08:00"
-    assert revised["cutoff_at"] == "2026-11-11T08:30:00+08:00"
+    assert revised["cutoff_at"] == resumed["cutoff_at"] == "2026-11-11T08:30:00+08:00"
     assert initial["evaluated_at"] == revised["evaluated_at"] == "2026-11-11T08:38:00+08:00"
-    assert initial["recommendation_rows"] == [{"stock_code": "600001"}]
-    assert revised["recommendation_rows"] == [{"stock_code": "600002"}]
-    assert decode_score_snapshot(initial["score_snapshot"])["input_decision_at"] == "2026-11-10T22:20:00"
-    assert decode_score_snapshot(revised["score_snapshot"])["input_decision_at"] == "2026-11-11T08:30:00"
+    assert calls == ["2026-11-10T22:20:00", "2026-11-11T08:30:00"]
+    store = FormalAnalysisStore(engine)
+    assert store.load_artifact(initial["recommendations_sha256"]) == [{"stock_code": "600001"}]
+    assert store.load_artifact(revised["recommendations_sha256"]) == [{"stock_code": "600002"}]
+    assert resumed["recommendations_sha256"] == revised["recommendations_sha256"]
+    assert decode_score_snapshot(initial["score_snapshot"], engine=engine)["input_decision_at"] == "2026-11-10T22:20:00"
+    assert decode_score_snapshot(revised["score_snapshot"], engine=engine)["input_decision_at"] == "2026-11-11T08:30:00"
+
+    journal = TerminalJournal(tmp_path)
+    ref = stage_frozen_pool_work(
+        journal, run_uid="4" * 32, build_sha="2" * 40,
+        parent_receipt_uid="a" * 64, source_evidence_sha256="9" * 64, scoring=resumed, engine=engine,
+    )
+    work = read_frozen_pool_work(
+        journal, ref, run_uid="4" * 32, build_sha="2" * 40, trade_date=target, engine=engine,
+    )
+    assert ref["bytes"] < 4096 and "analysis_rows" not in work["scoring"] and "recommendation_rows" not in work["scoring"]
     with engine.connect() as conn:
+        frozen_rows, recommendations, decoded = _load_prepared_score_rows(conn, work)
+        assert decoded['run_uid'] == '4' * 32
+        assert frozen_rows == fixture["analysis_rows"]
+        assert recommendations == [{"stock_code": "600002"}]
         assert conn.execute(text("SELECT stock_code FROM st_recommended_stocks")).scalar_one() == "600001"
 
 

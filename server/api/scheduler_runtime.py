@@ -4628,6 +4628,10 @@ def _strategy_pipeline_dependencies_ready(
             if inputs_ready_at > now.replace(microsecond=0):
                 return False, "formal_pool_inputs_waiting_for_cutoff_second"
             row["_strategy_inputs_ready_at"] = inputs_ready_at
+            row["_strategy_inputs_run_uids"] = {
+                dependency: str(latest_histories[dependency]["run_uid"])
+                for dependency in sorted(evidence_dependencies)
+            }
         return ready, reason
     return evaluate_strategy_pipeline_dependencies(task_type, task_rows, now=now)
 
@@ -8205,6 +8209,7 @@ def _activate_analysis_strategy_pool(
     publication_receipt: dict | None,
     allow_failed_parent: bool = False,
     decision_known_at: datetime | None = None,
+    staged_in_transaction: bool = False,
 ) -> dict[str, object]:
     """Activate one validated pool in the scheduler-success transaction."""
 
@@ -8212,7 +8217,7 @@ def _activate_analysis_strategy_pool(
         return {}
     from server.common.analysis_pool_receipt import publication_receipt_is_valid, publication_is_complete_empty
     if publication_receipt is not None and (
-        not publication_receipt_is_valid(publication_receipt)
+        not publication_receipt_is_valid(publication_receipt, engine=connection)
         or publication_receipt.get("run_uid") != run_uid
     ):
         raise RuntimeError("analysis pool activation score publication is unavailable")
@@ -8330,7 +8335,9 @@ def _activate_analysis_strategy_pool(
         != membership["proof_sha256"]
     ):
         raise RuntimeError("analysis pool activation membership proof differs")
-    staged_manifest = read_persisted_pool_manifest(
+    # save_outputs verified the full immutable projection on this connection.
+    # Only the three live gate fields change between this readback and activation.
+    staged_manifest = publication_receipt if staged_in_transaction and publication_receipt else read_persisted_pool_manifest(
         connection,
         trade_date,
         score_snapshot=(
@@ -8461,6 +8468,8 @@ def _activate_analysis_strategy_pool(
     }).scalar()
     if int(activated or 0) != expected_rows:
         raise RuntimeError("analysis pool activation readback differs")
+    if staged_in_transaction:
+        return activation_receipt()
     activated_manifest = read_persisted_pool_manifest(
         connection,
         trade_date,
@@ -9214,7 +9223,7 @@ def _build_daily_result_delivery_receipt(
     ):
         raise RuntimeError("daily delivery production API result differs")
     dependency_proofs = []
-    degradations = analysis_publication_degradations(publication)
+    degradations = analysis_publication_degradations(publication, engine=connection)
     for task_type in required_dependencies:
         row = latest_by_type[task_type]
         evidence = _history_validation_evidence(row.get("output"))
@@ -9848,6 +9857,7 @@ def _premarket_publication_context(engine, journal, run_uid, output):
     work = read_frozen_pool_work(
         journal, reference, run_uid=run_uid, build_sha=_scheduler_build_commit_sha(),
         trade_date=str(reference["trade_date"]),
+        engine=engine,
     )
     slot = resolve_strategy_pool_decision_slot(
         engine, data_trade_date=work["trade_date"], phase="PREMARKET_REVISION",
@@ -9934,7 +9944,26 @@ def _task_history_finish(
             terminal_step = "verify_governance_runtime"
             runtime_health = _daily_delivery_runtime_health(output, engine=engine)
         revision_context = None
+        initial_selection = None
         transaction = engine.begin
+        if status == "success" and normalized_task_type == "analysis_fast":
+            from contextlib import contextmanager
+            from biz.analysis.sync_analysis_fast import _analysis_execution_lock
+            from server.common.formal_score_publication import FORMAL_SCORE_WORK_SCHEMA
+            from server.common.scheduler_validation import _single_nested_machine_payload
+
+            evidence = _history_validation_evidence(output) or {}
+            initial_selection = _single_nested_machine_payload(
+                str(evidence.get("replay_output") or ""), schema=FORMAL_SCORE_WORK_SCHEMA,
+            )
+            if initial_selection is not None:
+                @contextmanager
+                def transaction():
+                    with _analysis_execution_lock(engine, evidence["target_trade_date"]) as verify_owner:
+                        with engine.begin() as connection:
+                            verify_owner()
+                            yield connection
+                            verify_owner()
         if status == "success" and normalized_task_type == PREMARKET_POOL_TASK:
             from contextlib import contextmanager
             from biz.analysis.sync_analysis_fast import _analysis_execution_lock
@@ -9977,8 +10006,16 @@ def _task_history_finish(
             )
             history_evidence = _history_validation_evidence(output)
             stage_checkpoint = history_evidence
+            if initial_selection is not None and status == "success":
+                from server.common.formal_score_publication import publish_initial_selection
+
+                terminal_step = "publish_initial_scores"
+                publication_receipt = publish_initial_selection(
+                    conn, initial_selection, run_uid=run_uid,
+                    build_sha=intent["identity"]["build_sha"],
+                    trade_date=history_evidence["target_trade_date"],
+                )
             if revision_context is not None and status == "success":
-                from server.common.daily_delivery_control import analysis_publication_reference
                 from server.common.frozen_strategy_pool_work import publish_prepared_premarket_pool
 
                 publication_receipt, activation_receipt, control_receipt = publish_prepared_premarket_pool(
@@ -9986,15 +10023,18 @@ def _task_history_finish(
                     slot=revision_context[1], external_context=revision_context[2],
                     activate_analysis_pool=_activate_analysis_strategy_pool,
                 )
+            if (initial_selection is not None or revision_context is not None) and status == "success":
                 amended = {key: value for key, value in history_evidence.items() if key != "evidence_sha256"}
-                replay = amended["replay_output"] + "\n" + json.dumps(analysis_publication_reference(publication_receipt))
+                replay = amended["replay_output"] + "\n" + json.dumps(
+                    analysis_publication_reference(publication_receipt, engine=conn),
+                )
                 amended.update(replay_output=replay, replay_output_sha256=_history_digest(replay),
                                input_receipt_root_sha256=_history_digest(replay))
                 history_evidence = {**amended, "evidence_sha256": canonical_sha256(amended)}
                 output = json.dumps(history_evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
             if publication_receipt is not None and status == "success":
                 stage_checkpoint = bind_analysis_publication_checkpoint(
-                    history_evidence or {}, publication_receipt,
+                    history_evidence or {}, publication_receipt, engine=conn,
                 )
             stage_attempt = None
             if daily_control_required:
@@ -10042,6 +10082,7 @@ def _task_history_finish(
                     run_uid=str(run_uid or "").strip().lower(),
                     task_type=normalized_task_type,
                     publication_receipt=publication_receipt,
+                    **({"staged_in_transaction": True} if initial_selection is not None else {}),
                 )
             if status == "success" and normalized_task_type == "strategy_governance_daily":
                 terminal_step = "build_delivery_receipt"
@@ -10545,6 +10586,16 @@ def _run_task_impl(
         dispatch_date=dispatch_date,
         now=dispatch_now,
     )
+    source_runs = argument_row.get("_strategy_inputs_run_uids")
+    if _is_formal_initial_analysis(argument_row) and source_runs:
+        from server.common.formal_score_publication import pin_initial_cutoff
+
+        cutoff = pin_initial_cutoff(
+            engine, trade_date=dispatch_date, release_id=strategy_release_identity(),
+            source_runs=source_runs, proposed_cutoff=argument_row["_scheduler_pipeline_decision_at"],
+        )
+        argument_row["_scheduler_execution_time"] = cutoff
+        argument_row["_scheduler_pipeline_decision_at"] = cutoff
     args = _build_task_args(argument_row, script_path, dispatch_date)
     argument_row = {
         **argument_row,
@@ -10574,6 +10625,9 @@ def _run_task_impl(
     )
     if task_type == "analysis_fast":
         _enforce_exact_analysis_inputs(child_env)
+        child_env.pop("PROBIGA_FORMAL_INPUT_RUNS_SHA256", None)
+        if _is_formal_initial_analysis(argument_row) and source_runs:
+            child_env["PROBIGA_FORMAL_INPUT_RUNS_SHA256"] = canonical_sha256(source_runs)
         if row.get("_release_analysis_research_mode") is True:
             child_env["PROBIGA_ANALYSIS_ALLOW_DEGRADED_INPUTS"] = "1"
         child_env["PROBIGA_ANALYSIS_DIAGNOSTICS_ROOT"] = str(
@@ -10923,7 +10977,14 @@ def _run_task_impl(
                 validation_message=validation.message,
             )
             if task_type in ANALYSIS_POOL_PUBLISHER_TASK_TYPES:
-                full_publication_receipt = _analysis_publication_for_checkpoint(machine_output)
+                from server.common.formal_score_publication import FORMAL_SCORE_WORK_SCHEMA
+                from server.common.scheduler_validation import _single_nested_machine_payload
+
+                prepared = _is_formal_initial_analysis(argument_row) and _single_nested_machine_payload(
+                    machine_output, schema=FORMAL_SCORE_WORK_SCHEMA,
+                )
+                if not prepared:
+                    full_publication_receipt = _analysis_publication_for_checkpoint(machine_output)
             history_output = _history_output_with_validation_evidence(
                 output,
                 evidence,

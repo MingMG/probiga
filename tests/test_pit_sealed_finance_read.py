@@ -11,6 +11,7 @@ from tests.test_pit_finance_event_facts import (
     _install_finance_test_catalog,
     _install_prior_finance_coverage,
 )
+from tests.test_formal_scoring_checkpoints import CheckpointStore
 from tests.test_pit_finance_compressed_read import _mysql_transport
 
 
@@ -121,6 +122,22 @@ def test_exact_finance_features_reuse_seal_and_skip_unbound_payloads(exclude, ma
     assert report_dates == {date(2026, 3, 31)}
     assert bound.revision_id in payload_reads
     assert not {coverage.coverage_id, unrelated.revision_id, after.revision_id, seal["seal_coverage_id"]} & payload_reads
+
+    checkpoint = CheckpointStore()
+    formal = {"formal_store": checkpoint, "formal_generation_sha256": "c" * 64}
+    initial_formal = load_sealed_finance_facts(mysql, **args, **formal)
+    assert initial_formal == result
+    payload_reads.clear()
+    projected_reads.clear()
+    report_dates.clear()
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        resumed_formal = load_sealed_finance_facts(mysql, **args, **formal)
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+    assert resumed_formal == result
+    assert list(resumed_formal.facts["000001"]) == list(result.facts["000001"])
+    assert not payload_reads and not projected_reads and not report_dates
 
     with pytest.raises(ValueError, match="SELECTION_DIFFERS"):
         load_sealed_finance_facts(mysql, **{**args, "fact_cutoff_at": decision})
