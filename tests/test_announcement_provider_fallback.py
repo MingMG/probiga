@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from collections import defaultdict
 from copy import deepcopy
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
+from hashlib import sha256
 import json
 import threading
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -17,6 +19,7 @@ from server.common.announcement_provider import (
     CninfoMarketAnnouncementProvider,
     ProviderBackedAnnouncementAdapter,
 )
+from server.common.official_historical_daily_evidence import official_daily_delisting_evidence
 from server.common.qmt_announcement_pit import (
     ANNOUNCEMENT_FALLBACK_REASON_CODES,
     AnnouncementCatalog,
@@ -429,6 +432,183 @@ def test_historical_authority_v3_requires_exact_stock_scope_contract() -> None:
         invalid_v3[field] = value
         with pytest.raises(QMTAnnouncementBlocked):
             validate(invalid_v3)
+
+
+def test_historical_reconstruction_reconciles_official_effective_day_delisting(
+    monkeypatch, tmp_path,
+) -> None:
+    target = date(2026, 11, 13)
+    zone = ZoneInfo("Asia/Shanghai")
+    traded, delisted, no_trade = "000001", "002731", "600519"
+    catalog = AnnouncementCatalog(
+        batch_id="catalog-historical-20261113",
+        manifest_hash="a" * 64,
+        member_set_hash="b" * 64,
+        codes=(traded, delisted, no_trade),
+        qmt_by_code={traded: "000001.SZ", delisted: "002731.SZ", no_trade: "600519.SH"},
+    )
+    published = datetime.combine(target, time.min, tzinfo=zone)
+    observed = published + timedelta(days=1, hours=21)
+    started = observed.replace(tzinfo=None) + timedelta(hours=1)
+    reconstructed = started + timedelta(seconds=20)
+    notice = "证券代码：002731。关于公司股票终止上市暨摘牌的公告。摘牌日期：2026年11月13日。"
+    document = {
+        "source_url": "https://static.cninfo.com.cn/finalpage/2026-11-13/1225669888.PDF",
+        "observed_at": observed.isoformat(),
+        "source_text": notice,
+        "source_text_sha256": sha256(notice.encode()).hexdigest(),
+        "official_document_sha256": "c" * 64,
+        "announcement_id": "1225669888",
+        "announcement_time_ms": int(published.timestamp() * 1000),
+        "source_row_sha256": "d" * 64,
+    }
+    def delisting_entity(proof_document: dict) -> dict:
+        core = {
+            "stock_code": delisted,
+            "classification": "DELISTED",
+            "evidence": official_daily_delisting_evidence(
+                [proof_document], stock_code=delisted, day=target.isoformat(), cutoff=observed,
+            ),
+        }
+        return {**core, "row_hash": pit_canonical_hash(core)}
+
+    entity = delisting_entity(document)
+    daily_manifest_hash = "e" * 64
+    authority = _historical_authority_v3(catalog, target)
+    authority["qmt_daily_truth"].update(
+        provider="qmt_datadir", decision_known_at=observed.isoformat(), attested_row_count=1,
+        truth_hash=daily_manifest_hash,
+    )
+    authority["qmt_daily_truth_sha256"] = pit_canonical_hash(authority["qmt_daily_truth"])
+    authority["reconciliation"].update(attested_daily_count=1, official_delisted_entities=[entity])
+    authority["reconciliation_sha256"] = pit_canonical_hash(authority["reconciliation"])
+
+    def context(candidate: dict) -> HistoricalReconstructionContext:
+        return HistoricalReconstructionContext(
+            target_trade_date=target,
+            source_query_cutoff_at=datetime.combine(target, time.max),
+            reconstruction_started_at=started,
+            scheduler_run_uid="1" * 32,
+            build_sha="2" * 40,
+            authority=candidate,
+        )
+
+    monkeypatch.setattr(
+        ProviderBackedAnnouncementAdapter,
+        "bind_capture_deadline",
+        lambda adapter, **_kwargs: setattr(adapter, "_deadline_monotonic", float("inf")),
+    )
+
+    def capture(candidate: dict, checkpoint_name: str):
+        master = _master(*catalog.codes)
+        client = _Client(
+            masters=[master, master],
+            rows_by_code={traded: [_row_on_date(traded, 0, target)], delisted: [], no_trade: []},
+        )
+        provider = CninfoMarketAnnouncementProvider(
+            client=client, minimum_request_interval=0, now_fn=lambda: started + timedelta(seconds=10),
+        )
+        engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+        ensure_pit_fact_schema(engine)
+        times = iter((started, reconstructed))
+        return engine, synchronize_historical_cninfo_announcements(
+            engine,
+            adapter=ProviderBackedAnnouncementAdapter(provider, workers=1),
+            checkpoint_root=tmp_path / checkpoint_name,
+            catalog=catalog,
+            context=context(candidate),
+            now_fn=lambda: next(times, reconstructed + timedelta(seconds=1)),
+            batch_size=2,
+        )
+
+    engine, result = capture(authority, "native")
+    assert validate_task_result(result, 0) == "complete"
+    assert result["coverage_count"] == 3
+    assert result["reconstruction_provenance"]["authority"]["reconciliation"]["official_delisted_entities"] == [entity]
+
+    stored_catalog = SimpleNamespace(
+        batch_id=catalog.batch_id,
+        manifest_hash=catalog.manifest_hash,
+        member_set_hash=catalog.member_set_hash,
+        members=[
+            {"stock_code": code, "qmt_code": catalog.qmt_by_code[code]}
+            for code in catalog.codes
+        ],
+        eligible_codes=lambda _target: list(catalog.codes),
+    )
+    monkeypatch.setattr("server.common.qmt_stock_catalog.load_stock_catalog", lambda *_a, **_k: stored_catalog)
+
+    def load_exact_manifest(_connection, day, *, decision_known_at, manifest_hash, verify_rows):
+        assert day == target.isoformat()
+        assert decision_known_at == reconstructed
+        assert manifest_hash == daily_manifest_hash
+        assert verify_rows is False
+        return {"entities": [entity]}
+
+    monkeypatch.setattr(
+        "server.common.qmt_datadir_daily_coverage.load_daily_manifest", load_exact_manifest,
+    )
+
+    def read_complete_batch(database):
+        return validate_complete_historical_reconstruction_batch(
+            database,
+            codes=catalog.codes,
+            decision_at=reconstructed + timedelta(seconds=1),
+            window_start=target - timedelta(days=30),
+            window_end=target,
+            expected_trade_date=target,
+        )
+
+    readback = read_complete_batch(engine)
+    assert readback["batch_id"] == result["batch_id"]
+    assert readback["reconstruction_sha256"] == result["reconstruction_sha256"]
+
+    alternate_document = {
+        **document,
+        "source_url": document["source_url"].replace("1225669888", "1225669889"),
+        "announcement_id": "1225669889",
+        "official_document_sha256": "f" * 64,
+        "source_row_sha256": "0" * 64,
+    }
+    substituted = deepcopy(authority)
+    substituted["reconciliation"]["official_delisted_entities"] = [delisting_entity(alternate_document)]
+    substituted["reconciliation_sha256"] = pit_canonical_hash(substituted["reconciliation"])
+    other_engine, accepted_task = capture(substituted, "substituted")
+    assert validate_task_result(accepted_task, 0) == "complete"
+    with pytest.raises(QMTAnnouncementBlocked, match="COMPLETE_BATCH_NOT_FOUND") as blocked:
+        read_complete_batch(other_engine)
+    assert blocked.value.detail == "ValueError"
+
+    wrong_day = deepcopy(authority)
+    wrong_notice = notice.replace("11月13日", "11月16日")
+    wrong_day["reconciliation"]["official_delisted_entities"][0]["evidence"]["documents"][0].update(
+        source_text=wrong_notice, source_text_sha256=sha256(wrong_notice.encode()).hexdigest(),
+    )
+    late = deepcopy(authority)
+    late["reconciliation"]["official_delisted_entities"][0]["evidence"]["documents"][0]["observed_at"] = (
+        observed + timedelta(seconds=1)
+    ).isoformat()
+    overlapping = deepcopy(authority)
+    overlapping["reconciliation"].update(
+        native_no_trade_codes=[delisted], native_no_trade_codes_sha256=pit_canonical_hash([delisted]),
+    )
+    for changed in (wrong_day, late, overlapping):
+        reconciliation = changed["reconciliation"]
+        altered_entity = reconciliation["official_delisted_entities"][0]
+        altered_entity.pop("row_hash")
+        altered_entity["row_hash"] = pit_canonical_hash(altered_entity)
+        changed["reconciliation_sha256"] = pit_canonical_hash(reconciliation)
+        with pytest.raises(QMTAnnouncementBlocked, match="RECONSTRUCTION_AUTHORITY_INVALID"):
+            _validate_reconstruction_context(context(changed), catalog=catalog)
+
+        tampered = deepcopy(result)
+        provenance = tampered["reconstruction_provenance"]
+        provenance["authority"] = changed
+        provenance.pop("reconstruction_sha256")
+        digest = pit_canonical_hash(provenance)
+        provenance["reconstruction_sha256"] = tampered["reconstruction_sha256"] = digest
+        with pytest.raises(ValueError, match="provenance"):
+            validate_task_result(tampered, 0)
 
 
 def _fetch(provider: CninfoMarketAnnouncementProvider, code: str):

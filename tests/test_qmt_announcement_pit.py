@@ -199,7 +199,7 @@ def test_historical_catalog_allows_exact_native_traded_bse_listing_with_official
     monkeypatch.setattr(tool, "load_qmt_daily_market_truth", lambda *a, **k: SimpleNamespace(
         **{**truth, "requested_sessions": (target.isoformat(),)}, as_dict=lambda: truth))
     monkeypatch.setattr(tool, "load_stock_catalog", lambda *a, **k: current if k.get("batch_id") else prior)
-    monkeypatch.setattr(tool, "_load_datadir_reconstruction_scope", lambda *a, **k: ([], {"920085": entity}))
+    monkeypatch.setattr(tool, "_load_datadir_reconstruction_scope", lambda *a, **k: ([], [], {"920085": entity}))
     monkeypatch.setattr(tool, "retained_listing_evidence", lambda *a, **k: {})
     calls = []
 
@@ -225,7 +225,7 @@ def test_historical_catalog_allows_exact_native_traded_bse_listing_with_official
 
 
 @pytest.mark.parametrize("daily_evidence", [
-    "legacy", "datadir", "mismatched_receipt", "late_receipt", "not_listed",
+    "legacy", "datadir", "mismatched_receipt", "late_receipt", "not_listed", "delisted",
 ])
 def test_historical_authority_loader_emits_v3_without_membership(
     monkeypatch, daily_evidence,
@@ -237,20 +237,40 @@ def test_historical_authority_loader_emits_v3_without_membership(
         QMT_ANNOUNCEMENT_SCHEDULER_RECOVERY_ORIGIN,
         _validate_reconstruction_context,
     )
+    from server.common.official_historical_daily_evidence import official_daily_delisting_evidence
     from server.common.qmt_daily_market_truth import QmtDailyMarketTruth
     from tools import sync_qmt_announcement_pit as announcement_tool
 
     target = date(2026, 9, 3)
-    authority_catalog = _stock_catalog(
-        "catalog-20260903",
-        ("000001", "1991-04-03"),
-        ("000002", "1991-01-29"),
-    )
-    prior_catalog = _stock_catalog(
-        "catalog-prior-20260903",
-        ("000001", "1991-04-03"),
-        ("000002", "1991-01-29"),
-    )
+    members = [("000001", "1991-04-03"), ("000002", "1991-01-29")]
+    delisted_entity = None
+    if daily_evidence == "delisted":
+        code = "002731"
+        members.append((code, "2015-01-22"))
+        body = (
+            "证券代码：002731。公司股票终止上市暨摘牌公告。"
+            "公司股票将于2026年9月3日终止上市并摘牌。摘牌日期：2026年9月3日。"
+        )
+        disclosure = {
+            "source_url": "https://static.cninfo.com.cn/finalpage/2026-09-03/1225646928.PDF",
+            "observed_at": "2026-09-05T10:00:00+08:00",
+            "announcement_id": "1225646928",
+            "announcement_time_ms": int(datetime(2026, 9, 3, 9, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp() * 1000),
+            "source_text": body,
+            "source_text_sha256": sha256(body.encode()).hexdigest(),
+            "official_document_sha256": "a" * 64,
+            "source_row_sha256": "b" * 64,
+        }
+        delisted_entity = {
+            "stock_code": code,
+            "classification": "DELISTED",
+            "evidence": official_daily_delisting_evidence(
+                [disclosure], stock_code=code, day=target.isoformat(), cutoff=datetime(2026, 9, 5, 12),
+            ),
+        }
+        delisted_entity["row_hash"] = canonical_digest(delisted_entity)
+    authority_catalog = _stock_catalog("catalog-20260903", *members)
+    prior_catalog = _stock_catalog("catalog-prior-20260903", *members)
     truth = QmtDailyMarketTruth(
         run_id="truth-run-20260903",
         run_start_date=target.isoformat(),
@@ -295,6 +315,7 @@ def test_historical_authority_loader_emits_v3_without_membership(
                     {"stock_code": "000002", "classification": (
                         "NOT_LISTED" if daily_evidence == "not_listed" else "NO_TRADE"
                     )},
+                    *([delisted_entity] if delisted_entity else []),
                 ],
             }
 
@@ -356,7 +377,7 @@ def test_historical_authority_loader_emits_v3_without_membership(
         engine, **args,
     )
 
-    assert catalog.codes == ("000001", "000002")
+    assert catalog.codes == tuple(code for code, _ in members)
     assert authority["schema"] == (
         QMT_ANNOUNCEMENT_RECONSTRUCTION_AUTHORITY_V3_SCHEMA
     )
@@ -369,6 +390,11 @@ def test_historical_authority_loader_emits_v3_without_membership(
     assert "membership_snapshot" not in authority
     assert "membership_snapshot_sha256" not in authority
     assert authority["reconciliation"]["native_no_trade_codes"] == ["000002"]
+    if delisted_entity:
+        assert authority["reconciliation"]["official_delisted_entities"] == [delisted_entity]
+        assert catalog.qmt_by_code[delisted_entity["stock_code"]] == "002731.SZ"
+    else:
+        assert "official_delisted_entities" not in authority["reconciliation"]
     _validate_reconstruction_context(
         HistoricalReconstructionContext(
             target_trade_date=target,
