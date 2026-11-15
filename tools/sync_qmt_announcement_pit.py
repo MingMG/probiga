@@ -1103,6 +1103,96 @@ def _reuse_signed_historical_reconstruction(
     return receipt
 
 
+def _revalidate_located_historical_reconstruction(
+    engine, connection, *, catalog: AnnouncementCatalog, target: date,
+    window_start: date, decision_at: datetime, consumer_release_id: str,
+    validation_build_sha: str,
+) -> Mapping[str, object] | None:
+    """Use a privileged prior completion to locate, then verify, the exact raw batch."""
+    from server.common.component_release_attestation import load_component_attestation
+    from server.common.daily_delivery_control import select_frozen_initial_announcement_source
+    from server.common.pit_facts import _load_certified_initial_event_selection
+
+    phase = "signed-locator"
+    try:
+        proof = select_frozen_initial_announcement_source(
+            connection, trade_date=target.isoformat(), decision_at=decision_at,
+        )
+        if proof is None or proof.receipt.get("mode") not in {
+            "HISTORICAL_RECONSTRUCTION", "HISTORICAL_RECONSTRUCTION_EXISTING",
+        }:
+            return None
+
+        phase = "component-identity"
+        binding = proof.score_binding
+        prior_contract = str(binding["contract_release_id"])
+        prior_producer = str(binding["producer_build_sha"])
+        prior = load_component_attestation(connection, prior_contract)
+        current = load_component_attestation(connection, consumer_release_id)
+        if (
+            prior["scope"] != "COORDINATED"
+            or prior["linux_build_sha"] != prior_contract
+            or prior["contract_build_sha"] != prior_contract
+            or prior["windows_build_sha"] != prior_producer
+            or current["scope"] != "COORDINATED"
+            or current["linux_build_sha"] != consumer_release_id
+            or current["contract_build_sha"] != consumer_release_id
+            or current["windows_build_sha"] != validation_build_sha
+        ):
+            raise ValueError("signed locator producer authority differs")
+
+        phase = "current-scope"
+        receipt = proof.receipt
+        codes = sorted(catalog.codes)
+        if (
+            receipt["batch_id"] != binding["batch_id"]
+            or receipt["batch_root_hash"] != binding["batch_root_hash"]
+            or receipt["source"] != CNINFO_ANNOUNCEMENT_SOURCE
+            or receipt["window_start"] != window_start.isoformat()
+            or receipt["window_end"] != target.isoformat()
+            or receipt["catalog_batch_id"] != catalog.batch_id
+            or receipt["catalog_manifest_hash"] != catalog.manifest_hash
+            or receipt["catalog_member_set_hash"] != catalog.member_set_hash
+            or receipt["stock_count"] != len(codes)
+            or receipt["reconstruction_provenance"]["catalog_codes_sha256"] != canonical_hash(codes)
+        ):
+            raise ValueError("signed locator differs from the current catalog or window")
+
+        phase = "exact-batch"
+        def progress(completed: int, total: int) -> None:
+            if completed == 0 or completed == total or completed % 400 == 0:
+                logger.info(
+                    "historical announcement exact batch revalidation %d/%d target=%s",
+                    completed, total, target,
+                )
+
+        selected = _load_certified_initial_event_selection(
+            engine, proof, codes=codes, decision=decision_at, data_date=target,
+            window_start=window_start, window_end=target, event_progress=progress,
+        )
+        batch = selected.batch
+        if (
+            batch["batch_id"] != receipt["batch_id"]
+            or batch["batch_root_hash"] != receipt["batch_root_hash"]
+            or batch["source"] != receipt["source"]
+            or batch["catalog_member_count"] != len(codes)
+            or set(selected.members) != set(codes)
+        ):
+            raise ValueError("revalidated historical batch does not match its signed locator")
+        return batch
+    except QMTAnnouncementBlocked:
+        # The exact verifier's bounded failure codes include the specific read stage.
+        raise
+    except (KeyError, TypeError, ValueError, RuntimeError, SQLAlchemyError) as exc:
+        original = getattr(exc, "orig", None)
+        args = getattr(original, "args", ())
+        errno = f":errno={args[0]}" if args and type(args[0]) is int else ""
+        raise QMTAnnouncementBlocked(
+            "QMT_ANNOUNCEMENT_SIGNED_RECONSTRUCTION_REVALIDATION_FAILED",
+            f"{phase}:{type(exc).__name__}{errno}",
+        ) from exc
+
+
 def validate_existing_complete_qmt_announcement_batch(
     engine,
     *,
@@ -1355,11 +1445,20 @@ def validate_existing_complete_qmt_announcement_batch(
                 validation_identity_declared and window_days == DEFAULT_WINDOW_DAYS
                 and os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip().lower() == "production"
             ):
+                consumer_release_id = runtime_contract_build_sha(
+                    expected_build_sha=exact_validation_build_sha,
+                )
                 historical = _reuse_signed_historical_reconstruction(
                     connection, catalog=catalog, target=target, window_start=required_start,
-                    decision_at=decision_at,
-                    consumer_release_id=runtime_contract_build_sha(expected_build_sha=exact_validation_build_sha),
+                    decision_at=decision_at, consumer_release_id=consumer_release_id,
                 )
+                if historical is None:
+                    historical = _revalidate_located_historical_reconstruction(
+                        engine, connection, catalog=catalog, target=target,
+                        window_start=required_start, decision_at=decision_at,
+                        consumer_release_id=consumer_release_id,
+                        validation_build_sha=exact_validation_build_sha,
+                    )
             if historical is None:
                 historical = validate_complete_historical_reconstruction_batch(
                     engine,

@@ -437,6 +437,8 @@ def test_historical_authority_v3_requires_exact_stock_scope_contract() -> None:
 def test_historical_reconstruction_reconciles_official_effective_day_delisting(
     monkeypatch, tmp_path,
 ) -> None:
+    from server.common.pit_facts import _bind_signed_historical_event_selection
+
     target = date(2026, 11, 13)
     zone = ZoneInfo("Asia/Shanghai")
     traded, delisted, no_trade = "000001", "002731", "600519"
@@ -563,6 +565,24 @@ def test_historical_reconstruction_reconciles_official_effective_day_delisting(
     assert readback["batch_id"] == result["batch_id"]
     assert readback["reconstruction_sha256"] == result["reconstruction_sha256"]
 
+    def read_signed_batch(database, publication):
+        return _bind_signed_historical_event_selection(
+            database,
+            {**publication, "stage_attempt_uid": "5" * 64, "stage_evidence_sha256": "6" * 64},
+            codes=[traded],
+            decision=reconstructed + timedelta(seconds=2),
+            received=reconstructed,
+            completion=reconstructed + timedelta(seconds=1),
+            window_start=target - timedelta(days=30),
+            window_end=target,
+        )
+
+    signed = read_signed_batch(engine, result)
+    assert tuple(signed.members) == (traded,)
+    assert signed.batch["batch_id"] == result["batch_id"]
+    assert signed.batch["batch_root_hash"] == result["batch_root_hash"]
+    assert signed.batch["reconstruction_provenance"] == result["reconstruction_provenance"]
+
     alternate_document = {
         **document,
         "source_url": document["source_url"].replace("1225669888", "1225669889"),
@@ -578,6 +598,8 @@ def test_historical_reconstruction_reconciles_official_effective_day_delisting(
     with pytest.raises(QMTAnnouncementBlocked, match="COMPLETE_BATCH_NOT_FOUND") as blocked:
         read_complete_batch(other_engine)
     assert blocked.value.detail == "ValueError"
+    with pytest.raises(ValueError, match="effective-day delisting proof differs from the daily manifest"):
+        read_signed_batch(other_engine, accepted_task)
 
     wrong_day = deepcopy(authority)
     wrong_notice = notice.replace("11月13日", "11月16日")
