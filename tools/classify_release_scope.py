@@ -252,6 +252,8 @@ _CONTRACT_WHOLE_FILE_FILES = (
 # Linux-only release already contains the change. Keep this separate from the
 # contract digest: ordinary implementation changes do not invent schema drift.
 _WINDOWS_RUNTIME_FILES = (
+    # The Windows daemon imports the scheduler runtime that enforces its writer ownership.
+    "server/api/scheduler_runtime.py",
     "tools/import_qmt_datadir_daily.py",
     "tools/import_qmt_datadir_history.py",
     "integrations/qmt/datadir.py",
