@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import hashlib
+from inspect import getsource
 import json
 import logging
 import math
@@ -114,7 +115,10 @@ from server.common.chase_risk_policy import (
     CanonicalChaseBar,
     assess_chase_risk,
 )
-from biz.analysis.formal_scoring_checkpoints import checkpoint_factor_frame, formal_factor_generation_sha256
+from biz.analysis.formal_scoring_checkpoints import (
+    checkpoint_factor_frame, checkpoint_stock_factor_frame, formal_factor_generation_sha256,
+    stock_factor_input_hashes,
+)
 from biz.analysis.intraday_reversal import load_index_stability, load_intraday_evidence
 from biz.analysis.tactical_market import (
     MODE_DEFENSIVE,
@@ -139,6 +143,16 @@ _KLINE_FEATURE_DEFAULT_CHUNK_DAYS = 5
 _KLINE_ROLLING_STATE_SCHEMA = "probiga.kline-rolling-feature-state.v2"
 _KLINE_ROLLING_REBUILD_CODE_LIMIT = 500
 _KLINE_TECHNICAL_STOCKS_PER_PART = 512
+_KLINE_TECHNICAL_INPUTS = ("close", "amount", "change_pct", "high", "low")
+_KLINE_TECHNICAL_FACTORS = (
+    "ma5", "ma10", "ma20", "ma60", "amount_ma5", "amount_ma20",
+    "previous_change_pct", "pct_5", "pct_20", "volatility_20", "high_20",
+    "high_60", "low_60", "drawdown_60", "from_low_60", "dist_ma20",
+    "amount_ratio_5", "amount_ratio_20",
+)
+_KLINE_TECHNICAL_PROVENANCE_COLUMNS = (
+    "data_source", "batch_id", "data_version", "quality_status", "permission_status", "received_at",
+)
 
 ProgressCallback = Callable[[dict[str, Any]], None]
 
@@ -1633,13 +1647,66 @@ def _kline_technical_window(df: pd.DataFrame, target: date) -> pd.DataFrame:
     df["amount_ratio_20"] = df["amount"] / df["amount_ma20"].replace(0, np.nan)
 
     latest = df[df["trade_date"] == target].copy()
-    return latest.drop(
-        columns=[
-            "data_source", "batch_id", "data_version", "quality_status",
-            "permission_status", "received_at",
-        ],
-        errors="ignore",
-    )
+    return latest.drop(columns=list(_KLINE_TECHNICAL_PROVENANCE_COLUMNS), errors="ignore")
+
+
+def _checkpoint_kline_technical_window(
+    store: FormalAnalysisStore,
+    frame: pd.DataFrame,
+    target: date,
+    *,
+    progress_callback: ProgressCallback | None,
+) -> tuple[pd.DataFrame, int, int]:
+    target_bars = frame.loc[frame["trade_date"] == target]
+    if target_bars.empty:
+        return target_bars, 0, 0
+    factors = ["stock_code", *_KLINE_TECHNICAL_FACTORS]
+    input_columns = ["stock_code", "trade_date", *_KLINE_TECHNICAL_INPUTS]
+    codes = target_bars["stock_code"].tolist()
+    fingerprints = stock_factor_input_hashes(frame, codes=codes, columns=_KLINE_TECHNICAL_INPUTS)
+    generation = canonical_sha256({
+        "schema": "probiga.formal-daily-technical-factors.v1",
+        "target": target.isoformat(),
+        "formula": hashlib.sha256(getsource(_kline_technical_window).encode("utf-8")).hexdigest(),
+        "columns": [(name, str(frame[name].dtype)) for name in _KLINE_TECHNICAL_INPUTS],
+        "factors": factors,
+        "pandas": pd.__version__,
+        "numpy": np.__version__,
+        "stock_range_size": _KLINE_TECHNICAL_STOCKS_PER_PART,
+    })
+    buckets: dict[int, dict[str, str]] = {}
+    for code, digest in fingerprints.items():
+        bucket = int(code) // _KLINE_TECHNICAL_STOCKS_PER_PART
+        buckets.setdefault(bucket, {})[code] = digest
+
+    def calculate(changed: list[str]) -> pd.DataFrame:
+        inputs = frame.loc[frame["stock_code"].isin(changed), input_columns].copy()
+        computed = _kline_technical_window(inputs, target)
+        if computed.columns.tolist() != [*input_columns, *_KLINE_TECHNICAL_FACTORS]:
+            raise ValueError("formal K-line technical factor outputs differ from their contract")
+        return computed[factors]
+
+    parts = []
+    recomputed = reused = 0
+    for index, (bucket, stock_inputs) in enumerate(sorted(buckets.items()), start=1):
+        part, recalculated = checkpoint_stock_factor_frame(
+            store, generation, "kline_technical", bucket, stock_inputs, calculate,
+        )
+        parts.append(part)
+        recomputed += recalculated
+        reused += len(part) - recalculated
+        _emit_progress(
+            progress_callback, stage="load_kline_technical", percent=12,
+            step=f"日K技术因子 {index}/{len(buckets)} 批，重算 {recomputed} 只，复用 {reused} 只",
+            trade_date=target.isoformat(), done=index, total=len(buckets),
+            kline_technical_recomputed_code_count=recomputed,
+            kline_technical_reused_code_count=reused,
+        )
+    base = target_bars.drop(columns=list(_KLINE_TECHNICAL_PROVENANCE_COLUMNS), errors="ignore")
+    latest = base.merge(pd.concat(parts, ignore_index=True), on="stock_code", validate="one_to_one")
+    if latest["stock_code"].tolist() != codes:
+        raise ValueError("formal K-line technical factor scope differs")
+    return latest, recomputed, reused
 
 
 def _load_kline_features_from_snapshot(
@@ -1992,43 +2059,18 @@ def _load_kline_features_from_snapshot(
 
     if formal_store is None:
         latest = _kline_technical_window(df, target_date)
+        technical_recomputed = len(latest)
+        technical_reused = 0
     else:
-        daily_root = canonical_sha256([
-            [
-                day,
-                daily_window["catalog_batches_by_session"][day],
-                daily_window["daily_partition_roots"][day],
-            ]
-            for day in ordered_dates
-        ])
-        target_bars = df.loc[df["trade_date"] == target_date]
-        stock_codes = sorted(target_bars["stock_code"].unique().tolist())
-        stock_parts = [
-            stock_codes[offset:offset + _KLINE_TECHNICAL_STOCKS_PER_PART]
-            for offset in range(0, len(stock_codes), _KLINE_TECHNICAL_STOCKS_PER_PART)
-        ]
-        features: list[pd.DataFrame] = []
-        for index, part in enumerate(stock_parts, start=1):
-            source_sha256 = formal_factor_generation_sha256(
-                trade_date=trade_date, decision_at=decision_cutoff,
-                stage="kline_technical",
-                source_identity={"daily_window_root": daily_root, "codes": part},
-            )
-            feature, resumed = checkpoint_factor_frame(
-                formal_store, formal_generation_sha256,
-                "kline_technical", source_sha256,
-                lambda: _kline_technical_window(df.loc[df["stock_code"].isin(part)].copy(), target_date),
-            )
-            if feature["stock_code"].tolist() != part:
-                raise ValueError("formal K-line technical factor scope differs")
-            features.append(feature)
-            _emit_progress(
-                progress_callback, stage="load_kline_technical", percent=12,
-                step=f"已计算日K技术因子 {index}/{len(stock_parts)}",
-                trade_date=trade_date, done=index, total=len(stock_parts),
-                checkpoint_reused=resumed,
-            )
-        latest = pd.concat(features, ignore_index=True) if features else target_bars
+        latest, technical_recomputed, technical_reused = _checkpoint_kline_technical_window(
+            formal_store, df, target_date, progress_callback=progress_callback,
+        )
+        logger.info(
+            "Formal daily technical factors: trade_date=%s decision_cutoff=%s "
+            "total=%s recomputed=%s reused=%s",
+            trade_date, decision_cutoff.isoformat(), len(latest),
+            technical_recomputed, technical_reused,
+        )
     if latest.empty:
         raise RuntimeError(f"No K-line rows exactly on {trade_date}")
     result = _attach_canonical_chase_risk_evidence(
@@ -2075,6 +2117,8 @@ def _load_kline_features_from_snapshot(
         kline_feature_chunk_count=len(date_chunks),
         kline_feature_rows=len(result),
         kline_feature_rebuilt_code_count=len(repaired_codes),
+        kline_technical_recomputed_code_count=technical_recomputed,
+        kline_technical_reused_code_count=technical_reused,
         kline_rolling_state_sha256=str(
             rolling_state_receipt.get("state_sha256") or ""
         ),

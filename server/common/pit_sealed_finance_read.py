@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import date, datetime
+from hashlib import sha256
 import json
+from pathlib import Path
 from time import monotonic
 from typing import TYPE_CHECKING, Any, Callable, Iterable
 
@@ -58,6 +60,15 @@ def load_sealed_finance_facts(
     statuses: dict[str, str] = {}
     reasons: dict[str, str] = {}
     deadline = monotonic() + pit.FINANCE_REVISION_MYSQL_DEADLINE_SECONDS
+    baseline_generation = (
+        pit.canonical_hash({
+            "schema": "probiga.finance-issuer-report-baseline.v1",
+            "as_of_date": target.isoformat(),
+            "reader_sha256": sha256(Path(__file__).read_bytes()).hexdigest(),
+            "fact_rules_sha256": sha256(Path(pit.__file__).read_bytes()).hexdigest(),
+        })
+        if formal_store is not None else None
+    )
 
     def read_rows(connection, columns, table, where, parameters, *, stage, index=""):
         mysql = connection.dialect.name == "mysql"
@@ -99,7 +110,7 @@ def load_sealed_finance_facts(
             raise ValueError(f"PIT_SEALED_FINANCE_MEMBERSHIP_DIFFERS:{stage}")
         return observed
 
-    def load_chunk(connection, chunk):
+    def load_chunk(connection, chunk, retained_bindings=None, retained_facts=None):
         members = {code: selection.members[code] for code in chunk if code not in selection.exclusions}
         by_coverage_id = {str(member["coverage_id"]): code for code, member in members.items()}
         if len(by_coverage_id) != len(members) or any(not pit._HASH_RE.fullmatch(key) for key in by_coverage_id):
@@ -142,6 +153,7 @@ def load_sealed_finance_facts(
         ) if predecessor_ids else []
         predecessor_by_id = {row["coverage_id"]: row for row in predecessors}
         bound_reports: dict[str, tuple[str, str]] = {}
+        ordinary_bindings: dict[str, str] = {}
         for coverage_id, row in coverage_rows.items():
             code = by_coverage_id[coverage_id]
             member = members[code]
@@ -202,6 +214,13 @@ def load_sealed_finance_facts(
                     != member["fact_set_hash"]
                 ):
                     raise ValueError(f"PIT_SEALED_FINANCE_FACT_SET_DIFFERS:{code}")
+                if formal_store is not None:
+                    ordinary_bindings[code] = pit.canonical_hash({
+                        "fact_set_hash": member["fact_set_hash"],
+                        "source": row["source"],
+                        "report_date": member["strategy_prefix_binding"].get("latest_report_date"),
+                        "late_date_only_guard": row["watermark_hash"] if known.date() > target else None,
+                    })
                 for binding in bindings:
                     revision_id = binding["revision_id"]
                     if revision_id in bound_reports:
@@ -242,8 +261,24 @@ def load_sealed_finance_facts(
                 continue
             raise ValueError(f"PIT_SEALED_FINANCE_COVERAGE_DISPOSITION_DIFFERS:{code}")
 
+        reused_codes = set()
+        for code, proof_hash in ordinary_bindings.items():
+            if retained_bindings is None or retained_bindings.get(code) != proof_hash:
+                continue
+            prior = retained_facts[code]
+            if bound_reports.get(prior.get("finance_revision_id")) != (code, prior.get("finance_content_hash")):
+                raise ValueError(f"PIT_SEALED_FINANCE_RETAINED_REPORT_BINDING_DIFFERS:{code}")
+            facts[code] = {
+                **prior, "finance_fact_cutoff_at": pit._dt_text(fact_cutoff),
+                "finance_decision_at": pit._dt_text(decision),
+            }
+            reasons[code] = ""
+            reused_codes.add(code)
+        if reused_codes:
+            bound_reports = {key: entry for key, entry in bound_reports.items() if entry[0] not in reused_codes}
+
         if not bound_reports:
-            return
+            return ordinary_bindings
         report_dates = {}
         codes_by_report = defaultdict(list)
         for code in sorted({code for code, _ in bound_reports.values()}):
@@ -375,6 +410,7 @@ def load_sealed_finance_facts(
                 fact.update(finance_published_at=source_date, finance_notice_date=source_date)
             facts[code] = fact
             reasons[code] = ""
+        return ordinary_bindings
 
     def load_checkpointed_chunk(connection, chunk):
         if formal_store is None:
@@ -418,14 +454,46 @@ def load_sealed_finance_facts(
             for field, destination in destinations.items():
                 destination.update(delta[field])
             return
-        load_chunk(connection, chunk)
+        baseline_key = pit.canonical_hash({"codes": chunk})
+        retained = formal_store.get(baseline_generation, "finance_issuer_facts", baseline_key)
+        retained_bindings = retained_facts = None
+        if retained is not None:
+            prior_cutoff, prior_decision = pit._fact_and_decision_times(
+                decision_at=retained["decision_at"], fact_cutoff_at=retained["fact_cutoff_at"],
+            )
+            if prior_cutoff <= fact_cutoff and prior_decision <= decision:
+                retained_bindings = retained["ordinary_bindings"]
+                retained_facts = json.loads(retained["ordered_json"])["facts"]
+                if (
+                    not isinstance(retained_bindings, dict)
+                    or not retained_bindings.keys() <= set(chunk) & retained_facts.keys()
+                    or any(
+                        not isinstance(root, str) or not pit._HASH_RE.fullmatch(root)
+                        or not isinstance(retained_facts[code], dict)
+                        or retained_facts[code].get("finance_fact_cutoff_at") != retained["fact_cutoff_at"]
+                        or retained_facts[code].get("finance_decision_at") != retained["decision_at"]
+                        for code, root in retained_bindings.items()
+                    )
+                ):
+                    raise ValueError("PIT_SEALED_FINANCE_BASELINE_SCOPE_DIFFERS")
+        # Even on a hit, the current verified seal's coverage and binding
+        # rows are checked live. Only the unchanged immutable report payloads
+        # and their already-verified revision chains are retained.
+        ordinary_bindings = load_chunk(connection, chunk, retained_bindings, retained_facts)
         delta = {
             field: {code: values[code] for code in active_codes if code in values}
             for field, values in destinations.items()
         }
-        formal_store.put(formal_generation_sha256, "finance_issuer_facts", key, {
+        state = {
+            "decision_at": pit._dt_text(decision), "fact_cutoff_at": pit._dt_text(fact_cutoff),
+            "ordinary_bindings": ordinary_bindings,
             "ordered_json": json.dumps(delta, ensure_ascii=False, separators=(",", ":"), allow_nan=False),
-        })
+        }
+        formal_store.put(formal_generation_sha256, "finance_issuer_facts", key, state)
+        if retained is None and ordinary_bindings:
+            # The baseline and first slot link the same content-addressed
+            # artifact. A concurrent first writer is safe to retain.
+            formal_store.get_or_put(baseline_generation, "finance_issuer_facts", baseline_key, state)
 
     for code in requested:
         if code in selection.exclusions:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from decimal import Decimal
+import hashlib
 import math
 from typing import TYPE_CHECKING, Any, Callable, Mapping
 
@@ -17,6 +18,7 @@ if TYPE_CHECKING:
 
 
 _SCHEMA = "probiga.formal-scoring-frame.v1"
+_STOCK_FACTORS = "probiga.formal-scoring-stock-factors.v1"
 _DEFAULT_ROWS_PER_PART = 1024
 _MAX_ROWS_PER_PART = 4096
 _MAX_FRAME_ROWS = 200_000
@@ -33,6 +35,29 @@ def formal_factor_generation_sha256(
         "stage": stage,
         "source": dict(source_identity),
     })
+
+
+def stock_factor_input_hashes(
+    frame: pd.DataFrame, *, codes: list[str], columns: tuple[str, ...],
+) -> dict[str, str]:
+    """Hash each security's ordered dated input values without per-row SQL."""
+    groups = frame.groupby("stock_code", sort=False).indices
+    dates = pd.to_datetime(frame["trade_date"]).to_numpy(dtype="datetime64[D]").astype("<i8")
+    values = [frame[column].to_numpy(copy=False) for column in columns]
+    fingerprints = {}
+    for code in codes:
+        positions = groups[code]
+        digest = hashlib.sha256()
+        digest.update(len(positions).to_bytes(8, "little"))
+        digest.update(dates.take(positions).tobytes())
+        for series in values:
+            stock = series.take(positions)
+            digest.update(
+                canonical_sha256([_pack(value) for value in stock]).encode("ascii")
+                if stock.dtype.hasobject else stock.tobytes()
+            )
+        fingerprints[code] = digest.hexdigest()
+    return fingerprints
 
 
 def _pack(value: Any) -> Any:
@@ -187,3 +212,59 @@ def checkpoint_factor_frame(
         artifacts.extend(hashes[key] for key in batch)
     store.put(generation_sha256, stage, source_sha256, {**headers, "parts": artifacts})
     return frame, False
+
+
+def checkpoint_stock_factor_frame(
+    store: FormalAnalysisStore,
+    generation_sha256: str,
+    stage: str,
+    bucket: int,
+    fingerprints: dict[str, str],
+    produce: Callable[[list[str]], pd.DataFrame],
+) -> tuple[pd.DataFrame, int]:
+    """Fill one immutable stock factor partition using its retained baseline."""
+    def source_key(inputs: dict[str, str]) -> str:
+        return canonical_sha256({"schema": _STOCK_FACTORS, "bucket": bucket, "stocks": inputs})
+
+    source = source_key(fingerprints)
+    baseline_key = f"baseline:{bucket}"
+    changed_count = 0
+    establish_baseline = False
+
+    def assemble() -> pd.DataFrame:
+        nonlocal changed_count, establish_baseline
+        baseline = store.get(generation_sha256, stage, baseline_key)
+        retained = pd.DataFrame()
+        unchanged: list[str] = []
+        if baseline is None:
+            establish_baseline = True
+        else:
+            prior_source = baseline["source_sha256"]
+            header = store.get(generation_sha256, stage, prior_source)
+            if header is None:
+                raise ValueError("stock factor baseline checkpoint is unavailable")
+            prior = _read_frame(store, header)
+            prior_inputs = prior.attrs.get("stock_fingerprints")
+            if (
+                not isinstance(prior_inputs, dict) or source_key(prior_inputs) != prior_source
+                or prior["stock_code"].tolist() != sorted(prior_inputs)
+            ):
+                raise ValueError("stock factor baseline identity differs")
+            unchanged = [code for code, digest in fingerprints.items() if prior_inputs.get(code) == digest]
+            retained = prior.loc[prior["stock_code"].isin(unchanged)]
+        changed = sorted(fingerprints.keys() - set(unchanged))
+        changed_count = len(changed)
+        updated = produce(changed) if changed else pd.DataFrame()
+        frame = pd.concat([part for part in (retained, updated) if not part.empty], ignore_index=True)
+        frame = frame.sort_values("stock_code").reset_index(drop=True)
+        if frame["stock_code"].tolist() != sorted(fingerprints):
+            raise ValueError("stock factor checkpoint security coverage differs")
+        frame.attrs = {"stock_fingerprints": fingerprints}
+        return frame
+
+    frame, reused = checkpoint_factor_frame(store, generation_sha256, stage, source, assemble)
+    if frame.attrs.get("stock_fingerprints") != fingerprints or frame["stock_code"].tolist() != sorted(fingerprints):
+        raise ValueError("stock factor checkpoint content identity differs")
+    if establish_baseline:
+        store.get_or_put(generation_sha256, stage, baseline_key, {"source_sha256": source})
+    return frame, 0 if reused else changed_count
