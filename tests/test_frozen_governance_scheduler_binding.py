@@ -264,3 +264,85 @@ def test_frozen_delivery_reads_the_governance_runs_consumed_score_from_the_datab
             with pytest.raises(RuntimeError, match="did not consume the exact frozen score"):
                 scheduler_runtime._require_governance_frozen_score(connection, **kwargs)
     engine.dispose()
+
+
+def test_delivery_reports_only_verified_dated_shadow_source_degradation():
+    import json
+
+    from sqlalchemy import create_engine, text
+
+    from server.common.daily_delivery_control import canonical_sha256
+
+    decision = "2026-11-15T21:14:30"
+    identity = {"run_uid": "3" * 32, "result_hash": "4" * 64}
+    sources = [{
+        "strategy_key": "v3_liquidity_shadow",
+        "strategy_version": "v3-paper:v3_liquidity_shadow",
+        "source_kind": "immutable_v3_sleeve",
+        "reason_code": "SHADOW_V3_COMPLETED_SOURCE_UNAVAILABLE_AS_OF",
+        "decision_known_at": decision,
+    }]
+    engine = create_engine("sqlite://")
+    with engine.begin() as connection:
+        connection.execute(text("""
+            CREATE TABLE st_strategy_governance_run
+            (run_uid TEXT, result_hash TEXT, result_json TEXT)
+        """))
+        connection.execute(text("""
+            INSERT INTO st_strategy_governance_run VALUES (:run_uid, :result_hash, '{}')
+        """), identity)
+
+        def load_degradation(cutoff=decision):
+            return scheduler_runtime._governance_deferred_shadow_degradation(
+                connection, governance_row=identity, decision_known_at=cutoff,
+            )
+
+        def store_evidence(items, digest):
+            candidate_source = {
+                "schema": "probiga.strategy-candidate-source.v2",
+                "status": "COMPLETED",
+                "query_completed": True,
+                "trade_date": "2026-11-13",
+                "publication_proof": {
+                    "schema": "probiga.strategy-candidate-publication-proof.v1",
+                    "status": "COMPLETED",
+                    "trade_date": "2026-11-13",
+                    "publisher_task_type": "analysis_fast",
+                    "membership_snapshot_source": "gj_big_qmt_inner",
+                    "publisher_run_uid": "a" * 32,
+                    "build_sha": "b" * 40,
+                    "canonical_pool_sha256": "c" * 64,
+                    "analysis_score_snapshot_sha256": "d" * 64,
+                    "membership_proof_sha256": "e" * 64,
+                    "decision_known_at": decision,
+                },
+                "deferred_shadow_sources": items,
+                "deferred_shadow_sources_hash": digest,
+                "dynamic_adapter_results": [],
+            }
+            result = {"candidate_source": {
+                **candidate_source, "source_hash": canonical_sha256(candidate_source),
+                "dynamic_adapter_receipts": [],
+            }}
+            connection.execute(
+                text("UPDATE st_strategy_governance_run SET result_json=:result"),
+                {"result": json.dumps(result)},
+            )
+
+        assert load_degradation() is None
+        store_evidence(sources, canonical_sha256(sources))
+        assert load_degradation() == {
+            "stage": "strategy_governance_daily",
+            "reason_code": "SHADOW_V3_COMPLETED_SOURCE_UNAVAILABLE_AS_OF",
+            "count": 1,
+            "strategy_key_sample": ["v3_liquidity_shadow"],
+            "strategy_key_sample_complete": True,
+            "decision_known_at": decision,
+            "deferred_shadow_sources_sha256": canonical_sha256(sources),
+            "governance_result_sha256": identity["result_hash"],
+        }
+        with pytest.raises(RuntimeError, match="shadow source evidence differs"):
+            load_degradation("2026-11-16T00:30:00")
+        store_evidence(sources, "0" * 64)
+        with pytest.raises(RuntimeError, match="shadow source evidence differs"):
+            load_degradation()

@@ -494,6 +494,116 @@ def _recommendation_publication_proof(
     }
 
 
+_MISSING_V3_SOURCE = "SHADOW_V3_COMPLETED_SOURCE_UNAVAILABLE_AS_OF"
+_DEFERRED_SHADOW_FIELDS = frozenset({
+    "strategy_key", "strategy_version", "source_kind", "reason_code", "decision_known_at",
+})
+
+
+def _deferred_shadow_cutoff(proof: Any, trade_date: str) -> str | None:
+    if (
+        not isinstance(proof, dict)
+        or proof.get("schema") != "probiga.strategy-candidate-publication-proof.v1"
+        or proof.get("status") != "COMPLETED" or proof.get("trade_date") != trade_date
+        or proof.get("publisher_task_type") not in ANALYSIS_SCORE_PUBLICATION_TASK_TYPES
+        or proof.get("membership_snapshot_source") != PROVIDER_ID
+        or any(
+            not isinstance(proof.get(key), str)
+            or re.fullmatch(f"[0-9a-f]{{{width}}}", proof[key]) is None
+            or proof[key] == "0" * width
+            for key, width in (
+                ("publisher_run_uid", 32), ("build_sha", 40), ("canonical_pool_sha256", 64),
+                ("analysis_score_snapshot_sha256", 64), ("membership_proof_sha256", 64),
+            )
+        )
+    ):
+        return None
+    cutoff = proof.get("decision_known_at")
+    try:
+        stamp = datetime.fromisoformat(cutoff)
+        day = date.fromisoformat(trade_date)
+        if stamp.tzinfo is None and stamp.isoformat() == cutoff and day.isoformat() == trade_date and stamp.date() >= day:
+            return cutoff
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _deferred_shadow_records(
+    statuses: list[dict[str, Any]], proof: Any, trade_date: str,
+) -> list[dict[str, str]]:
+    cutoff = _deferred_shadow_cutoff(proof, trade_date)
+    if cutoff is None:
+        return []
+    keys = [str(item.get("strategy_key") or "") for item in statuses]
+    if len(keys) != len(set(keys)):
+        return []
+    return [
+        {
+            "strategy_key": item["strategy_key"], "strategy_version": item["strategy_version"],
+            "source_kind": "immutable_v3_sleeve", "reason_code": _MISSING_V3_SOURCE,
+            "decision_known_at": cutoff,
+        }
+        for item in sorted(statuses, key=lambda item: str(item.get("strategy_key") or ""))
+        if item.get("enabled") is True and item.get("source_kind") == "immutable_v3_sleeve"
+        and item.get("lifecycle_status") == "SHADOW" and item.get("status") == "ADAPTER_SOURCE_BLOCKED"
+        and item.get("reason") == _MISSING_V3_SOURCE and item.get("run_receipt_valid") is False
+        and item.get("adapter_capability_status") in {"RESEARCH_READY", "READY"}
+        and _valid_deferred_shadow_identity(item)
+        and not any(item.get(field) for field in (
+            "candidate_run_receipt", "candidate_run_uid", "candidate_receipt_hash",
+            "candidate_count", "shadow_trial_plan_count",
+        ))
+    ]
+
+
+def _valid_deferred_shadow_identity(item: Mapping[str, Any]) -> bool:
+    return all(
+        isinstance(item.get(field), str) and 0 < len(item[field]) <= maximum and item[field] == item[field].strip()
+        for field, maximum in (("strategy_key", 80), ("strategy_version", 160))
+    )
+
+
+def validated_deferred_shadow_sources(candidate_source: Any) -> list[dict[str, str]]:
+    """Read the exact sealed optional-source boundary without inventing a CandidateBatch."""
+    if not isinstance(candidate_source, dict) or not {
+        "deferred_shadow_sources", "deferred_shadow_sources_hash",
+    } & candidate_source.keys():
+        return []
+    raw = candidate_source.get("deferred_shadow_sources")
+    cutoff = _deferred_shadow_cutoff(
+        candidate_source.get("publication_proof"), candidate_source.get("trade_date"),
+    )
+    if (
+        candidate_source.get("schema") != "probiga.strategy-candidate-source.v2"
+        or candidate_source.get("status") != "COMPLETED"
+        or candidate_source.get("query_completed") is not True
+        or cutoff is None or not isinstance(raw, list) or not raw
+        or any(
+            not isinstance(item, dict) or set(item) != _DEFERRED_SHADOW_FIELDS
+            or not _valid_deferred_shadow_identity(item)
+            or item["source_kind"] != "immutable_v3_sleeve" or item["reason_code"] != _MISSING_V3_SOURCE
+            or item["decision_known_at"] != cutoff
+            for item in raw
+        )
+        or _canonical_hash(raw) != candidate_source.get("deferred_shadow_sources_hash")
+        or _canonical_hash({
+            key: value for key, value in candidate_source.items()
+            if key not in {"source_hash", "dynamic_adapter_receipts"}
+        }) != candidate_source.get("source_hash")
+    ):
+        raise ValueError("deferred SHADOW source proof is invalid")
+    keys = [item["strategy_key"] for item in raw]
+    if keys != sorted(set(keys)) or any(
+        not isinstance(items, list) or any(
+            not isinstance(item, dict) or item.get("strategy_key") in keys for item in items
+        )
+        for items in (candidate_source.get("dynamic_adapter_receipts"), candidate_source.get("dynamic_adapter_results"))
+    ):
+        raise ValueError("deferred SHADOW source conflicts with a candidate receipt")
+    return raw
+
+
 def _candidate_source_contract(
     trade_date: str,
     rows: list[dict[str, Any]],
@@ -582,9 +692,12 @@ def _candidate_source_contract(
         dict(item) for item in (dynamic_adapter_statuses or [])
         if isinstance(item, dict) and str(item.get("strategy_key") or "")
     ]
+    deferred = [] if reference_pool else _deferred_shadow_records(dynamic_statuses, fixed_publication_proof, target)
+    deferred_keys = {item["strategy_key"] for item in deferred}
     invalid_dynamic_runs = [
         item for item in dynamic_statuses
         if item.get("enabled") is True
+        and item.get("strategy_key") not in deferred_keys
         and str(item.get("lifecycle_status") or "")
         not in {"RETIRED", "SUSPENDED"}
         and str(item.get("adapter_capability_status") or "")
@@ -662,6 +775,10 @@ def _candidate_source_contract(
         ),
         "dynamic_adapter_results": dynamic_results,
         "dynamic_adapter_results_hash": _canonical_hash(dynamic_results),
+        **({
+            "deferred_shadow_sources": deferred,
+            "deferred_shadow_sources_hash": _canonical_hash(deferred),
+        } if deferred and status == "COMPLETED" else {}),
         "publication_proof": publication_proof,
         "pit_reconstruction": reconstruction,
         "reason": reason,
@@ -4290,7 +4407,7 @@ def _dynamic_execution_signals(
                 decision_known_at is not None
                 and source_kind == "immutable_v3_sleeve"
                 and isinstance(exc, ValueError)
-                and str(exc) == "SHADOW_V3_COMPLETED_SOURCE_UNAVAILABLE_AS_OF"
+                and str(exc) == _MISSING_V3_SOURCE
             ):
                 status.update({
                     "status": "ADAPTER_SOURCE_BLOCKED",
