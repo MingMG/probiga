@@ -167,8 +167,9 @@ def test_dynamic_execution_reuses_one_batch_registry_readiness_snapshot(
 
     observed_statuses = []
 
-    def execute(strategy, _context, *, adapter_status):
+    def execute(strategy, context, *, adapter_status):
         assert adapter_status is strategy["execution_adapter"]
+        assert set(context) == {"trade_date", "recommendation_rows", "market", "configs", "metrics"}
         observed_statuses.append(adapter_status)
         return {
             "signals": [],
@@ -196,6 +197,8 @@ def test_dynamic_execution_reuses_one_batch_registry_readiness_snapshot(
         market={},
         configs={},
         metrics={},
+        analysis_run_uid="1" * 32,
+        decision_known_at="2026-08-24T22:20:00",
     )
 
     assert signals == []

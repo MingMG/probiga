@@ -129,6 +129,89 @@ def test_native_analysis_batch_reaches_bounded_paper_intent_with_frozen_contract
             verify_dynamic_shadow_bootstrap_authorization(connection, auth, require_current_shadow=True)
 
 
+def test_fixed_native_empty_batch_binds_formal_uid_and_cutoff(monkeypatch):
+    strategy = _strategy()
+    context = {
+        "trade_date": "2026-08-21", "analysis_run_uid": "a" * 32,
+        "decision_known_at": "2026-08-23T19:28:45", "market": {"market_state": "extreme_event"},
+        "recommendation_rows": (), "configs": {}, "metrics": {},
+    }
+    consumed = []
+    authority = {"publication_sha256": "1" * 64}
+
+    def source(_connection, target, run_uid, *, decision_known_at):
+        consumed.append((target, run_uid, decision_known_at))
+        return {"status": "COMPLETED", "recommendation_count": 0, "run_uid": run_uid, "trade_date": target, **authority}, {
+            "run_uid": run_uid, "decision_at": decision_known_at, "scored_rows": [_analysis_row()],
+        }
+
+    monkeypatch.setattr(native, "_analysis_source", source)
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    with engine.begin() as connection:
+        _schema(connection)
+        records = []
+        for override in ({}, {"analysis_run_uid": "b" * 32}, {"decision_known_at": "2026-08-23T19:28:46"}):
+            execution = native.native_trial_candidate_batch(connection, strategy, {**context, **override})
+            assert not execution["signals"] and execution["receipt"]["candidate_count"] == 0
+            records.append(persist_strategy_adapter_run_receipt(connection, execution["receipt"]))
+        equivalent = native.native_trial_candidate_batch(connection, strategy, {
+            **context, "analysis_run_uid": "A" * 32, "decision_known_at": "2026-08-23T11:28:45Z",
+        })["receipt"]
+        assert equivalent["input_hash"] == records[0]["input_hash"]
+        authority["publication_sha256"] = "2" * 64
+        changed_receipt = native.native_trial_candidate_batch(connection, strategy, context)["receipt"]
+        assert changed_receipt["input_hash"] != records[0]["input_hash"]
+        for override in (
+            {"analysis_run_uid": None}, {"analysis_run_uid": "0" * 32},
+            {"decision_known_at": None}, {"decision_known_at": "2026-08-20T19:28:45"},
+        ):
+            with pytest.raises(ValueError, match="SHADOW_NATIVE_FROZEN_"):
+                native.native_trial_candidate_batch(connection, strategy, {**context, **override})
+        with pytest.raises(ValueError, match="unknown"):
+            native.native_trial_candidate_batch(connection, strategy, {**context, "unknown": True})
+    assert consumed[:5] == [
+        ("2026-08-21", "a" * 32, "2026-08-23T19:28:45"),
+        ("2026-08-21", "b" * 32, "2026-08-23T19:28:45"),
+        ("2026-08-21", "a" * 32, "2026-08-23T19:28:46"),
+        ("2026-08-21", "a" * 32, "2026-08-23T19:28:45"),
+        ("2026-08-21", "a" * 32, "2026-08-23T19:28:45"),
+    ]
+    assert len({row["input_hash"] for row in records}) == 3
+    assert len({row["stable_result_hash"] for row in records}) == 3
+    assert len({row["output_hash"] for row in records}) == 1
+
+
+def test_fixed_v3_empty_batch_binds_verified_source_result(monkeypatch):
+    strategy = _strategy(sorted(load_v3_config()["sleeves"])[0])
+    context = {
+        "trade_date": "2026-08-21", "analysis_run_uid": "a" * 32,
+        "decision_known_at": "2026-08-23T19:28:45", "market": {"market_state": "extreme_event"},
+        "recommendation_rows": (), "configs": {}, "metrics": {},
+    }
+    probabilities = {
+        state: float(state == "RANGE")
+        for state in strategy["evaluator_config"]["shadow_trial_routing"]["regime_weights"]
+    }
+    run = {
+        "trade_date": context["trade_date"], "run_uid": "d" * 32, "result_hash": "c" * 64,
+        "regime_json": json.dumps({"probabilities": probabilities, "risk_asset_cap": 0.45}),
+        "risk_asset_cap": 0.45,
+    }
+
+    def verified_source(_connection, bound_strategy, target, *, decision_known_at):
+        assert bound_strategy == strategy and target == context["trade_date"]
+        assert decision_known_at == context["decision_known_at"]
+        return {"run": run, "forecasts": {}}
+
+    monkeypatch.setattr(native, "_v3_source", verified_source)
+    first = native.native_trial_candidate_batch(None, strategy, context)["receipt"]
+    run["result_hash"] = "e" * 64
+    second = native.native_trial_candidate_batch(None, strategy, context)["receipt"]
+    assert first["candidate_count"] == second["candidate_count"] == 0
+    assert first["output_hash"] == second["output_hash"]
+    assert first["input_hash"] != second["input_hash"]
+
+
 @pytest.mark.parametrize("change", [
     {"recommend_status": "WATCH"}, {"signal_status": "WATCH"},
     {"chase_risk_status": "BLOCK"}, {"ordinary_buy_eligible": None},

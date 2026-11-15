@@ -4117,9 +4117,11 @@ def _dynamic_execution_signals(
     statuses: list[dict[str, Any]] = []
     shadow_plan_groups: list[dict[str, Any]] = []
     native_source_cache: dict[tuple, Any] = {}
+    native_context = context
     if decision_known_at is not None:
-        context["analysis_run_uid"] = analysis_run_uid
-        context["decision_known_at"] = decision_known_at
+        native_context = {
+            **context, "analysis_run_uid": analysis_run_uid, "decision_known_at": decision_known_at,
+        }
         if native_analysis_source is not None:
             native_source_cache[("analysis", trade_date, analysis_run_uid, decision_known_at)] = native_analysis_source
     governance_connection = (
@@ -4195,12 +4197,12 @@ def _dynamic_execution_signals(
                 from server.engine.strategy_shadow_trials import native_trial_candidate_batch
                 if governance_connection is not None:
                     execution = native_trial_candidate_batch(
-                        governance_connection, strategy, context, source_cache=native_source_cache,
+                        governance_connection, strategy, native_context, source_cache=native_source_cache,
                     )
                 else:
                     with get_engine().connect() as native_connection:
                         execution = native_trial_candidate_batch(
-                            native_connection, strategy, context, source_cache=native_source_cache,
+                            native_connection, strategy, native_context, source_cache=native_source_cache,
                         )
             receipt = execution["receipt"]
             shadow_plan_set: dict[str, Any] | None = None
