@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import math
 import os
 import re
@@ -40,10 +41,14 @@ from server.common.formal_score_publication import (
 
 
 _RELEASE_ROOT = Path("/opt/ProBigA-releases")
+_RELEASE_GIT_CACHE = Path("/var/lib/probiga/release-sources/probiga.git")
+_MAX_SCORER_SOURCE_BYTES = 8 * 1024 * 1024
 _PERMITTED_VALIDATION_FILES = frozenset({
     "server/common/formal_score_recovery.py",
     "server/common/formal_score_source_evidence.py",
     "server/common/scheduler_validation.py",
+    "server/static/index.html",
+    "server/static/js/app.js",
     "tools/run_ai_recommendation_premarket.py",
 })
 _SCORER_FILES = (
@@ -61,9 +66,10 @@ _REQUIRED_INPUTS = frozenset({
 _SHA40 = re.compile(r"[0-9a-f]{40}")
 _RUN_UID = re.compile(r"[0-9a-f]{32}")
 _VALIDATION_ONLY_BODIES = {
-    "server/api/scheduler_runtime.py": "_terminal_snapshot",
-    "server/engine/strategy_center.py": "_dynamic_execution_signals",
-    "server/engine/strategy_shadow_trials.py": "native_trial_candidate_batch",
+    "server/api/routers/hot_data.py": ("_recommended_stocks_v2", "_recommended_data_freshness"),
+    "server/api/scheduler_runtime.py": ("_terminal_snapshot", "_daily_result_recovery_target"),
+    "server/engine/strategy_center.py": ("_dynamic_execution_signals",),
+    "server/engine/strategy_shadow_trials.py": ("native_trial_candidate_batch",),
 }
 _MAX_COMPONENT_PARENT_LINKS = 8
 _MAX_RECOVERY_ATTEMPTS = 8
@@ -91,35 +97,66 @@ def _local_decision(value: str | datetime, *, whole_seconds: bool = True) -> dat
     return result
 
 
+def _protected_release_path(path: Path, *, directory: bool = False) -> os.stat_result:
+    info = path.lstat()
+    expected_type = stat.S_ISDIR if directory else stat.S_ISREG
+    if not expected_type(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        raise FormalScoreContractError("formal recovery checkout is not an immutable release")
+    return info
+
+
 def _trusted_checkout(build_sha: str) -> Path:
     if not _SHA40.fullmatch(build_sha) or build_sha == "0" * 40:
         raise FormalScoreContractError("formal recovery checkout identity is invalid")
     root = _RELEASE_ROOT / build_sha
     try:
-        for candidate in (_RELEASE_ROOT, root, root / ".git"):
-            info = candidate.lstat()
-            is_expected_type = stat.S_ISREG(info.st_mode) if candidate.name == ".git" else stat.S_ISDIR(info.st_mode)
-            if not is_expected_type or info.st_uid != 0 or info.st_mode & 0o022:
-                raise FormalScoreContractError("formal recovery checkout is not an immutable release")
+        _protected_release_path(_RELEASE_ROOT, directory=True)
+        _protected_release_path(root, directory=True)
+        pointer = root / ".git"
+        if _protected_release_path(pointer).st_size > 4096:
+            raise FormalScoreContractError("formal recovery Git worktree pointer exceeds its bound")
+        marker = pointer.read_text(encoding="utf-8").rstrip("\n")
+        control = Path(marker.removeprefix("gitdir: "))
+        if (
+            not marker.startswith("gitdir: ") or control.name in {"", ".", ".."}
+            or control.parent != _RELEASE_GIT_CACHE / "worktrees"
+        ):
+            raise FormalScoreContractError("formal recovery Git worktree is outside the release cache")
+        for directory in (*_RELEASE_GIT_CACHE.parents, _RELEASE_GIT_CACHE,
+                          _RELEASE_GIT_CACHE / "objects", control.parent, control):
+            _protected_release_path(directory, directory=True)
+        for path in (_RELEASE_GIT_CACHE / "config", control / "HEAD", control / "index"):
+            _protected_release_path(path)
+        common_dir = control / "commondir"
+        if _protected_release_path(common_dir).st_size > 16 or common_dir.read_bytes().strip() != b"../..":
+            raise FormalScoreContractError("formal recovery Git common directory differs")
+        for name in ("alternates", "http-alternates"):
+            if os.path.lexists(_RELEASE_GIT_CACHE / "objects" / "info" / name):
+                raise FormalScoreContractError("formal recovery Git cache has object alternates")
     except OSError as exc:
-        raise FormalScoreContractError("formal recovery retained checkout is unavailable") from exc
+        raise FormalScoreContractError("formal recovery active checkout or Git cache is unavailable") from exc
     return root
 
 
-def _git(root: Path, *args: str) -> bytes:
+def _git(root: Path, *args: str, output_limit: int = 256 * 1024) -> bytes:
     safe_env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
-    safe_env["GIT_OPTIONAL_LOCKS"] = "0"
+    safe_env.update(
+        GIT_OPTIONAL_LOCKS="0", GIT_CONFIG_NOSYSTEM="1",
+        GIT_CONFIG_GLOBAL=os.devnull, GIT_NO_LAZY_FETCH="1", GIT_TERMINAL_PROMPT="0",
+    )
     try:
         command = subprocess.run(
             [
-                "git", "--no-replace-objects", "-c", f"safe.directory={root}",
-                "-c", "core.fsmonitor=false", "-C", str(root), *args,
+                "git" if os.name == "nt" else "/usr/bin/git",
+                "--no-replace-objects", "--literal-pathspecs", "-c", f"safe.directory={root}",
+                "-c", "core.fsmonitor=false", "-c", f"core.hooksPath={os.devnull}",
+                "-c", "protocol.allow=never", "-C", str(root), *args,
             ],
-            env=safe_env, capture_output=True, check=True, timeout=5,
+            env=safe_env, stdin=subprocess.DEVNULL, capture_output=True, check=True, timeout=5,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise FormalScoreContractError("formal recovery retained Git proof is unavailable") from exc
-    if len(command.stdout) > 256 * 1024:
+    if len(command.stdout) > output_limit:
         raise FormalScoreContractError("formal recovery Git proof exceeds its bound")
     return command.stdout
 
@@ -130,11 +167,8 @@ def _scorer_source(root: Path, relative: str) -> bytes:
         for parent in path.parents:
             if parent == root:
                 break
-            owner = parent.lstat()
-            if not stat.S_ISDIR(owner.st_mode) or owner.st_uid != 0 or owner.st_mode & 0o022:
-                raise FormalScoreContractError("formal recovery scorer path differs from its retained release")
-        info = path.lstat()
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022 or info.st_size > 8 * 1024 * 1024:
+            _protected_release_path(parent, directory=True)
+        if _protected_release_path(path).st_size > _MAX_SCORER_SOURCE_BYTES:
             raise FormalScoreContractError("formal recovery scorer file is not an immutable release file")
         return path.read_bytes()
     except OSError as exc:
@@ -143,42 +177,100 @@ def _scorer_source(root: Path, relative: str) -> bytes:
 
 def _without_validation_body(path: str, source: bytes) -> str:
     tree = ast.parse(source, filename=path)
-    function_name = _VALIDATION_ONLY_BODIES[path]
-    functions = [
-        node for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == function_name
-    ]
-    if len(functions) != 1:
-        raise FormalScoreContractError("formal recovery isolated validation function is unavailable")
-    functions[0].body = []
+    for name in _VALIDATION_ONLY_BODIES[path]:
+        functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == name]
+        if len(functions) != 1:
+            raise FormalScoreContractError("formal recovery isolated validation function is unavailable")
+        function = functions[0]
+        if name == "_recommended_data_freshness":
+            # The display-only reader gained one optional status input.
+            arguments = function.args
+            if arguments.kwonlyargs and arguments.kwonlyargs[-1].arg == "publication_status":
+                parameter = arguments.kwonlyargs[-1]
+                default = arguments.kw_defaults[-1]
+                if (
+                    isinstance(parameter.annotation, ast.Name) and parameter.annotation.id == "str"
+                    and isinstance(default, ast.Constant) and default.value == ""
+                ):
+                    arguments.kwonlyargs.pop()
+                    arguments.kw_defaults.pop()
+        function.body = []
     return ast.dump(tree)
 
 
+def _scorer_blobs(root: Path, build: str, paths: set[str]) -> dict[str, str]:
+    result = {}
+    entries = _git(root, "ls-tree", "-z", "--full-tree", build, "--", *sorted(paths))
+    for entry in entries.split(b"\0")[:-1]:
+        metadata, _, relative = entry.partition(b"\t")
+        path = relative.decode("utf-8")
+        match = re.fullmatch(rb"100(?:644|755) blob ([0-9a-f]{40})", metadata)
+        if path not in paths or path in result or match is None:
+            raise FormalScoreContractError("formal recovery scorer Git entry differs")
+        result[path] = match.group(1).decode("ascii")
+    if result.keys() != paths:
+        raise FormalScoreContractError("formal recovery scorer Git entries are unavailable")
+    return result
+
+
+def _scorer_blob_bytes(root: Path, blob: str) -> bytes:
+    size = _git(root, "cat-file", "-s", blob, output_limit=32).strip()
+    if not size.isdigit() or int(size) > _MAX_SCORER_SOURCE_BYTES:
+        raise FormalScoreContractError("formal recovery scorer Git blob exceeds its bound")
+    source = _git(root, "cat-file", "blob", blob, output_limit=int(size))
+    if len(source) != int(size) or _blob_oid(source) != blob:
+        raise FormalScoreContractError("formal recovery retained scorer differs from its Git blob")
+    return source
+
+
+def _blob_oid(source: bytes) -> str:
+    return hashlib.sha1(f"blob {len(source)}\0".encode("ascii") + source, usedforsecurity=False).hexdigest()
+
+
 def _same_scorer(previous_build: str, current_build: str) -> bool:
-    previous, current = _trusted_checkout(previous_build), _trusted_checkout(current_build)
+    if not _SHA40.fullmatch(previous_build) or previous_build == "0" * 40:
+        raise FormalScoreContractError("formal recovery previous Git identity is invalid")
+    current = _trusted_checkout(current_build)
     if Path(__file__).resolve().parents[2] != current:
         raise FormalScoreContractError("formal recovery is not running from the sealed current checkout")
-    for root, build in ((previous, previous_build), (current, current_build)):
-        if (
-            _git(root, "rev-parse", "--verify", "HEAD").strip() != build.encode("ascii")
-            or _git(root, "status", "--porcelain=v1", "-z", "--untracked-files=no")
-        ):
-            raise FormalScoreContractError("formal recovery checkout does not match its sealed build")
-    if previous == current:
-        return True
-    changed = _git(current, "diff", "--name-only", "-z", "--no-renames", previous_build, current_build, "--")
+    if (
+        _git(current, "rev-parse", "--verify", "HEAD").strip() != current_build.encode("ascii")
+        or _git(current, "status", "--porcelain=v1", "-z", "--untracked-files=no", "--ignore-submodules=none")
+    ):
+        raise FormalScoreContractError("formal recovery checkout does not match its sealed build")
+    # The caller restricts both builds to signed component lineage and verifies
+    # the originating terminal and immutable score. The root-owned Git cache
+    # retains those commits independently of old deployed worktree directories.
+    if previous_build != current_build and _git(current, "cat-file", "-t", previous_build) != b"commit\n":
+        raise FormalScoreContractError("formal recovery previous Git object is not a commit")
+    changed = b""
+    if previous_build != current_build:
+        changed = _git(
+            current, "diff", "--name-only", "-z", "--no-renames", "--no-ext-diff",
+            "--no-textconv", "--ignore-submodules=none", previous_build, current_build, "--",
+        )
     paths = changed.decode("utf-8").rstrip("\0").split("\0") if changed else []
-    if not paths or any(
+    if (previous_build != current_build and not paths) or any(
         path not in _VALIDATION_ONLY_BODIES and path not in _PERMITTED_VALIDATION_FILES and not path.startswith("tests/")
         for path in paths
     ):
         return False
-    for path in _VALIDATION_ONLY_BODIES.keys() & set(paths):
-        if _without_validation_body(path, _scorer_source(previous, path)) != _without_validation_body(
-            path, _scorer_source(current, path),
-        ):
+    masked_paths = _VALIDATION_ONLY_BODIES.keys() & set(paths)
+    scorer_paths = set(_SCORER_FILES) | masked_paths
+    current_blobs = _scorer_blobs(current, current_build, scorer_paths)
+    previous_blobs = current_blobs if previous_build == current_build else _scorer_blobs(current, previous_build, scorer_paths)
+    for path in sorted(scorer_paths):
+        source = _scorer_source(current, path)
+        oid = _blob_oid(source)
+        if oid != current_blobs[path]:
+            raise FormalScoreContractError("formal recovery current scorer differs from its Git blob")
+        if path in masked_paths:
+            old_source = _scorer_blob_bytes(current, previous_blobs[path])
+            if _without_validation_body(path, old_source) != _without_validation_body(path, source):
+                return False
+        elif previous_blobs[path] != oid:
             return False
-    return all(_scorer_source(previous, name) == _scorer_source(current, name) for name in _SCORER_FILES)
+    return True
 
 
 def _exact_prior_terminal(connection, *, run_uid: str, build_sha: str, trade_date: str,

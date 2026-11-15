@@ -1,5 +1,6 @@
 """Recovery reuses only the attested original score under the next scheduler fence."""
 import json
+import subprocess
 from datetime import datetime
 
 import pandas as pd
@@ -404,19 +405,17 @@ def test_component_path_fails_closed_for_unrelated_ancestor(monkeypatch):
         recovery._compatible_recovery_builds(object(), current)
 
 
-@pytest.mark.parametrize("path,definition", recovery._VALIDATION_ONLY_BODIES.items())
+@pytest.mark.parametrize(
+    "path,definition",
+    [(path, name) for path, names in recovery._VALIDATION_ONLY_BODIES.items() for name in names],
+)
 def test_validation_delta_must_be_confined_to_exact_function_body(path, definition):
-    source = b"""from pathlib import Path
-VERSION = 1
-
-@wrapper
-def _terminal_snapshot(conn):
-    return conn.get()
-
-def calculate(conn):
-    return conn.score()
-"""
-    source = source.replace(b"_terminal_snapshot", definition.encode("ascii"))
+    functions = "".join(
+        f"@wrapper\ndef {name}(conn):\n    return conn.get()\n\n"
+        for name in recovery._VALIDATION_ONLY_BODIES[path]
+    )
+    source = ("from pathlib import Path\nVERSION = 1\n\n"
+              + functions + "def calculate(conn):\n    return conn.score()\n").encode("ascii")
     def normalized(data):
         return recovery._without_validation_body(path, data)
 
@@ -428,6 +427,91 @@ def calculate(conn):
         (f"{definition}(conn)".encode("ascii"), f"{definition}(conn, extra=None)".encode("ascii")),
     ]:
         assert normalized(source) != normalized(source.replace(old, new))
+
+
+def test_display_reader_accepts_only_the_exact_optional_publication_argument():
+    path = "server/api/routers/hot_data.py"
+    original = b"""
+def _recommended_stocks_v2(trade_date):
+    return display(trade_date)
+
+def _recommended_data_freshness(*, total=0):
+    return total
+"""
+    allowed = original.replace(b"total=0", b'total=0, publication_status: str = ""')
+    with_new_required_input = allowed.replace(b'str = ""', b"str")
+    assert recovery._without_validation_body(path, original) == recovery._without_validation_body(path, allowed)
+    assert recovery._without_validation_body(path, original) != recovery._without_validation_body(path, with_new_required_input)
+
+
+def test_pruned_previous_checkout_reuses_only_immutable_git_and_current_scorer(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+
+    def git(*args, cwd=source):
+        return subprocess.run(
+            ["git", "-c", "core.autocrlf=false", "-c", "user.name=Test",
+             "-c", "user.email=test@example.invalid", *args],
+            cwd=cwd, capture_output=True, check=True, timeout=10,
+        ).stdout.decode("ascii").strip()
+
+    git("init")
+    for relative in recovery._SCORER_FILES:
+        path = source / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"def scorer():\n    return 7\n")
+    scheduler = "server/api/scheduler_runtime.py"
+    scheduler_source = b"""
+def _terminal_snapshot(conn):
+    return conn.get()
+
+def _daily_result_recovery_target(conn):
+    return conn.older()
+
+def calculate(conn):
+    return conn.score()
+"""
+    scheduler_file = source / scheduler
+    scheduler_file.parent.mkdir(parents=True, exist_ok=True)
+    scheduler_file.write_bytes(scheduler_source)
+    git("add", ".")
+    git("commit", "-m", "verified prior selection")
+    previous = git("rev-parse", "HEAD")
+
+    scheduler_file.write_bytes(scheduler_source.replace(b"conn.older()", b"conn.exact()"))
+    display_file = source / "server/static/js/app.js"
+    display_file.parent.mkdir(parents=True)
+    display_file.write_bytes(b"renderVerifiedEmpty();\n")
+    git("add", ".")
+    git("commit", "-m", "display and exact recovery selector")
+    current = git("rev-parse", "HEAD")
+
+    releases = tmp_path / "releases"
+    releases.mkdir()
+    cache = tmp_path / "release.git"
+    git("clone", "--bare", str(source), str(cache))
+    git("--git-dir", str(cache), "worktree", "add", "--detach", str(releases / previous), previous)
+    git("--git-dir", str(cache), "worktree", "add", "--detach", str(releases / current), current)
+    git("--git-dir", str(cache), "worktree", "remove", str(releases / previous))
+    assert not (releases / previous).exists()
+    assert git("--git-dir", str(cache), "cat-file", "-t", previous) == "commit"
+
+    checkout = releases / current
+    monkeypatch.setattr(recovery, "_RELEASE_ROOT", releases)
+    monkeypatch.setattr(recovery, "_RELEASE_GIT_CACHE", cache)
+    monkeypatch.setattr(recovery, "__file__", str(checkout / "server/common/formal_score_recovery.py"))
+    # The same proof runs on developer hosts that cannot create root-owned Unix files.
+    monkeypatch.setattr(recovery, "_protected_release_path", lambda path, **_: path.lstat())
+    assert recovery._same_scorer(previous, current)
+    assert recovery._same_scorer(current, current)
+
+    score_file = recovery._SCORER_FILES[0]
+    git("update-index", "--assume-unchanged", score_file, cwd=checkout)
+    (checkout / score_file).write_bytes(b"def scorer():\n    return 8\n")
+    assert git("status", "--porcelain=v1", "--untracked-files=no", cwd=checkout) == ""
+    for build in (previous, current):
+        with pytest.raises(FormalScoreContractError, match="current scorer differs from its Git blob"):
+            recovery._same_scorer(build, current)
 
 
 def _record_takeover(engine, *, old_uid, old_build, new_build, new_claim_at, expired_at, task_expired_at, audit_finished_at):
