@@ -3,12 +3,19 @@
 Windows produces the preliminary upper-limit subject and Linux consumes it to
 publish the complete score universe. Both use the shared codec in
 `server/common/analysis_snapshot_codec.py` through `analysis_pool_receipt.py`.
-Changes to this storage contract require a coordinated Windows/Linux release.
+Changes to the shared preliminary storage contract require a coordinated Windows/Linux release.
 
 New snapshots use `zlib-base64-dictionary-columnar-json-v1`. The logical
 preliminary and score schemas are unchanged. Canonical logical JSON still owns
 `payload_sha256`; frozen row hashes, stock coverage, scores and all provenance
 remain unchanged. `compressed_sha256` separately binds the stored zlib stream.
+
+Linux final scores with a shared historical announcement proof use
+`zlib-base64-dictionary-columnar-score-proof-v1`. Its payload hash binds
+the compact score, including one exact shared proof and the remaining
+per-stock detail. Decoding restores the original scoring rows and event-detail
+strings. The preliminary format and existing receipt identities follow their
+original encoding and validation rules.
 
 The representation contains non-table `metadata`, a global pool of complete
 JSON cell `values`, and ordered column indices for each row table. Index zero

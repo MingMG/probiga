@@ -30,9 +30,12 @@ from server.common.analysis_output_schema import (
     RECOMMENDATION_COLUMN_CONTRACT,
 )
 from server.common.analysis_snapshot_codec import (
+    SCORE_RECONSTRUCTION_STORAGE_KEY,
     SNAPSHOT_DICTIONARY_ENCODING,
+    compact_score_reconstruction,
     decode_snapshot_payload,
     encode_snapshot_payload,
+    expand_score_reconstruction,
 )
 from server.common.verified_daily_market_truth import (
     VERIFIED_FREE_DAILY_ROW_SOURCES,
@@ -49,6 +52,7 @@ PRELIMINARY_ANALYSIS_SNAPSHOT_SCHEMA = (
     "probiga.analysis-preliminary-full-snapshot.v1"
 )
 _HISTORICAL_SNAPSHOT_ENCODING = "zlib-base64-canonical-json-v1"
+_SCORE_RECONSTRUCTION_ENCODING = "zlib-base64-dictionary-columnar-score-proof-v1"
 PRELIMINARY_ANALYSIS_SNAPSHOT_ENCODING = SNAPSHOT_DICTIONARY_ENCODING
 PRELIMINARY_ANALYSIS_SNAPSHOT_MAX_BYTES = 12 * 1024 * 1024
 # Daily delivery caps the complete checkpoint at 15 MiB. Reserve 512 KiB
@@ -509,12 +513,22 @@ def build_score_snapshot(
         payload["frozen_core_inputs"] = _validate_frozen_core_inputs(
             frozen_core_inputs, initial_announcement=payload.get("frozen_announcement_source"),
         )
-    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
-    return _score_snapshot_envelope(payload, raw, _snapshot_compress(payload))
+    compact = compact_score_reconstruction(payload)
+    if compact is not None:
+        # The compact payload pins the shared proof and each row's exact text
+        # fragments. It has a distinct identity domain from historical scores.
+        return _score_snapshot_envelope(
+            compact, _snapshot_json_bytes(compact), _snapshot_compress(compact),
+            encoding=_SCORE_RECONSTRUCTION_ENCODING,
+        )
+    return _score_snapshot_envelope(payload, _snapshot_json_bytes(payload), _snapshot_compress(payload))
 
 
 def decode_score_snapshot(value: Mapping[str, Any], *, trade_date: str | None = None) -> dict[str, Any]:
-    if not isinstance(value, Mapping) or value.get("schema") != SCORE_SNAPSHOT_SCHEMA or value.get("encoding") not in {PRELIMINARY_ANALYSIS_SNAPSHOT_ENCODING, _HISTORICAL_SNAPSHOT_ENCODING}:
+    if not isinstance(value, Mapping) or value.get("schema") != SCORE_SNAPSHOT_SCHEMA or value.get("encoding") not in {
+        PRELIMINARY_ANALYSIS_SNAPSHOT_ENCODING, _HISTORICAL_SNAPSHOT_ENCODING,
+        _SCORE_RECONSTRUCTION_ENCODING,
+    }:
         raise ValueError("ANALYSIS_SCORE_SNAPSHOT_MISSING")
     encoded = str(value.get("payload_base64") or "")
     if not encoded or len(encoded) > SCORE_SNAPSHOT_MAX_BYTES:
@@ -523,10 +537,16 @@ def decode_score_snapshot(value: Mapping[str, Any], *, trade_date: str | None = 
         compressed = base64.b64decode(encoded, validate=True)
         if hashlib.sha256(compressed).hexdigest() != value.get("compressed_sha256"):
             raise ValueError("analysis snapshot compressed root differs")
-        payload, raw = _snapshot_expand(compressed, value["encoding"])
+        dictionary_proof = value["encoding"] == _SCORE_RECONSTRUCTION_ENCODING
+        payload, raw = _snapshot_expand(
+            compressed,
+            PRELIMINARY_ANALYSIS_SNAPSHOT_ENCODING if dictionary_proof else value["encoding"],
+        )
     except (ValueError, TypeError, zlib.error) as exc:
         raise ValueError("ANALYSIS_SCORE_SNAPSHOT_INVALID") from exc
     if not isinstance(payload, dict):
+        raise ValueError("ANALYSIS_SCORE_SNAPSHOT_INVALID")
+    if (SCORE_RECONSTRUCTION_STORAGE_KEY in payload) != dictionary_proof:
         raise ValueError("ANALYSIS_SCORE_SNAPSHOT_INVALID")
     # The producer validates and canonicalizes the complete scored universe
     # once when the immutable snapshot is sealed. Readers authenticate the
@@ -552,6 +572,11 @@ def decode_score_snapshot(value: Mapping[str, Any], *, trade_date: str | None = 
         _validate_frozen_core_inputs(
             payload["frozen_core_inputs"], initial_announcement=payload.get("frozen_announcement_source"),
         )
+    if dictionary_proof:
+        try:
+            return expand_score_reconstruction(payload)
+        except ValueError as exc:
+            raise ValueError("ANALYSIS_SCORE_SNAPSHOT_INVALID") from exc
     return payload
 
 
