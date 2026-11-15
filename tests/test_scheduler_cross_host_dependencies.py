@@ -250,3 +250,64 @@ def test_blocked_peer_dependency_does_not_abort_owned_gap_dispatch(windows_depen
     assert claims.call_count == 1
     assert threads.call_args.kwargs["name"] == "scheduler-task-114"
     assert "linux" not in state.local_calls
+
+
+def test_midpass_windows_lease_retry_preserves_the_running_task(windows_dependencies, monkeypatch):
+    engine = windows_dependencies.engine
+    candidate = dict(scheduler.WINDOWS_QMT_EDGE_TASKS_BY_TYPE["qmt_canonical_history_gap_repair"])
+    candidate.update(id=114, cron_time="00:15", interval_minutes=0, enabled=1,
+                     last_run_at=None, last_triggered_at=None, last_run_status="",
+                     _scheduler_target_trade_date=TARGET, _scheduler_target_available=True)
+    result = MagicMock()
+    result.keys.return_value = tuple(candidate)
+    result.fetchall.return_value = [tuple(candidate.values())]
+    monkeypatch.setattr(windows_dependencies.connection, "execute", lambda *_: result)
+    monkeypatch.setattr(scheduler, "get_engine", lambda: engine)
+    monkeypatch.setattr(scheduler, "_now_shanghai_naive", lambda: NOW)
+    for name in ("_retry_pending_terminal_writes", "_cleanup_stale_running_tasks", "_maybe_cleanup_history",
+                 "_attach_daily_recovery_targets", "_attach_qmt_minute_scope_recovery",
+                 "_attach_research_pool_recovery_target", "_attach_release_analysis_recovery_request"):
+        monkeypatch.setattr(scheduler, name, lambda *_, **__: None)
+    monkeypatch.setattr(scheduler, "_release_catchup_disabled_for_deferred_database", lambda: True)
+    monkeypatch.setattr(scheduler, "_qmt_windows_loop_activation_ready", lambda *_, **__: (True, "ready"))
+    monkeypatch.setattr(scheduler, "_should_skip_non_trading_day", lambda *_, **__: False)
+    for lane in ("core", "fast_lane", "bulk_history", "provider_maintenance", "quote_lane",
+                 "alert_lane", "delivery_lane", "exclusive"):
+        monkeypatch.setattr(scheduler, f"_{lane}_running_task_ids", set())
+    monkeypatch.setattr(scheduler, "_running_task_ids", {111})
+    monkeypatch.setattr(scheduler, "_running_history_uids", {111: "f" * 32})
+    monkeypatch.setattr(scheduler, "_running_procs", {})
+    monkeypatch.setattr(scheduler, "_shutdown_owned_runs", None)
+    monkeypatch.setattr(scheduler, "_scheduler_stopping", False)
+    monkeypatch.setattr(scheduler, "_scheduler_wake_event", scheduler.threading.Event())
+
+    lease = MagicMock()
+    lease.authorized.return_value = True
+    monkeypatch.setattr(scheduler, "_windows_scheduler_lease", lease)
+    claims = MagicMock(side_effect=lambda row, engine, *, run_uid: (True, run_uid))
+    monkeypatch.setattr(scheduler, "_claim_task_run_with_audit", claims)
+    worker = MagicMock()
+    monkeypatch.setattr(scheduler.threading, "Thread", worker)
+    polls = []
+
+    def preflight(*_, **__):
+        if not polls:
+            lease.authorized.return_value = False
+        elif len(polls) == 2:
+            scheduler.begin_scheduler_shutdown()
+        return True, "ready"
+
+    def finish_poll(*_):
+        polls.append((claims.call_count, set(scheduler._running_task_ids), scheduler._scheduler_stopping))
+        lease.authorized.return_value = True
+        return len(polls) >= 3
+
+    monkeypatch.setattr(scheduler, "_qmt_windows_dispatch_preflight", preflight)
+    monkeypatch.setattr(scheduler, "_wait_for_scheduler_poll", finish_poll)
+    scheduler._check_and_run_tasks(mode="standalone")
+
+    assert polls == [(0, {111}, False), (1, {111, 114}, False)]
+    assert worker.call_args.kwargs["name"] == "scheduler-task-114"
+    worker.return_value.start.assert_called_once()
+    assert scheduler._scheduler_stopping
+    assert scheduler._shutdown_owned_runs[111] == "f" * 32
