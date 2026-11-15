@@ -6964,6 +6964,9 @@
                 c.innerHTML = '<div class="loading" style="color:#e74c3c">加载失败: ' + err.message + '</div>';
             });
         },
+        'weekly-strategy': function (d, c) {
+            return window.renderWeeklyStrategy(c, fetchJsonWithTimeout, escHtml);
+        },
         review: function (d, c) {
             // 统一研究报告为默认视图；目标日完全无量化记录时保留旧版历史视图。
             Promise.all([
@@ -8057,7 +8060,8 @@
             {id:'qmt-strategy-results', icon:'◫', label:'QMT每日模拟'}
         ]},
         {id:'reports', group:'复盘、早报与日志', items:[
-            {id:'review', icon:'📋', label:'每日复盘与早报'}
+            {id:'review', icon:'📋', label:'每日复盘与早报'},
+            {id:'weekly-strategy', icon:'◫', label:'周度策略'}
         ]},
         {id:'ai', group:'AI 问答', items:[
             {id:'ai-stock', icon:'📈', label:'股票问答'},

@@ -5427,6 +5427,74 @@ def _quant_review_lookup(review_date: str, adjust_type: int = 0):
     return row, resolved_date != review_date
 
 
+@router.get("/hot-data/weekly-strategy")
+def weekly_strategy(week_of: date | None = Query(default=None)):
+    """Read one closed calendar week with no prior-date substitution."""
+    from biz.review.weekly_strategy import INDEX_NAMES, build_weekly_strategy
+
+    now = datetime.now(timezone(timedelta(hours=8)))
+    today = now.date()
+    anchor = week_of or today - timedelta(days=today.weekday() + 1)
+    start = anchor - timedelta(days=anchor.weekday())
+    end = start + timedelta(days=6)
+    if start > today:
+        raise HTTPException(status_code=422, detail="所选自然周尚未开始")
+    prior_start = start - timedelta(days=7)
+    params = {"prior": prior_start, "start": start, "end": end}
+    calendar = _read_sql(
+        "SELECT /*+ MAX_EXECUTION_TIME(2500) */ trade_date, trade_status FROM si_trade_calendar "
+        "WHERE trade_date BETWEEN :prior AND :end ORDER BY trade_date LIMIT 15", params,
+    )
+    expected = {prior_start + timedelta(days=index) for index in range(14)}
+    if len(calendar) != len(expected) or {row["trade_date"] for row in calendar} != expected:
+        raise HTTPException(status_code=503, detail="交易日历不完整，无法确定本周和前周交易日")
+    sessions = [row["trade_date"] for row in calendar if row["trade_status"] == 1]
+    week_sessions = [day for day in sessions if day >= start]
+    if week_sessions:
+        last_session = week_sessions[-1]
+        if last_session > today or (last_session == today and now.hour < 15):
+            raise HTTPException(status_code=409, detail="所选周仍有未收盘交易日")
+
+    errors = {}
+
+    def read_source(stage, sql, bindings):
+        try:
+            return _read_sql(sql, bindings)
+        except Exception:
+            logger.exception("Weekly strategy source failed: %s", stage)
+            errors[stage] = "读取失败"
+            return []
+
+    digests = read_source(
+        "review",
+        "SELECT /*+ MAX_EXECUTION_TIME(2500) */ review_date, publish_status, data_cutoff_at, generated_at, "
+        "market_structure_json, industry_rotation_json FROM st_quant_review_digest "
+        "WHERE adjust_type = 0 AND review_date BETWEEN :prior AND :end ORDER BY review_date LIMIT 14",
+        params,
+    )
+    codes = {f"code{index}": code for index, code in enumerate(INDEX_NAMES)}
+    placeholders = ", ".join(f":{key}" for key in codes)
+    previous_sessions = [day for day in sessions if day < start]
+    base = previous_sessions[-1] if previous_sessions else start
+    indices = read_source(
+        "indices",
+        "SELECT /*+ MAX_EXECUTION_TIME(2500) */ index_code, trade_date, close FROM sm_index_kline "
+        f"WHERE k_type = 1 AND index_code IN ({placeholders}) AND trade_date BETWEEN :base AND :end "
+        "ORDER BY trade_date, index_code LIMIT 100",
+        {**codes, "base": base, "end": end},
+    )
+    margins = read_source(
+        "margin",
+        "SELECT /*+ MAX_EXECUTION_TIME(2500) */ trade_date, rzye, etl_sync_at FROM st_securities_margin "
+        "WHERE trade_date BETWEEN :start AND :end ORDER BY trade_date LIMIT 7",
+        params,
+    )
+    return build_weekly_strategy(
+        week_start=start, calendar=calendar, digests=digests, indices=indices,
+        margins=margins, source_errors=errors,
+    )
+
+
 @router.get("/hot-data/daily-review/quant")
 def quant_daily_review(
     review_date: str = Query(default_factory=lambda: date.today().isoformat()),
