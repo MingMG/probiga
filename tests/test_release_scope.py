@@ -110,6 +110,7 @@ def _missed_windows_runtime_release(
 
 
 @pytest.mark.parametrize("path", [
+    "server/api/scheduler_runtime.py",
     "tools/import_qmt_datadir_daily.py",
     "server/common/historical_daily_bar_evidence.py",
     "server/common/official_historical_daily_evidence.py",

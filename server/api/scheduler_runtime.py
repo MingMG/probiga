@@ -11704,11 +11704,12 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                     row["_trigger_source"] = "release_catchup"
 
                 with _running_lock:
-                    if _scheduler_stopping or (
-                        _windows_scheduler_lease is not None and not _windows_scheduler_lease.authorized()
-                    ):
+                    if _scheduler_stopping:
                         logger.info("Scheduler shutdown started; stop dispatching new tasks")
                         return
+                    if _windows_scheduler_lease is not None and not _windows_scheduler_lease.authorized():
+                        logger.debug("Windows scheduler owner lease unavailable; defer remaining dispatch")
+                        break
                     task_running = task_id in _running_task_ids
                     if not task_running:
                         proc = _running_procs.get(task_id)
