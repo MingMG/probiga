@@ -60,125 +60,66 @@ def test_strategy_pool_defaults_to_strategy_selected_stocks_without_hiding_resea
     assert "研究观察（不可执行）" in script
 
 
-def test_strategy_pool_uses_only_an_older_readable_batch_as_historical_fallback():
+def test_strategy_pool_page_requests_the_selected_date_without_fallback():
     script = (ROOT / "server/static/js/trading-v3.js").read_text(encoding="utf-8")
-
-    assert "function stockPoolWithHistoricalFallback(requestedDate)" in script
-    assert "function stockPoolIsReadable(pool)" in script
-    assert "return api3('/stock-pool?before_session_date='" in script
-    assert "latestSession<target" in script
-    assert "latest.historical_read_only===true" in script
-    assert "latest.historical_fallback_status||'')==='HISTORICAL_READ_ONLY'" in script
-    assert "runStatus==='COMPLETED'" in script
-    assert "pool.decision_integrity_verified===true" in script
-    assert "pool.pool_readable===true" in script
-    assert "Number.isInteger(stockCount)" in script
-    assert "datePattern.test(sessionDate)" in script
-    assert "candidateCount===actualCandidateCount" in script
-    assert "exactSession===target" in script
-    assert "is_historical_fallback:true" in script
-    assert "exact_run_missing:true" in script
-    assert "历史只读 · 原" in script
-    assert "HISTORICAL_READ_ONLY" in script
-    assert "全部不可执行，也不会创建模拟或真实订单" in script
-    assert "历史保护位 " in script
-    assert "不可作为当前指令" in script
+    assert "dailyResultReadPath(state.requestedDate,state.requestedDateMode)" in script
+    assert "before_session_date=" not in script
+    recommendations = (ROOT / "server/static/js/app.js").read_text(encoding="utf-8")
+    recommendation_query = recommendations.split("function recQueryUrl(d)", 1)[1].split("function recGateUrl", 1)[0]
+    assert "prefer_latest" not in recommendation_query
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node.js unavailable")
-def test_strategy_pool_fallback_executes_fail_closed_for_partial_batches():
-    script = (ROOT / "server/static/js/trading-v3.js").read_text(
-        encoding="utf-8"
-    )
-    start = script.index("  function stockPoolIsReadable(pool)")
-    end = script.index("  function errorText(err)", start)
-    functions = script[start:end]
+def test_strategy_pool_render_ignores_previous_batch_and_distinguishes_verified_empty():
+    script = (ROOT / "server/static/js/trading-v3.js").read_text(encoding="utf-8")
+    helpers = script[script.index("  function stockPoolIsReadable("):script.index("  function errorText(")]
+    render = script[script.index("  function renderCandidates("):script.index("  function renderIntraday(")]
     harness = f"""
 const assert = require('assert');
-let responses = Object.create(null), calls = [];
-function unwrap(value) {{ return value && value.data !== undefined ? value.data : value; }}
-function api3(path) {{
-  calls.push(path);
-  if (!(path in responses)) return Promise.reject(new Error('unexpected '+path));
-  return Promise.resolve(responses[path]);
+const nodes = new Map();
+function el(key) {{
+  if (!nodes.has(key)) nodes.set(key, {{value:'', textContent:'', innerHTML:'', hidden:false, options:[]}});
+  return nodes.get(key);
 }}
-{functions}
-function readable(runUid, session, status, candidateCount) {{
-  const items = Array.from({{length:candidateCount}}, () => ({{is_strategy_candidate:true}}));
-  return {{run_uid:runUid, decision_session_date:session, trade_date:session,
-    execution_session_date:'2026-09-01',
-    pool_readable:true, run_status:'COMPLETED', decision_integrity_verified:true,
-    pool_status:status, items:items,
-    summary:{{stock_count:items.length,strategy_candidate_count:candidateCount}}}};
+const strategyNames = {{}};
+const esc = String;
+const empty = (_, message) => message;
+const state = {{
+  requestedDate:'2026-11-13', stockPool:{{}}, auctionGate:{{}}, dailyResult:{{}},
+  errors:{{}}, candidatePage:1
+}};
+function truthState() {{ return {{code:'UNAVAILABLE'}}; }}
+function renderResearchObservationPool() {{ return {{visible:false}}; }}
+{helpers}
+{render}
+function pool(day, items) {{
+  return {{run_uid:'verified', decision_session_date:day, trade_date:day,
+    execution_session_date:'2026-11-16', pool_readable:true, run_status:'COMPLETED',
+    decision_integrity_verified:true, pool_status:items.length ? 'READY' : 'EMPTY',
+    items, summary:{{stock_count:items.length,strategy_candidate_count:items.length}}}};
 }}
-function boundedReadable(runUid, session, target, status, candidateCount) {{
-  return Object.assign(readable(runUid,session,status,candidateCount), {{
-    before_session_date:target,requested_trade_date:target,
-    is_historical_fallback:true,historical_read_only:true,
-    historical_fallback_status:'HISTORICAL_READ_ONLY',
-    historical_fallback_session_date:session
-  }});
-}}
-(async () => {{
-  responses = {{
-    '/stock-pool?trade_date=2026-08-26': {{run_uid:'partial',
-      decision_session_date:'2026-08-26',trade_date:'2026-08-25',
-      pool_readable:false,run_status:'PROCESSING',
-      decision_integrity_verified:false,pool_status:'UNAVAILABLE',items:[],
-      summary:{{stock_count:0,strategy_candidate_count:0}}}},
-    '/stock-pool?before_session_date=2026-08-26': boundedReadable('older-complete','2026-08-25','2026-08-26','READY',1)
-  }};
-  calls = [];
-  const historical = await stockPoolWithHistoricalFallback('2026-08-26');
-  assert.deepStrictEqual(calls, ['/stock-pool?trade_date=2026-08-26','/stock-pool?before_session_date=2026-08-26']);
-  assert.strictEqual(historical.run_uid, 'older-complete');
-  assert.strictEqual(historical.is_historical_fallback, true);
-  assert.strictEqual(historical.historical_read_only, true);
-  assert.strictEqual(historical.exact_run_unreadable, true);
-
-  responses = {{
-    '/stock-pool?trade_date=2026-08-26': readable('verified-empty','2026-08-26','EMPTY',0)
-  }};
-  calls = [];
-  const empty = await stockPoolWithHistoricalFallback('2026-08-26');
-  assert.deepStrictEqual(calls, ['/stock-pool?trade_date=2026-08-26']);
-  assert.strictEqual(empty.pool_status, 'EMPTY');
-  assert.strictEqual(empty.is_historical_fallback, false);
-  const latestAsOf = readable('latest-as-of','2026-08-28','READY',1);
-  latestAsOf.is_as_of_fallback = true;
-  latestAsOf.requested_trade_date = '2026-08-31';
-  responses = {{
-    '/stock-pool?trade_date=2026-08-31': latestAsOf
-  }};
-  calls = [];
-  const asOf = await stockPoolWithHistoricalFallback('2026-08-31');
-  assert.deepStrictEqual(calls, ['/stock-pool?trade_date=2026-08-31']);
-  assert.strictEqual(asOf.run_uid, 'latest-as-of');
-  assert.strictEqual(asOf.is_as_of_fallback, true);
-  assert.strictEqual(asOf.requested_trade_date, '2026-08-31');
-  const stringCount = readable('forged-string-count','2026-08-26','READY',1);
-  stringCount.summary.stock_count = '1';
-  assert.strictEqual(stockPoolIsReadable(stringCount), false);
-  const futureData = readable('forged-future-data','2026-08-26','READY',1);
-  futureData.trade_date = '2026-08-27';
-  assert.strictEqual(stockPoolIsReadable(futureData), false);
-  const missingExecution = readable('missing-execution','2026-08-26','READY',1);
-  delete missingExecution.execution_session_date;
-  assert.strictEqual(stockPoolIsReadable(missingExecution), false);
-
-  responses = {{
-    '/stock-pool?trade_date=2026-08-26': {{run_uid:null,pool_status:'UNAVAILABLE',
-      pool_readable:false,items:[],summary:{{stock_count:0,strategy_candidate_count:0}}}},
-    '/stock-pool?before_session_date=2026-08-26': Object.assign(boundedReadable('forged','2026-08-25','2026-08-26','READY',1),
-      {{summary:{{stock_count:0,strategy_candidate_count:1}}}})
-  }};
-  calls = [];
-  const unavailable = await stockPoolWithHistoricalFallback('2026-08-26');
-  assert.strictEqual(unavailable.run_uid, null);
-  assert.strictEqual(unavailable.exact_run_missing, true);
-  assert.strictEqual(unavailable.is_historical_fallback, false);
-  process.stdout.write(JSON.stringify({{status:'PASS'}}));
-}})().catch(error => {{ console.error(error); process.exit(1); }});
+el('candidateDate').value = '2026-11-13';
+state.stockPool = {{
+  ...pool('2026-08-31',[{{stock_code:'000011',stock_name:'深物业A',is_strategy_candidate:true}}]),
+  requested_trade_date:'2026-11-13',is_historical_fallback:true,
+  daily_change:{{new_count:1}},strategy_execution:{{strategies:[{{strategy_key:'main_wave'}}]}}
+}};
+state.auctionGate = {{source_run_uid:'verified',decision_date:'2026-08-31'}};
+renderCandidates();
+assert.match(el('candidateCards').innerHTML,/当日暂无策略选股结果/);
+assert.doesNotMatch(el('candidateRows').innerHTML,/深物业A|000011/);
+assert.strictEqual(el('candidateDailyNotice').textContent,'');
+assert.strictEqual(el('candidateAuctionNotice').textContent,'');
+assert.strictEqual(el('candidateStrategyRuns').innerHTML,'');
+assert.strictEqual(el('candidatePoolStats').innerHTML,'');
+assert.strictEqual(el('candidatePager').hidden,true);
+assert.strictEqual(stockPoolMatchesObservationDate(pool('2026-08-31',[]),'2026-11-13'),false);
+assert.strictEqual(stockPoolMatchesObservationDate({{...pool('2026-08-31',[]),is_as_of_fallback:true}},'2026-11-13'),false);
+state.stockPool = {{...pool('2026-11-13',[]),requested_trade_date:'2026-11-13'}};
+renderCandidates();
+assert.match(el('candidateCards').innerHTML,/已发布 · 0 只/);
+assert.strictEqual(stockPoolMatchesObservationDate({{...state.stockPool,historical_read_only:true}},'2026-11-13'),true);
+process.stdout.write(JSON.stringify({{status:'PASS'}}));
 """
     result = subprocess.run(
         [shutil.which("node") or "node", "-"],
@@ -320,9 +261,9 @@ const assert = require('assert');
 {functions}
 const friday = {{authoritative_closed_trade_date:'2026-09-04'}};
 const monday = {{authoritative_closed_trade_date:'2026-09-07'}};
-assert.strictEqual(researchPoolRequestDate('DEFAULT','2026-09-04',friday,{{}}),'2026-09-04');
-assert.strictEqual(researchPoolRequestDate('DEFAULT','2026-09-04',monday,{{}}),'2026-09-07');
-assert.strictEqual(researchPoolRequestDate('EXPLICIT_HISTORICAL','2026-09-03',monday,{{}}),'2026-09-03');
+assert.strictEqual(researchPoolRequestDate('2026-09-04',friday,{{}}),'2026-09-04');
+assert.strictEqual(researchPoolRequestDate('2026-09-04',monday,{{}}),'2026-09-04');
+assert.strictEqual(researchPoolRequestDate('2026-09-03',monday,{{}}),'2026-09-03');
 process.stdout.write(JSON.stringify({{status:'PASS'}}));
 """
     result = subprocess.run(
