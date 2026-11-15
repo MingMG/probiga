@@ -1,7 +1,9 @@
 """Real SQLite daily DDL and ordinary-user job-log recovery, never production."""
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta
+from decimal import Decimal
 import json
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +13,35 @@ from sqlalchemy.exc import OperationalError
 from server.api import scheduler_runtime as runtime
 from server.common import daily_delivery_control as daily
 from server.common.scheduler_tasks import claim_scheduler_task_run
+
+
+def test_terminal_snapshot_preserves_database_decimal_before_and_after_commit(monkeypatch):
+    sqlite3.register_converter("PROBIGA_TEST_DECIMAL", lambda raw: Decimal(raw.decode("ascii")))
+    engine = create_engine("sqlite://", connect_args={"detect_types": sqlite3.PARSE_DECLTYPES})
+    monkeypatch.setattr(runtime, "_terminal_history_row", lambda _conn, uid: {"run_uid": uid})
+    monkeypatch.setattr(runtime, "_terminal_stage_row", lambda _conn, _uid: None)
+    uid = "a" * 32
+    intent = {"outcome": {"status": "success", "task_type": "analysis_fast"}}
+    try:
+        with engine.begin() as conn:
+            conn.exec_driver_sql(f"CREATE TABLE {daily.RECEIPT_TABLE} (receipt_uid TEXT, scheduler_run_uid TEXT)")
+            conn.exec_driver_sql("""
+                CREATE TABLE st_recommended_run_history (
+                    run_uid TEXT, min_score PROBIGA_TEST_DECIMAL TEXT,
+                    market_mood_score PROBIGA_TEST_DECIMAL TEXT
+                )
+            """)
+            conn.exec_driver_sql("INSERT INTO st_recommended_run_history VALUES (?, ?, ?)", (uid, "62.00", "69.70"))
+            exact = conn.exec_driver_sql("SELECT min_score FROM st_recommended_run_history").scalar_one()
+            assert type(exact) is Decimal and exact.as_tuple().exponent == -2
+            before_commit = runtime._terminal_snapshot(conn, uid, intent)
+        with engine.connect() as conn:
+            assert runtime._terminal_snapshot(conn, uid, intent) == before_commit
+        assert before_commit["activation"] == {
+            "run_uid": uid, "min_score": "62.00", "market_mood_score": "69.70",
+        }
+    finally:
+        engine.dispose()
 
 
 @pytest.fixture

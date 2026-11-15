@@ -9681,12 +9681,19 @@ def _terminal_snapshot(connection, uid, intent):
         # The run publication and activation receipt in history are immutable
         # originals. Later legal publications may change the live ACTIVE pool;
         # that mutable projection is not evidence against an earlier COMMIT.
+        from decimal import Decimal
+
         rows = connection.execute(text(
             "SELECT * FROM st_recommended_run_history WHERE run_uid=:uid"
         ), {"uid": uid}).mappings().all()
         if len(rows) != 1:
             raise _TerminalPersistencePending("scheduler terminal publication original unavailable")
-        activation = _terminal_values(dict(rows[0]))
+        # MySQL returns DECIMAL for the score threshold and market mood.
+        # Preserve both precision and scale identically before and after COMMIT.
+        activation = _terminal_values({
+            key: format(value, "f") if isinstance(value, Decimal) and value.is_finite() else value
+            for key, value in rows[0].items()
+        })
     return dict(history=history, stage=stage, session_identity=session,
                 receipts=receipts, activation=activation)
 

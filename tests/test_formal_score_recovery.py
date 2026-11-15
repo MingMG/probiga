@@ -22,7 +22,7 @@ from tests.score_snapshot_helpers import scored_publication
 TARGET = "2026-11-13"
 CUTOFF = "2026-11-15T19:28:45"
 PROPOSAL = "2026-11-15T20:15:00"
-PARENT, CURRENT = "1" * 40, "2" * 40
+PARENT, CURRENT, INTERMEDIATE = "1" * 40, "2" * 40, "f" * 40
 ORIGINAL_RUN, FIRST_RETRY, NEXT_RETRY = "3" * 32, "4" * 32, "5" * 32
 ATTEMPTS = {
     "qmt_stock_daily_canonical": "6" * 32, "target_turnover_snapshot": "7" * 32,
@@ -198,3 +198,103 @@ def test_only_provably_absent_current_ledger_can_use_existing_signed_lite(monkey
     with pytest.raises(FormalScoreContractError, match="cannot authenticate"):
         recovery._verify_component_lineage(object(), RUNTIME)
     assert called == [RUNTIME]
+
+
+def test_recover_original_across_signed_parent_and_unpublished_interrupted_attempts(archived, monkeypatch):
+    engine, original = archived
+    expired_uid, stopped_uid = "e" * 32, "f" * 32
+    intermediate = {**RUNTIME, "linux_build_sha": INTERMEDIATE}
+    current_release = {**RUNTIME, "parent_linux_build_sha": INTERMEDIATE}
+    manifests = {CURRENT: current_release, INTERMEDIATE: intermediate, PARENT: ORIGIN_COMPONENT}
+    monkeypatch.setattr(recovery, "load_runtime_component_release", lambda: current_release)
+    monkeypatch.setattr(recovery, "load_component_attestation", lambda _connection, build: manifests[build])
+    monkeypatch.setattr(recovery, "require_compatible_component_build",
+                        lambda _connection, producer, current: manifests[producer])
+
+    first = load_initial_selection(
+        FormalAnalysisStore(engine), generation=original["generation_sha256"],
+        run_uid=FIRST_RETRY, build_sha=PARENT,
+    )["reference"]
+    expired = load_initial_selection(
+        FormalAnalysisStore(engine), generation=original["generation_sha256"],
+        run_uid=expired_uid, build_sha=INTERMEDIATE,
+    )["reference"]
+    with engine.begin() as conn:
+        for table, key in (("st_daily_stage_attempt", "scheduler_run_uid"), ("st_scheduled_task_history", "run_uid"),
+                           ("st_recommended_run_history", "run_uid")):
+            conn.execute(text(f"DELETE FROM {table} WHERE {key}=:uid"), {"uid": FIRST_RETRY})
+    _record(engine, run_uid=FIRST_RETRY, build=PARENT, historical=first)
+    _record(engine, run_uid=expired_uid, build=INTERMEDIATE, historical=expired)
+    _record(engine, run_uid=stopped_uid, build=INTERMEDIATE, historical=expired)
+    owner_expired = (
+        "TASK_OWNER_LEASE_EXPIRED: exact run lease expired; "
+        "original process result retained in OBSERVED; no publication retried."
+    )
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE st_scheduled_task_history SET output=:o,exit_code=NULL WHERE run_uid=:uid"),
+                     {"uid": expired_uid, "o": json.dumps(expired) + "\n" + owner_expired})
+        conn.execute(text("UPDATE st_scheduled_task_history SET output=:output,status='stopped',exit_code=-15 WHERE run_uid=:uid"),
+                     {"uid": stopped_uid, "output": "调度服务停止；子进程已确认退出。\npartial log"})
+        conn.execute(text("UPDATE st_daily_stage_attempt SET status='STOPPED' WHERE scheduler_run_uid=:uid"),
+                     {"uid": stopped_uid})
+    _record(engine, run_uid=NEXT_RETRY, build=CURRENT)
+
+    rebound = _recover(engine, NEXT_RETRY)["reference"]
+    assert rebound["run_uid"] == NEXT_RETRY
+    assert rebound["selection_sha256"] == original["selection_sha256"]
+    assert rebound["decision_at"] == CUTOFF
+    recovery.verify_recovered_initial_selection(engine, rebound, proposed_cutoff=PROPOSAL)
+
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE st_scheduled_task_history SET output=:o WHERE run_uid=:uid"),
+                     {"uid": expired_uid, "o": json.dumps(expired)})
+    assert _recover(engine, NEXT_RETRY) is None
+
+
+@pytest.mark.parametrize("status, published", [("running", False), ("stopped", True), ("success", False)])
+def test_cannot_search_past_active_or_published_attempts(archived, status, published):
+    engine, _ = archived
+    stopped = "调度服务停止；子进程已确认退出。"
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE st_scheduled_task_history SET status=:status,output=:log,finished_at=:finish "
+                          "WHERE run_uid=:uid"),
+                     {"uid": FIRST_RETRY, "status": status, "log": stopped, "finish": "2026-11-15T20:09:59"})
+        conn.execute(text("UPDATE st_daily_stage_attempt SET status=:status,finished_at=:finish WHERE scheduler_run_uid=:uid"),
+                     {"uid": FIRST_RETRY, "status": status.upper(), "finish": "2026-11-15T20:10:00"})
+        if published:
+            conn.execute(text("UPDATE st_recommended_run_history SET published_at=:stamp WHERE run_uid=:uid"),
+                         {"uid": FIRST_RETRY, "stamp": "2026-11-15T20:10:00"})
+    _record(engine, run_uid=NEXT_RETRY, build=CURRENT)
+    assert _recover(engine, NEXT_RETRY) is None
+
+
+def test_component_path_fails_closed_for_unrelated_ancestor(monkeypatch):
+    current = {**RUNTIME, "parent_linux_build_sha": INTERMEDIATE}
+    intermediate = {**RUNTIME, "linux_build_sha": INTERMEDIATE}
+    monkeypatch.setattr(recovery, "_verify_component_lineage", lambda *_: intermediate)
+    monkeypatch.setattr(recovery, "load_component_attestation",
+                        lambda _connection, build: {**ORIGIN_COMPONENT, "windows_build_sha": "e" * 40})
+    with pytest.raises(FormalScoreContractError, match="parent scope differs"):
+        recovery._compatible_recovery_builds(object(), current)
+
+
+def test_scheduler_delta_must_be_confined_to_terminal_projection_body():
+    source = b"""from pathlib import Path
+VERSION = 1
+
+@wrapper
+def _terminal_snapshot(conn):
+    return conn.get()
+
+def calculate(conn):
+    return conn.score()
+"""
+    normalized = recovery._scheduler_outside_terminal_projection
+    assert normalized(source) == normalized(source.replace(b"return conn.get()", b"return normalize(conn.get())"))
+    for old, new in [
+        (b"VERSION = 1", b"VERSION = 2"),
+        (b"return conn.score()", b"return 0"),
+        (b"@wrapper", b"@other_wrapper"),
+        (b"_terminal_snapshot(conn)", b"_terminal_snapshot(conn, extra=None)"),
+    ]:
+        assert normalized(source) != normalized(source.replace(old, new))
