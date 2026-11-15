@@ -34,6 +34,7 @@ CHINA = ZoneInfo("Asia/Shanghai")
 MANIFEST_TABLE = "qmt_history_coverage_manifest"
 ENTITY_TABLE = "qmt_history_coverage_entity"
 NATIVE_AMOUNT_WORD = 2 ** 32
+ENTITY_INSERT_BATCH_SIZE = 256
 
 
 def _scope(engine):
@@ -351,6 +352,7 @@ def validate_manifest(manifest: Mapping[str, Any], *, catalog, calendar) -> dict
 
 def insert_manifest(connection, manifest: dict) -> None:
     """Append one immutable proof in the same transaction as its daily rows."""
+    created_at = connection.execute(text("SELECT CURRENT_TIMESTAMP")).scalar_one()
     entities = manifest["entities"]
     traded = [entity["stock_code"] for entity in entities if entity["classification"] == "TRADED"]
     absent = [entity["stock_code"] for entity in entities if entity["classification"] != "TRADED"]
@@ -362,14 +364,18 @@ def insert_manifest(connection, manifest: dict) -> None:
               "expected_traded_set_hash": canonical_digest(traded), "actual_traded_set_hash": canonical_digest(traded),
               "no_trade_set_hash": canonical_digest(absent),
               "entity_root_hash": canonical_digest([entity["row_hash"] for entity in entities]), "reason_count": 0,
-              "manifest_json": json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":"))}
+              "manifest_json": json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+              "created_at": created_at}
     keys = ("manifest_hash", "schema_version", "dataset", "period", "provider", "trade_date", "status",
             "strategy_eligible", "run_id", "catalog_batch_id", "catalog_manifest_hash", "calendar_batch_id",
             "calendar_manifest_hash", "source_batch_id", "grid_profile", "expected_entity_count", "entity_count",
             "expected_traded_count", "actual_traded_count", "no_trade_count", "bar_count", "expected_entity_set_hash",
             "expected_traded_set_hash", "actual_traded_set_hash", "no_trade_set_hash", "entity_root_hash", "reason_count",
-            "captured_at", "manifest_json")
-    connection.execute(text(f"INSERT INTO {MANIFEST_TABLE} ({','.join(keys)},created_at) VALUES ({','.join(':'+key for key in keys)},CURRENT_TIMESTAMP)"), params)
+            "captured_at", "manifest_json", "created_at")
+    connection.execute(
+        text(f"INSERT INTO {MANIFEST_TABLE} ({','.join(keys)}) VALUES ({','.join(':'+key for key in keys)})"),
+        params,
+    )
     persisted_entities = []
     for entity in entities:
         traded_bar = entity["classification"] == "TRADED"
@@ -377,8 +383,18 @@ def insert_manifest(connection, manifest: dict) -> None:
         persisted_entities.append({"manifest_hash": manifest["manifest_hash"], "stock_code": entity["stock_code"],
                             "state": entity["classification"], "bars": int(traded_bar),
                             "times": canonical_digest([day] if traded_bar else []), "day": day,
-                            "source_hash": canonical_digest(entity["evidence"]), "row_hash": entity["row_hash"]})
-    connection.execute(text(f"INSERT INTO {ENTITY_TABLE} (manifest_hash,stock_code,expected_state,classification,bar_count,time_set_hash,first_time,last_time,source_row_hash,row_hash,created_at) VALUES (:manifest_hash,:stock_code,:state,:state,:bars,:times,:day,:day,:source_hash,:row_hash,CURRENT_TIMESTAMP)"), persisted_entities)
+                            "source_hash": canonical_digest(entity["evidence"]), "row_hash": entity["row_hash"],
+                            "created_at": created_at})
+    # PyMySQL batches only VALUES tuples composed entirely of bind parameters.
+    statement = text(f"""
+        INSERT INTO {ENTITY_TABLE}
+          (manifest_hash,stock_code,expected_state,classification,bar_count,time_set_hash,
+           first_time,last_time,source_row_hash,row_hash,created_at)
+        VALUES
+          (:manifest_hash,:stock_code,:state,:state,:bars,:times,:day,:day,:source_hash,:row_hash,:created_at)
+    """)
+    for offset in range(0, len(persisted_entities), ENTITY_INSERT_BATCH_SIZE):
+        connection.execute(statement, persisted_entities[offset:offset + ENTITY_INSERT_BATCH_SIZE])
 
 
 def load_daily_manifest(engine, day: str, *, decision_known_at: datetime | str,
