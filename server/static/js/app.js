@@ -11706,7 +11706,7 @@
             var res = results[0] || {};
             res.gate = results[1] || {};
             res.runtime_params = results[2] || {};
-            setStatus('AI 推荐结果已就绪。');
+            setStatus(res.error ? 'AI 推荐结果读取失败。' : 'AI 推荐结果已读取。');
             renderRecommendedPage(container, res, d);
             try {
                 if (window.sessionStorage && Array.isArray(res.data) && res.data.length) {
@@ -12010,9 +12010,11 @@
         var gateNews = gate.news || {};
         var gateDegraded = gate.status === 'error' || gate.status === 'degraded';
         var hasDisplayedRecommendation = rawItems.length > 0;
+        var publishedEmpty = data.identity_verified === true && data.data_status === 'READY'
+            && data.publication_status === 'VERIFIED_EMPTY' && data.published_total === 0;
         var fresh = data.freshness || {};
         var showingFallbackRecommendation = !!(fresh.is_fallback_date || (data.date && dateStr && data.date !== dateStr));
-        gateReady = !!(gateReady || gate.has_recommendation || gateRec.count || hasDisplayedRecommendation);
+        gateReady = !!(gateReady || gate.has_recommendation || gateRec.count || hasDisplayedRecommendation || publishedEmpty);
         var gateColor = gateReady ? '#16a34a' : (gateDegraded ? '#d97706' : '#dc2626');
         var gateBg = gateReady ? '#ecfdf5' : (gateDegraded ? '#fff7ed' : '#fff1f2');
         var gateStatusText = gateDegraded ? '门禁状态待确认' : (gateReady ? (showingFallbackRecommendation ? '显示最近推荐日' : '数据可用') : '目标日推荐未生成');
@@ -12227,15 +12229,24 @@
         h += '</div>';
 
         if (!items.length) {
-            var emptyTitle = rawItems.length ? '当前筛选条件下暂无候选' : (fresh.status === 'missing' ? '目标交易日尚未生成推荐' : '当前没有可展示的推荐候选');
-            var emptyReason = rawItems.length ? '可以放宽策略、状态或最低分筛选。' : (readinessSources.some(function(s) { return s.required && !s.ready; }) ? '基础数据覆盖不足，系统会先补齐 K 线和资金流，再重新运行推荐。' : '请先运行 AI 推荐筛选，或切换到最近一个有数据的推荐日。');
-            h += '<div style="margin:0 0 14px;padding:12px 14px;border-radius:10px;background:#fff7ed;border:1px solid #fed7aa;color:#9a3412;"><div style="font-weight:900;">' + emptyTitle + '</div><div style="font-size:12px;margin-top:4px;line-height:1.6;">' + emptyReason + ' 不会自动下单，盘中建议仍需人工确认。</div></div>';
-            h += '<div style="text-align:center;padding:60px 20px;color:#888;">';
-            h += '<div style="font-size:48px;margin-bottom:16px;">💎</div>';
-            h += '<div style="font-size:16px;font-weight:600;color:#555;margin-bottom:8px;">当前无买入信号</div>';
-            h += '<div style="font-size:13px;color:#999;margin-bottom:8px;">系统已完成筛选，但没有股票满足买点/观察候选条件。</div>';
-            h += '<div style="font-size:12px;color:#aaa;">筛选日期: ' + dateInfo + '；卖出提醒和风险票不会再占用 AI推荐买入榜。</div>';
-            h += '</div>';
+            var emptyTitle;
+            var emptyReason;
+            if (publishedEmpty) {
+                emptyTitle = (showingFallbackRecommendation ? '最近发布日 ' : '已发布 ') + data.date + ' · 0 只';
+                emptyReason = '已分析 ' + data.analysis_count + ' 只股票，当批没有符合条件的候选。';
+            } else if (rawItems.length) {
+                emptyTitle = '当前筛选条件下暂无候选';
+                emptyReason = '可以放宽策略、状态或最低分筛选。';
+            } else if (data.error) {
+                emptyTitle = '推荐结果读取失败';
+                emptyReason = data.error;
+            } else {
+                emptyTitle = fresh.status === 'missing' ? '目标交易日尚未生成推荐' : '当前没有可展示的推荐候选';
+                emptyReason = readinessSources.some(function(s) { return s.required && !s.ready; })
+                    ? '基础数据覆盖不足，系统会先补齐 K 线和资金流，再重新运行推荐。'
+                    : '可切换到已发布日期查看推荐。';
+            }
+            h += '<div style="margin:0 0 14px;padding:12px 14px;border-radius:10px;background:' + (publishedEmpty ? '#ecfdf5;border:1px solid #bbf7d0;color:#166534' : '#fff7ed;border:1px solid #fed7aa;color:#9a3412') + ';"><div style="font-weight:900;">' + safeText(emptyTitle) + '</div><div style="font-size:12px;margin-top:4px;line-height:1.6;">' + safeText(emptyReason) + '</div></div>';
             // 进度条（空数据时也需要显示）
             h += '<div id="recProgressBar" style="display:none;margin-bottom:14px;padding:10px 14px;background:#1a1a2e;border-radius:8px;border:1px solid #2a2a4a;">';
             h += '<div style="display:flex;align-items:center;gap:10px;">';
