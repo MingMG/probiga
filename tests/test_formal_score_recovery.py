@@ -44,15 +44,17 @@ def _record(engine, *, run_uid, build, historical=None, published=False, started
     with engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO st_daily_stage_attempt
-                (session_uid, scheduler_run_uid, stage_name, status, started_at, finished_at)
-            VALUES ('session', :uid, 'analysis_fast', :status, :started, :finish)
-        """), {"uid": run_uid, "status": status, "started": started, "finish": finish})
+                (session_uid, scheduler_run_uid, stage_name, status, started_at, finished_at,
+                 shard_id, lease_owner, fencing_token)
+            VALUES ('session', :uid, 'analysis_fast', :status, :started, :finish,
+                    'main', :owner, (SELECT COALESCE(MAX(fencing_token), 0) + 1 FROM st_daily_stage_attempt))
+        """), {"uid": run_uid, "status": status, "started": started, "finish": finish, "owner": "linux-" + run_uid[:6]})
         conn.execute(text("""
             INSERT INTO st_scheduled_task_history
-                (run_uid, task_type, build_sha, status, finished_at, exit_code, output)
-            VALUES (:uid, 'analysis_fast', :build, :status, :finish, :exit, :output)
+                (run_uid, task_type, build_sha, status, finished_at, exit_code, output, scheduler_instance_id)
+            VALUES (:uid, 'analysis_fast', :build, :status, :finish, :exit, :output, :owner)
         """), {"uid": run_uid, "build": build, "status": status.lower(), "finish": finish,
-               "exit": 0 if historical else None, "output": output})
+               "exit": 0 if historical else None, "output": output, "owner": "linux-" + run_uid[:6]})
         conn.execute(text("""
             INSERT INTO st_recommended_run_history
                 (run_uid, scheduler_job_id, trade_date, min_score, top_n, execution_time, published_at, canonical_pool_sha256)
@@ -67,8 +69,8 @@ def archived(tmp_path, monkeypatch):
     with engine.begin() as conn:
         for ddl in (
             "CREATE TABLE st_daily_delivery_session (session_uid TEXT PRIMARY KEY,trade_date TEXT,release_id TEXT,strategy_release_id TEXT)",
-            "CREATE TABLE st_daily_stage_attempt (id INTEGER PRIMARY KEY,session_uid TEXT,scheduler_run_uid TEXT,stage_name TEXT,status TEXT,started_at TEXT,finished_at TEXT)",
-            "CREATE TABLE st_scheduled_task_history (run_uid TEXT PRIMARY KEY,task_type TEXT,build_sha TEXT,status TEXT,finished_at TEXT,exit_code INTEGER,output TEXT)",
+            "CREATE TABLE st_daily_stage_attempt (id INTEGER PRIMARY KEY,session_uid TEXT,scheduler_run_uid TEXT,stage_name TEXT,status TEXT,started_at TEXT,finished_at TEXT,shard_id TEXT,lease_owner TEXT,fencing_token INTEGER,lease_until TEXT,error_code TEXT,output_dataset_id TEXT)",
+            "CREATE TABLE st_scheduled_task_history (run_uid TEXT PRIMARY KEY,task_type TEXT,build_sha TEXT,status TEXT,finished_at TEXT,exit_code INTEGER,output TEXT,scheduler_instance_id TEXT)",
             "CREATE TABLE st_recommended_run_history (run_uid TEXT PRIMARY KEY,scheduler_job_id TEXT,trade_date TEXT,min_score REAL,top_n INTEGER,execution_time TEXT,published_at TEXT,canonical_pool_sha256 TEXT)",
         ):
             conn.exec_driver_sql(ddl)
@@ -298,3 +300,82 @@ def calculate(conn):
         (b"_terminal_snapshot(conn)", b"_terminal_snapshot(conn, extra=None)"),
     ]:
         assert normalized(source) != normalized(source.replace(old, new))
+
+
+def _record_takeover(engine, *, old_uid, old_build, new_build, new_claim_at, expired_at, task_expired_at, audit_finished_at):
+    owner = "linux-" + old_uid[:6]
+    output = (
+        "INTERRUPTED_OWNER_GONE: exact scheduler task owner exited before completion; "
+        f"previous_instance={owner}; previous_build={old_build}; current_build={new_build}; "
+        f"owner_evidence=expired_exact_run_lease:{task_expired_at}; released_for_scheduler_catchup=true"
+    )
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE st_scheduled_task_history
+            SET status='failed', finished_at=:finished, exit_code=NULL, output=:output
+            WHERE run_uid=:uid
+        """), {"uid": old_uid, "finished": audit_finished_at, "output": output})
+        conn.execute(text("""
+            UPDATE st_daily_stage_attempt
+            SET status='SUPERSEDED', finished_at=:new_claim, lease_until=:expiration,
+                error_code='LEASE_EXPIRED_TAKEOVER'
+            WHERE scheduler_run_uid=:uid
+        """), {"uid": old_uid, "new_claim": new_claim_at, "expiration": expired_at})
+
+
+def test_recover_original_after_repeated_expired_takeovers(archived, monkeypatch):
+    engine, original = archived
+    third_uid = "a" * 32
+    intermediate = {**RUNTIME, "linux_build_sha": INTERMEDIATE}
+    current_release = {**RUNTIME, "parent_linux_build_sha": INTERMEDIATE}
+    manifests = {CURRENT: current_release, INTERMEDIATE: intermediate, PARENT: ORIGIN_COMPONENT}
+    monkeypatch.setattr(recovery, "load_runtime_component_release", lambda: current_release)
+    monkeypatch.setattr(recovery, "load_component_attestation", lambda _connection, build: manifests[build])
+    monkeypatch.setattr(recovery, "require_compatible_component_build",
+                        lambda _connection, producer, current: manifests[producer])
+
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE st_daily_stage_attempt SET started_at=:stamp WHERE scheduler_run_uid=:uid"),
+                     {"uid": FIRST_RETRY, "stamp": "2026-11-15T20:03:00"})
+        conn.execute(text("UPDATE st_scheduled_task_history SET build_sha=:build WHERE run_uid=:uid"),
+                     {"uid": FIRST_RETRY, "build": PARENT})
+    _record(engine, run_uid=third_uid, build=INTERMEDIATE, started="2026-11-15T20:10:00")
+    _record(engine, run_uid=NEXT_RETRY, build=CURRENT)
+
+    _record_takeover(
+        engine, old_uid=FIRST_RETRY, old_build=PARENT, new_build=INTERMEDIATE,
+        new_claim_at="2026-11-15T20:10:00", expired_at="2026-11-15T20:09:51",
+        task_expired_at="2026-11-15T20:09:48", audit_finished_at="2026-11-15T20:09:56",
+    )
+    _record_takeover(
+        engine, old_uid=third_uid, old_build=INTERMEDIATE, new_build=CURRENT,
+        new_claim_at=PROPOSAL, expired_at="2026-11-15T20:14:41",
+        task_expired_at="2026-11-15T20:14:38", audit_finished_at="2026-11-15T20:14:52",
+    )
+
+    recovered = _recover(engine, NEXT_RETRY)
+    assert recovered is not None
+    rebound = recovered["reference"]
+    assert rebound["run_uid"] == NEXT_RETRY
+    assert rebound["selection_sha256"] == original["selection_sha256"]
+    assert rebound["decision_at"] == CUTOFF
+    recovery.verify_recovered_initial_selection(engine, rebound, proposed_cutoff=PROPOSAL)
+
+    for field, changed in (
+        ("error_code", "UNKNOWN_TAKEOVER"), ("fencing_token", 4), ("lease_owner", "wrong-owner"),
+        ("lease_until", "2026-11-15T20:14:59"), ("finished_at", "2026-11-15T20:14:59"),
+        ("output_dataset_id", "already-written"),
+    ):
+        with engine.begin() as conn:
+            previous = conn.execute(text(f"SELECT {field} FROM st_daily_stage_attempt WHERE scheduler_run_uid=:uid"),
+                                    {"uid": third_uid}).scalar_one()
+            conn.execute(text(f"UPDATE st_daily_stage_attempt SET {field}=:value WHERE scheduler_run_uid=:uid"),
+                         {"uid": third_uid, "value": changed})
+        assert _recover(engine, NEXT_RETRY) is None
+        with engine.begin() as conn:
+            conn.execute(text(f"UPDATE st_daily_stage_attempt SET {field}=:value WHERE scheduler_run_uid=:uid"),
+                         {"uid": third_uid, "value": previous})
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE st_scheduled_task_history SET output=REPLACE(output,:before,:after) WHERE run_uid=:uid"),
+                     {"uid": FIRST_RETRY, "before": "current_build=" + INTERMEDIATE, "after": "current_build=" + CURRENT})
+    assert _recover(engine, NEXT_RETRY) is None

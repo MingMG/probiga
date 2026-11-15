@@ -61,6 +61,13 @@ _ABANDONED_PUBLICATION_MARKERS = frozenset({
     "DAILY_DELIVERY_FINALIZATION_FAILED: publication lease expired; original process result retained in OBSERVED; no publication retried.",
 })
 _SERVICE_STOP_MARKER = "调度服务停止；子进程已确认退出。"
+_EXPIRED_TASK_OWNER_TAKEOVER = re.compile(
+    r"INTERRUPTED_OWNER_GONE: exact scheduler task owner exited before completion; "
+    r"previous_instance=(?P<owner>[^;\r\n]{1,160}); previous_build=(?P<old>[0-9a-f]{40}); "
+    r"current_build=(?P<new>[0-9a-f]{40}); "
+    r"owner_evidence=expired_exact_run_lease:(?P<task_expiration>[0-9T:.-]{19,26}); "
+    r"released_for_scheduler_catchup=true"
+)
 
 
 def _local_decision(value: str | datetime, *, whole_seconds: bool = True) -> datetime:
@@ -165,7 +172,8 @@ def _exact_prior_terminal(connection, *, run_uid: str, build_sha: str, trade_dat
     current = connection.execute(text("""
         SELECT /*+ MAX_EXECUTION_TIME(3000) */ a.id AS stage_id, a.session_uid,
             a.status AS stage_status, a.started_at AS stage_started_at,
-            h.status AS audit_status, h.task_type, h.build_sha,
+            a.shard_id, a.lease_owner, a.fencing_token,
+            h.status AS audit_status, h.task_type, h.build_sha, h.scheduler_instance_id,
             r.trade_date AS score_trade_date,r.min_score,r.top_n,r.execution_time
         FROM st_daily_stage_attempt a
         JOIN st_daily_delivery_session s ON s.session_uid=a.session_uid
@@ -187,22 +195,24 @@ def _exact_prior_terminal(connection, *, run_uid: str, build_sha: str, trade_dat
     return dict(current)
 
 
-def _attempts_in_session(connection, session_uid: str, *, excluding: str | None = None,
+def _attempts_in_session(connection, session_uid: str, *, shard_id: str, excluding: str | None = None,
                          exact: str | None = None) -> list[dict]:
     rows = connection.execute(text("""
         SELECT /*+ MAX_EXECUTION_TIME(3000) */ a.id AS stage_id, a.scheduler_run_uid AS run_uid,
-            a.status AS stage_status, a.finished_at AS stage_finished_at,
-            h.status AS audit_status,h.finished_at,h.exit_code,h.build_sha,h.task_type,SUBSTR(h.output, 1, 60000) AS output,
+            a.status AS stage_status, a.started_at AS stage_started_at, a.finished_at AS stage_finished_at,
+            a.lease_owner, a.lease_until, a.fencing_token, a.error_code, a.output_dataset_id,
+            h.status AS audit_status,h.finished_at,h.exit_code,h.build_sha,h.task_type,
+            h.scheduler_instance_id,SUBSTR(h.output, 1, 60000) AS output,
             r.trade_date AS score_trade_date,r.min_score,r.top_n,r.execution_time,
             r.published_at,r.canonical_pool_sha256
         FROM st_daily_stage_attempt a
         LEFT JOIN st_scheduled_task_history h ON h.run_uid=a.scheduler_run_uid
         LEFT JOIN st_recommended_run_history r ON r.run_uid=h.run_uid AND r.scheduler_job_id=h.run_uid
-        WHERE a.session_uid=:session_uid AND a.stage_name='analysis_fast'
+        WHERE a.session_uid=:session_uid AND a.stage_name='analysis_fast' AND a.shard_id=:shard_id
           AND (:excluding IS NULL OR a.scheduler_run_uid<>:excluding)
           AND (:exact IS NULL OR a.scheduler_run_uid=:exact)
         ORDER BY a.id DESC LIMIT :limit
-    """), {"session_uid": session_uid, "excluding": excluding, "exact": exact,
+    """), {"session_uid": session_uid, "shard_id": shard_id, "excluding": excluding, "exact": exact,
                "limit": 1 if exact is not None else _MAX_RECOVERY_ATTEMPTS}).mappings().all()
     return [dict(row) for row in rows]
 
@@ -220,7 +230,41 @@ def _successful_child_failed_publication(record: Mapping[str, Any]) -> bool:
     return record["stage_status"] == "FAILED" and record["audit_status"] == "failed" and record["exit_code"] == 0
 
 
-def _abandoned_without_publication(record: Mapping[str, Any]) -> bool:
+def _expired_takeover(record: Mapping[str, Any], newer: Mapping[str, Any]) -> bool:
+    if (
+        record["error_code"] != "LEASE_EXPIRED_TAKEOVER" or record["audit_status"] != "failed"
+        or record["exit_code"] is not None or record["output_dataset_id"] is not None
+        or type(record["fencing_token"]) is not int or type(newer["fencing_token"]) is not int
+        or not 0 < record["fencing_token"] < newer["fencing_token"]
+        or record["lease_owner"] != record["scheduler_instance_id"]
+        or newer["lease_owner"] != newer["scheduler_instance_id"]
+        or not newer["lease_owner"] or record["lease_owner"] == newer["lease_owner"]
+    ):
+        return False
+    audit = _EXPIRED_TASK_OWNER_TAKEOVER.fullmatch(record["output"] or "")
+    if (
+        audit is None or audit["owner"] != record["lease_owner"]
+        or audit["old"] != record["build_sha"] or audit["new"] != newer["build_sha"]
+    ):
+        return False
+    try:
+        stage_started = _local_decision(record["stage_started_at"], whole_seconds=False)
+        stage_expires = _local_decision(record["lease_until"], whole_seconds=False)
+        task_expires = _local_decision(audit["task_expiration"], whole_seconds=False)
+        audit_finished = _local_decision(record["finished_at"], whole_seconds=False)
+        superseded = _local_decision(record["stage_finished_at"], whole_seconds=False)
+        newer_started = _local_decision(newer["stage_started_at"], whole_seconds=False)
+    except FormalScoreContractError:
+        return False
+    return (
+        stage_started <= min(task_expires, stage_expires)
+        and max(task_expires, stage_expires) < audit_finished <= superseded == newer_started
+    )
+
+
+def _abandoned_without_publication(record: Mapping[str, Any], newer: Mapping[str, Any]) -> bool:
+    if record["stage_status"] == "SUPERSEDED":
+        return _expired_takeover(record, newer)
     lines = (record["output"] or "").splitlines()
     if record["stage_status"] == "FAILED" and record["audit_status"] == "failed":
         return record["exit_code"] is None and any(line in _ABANDONED_PUBLICATION_MARKERS for line in lines)
@@ -303,11 +347,14 @@ def _candidate(
             connection, run_uid=run_uid, build_sha=build_sha, trade_date=trade_date,
             contract_build=runtime["contract_build_sha"], strategy_release=strategy_release_identity(),
         )
-        attempts = _attempts_in_session(connection, current["session_uid"], excluding=run_uid)
+        attempts = _attempts_in_session(
+            connection, current["session_uid"], shard_id=current["shard_id"], excluding=run_uid,
+        )
         if not attempts:
             return None
         builds = _compatible_recovery_builds(connection, runtime)
     current_started = _local_decision(current["stage_started_at"], whole_seconds=False)
+    newer = current
     for prior in attempts:
         if prior["stage_id"] >= current["stage_id"] or not _unpublished_terminal(prior, builds, trade_date):
             return None
@@ -317,8 +364,9 @@ def _candidate(
             raise FormalScoreContractError("formal recovery discarded attempt is not earlier")
         if _successful_child_failed_publication(prior):
             break
-        if not _abandoned_without_publication(prior):
+        if not _abandoned_without_publication(prior, newer):
             return None
+        newer = prior
     else:
         return None
 
@@ -336,7 +384,9 @@ def _candidate(
         original = latest
     else:
         with engine.connect() as connection:
-            original_records = _attempts_in_session(connection, current["session_uid"], exact=origin["run_uid"])
+            original_records = _attempts_in_session(
+                connection, current["session_uid"], shard_id=current["shard_id"], exact=origin["run_uid"],
+            )
         if not original_records:
             raise FormalScoreContractError("formal recovery original scheduler audit is unavailable")
         original_record = original_records[0]
