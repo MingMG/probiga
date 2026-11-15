@@ -9046,6 +9046,44 @@ def _require_governance_frozen_score(
         raise RuntimeError("daily delivery governance did not consume the exact frozen score")
 
 
+def _governance_deferred_shadow_degradation(
+    connection, *, governance_row: Mapping[str, object], decision_known_at: str,
+) -> dict[str, object] | None:
+    from server.engine.strategy_center import validated_deferred_shadow_sources
+
+    raw_source = connection.execute(text("""
+        SELECT /*+ MAX_EXECUTION_TIME(3000) */
+               CASE WHEN JSON_EXTRACT(result_json, '$.candidate_source.deferred_shadow_sources') IS NOT NULL
+                      OR JSON_EXTRACT(result_json, '$.candidate_source.deferred_shadow_sources_hash') IS NOT NULL
+                   THEN JSON_EXTRACT(result_json, '$.candidate_source')
+               END
+        FROM st_strategy_governance_run
+        WHERE run_uid=:run_uid AND result_hash=:result_hash
+    """), {
+        "run_uid": governance_row["run_uid"], "result_hash": governance_row["result_hash"],
+    }).scalar_one()
+    if raw_source is None:
+        return None
+    try:
+        candidate_source = json.loads(raw_source) if isinstance(raw_source, (str, bytes)) else raw_source
+        sources = validated_deferred_shadow_sources(candidate_source)
+        if not sources or sources[0]["decision_known_at"] != decision_known_at:
+            raise ValueError("shadow source cutoff differs from the published score")
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("daily delivery governance shadow source evidence differs") from exc
+    keys = [item["strategy_key"] for item in sources]
+    return {
+        "stage": "strategy_governance_daily",
+        "reason_code": sources[0]["reason_code"],
+        "count": len(keys),
+        "strategy_key_sample": keys[:20],
+        "strategy_key_sample_complete": len(keys) <= 20,
+        "decision_known_at": decision_known_at,
+        "deferred_shadow_sources_sha256": candidate_source["deferred_shadow_sources_hash"],
+        "governance_result_sha256": governance_row["result_hash"],
+    }
+
+
 def _build_daily_result_delivery_receipt(
     connection,
     *,
@@ -9433,6 +9471,12 @@ def _build_daily_result_delivery_receipt(
         raise RuntimeError("daily delivery production API result differs")
     dependency_proofs = []
     degradations = analysis_publication_degradations(publication, engine=connection)
+    if is_frozen_initial:
+        deferred_shadow = _governance_deferred_shadow_degradation(
+            connection, governance_row=governance_row, decision_known_at=scoring_snapshot["input_decision_at"],
+        )
+        if deferred_shadow is not None:
+            degradations.append(deferred_shadow)
     for task_type in required_dependencies:
         row = latest_by_type[task_type]
         evidence = _history_validation_evidence(row.get("output"))

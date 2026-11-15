@@ -21510,6 +21510,73 @@ def _combination_rankings(
     return rows
 
 
+def _hold_deferred_shadow_strategy(row: dict[str, Any], proof: dict[str, str]) -> tuple[str, str]:
+    if (
+        row.get("strategy_key") != proof["strategy_key"]
+        or row.get("current_version") != proof["strategy_version"]
+        or row.get("source_kind") != proof["source_kind"]
+        or row.get("current_status") != "SHADOW" or row.get("enabled") is not True
+    ):
+        raise GovernanceEvidenceNotReady("待补V3影子策略身份或生命周期已变化")
+    reason = "冻结决策时点没有V3收盘来源，保留影子状态并停止本日模拟资金检查点"
+    row["deferred_shadow_source"] = dict(proof)
+    row.pop("funding_checkpoint_candidate", None)
+    row.pop("funding_checkpoint_ref", None)
+    row["funding_checkpoint_ready"] = False
+    row["funding_checkpoint_storage_bytes"] = 0
+    row["funding_checkpoint_persistence_reason_code"] = proof["reason_code"]
+    row["funding_checkpoint_persistence_reason"] = reason
+    return "SHADOW", reason
+
+
+def _validate_deferred_shadow_outcome(result: dict[str, Any]) -> None:
+    from server.engine.strategy_center import validated_deferred_shadow_sources
+
+    candidate_source = result.get("candidate_source")
+    try:
+        deferred = validated_deferred_shadow_sources(candidate_source)
+    except ValueError as exc:
+        raise RuntimeError("治理V3影子来源缺口证明无效") from exc
+    if not deferred:
+        return
+    if candidate_source["trade_date"] != result.get("trade_date"):
+        raise RuntimeError("治理V3影子来源缺口与交易日不一致")
+    keys = {item["strategy_key"] for item in deferred}
+    for proof in deferred:
+        rows = [row for row in result["strategies"] if row.get("strategy_key") == proof["strategy_key"]]
+        if len(rows) != 1:
+            raise RuntimeError("治理V3影子来源缺口与注册版本不一致")
+        row = rows[0]
+        if (
+            row.get("current_version") != proof["strategy_version"] or row.get("source_kind") != proof["source_kind"]
+            or row.get("enabled") is not True or row.get("deferred_shadow_source") != proof
+            or any(row.get(field) != "SHADOW" for field in ("current_status", "projected_status", "recommended_status"))
+            or row.get("paper_allocation_eligible") is not False
+            or (row.get("confirmation_guard") or {}).get("passed") is not False
+            or row.get("funding_checkpoint_ready") is not False
+            or row.get("funding_checkpoint_ref")
+        ):
+            raise RuntimeError("治理V3影子来源缺口获得了生命周期或模拟资金资格")
+    queue = result.get("shadow_capacity_queue") or {}
+    if (
+        any(
+            row.get("dominant_strategy") in keys or keys.intersection(row.get("strategies") or ())
+            for rows in result["pools"].values() for row in rows
+        )
+        or any(
+            (row.get("target_type") == "STRATEGY" and row.get("target_key") in keys)
+            or any(member.get("strategy_key") in keys for member in row.get("member_sleeves") or [])
+            for row in result["allocations"]
+        )
+        or any(row.get("strategy_key") in keys for row in result["paper_execution_plan"].get("funded_sleeves") or [])
+        or any(row.get("strategy_key") in keys for row in result["paper_execution_plan"].get("targets") or [])
+        or any(row.get("entity_type") == "STRATEGY" and row.get("entity_key") in keys
+               for row in result["automatic_transition_plan"].get("transitions") or [])
+        or ((queue.get("selected") or {}).get("strategy_key") in keys and queue.get("authorized_plan_ids"))
+    ):
+        raise RuntimeError("治理V3影子来源缺口产生了候选、生命周期变更或模拟执行授权")
+
+
 def governance_input_ready(snapshot: dict[str, Any]) -> tuple[bool, str]:
     source_status = str(snapshot.get("source_status") or "")
     if source_status != "fresh":
@@ -21671,12 +21738,32 @@ def governance_input_ready(snapshot: dict[str, Any]) -> tuple[bool, str]:
         or [str(value) for value in declared_identity] != actual_identity
     ):
         return False, "候选源完成证明证券身份与实际票池不一致"
-    runtime_statuses = [
+    adapter_statuses = [
         item for item in (snapshot.get("dynamic_adapter_statuses") or [])
-        if isinstance(item, dict)
-        and str(item.get("strategy_key") or "")
-        and str(item.get("adapter_capability_status") or "")
-        == "RESEARCH_READY"
+        if isinstance(item, dict) and str(item.get("strategy_key") or "")
+    ]
+    from server.engine.strategy_center import _deferred_shadow_records, validated_deferred_shadow_sources
+
+    try:
+        deferred = validated_deferred_shadow_sources(candidate_source)
+    except ValueError:
+        return False, "待补V3影子来源的冻结证明无效"
+    if deferred:
+        if deferred != _deferred_shadow_records(adapter_statuses, candidate_source.get("publication_proof"), trade_day):
+            return False, "待补V3影子来源与实际适配器结果不一致"
+        deferred_keys = {item["strategy_key"] for item in deferred}
+        if any(
+            item.get("dominant_strategy") in deferred_keys or deferred_keys.intersection(item.get("strategies") or ())
+            for item in candidates if isinstance(item, dict)
+        ):
+            return False, "待补V3影子来源不得生成候选"
+    else:
+        deferred_keys = set()
+    required_capability_statuses = {"RESEARCH_READY", "READY"} if deferred else {"RESEARCH_READY"}
+    runtime_statuses = [
+        item for item in adapter_statuses
+        if item.get("strategy_key") not in deferred_keys
+        and item.get("adapter_capability_status") in required_capability_statuses
         and item.get("enabled") is True
         and str(item.get("lifecycle_status") or "")
         not in {"RETIRED", "SUSPENDED"}
@@ -27023,6 +27110,7 @@ def _validate_canonical_governance_result(result: dict[str, Any]) -> None:
         or not isinstance(funding_manifest, dict)
     ):
         raise RuntimeError("canonical治理完整结果缺少可复算决策字段")
+    _validate_deferred_shadow_outcome(result)
     validate_funding_checkpoint_manifest_contract(result)
     (
         industry_bindings,
@@ -27923,6 +28011,14 @@ def governance_snapshot(
         statistical_inventory
     )
     registry = load_registry()
+    from server.engine.strategy_center import validated_deferred_shadow_sources
+
+    deferred_by_key = {
+        item["strategy_key"]: item
+        for item in validated_deferred_shadow_sources(strategy_snapshot.get("candidate_source"))
+    } if input_ready else {}
+    if not deferred_by_key.keys() <= {row["strategy_key"] for row in registry}:
+        raise GovernanceEvidenceNotReady("待补V3影子策略已不在当前注册表")
     # The immutable run identity is allocated before ledger construction so
     # addressable daily-fact IDs and their branch chain are deterministic.
     # Economic fact/state hashes deliberately exclude the later result/audit
@@ -27994,7 +28090,11 @@ def governance_snapshot(
             prefetched_boundaries=strategy_lifecycle_facts["boundaries"],
         )
         row["suspension_boundary"] = suspension_boundary
-        recommended, reason = _recommend_strategy_row(row)
+        deferred_shadow = deferred_by_key.get(row["strategy_key"])
+        recommended, reason = (
+            _hold_deferred_shadow_strategy(row, deferred_shadow)
+            if deferred_shadow is not None else _recommend_strategy_row(row)
+        )
         recommended, reason = _apply_suspended_recovery_rule(
             current_status=current_status,
             recommended_status=recommended,
@@ -28041,7 +28141,8 @@ def governance_snapshot(
         row["recommendation_reason"] = reason
         row["confirmation_guard"] = confirmation_guard
         row["paper_allocation_eligible"] = bool(
-            row["projected_status"] in {"ACTIVE", "REDUCE"}
+            deferred_shadow is None
+            and row["projected_status"] in {"ACTIVE", "REDUCE"}
             and row["profit_gate_passed"]
             and confirmation_guard.get("passed") is True
             and row.get("execution_adapter_executable") is True
@@ -28668,6 +28769,7 @@ def governance_snapshot(
         "no_qualified_strategy_policy": "没有合格策略或组合时，模拟资金保持现金，不强制交易",
     }
     if persist:
+        _validate_deferred_shadow_outcome(payload)
         transitions = []
         connection = _governance_connection
         if connection is None:  # pragma: no cover - guarded above
