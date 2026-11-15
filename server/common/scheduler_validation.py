@@ -4046,11 +4046,18 @@ def _validate_analysis_strategy_pool(
 
             prepared = _single_nested_machine_payload(output, schema=FORMAL_SCORE_WORK_SCHEMA)
             try:
-                if not prepared or prepared.get("decision_at") != expected_initial_cutoff:
-                    raise ValueError("prepared score cutoff differs")
-                verify_initial_selection(
+                if not prepared:
+                    raise ValueError("prepared score reference is missing")
+                selection = verify_initial_selection(
                     FormalAnalysisStore(engine), prepared, run_uid=run_uid, build_sha=build_sha, trade_date=target,
                 )
+                if (
+                    prepared.get("decision_at") != expected_initial_cutoff
+                    or selection["score_snapshot"]["build_sha"] != build_sha
+                ):
+                    from server.common.formal_score_recovery import verify_recovered_initial_selection
+
+                    verify_recovered_initial_selection(engine, prepared, proposed_cutoff=expected_initial_cutoff)
             except (ValueError, KeyError, FormalAnalysisStoreError) as exc:
                 return False, f"initial strategy score could not be verified: {exc}"
             return True, f"durable formal scores sealed: date={target} stocks={prepared['analysis_count']}"
@@ -4865,7 +4872,19 @@ def validate_scheduler_task_result(
             or direct_flow_receipt
             and release_target_date is not None
         )
-        for requirement in requirements or ():
+        staged_initial = None
+        if task_type == "analysis_fast" and task.get("_scheduler_pipeline_phase") == "INITIAL":
+            from server.common.formal_score_publication import FORMAL_SCORE_WORK_SCHEMA
+
+            staged_initial = _single_nested_machine_payload(output, schema=FORMAL_SCORE_WORK_SCHEMA)
+            if staged_initial is not None and (
+                type(staged_initial.get("analysis_count")) is not int
+                or staged_initial["analysis_count"] < requirements[0].min_rows
+            ):
+                raise ValueError("prepared analysis score universe is incomplete")
+        # The final transaction writes and verifies the projection. At this
+        # point a staged initial score can only be read from its immutable store.
+        for requirement in (() if staged_initial is not None else requirements or ()):
             effective_requirement = (
                 replace(requirement, require_fresh=False)
                 if (

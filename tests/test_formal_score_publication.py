@@ -1,10 +1,13 @@
 import json
+from dataclasses import replace
+from datetime import datetime
 
 import pandas as pd
 import pytest
 from sqlalchemy import create_engine, text
 
 from biz.analysis import sync_analysis_fast as analysis
+from server.common import scheduler_validation
 from server.common.analysis_pool_receipt import decode_score_snapshot
 from server.common.formal_analysis_store import FormalAnalysisStore
 from server.common.formal_score_publication import (
@@ -41,6 +44,41 @@ def test_publication_rolls_back_and_replay_reads_same_ranked_universe(monkeypatc
         recommendation_rows=recommendations, scored=pd.DataFrame(baseline["scored_rows"]),
         market_mood_score=66, flow_date=target, hot_date=target,
     )["reference"]
+
+    # Reproduce the live ordering failure: the sealed worker has completed,
+    # while the scheduler's publication transaction has not written any rows.
+    requirements = scheduler_validation.TASK_OUTPUT_REQUIREMENTS
+    monkeypatch.setitem(requirements, "analysis_fast", (replace(requirements["analysis_fast"][0], min_rows=2),))
+    source_checks = []
+    projection_checks = []
+
+    def verify_source(_engine, *, target_date, **_):
+        source_checks.append(target_date)
+        return True, "source verified"
+
+    def verify_projection(*_args, **_kwargs):
+        projection_checks.append(True)
+        return False, "projection still has 0 rows"
+
+    monkeypatch.setattr(scheduler_validation, "_validate_daily_universe_coverage", verify_source)
+    monkeypatch.setattr(scheduler_validation, "_validate_requirement", verify_projection)
+    task = {
+        "task_type": "analysis_fast", "_scheduler_pipeline_phase": "INITIAL",
+        "_scheduler_pipeline_decision_at": decision_at, "_release_target_date": target,
+        "_trigger_source": "release_catchup", "_scheduler_history_run_uid": initial["run_uid"],
+        "_scheduler_expected_build_sha": build,
+    }
+    started = datetime.fromisoformat(decision_at)
+    staged = scheduler_validation.validate_scheduler_task_result(
+        task, engine=engine, started_at=started, now=started, output=json.dumps(initial),
+    )
+    assert staged.checked and staged.ok and len(source_checks) == 1
+    assert not projection_checks
+    legacy = scheduler_validation.validate_scheduler_task_result(
+        {**task, "_scheduler_pipeline_phase": ""}, engine=engine, started_at=started,
+        now=started, output=json.dumps(scored_publication(trade_date=target)),
+    )
+    assert legacy.checked and not legacy.ok and projection_checks == [True]
 
     def save_projection(_engine, rows, recommendations, _, *, publication_connection, decoded_score_snapshot, **__):
         assert rows == baseline["analysis_rows"]
