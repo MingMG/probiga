@@ -11637,7 +11637,6 @@
         if (e && e.value) qs.push('end_date=' + encodeURIComponent(e.value));
         if (!qs.length) {
             qs.push('trade_date=' + encodeURIComponent(d || recommendationDateValue() || currentDateValue()));
-            qs.push('prefer_latest=true');
         }
         return '/recommended-stocks?' + qs.join('&');
     }
