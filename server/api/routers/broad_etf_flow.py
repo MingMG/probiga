@@ -440,6 +440,8 @@ def _build_flow_rows(
                 "share_change": share_change,
                 "share_change_pct": share_change_pct,
                 "fund_share": current_value,
+                "previous_fund_share": previous_value,
+                "reference_price": multiplier,
                 "price": _safe_float(usable_price.get("close")),
                 "change_pct": _safe_float(usable_price.get("change_pct")),
                 "amount": _safe_float(usable_price.get("amount")),
@@ -661,12 +663,14 @@ def _build_payload(requested_date: str, days: int) -> dict[str, Any]:
 
     history: list[dict[str, Any]] = []
     for row_date in trade_dates[1:]:
-        date_rows = [row for row in by_date.get(row_date, ()) if row.get("net_amount") is not None]
+        components = by_date.get(row_date, [])
+        date_rows = [row for row in components if row.get("net_amount") is not None]
         history.append({
             "trade_date": row_date,
             "net_amount": _sum(date_rows) if date_rows else None,
             "coverage_pct": round(len(date_rows) / len(CORE_ETFS) * 100, 1),
             "available": len(date_rows),
+            "components": components,
         })
     # Prefer the requested/latest date when coverage clears the minimum gate;
     # otherwise fall back to the most recent usable date and expose the lag.

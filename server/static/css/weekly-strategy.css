@@ -1,0 +1,13 @@
+.weekly-strategy { max-width: 1180px; margin: 0 auto; padding: 16px 18px 36px; }
+.weekly-strategy header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }
+.weekly-strategy h3 { margin-top: 24px; }
+.weekly-strategy p { margin: 8px 0 14px; line-height: 1.55; }
+.weekly-strategy canvas { width: min(100%, 790px); height: auto; border: 1px solid #cbd5e1; border-radius: 8px; }
+.weekly-strategy .weekly-legend { display: flex; flex-wrap: wrap; gap: 6px 14px; margin: 10px 0; }
+.weekly-strategy .weekly-legend span::before { content: ""; display: inline-block; width: 14px; height: 4px; margin: 0 5px 3px 0; background: var(--series); }
+.weekly-strategy .weekly-scroll { max-width: 100%; overflow-x: auto; margin-bottom: 12px; }
+.weekly-strategy table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.weekly-strategy th, .weekly-strategy td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #71809655; white-space: nowrap; }
+.weekly-strategy th { background: #71809618; }
+.weekly-strategy details { margin: 8px 0; }
+.weekly-strategy summary { cursor: pointer; padding: 6px 0; }
