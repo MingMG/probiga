@@ -6,7 +6,7 @@ from server.common import production_runtime_schema_bundle as bundle
 
 
 EXPECTED_BUNDLE_CONTRACT_HASH = (
-    "390c15c3f6cbc316950b1d738b1fbd09255526b42b807b3d7e3e1e175d393f71"
+    "3a3ecc580f227fa3dda21d8a7bc51fe707e24bd560101f18cbb852d3797f3e3f"
 )
 
 

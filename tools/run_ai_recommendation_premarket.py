@@ -698,7 +698,24 @@ def main() -> int:
             **batch_kwargs,
         )
         publication_receipt = getattr(stats, "publication_receipt", None)
-        if bound_run_uid:
+        prepared_publication = getattr(stats, "prepared_publication", None)
+        durable_initial = production and args.pool_decision_phase == "INITIAL"
+        if durable_initial:
+            from server.common.formal_score_publication import FORMAL_SCORE_WORK_SCHEMA, FormalScoreContractError
+
+            if (
+                not isinstance(prepared_publication, dict)
+                or prepared_publication.get("schema") != FORMAL_SCORE_WORK_SCHEMA
+                or prepared_publication.get("run_uid") != run_uid
+                or prepared_publication.get("build_sha") != publisher_build_sha
+                or prepared_publication.get("trade_date") != stats.trade_date
+                or prepared_publication.get("analysis_count") != stats.analysis_count
+                or prepared_publication.get("recommendation_count") != stats.recommendation_count
+                or prepared_publication.get("executable_count") != stats.executable_count
+                or publication_receipt is not None
+            ):
+                raise FormalScoreContractError("scheduled analysis did not seal its exact score result")
+        elif bound_run_uid:
             has_receipt = isinstance(publication_receipt, dict)
             executable_count = int(
                 (publication_receipt or {}).get("executable_count") or 0
@@ -750,15 +767,18 @@ def main() -> int:
             "run_uid": run_uid,
             "repair": repair_report,
         }
-        _recommended_run_history_finish(run_uid, status="done", payload={
-            "trade_date": stats.trade_date,
-            "total": stats.analysis_count,
-            "passed": stats.recommendation_count,
-            "flow_date": stats.flow_date,
-            "hot_date": stats.hot_date,
-            "market_mood_score": stats.market_mood_score,
-            "message": f"盘前预演完成，通过 {stats.recommendation_count} 只",
-        })
+        if not durable_initial:
+            _recommended_run_history_finish(run_uid, status="done", payload={
+                "trade_date": stats.trade_date,
+                "total": stats.analysis_count,
+                "passed": stats.recommendation_count,
+                "flow_date": stats.flow_date,
+                "hot_date": stats.hot_date,
+                "market_mood_score": stats.market_mood_score,
+                "message": f"盘前预演完成，通过 {stats.recommendation_count} 只",
+            })
+        if durable_initial:
+            print(json.dumps(prepared_publication, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         if args.json:
             if publication_receipt is not None:
                 print(json.dumps(
@@ -787,6 +807,13 @@ def main() -> int:
                 f"original={type(exc).__name__}: {exc}; "
                 f"terminal_audit={type(finish_exc).__name__}: {finish_exc}"
             ) from exc
+        if production and args.pool_decision_phase == "INITIAL":
+            from server.common.formal_score_publication import formal_score_blocked
+
+            blocker = formal_score_blocked(exc)
+            if blocker is not None:
+                print(json.dumps(blocker, ensure_ascii=False))
+                return 2
         raise
 
 

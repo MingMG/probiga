@@ -157,6 +157,10 @@ from server.common.versioned_strategy_config import (
     privileged_seed_versioned_strategy_configs,
     validate_versioned_strategy_runtime,
 )
+from server.db.formal_analysis_schema import (
+    privileged_migrate_formal_analysis_schema,
+    validate_formal_analysis_runtime_schema,
+)
 from server.engine.strategy_center import (
     privileged_migrate_strategy_center_tables,
     privileged_seed_strategy_center_configs,
@@ -210,6 +214,7 @@ _MIGRATIONS: tuple[tuple[str, SchemaCallable], ...] = (
     ("auth", privileged_migrate_auth_schema),
     ("ai_bridge", privileged_migrate_ai_bridge_schema),
     ("analysis_output", migrate_analysis_output_schema),
+    ("formal_analysis", privileged_migrate_formal_analysis_schema),
     ("qmt_stock_catalog_truth", _migrate_stock_catalog_tables),
     ("qmt_trade_calendar", _migrate_trade_calendar_tables),
     ("market_field_capture", _migrate_market_field_capture_tables),
@@ -255,6 +260,7 @@ _VALIDATORS: tuple[tuple[str, SchemaCallable], ...] = (
     ("auth", validate_auth_runtime_schema),
     ("ai_bridge", validate_ai_bridge_runtime_schema),
     ("analysis_output", validate_analysis_output_schema),
+    ("formal_analysis", validate_formal_analysis_runtime_schema),
     ("qmt_stock_catalog_truth", validate_stock_catalog_runtime_schema),
     ("qmt_trade_calendar", validate_trade_calendar_runtime_schema),
     ("market_field_capture", validate_market_field_capture_runtime),

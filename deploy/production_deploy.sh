@@ -8136,7 +8136,7 @@ full_trigger_inventory = (
     p.get("full_trigger_inventory") if isinstance(p, dict) else None
 )
 expected_runtime_bundle_hash = (
-    "390c15c3f6cbc316950b1d738b1fbd09255526b42b807b3d7e3e1e175d393f71"
+    "3a3ecc580f227fa3dda21d8a7bc51fe707e24bd560101f18cbb852d3797f3e3f"
 )
 expected_recovery_planners = [
     "ai_bridge",
@@ -8576,9 +8576,9 @@ runtime_bundle_exact = (
     and runtime_bundle.get("schema")
     == "probiga.production-runtime-schema-bundle.v1"
     and runtime_bundle.get("contract_hash") == expected_runtime_bundle_hash
-    and runtime_bundle.get("migration_count") == 36
+    and runtime_bundle.get("migration_count") == 37
     and runtime_bundle.get("seed_count") == 3
-    and runtime_bundle.get("validator_count") == 39
+    and runtime_bundle.get("validator_count") == 40
     and runtime_bundle.get("recovery_planner_count") == 6
     and runtime_bundle.get("recovery_planner_names")
     == expected_recovery_planners
@@ -8733,7 +8733,7 @@ runtime_bundle = (
     p.get("runtime_schema_bundle") if isinstance(p, dict) else None
 )
 expected_runtime_bundle_hash = (
-    "390c15c3f6cbc316950b1d738b1fbd09255526b42b807b3d7e3e1e175d393f71"
+    "3a3ecc580f227fa3dda21d8a7bc51fe707e24bd560101f18cbb852d3797f3e3f"
 )
 expected_recovery_planners = [
     "ai_bridge",
@@ -9006,9 +9006,9 @@ runtime_bundle_exact = (
     and runtime_bundle.get("schema")
     == "probiga.production-runtime-schema-bundle.v1"
     and runtime_bundle.get("contract_hash") == expected_runtime_bundle_hash
-    and runtime_bundle.get("migration_count") == 36
+    and runtime_bundle.get("migration_count") == 37
     and runtime_bundle.get("seed_count") == 3
-    and runtime_bundle.get("validator_count") == 39
+    and runtime_bundle.get("validator_count") == 40
     and runtime_bundle.get("recovery_planner_count") == 6
     and runtime_bundle.get("recovery_planner_names")
     == expected_recovery_planners
@@ -15373,7 +15373,7 @@ expected_planners = [
     "qmt_audit",
 ]
 expected_bundle_hash = (
-    "390c15c3f6cbc316950b1d738b1fbd09255526b42b807b3d7e3e1e175d393f71"
+    "3a3ecc580f227fa3dda21d8a7bc51fe707e24bd560101f18cbb852d3797f3e3f"
 )
 plans = bundle.get("recovery_plans") if isinstance(bundle, dict) else None
 contracts = bundle.get("contracts") if isinstance(bundle, dict) else None
@@ -15441,8 +15441,8 @@ contracts_exact = (
     and validator_names == list(dict.fromkeys(validator_names))
     and isinstance(contracts, dict)
     and set(contracts) == set(validator_names)
-    and bundle.get("validator_count") == 39
-    and len(validator_names) == 39
+    and bundle.get("validator_count") == 40
+    and len(validator_names) == 40
     and bundle.get("contract_count") == len(contracts)
     and all(
         isinstance(item, dict)
@@ -15529,7 +15529,7 @@ ok = (
     and bundle.get("schema")
     == "probiga.production-runtime-schema-bundle.v1"
     and bundle.get("contract_hash") == expected_bundle_hash
-    and bundle.get("migration_count") == 36
+    and bundle.get("migration_count") == 37
     and bundle.get("seed_count") == 3
     and bundle.get("trigger_installation_policy")
     == "FROZEN_RELEASE_BROKER_ONLY"

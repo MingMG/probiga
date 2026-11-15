@@ -15,6 +15,7 @@ import json
 import math
 import re
 import zlib
+from copy import deepcopy
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from email.utils import parsedate_to_datetime
@@ -23,7 +24,7 @@ from typing import Any, Iterable, Mapping
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
 from server.common.analysis_output_schema import (
     ANALYSIS_COLUMN_CONTRACT,
@@ -62,6 +63,29 @@ _SNAPSHOT_WIRE_MAX_BYTES = 128 * 1024 * 1024
 _ANALYSIS_READBACK_PAGE_SIZE = 200
 _ANALYSIS_READBACK_DEADLINE_SECONDS = 8 * 60
 SCORE_SNAPSHOT_SCHEMA = "probiga.analysis-score-snapshot.v1"
+DURABLE_SCORE_SNAPSHOT_ENCODING = "formal-analysis-score-shards-v1"
+_DURABLE_SCORE_MANIFEST_SCHEMA = "probiga.formal-analysis-score-manifest.v1"
+_DURABLE_SCORE_SHARD_SCHEMA = "probiga.formal-analysis-score-shard.v1"
+_DURABLE_SCORE_STAGE = "score"
+_DURABLE_SCORE_SHARD_ROWS = 128
+_DURABLE_SCORE_BATCH_SHARDS = 4
+_DURABLE_SCORE_SHARD_BYTES = 8 * 1024 * 1024
+_DURABLE_SCORE_HEADER_BYTES = 256 * 1024
+_DURABLE_SCORE_MAX_STOCKS = 10_000
+_SCORE_SHARED_PROOF_FIELD = "pit_reconstruction_provenance"
+_SCORE_HEADER_FIELDS = (
+    "trade_date", "decision_at", "run_uid", "build_sha", "stock_count",
+    "stock_codes_sha256", "input_proof", "input_decision_at", "execution_evidence",
+    "data_excluded_count", "data_blocked_count",
+)
+_SCORE_PROOF_FIELDS = (
+    "membership_snapshot_date", "membership_snapshot_source", "membership_proof_sha256",
+    "pit_common_receipt_root_hash", "turnover_full_market_count",
+    "turnover_full_market_proof_root_sha256", "flow_input_root_sha256", "flow_input_decision_at",
+)
+_SCORE_OPTIONAL_METADATA = frozenset({
+    "fixed_market_context", "frozen_announcement_source", "frozen_core_inputs",
+})
 TURNOVER_DIRECT_FORMULA = "EASTMONEY_PUSH2HIS_F61_PERCENT"
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 ANALYSIS_POOL_PUBLISHER_TASK_TYPES = frozenset({"analysis_fast"})
@@ -285,15 +309,10 @@ def _score_snapshot_payload(
     codes = [row["stock_code"] for row in scores]
     if not scores or codes != [row["stock_code"] for row in analysis]:
         raise ValueError("ANALYSIS_SCORE_UNIVERSE_INCOMPLETE")
-    fields = (
-        "membership_snapshot_date", "membership_snapshot_source", "membership_proof_sha256",
-        "pit_common_receipt_root_hash", "turnover_full_market_count", "turnover_full_market_proof_root_sha256",
-        "flow_input_root_sha256", "flow_input_decision_at",
-    )
-    proofs = {tuple(row.get(field) for field in fields) for row in scores}
+    proofs = {tuple(row.get(field) for field in _SCORE_PROOF_FIELDS) for row in scores}
     if len(proofs) != 1:
         raise ValueError("ANALYSIS_SCORE_INPUT_BATCH_MISMATCH")
-    proof = dict(zip(fields, next(iter(proofs))))
+    proof = dict(zip(_SCORE_PROOF_FIELDS, next(iter(proofs))))
     input_decision = datetime.fromisoformat(str(proof["flow_input_decision_at"] or ""))
     if (
         proof["membership_snapshot_date"] != target
@@ -482,7 +501,7 @@ def _validate_frozen_core_inputs(
     return {key: dict(value) for key, value in inputs.items()}
 
 
-def build_score_snapshot(
+def _complete_score_snapshot_payload(
     *, trade_date: str, decision_at: datetime | str, run_uid: str,
     build_sha: str, analysis_rows: Iterable[Mapping[str, Any]],
     scored_rows: Iterable[Mapping[str, Any]],
@@ -513,6 +532,22 @@ def build_score_snapshot(
         payload["frozen_core_inputs"] = _validate_frozen_core_inputs(
             frozen_core_inputs, initial_announcement=payload.get("frozen_announcement_source"),
         )
+    return payload
+
+
+def build_score_snapshot(
+    *, trade_date: str, decision_at: datetime | str, run_uid: str,
+    build_sha: str, analysis_rows: Iterable[Mapping[str, Any]],
+    scored_rows: Iterable[Mapping[str, Any]],
+    fixed_market_context: Mapping[str, Any] | None = None,
+    frozen_announcement_source: Mapping[str, Any] | None = None,
+    frozen_core_inputs: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = _complete_score_snapshot_payload(
+        trade_date=trade_date, decision_at=decision_at, run_uid=run_uid, build_sha=build_sha,
+        analysis_rows=analysis_rows, scored_rows=scored_rows, fixed_market_context=fixed_market_context,
+        frozen_announcement_source=frozen_announcement_source, frozen_core_inputs=frozen_core_inputs,
+    )
     compact = compact_score_reconstruction(payload)
     if compact is not None:
         # The compact payload pins the shared proof and each row's exact text
@@ -524,7 +559,422 @@ def build_score_snapshot(
     return _score_snapshot_envelope(payload, _snapshot_json_bytes(payload), _snapshot_compress(payload))
 
 
-def decode_score_snapshot(value: Mapping[str, Any], *, trade_date: str | None = None) -> dict[str, Any]:
+def _durable_score_digest(value: Any) -> bool:
+    return type(value) is str and re.fullmatch(r"[0-9a-f]{64}", value) is not None and value != "0" * 64
+
+
+def _durable_score_stock_code(value: Any) -> bool:
+    return type(value) is str and re.fullmatch(r"[0-9]{6}", value) is not None
+
+
+def _score_artifact_store(*, store=None, engine=None):
+    if store is not None:
+        if engine is not None:
+            raise ValueError("supply a single formal analysis artifact authority")
+        return store
+    if engine is None:
+        from server.api.routers._engine import get_engine
+
+        engine = get_engine()
+    from server.common.formal_analysis_store import FormalAnalysisStore
+
+    return FormalAnalysisStore(engine)
+
+
+def _score_shard_payload(analysis: list, scores: list, *, shared_field: bool) -> dict[str, Any]:
+    scored_rows, mirrored_event_details = [], []
+    for item, score in zip(analysis, scores):
+        compact = dict(score)
+        event_detail = item.get("event_risk_detail")
+        if type(event_detail) is str and event_detail == compact.get("event_risk_detail"):
+            del compact["event_risk_detail"]
+            mirrored_event_details.append(item["stock_code"])
+        if shared_field:
+            del compact[_SCORE_SHARED_PROOF_FIELD]
+        scored_rows.append(compact)
+    return {
+        "schema": _DURABLE_SCORE_SHARD_SCHEMA,
+        "analysis_rows": analysis,
+        "scored_rows": scored_rows,
+        "mirrored_event_details": mirrored_event_details,
+    }
+
+
+def build_durable_score_snapshot(
+    *, store, generation_sha256: str, trade_date: str, decision_at: datetime | str,
+    run_uid: str, build_sha: str, analysis_rows: Iterable[Mapping[str, Any]],
+    scored_rows: Iterable[Mapping[str, Any]],
+    fixed_market_context: Mapping[str, Any] | None = None,
+    frozen_announcement_source: Mapping[str, Any] | None = None,
+    frozen_core_inputs: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Seal exact bounded rows under a frozen generation and publish only its root."""
+    if not _durable_score_digest(generation_sha256):
+        raise ValueError("ANALYSIS_SCORE_GENERATION_INVALID")
+    payload = _complete_score_snapshot_payload(
+        trade_date=trade_date, decision_at=decision_at, run_uid=run_uid, build_sha=build_sha,
+        analysis_rows=analysis_rows, scored_rows=scored_rows, fixed_market_context=fixed_market_context,
+        frozen_announcement_source=frozen_announcement_source, frozen_core_inputs=frozen_core_inputs,
+    )
+    analysis, scores = payload.pop("analysis_rows"), payload.pop("scored_rows")
+    if len(scores) > _DURABLE_SCORE_MAX_STOCKS:
+        raise ValueError("ANALYSIS_SCORE_UNIVERSE_INVALID")
+
+    shared = {}
+    proof = scores[0].get(_SCORE_SHARED_PROOF_FIELD)
+    if isinstance(proof, dict):
+        exact_proof = _snapshot_json_bytes(proof)
+        if len(exact_proof) <= 64 * 1024 and all(
+            _SCORE_SHARED_PROOF_FIELD in row
+            and _snapshot_json_bytes(row[_SCORE_SHARED_PROOF_FIELD]) == exact_proof
+            for row in scores
+        ):
+            shared[_SCORE_SHARED_PROOF_FIELD] = proof
+
+    shards, pending = [], {}
+    offset = 0
+    while offset < len(scores):
+        count = min(_DURABLE_SCORE_SHARD_ROWS, len(scores) - offset)
+        while True:
+            shard = _score_shard_payload(
+                analysis[offset : offset + count], scores[offset : offset + count],
+                shared_field=bool(shared),
+            )
+            if len(_snapshot_json_bytes(shard)) <= _DURABLE_SCORE_SHARD_BYTES:
+                break
+            if count == 1:
+                raise ValueError("ANALYSIS_SCORE_ROW_EXCEEDS_SHARD_BUDGET")
+            count //= 2
+        pending[f"rows:{len(shards):06d}"] = shard
+        shards.append({
+            "first_code": analysis[offset]["stock_code"],
+            "last_code": analysis[offset + count - 1]["stock_code"],
+            "row_count": count,
+        })
+        offset += count
+        if len(pending) == _DURABLE_SCORE_BATCH_SHARDS or offset == len(scores):
+            digests = store.put_many(generation_sha256, _DURABLE_SCORE_STAGE, pending)
+            for key, desc in zip(pending, shards[-len(pending):]):
+                digest = digests.get(key)
+                if not _durable_score_digest(digest):
+                    raise ValueError("ANALYSIS_SCORE_SHARD_SEAL_INVALID")
+                desc["sha256"] = digest
+            pending.clear()
+
+    manifest = {
+        "schema": _DURABLE_SCORE_MANIFEST_SCHEMA, "generation_sha256": generation_sha256,
+        "origin": {"run_uid": run_uid, "build_sha": build_sha},
+        "metadata": payload, "shared_scored_fields": shared, "shards": shards,
+    }
+    return _store_score_manifest(store, manifest)
+
+
+def _store_score_manifest(store, manifest: dict[str, Any]) -> dict[str, Any]:
+    if len(_snapshot_json_bytes(manifest)) > _DURABLE_SCORE_HEADER_BYTES:
+        raise ValueError("ANALYSIS_SCORE_MANIFEST_EXCEEDS_BUDGET")
+    generation, metadata = manifest["generation_sha256"], manifest["metadata"]
+    digest = store.put(generation, _DURABLE_SCORE_STAGE, f"manifest:{metadata['run_uid']}", manifest)
+    envelope = {
+        "schema": SCORE_SNAPSHOT_SCHEMA, "encoding": DURABLE_SCORE_SNAPSHOT_ENCODING,
+        "generation_sha256": generation, "payload_sha256": digest,
+        **{field: metadata[field] for field in _SCORE_HEADER_FIELDS},
+    }
+    return _validate_durable_score_header(envelope, trade_date=metadata["trade_date"])
+
+
+def _validate_durable_score_header(value: Mapping[str, Any], *, trade_date: str | None) -> dict[str, Any]:
+    if (
+        set(value) != {"schema", "encoding", "generation_sha256", "payload_sha256", *_SCORE_HEADER_FIELDS}
+        or value.get("schema") != SCORE_SNAPSHOT_SCHEMA
+        or value.get("encoding") != DURABLE_SCORE_SNAPSHOT_ENCODING
+        or any(not _durable_score_digest(value.get(field)) for field in (
+            "generation_sha256", "payload_sha256", "stock_codes_sha256",
+        ))
+        or type(value["trade_date"]) is not str
+        or (trade_date is not None and value["trade_date"] != trade_date)
+        or re.fullmatch(r"[0-9a-f]{32}", str(value["run_uid"])) is None
+        or re.fullmatch(r"[0-9a-f]{40}", str(value["build_sha"])) is None
+        or value["build_sha"] == "0" * 40
+        or type(value["stock_count"]) is not int
+        or not 0 < value["stock_count"] <= _DURABLE_SCORE_MAX_STOCKS
+        or any(type(value[field]) is not int or value[field] < 0 for field in (
+            "data_excluded_count", "data_blocked_count",
+        ))
+        or value["data_excluded_count"] + value["data_blocked_count"] > value["stock_count"]
+        or type(value["execution_evidence"]) is not list
+        or not isinstance(value["input_proof"], dict)
+        or set(value["input_proof"]) != set(_SCORE_PROOF_FIELDS)
+        or len(_snapshot_json_bytes(value)) > _DURABLE_SCORE_HEADER_BYTES
+    ):
+        raise ValueError("ANALYSIS_SCORE_DURABLE_HEADER_INVALID")
+
+    target = date.fromisoformat(value["trade_date"])
+    decision = datetime.fromisoformat(value["decision_at"])
+    input_decision = datetime.fromisoformat(value["input_decision_at"])
+    proof = value["input_proof"]
+    if (
+        target.isoformat() != value["trade_date"]
+        or any(item.tzinfo is not None or item.microsecond for item in (decision, input_decision))
+        or any(value[key] != instant.isoformat(timespec="seconds") for key, instant in (
+            ("decision_at", decision), ("input_decision_at", input_decision),
+        ))
+        or not target <= input_decision.date() <= decision.date()
+        or input_decision > decision
+        or proof["membership_snapshot_date"] != value["trade_date"]
+        or not proof["membership_snapshot_source"]
+        or proof["turnover_full_market_count"] != value["stock_count"]
+        or datetime.fromisoformat(proof["flow_input_decision_at"]) != input_decision
+        or any(not _durable_score_digest(proof[field]) for field in (
+            "membership_proof_sha256", "pit_common_receipt_root_hash",
+            "turnover_full_market_proof_root_sha256", "flow_input_root_sha256",
+        ))
+    ):
+        raise ValueError("ANALYSIS_SCORE_DURABLE_HEADER_INVALID")
+    return dict(value)
+
+
+def _read_score_manifest(value: Mapping[str, Any], *, trade_date: str | None, store) -> dict[str, Any]:
+    header = _validate_durable_score_header(value, trade_date=trade_date)
+    manifest = store.get(header["generation_sha256"], _DURABLE_SCORE_STAGE, f"manifest:{header['run_uid']}")
+    if (
+        type(manifest) is not dict
+        or set(manifest) != {"schema", "generation_sha256", "origin", "metadata", "shared_scored_fields", "shards"}
+        or manifest["schema"] != _DURABLE_SCORE_MANIFEST_SCHEMA
+        or manifest["generation_sha256"] != header["generation_sha256"]
+        or len(_snapshot_json_bytes(manifest)) > _DURABLE_SCORE_HEADER_BYTES
+        or canonical_sha256(manifest) != header["payload_sha256"]
+    ):
+        raise ValueError("ANALYSIS_SCORE_DURABLE_MANIFEST_INVALID")
+    origin = manifest["origin"]
+    if (
+        type(origin) is not dict or set(origin) != {"run_uid", "build_sha"}
+        or type(origin["run_uid"]) is not str or re.fullmatch(r"[0-9a-f]{32}", origin["run_uid"]) is None
+        or type(origin["build_sha"]) is not str or re.fullmatch(r"[0-9a-f]{40}", origin["build_sha"]) is None
+        or origin["build_sha"] == "0" * 40
+    ):
+        raise ValueError("ANALYSIS_SCORE_DURABLE_ORIGIN_INVALID")
+    metadata = manifest["metadata"]
+    if (
+        type(metadata) is not dict
+        or not {"schema", *_SCORE_HEADER_FIELDS} <= set(metadata)
+        or set(metadata) - {"schema", *_SCORE_HEADER_FIELDS} - _SCORE_OPTIONAL_METADATA
+        or metadata["schema"] != SCORE_SNAPSHOT_SCHEMA
+        or any(metadata[field] != header[field] for field in _SCORE_HEADER_FIELDS)
+    ):
+        raise ValueError("ANALYSIS_SCORE_DURABLE_METADATA_INVALID")
+    if "fixed_market_context" in metadata:
+        context = dict(metadata["fixed_market_context"])
+        digest = context.pop("context_sha256", None)
+        if (
+            context.get("trade_date") != metadata["trade_date"]
+            or context.get("decision_known_at") != metadata["input_decision_at"]
+            or canonical_sha256(context) != digest
+        ):
+            raise ValueError("ANALYSIS_SCORE_FIXED_MARKET_CONTEXT_MISMATCH")
+    if "frozen_announcement_source" in metadata:
+        _validate_frozen_announcement_source(
+            metadata["frozen_announcement_source"], trade_date=metadata["trade_date"],
+            decision_at=metadata["input_decision_at"],
+        )
+    if "frozen_core_inputs" in metadata:
+        _validate_frozen_core_inputs(
+            metadata["frozen_core_inputs"], initial_announcement=metadata.get("frozen_announcement_source"),
+        )
+
+    shared, shards = manifest["shared_scored_fields"], manifest["shards"]
+    if (
+        type(shared) is not dict
+        or set(shared) not in (set(), {_SCORE_SHARED_PROOF_FIELD})
+        or (shared and (type(shared[_SCORE_SHARED_PROOF_FIELD]) is not dict or len(_snapshot_json_bytes(shared)) > 65 * 1024))
+        or type(shards) is not list or not 0 < len(shards) <= header["stock_count"]
+    ):
+        raise ValueError("ANALYSIS_SCORE_DURABLE_MANIFEST_INVALID")
+    previous, total = "", 0
+    for shard in shards:
+        if (
+            type(shard) is not dict
+            or set(shard) != {"first_code", "last_code", "row_count", "sha256"}
+            or not _durable_score_stock_code(shard["first_code"])
+            or not _durable_score_stock_code(shard["last_code"])
+            or not previous < shard["first_code"] <= shard["last_code"]
+            or type(shard["row_count"]) is not int
+            or not 0 < shard["row_count"] <= _DURABLE_SCORE_SHARD_ROWS
+            or (shard["row_count"] == 1) != (shard["first_code"] == shard["last_code"])
+            or not _durable_score_digest(shard["sha256"])
+        ):
+            raise ValueError("ANALYSIS_SCORE_DURABLE_SHARD_DESCRIPTOR_INVALID")
+        previous = shard["last_code"]
+        total += shard["row_count"]
+    if total != header["stock_count"]:
+        raise ValueError("ANALYSIS_SCORE_DURABLE_COVERAGE_INVALID")
+    return manifest
+
+
+def rebind_durable_score_snapshot(
+    value: Mapping[str, Any], *, store, run_uid: str, build_sha: str,
+) -> dict[str, Any]:
+    """Bind an existing frozen calculation to a replacement scheduler audit."""
+    if (
+        type(run_uid) is not str or re.fullmatch(r"[0-9a-f]{32}", run_uid) is None
+        or type(build_sha) is not str or re.fullmatch(r"[0-9a-f]{40}", build_sha) is None
+        or build_sha == "0" * 40
+    ):
+        raise ValueError("ANALYSIS_SCORE_PUBLISHER_INVALID")
+    manifest = _read_score_manifest(value, trade_date=None, store=store)
+    original = manifest["metadata"]
+    if original["run_uid"] == run_uid:
+        if original["build_sha"] != build_sha:
+            raise ValueError("ANALYSIS_SCORE_PUBLISHER_IDENTITY_CHANGED")
+        return dict(value)
+    members = store.list_members(manifest["generation_sha256"], _DURABLE_SCORE_STAGE)
+    if any(members.get(f"rows:{index:06d}") != shard["sha256"] for index, shard in enumerate(manifest["shards"])):
+        raise ValueError("ANALYSIS_SCORE_DURABLE_SHARD_MEMBER_MISMATCH")
+    return _store_score_manifest(store, {**manifest, "metadata": {**original, "run_uid": run_uid, "build_sha": build_sha}})
+
+
+def read_score_snapshot_header(
+    value: Mapping[str, Any], *, trade_date: str | None = None, store=None, engine=None,
+) -> dict[str, Any]:
+    """Authenticate durable score metadata without materializing any stock rows."""
+    if isinstance(value, Mapping) and value.get("encoding") == DURABLE_SCORE_SNAPSHOT_ENCODING:
+        try:
+            authority = _score_artifact_store(store=store, engine=engine)
+            return _read_score_manifest(value, trade_date=trade_date, store=authority)["metadata"]
+        except (TypeError, KeyError, RuntimeError, SQLAlchemyError) as exc:
+            raise ValueError("ANALYSIS_SCORE_DURABLE_MANIFEST_INVALID") from exc
+    payload = decode_score_snapshot(value, trade_date=trade_date)
+    return {key: member for key, member in payload.items() if key not in {"analysis_rows", "scored_rows"}}
+
+
+def _read_score_shards(store, manifest: Mapping[str, Any]):
+    members = store.list_members(manifest["generation_sha256"], _DURABLE_SCORE_STAGE)
+    shards = manifest["shards"]
+    if any(members.get(f"rows:{index:06d}") != shard["sha256"] for index, shard in enumerate(shards)):
+        raise ValueError("ANALYSIS_SCORE_DURABLE_SHARD_MEMBER_MISMATCH")
+    for offset in range(0, len(shards), _DURABLE_SCORE_BATCH_SHARDS):
+        batch = shards[offset : offset + _DURABLE_SCORE_BATCH_SHARDS]
+        artifacts = store.load_artifacts([descriptor["sha256"] for descriptor in batch])
+        for descriptor in batch:
+            yield descriptor, artifacts[descriptor["sha256"]]
+
+
+def _decode_durable_score_snapshot(value: Mapping[str, Any], *, trade_date: str | None, store) -> dict[str, Any]:
+    manifest = _read_score_manifest(value, trade_date=trade_date, store=store)
+    metadata, shared = manifest["metadata"], manifest["shared_scored_fields"]
+    analysis, scores, codes = [], [], []
+    excluded, blocked = 0, 0
+    input_proof = metadata["input_proof"]
+    for desc, shard in _read_score_shards(store, manifest):
+        if (
+            type(shard) is not dict
+            or set(shard) != {"schema", "analysis_rows", "scored_rows", "mirrored_event_details"}
+            or shard["schema"] != _DURABLE_SCORE_SHARD_SCHEMA
+            or len(_snapshot_json_bytes(shard)) > _DURABLE_SCORE_SHARD_BYTES
+        ):
+            raise ValueError("ANALYSIS_SCORE_DURABLE_SHARD_INVALID")
+        items, scored, mirrored = shard["analysis_rows"], shard["scored_rows"], shard["mirrored_event_details"]
+        if (
+            type(items) is not list or type(scored) is not list or type(mirrored) is not list
+            or len(items) != len(scored) or len(items) != desc["row_count"]
+            or any(not _durable_score_stock_code(code) for code in mirrored)
+            or mirrored != sorted(set(mirrored))
+        ):
+            raise ValueError("ANALYSIS_SCORE_DURABLE_SHARD_INVALID")
+        stock_codes = []
+        for item, score in zip(items, scored):
+            if type(item) is not dict or type(score) is not dict:
+                raise ValueError("ANALYSIS_SCORE_DURABLE_SHARD_ROW_INVALID")
+            code = item.get("stock_code")
+            if (
+                not _durable_score_stock_code(code)
+                or (stock_codes and code <= stock_codes[-1])
+                or score.get("stock_code") != code
+                or any(score.get(field) != input_proof[field] for field in _SCORE_PROOF_FIELDS)
+                or set(score) & set(shared)
+            ):
+                raise ValueError("ANALYSIS_SCORE_DURABLE_ROW_BINDING_INVALID")
+            stock_codes.append(code)
+        if (
+            stock_codes[0] != desc["first_code"] or stock_codes[-1] != desc["last_code"]
+            or not set(mirrored) <= set(stock_codes)
+        ):
+            raise ValueError("ANALYSIS_SCORE_DURABLE_SHARD_COVERAGE_INVALID")
+        for item, score in zip(items, scored):
+            if item["stock_code"] in mirrored:
+                if "event_risk_detail" in score or type(item.get("event_risk_detail")) is not str:
+                    raise ValueError("ANALYSIS_SCORE_DURABLE_EVENT_DETAIL_INVALID")
+                score["event_risk_detail"] = item["event_risk_detail"]
+            score.update(deepcopy(shared))
+            excluded += bool(score.get("finance_data_exclusion"))
+            blocked += not score.get("finance_data_exclusion") and (
+                score.get("finance_pit_status") != "AVAILABLE" or score.get("event_pit_status") != "AVAILABLE"
+            )
+        codes.extend(stock_codes)
+        analysis.extend(items)
+        scores.extend(scored)
+    if (
+        len(codes) != metadata["stock_count"] or canonical_sha256(codes) != metadata["stock_codes_sha256"]
+        or excluded != metadata["data_excluded_count"] or blocked != metadata["data_blocked_count"]
+    ):
+        raise ValueError("ANALYSIS_SCORE_DURABLE_COVERAGE_INVALID")
+    return {**metadata, "analysis_rows": analysis, "scored_rows": scores}
+
+
+class _AuthenticatedDurableScore(dict):
+    """An in-process readback bound to one immutable envelope and SQL authority."""
+
+    __slots__ = ("_envelope_sha256", "_authority", "_metadata_sha256", "_projection_rows", "_stock_codes")
+
+    def __init__(self, snapshot: dict[str, Any], envelope: Mapping[str, Any], authority) -> None:
+        super().__init__(snapshot)
+        self._envelope_sha256 = canonical_sha256(dict(envelope))
+        self._authority = authority
+        self._metadata_sha256 = canonical_sha256({
+            key: value for key, value in snapshot.items() if key not in {"analysis_rows", "scored_rows"}
+        })
+        self._projection_rows = tuple({
+            field: deepcopy(row[field]) for field in CANONICAL_ANALYSIS_COLUMNS if field in row
+        } for row in snapshot["analysis_rows"])
+        self._stock_codes = tuple(row["stock_code"] for row in snapshot["scored_rows"])
+
+
+def _reuse_authenticated_score(
+    score_snapshot: Mapping[str, Any], decoded_score_snapshot: Mapping[str, Any],
+    *, target: str, store=None, engine=None,
+) -> dict[str, Any]:
+    header = _validate_durable_score_header(score_snapshot, trade_date=target)
+    authority = store if store is not None else engine
+    if (
+        authority is None or (store is not None and engine is not None)
+        or not isinstance(decoded_score_snapshot, _AuthenticatedDurableScore)
+        or decoded_score_snapshot._authority is not authority
+        or decoded_score_snapshot._envelope_sha256 != canonical_sha256(header)
+        or any(decoded_score_snapshot.get(key) != header[key] for key in _SCORE_HEADER_FIELDS)
+        or decoded_score_snapshot._metadata_sha256 != canonical_sha256({
+            key: value for key, value in decoded_score_snapshot.items()
+            if key not in {"analysis_rows", "scored_rows"}
+        })
+    ):
+        raise ValueError("ANALYSIS_SCORE_DURABLE_READBACK_IDENTITY_MISMATCH")
+    # Only the projection checker uses this cache. Keep its required fields
+    # independent from the public mutable rows returned to other consumers.
+    return {
+        **decoded_score_snapshot,
+        "analysis_rows": decoded_score_snapshot._projection_rows,
+        "scored_rows": [{"stock_code": code} for code in decoded_score_snapshot._stock_codes],
+    }
+
+
+def decode_score_snapshot(
+    value: Mapping[str, Any], *, trade_date: str | None = None, store=None, engine=None,
+) -> dict[str, Any]:
+    if isinstance(value, Mapping) and value.get("encoding") == DURABLE_SCORE_SNAPSHOT_ENCODING:
+        try:
+            authority = _score_artifact_store(store=store, engine=engine)
+            decoded = _decode_durable_score_snapshot(value, trade_date=trade_date, store=authority)
+            return _AuthenticatedDurableScore(decoded, value, store if store is not None else engine)
+        except (TypeError, KeyError, RuntimeError, SQLAlchemyError) as exc:
+            raise ValueError("ANALYSIS_SCORE_DURABLE_UNAVAILABLE") from exc
     if not isinstance(value, Mapping) or value.get("schema") != SCORE_SNAPSHOT_SCHEMA or value.get("encoding") not in {
         PRELIMINARY_ANALYSIS_SNAPSHOT_ENCODING, _HISTORICAL_SNAPSHOT_ENCODING,
         _SCORE_RECONSTRUCTION_ENCODING,
@@ -1365,6 +1815,9 @@ def build_pool_manifest(
     analysis_rows: Iterable[Mapping[str, Any]],
     recommendation_rows: Iterable[Mapping[str, Any]],
     score_snapshot: Mapping[str, Any] | None = None,
+    decoded_score_snapshot: Mapping[str, Any] | None = None,
+    store=None,
+    engine=None,
 ) -> dict[str, Any]:
     target = str(trade_date or "").strip()[:10]
     try:
@@ -1382,7 +1835,16 @@ def build_pool_manifest(
         recommendation_sources,
         columns=CANONICAL_RECOMMENDATION_COLUMNS,
     )
-    snapshot = decode_score_snapshot(score_snapshot, trade_date=target) if score_snapshot is not None else None
+    if decoded_score_snapshot is not None:
+        if score_snapshot is None:
+            raise ValueError("ANALYSIS_SCORE_DURABLE_READBACK_ENVELOPE_REQUIRED")
+        snapshot = _reuse_authenticated_score(
+            score_snapshot, decoded_score_snapshot, target=target, store=store, engine=engine,
+        )
+    elif score_snapshot is not None:
+        snapshot = decode_score_snapshot(score_snapshot, trade_date=target, store=store, engine=engine)
+    else:
+        snapshot = None
     if snapshot is not None:
         frozen_analysis = _canonical_rows(snapshot["analysis_rows"], columns=CANONICAL_ANALYSIS_COLUMNS)
         # A frozen DATETIME can omit zero fractional seconds. Align only the
@@ -1659,7 +2121,10 @@ def _read_persisted_analysis_rows(connection: Any, trade_date: str, columns: str
         last_code = rows[-1]["stock_code"]
 
 
-def read_persisted_pool_manifest(connection: Any, trade_date: str, *, score_snapshot: Mapping[str, Any] | None = None) -> dict[str, Any]:
+def read_persisted_pool_manifest(
+    connection: Any, trade_date: str, *, score_snapshot: Mapping[str, Any] | None = None,
+    decoded_score_snapshot: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     analysis_columns = ", ".join(f"`{name}`" for name in CANONICAL_ANALYSIS_COLUMNS)
     recommendation_read_columns = (
         *CANONICAL_RECOMMENDATION_COLUMNS,
@@ -1683,6 +2148,8 @@ def read_persisted_pool_manifest(connection: Any, trade_date: str, *, score_snap
         analysis_rows=analysis_rows,
         recommendation_rows=recommendation_rows,
         score_snapshot=score_snapshot,
+        decoded_score_snapshot=decoded_score_snapshot,
+        engine=connection,
     )
 
 
@@ -1694,8 +2161,12 @@ def build_publication_receipt(
     build_sha: str,
     published_at: datetime | str,
     score_snapshot: Mapping[str, Any],
+    store=None,
+    engine=None,
 ) -> dict[str, Any]:
-    snapshot = decode_score_snapshot(score_snapshot, trade_date=str(manifest.get("trade_date") or ""))
+    snapshot = read_score_snapshot_header(
+        score_snapshot, trade_date=str(manifest.get("trade_date") or ""), store=store, engine=engine,
+    )
     if publisher_task_type not in ANALYSIS_SCORE_PUBLICATION_TASK_TYPES:
         raise ValueError("ANALYSIS_CANONICAL_PUBLISHER_REQUIRED")
     if datetime.fromisoformat(str(published_at)) < datetime.fromisoformat(snapshot["decision_at"]):
@@ -1713,14 +2184,17 @@ def build_publication_receipt(
     return {**core, "receipt_id": canonical_sha256(core)}
 
 
-def publication_receipt_is_valid(value: Mapping[str, Any]) -> bool:
+def publication_receipt_is_valid(value: Mapping[str, Any], *, store=None, engine=None) -> bool:
     if not isinstance(value, Mapping):
         return False
     supplied = str(value.get("receipt_id") or "").strip().lower()
     core = dict(value)
     core.pop("receipt_id", None)
     try:
-        snapshot = decode_score_snapshot(value.get("score_snapshot") or {}, trade_date=str(value.get("trade_date") or ""))
+        snapshot = read_score_snapshot_header(
+            value.get("score_snapshot") or {}, trade_date=str(value.get("trade_date") or ""),
+            store=store, engine=engine,
+        )
         if datetime.fromisoformat(str(value.get("published_at"))) < datetime.fromisoformat(snapshot["decision_at"]):
             return False
     except (ValueError, TypeError, KeyError):
@@ -1740,6 +2214,7 @@ __all__ = [
     "ANALYSIS_POOL_RECEIPT_SCHEMA",
     "ANALYSIS_POOL_PUBLISHER_TASK_TYPES",
     "SCORE_SNAPSHOT_SCHEMA",
+    "DURABLE_SCORE_SNAPSHOT_ENCODING",
     "PRELIMINARY_UPPER_SUBJECT_SCHEMA",
     "TURNOVER_DIRECT_FORMULA",
     "TURNOVER_EVIDENCE_SCHEMA",
@@ -1747,6 +2222,8 @@ __all__ = [
     "CANONICAL_RECOMMENDATION_COLUMNS",
     "build_pool_manifest",
     "build_score_snapshot",
+    "build_durable_score_snapshot",
+    "rebind_durable_score_snapshot",
     "build_preliminary_analysis_snapshot",
     "build_publication_receipt",
     "build_preliminary_upper_subject_receipt",
@@ -1754,6 +2231,7 @@ __all__ = [
     "canonical_sha256",
     "decode_preliminary_analysis_snapshot",
     "decode_score_snapshot",
+    "read_score_snapshot_header",
     "explicit_database_true",
     "is_executable_recommendation",
     "is_research_only_recommendation",

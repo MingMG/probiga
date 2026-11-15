@@ -8,16 +8,24 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Mapping
 
-from server.common.analysis_pool_receipt import PREMARKET_POOL_TASK, decode_score_snapshot
+from server.common.analysis_pool_receipt import (
+    DURABLE_SCORE_SNAPSHOT_ENCODING, PREMARKET_POOL_TASK,
+    decode_score_snapshot, read_score_snapshot_header,
+)
+from server.common.formal_analysis_store import FormalAnalysisStore
 from server.common.authoritative_market_clock import (
     PRODUCTION_TIMEZONE, STRATEGY_POOL_PREMARKET_PUBLICATION_DEADLINE, StrategyPoolDecisionSlot,
 )
-from server.common.scheduler_terminal_journal import TerminalJournal, digest
+from server.common.scheduler_terminal_journal import TerminalJournal, canonical, digest
 
 
-PREMARKET_POOL_WORK_SCHEMA = "probiga.premarket-pool-work.v1"
+PREMARKET_POOL_WORK_SCHEMA = "probiga.premarket-pool-work.v2"
+_LEGACY_PREMARKET_POOL_WORK_SCHEMA = "probiga.premarket-pool-work.v1"
 PREMARKET_POOL_WORK_REF_SCHEMA = "probiga.premarket-pool-work-reference.v1"
 WORK_RECORD = "FROZEN_INPUT"
+FROZEN_SCORING_STAGE = "frozen_pool"
+RECOMMENDATIONS_KEY = "recommendations"
+_MAX_PREMARKET_WORK_BYTES = 256 * 1024
 
 
 def _json_value(value):
@@ -56,7 +64,7 @@ def _require_identity(run_uid, build_sha, trade_date, parent_receipt_uid, source
 
 def stage_frozen_pool_work(
     journal: TerminalJournal, *, run_uid: str, build_sha: str,
-    parent_receipt_uid: str, source_evidence_sha256: str, scoring: Mapping,
+    parent_receipt_uid: str, source_evidence_sha256: str, scoring: Mapping, engine=None,
 ) -> dict:
     trade_date = scoring["data_trade_date"]
     _require_identity(run_uid, build_sha, trade_date, parent_receipt_uid, source_evidence_sha256)
@@ -66,7 +74,9 @@ def stage_frozen_pool_work(
         "source_evidence_sha256": source_evidence_sha256,
         "scoring": scoring,
     })
-    _validate_work(work)
+    _validate_work(work, engine=engine)
+    if len(canonical(work)) > _MAX_PREMARKET_WORK_BYTES:
+        raise ValueError("prepared premarket pool reference exceeds its budget")
     raw = journal.preserve(run_uid, WORK_RECORD, work)
     return {
         "schema": PREMARKET_POOL_WORK_REF_SCHEMA, "run_uid": run_uid, "build_sha": build_sha,
@@ -75,14 +85,35 @@ def stage_frozen_pool_work(
     }
 
 
-def _validate_work(work: dict) -> dict:
-    if set(work) != {"schema", "run_uid", "build_sha", "trade_date", "parent_receipt_uid",
-                     "source_evidence_sha256", "scoring"} or work["schema"] != PREMARKET_POOL_WORK_SCHEMA:
+def _validate_work(work: dict, *, engine=None) -> dict:
+    if (
+        set(work) != {"schema", "run_uid", "build_sha", "trade_date", "parent_receipt_uid",
+                      "source_evidence_sha256", "scoring"}
+        or work["schema"] not in {PREMARKET_POOL_WORK_SCHEMA, _LEGACY_PREMARKET_POOL_WORK_SCHEMA}
+    ):
         raise ValueError("prepared strategy pool record differs")
     _require_identity(work["run_uid"], work["build_sha"], work["trade_date"],
                       work["parent_receipt_uid"], work["source_evidence_sha256"])
     scoring = work["scoring"]
-    snapshot = decode_score_snapshot(scoring["score_snapshot"], trade_date=work["trade_date"])
+    durable = work["schema"] == PREMARKET_POOL_WORK_SCHEMA
+    if durable:
+        if (
+            set(scoring) != {
+                "phase", "data_trade_date", "execution_session_date", "cutoff_at", "evaluated_at",
+                "score_snapshot", "core_inputs", "recommendations_sha256", "recommendation_count",
+                "market_mood_score", "flow_date", "hot_date",
+            }
+            or scoring["score_snapshot"].get("encoding") != DURABLE_SCORE_SNAPSHOT_ENCODING
+            or re.fullmatch(r"[0-9a-f]{64}", str(scoring["recommendations_sha256"])) is None
+            or type(scoring["recommendation_count"]) is not int
+            or not 0 <= scoring["recommendation_count"] <= 80
+        ):
+            raise ValueError("prepared premarket scoring checkpoint differs")
+    elif not isinstance(scoring["analysis_rows"], list) or not isinstance(scoring["recommendation_rows"], list):
+        raise ValueError("historical prepared premarket score rows differ")
+    snapshot = read_score_snapshot_header(
+        scoring["score_snapshot"], trade_date=work["trade_date"], engine=engine,
+    )
     cutoff = datetime.fromisoformat(scoring["cutoff_at"])
     evaluated = datetime.fromisoformat(scoring["evaluated_at"])
     if (
@@ -93,15 +124,31 @@ def _validate_work(work: dict) -> dict:
         or snapshot["run_uid"] != work["run_uid"] or snapshot["build_sha"] != work["build_sha"]
         or snapshot["decision_at"] != cutoff.replace(tzinfo=None).isoformat(timespec="seconds")
         or snapshot["input_decision_at"] != cutoff.replace(tzinfo=None).isoformat(timespec="seconds")
-        or not isinstance(scoring["analysis_rows"], list)
-        or not isinstance(scoring["recommendation_rows"], list)
+        or scoring.get("core_inputs") != snapshot.get("frozen_core_inputs")
     ):
         raise ValueError("prepared strategy pool score identity differs")
     return snapshot
 
 
+def _load_prepared_score_rows(connection, work: dict) -> tuple[list, list, dict | None]:
+    scoring = work["scoring"]
+    if work["schema"] == _LEGACY_PREMARKET_POOL_WORK_SCHEMA:
+        return scoring["analysis_rows"], scoring["recommendation_rows"], None
+    store = FormalAnalysisStore(connection)
+    envelope = scoring["score_snapshot"]
+    members = store.list_members(envelope["generation_sha256"], FROZEN_SCORING_STAGE)
+    recommendation_sha256 = scoring["recommendations_sha256"]
+    if members.get(RECOMMENDATIONS_KEY) != recommendation_sha256:
+        raise ValueError("prepared premarket recommendation manifest differs")
+    recommendations = store.load_artifact(recommendation_sha256)
+    if not isinstance(recommendations, list) or len(recommendations) != scoring["recommendation_count"]:
+        raise ValueError("prepared premarket recommendation coverage differs")
+    decoded = decode_score_snapshot(envelope, trade_date=work["trade_date"], engine=connection)
+    return decoded["analysis_rows"], recommendations, decoded
+
+
 def read_frozen_pool_work(
-    journal: TerminalJournal, reference: Mapping, *, run_uid: str, build_sha: str, trade_date: str,
+    journal: TerminalJournal, reference: Mapping, *, run_uid: str, build_sha: str, trade_date: str, engine=None,
 ) -> dict:
     if (
         set(reference) != {"schema", "run_uid", "build_sha", "trade_date", "sha256", "bytes",
@@ -118,7 +165,9 @@ def read_frozen_pool_work(
     if not raw or len(raw) != reference["bytes"] or digest(raw) != reference["sha256"]:
         raise ValueError("prepared strategy pool work is unavailable or has changed")
     work = json.loads(raw)
-    _validate_work(work)
+    if work.get("schema") == PREMARKET_POOL_WORK_SCHEMA and len(raw) > _MAX_PREMARKET_WORK_BYTES:
+        raise ValueError("prepared premarket pool reference exceeds its budget")
+    _validate_work(work, engine=engine)
     if any(work[key] != reference[key] for key in ("run_uid", "build_sha", "trade_date")):
         raise ValueError("prepared strategy pool sealed identity differs")
     return work
@@ -164,7 +213,7 @@ def publish_prepared_premarket_pool(
 
     _require_governance_write_transaction(connection)
     require_premarket_publication_window(slot)
-    snapshot = _validate_work(work)
+    snapshot = _validate_work(work, engine=connection)
     score = work["scoring"]
     target, build = work["trade_date"], work["build_sha"]
     if (
@@ -196,6 +245,7 @@ def publish_prepared_premarket_pool(
     ):
         raise RuntimeError("PREMARKET_INITIAL_POOL_UNAVAILABLE_OR_CHANGED")
 
+    analysis_rows, recommendations, decoded_score = _load_prepared_score_rows(connection, work)
     engine = connection.engine
     _prebind_direct_publication_history(
         engine, run_uid=run_uid, task_type=PREMARKET_POOL_TASK, build_sha=build,
@@ -203,10 +253,10 @@ def publish_prepared_premarket_pool(
         execution_time=score["cutoff_at"], publication_connection=connection,
     )
     publication = save_outputs(
-        engine, score["analysis_rows"], score["recommendation_rows"], target,
+        engine, analysis_rows, recommendations, target,
         publication_run_uid=run_uid, publisher_task_type=PREMARKET_POOL_TASK,
         publisher_build_sha=build, score_snapshot=score["score_snapshot"],
-        publication_connection=connection,
+        decoded_score_snapshot=decoded_score, publication_connection=connection,
     )
     _finish_direct_publication_history(
         engine, run_uid=run_uid, success=True, publication_receipt=publication,
@@ -215,6 +265,7 @@ def publish_prepared_premarket_pool(
     activation = activate_analysis_pool(
         connection, run_uid=run_uid, task_type=PREMARKET_POOL_TASK,
         publication_receipt=publication, decision_known_at=slot.scheduled_at,
+        staged_in_transaction=True,
     )
     empty_recommendations = publication["recommendation_count"] == 0
     if (
@@ -253,7 +304,7 @@ def publish_prepared_premarket_pool(
         next_rows=next_rows, time_field="finished_at",
     )
     empty_governance = next_identity["stock_count"] == 0
-    degradations = analysis_publication_degradations(publication)
+    degradations = analysis_publication_degradations(publication, engine=connection)
     receipt = build_terminal_delivery_receipt(
         session=initial, scheduler_run_uid=run_uid, stage_name=PREMARKET_POOL_TASK,
         status="DEGRADED" if degradations else "PASS", strategy_release_id=initial["strategy_release_id"],

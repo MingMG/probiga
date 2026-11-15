@@ -77,6 +77,7 @@ from server.common.pit_facts import (
     resolve_strategy_fact_cutoffs,
 )
 if TYPE_CHECKING:
+    from server.common.formal_analysis_store import FormalAnalysisStore
     from server.common.pit_facts import SealedFinanceInputs
 from server.common.authoritative_market_clock import (
     STRATEGY_POOL_INITIAL_TIME,
@@ -113,8 +114,9 @@ from server.common.chase_risk_policy import (
     CanonicalChaseBar,
     assess_chase_risk,
 )
-from .intraday_reversal import load_index_stability, load_intraday_evidence
-from .tactical_market import (
+from biz.analysis.formal_scoring_checkpoints import checkpoint_factor_frame, formal_factor_generation_sha256
+from biz.analysis.intraday_reversal import load_index_stability, load_intraday_evidence
+from biz.analysis.tactical_market import (
     MODE_DEFENSIVE,
     MODE_PANIC_REBOUND,
     MODE_SPECULATIVE,
@@ -136,6 +138,7 @@ _KLINE_FEATURE_DEFAULT_QUERY_TIMEOUT_SECONDS = 180
 _KLINE_FEATURE_DEFAULT_CHUNK_DAYS = 5
 _KLINE_ROLLING_STATE_SCHEMA = "probiga.kline-rolling-feature-state.v2"
 _KLINE_ROLLING_REBUILD_CODE_LIMIT = 500
+_KLINE_TECHNICAL_STOCKS_PER_PART = 512
 
 ProgressCallback = Callable[[dict[str, Any]], None]
 
@@ -295,6 +298,7 @@ class BatchStats:
     executable_count: int = 0
     canonical_pool_sha256: str = ""
     publication_receipt: dict[str, Any] | None = None
+    prepared_publication: dict[str, Any] | None = None
 
 
 def _analysis_lock_key(database_name: str, trade_date: str) -> str:
@@ -1594,6 +1598,8 @@ def load_kline_features(
     *,
     decision_known_at: datetime | str | None = None,
     progress_callback: ProgressCallback | None = None,
+    formal_store: FormalAnalysisStore | None = None,
+    formal_generation_sha256: str | None = None,
 ) -> pd.DataFrame:
     with daily_input_snapshot(engine) as connection:
         return _load_kline_features_from_snapshot(
@@ -1601,7 +1607,39 @@ def load_kline_features(
             decision_known_at=decision_known_at,
             progress_callback=progress_callback,
             verification_engine=engine,
+            formal_store=formal_store,
+            formal_generation_sha256=formal_generation_sha256,
         )
+
+
+def _kline_technical_window(df: pd.DataFrame, target: date) -> pd.DataFrame:
+    grouped = df.groupby("stock_code", group_keys=False)
+    for window in (5, 10, 20, 60):
+        min_periods = max(3, min(window, window // 2))
+        df[f"ma{window}"] = grouped["close"].transform(lambda s, w=window, m=min_periods: s.rolling(w, min_periods=m).mean())
+    df["amount_ma5"] = grouped["amount"].transform(lambda s: s.rolling(5, min_periods=3).mean())
+    df["amount_ma20"] = grouped["amount"].transform(lambda s: s.rolling(20, min_periods=8).mean())
+    df["previous_change_pct"] = grouped["change_pct"].shift(1)
+    df["pct_5"] = grouped["close"].pct_change(5) * 100.0
+    df["pct_20"] = grouped["close"].pct_change(20) * 100.0
+    df["volatility_20"] = grouped["change_pct"].transform(lambda s: s.rolling(20, min_periods=8).std())
+    df["high_20"] = grouped["high"].transform(lambda s: s.rolling(20, min_periods=8).max())
+    df["high_60"] = grouped["high"].transform(lambda s: s.rolling(60, min_periods=20).max())
+    df["low_60"] = grouped["low"].transform(lambda s: s.rolling(60, min_periods=20).min())
+    df["drawdown_60"] = (df["close"] / df["high_60"] - 1.0) * 100.0
+    df["from_low_60"] = (df["close"] / df["low_60"] - 1.0) * 100.0
+    df["dist_ma20"] = (df["close"] / df["ma20"] - 1.0) * 100.0
+    df["amount_ratio_5"] = df["amount"] / df["amount_ma5"].replace(0, np.nan)
+    df["amount_ratio_20"] = df["amount"] / df["amount_ma20"].replace(0, np.nan)
+
+    latest = df[df["trade_date"] == target].copy()
+    return latest.drop(
+        columns=[
+            "data_source", "batch_id", "data_version", "quality_status",
+            "permission_status", "received_at",
+        ],
+        errors="ignore",
+    )
 
 
 def _load_kline_features_from_snapshot(
@@ -1612,6 +1650,8 @@ def _load_kline_features_from_snapshot(
     decision_known_at: datetime | str | None,
     progress_callback: ProgressCallback | None,
     verification_engine: Engine | None = None,
+    formal_store: FormalAnalysisStore | None = None,
+    formal_generation_sha256: str | None = None,
 ) -> pd.DataFrame:
     stage_started_at = time.monotonic()
     query_timeout_seconds = _bounded_env_int(
@@ -1673,7 +1713,9 @@ def _load_kline_features_from_snapshot(
     frames: list[pd.DataFrame] = []
     rolling_mode = "INDEXED_DATE_CHUNKS"
     repaired_codes: list[str] = []
-    state_path = _kline_rolling_state_path()
+    # The preceding-session rolling file cannot resume an incomplete
+    # same-date run. Formal scoring reads the exact source partitions below.
+    state_path = _kline_rolling_state_path() if formal_store is None else None
     state = _load_kline_rolling_state(state_path) if state_path else None
     previous_session = ordered_dates[-2] if len(ordered_dates) >= 2 else None
     previous_session_text = str(previous_session or "")[:10]
@@ -1808,12 +1850,25 @@ def _load_kline_features_from_snapshot(
                 kline_feature_chunk=index,
                 kline_feature_chunk_count=len(date_chunks),
             )
-            try:
-                frame = _read_kline_feature_frame(
+            def read_chunk() -> pd.DataFrame:
+                statement = chunk_sql
+                bindings = catalog_params
+                if formal_store is not None:
+                    # Each query only joins the attested catalogs for dates it reads.
+                    scope = {
+                        "sessions": date_chunk,
+                        "catalog_batches_by_session": {
+                            day: daily_window["catalog_batches_by_session"][day]
+                            for day in date_chunk
+                        },
+                    }
+                    segment_join, bindings = daily_input_catalog_join(scope)
+                    statement = chunk_sql.replace(catalog_join, segment_join, 1)
+                return _read_kline_feature_frame(
                     engine,
-                    chunk_sql,
+                    statement,
                     params={
-                        **catalog_params,
+                        **bindings,
                         "chunk_start_date": date_chunk[0],
                         "chunk_end_date": date_chunk[-1],
                         "decision_known_at": decision_cutoff,
@@ -1822,6 +1877,37 @@ def _load_kline_features_from_snapshot(
                     stage=stage,
                     query_timeout_seconds=query_timeout_seconds,
                 )
+
+            try:
+                if formal_store is None:
+                    frame = read_chunk()
+                else:
+                    source_sha256 = formal_factor_generation_sha256(
+                        trade_date=trade_date, decision_at=decision_cutoff,
+                        stage="kline_source",
+                        source_identity={
+                            "partitions": [
+                                [
+                                    day,
+                                    daily_window["catalog_batches_by_session"][day],
+                                    daily_window["daily_partition_roots"][day],
+                                ]
+                                for day in date_chunk
+                            ],
+                        },
+                    )
+                    frame, resumed = checkpoint_factor_frame(
+                        formal_store, formal_generation_sha256,
+                        "kline_source", source_sha256, read_chunk, rows_per_part=4096,
+                    )
+                    _emit_progress(
+                        progress_callback,
+                        stage="load_kline_chunk", percent=5 + int(index * 7 / len(date_chunks)),
+                        step=f"已核验日K分片 {index}/{len(date_chunks)}",
+                        trade_date=trade_date, kline_feature_chunk=index,
+                        kline_feature_chunk_count=len(date_chunks),
+                        checkpoint_reused=resumed, checkpoint_rows=len(frame),
+                    )
             except KlineFeatureDataBlocked:
                 raise
             except Exception as exc:
@@ -1904,36 +1990,47 @@ def _load_kline_features_from_snapshot(
         "received_at",
     ]).copy()
 
-    grouped = df.groupby("stock_code", group_keys=False)
-    for window in (5, 10, 20, 60):
-        min_periods = max(3, min(window, window // 2))
-        df[f"ma{window}"] = grouped["close"].transform(lambda s, w=window, m=min_periods: s.rolling(w, min_periods=m).mean())
-    df["amount_ma5"] = grouped["amount"].transform(lambda s: s.rolling(5, min_periods=3).mean())
-    df["amount_ma20"] = grouped["amount"].transform(lambda s: s.rolling(20, min_periods=8).mean())
-    df["previous_change_pct"] = grouped["change_pct"].shift(1)
-    df["pct_5"] = grouped["close"].pct_change(5) * 100.0
-    df["pct_20"] = grouped["close"].pct_change(20) * 100.0
-    df["volatility_20"] = grouped["change_pct"].transform(lambda s: s.rolling(20, min_periods=8).std())
-    df["high_20"] = grouped["high"].transform(lambda s: s.rolling(20, min_periods=8).max())
-    df["high_60"] = grouped["high"].transform(lambda s: s.rolling(60, min_periods=20).max())
-    df["low_60"] = grouped["low"].transform(lambda s: s.rolling(60, min_periods=20).min())
-    df["drawdown_60"] = (df["close"] / df["high_60"] - 1.0) * 100.0
-    df["from_low_60"] = (df["close"] / df["low_60"] - 1.0) * 100.0
-    df["dist_ma20"] = (df["close"] / df["ma20"] - 1.0) * 100.0
-    df["amount_ratio_5"] = df["amount"] / df["amount_ma5"].replace(0, np.nan)
-    df["amount_ratio_20"] = df["amount"] / df["amount_ma20"].replace(0, np.nan)
-
-    target = pd.to_datetime(trade_date).date()
-    latest = df[df["trade_date"] == target].copy()
+    if formal_store is None:
+        latest = _kline_technical_window(df, target_date)
+    else:
+        daily_root = canonical_sha256([
+            [
+                day,
+                daily_window["catalog_batches_by_session"][day],
+                daily_window["daily_partition_roots"][day],
+            ]
+            for day in ordered_dates
+        ])
+        target_bars = df.loc[df["trade_date"] == target_date]
+        stock_codes = sorted(target_bars["stock_code"].unique().tolist())
+        stock_parts = [
+            stock_codes[offset:offset + _KLINE_TECHNICAL_STOCKS_PER_PART]
+            for offset in range(0, len(stock_codes), _KLINE_TECHNICAL_STOCKS_PER_PART)
+        ]
+        features: list[pd.DataFrame] = []
+        for index, part in enumerate(stock_parts, start=1):
+            source_sha256 = formal_factor_generation_sha256(
+                trade_date=trade_date, decision_at=decision_cutoff,
+                stage="kline_technical",
+                source_identity={"daily_window_root": daily_root, "codes": part},
+            )
+            feature, resumed = checkpoint_factor_frame(
+                formal_store, formal_generation_sha256,
+                "kline_technical", source_sha256,
+                lambda: _kline_technical_window(df.loc[df["stock_code"].isin(part)].copy(), target_date),
+            )
+            if feature["stock_code"].tolist() != part:
+                raise ValueError("formal K-line technical factor scope differs")
+            features.append(feature)
+            _emit_progress(
+                progress_callback, stage="load_kline_technical", percent=12,
+                step=f"已计算日K技术因子 {index}/{len(stock_parts)}",
+                trade_date=trade_date, done=index, total=len(stock_parts),
+                checkpoint_reused=resumed,
+            )
+        latest = pd.concat(features, ignore_index=True) if features else target_bars
     if latest.empty:
         raise RuntimeError(f"No K-line rows exactly on {trade_date}")
-    latest = latest.drop(
-        columns=[
-            "data_source", "batch_id", "data_version", "quality_status",
-            "permission_status", "received_at",
-        ],
-        errors="ignore",
-    )
     result = _attach_canonical_chase_risk_evidence(
         latest.reset_index(drop=True),
         engine,
@@ -2027,6 +2124,8 @@ def load_finance(
     progress_callback: ProgressCallback | None = None,
     require_complete_source: bool = False,
     sealed_finance_inputs: SealedFinanceInputs | None = None,
+    formal_store: FormalAnalysisStore | None = None,
+    formal_generation_sha256: str | None = None,
 ) -> pd.DataFrame:
     """Load strategy finance only from immutable as-known revisions."""
 
@@ -2052,15 +2151,28 @@ def load_finance(
             total=total, trade_date=trade_date,
         )
 
-    batch = load_finance_facts(
-        engine,
-        codes=codes,
-        decision_at=decision_at,
-        fact_cutoff_at=fact_cutoff_at,
-        as_of_date=trade_date,
+    read_options = {
+        "codes": codes,
+        "decision_at": decision_at,
+        "fact_cutoff_at": fact_cutoff_at,
+        "as_of_date": trade_date,
         **({"read_progress": finance_progress} if progress_callback is not None else {}),
-        **({"sealed_finance_inputs": sealed_finance_inputs} if sealed_finance_inputs is not None else {}),
-    )
+    }
+    if formal_store is not None:
+        from server.common.pit_sealed_finance_read import load_sealed_finance_facts
+
+        if sealed_finance_inputs is None:
+            raise RuntimeError("ANALYSIS_INPUT_BATCH_BLOCKED: formal finance seal is unavailable")
+        batch = load_sealed_finance_facts(
+            engine, selection=sealed_finance_inputs,
+            formal_store=formal_store, formal_generation_sha256=formal_generation_sha256,
+            **read_options,
+        )
+    else:
+        batch = load_finance_facts(
+            engine, **read_options,
+            **({"sealed_finance_inputs": sealed_finance_inputs} if sealed_finance_inputs is not None else {}),
+        )
     if require_complete_source:
         _require_formal_pit_source(batch, source="finance", trade_date=trade_date, codes=codes)
     rows: list[dict[str, Any]] = []
@@ -4903,6 +5015,7 @@ def save_outputs(
     publisher_build_sha: str = "",
     score_snapshot: Mapping[str, Any] | None = None,
     publication_connection: Connection | None = None,
+    decoded_score_snapshot: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Publish rows in their own transaction or the caller's atomic release."""
     if publication_connection is not None and (
@@ -5102,7 +5215,9 @@ def save_outputs(
         if not publish:
             return None
 
-        manifest = read_persisted_pool_manifest(conn, trade_date, score_snapshot=score_snapshot)
+        manifest = read_persisted_pool_manifest(
+            conn, trade_date, score_snapshot=score_snapshot, decoded_score_snapshot=decoded_score_snapshot,
+        )
         if (
             int(manifest["analysis_count"]) != len(analysis_rows)
             or int(manifest["recommendation_count"]) != len(write_rec_rows)
@@ -5238,6 +5353,7 @@ def save_outputs(
             build_sha=build_sha,
             published_at=history["published_at"],
             score_snapshot=score_snapshot,
+            engine=conn,
         )
 
 
@@ -5385,8 +5501,17 @@ def _prepare_batch_outputs(
     event_checkpoint_path: Path | None = None,
     pool_decision_phase: StrategyPoolDecisionPhase | None = None,
     required_premarket_announcement: FrozenPremarketAnnouncement | None = None,
+    formal_store: FormalAnalysisStore | None = None,
+    formal_generation_sha256: str | None = None,
 ) -> Any:
     scoped_codes = _normalize_stock_codes(stock_codes)
+    if (formal_store is not None) != (formal_generation_sha256 is not None):
+        raise ValueError("formal scoring checkpoint identity is incomplete")
+    if formal_store is not None and (
+        pool_decision_phase is None or allow_degraded_inputs or scoped_codes
+        or re.fullmatch(r"[0-9a-f]{64}", formal_generation_sha256 or "") is None
+    ):
+        raise ValueError("formal scoring checkpoint requires an exact full-market decision")
     decision_at: datetime | str | None = (
         normalize_decision_at(news_cutoff_time)
         if news_cutoff_time is not None
@@ -5494,6 +5619,10 @@ def _prepare_batch_outputs(
         trade_date,
         decision_known_at=decision_at,
         progress_callback=progress_callback,
+        **({
+            "formal_store": formal_store,
+            "formal_generation_sha256": formal_generation_sha256,
+        } if formal_store is not None else {}),
     )
     kline = _filter_frame_by_codes(kline_all, scoped_codes)
     if scoped_codes and kline.empty:
@@ -5607,6 +5736,34 @@ def _prepare_batch_outputs(
     ):
         raise RuntimeError("ANALYSIS_INPUT_BATCH_BLOCKED: " + str(common_cutoff.get("reason") or "PIT_INPUT_BATCH_UNAVAILABLE"))
 
+    def load_pit_factor(
+        stage: str, percent: int, source_cutoff: datetime | str,
+        producer: Callable[[], pd.DataFrame],
+    ) -> pd.DataFrame:
+        if formal_store is None:
+            return producer()
+        receipt_root = str(common_cutoff.get("receipt_root_hash") or "")
+        if re.fullmatch(r"[0-9a-f]{64}", receipt_root) is None:
+            raise RuntimeError("ANALYSIS_INPUT_BATCH_BLOCKED: formal PIT receipt root is unavailable")
+        source_sha256 = formal_factor_generation_sha256(
+            trade_date=trade_date, decision_at=decision_at, stage=stage,
+            source_identity={
+                "pit_receipt_root_sha256": receipt_root,
+                "cutoff": normalize_decision_at(source_cutoff).isoformat(timespec="microseconds"),
+                "scored_codes": feature_codes,
+                "event_window_end": event_window_end,
+            },
+        )
+        frame, reused = checkpoint_factor_frame(
+            formal_store, formal_generation_sha256, stage, source_sha256, producer,
+        )
+        _emit_progress(
+            progress_callback, stage=stage, percent=percent,
+            step=f"已核验 {len(frame)} 只股票的因子输入", trade_date=trade_date,
+            done=len(frame), total=len(feature_codes), checkpoint_reused=reused,
+        )
+        return frame
+
     _emit_progress(progress_callback, stage="load_finance", percent=14, step="加载财务因子...", trade_date=trade_date)
     finance = _filter_frame_by_codes(
         load_finance(
@@ -5618,6 +5775,10 @@ def _prepare_batch_outputs(
             progress_callback=progress_callback,
             require_complete_source=require_complete_pit_sources,
             sealed_finance_inputs=next(iter(finance_reads), None),
+            **({
+                "formal_store": formal_store,
+                "formal_generation_sha256": formal_generation_sha256,
+            } if formal_store is not None else {}),
         ),
         scoped_codes,
     )
@@ -5668,7 +5829,7 @@ def _prepare_batch_outputs(
     hot = _filter_frame_by_codes(hot, scoped_codes)
     _emit_progress(progress_callback, stage="load_notices", percent=40, step="加载公告事件...", trade_date=trade_date)
     notices = _filter_frame_by_codes(
-        load_notice_features(
+        load_pit_factor("load_notices", 40, event_cutoff, lambda: load_notice_features(
             engine,
             trade_date,
             decision_at=reader_decision_at,
@@ -5677,7 +5838,7 @@ def _prepare_batch_outputs(
             event_window_end=event_window_end,
             historical_selection=next(iter(historical_event_reads), None),
             require_complete_source=require_complete_pit_sources,
-        ),
+        )),
         scoped_codes,
     )
     if common_cutoff.get("status") != PIT_AVAILABLE:
@@ -5947,8 +6108,16 @@ def prepare_frozen_strategy_pool_scoring(
     min_score: float = 62.0,
     progress_callback: ProgressCallback | None = None,
     required_premarket_announcement: FrozenPremarketAnnouncement | None = None,
+    parent_receipt_uid: str | None = None,
 ) -> dict[str, Any]:
-    """Score the full universe at one fixed slot without replacing prior rows."""
+    """Score one fixed slot and leave the active prior projection untouched."""
+    from server.common.analysis_pool_receipt import (
+        build_durable_score_snapshot, read_score_snapshot_header, rebind_durable_score_snapshot,
+    )
+    from server.common.formal_analysis_store import FormalAnalysisStore
+    from server.common.frozen_strategy_pool_work import (
+        FROZEN_SCORING_STAGE, RECOMMENDATIONS_KEY, _json_value,
+    )
 
     if re.fullmatch(r"[0-9a-f]{32}", run_uid) is None:
         raise ValueError("frozen strategy pool run identity is invalid")
@@ -5964,7 +6133,48 @@ def prepare_frozen_strategy_pool_scoring(
         required_premarket_announcement, FrozenPremarketAnnouncement,
     ):
         raise RuntimeError("fixed premarket scoring requires its signed announcement source")
+    source = (
+        str(required_premarket_announcement.receipt.get("stage_evidence_sha256") or "")
+        if required_premarket_announcement is not None else None
+    )
+    if slot.phase == "PREMARKET_REVISION":
+        if any(re.fullmatch(r"[0-9a-f]{64}", value or "") is None for value in (parent_receipt_uid, source)):
+            raise ValueError("premarket scoring parent or announcement evidence is unavailable")
+    elif parent_receipt_uid is not None:
+        raise ValueError("initial fixed score cannot bind a premarket parent")
+
     cutoff = slot.scheduled_at.replace(tzinfo=None).isoformat(timespec="seconds")
+    generation = canonical_sha256({
+        "schema": "probiga.fixed-strategy-scoring-generation.v1",
+        "phase": slot.phase, "data_trade_date": slot.data_trade_date,
+        "execution_session_date": slot.execution_session_date, "cutoff_at": cutoff,
+        "parent_receipt_uid": parent_receipt_uid, "announcement_evidence_sha256": source,
+        "build_sha": build_sha, "model_version": MODEL_VERSION, "top_n": top_n, "min_score": min_score,
+    })
+    store = FormalAnalysisStore(engine)
+    sealed = store.get(generation, FROZEN_SCORING_STAGE, "complete")
+    timeline = {
+        "phase": slot.phase,
+        "data_trade_date": slot.data_trade_date,
+        "execution_session_date": slot.execution_session_date,
+        "cutoff_at": slot.scheduled_at.isoformat(timespec="seconds"),
+        "evaluated_at": slot.evaluated_at.isoformat(timespec="seconds"),
+    }
+    if sealed is not None:
+        header = read_score_snapshot_header(sealed["score_snapshot"], trade_date=slot.data_trade_date, store=store)
+        if (
+            header["decision_at"] != cutoff
+            or header.get("frozen_core_inputs") != sealed["core_inputs"]
+            or store.list_members(generation, FROZEN_SCORING_STAGE).get(RECOMMENDATIONS_KEY)
+            != sealed["recommendations_sha256"]
+        ):
+            raise RuntimeError("fixed strategy scoring checkpoint binding differs")
+        return {
+            **sealed, **timeline,
+            "score_snapshot": rebind_durable_score_snapshot(
+                sealed["score_snapshot"], store=store, run_uid=run_uid, build_sha=build_sha,
+            ),
+        }
     analysis_rows, recommendations, mood, flow_date, hot_date, scored = (
         _prepare_batch_outputs(
             engine=engine,
@@ -5978,9 +6188,13 @@ def prepare_frozen_strategy_pool_scoring(
             refresh_upper_limit=slot.phase == "INITIAL",
             pool_decision_phase=slot.phase,
             required_premarket_announcement=required_premarket_announcement,
+            formal_store=store,
+            formal_generation_sha256=generation,
         )
     )
-    score_snapshot = build_score_snapshot(
+    score_snapshot = build_durable_score_snapshot(
+        store=store,
+        generation_sha256=generation,
         trade_date=slot.data_trade_date,
         decision_at=cutoff,
         run_uid=run_uid,
@@ -5991,20 +6205,20 @@ def prepare_frozen_strategy_pool_scoring(
         frozen_announcement_source=scored.attrs.get("frozen_announcement_source"),
         frozen_core_inputs=scored.attrs.get("frozen_core_inputs"),
     )
-    return {
-        "phase": slot.phase,
-        "data_trade_date": slot.data_trade_date,
-        "execution_session_date": slot.execution_session_date,
-        "cutoff_at": slot.scheduled_at.isoformat(timespec="seconds"),
-        "evaluated_at": slot.evaluated_at.isoformat(timespec="seconds"),
+    recommendations_sha256 = store.put(
+        generation, FROZEN_SCORING_STAGE, RECOMMENDATIONS_KEY, _json_value(recommendations),
+    )
+    sealed = _json_value({
         "score_snapshot": score_snapshot,
         "core_inputs": scored.attrs.get("frozen_core_inputs"),
-        "analysis_rows": analysis_rows,
-        "recommendation_rows": recommendations,
+        "recommendations_sha256": recommendations_sha256,
+        "recommendation_count": len(recommendations),
         "market_mood_score": mood,
         "flow_date": flow_date,
         "hot_date": hot_date,
-    }
+    })
+    store.put(generation, FROZEN_SCORING_STAGE, "complete", sealed)
+    return {**sealed, **timeline}
 
 
 def run_batch(
@@ -6125,6 +6339,60 @@ def run_batch(
             )
     logger.info("Fast analysis batch started for %s", trade_date)
     with _analysis_execution_lock(engine, trade_date) as verify_write_owner:
+        if production and formal_initial:
+            from server.common.daily_delivery_control import canonical_sha256
+            from server.common.formal_analysis_store import FormalAnalysisStore
+            from server.common.formal_score_publication import (
+                load_initial_selection, seal_initial_selection,
+            )
+
+            execution_time = exact_decision_at.isoformat(timespec="seconds")
+            generation = canonical_sha256({
+                "schema": "probiga.initial-selection-generation.v1",
+                "trade_date": trade_date,
+                "decision_at": execution_time,
+                "build_sha": build_sha,
+                "model_version": MODEL_VERSION,
+                "source_runs_sha256": os.environ.get("PROBIGA_FORMAL_INPUT_RUNS_SHA256") or "",
+                "min_score": min_score,
+                "top_n": top_n,
+            })
+            store = FormalAnalysisStore(engine)
+            prepared = load_initial_selection(store, generation=generation, run_uid=run_uid, build_sha=build_sha)
+            reused = prepared is not None
+            if prepared is None:
+                analysis_rows, rec_rows, mood, flow_date, hot_date, scored = _prepare_batch_outputs(
+                    engine=engine, trade_date=trade_date, min_score=min_score, top_n=top_n,
+                    stock_codes=None, progress_callback=progress_callback, news_cutoff_time=execution_time,
+                    publisher_build_sha=build_sha, reuse_preliminary_snapshot=True,
+                    return_scored=True, pool_decision_phase="INITIAL",
+                    event_checkpoint_path=Path(os.environ.get("PROBIGA_JOB_LOG_ROOT") or "/var/lib/probiga/jobs")
+                    / "analysis-event-coverage.sqlite",
+                    formal_store=store, formal_generation_sha256=generation,
+                )
+                verify_write_owner()
+                prepared = seal_initial_selection(
+                    store, generation=generation, trade_date=trade_date, decision_at=execution_time,
+                    run_uid=run_uid, build_sha=build_sha, analysis_rows=analysis_rows,
+                    recommendation_rows=rec_rows, scored=scored, market_mood_score=mood,
+                    flow_date=flow_date, hot_date=hot_date,
+                )
+            reference = prepared["reference"]
+            _emit_progress(
+                progress_callback, stage="formal_scores_sealed", percent=95,
+                step="reuse sealed scores" if reused else "seal scores for atomic publication",
+                trade_date=trade_date, analysis_count=reference["analysis_count"],
+                recommendation_count=reference["recommendation_count"],
+                done=reference["analysis_count"], total=reference["analysis_count"],
+            )
+            return BatchStats(
+                trade_date=trade_date, analysis_count=reference["analysis_count"],
+                recommendation_count=reference["recommendation_count"],
+                executable_count=reference["executable_count"],
+                market_mood_score=prepared["market_mood_score"],
+                flow_date=prepared["flow_date"], hot_date=prepared["hot_date"],
+                prepared_publication=reference,
+            )
         analysis_rows, rec_rows, market_mood_score, flow_date, hot_date, scored = _prepare_batch_outputs(
             engine=engine,
             trade_date=trade_date,
@@ -6140,12 +6408,6 @@ def run_batch(
             return_scored=True,
             allow_degraded_inputs=allow_degraded_inputs,
             pool_decision_phase=pool_decision_phase,
-            event_checkpoint_path=(
-                Path(os.environ.get("PROBIGA_JOB_LOG_ROOT") or "/var/lib/probiga/jobs")
-                / "analysis-event-coverage.sqlite"
-                if production and publish and task_type == "analysis_fast" and not allow_degraded_inputs
-                else None
-            ),
         )
         score_snapshot = build_score_snapshot(
             trade_date=trade_date, decision_at=execution_time, run_uid=publication_run_uid,
@@ -6372,13 +6634,14 @@ def _finish_direct_publication_history(
     error: str = "",
     publication_receipt: Mapping[str, Any] | None = None,
     publication_connection: Connection | None = None,
+    score_stats: Mapping[str, Any] | None = None,
 ) -> None:
     """Persist one terminal recommendation audit before scheduler validation."""
 
     receipt = dict(publication_receipt or {})
     if success:
         if (
-            not publication_receipt_is_valid(receipt)
+            not publication_receipt_is_valid(receipt, engine=publication_connection or engine)
             or receipt.get("run_uid") != run_uid
             or receipt.get("publisher_task_type") not in ANALYSIS_SCORE_PUBLICATION_TASK_TYPES
             or (receipt.get("publisher_task_type") == PREMARKET_POOL_TASK and publication_connection is None)
@@ -6416,10 +6679,15 @@ def _finish_direct_publication_history(
                 or datetime.fromisoformat(str(history_rows[0]["published_at"])) != published_at
             ):
                 raise RuntimeError("direct analysis publication history timestamp differs")
-            result = connection.execute(text("""
+            score_stats_sql = """
+                    duration_seconds=TIMESTAMPDIFF(SECOND, started_at, CURRENT_TIMESTAMP),
+                    market_mood_score=:market_mood_score, flow_date=:flow_date, hot_date=:hot_date,
+            """ if score_stats is not None else ""
+            result = connection.execute(text(f"""
                 UPDATE st_recommended_run_history
                 SET status='done', finished_at=CURRENT_TIMESTAMP,
                     progress_percent=100, done_count=total,
+                    {score_stats_sql}
                     message='scheduled analysis completed', error=NULL
                 WHERE run_uid=:run_uid
                   AND scheduler_job_id=:run_uid
@@ -6437,6 +6705,9 @@ def _finish_direct_publication_history(
                 "canonical_pool_sha256": receipt["canonical_pool_sha256"],
                 "published_at": history_rows[0]["published_at"],
                 "analysis_count": counts[0], "recommendation_count": counts[1], "executable_count": counts[2],
+                "market_mood_score": (score_stats or {}).get("market_mood_score"),
+                "flow_date": (score_stats or {}).get("flow_date"),
+                "hot_date": (score_stats or {}).get("hot_date"),
             })
         else:
             result = connection.execute(text("""
@@ -6470,7 +6741,15 @@ def main() -> int:
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
+    from server.common.formal_score_publication import (
+        FORMAL_SCORE_WORK_SCHEMA, FormalScoreContractError, formal_score_blocked,
+    )
+
     engine = create_batch_engine()
+    durable_initial = (
+        args.pool_decision_phase == "INITIAL"
+        and os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip().lower() == "production"
+    )
     publication_run_uid = str(
         os.environ.get("PROBIGA_SCHEDULER_HISTORY_RUN_UID") or ""
     ).strip().lower()
@@ -6531,7 +6810,22 @@ def main() -> int:
             publisher_build_sha=publisher_build_sha,
             pool_decision_phase=args.pool_decision_phase,
         )
-        if history_prebound:
+        prepared = stats.prepared_publication
+        if durable_initial:
+            if (
+                not history_prebound
+                or not isinstance(prepared, dict)
+                or prepared.get("schema") != FORMAL_SCORE_WORK_SCHEMA
+                or prepared.get("run_uid") != publication_run_uid
+                or prepared.get("build_sha") != publisher_build_sha
+                or prepared.get("trade_date") != stats.trade_date
+                or prepared.get("analysis_count") != stats.analysis_count
+                or prepared.get("recommendation_count") != stats.recommendation_count
+                or prepared.get("executable_count") != stats.executable_count
+                or stats.publication_receipt is not None
+            ):
+                raise FormalScoreContractError("direct analysis did not seal its exact score result")
+        elif history_prebound:
             _finish_direct_publication_history(
                 engine,
                 run_uid=publication_run_uid,
@@ -6553,7 +6847,13 @@ def main() -> int:
                     f"original={type(exc).__name__}: {exc}; "
                     f"audit={type(audit_exc).__name__}: {audit_exc}"
                 ) from exc
+        blocker = formal_score_blocked(exc) if durable_initial else None
+        if blocker is not None:
+            print(json.dumps(blocker, ensure_ascii=False))
+            return 2
         raise
+    finally:
+        engine.dispose()
     payload = {
         "trade_date": stats.trade_date,
         "analysis_count": stats.analysis_count,
@@ -6563,11 +6863,12 @@ def main() -> int:
         "hot_date": stats.hot_date,
         "executable_count": stats.executable_count,
     }
-    if stats.publication_receipt is not None:
-        # Scheduler publication validation consumes this signed nested receipt.
-        # Keep it as one canonical stdout line even when the production task
-        # does not pass --json; logging remains on stderr.
-        payload["publication_receipt"] = stats.publication_receipt
+    if prepared is not None or stats.publication_receipt is not None:
+        # Scheduler validation consumes a single nested machine receipt.
+        if prepared is not None:
+            payload["prepared_publication"] = prepared
+        else:
+            payload["publication_receipt"] = stats.publication_receipt
         print(json.dumps(
             payload,
             ensure_ascii=False,
@@ -6583,7 +6884,6 @@ def main() -> int:
             f"analysis={stats.analysis_count}, recommendations={stats.recommendation_count}, "
             f"market_mood={stats.market_mood_score:.1f}, flow_date={stats.flow_date or '-'}, hot_date={stats.hot_date or '-'}"
         )
-    engine.dispose()
     return 0
 
 

@@ -12,6 +12,7 @@ from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Engine
 
 if TYPE_CHECKING:
+    from server.common.formal_analysis_store import FormalAnalysisStore
     from server.common.pit_facts import PITFactBatch, SealedFinanceInputs
 
 
@@ -24,6 +25,8 @@ def load_sealed_finance_facts(
     fact_cutoff_at: datetime | str | None,
     as_of_date: date | str,
     read_progress: Callable[[int, int], None] | None = None,
+    formal_store: FormalAnalysisStore | None = None,
+    formal_generation_sha256: str | None = None,
 ) -> PITFactBatch:
     from server.common import pit_facts as pit
     from server.common.qmt_announcement_pit import (
@@ -46,6 +49,9 @@ def load_sealed_finance_facts(
         or not pit._HASH_RE.fullmatch(selection.batch_root_sha256)
     ):
         raise ValueError("PIT_SEALED_FINANCE_SELECTION_DIFFERS")
+
+    if (formal_store is not None) != (formal_generation_sha256 is not None):
+        raise ValueError("PIT_SEALED_FINANCE_CHECKPOINT_IDENTITY_INCOMPLETE")
 
     facts: dict[str, Any] = {}
     coverage: dict[str, Any] = {}
@@ -370,6 +376,57 @@ def load_sealed_finance_facts(
             facts[code] = fact
             reasons[code] = ""
 
+    def load_checkpointed_chunk(connection, chunk):
+        if formal_store is None:
+            load_chunk(connection, chunk)
+            return
+        active_codes = [code for code in chunk if code not in selection.exclusions]
+        if not active_codes:
+            return
+        key = pit.canonical_hash({
+            "schema": "probiga.sealed-finance-factor-chunk.v1",
+            "seal_id": selection.seal_id,
+            "batch_root_sha256": selection.batch_root_sha256,
+            "decision_at": pit._dt_text(decision),
+            "fact_cutoff_at": pit._dt_text(fact_cutoff),
+            "as_of_date": target.isoformat(),
+            "codes": active_codes,
+        })
+        state = formal_store.get(formal_generation_sha256, "finance_issuer_facts", key)
+        destinations = {
+            "facts": facts, "coverage": coverage, "statuses": statuses, "reasons": reasons,
+        }
+        if state is not None:
+            # An ordered JSON document keeps the original per-issuer feature
+            # column order as well as the globally bound PIT manifest values.
+            delta = json.loads(state["ordered_json"])
+            expected_codes = set(active_codes)
+            if (
+                set(delta) != set(destinations)
+                or any(not isinstance(value, dict) for value in delta.values())
+                or set(delta["statuses"]) != expected_codes
+                or set(delta["reasons"]) != expected_codes
+                or set(delta["facts"]) ^ set(delta["coverage"]) != expected_codes
+                or set(delta["facts"]) & set(delta["coverage"])
+                or any(status != pit.PIT_AVAILABLE for status in delta["statuses"].values())
+                or any(
+                    row["coverage_id"] != selection.members[code]["coverage_id"]
+                    for code, row in delta["coverage"].items()
+                )
+            ):
+                raise ValueError("PIT_SEALED_FINANCE_CHECKPOINT_SCOPE_DIFFERS")
+            for field, destination in destinations.items():
+                destination.update(delta[field])
+            return
+        load_chunk(connection, chunk)
+        delta = {
+            field: {code: values[code] for code in active_codes if code in values}
+            for field, values in destinations.items()
+        }
+        formal_store.put(formal_generation_sha256, "finance_issuer_facts", key, {
+            "ordered_json": json.dumps(delta, ensure_ascii=False, separators=(",", ":"), allow_nan=False),
+        })
+
     for code in requested:
         if code in selection.exclusions:
             exclusion = dict(selection.exclusions[code])
@@ -388,7 +445,7 @@ def load_sealed_finance_facts(
             with connection.begin():
                 for offset in range(0, len(requested), batch_size):
                     chunk = requested[offset:offset + batch_size]
-                    load_chunk(connection, chunk)
+                    load_checkpointed_chunk(connection, chunk)
                     if read_progress is not None:
                         read_progress(offset + len(chunk), len(requested))
 
