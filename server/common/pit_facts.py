@@ -5928,8 +5928,10 @@ def _bind_signed_historical_event_selection(
             )
         ):
             raise ValueError("historical announcement reconstruction catalog differs")
-        additions = authority["reconciliation"]["added_to_prior"]
-        if additions:
+        reconciliation = authority["reconciliation"]
+        additions = reconciliation["added_to_prior"]
+        delisted = reconciliation.get("official_delisted_entities", [])
+        if additions or delisted:
             from server.common.qmt_datadir_daily_coverage import load_daily_manifest
 
             with _live_announcement_reply_budget(connection, deadline=deadline, stage="signed-historical-native"):
@@ -5940,6 +5942,8 @@ def _bind_signed_historical_event_selection(
             entities = {item["stock_code"]: item for item in (native or {}).get("entities", ())}
             if any(entities.get(item["stock_code"]) != item["native_daily_entity"] for item in additions):
                 raise ValueError("historical announcement added listing native trade proof differs")
+            if any(entities.get(item["stock_code"]) != item for item in delisted):
+                raise ValueError("historical announcement effective-day delisting proof differs from the daily manifest")
 
         stage = "signed-historical-inventory"
         hint = _live_announcement_read_hint(mysql=mysql, deadline=deadline, stage=stage)
