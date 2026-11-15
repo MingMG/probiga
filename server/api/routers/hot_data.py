@@ -11457,6 +11457,34 @@ def _recommended_stocks_v2(
             LIMIT 1000
         """, params)
 
+    def _query_publication(selected_date: str, connection) -> tuple[list[dict], dict[str, object]]:
+        rows = _query_for_date(selected_date)
+        contract = _recommended_pool_publication_contract(
+            columns=columns,
+            trade_date=selected_date,
+            rows=rows,
+            expected_run_uid=expected_run_uid,
+            expected_build_sha=expected_build_sha,
+            expected_pool_sha256=expected_pool_sha256,
+            full_pool_response=not strategy and not signal_status,
+            connection=connection,
+        )
+        return rows, contract
+
+    def _latest_published_date(before: str = "") -> str:
+        if not {"publisher_run_uid", "publication_status"}.issubset(columns):
+            if before:
+                return _latest_date_not_after("st_recommended_stocks", before, "pick_date")
+            return _latest_date("st_recommended_stocks", "pick_date")
+        date_filter = "AND trade_date < :before" if before else ""
+        dates = _read_sql(
+            "SELECT trade_date FROM st_recommended_run_history "
+            "WHERE status='done' AND published_at IS NOT NULL "
+            f"{date_filter} ORDER BY trade_date DESC LIMIT 1",
+            {"before": before} if before else {},
+        )
+        return str(dates[0]["trade_date"])[:10] if dates else ""
+
     start_date = str(start_date or "").strip()[:10]
     end_date = str(end_date or "").strip()[:10]
     start_date = start_date if isinstance(start_date, str) else ""
@@ -11479,60 +11507,39 @@ def _recommended_stocks_v2(
         with get_engine().connect() as publication_connection:
             with publication_connection.begin():
                 with bind_sql_connection(publication_connection):
-                    if requested_trade_date:
-                        trade_date = requested_trade_date
-                    else:
-                        trade_date = _latest_date(
-                            "st_recommended_stocks", "pick_date"
+                    trade_date = requested_trade_date or _latest_published_date()
+                    rows = []
+                    if trade_date:
+                        rows, publication_contract = _query_publication(
+                            trade_date, publication_connection
                         )
-                    rows = _query_for_date(trade_date) if trade_date else []
                     if (
                         not rows
+                        and (publication_contract or {}).get("identity_verified") is not True
                         and requested_trade_date
                         and allow_previous_snapshot
                     ):
-                        fallback = _latest_date_not_after(
-                            "st_recommended_stocks",
-                            requested_trade_date,
-                            "pick_date",
-                        )
+                        fallback = _latest_published_date(before=requested_trade_date)
                         if fallback and fallback != trade_date:
                             trade_date = fallback
-                            rows = _query_for_date(trade_date)
-                    if not rows and not requested_trade_date:
-                        fallback = _latest_date(
-                            "st_recommended_stocks", "pick_date"
-                        )
-                        if fallback and fallback != trade_date:
-                            trade_date = fallback
-                            rows = _query_for_date(trade_date)
-                    if trade_date:
-                        publication_contract = (
-                            _recommended_pool_publication_contract(
-                                columns=columns,
-                                trade_date=trade_date,
-                                rows=rows,
-                                expected_run_uid=expected_run_uid,
-                                expected_build_sha=expected_build_sha,
-                                expected_pool_sha256=expected_pool_sha256,
-                                full_pool_response=(
-                                    not strategy and not signal_status
-                                ),
-                                connection=publication_connection,
+                            rows, publication_contract = _query_publication(
+                                trade_date, publication_connection
                             )
-                        )
     if not rows:
+        publication_status = str((publication_contract or {}).get("publication_status") or "")
         payload = {
             "date": trade_date,
             "data": [],
             "total": 0,
-            "note": "no recommendation data",
+            "note": "verified empty recommendation pool"
+            if publication_status == "VERIFIED_EMPTY" else "no recommendation data",
             "freshness": _recommended_data_freshness(
                 requested_date=requested_trade_date,
                 result_date=trade_date,
                 start_date=start_date,
                 end_date=end_date,
                 total=0,
+                publication_status=publication_status,
             ),
         }
         payload.update(
@@ -12006,6 +12013,7 @@ def _recommended_data_freshness(
     end_date: str = "",
     live_quote_count: int = 0,
     total: int = 0,
+    publication_status: str = "",
 ) -> dict:
     requested_date = str(requested_date or "").strip()[:10]
     result_date = str(result_date or "").strip()[:10]
@@ -12042,6 +12050,7 @@ def _recommended_data_freshness(
         requested_date
         and result_date == requested_date
         and not is_range
+        and publication_status not in {"VERIFIED_EMPTY", "ACTIVE"}
         and int(total or 0) == 0
     )
     status = "fresh"
@@ -12049,6 +12058,9 @@ def _recommended_data_freshness(
     if is_missing_date:
         status = "missing"
         status_label = "目标日推荐未生成"
+    elif publication_status == "VERIFIED_EMPTY":
+        status = "fallback" if is_fallback_date else "fresh"
+        status_label = "最近已发布票池 · 0 只" if is_fallback_date else "已发布 · 0 只"
     elif stale_sources:
         kline_source = next((s for s in sources if s.get("key") == "kline"), {})
         if stale_sources == ["行情快照"] and reference_date and str(kline_source.get("latest_date") or "") >= reference_date:

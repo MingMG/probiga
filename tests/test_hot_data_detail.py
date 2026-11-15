@@ -1361,6 +1361,69 @@ class HotDataDetailHelperTest(unittest.TestCase):
             for connection in bound_connections
         ))
 
+    def test_recommended_page_reads_verified_empty_before_older_candidates(self):
+        engine = create_engine("sqlite+pysqlite:///:memory:")
+        self.addCleanup(engine.dispose)
+        with engine.begin() as connection:
+            connection.execute(text("""
+                CREATE TABLE st_recommended_stocks (
+                    stock_code TEXT, pick_date TEXT, ai_score REAL,
+                    publisher_run_uid TEXT, publication_status TEXT
+                )
+            """))
+            connection.execute(text("""
+                CREATE TABLE st_recommended_run_history (
+                    id INTEGER PRIMARY KEY, run_uid TEXT, trade_date TEXT, status TEXT,
+                    total INTEGER, passed INTEGER, executable_count INTEGER,
+                    canonical_pool_sha256 TEXT, build_sha TEXT, published_at TEXT
+                )
+            """))
+            connection.execute(text("""
+                INSERT INTO st_recommended_stocks VALUES
+                    ('000001', '2026-11-11', 80, :old_run, 'ACTIVE'),
+                    ('000002', '2026-11-16', 80, :pending_run, 'PENDING')
+            """), {"old_run": "a" * 32, "pending_run": "b" * 32})
+            connection.execute(text("""
+                INSERT INTO st_recommended_run_history VALUES
+                    (1, :old_run, '2026-11-11', 'done', 5573, 1, 0, :pool_sha, :build, '2026-11-11 20:00:00'),
+                    (2, :empty_run, '2026-11-13', 'done', 5571, 0, 0, :pool_sha, :build, '2026-11-15 21:42:28'),
+                    (3, :pending_run, '2026-11-16', 'running', 5571, 0, NULL, NULL, :build, NULL)
+            """), {
+                "old_run": "a" * 32, "pending_run": "b" * 32, "empty_run": "c" * 32,
+                "pool_sha": "d" * 64, "build": "e" * 40,
+            })
+
+        columns = {"stock_code", "pick_date", "ai_score", "publisher_run_uid", "publication_status"}
+        with patch.object(hot_data, "get_engine", return_value=engine), \
+             patch.object(hot_data, "_table_columns", return_value=columns), \
+             patch.object(hot_data, "_latest_date", return_value="2026-11-13"), \
+             patch.object(hot_data, "_is_monitor_trading_time", return_value=False), \
+             patch.object(hot_data, "_recommendation_theme_coverage", return_value={}):
+            exact = hot_data.recommended_stocks(
+                trade_date="2026-11-13", strategy="", signal_status="", prefer_latest=True,
+            )
+            fallback = hot_data.recommended_stocks(
+                trade_date="2026-11-16", strategy="", signal_status="", prefer_latest=True,
+            )
+            missing = hot_data.recommended_stocks(
+                trade_date="2026-11-16", strategy="", signal_status="", prefer_latest=False,
+            )
+
+        for payload in (exact, fallback):
+            self.assertEqual(payload["date"], "2026-11-13")
+            self.assertEqual(payload["data"], [])
+            self.assertEqual(payload["total"], 0)
+            self.assertEqual(payload["analysis_count"], 5571)
+            self.assertEqual(payload["publication_status"], "VERIFIED_EMPTY")
+            self.assertTrue(payload["identity_verified"])
+            self.assertEqual(payload["run_uid"], "c" * 32)
+            self.assertFalse(payload["freshness"]["is_missing_date"])
+        self.assertEqual(exact["freshness"]["status_label"], "已发布 · 0 只")
+        self.assertFalse(exact["freshness"]["is_fallback_date"])
+        self.assertTrue(fallback["freshness"]["is_fallback_date"])
+        self.assertEqual(missing["reason_code"], "TICKET_POOL_NOT_PUBLISHED")
+        self.assertTrue(missing["freshness"]["is_missing_date"])
+
     def test_recommended_pool_contract_rejects_another_active_run(self):
         with patch(
             "server.api.routers.hot_data._read_sql",
