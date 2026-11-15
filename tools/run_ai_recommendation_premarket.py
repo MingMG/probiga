@@ -26,7 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from biz.analysis.sync_analysis_fast import latest_trade_date, previous_trade_date, run_batch
+from biz.analysis.sync_analysis_fast import BatchStats, MODEL_VERSION, latest_trade_date, previous_trade_date, run_batch
 from biz.market_context.external_market import fetch_external_market_snapshot, store_external_market_snapshot
 from biz.premarket.theme_forecast import (
     format_forecast_markdown,
@@ -694,12 +694,36 @@ def main() -> int:
             batch_kwargs["use_intraday_current"] = True
         if args.pool_decision_phase is not None:
             batch_kwargs["pool_decision_phase"] = args.pool_decision_phase
-        stats = run_batch(
-            **batch_kwargs,
-        )
+        durable_initial = production and args.pool_decision_phase == "INITIAL"
+        recovered = None
+        if durable_initial and publisher_task_type == "analysis_fast":
+            from server.common.formal_score_recovery import recover_initial_selection
+
+            recovered = recover_initial_selection(
+                engine, trade_date=target_trade_date, proposed_cutoff=batch_execution_time,
+                run_uid=run_uid, build_sha=publisher_build_sha, min_score=float(args.min_score),
+                top_n=int(args.top_n), model_version=MODEL_VERSION,
+            )
+        if recovered is None:
+            stats = run_batch(**batch_kwargs)
+        else:
+            reference = recovered["reference"]
+            stats = BatchStats(
+                trade_date=target_trade_date, analysis_count=reference["analysis_count"],
+                recommendation_count=reference["recommendation_count"],
+                executable_count=reference["executable_count"],
+                market_mood_score=recovered["market_mood_score"],
+                flow_date=recovered["flow_date"], hot_date=recovered["hot_date"],
+                prepared_publication=reference,
+            )
+            _progress_callback({
+                "stage": "formal_scores_sealed", "percent": 95, "step": "复用已封存的正式评分",
+                "trade_date": target_trade_date, "done": stats.analysis_count,
+                "total": stats.analysis_count, "recommendation_count": stats.recommendation_count,
+                "checkpoint_reused": True,
+            })
         publication_receipt = getattr(stats, "publication_receipt", None)
         prepared_publication = getattr(stats, "prepared_publication", None)
-        durable_initial = production and args.pool_decision_phase == "INITIAL"
         if durable_initial:
             from server.common.formal_score_publication import FORMAL_SCORE_WORK_SCHEMA, FormalScoreContractError
 
