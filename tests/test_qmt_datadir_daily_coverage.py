@@ -4,8 +4,11 @@ import hashlib
 import json
 from types import SimpleNamespace
 
+import pymysql
 import pytest
+from pymysql.cursors import Cursor
 from sqlalchemy import create_engine, text
+from sqlalchemy.dialects.mysql.pymysql import dialect
 
 from server.common import qmt_datadir_daily_coverage as coverage
 from server.common import daily_stock_universe
@@ -133,6 +136,57 @@ def database(monkeypatch):
     monkeypatch.setattr(coverage, "load_stock_catalog", lambda *args, **kwargs: catalog)
     monkeypatch.setattr(coverage, "load_trade_calendar_receipt", lambda *args, **kwargs: calendar)
     return engine
+
+
+def test_daily_proof_uses_bounded_pymysql_multi_row_inserts():
+    catalog, calendar = authorities()
+    traded_codes = [f"{600000 + offset:06d}" for offset in range(514)]
+    catalog.eligible_codes = lambda day: sorted((*traded_codes, *SUSPENDED, IPO))
+    proof = coverage.build_manifest(
+        catalog=catalog, calendar=calendar, day=DAY,
+        rows=[{**bar(), "stock_code": code} for code in traded_codes],
+        run_id="qdd-bulk", captured_at=CUTOFF, snapshot=snapshot(), listings=listing(),
+    )
+    server_time = datetime(2026, 11, 2, 20, 1, 23)
+    sent = []
+
+    class CapturingCursor(Cursor):
+        def _query(self, query):
+            statement = query if isinstance(query, str) else query.decode("utf-8")
+            sent.append(statement)
+            self.rowcount = statement.count("),(") + 1
+            return self.rowcount
+
+    mysql_connection = pymysql.connections.Connection(defer_connect=True)
+    mysql_connection.server_status = 0
+    cursor = CapturingCursor(mysql_connection)
+    mysql_dialect = dialect(dbapi=pymysql)
+
+    class CompilingConnection:
+        def execute(self, statement, parameters=None):
+            compiled = statement.compile(dialect=mysql_dialect)
+            if isinstance(parameters, list):
+                return cursor.executemany(str(compiled), [
+                    compiled.construct_params(row) for row in parameters
+                ])
+            cursor.execute(str(compiled), compiled.construct_params(parameters))
+            return SimpleNamespace(scalar_one=lambda: server_time, scalar=lambda: server_time)
+
+    coverage.insert_manifest(CompilingConnection(), proof)
+
+    entity_inserts = [
+        query for query in sent if query.lstrip().startswith("INSERT INTO qmt_history_coverage_entity")
+    ]
+    assert len(entity_inserts) == 3
+    assert [query.count("),(") + 1 for query in entity_inserts] == [256, 256, 9]
+    assert sent[0].strip() == "SELECT CURRENT_TIMESTAMP"
+    assert len(sent) == 5
+    assert sent[1].lstrip().startswith("INSERT INTO qmt_history_coverage_manifest")
+    timestamp_literal = f"'{server_time:%Y-%m-%d %H:%M:%S}'"
+    assert [query.count(timestamp_literal) for query in sent[1:]] == [1, 256, 256, 9]
+    persisted_rows = "".join(query.split("VALUES", 1)[1] for query in entity_inserts)
+    for entity in proof["entities"]:
+        assert persisted_rows.count(f",'{entity['stock_code']}',") == 1
 
 
 def test_recovered_suspension_is_visible_only_after_real_native_observation(monkeypatch):
