@@ -22,7 +22,14 @@ from server.common.component_release_attestation import (
 )
 from server.common.component_release_ledger import component_release_row_state
 from server.common.component_release_proof import load_runtime_component_release_lite
-from server.common.daily_delivery_control import canonical_sha256, strategy_release_identity
+from server.common.daily_delivery_control import (
+    ANALYSIS_PUBLICATION_REFERENCE_SCHEMA,
+    DailyDeliveryControlError,
+    analysis_publication_reference,
+    canonical_sha256,
+    load_published_analysis_receipt,
+    strategy_release_identity,
+)
 from server.common.formal_analysis_store import FormalAnalysisStore
 from server.common.formal_score_publication import (
     FORMAL_SCORE_WORK_SCHEMA,
@@ -53,7 +60,11 @@ _REQUIRED_INPUTS = frozenset({
 })
 _SHA40 = re.compile(r"[0-9a-f]{40}")
 _RUN_UID = re.compile(r"[0-9a-f]{32}")
-_SCHEDULER_RUNTIME = "server/api/scheduler_runtime.py"
+_VALIDATION_ONLY_BODIES = {
+    "server/api/scheduler_runtime.py": "_terminal_snapshot",
+    "server/engine/strategy_center.py": "_dynamic_execution_signals",
+    "server/engine/strategy_shadow_trials.py": "native_trial_candidate_batch",
+}
 _MAX_COMPONENT_PARENT_LINKS = 8
 _MAX_RECOVERY_ATTEMPTS = 8
 _ABANDONED_PUBLICATION_MARKERS = frozenset({
@@ -130,13 +141,16 @@ def _scorer_source(root: Path, relative: str) -> bytes:
         raise FormalScoreContractError("formal recovery retained scorer source is unavailable") from exc
 
 
-def _scheduler_outside_terminal_projection(source: bytes) -> str:
-    tree = ast.parse(source, filename=_SCHEDULER_RUNTIME)
-    snapshots = [node for node in tree.body
-                 if isinstance(node, ast.FunctionDef) and node.name == "_terminal_snapshot"]
-    if len(snapshots) != 1:
-        raise FormalScoreContractError("formal recovery scheduler terminal projection is unavailable")
-    snapshots[0].body = []
+def _without_validation_body(path: str, source: bytes) -> str:
+    tree = ast.parse(source, filename=path)
+    function_name = _VALIDATION_ONLY_BODIES[path]
+    functions = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == function_name
+    ]
+    if len(functions) != 1:
+        raise FormalScoreContractError("formal recovery isolated validation function is unavailable")
+    functions[0].body = []
     return ast.dump(tree)
 
 
@@ -155,15 +169,15 @@ def _same_scorer(previous_build: str, current_build: str) -> bool:
     changed = _git(current, "diff", "--name-only", "-z", "--no-renames", previous_build, current_build, "--")
     paths = changed.decode("utf-8").rstrip("\0").split("\0") if changed else []
     if not paths or any(
-        path != _SCHEDULER_RUNTIME and path not in _PERMITTED_VALIDATION_FILES and not path.startswith("tests/")
+        path not in _VALIDATION_ONLY_BODIES and path not in _PERMITTED_VALIDATION_FILES and not path.startswith("tests/")
         for path in paths
     ):
         return False
-    if _SCHEDULER_RUNTIME in paths and (
-        _scheduler_outside_terminal_projection(_scorer_source(previous, _SCHEDULER_RUNTIME))
-        != _scheduler_outside_terminal_projection(_scorer_source(current, _SCHEDULER_RUNTIME))
-    ):
-        return False
+    for path in _VALIDATION_ONLY_BODIES.keys() & set(paths):
+        if _without_validation_body(path, _scorer_source(previous, path)) != _without_validation_body(
+            path, _scorer_source(current, path),
+        ):
+            return False
     return all(_scorer_source(previous, name) == _scorer_source(current, name) for name in _SCORER_FILES)
 
 
@@ -204,7 +218,7 @@ def _attempts_in_session(connection, session_uid: str, *, shard_id: str, excludi
             h.status AS audit_status,h.finished_at,h.exit_code,h.build_sha,h.task_type,
             h.scheduler_instance_id,SUBSTR(h.output, 1, 60000) AS output,
             r.trade_date AS score_trade_date,r.min_score,r.top_n,r.execution_time,
-            r.published_at,r.canonical_pool_sha256
+            r.status AS score_status,r.published_at,r.canonical_pool_sha256
         FROM st_daily_stage_attempt a
         LEFT JOIN st_scheduled_task_history h ON h.run_uid=a.scheduler_run_uid
         LEFT JOIN st_recommended_run_history r ON r.run_uid=h.run_uid AND r.scheduler_job_id=h.run_uid
@@ -217,13 +231,64 @@ def _attempts_in_session(connection, session_uid: str, *, shard_id: str, excludi
     return [dict(row) for row in rows]
 
 
-def _unpublished_terminal(record: Mapping[str, Any], builds: set[str], trade_date: str) -> bool:
+def _terminal_in_scope(record: Mapping[str, Any], builds: set[str], trade_date: str) -> bool:
     return (
         record["build_sha"] in builds and record["task_type"] == "analysis_fast"
         and str(record["score_trade_date"])[:10] == trade_date
         and record["finished_at"] is not None and record["stage_finished_at"] is not None
+    )
+
+
+def _unpublished_terminal(record: Mapping[str, Any], builds: set[str], trade_date: str) -> bool:
+    return (
+        _terminal_in_scope(record, builds, trade_date)
         and record["published_at"] is None and record["canonical_pool_sha256"] is None
     )
+
+
+def _published_terminal(record: Mapping[str, Any], builds: set[str], trade_date: str) -> bool:
+    pool_hash = record["canonical_pool_sha256"]
+    return (
+        _terminal_in_scope(record, builds, trade_date)
+        and record["stage_status"] == "SUCCESS" and record["audit_status"] == "success"
+        and record["exit_code"] == 0 and _RUN_UID.fullmatch(record["run_uid"] or "") is not None
+        and record["output_dataset_id"] == record["run_uid"] and record["score_status"] == "done"
+        and record["published_at"] is not None and isinstance(pool_hash, str)
+        and re.fullmatch(r"[0-9a-f]{64}", pool_hash) is not None and pool_hash != "0" * 64
+    )
+
+
+def _verify_terminal_publication(
+    engine, record: Mapping[str, Any], work: Mapping[str, Any], *, trade_date: str,
+    consumer_started_at: datetime,
+) -> None:
+    from server.common.scheduler_validation import _single_nested_machine_payload
+
+    try:
+        with engine.connect() as connection:
+            receipt = load_published_analysis_receipt(
+                connection, trade_date, decision_at=consumer_started_at, run_uid=record["run_uid"],
+            )
+            reference = analysis_publication_reference(receipt, engine=connection)
+        published_at = _local_decision(receipt["published_at"], whole_seconds=False)
+        if (
+            receipt["publisher_task_type"] != "analysis_fast"
+            or receipt["trade_date"] != trade_date or receipt["run_uid"] != record["run_uid"]
+            or receipt["build_sha"] != record["build_sha"]
+            or receipt["canonical_pool_sha256"] != record["canonical_pool_sha256"]
+            or receipt["score_snapshot"] != work["score_snapshot"]
+            or any(receipt[field] != work[field] for field in (
+                "analysis_count", "recommendation_count", "executable_count",
+            ))
+            or published_at != _local_decision(record["published_at"], whole_seconds=False)
+            or not _local_decision(record["finished_at"], whole_seconds=False) <= published_at
+                <= _local_decision(record["stage_finished_at"], whole_seconds=False) <= consumer_started_at
+            or _single_nested_machine_payload(record["output"], schema=ANALYSIS_PUBLICATION_REFERENCE_SCHEMA)
+                != reference
+        ):
+            raise FormalScoreContractError("formal recovery completed publication differs from its scheduler audit")
+    except (DailyDeliveryControlError, KeyError, TypeError) as exc:
+        raise FormalScoreContractError("formal recovery completed publication could not be verified") from exc
 
 
 def _successful_child_failed_publication(record: Mapping[str, Any]) -> bool:
@@ -356,13 +421,19 @@ def _candidate(
     current_started = _local_decision(current["stage_started_at"], whole_seconds=False)
     newer = current
     for prior in attempts:
-        if prior["stage_id"] >= current["stage_id"] or not _unpublished_terminal(prior, builds, trade_date):
+        if prior["stage_id"] >= current["stage_id"]:
+            return None
+        published = prior["stage_status"] == "SUCCESS"
+        if published:
+            if prior["build_sha"] == build_sha or not _published_terminal(prior, builds, trade_date):
+                return None
+        elif not _unpublished_terminal(prior, builds, trade_date):
             return None
         if any(_local_decision(prior[field], whole_seconds=False) > current_started for field in (
             "stage_finished_at", "finished_at",
         )):
-            raise FormalScoreContractError("formal recovery discarded attempt is not earlier")
-        if _successful_child_failed_publication(prior):
+            raise FormalScoreContractError("formal recovery prior attempt is not earlier")
+        if published or _successful_child_failed_publication(prior):
             break
         if not _abandoned_without_publication(prior, newer):
             return None
@@ -380,6 +451,12 @@ def _candidate(
     origin_build = origin["build_sha"]
     if origin_build not in builds or not _same_scorer(origin_build, build_sha):
         return None
+    if published:
+        if prior["build_sha"] != origin_build and not _same_scorer(prior["build_sha"], build_sha):
+            return None
+        _verify_terminal_publication(
+            engine, prior, latest, trade_date=trade_date, consumer_started_at=current_started,
+        )
     if prior["run_uid"] == origin["run_uid"]:
         original = latest
     else:
@@ -390,17 +467,27 @@ def _candidate(
         if not original_records:
             raise FormalScoreContractError("formal recovery original scheduler audit is unavailable")
         original_record = original_records[0]
-        if (
-            original_record["stage_id"] >= prior["stage_id"]
-            or not _unpublished_terminal(original_record, {origin_build}, trade_date)
-            or not _successful_child_failed_publication(original_record)
-        ):
+        original_published = _published_terminal(original_record, {origin_build}, trade_date)
+        original_failed = (
+            _unpublished_terminal(original_record, {origin_build}, trade_date)
+            and _successful_child_failed_publication(original_record)
+        )
+        if original_record["stage_id"] >= prior["stage_id"] or not (original_published or original_failed):
             raise FormalScoreContractError("formal recovery original scheduler audit is unavailable")
         original = _single_nested_machine_payload(original_record["output"], schema=FORMAL_SCORE_WORK_SCHEMA)
         if not original or any(latest.get(field) != original.get(field) for field in (
             "trade_date", "decision_at", "generation_sha256", "selection_sha256",
         )):
-            raise FormalScoreContractError("formal recovery failed rebind has different original evidence")
+            raise FormalScoreContractError("formal recovery rebind has different original evidence")
+        previous_claim = _local_decision(prior["stage_started_at"], whole_seconds=False)
+        if any(_local_decision(original_record[field], whole_seconds=False) > previous_claim for field in (
+            "stage_finished_at", "finished_at",
+        )):
+            raise FormalScoreContractError("formal recovery origin was unavailable to its prior rebind")
+        if original_published:
+            _verify_terminal_publication(
+                engine, original_record, original, trade_date=trade_date, consumer_started_at=previous_claim,
+            )
         prior = original_record
     if prior["build_sha"] != origin_build or prior["run_uid"] != origin["run_uid"]:
         raise FormalScoreContractError("formal recovery manifest origin differs from its scheduler audit")

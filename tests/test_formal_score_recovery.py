@@ -9,8 +9,11 @@ from sqlalchemy import create_engine, text
 from biz.analysis.sync_analysis_fast import MODEL_VERSION
 from server.common import formal_score_recovery as recovery
 from server.common import formal_score_source_evidence as source_evidence
-from server.common.analysis_pool_receipt import FROZEN_INITIAL_ANNOUNCEMENT_SCHEMA, decode_score_snapshot
-from server.common.daily_delivery_control import canonical_sha256
+from server.common.analysis_pool_receipt import (
+    ANALYSIS_POOL_RECEIPT_SCHEMA, FROZEN_INITIAL_ANNOUNCEMENT_SCHEMA, build_publication_receipt,
+    decode_score_snapshot,
+)
+from server.common.daily_delivery_control import analysis_publication_reference, canonical_sha256
 from server.common.formal_analysis_store import FormalAnalysisStore
 from server.common.formal_score_publication import (
     FormalScoreContractError, load_initial_selection, seal_initial_selection,
@@ -71,7 +74,7 @@ def archived(tmp_path, monkeypatch):
             "CREATE TABLE st_daily_delivery_session (session_uid TEXT PRIMARY KEY,trade_date TEXT,release_id TEXT,strategy_release_id TEXT)",
             "CREATE TABLE st_daily_stage_attempt (id INTEGER PRIMARY KEY,session_uid TEXT,scheduler_run_uid TEXT,stage_name TEXT,status TEXT,started_at TEXT,finished_at TEXT,shard_id TEXT,lease_owner TEXT,fencing_token INTEGER,lease_until TEXT,error_code TEXT,output_dataset_id TEXT)",
             "CREATE TABLE st_scheduled_task_history (run_uid TEXT PRIMARY KEY,task_type TEXT,build_sha TEXT,status TEXT,finished_at TEXT,exit_code INTEGER,output TEXT,scheduler_instance_id TEXT)",
-            "CREATE TABLE st_recommended_run_history (run_uid TEXT PRIMARY KEY,scheduler_job_id TEXT,trade_date TEXT,min_score REAL,top_n INTEGER,execution_time TEXT,published_at TEXT,canonical_pool_sha256 TEXT)",
+            "CREATE TABLE st_recommended_run_history (run_uid TEXT PRIMARY KEY,scheduler_job_id TEXT,trade_date TEXT,min_score REAL,top_n INTEGER,execution_time TEXT,published_at TEXT,canonical_pool_sha256 TEXT,status TEXT)",
         ):
             conn.exec_driver_sql(ddl)
         conn.execute(text("INSERT INTO st_daily_delivery_session VALUES ('session',:day,:contract,:strategy)"),
@@ -174,6 +177,127 @@ def test_recover_failed_rebind_but_never_search_past_a_success(archived, failed_
         conn.execute(text("UPDATE st_daily_stage_attempt SET status='SUCCESS' WHERE scheduler_run_uid=:uid"),
                      {"uid": FIRST_RETRY})
     assert _recover(engine, NEXT_RETRY) is None
+
+
+def _published_record(
+    engine, work, *, published_at="2026-11-15T20:01:59", finished_at="2026-11-15T20:02:00",
+):
+    manifest = {
+        "schema": ANALYSIS_POOL_RECEIPT_SCHEMA, "trade_date": TARGET,
+        "canonical_pool_sha256": "7" * 64, "score_snapshot_sha256": work["score_snapshot"]["payload_sha256"],
+        **{field: work[field] for field in ("analysis_count", "recommendation_count", "executable_count")},
+    }
+    receipt = build_publication_receipt(
+        manifest=manifest, run_uid=work["run_uid"], build_sha=work["build_sha"],
+        publisher_task_type="analysis_fast", published_at=published_at,
+        score_snapshot=work["score_snapshot"], engine=engine,
+    )
+    audit = json.dumps({
+        "replay_output": json.dumps(work) + "\n" + json.dumps(analysis_publication_reference(receipt, engine=engine)),
+    })
+    params = {
+        "uid": work["run_uid"], "audit": audit, "published_at": published_at,
+        "finished_at": finished_at, "pool": receipt["canonical_pool_sha256"],
+    }
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE st_daily_stage_attempt
+            SET status='SUCCESS',output_dataset_id=:uid,finished_at=:finished_at
+            WHERE scheduler_run_uid=:uid
+        """), params)
+        conn.execute(text("""
+            UPDATE st_scheduled_task_history
+            SET status='success',finished_at=:published_at,exit_code=0,output=:audit
+            WHERE run_uid=:uid
+        """), params)
+        conn.execute(text("""
+            UPDATE st_recommended_run_history
+            SET status='done',published_at=:published_at,canonical_pool_sha256=:pool
+            WHERE run_uid=:uid
+        """), params)
+    return receipt
+
+
+def test_rebind_published_original_after_compatible_linux_release(archived, monkeypatch):
+    engine, original = archived
+    receipt = _published_record(engine, original)
+
+    def load_exact(conn, target, *, decision_at, run_uid):
+        assert conn.engine is engine and target == TARGET
+        assert exact_time(decision_at) == PROPOSAL and run_uid == ORIGINAL_RUN
+        return receipt
+
+    monkeypatch.setattr(recovery, "load_published_analysis_receipt", load_exact)
+    monkeypatch.setattr(FormalAnalysisStore, "load_artifacts", lambda *_: pytest.fail("recovery reloaded score rows"))
+    rebound = _recover(engine)["reference"]
+    assert rebound["run_uid"] == FIRST_RETRY and rebound["build_sha"] == CURRENT
+    assert rebound["decision_at"] == CUTOFF
+    assert rebound["generation_sha256"] == original["generation_sha256"]
+    assert rebound["selection_sha256"] == original["selection_sha256"]
+    recovery.verify_recovered_initial_selection(engine, rebound, proposed_cutoff=PROPOSAL)
+
+
+@pytest.mark.parametrize("published_origin", [False, True])
+def test_rebind_newest_publication_with_earlier_verified_origin(archived, monkeypatch, published_origin):
+    engine, original = archived
+    rebound = load_initial_selection(
+        FormalAnalysisStore(engine), generation=original["generation_sha256"],
+        run_uid=FIRST_RETRY, build_sha=INTERMEDIATE,
+    )["reference"]
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE st_scheduled_task_history SET build_sha=:build WHERE run_uid=:uid"),
+                     {"build": INTERMEDIATE, "uid": FIRST_RETRY})
+        conn.execute(text("UPDATE st_daily_stage_attempt SET started_at='2026-11-15T20:10:00' WHERE scheduler_run_uid=:uid"),
+                     {"uid": FIRST_RETRY})
+    receipts = {
+        FIRST_RETRY: _published_record(
+            engine, rebound, published_at="2026-11-15T20:11:00", finished_at="2026-11-15T20:12:00",
+        ),
+    }
+    if published_origin:
+        receipts[ORIGINAL_RUN] = _published_record(engine, original)
+    _record(engine, run_uid=NEXT_RETRY, build=CURRENT)
+    monkeypatch.setattr(recovery, "_compatible_recovery_builds", lambda *_: {CURRENT, PARENT, INTERMEDIATE})
+    monkeypatch.setattr(recovery, "_same_scorer", lambda old, new: old in {PARENT, INTERMEDIATE} and new == CURRENT)
+    reads = []
+
+    def load_exact(conn, target, *, decision_at, run_uid):
+        assert conn.engine is engine and target == TARGET
+        expected = PROPOSAL if run_uid == FIRST_RETRY else "2026-11-15T20:10:00"
+        assert exact_time(decision_at) == expected
+        reads.append(run_uid)
+        return receipts[run_uid]
+
+    monkeypatch.setattr(recovery, "load_published_analysis_receipt", load_exact)
+    latest = _recover(engine, NEXT_RETRY)["reference"]
+    assert latest["generation_sha256"] == original["generation_sha256"]
+    assert latest["selection_sha256"] == original["selection_sha256"]
+    assert reads == ([FIRST_RETRY, ORIGINAL_RUN] if published_origin else [FIRST_RETRY])
+
+
+@pytest.mark.parametrize("change", ["audit_reference", "pool_hash", "dataset_id", "unchanged_build", "scorer"])
+def test_published_recovery_rejects_wrong_evidence_or_unapproved_scorer(archived, monkeypatch, change):
+    engine, original = archived
+    receipt = _published_record(engine, original)
+    monkeypatch.setattr(recovery, "load_published_analysis_receipt", lambda *_a, **_k: receipt)
+    with engine.begin() as conn:
+        params = {"uid": ORIGINAL_RUN, "wrong_uid": "8" * 32, "hash": "6" * 64,
+                  "work": json.dumps(original), "current": CURRENT}
+        if change == "audit_reference":
+            conn.execute(text("UPDATE st_scheduled_task_history SET output=:work WHERE run_uid=:uid"), params)
+        elif change == "pool_hash":
+            conn.execute(text("UPDATE st_recommended_run_history SET canonical_pool_sha256=:hash WHERE run_uid=:uid"), params)
+        elif change == "dataset_id":
+            conn.execute(text("UPDATE st_daily_stage_attempt SET output_dataset_id=:wrong_uid WHERE scheduler_run_uid=:uid"), params)
+        elif change == "unchanged_build":
+            conn.execute(text("UPDATE st_scheduled_task_history SET build_sha=:current WHERE run_uid=:uid"), params)
+    if change == "scorer":
+        monkeypatch.setattr(recovery, "_same_scorer", lambda *_: False)
+    if change in {"audit_reference", "pool_hash"}:
+        with pytest.raises(FormalScoreContractError, match="completed publication differs"):
+            _recover(engine)
+    else:
+        assert _recover(engine) is None
 
 
 def test_recovery_fails_closed_for_wrong_source_lineage(archived, monkeypatch):
@@ -280,7 +404,8 @@ def test_component_path_fails_closed_for_unrelated_ancestor(monkeypatch):
         recovery._compatible_recovery_builds(object(), current)
 
 
-def test_scheduler_delta_must_be_confined_to_terminal_projection_body():
+@pytest.mark.parametrize("path,definition", recovery._VALIDATION_ONLY_BODIES.items())
+def test_validation_delta_must_be_confined_to_exact_function_body(path, definition):
     source = b"""from pathlib import Path
 VERSION = 1
 
@@ -291,13 +416,16 @@ def _terminal_snapshot(conn):
 def calculate(conn):
     return conn.score()
 """
-    normalized = recovery._scheduler_outside_terminal_projection
+    source = source.replace(b"_terminal_snapshot", definition.encode("ascii"))
+    def normalized(data):
+        return recovery._without_validation_body(path, data)
+
     assert normalized(source) == normalized(source.replace(b"return conn.get()", b"return normalize(conn.get())"))
     for old, new in [
         (b"VERSION = 1", b"VERSION = 2"),
         (b"return conn.score()", b"return 0"),
         (b"@wrapper", b"@other_wrapper"),
-        (b"_terminal_snapshot(conn)", b"_terminal_snapshot(conn, extra=None)"),
+        (f"{definition}(conn)".encode("ascii"), f"{definition}(conn, extra=None)".encode("ascii")),
     ]:
         assert normalized(source) != normalized(source.replace(old, new))
 

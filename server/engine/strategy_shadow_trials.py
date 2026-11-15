@@ -241,9 +241,31 @@ def native_trial_candidate_batch(
     rows = []
     market_route = None
     cache = source_cache if source_cache is not None else {}
+    batch_context = dict(context)
     cutoff = context.get("decision_known_at")
-    cutoff_options = {"decision_known_at": cutoff} if cutoff is not None else {}
     analysis_run_uid = context.get("analysis_run_uid")
+    source_provenance = None
+    if "analysis_run_uid" in context or "decision_known_at" in context:
+        import re
+
+        if (
+            not isinstance(analysis_run_uid, str)
+            or re.fullmatch(r"[0-9a-fA-F]{32}", analysis_run_uid) is None
+            or analysis_run_uid == "0" * 32
+            or not isinstance(cutoff, (datetime, str))
+        ):
+            raise ValueError("SHADOW_NATIVE_FROZEN_ANALYSIS_IDENTITY_INVALID")
+        decision = normalize_decision_at(cutoff)
+        if decision.date() < date.fromisoformat(target):
+            raise ValueError("SHADOW_NATIVE_FROZEN_DECISION_PRECEDES_TRADE_DATE")
+        cutoff = decision.isoformat()
+        analysis_run_uid = analysis_run_uid.lower()
+        source_provenance = {
+            "source_kind": source_kind, "trade_date": target,
+            "analysis_run_uid": analysis_run_uid, "decision_known_at": cutoff,
+        }
+        del batch_context["analysis_run_uid"], batch_context["decision_known_at"]
+    cutoff_options = {"decision_known_at": cutoff} if cutoff is not None else {}
     if source_kind == "immutable_manifest":
         source_key = ("analysis", target, analysis_run_uid, cutoff)
         if source_key not in cache:
@@ -251,6 +273,14 @@ def native_trial_candidate_batch(
                 connection, target, analysis_run_uid, **cutoff_options,
             )
         receipt, snapshot = cache[source_key]
+        if source_provenance is not None:
+            if (
+                receipt.get("run_uid") != analysis_run_uid or receipt.get("trade_date") != target
+                or snapshot.get("run_uid") != analysis_run_uid
+                or normalize_decision_at(snapshot.get("decision_at")).isoformat() != cutoff
+            ):
+                raise ValueError("SHADOW_ANALYSIS_SCORE_CUTOFF_MISMATCH")
+            source_provenance.update(source_run_uid=analysis_run_uid, receipt_sha256=canonical_sha256(receipt))
         for raw in snapshot["scored_rows"]:
             signal = _manifest_signal(
                 strategy, raw, target=target, market=context["market"],
@@ -273,6 +303,10 @@ def native_trial_candidate_batch(
             cache[source_key] = _v3_source(connection, strategy, target, **cutoff_options)
         source = cache[source_key]
         market_route = _v3_market_route(strategy, source["run"])
+        if source_provenance is not None:
+            source_provenance.update(
+                source_run_uid=market_route["source_run_uid"], result_hash=market_route["result_hash"],
+            )
         for forecast in source["forecasts"].values():
             if forecast["strategy_key"] != key:
                 continue
@@ -291,7 +325,13 @@ def native_trial_candidate_batch(
     else:
         raise ValueError("SHADOW_NATIVE_SOURCE_KIND_INVALID")
     rows.sort(key=lambda row: (-float(row.get("effective_score") or 0), row["stock_code"]))
-    result = verified_native_candidate_batch(strategy, context, rows)
+    if source_provenance is not None:
+        # Hash native source provenance in the verified batch even when it emits no candidates.
+        market = context.get("market") or {}
+        if not isinstance(market, Mapping) or "native_source_binding" in market:
+            raise ValueError("SHADOW_NATIVE_FROZEN_MARKET_BINDING_INVALID")
+        batch_context["market"] = {**market, "native_source_binding": source_provenance}
+    result = verified_native_candidate_batch(strategy, batch_context, rows)
     result["native_market_route"] = market_route
     return result
 
