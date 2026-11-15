@@ -22,7 +22,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -80,6 +80,8 @@ from server.engine.strategy_funding_checkpoint import (
 from server.engine.strategy_industry_history import (
     QMT_PREVIOUS_SESSION_FALLBACKS,
     STRATEGY_INDUSTRY_HISTORY_PRODUCTION_CUTOVER_DATE,
+    authorized_industry_fallback,
+    resolve_analysis_industry_membership_binding,
 )
 
 
@@ -749,6 +751,7 @@ POOL_ROW_EVIDENCE_SCHEMA = "probiga.strategy-pool-row-evidence.v1"
 POOL_SNAPSHOT_SCHEMA = "probiga.strategy-pool-snapshot.v1"
 INDUSTRY_BINDING_SCHEMA = "probiga.governance-industry-binding.v1"
 INDUSTRY_SNAPSHOT_SCHEMA = "probiga.governance-industry-snapshot.v2"
+PINNED_INDUSTRY_SNAPSHOT_SCHEMA = "probiga.governance-industry-snapshot.v3"
 L1_INDUSTRY_TYPES = frozenset({"L1", "一级行业", "申万一级", "SW2021"})
 QMT_VALIDATED = "QMT_VALIDATED"
 _QMT_INDUSTRY_FACT_ID_RE = re.compile(
@@ -6272,38 +6275,23 @@ def _strategy_industry_history_contract_check(
 
             fallback_reason = ""
             if source_date != trade_date:
-                target_runs = _rows(
-                    connection,
-                    "SELECT snapshot_date, source, quality_status, "
-                    "capture_mode, captured_at "
-                    "FROM qmt_membership_snapshot_run "
-                    "WHERE snapshot_date=:fallback_target_date "
-                    "ORDER BY source, captured_at",
-                    {"fallback_target_date": trade_date},
+                allowed_source_date, fallback_reason = authorized_industry_fallback(
+                    connection, trade_date=trade_date,
                 )
-                if target_runs:
-                    raise ValueError(
-                        "target-date QMT run exists; previous-session fallback denied"
+                if allowed_source_date != source_date:
+                    raise ValueError("QMT industry source differs from the authorized prior session")
+                if trade_date in QMT_PREVIOUS_SESSION_FALLBACKS:
+                    # Archived exceptions were valid only with no target run.
+                    target_runs = _rows(
+                        connection,
+                        "SELECT snapshot_date, source FROM qmt_membership_snapshot_run "
+                        "WHERE snapshot_date=:fallback_target_date",
+                        {"fallback_target_date": trade_date},
                     )
-                fallback_reason = QMT_PREVIOUS_SESSION_FALLBACKS.get(
-                    trade_date, "",
-                )
-                previous_rows = _rows(
-                    connection,
-                    "SELECT MAX(trade_date) AS trade_date "
-                    "FROM si_trade_calendar "
-                    "WHERE trade_date < :trade_date AND trade_status=1",
-                    {"trade_date": trade_date},
-                )
-                previous_date = _iso_date(
-                    (previous_rows[0] if previous_rows else {}).get(
-                        "trade_date"
-                    )
-                )
-                if not fallback_reason or previous_date != source_date:
-                    raise ValueError(
-                        "QMT previous-session fallback is not explicitly authorized"
-                    )
+                    if target_runs:
+                        raise ValueError(
+                            "target-date QMT run exists; archived previous-session fallback denied"
+                        )
 
             normalized: list[dict[str, Any]] = []
             seen_codes: set[str] = set()
@@ -6452,12 +6440,57 @@ def _strategy_industry_history_contract_check(
     }, bindings, snapshots
 
 
+def _pinned_candidate_membership_matches(
+    connection,
+    *,
+    result: dict[str, Any],
+    snapshot: dict[str, Any],
+    source_snapshot: dict[str, Any],
+    trade_date: str,
+) -> bool:
+    from server.engine.strategy_governance import (
+        _industry_proof_matches_publication,
+        _pinned_industry_membership,
+    )
+
+    proof = _pinned_industry_membership(snapshot.get("membership_proof"), trade_date)
+    if (
+        connection is None or proof is None
+        or proof["source_snapshot_date"] != source_snapshot.get("source_snapshot_date")
+        or proof["source_snapshot_captured_at"] != source_snapshot.get("captured_at")
+        or proof["fallback_reason"] != source_snapshot.get("fallback_reason")
+        or proof["source"] != source_snapshot.get("source")
+        or not _industry_proof_matches_publication(
+            result.get("candidate_source"),
+            proof_sha256=proof["proof_sha256"],
+            decision_known_at=proof["decision_known_at"],
+        )
+    ):
+        return False
+    try:
+        binding = resolve_analysis_industry_membership_binding(
+            connection, trade_date=trade_date, source=proof["source"],
+            decision_known_at=proof["decision_known_at"],
+            expected_proof_sha256=proof["proof_sha256"],
+        )
+        return (
+            binding["proof_sha256"] == proof["proof_sha256"]
+            and binding["source"] == proof["source"]
+            and binding["source_snapshot_date"] == proof["source_snapshot_date"]
+            and binding["captured_at"] == proof["source_snapshot_captured_at"]
+            and binding["fallback_reason"] == proof["fallback_reason"]
+        )
+    except (KeyError, TypeError, ValueError, RuntimeError, SQLAlchemyError):
+        return False
+
+
 def _candidate_industry_snapshot_contract(
     result: dict[str, Any],
     *,
     trade_date: str,
     history_bindings: dict[tuple[str, str], dict[str, Any]],
     history_snapshots: dict[str, dict[str, Any]],
+    connection=None,
 ) -> tuple[bool, dict[str, Any], dict[str, dict[str, Any]]]:
     snapshot = result.get("candidate_industry_snapshot")
     summary = result.get("summary")
@@ -6471,6 +6504,10 @@ def _candidate_industry_snapshot_contract(
         "status", "requested_stock_codes", "rows", "reason",
         "snapshot_hash",
     }
+    schema = snapshot.get("schema")
+    is_pinned = schema == PINNED_INDUSTRY_SNAPSHOT_SCHEMA
+    if is_pinned:
+        expected_fields.add("membership_proof")
     requested = snapshot.get("requested_stock_codes")
     rows = snapshot.get("rows")
     cutoff = (
@@ -6481,7 +6518,7 @@ def _candidate_industry_snapshot_contract(
     source_snapshot = history_snapshots.get(trade_date) or {}
     if (
         set(snapshot) != expected_fields
-        or snapshot.get("schema") != INDUSTRY_SNAPSHOT_SCHEMA
+        or schema not in {INDUSTRY_SNAPSHOT_SCHEMA, PINNED_INDUSTRY_SNAPSHOT_SCHEMA}
         or str(snapshot.get("trade_date") or "") != trade_date
         or str(snapshot.get("as_of_exclusive") or "") != cutoff
         or not isinstance(requested, list)
@@ -6503,6 +6540,17 @@ def _candidate_industry_snapshot_contract(
         != str(summary.get("candidate_industry_snapshot_status") or "")
     ):
         errors.append({"reason": "candidate industry wrapper/hash differs"})
+    if is_pinned and not _pinned_candidate_membership_matches(
+        connection, result=result, snapshot=snapshot,
+        source_snapshot=source_snapshot, trade_date=trade_date,
+    ):
+        errors.append({"reason": "candidate pinned industry proof differs from publication"})
+    if (
+        not is_pinned
+        and source_snapshot.get("fallback_reason")
+        and trade_date not in QMT_PREVIOUS_SESSION_FALLBACKS
+    ):
+        errors.append({"reason": "candidate previous-session industry requires a pinned proof"})
     observed_by_code: dict[str, dict[str, Any]] = {}
     for row in rows if isinstance(rows, list) else []:
         if not isinstance(row, dict):
@@ -6535,12 +6583,12 @@ def _candidate_industry_snapshot_contract(
     )
     expected_snapshot_id = (
         str(source_snapshot.get("snapshot_id") or "")
-        if observed_codes else ""
+        if is_pinned or observed_codes else ""
     )
     if (
         str(snapshot.get("status") or "") != expected_status
         or snapshot_id != expected_snapshot_id
-        or (observed_codes and RESULT_HASH_RE.fullmatch(snapshot_id) is None)
+        or ((is_pinned or observed_codes) and RESULT_HASH_RE.fullmatch(snapshot_id) is None)
     ):
         errors.append({
             "reason": "candidate industry completion/snapshot identity differs",
@@ -13162,6 +13210,7 @@ def collect_governance_health(
             trade_date=validation_trade_date,
             history_bindings=industry_history_bindings,
             history_snapshots=industry_history_snapshots,
+            connection=connection,
         )
         add(
             "candidate_pool_industry_snapshot_binds_exact_qmt_history",

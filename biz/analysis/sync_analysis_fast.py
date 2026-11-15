@@ -3026,6 +3026,8 @@ def _load_sector_industry_memberships(
                     engine,
                     trade_date=target.isoformat(),
                     source=source,
+                    decision_known_at=cutoff,
+                    expected_proof_sha256=binding["proof_sha256"],
                 )
                 if report.get("snapshot_id") != binding["proof_sha256"]:
                     raise RuntimeError(

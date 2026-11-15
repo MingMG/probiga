@@ -1,17 +1,11 @@
 # -*- coding: utf-8 -*-
-"""Hash-verified exact-date QMT industry facts for strategy governance.
-
-Historical governance must never reconstruct an earlier industry map from the
-mutable ``si_industry_sw`` table.  This module accepts only the immutable QMT
-membership snapshot for the exact target session and verifies its published
-row count and canonical industry hash before copying the L1 facts into the
-append-only strategy-governance ledger.
-"""
+"""Hash-verified QMT industry facts for the target or preceding open session."""
 from __future__ import annotations
 
 import hashlib
 import json
 import re
+from contextlib import nullcontext
 from datetime import date, datetime, timedelta
 from typing import Any, Iterable, Mapping
 from zoneinfo import ZoneInfo
@@ -27,9 +21,8 @@ L1_INDUSTRY_TYPES = frozenset({"L1", "一级行业", "申万一级", "SW2021"})
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 
-# One-date, evidence-backed recovery authorization.  This is intentionally not
-# a general stale-data policy: later sessions remain exact-date only unless a
-# separately reviewed recovery entry is added.
+QMT_PREVIOUS_OPEN_SESSION_REASON = "QMT_VALIDATED_PREVIOUS_OPEN_SESSION"
+# Preserve the sealed identities of previously approved recoveries.
 QMT_PREVIOUS_SESSION_FALLBACKS = {
     "2026-08-28": "QMT_HISTORICAL_SECTOR_API_UNAVAILABLE",
     "2026-08-31": "QMT_MEMBERSHIP_CAPTURE_SKIPPED_DURING_RELEASE",
@@ -107,7 +100,7 @@ def previous_open_session_date(engine, *, trade_date: str) -> str:
 
     target = date.fromisoformat(str(trade_date)[:10]).isoformat()
     try:
-        with engine.connect() as connection:
+        with (engine.connect() if hasattr(engine, "connect") else nullcontext(engine)) as connection:
             previous = connection.execute(text("""
                 SELECT MAX(trade_date)
                 FROM si_trade_calendar
@@ -129,32 +122,81 @@ def authorized_industry_fallback(
     *,
     trade_date: str,
 ) -> tuple[str, str]:
-    """Return the one explicitly authorized immutable source date/reason."""
+    """Return the preceding open session, including existing recovery proofs."""
 
     target = date.fromisoformat(str(trade_date)[:10]).isoformat()
-    reason = QMT_PREVIOUS_SESSION_FALLBACKS.get(target, "")
-    if not reason:
-        return "", ""
+    reason = QMT_PREVIOUS_SESSION_FALLBACKS.get(
+        target, QMT_PREVIOUS_OPEN_SESSION_REASON,
+    )
     source_date = QMT_EXPLICIT_SESSION_FALLBACK_SOURCE_DATES.get(target)
     if source_date is None:
         source_date = previous_open_session_date(engine, trade_date=target)
     return date.fromisoformat(source_date).isoformat(), reason
 
 
-def _snapshot_run_count(engine, *, trade_date: str) -> int:
-    target = date.fromisoformat(str(trade_date)[:10]).isoformat()
-    with engine.connect() as connection:
-        return int(connection.execute(text("""
-            SELECT COUNT(*) FROM qmt_membership_snapshot_run
+def _visible_industry_run(
+    engine, *, trade_date: str, source: str, decision_known_at: str | None,
+) -> dict[str, Any] | None:
+    with (engine.connect() if hasattr(engine, "connect") else nullcontext(engine)) as connection:
+        runs = connection.execute(text("""
+            SELECT source, quality_status, capture_mode, captured_at,
+                   industry_count, industry_relation_count, industry_hash
+            FROM qmt_membership_snapshot_run
             WHERE snapshot_date=:trade_date
-        """), {"trade_date": target}).scalar() or 0)
+        """), {"trade_date": trade_date}).mappings().all()
+    earliest = f"{trade_date}T15:00:00"
+    midnight = (date.fromisoformat(trade_date) + timedelta(days=1)).isoformat() + "T00:00:00"
+    visible = []
+    for run in runs:
+        captured_at = _iso_datetime(run["captured_at"], field="运行时间")
+        if not earliest <= captured_at < midnight:
+            raise IndustrySnapshotIntegrityError("QMT行业快照不是目标交易日收盘后的精确日期事实")
+        if decision_known_at is None or captured_at <= decision_known_at:
+            visible.append(run)
+    if not visible:
+        return None
+    if len(visible) != 1 or visible[0]["source"] != source:
+        raise IndustrySnapshotIntegrityError("QMT行业快照来源或运行记录不唯一")
+    run = visible[0]
+    if run["quality_status"] != QMT_VALIDATED:
+        raise IndustrySnapshotIntegrityError(f"{trade_date}的QMT行业快照尚未达到{QMT_VALIDATED}")
+    if (
+        run["capture_mode"] != "qmt_close_full_refresh"
+        or not _SHA256.fullmatch(str(run["industry_hash"] or "").lower())
+        or int(run["industry_count"] or 0) <= 0
+        or int(run["industry_relation_count"] or 0) <= 0
+    ):
+        raise IndustrySnapshotIntegrityError("QMT行业快照运行证据不完整")
+    return dict(run)
+
+
+def select_industry_history_source(
+    engine, *, trade_date: str, decision_known_at: datetime | str | None = None,
+    source: str = PROVIDER_ID,
+) -> tuple[str, str]:
+    """Select one available immutable partition from its published metadata."""
+    target = date.fromisoformat(str(trade_date)[:10]).isoformat()
+    cutoff = (
+        _iso_datetime(decision_known_at, field="分析决策时间")
+        if decision_known_at is not None else None
+    )
+    if _visible_industry_run(engine, trade_date=target, source=source, decision_known_at=cutoff) is not None:
+        return target, ""
+    return _select_previous_industry_source(engine, target=target, source=source, cutoff=cutoff)
+
+
+def _select_previous_industry_source(engine, *, target: str, source: str, cutoff: str | None) -> tuple[str, str]:
+    prior, reason = authorized_industry_fallback(engine, trade_date=target)
+    if _visible_industry_run(engine, trade_date=prior, source=source, decision_known_at=cutoff) is None:
+        raise IndustrySnapshotNotReady(f"{target}及允许沿用的{prior}均没有可用的QMT行业快照")
+    return prior, reason
 
 
 def _exact_snapshot_contract(
     engine, *, trade_date: str, source: str = PROVIDER_ID,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     target = date.fromisoformat(str(trade_date)[:10]).isoformat()
-    with engine.connect() as connection:
+    with (engine.connect() if hasattr(engine, "connect") else nullcontext(engine)) as connection:
         runs = [dict(row) for row in connection.execute(text("""
             SELECT snapshot_date, source, quality_status, capture_mode,
                    industry_count, industry_relation_count, industry_hash,
@@ -256,6 +298,7 @@ def build_history_rows(
     source_snapshot_date: str | None = None,
     capture_mode: str = "qmt_close_full_refresh",
     fallback_reason: str = "",
+    authorized_fallback_date: str | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Build the strategy ledger only from one verified QMT snapshot."""
 
@@ -265,9 +308,10 @@ def build_history_rows(
     ).isoformat()
     normalized_mode = str(capture_mode or "").strip()
     normalized_fallback_reason = str(fallback_reason or "").strip()
-    expected_fallback_reason = QMT_PREVIOUS_SESSION_FALLBACKS.get(target, "")
+    legacy_reason = QMT_PREVIOUS_SESSION_FALLBACKS.get(target)
+    expected_fallback_reason = legacy_reason or QMT_PREVIOUS_OPEN_SESSION_REASON
     expected_source_date = QMT_EXPLICIT_SESSION_FALLBACK_SOURCE_DATES.get(
-        target
+        target, authorized_fallback_date,
     )
     if normalized_mode != "qmt_close_full_refresh":
         raise IndustrySnapshotIntegrityError(
@@ -279,8 +323,9 @@ def build_history_rows(
                 "QMT精确日期行业快照不得声明降级原因"
             )
     elif (
-        not expected_fallback_reason
-        or normalized_fallback_reason != expected_fallback_reason
+        normalized_fallback_reason != expected_fallback_reason
+        or source_date >= target
+        or (not expected_source_date and not legacy_reason)
         or (
             expected_source_date is not None
             and source_date != expected_source_date
@@ -389,28 +434,33 @@ def build_history_rows(
 
 def prepare_industry_history(
     engine, *, trade_date: str, source: str = PROVIDER_ID,
+    decision_known_at: datetime | str | None = None,
+    expected_proof_sha256: str | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     target = date.fromisoformat(str(trade_date)[:10]).isoformat()
-    fallback_reason = ""
-    try:
-        run, source_rows = _exact_snapshot_contract(
-            engine, trade_date=target, source=source,
+    if expected_proof_sha256 is not None:
+        if decision_known_at is None:
+            raise IndustrySnapshotIntegrityError("核对已封存行业证据需要原分析决策时间")
+        binding, history = _resolve_membership_and_history(
+            engine, target=target, source=source, decision_known_at=decision_known_at,
+            expected_proof_sha256=expected_proof_sha256,
         )
-    except IndustrySnapshotNotReady:
-        # Never hide a present-but-unvalidated/bad target snapshot behind an
-        # older partition.  Fallback is considered only when the target run is
-        # entirely absent and the target date has explicit recovery approval.
-        if _snapshot_run_count(engine, trade_date=target):
-            raise
-        source_date, fallback_reason = authorized_industry_fallback(
-            engine,
-            trade_date=target,
+        if history is not None:
+            return history
+        source_date, fallback_reason = binding["source_snapshot_date"], binding["fallback_reason"]
+    else:
+        source_date, fallback_reason = select_industry_history_source(
+            engine, trade_date=target, source=source, decision_known_at=decision_known_at,
         )
-        if not source_date or not fallback_reason:
-            raise
-        run, source_rows = _exact_snapshot_contract(
-            engine, trade_date=source_date, source=source,
-        )
+    return _prepare_selected_industry_history(
+        engine, target=target, source_date=source_date, source=source, fallback_reason=fallback_reason,
+    )
+
+
+def _prepare_selected_industry_history(
+    engine, *, target: str, source_date: str, source: str, fallback_reason: str,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    run, source_rows = _exact_snapshot_contract(engine, trade_date=source_date, source=source)
     snapshot_id, rows = build_history_rows(
         source_rows,
         trade_date=target,
@@ -420,6 +470,7 @@ def prepare_industry_history(
         source_snapshot_date=run["trade_date"],
         capture_mode=run["capture_mode"],
         fallback_reason=fallback_reason,
+        authorized_fallback_date=source_date if fallback_reason else None,
     )
     report = {
         "status": "VALIDATED",
@@ -457,113 +508,103 @@ def resolve_analysis_industry_membership_binding(
     trade_date: str,
     decision_known_at: datetime | str,
     source: str = PROVIDER_ID,
+    expected_proof_sha256: str | None = None,
 ) -> dict[str, Any]:
-    """Resolve the exact proof accepted by analysis and publication.
-
-    Ordinary sessions retain the existing whole-membership proof.  The one
-    explicitly authorized recovery session uses the immutable strategy
-    industry wrapper produced by :func:`prepare_industry_history`; its
-    ``snapshot_id`` binds the target date, the previous open source session,
-    the verified QMT source hash, capture time, fallback reason, and every L1
-    stock/industry fact.  No mutable current-industry table is consulted.
-    """
+    """Bind the available validated membership to the analysis decision."""
 
     target = date.fromisoformat(str(trade_date)[:10]).isoformat()
-    cutoff = _iso_datetime(decision_known_at, field="分析决策时间")
-    cutoff_value = datetime.fromisoformat(cutoff)
+    binding, _history = _resolve_membership_and_history(
+        engine, target=target, source=source, decision_known_at=decision_known_at,
+        expected_proof_sha256=expected_proof_sha256,
+    )
+    return binding
 
-    # Preserve the established proof identity whenever the exact target-day
-    # membership snapshot exists and was already known at the decision time.
+
+def _resolve_membership_and_history(
+    engine, *, target: str, source: str, decision_known_at: datetime | str,
+    expected_proof_sha256: str | None,
+) -> tuple[dict[str, Any], tuple[dict[str, Any], list[dict[str, Any]]] | None]:
+    if expected_proof_sha256 is not None and not _SHA256.fullmatch(expected_proof_sha256):
+        raise IndustrySnapshotIntegrityError("已封存分析行业证据哈希无效")
+    source_date, fallback_reason = select_industry_history_source(
+        engine, trade_date=target, source=source, decision_known_at=decision_known_at,
+    )
+    if not fallback_reason:
+        exact = _verify_exact_membership(
+            engine, target=target, source=source, decision_known_at=decision_known_at,
+        )
+        proof_sha256 = _digest(exact)
+        if expected_proof_sha256 is None or proof_sha256 == expected_proof_sha256:
+            return {
+                "snapshot_date": target,
+                "source": source,
+                "proof_sha256": proof_sha256,
+                "proof_mode": "EXACT_QMT_MEMBERSHIP_SNAPSHOT",
+                "source_snapshot_date": target,
+                "previous_session_fallback": False,
+                "fallback_reason": "",
+                "captured_at": _iso_datetime(exact.get("captured_at"), field="运行时间"),
+                "industry_relation_count": int(exact.get("industry_relation_count") or 0),
+                "concept_relation_count": int(exact.get("concept_relation_count") or 0),
+            }, None
+        # A same-day capture can reach the database after the analysis read.
+        # Replay may use the sealed prior proof only if it still verifies.
+        source_date, fallback_reason = _select_previous_industry_source(
+            engine, target=target, source=source,
+            cutoff=_iso_datetime(decision_known_at, field="分析决策时间"),
+        )
+
+    report, rows = _prepare_selected_industry_history(
+        engine, target=target, source_date=source_date, source=source,
+        fallback_reason=fallback_reason,
+    )
+    if expected_proof_sha256 is not None and report["snapshot_id"] != expected_proof_sha256:
+        raise IndustrySnapshotIntegrityError("QMT行业快照与已封存分析证据不一致")
+    return {
+        "snapshot_date": target,
+        "source": source,
+        "proof_sha256": report["snapshot_id"],
+        "proof_mode": (
+            "EXPLICIT_PRIOR_SESSION_INDUSTRY_CARRY_FORWARD"
+            if target in QMT_EXPLICIT_SESSION_FALLBACK_SOURCE_DATES
+            else "PREVIOUS_OPEN_SESSION_INDUSTRY_CARRY_FORWARD"
+        ),
+        "source_snapshot_date": source_date,
+        "previous_session_fallback": True,
+        "fallback_reason": fallback_reason,
+        "captured_at": report["source_snapshot_captured_at"],
+        "industry_relation_count": report["source_relation_count"],
+        "concept_relation_count": 0,
+    }, (report, rows)
+
+
+def _verify_exact_membership(
+    engine, *, target: str, source: str, decision_known_at: datetime | str,
+) -> dict[str, Any]:
+    from integrations.bigqmt.membership_snapshot import verify_existing_membership_snapshot
+
+    cutoff = datetime.fromisoformat(_iso_datetime(decision_known_at, field="分析决策时间"))
     try:
-        from integrations.bigqmt.membership_snapshot import (
-            verify_existing_membership_snapshot,
-        )
-
         exact = verify_existing_membership_snapshot(
-            engine,
-            snapshot_date=date.fromisoformat(target),
-            decision_known_at=cutoff_value,
+            engine, snapshot_date=date.fromisoformat(target), decision_known_at=cutoff, source=source,
         )
-        if str(exact.get("source") or "") != source:
-            raise IndustrySnapshotIntegrityError(
-                "QMT行业快照来源与分析合同不一致"
-            )
-        return {
-            "snapshot_date": target,
-            "source": source,
-            "proof_sha256": _digest(exact),
-            "proof_mode": "EXACT_QMT_MEMBERSHIP_SNAPSHOT",
-            "source_snapshot_date": target,
-            "previous_session_fallback": False,
-            "fallback_reason": "",
-            "captured_at": _iso_datetime(
-                exact.get("captured_at"), field="运行时间"
-            ),
-            "industry_relation_count": int(
-                exact.get("industry_relation_count") or 0
-            ),
-            "concept_relation_count": int(
-                exact.get("concept_relation_count") or 0
-            ),
-        }
-    except Exception as exact_error:
-        report, _rows = prepare_industry_history(
-            engine,
-            trade_date=target,
-            source=source,
-        )
-        captured = _iso_datetime(
-            report.get("source_snapshot_captured_at"), field="运行时间"
-        )
-        if datetime.fromisoformat(captured) > cutoff_value:
-            raise IndustrySnapshotIntegrityError(
-                "QMT行业快照在分析决策时间之后才可知"
-            ) from exact_error
-        if (
-            report.get("trade_date") != target
-            or report.get("source") != source
-            or not _SHA256.fullmatch(
-                str(report.get("snapshot_id") or "").lower()
-            )
-        ):
-            raise IndustrySnapshotIntegrityError(
-                "策略行业快照分析绑定不完整"
-            ) from exact_error
-        return {
-            "snapshot_date": target,
-            "source": source,
-            "proof_sha256": str(report["snapshot_id"]).lower(),
-            "proof_mode": (
-                (
-                    "EXPLICIT_PRIOR_SESSION_INDUSTRY_CARRY_FORWARD"
-                    if target in QMT_EXPLICIT_SESSION_FALLBACK_SOURCE_DATES
-                    else "PREVIOUS_OPEN_SESSION_INDUSTRY_CARRY_FORWARD"
-                )
-                if report.get("previous_session_fallback")
-                else "EXACT_QMT_INDUSTRY_SNAPSHOT"
-            ),
-            "source_snapshot_date": str(
-                report.get("source_snapshot_date") or ""
-            ),
-            "previous_session_fallback": bool(
-                report.get("previous_session_fallback")
-            ),
-            "fallback_reason": str(report.get("fallback_reason") or ""),
-            "captured_at": captured,
-            "industry_relation_count": int(
-                report.get("source_relation_count") or 0
-            ),
-            "concept_relation_count": 0,
-        }
+    except RuntimeError as exc:
+        raise IndustrySnapshotIntegrityError("目标日QMT板块成员完整性校验失败") from exc
+    if str(exact.get("source") or "") != source:
+        raise IndustrySnapshotIntegrityError("QMT行业快照来源与分析合同不一致")
+    return exact
 
 
-def _verify_existing_rows(connection, *, report: Mapping[str, Any], rows: list[dict[str, Any]]) -> bool:
-    existing = [dict(row) for row in connection.execute(text("""
+def _verify_existing_rows(
+    connection, *, report: Mapping[str, Any], rows: list[dict[str, Any]], pinned: bool,
+) -> bool:
+    snapshot_scope = " AND snapshot_id=:snapshot_id" if pinned else ""
+    existing = [dict(row) for row in connection.execute(text(f"""
         SELECT snapshot_id, stock_code, row_hash
         FROM st_strategy_industry_history
-        WHERE trade_date=:trade_date
+        WHERE trade_date=:trade_date{snapshot_scope}
         ORDER BY stock_code
-    """), {"trade_date": report["trade_date"]}).mappings().all()]
+    """), {"trade_date": report["trade_date"], "snapshot_id": report["snapshot_id"]}).mappings().all()]
     if not existing:
         return False
     expected = [
@@ -583,52 +624,49 @@ def _verify_existing_rows(connection, *, report: Mapping[str, Any], rows: list[d
 
 def capture_industry_history(
     engine, *, trade_date: str, source: str = PROVIDER_ID,
+    decision_known_at: datetime | str | None = None,
+    expected_proof_sha256: str | None = None,
 ) -> dict[str, Any]:
-    """Copy one verified exact-date QMT snapshot into the append-only ledger."""
+    """Copy the membership bound to one decision into the append-only ledger."""
 
     report, rows = prepare_industry_history(
-        engine, trade_date=trade_date, source=source,
+        engine, trade_date=trade_date, source=source, decision_known_at=decision_known_at,
+        expected_proof_sha256=expected_proof_sha256,
     )
-    try:
-        with engine.begin() as connection:
-            if _verify_existing_rows(connection, report=report, rows=rows):
-                return {
-                    **report,
-                    "status": "COMPLETED",
-                    "idempotent_replay": True,
-                }
-            insert = text("""
-                INSERT INTO st_strategy_industry_history
-                (snapshot_id, trade_date, as_of_exclusive, stock_code,
-                 industry_name, industry_type, source_system,
-                 source_fact_id, source_effective_at,
-                 source_etl_sync_at, row_hash)
-                VALUES
-                (:snapshot_id, :trade_date, :as_of_exclusive,
-                 :stock_code, :industry_name, :industry_type,
-                 :source_system, :source_fact_id,
-                 :source_effective_at, :source_etl_sync_at, :row_hash)
-            """)
-            for row in rows:
-                connection.execute(insert, row)
-    except IntegrityError as exc:
-        # A concurrent exact replay is acceptable only when every immutable row
-        # now matches; all other duplicate/collision cases remain integrity errors.
-        with engine.connect() as connection:
-            if _verify_existing_rows(connection, report=report, rows=rows):
-                return {
-                    **report,
-                    "status": "COMPLETED",
-                    "idempotent_replay": True,
-                }
-        raise IndustrySnapshotIntegrityError(
-            "策略行业历史并发写入发生不可验证冲突"
-        ) from exc
-    return {
-        **report,
-        "status": "COMPLETED",
-        "idempotent_replay": False,
-    }
+    pinned = expected_proof_sha256 is not None
+
+    def write_or_verify(connection) -> bool:
+        if _verify_existing_rows(connection, report=report, rows=rows, pinned=pinned):
+            return True
+        insert = text("""
+            INSERT INTO st_strategy_industry_history
+            (snapshot_id, trade_date, as_of_exclusive, stock_code,
+             industry_name, industry_type, source_system,
+             source_fact_id, source_effective_at, source_etl_sync_at, row_hash)
+            VALUES
+            (:snapshot_id, :trade_date, :as_of_exclusive, :stock_code,
+             :industry_name, :industry_type, :source_system,
+             :source_fact_id, :source_effective_at, :source_etl_sync_at, :row_hash)
+        """)
+        for offset in range(0, len(rows), 500):
+            connection.execute(insert, rows[offset:offset + 500])
+        return False
+
+    if not hasattr(engine, "connect"):
+        if not engine.in_transaction():
+            raise IndustrySnapshotIntegrityError("策略行业历史需要调用方事务")
+        idempotent = write_or_verify(engine)
+    else:
+        try:
+            with engine.begin() as connection:
+                idempotent = write_or_verify(connection)
+        except IntegrityError as exc:
+            # A concurrent replay is valid only if every immutable row matches.
+            with engine.connect() as connection:
+                idempotent = _verify_existing_rows(connection, report=report, rows=rows, pinned=pinned)
+            if not idempotent:
+                raise IndustrySnapshotIntegrityError("策略行业历史并发写入发生不可验证冲突") from exc
+    return {**report, "status": "COMPLETED", "idempotent_replay": idempotent}
 
 
 __all__ = [
@@ -636,6 +674,7 @@ __all__ = [
     "IndustrySnapshotNotReady",
     "L1_INDUSTRY_TYPES",
     "QMT_EXPLICIT_SESSION_FALLBACK_SOURCE_DATES",
+    "QMT_PREVIOUS_OPEN_SESSION_REASON",
     "QMT_PREVIOUS_SESSION_FALLBACKS",
     "STRATEGY_INDUSTRY_HISTORY_PRODUCTION_CUTOVER_DATE",
     "authorized_industry_fallback",
@@ -644,4 +683,5 @@ __all__ = [
     "prepare_industry_history",
     "previous_open_session_date",
     "resolve_analysis_industry_membership_binding",
+    "select_industry_history_source",
 ]

@@ -1330,6 +1330,7 @@ def test_governance_industry_wrapper_keeps_fallback_provenance(monkeypatch):
 
     target = "2026-08-28"
     source_date = "2026-08-27"
+    target_raw_runs = 0
     _snapshot_id, history_rows = build_history_rows(
         [{
             "industry_code": "801780",
@@ -1351,7 +1352,7 @@ def test_governance_industry_wrapper_keeps_fallback_provenance(monkeypatch):
 
     def read(sql, params=None):
         if "FROM qmt_membership_snapshot_run" in sql:
-            return [{"run_count": 0}]
+            return [{"run_count": target_raw_runs}]
         if "FROM si_trade_calendar" in sql:
             return [{"trade_date": source_date}]
         if "FROM st_strategy_industry_history" in sql:
@@ -1365,6 +1366,7 @@ def test_governance_industry_wrapper_keeps_fallback_provenance(monkeypatch):
     snapshot = governance_module._frozen_industry_snapshot(
         target, ["000001"],
     )
+    target_raw_runs = 1
     bindings, reason, valid = governance_module._industry_snapshot_binding_map(
         snapshot, target, expected_codes=["000001"],
     )
@@ -1477,6 +1479,83 @@ def test_governance_fallback_is_invalid_after_target_run_arrives(monkeypatch):
     assert valid is True
     assert bindings == {}
     assert "拒绝前一日行业降级" in snapshot["reason"]
+
+
+def test_sealed_governance_membership_keeps_prior_ledger_after_exact_arrives(monkeypatch):
+    from server.engine.strategy_industry_history import PROVIDER_ID, build_history_rows
+
+    target, prior = "2026-11-13", "2026-11-12"
+    cutoff = f"{target}T22:20:00"
+    fallback = "QMT_VALIDATED_PREVIOUS_OPEN_SESSION"
+
+    def industry_rows(source_day, name, reason):
+        return build_history_rows(
+            [{"industry_code": "801780", "industry_name": name,
+              "industry_type": "L1", "stock_code": "000001"}],
+            trade_date=target, source=PROVIDER_ID, industry_hash="a" * 64,
+            captured_at=f"{source_day}T15:20:00", source_snapshot_date=source_day,
+            fallback_reason=reason, authorized_fallback_date=source_day if reason else None,
+        )
+
+    prior_id, prior_rows = industry_rows(prior, "银行", fallback)
+    exact_id, exact_rows = industry_rows(target, "金融", "")
+    assert prior_id != exact_id
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    columns = list(prior_rows[0])
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE st_strategy_industry_history ("
+            + ", ".join(f"{key} TEXT NOT NULL" for key in columns) + ")"
+        )
+        write = text(
+            "INSERT INTO st_strategy_industry_history (" + ", ".join(columns) + ") "
+            "VALUES (" + ", ".join(f":{key}" for key in columns) + ")"
+        )
+        connection.execute(write, prior_rows)
+
+    def prepare(database, *, trade_date, decision_known_at, expected_proof_sha256):
+        assert (database, trade_date, decision_known_at, expected_proof_sha256) == (
+            engine, target, cutoff, prior_id,
+        )
+        return ({
+            "snapshot_id": prior_id, "source": PROVIDER_ID, "source_snapshot_date": prior,
+            "source_snapshot_captured_at": f"{prior}T15:20:00", "fallback_reason": fallback,
+        }, prior_rows)
+
+    def read(sql, params):
+        assert "FROM st_strategy_industry_history" in sql
+        with engine.connect() as connection:
+            return list(connection.execute(text(sql), params).mappings())
+
+    monkeypatch.setattr(governance_module, "get_engine", lambda: engine)
+    monkeypatch.setattr(governance_module, "_strict_table_exists", lambda _table: True)
+    monkeypatch.setattr(governance_module, "prepare_industry_history", prepare)
+    monkeypatch.setattr(governance_module, "_db_read", read)
+    pinned = {
+        "decision_known_at": cutoff, "membership_proof_sha256": prior_id,
+    }
+    before = governance_module._frozen_industry_snapshot(target, ["000001"], **pinned)
+    with engine.begin() as connection:
+        connection.execute(write, exact_rows)
+    after = governance_module._frozen_industry_snapshot(target, ["000001"], **pinned)
+
+    assert after == before
+    assert after["snapshot_id"] == prior_id
+    assert after["membership_proof"]["source_snapshot_date"] == prior
+    bindings, _, valid = governance_module._industry_snapshot_binding_map(after, target)
+    assert valid and bindings["000001"]["industry_name"] == "银行"
+    assert governance_module._industry_proof_matches_publication(
+        {"publication_proof": {
+            "status": "COMPLETED", "membership_snapshot_source": PROVIDER_ID,
+            "membership_proof_sha256": prior_id, "decision_known_at": cutoff,
+        }},
+        proof_sha256=prior_id, decision_known_at=cutoff,
+    )
+    tampered = deepcopy(after)
+    tampered.pop("snapshot_hash")
+    tampered["membership_proof"]["decision_known_at"] = f"{prior}T14:59:00"
+    tampered["snapshot_hash"] = governance_module._digest(tampered)
+    assert governance_module._industry_snapshot_binding_map(tampered, target)[2] is False
 
 
 @pytest.mark.parametrize("inactive_status", ("SHADOW", "SUSPENDED"))

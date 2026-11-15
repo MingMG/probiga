@@ -4230,11 +4230,16 @@ def _validate_analysis_strategy_pool(
             resolve_analysis_industry_membership_binding,
         )
 
+        producer_receipt = (
+            current_receipt if producer_uid == run_uid
+            else load_published_analysis_receipt(engine, target, run_uid=producer_uid)
+        )
         try:
             membership_binding = resolve_analysis_industry_membership_binding(
                 engine,
                 trade_date=target,
-                decision_known_at=now,
+                decision_known_at=producer_receipt["score_snapshot"]["decision_at"],
+                expected_proof_sha256=producer_membership["proof_sha256"],
             )
         except Exception as exc:
             return (
@@ -4250,7 +4255,6 @@ def _validate_analysis_strategy_pool(
             != producer_membership["proof_sha256"]
         ):
             return False, "analysis strategy pool membership proof differs"
-        producer_receipt = current_receipt if producer_uid == run_uid else load_published_analysis_receipt(engine, target, run_uid=producer_uid)
         manifest = read_persisted_pool_manifest(connection, target, score_snapshot=producer_receipt["score_snapshot"])
     if (
         int(manifest["analysis_count"]) != producer_total
@@ -4283,6 +4287,7 @@ def _validate_analysis_strategy_pool(
         f"date={target} analysis={manifest['analysis_count']} "
         f"picks={manifest['recommendation_count']} "
         f"executable={manifest['executable_count']} "
+        f"membership_source_date={membership_binding['source_snapshot_date']} "
         f"canonical_pool_sha256={producer_hash}",
     )
 
@@ -5093,28 +5098,8 @@ def validate_scheduler_task_result(
                 now=now,
                 output=output,
             )
-            # Membership is intentionally verified against the analysis
-            # target, not against the membership support task's own cutoff.
-            # At 15:10 that support task rolls to today's closed snapshot
-            # while a morning analysis can still target the prior session.
-            from server.engine.strategy_industry_history import (
-                resolve_analysis_industry_membership_binding,
-            )
-
-            membership_proof = resolve_analysis_industry_membership_binding(
-                engine,
-                trade_date=target_date.isoformat(),
-                decision_known_at=now,
-            )
-            messages.append(
-                "analysis industry membership snapshot verified: "
-                f"date={target_date.isoformat()} "
-                f"source_date={membership_proof['source_snapshot_date']} "
-                f"proof_mode={membership_proof['proof_mode']} "
-                f"industry_relations="
-                f"{int(membership_proof['industry_relation_count'])} "
-                f"proof_sha256={membership_proof['proof_sha256']}"
-            )
+            # Verify membership once against the sealed score's original
+            # decision time, even if the target-day capture arrives later.
             ok, message = _validate_analysis_strategy_pool(
                 engine,
                 target_date=target_date,

@@ -344,6 +344,41 @@ def test_monday_preclose_recovers_missed_friday_from_exact_snapshot():
     ]
 
 
+def test_scheduled_governance_captures_the_membership_from_frozen_scoring():
+    engine = _engine()
+    target = "2026-08-21"
+    cutoff = "2026-08-21T22:20:00"
+    proof = "d" * 64
+    calls = {}
+
+    def capture(database, *, trade_date, **selection):
+        assert database is engine
+        calls["capture"] = (trade_date, selection)
+        return _industry(database, trade_date=trade_date)
+
+    def govern(**kwargs):
+        calls["governance"] = kwargs
+        return _governance(**kwargs)
+
+    result = orchestrate_strategy_governance(
+        engine=engine,
+        now=datetime(2026, 8, 24, 10, 0),
+        industry_capture=capture,
+        governance_runner=govern,
+        fixed_scoring={
+            "trade_date": target, "decision_known_at": cutoff,
+            "analysis_run_uid": "b" * 32, "fixed_market_context": {"trade_date": target},
+            "membership_proof_sha256": proof,
+        },
+    )
+    assert result["orchestration_status"] == "COMPLETED"
+    assert calls["capture"] == (target, {
+        "decision_known_at": cutoff, "expected_proof_sha256": proof,
+    })
+    assert calls["governance"]["decision_known_at"] == cutoff
+    assert calls["governance"]["membership_proof_sha256"] == proof
+
+
 def test_completed_friday_is_not_due_on_weekend_or_monday():
     engine = _engine()
     current_sha = "1" * 40

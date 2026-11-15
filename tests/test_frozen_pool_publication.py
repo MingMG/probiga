@@ -121,6 +121,10 @@ def prepared(monkeypatch):
         log(connection, "governance")
         assert kwargs["expected_prior_governance_run_uid"] == PRIOR_RUN
         assert kwargs["fixed_scoring"]["fixed_market_context"] == context
+        assert kwargs["fixed_scoring"]["decision_known_at"] == envelope["decision_at"]
+        assert kwargs["fixed_scoring"]["membership_proof_sha256"] == (
+            envelope["input_proof"]["membership_proof_sha256"]
+        )
         return revised
 
     monkeypatch.setattr(analysis, "_prebind_direct_publication_history", lambda _engine, **kw: log(kw["publication_connection"], "prebind"))

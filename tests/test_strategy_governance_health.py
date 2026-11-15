@@ -2126,6 +2126,9 @@ class _Result:
     def first(self):
         return self._rows[0] if self._rows else None
 
+    def scalar(self):
+        return self.scalar_one() if self._rows or self._scalar_values else None
+
     def scalar_one(self):
         if self._scalar_values:
             return self._scalar_values[0]
@@ -5047,6 +5050,56 @@ def test_industry_history_replay_accepts_audited_one_session_fallback():
     )
 
 
+def test_industry_history_replay_accepts_only_the_actual_prior_open_session():
+    from server.engine.strategy_industry_history import (
+        QMT_PREVIOUS_OPEN_SESSION_REASON,
+        build_history_rows,
+    )
+
+    target, source_date = "2026-11-16", "2026-11-13"
+    source = "gj_big_qmt_inner"
+    captured_at = f"{source_date}T15:20:00"
+    members = [{
+        "snapshot_date": source_date, "source": source,
+        "industry_code": "801780", "industry_name": "银行",
+        "industry_type": "L1", "stock_code": "000001",
+        "short_name": "平安银行", "quality_status": health.QMT_VALIDATED,
+        "captured_at": captured_at,
+    }]
+    source_hash = health._canonical_qmt_industry_hash(members)
+    _snapshot_id, history_rows = build_history_rows(
+        members, trade_date=target, source=source, industry_hash=source_hash,
+        captured_at=captured_at, source_snapshot_date=source_date,
+        capture_mode="qmt_close_full_refresh", fallback_reason=QMT_PREVIOUS_OPEN_SESSION_REASON,
+        authorized_fallback_date=source_date,
+    )
+    contract = {
+        "previous_trade_date": source_date, "history_rows": history_rows,
+        "members": members,
+        "run": {
+            "snapshot_date": source_date, "source": source,
+            "quality_status": health.QMT_VALIDATED, "capture_mode": "qmt_close_full_refresh",
+            "industry_count": 1, "industry_relation_count": 1, "industry_hash": source_hash,
+            "captured_at": captured_at,
+        },
+    }
+    passed, detail, rows, snapshots = health._strategy_industry_history_contract_check(
+        _Connection(_GovernanceHealthEngine(industry_contract=contract)),
+    )
+    assert passed
+    assert rows[(target, "000001")]["source_effective_at"] == captured_at
+    assert snapshots[target]["fallback_reason"] == QMT_PREVIOUS_OPEN_SESSION_REASON
+    assert detail["invalid_count"] == 0
+
+    contract["previous_trade_date"] = "2026-11-14"
+    passed, detail, rows, snapshots = health._strategy_industry_history_contract_check(
+        _Connection(_GovernanceHealthEngine(industry_contract=contract)),
+    )
+    assert not passed
+    assert detail["invalid_count"] == 1
+    assert not rows and not snapshots
+
+
 def test_industry_history_cutover_isolates_legacy_but_replays_production(
     monkeypatch,
 ):
@@ -5328,6 +5381,79 @@ def test_empty_candidate_industry_wrapper_is_reproducible_not_missing():
     assert detail["requested_count"] == 0
     assert bindings == {}
     assert wrapper["reason"] == "当日候选为空，无需行业绑定；模拟资金保持现金"
+
+
+def test_pinned_empty_candidate_history_replays_bound_proof_and_rejects_drift(monkeypatch):
+    from server.engine.strategy_industry_history import QMT_PREVIOUS_OPEN_SESSION_REASON
+
+    target, source_date = "2026-11-13", "2026-11-12"
+    capture, cutoff = f"{source_date}T15:30:00", "2026-11-15T14:00:00"
+    digest = "a" * 64
+    provider = "gj_big_qmt_inner"
+    connection = object()
+    membership = {
+        "proof_sha256": digest,
+        "source": provider,
+        "source_snapshot_date": source_date,
+        "source_snapshot_captured_at": capture,
+        "decision_known_at": cutoff,
+        "fallback_reason": QMT_PREVIOUS_OPEN_SESSION_REASON,
+    }
+    wrapper = {
+        "schema": health.PINNED_INDUSTRY_SNAPSHOT_SCHEMA,
+        "snapshot_id": digest,
+        "trade_date": target,
+        "as_of_exclusive": "2026-11-14T00:00:00",
+        "status": "INCOMPLETE",
+        "requested_stock_codes": [],
+        "rows": [],
+        "reason": "",
+        "membership_proof": membership,
+    }
+    wrapper["snapshot_hash"] = health._canonical_digest(wrapper)
+    result = {
+        "candidate_industry_snapshot": wrapper,
+        "candidate_industry_snapshot_hash": wrapper["snapshot_hash"],
+        "candidate_source": {"publication_proof": {
+            "status": "COMPLETED",
+            "membership_snapshot_source": provider,
+            "membership_proof_sha256": digest,
+            "decision_known_at": cutoff,
+        }},
+        "summary": {
+            "candidate_industry_snapshot_id": digest,
+            "candidate_industry_snapshot_hash": wrapper["snapshot_hash"],
+            "candidate_industry_snapshot_status": "INCOMPLETE",
+        },
+    }
+    source_snapshot = {
+        "snapshot_id": digest,
+        "source": provider,
+        "source_snapshot_date": source_date,
+        "captured_at": capture,
+        "fallback_reason": QMT_PREVIOUS_OPEN_SESSION_REASON,
+    }
+
+    def resolve(subject, *, trade_date, decision_known_at, expected_proof_sha256, source):
+        assert subject is connection
+        assert (trade_date, decision_known_at, expected_proof_sha256, source) == (
+            target, cutoff, digest, provider,
+        )
+        return {**source_snapshot, "proof_sha256": digest}
+
+    monkeypatch.setattr(health, "resolve_analysis_industry_membership_binding", resolve)
+    kwargs = {
+        "trade_date": target, "history_bindings": {},
+        "history_snapshots": {target: source_snapshot}, "connection": connection,
+    }
+    passed, detail, bindings = health._candidate_industry_snapshot_contract(result, **kwargs)
+    assert passed and detail["snapshot_id"] == digest
+    assert not bindings
+
+    result["candidate_source"]["publication_proof"]["decision_known_at"] = "2026-11-15T14:00:01"
+    passed, detail, _bindings = health._candidate_industry_snapshot_contract(result, **kwargs)
+    assert not passed
+    assert detail["errors"] == [{"reason": "candidate pinned industry proof differs from publication"}]
 
 
 @pytest.mark.parametrize(

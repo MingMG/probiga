@@ -312,7 +312,6 @@ RELEASE_DATA_CATCHUP_DEPENDENCIES = {
     "analysis_upper_evidence_prepare": (
         "target_turnover_snapshot",
         "capital_flow_batch_fast",
-        "qmt_membership_snapshot",
         "qmt_announcement_pit",
         "qmt_stock_daily_canonical",
         "stock_finance",
@@ -332,7 +331,6 @@ RELEASE_DATA_CATCHUP_DEPENDENCIES = {
     ),
     "analysis_fast": (
         "target_turnover_snapshot",
-        "qmt_membership_snapshot",
         "qmt_announcement_pit",
         "qmt_stock_daily_canonical",
         "capital_flow_batch_fast",
@@ -357,19 +355,18 @@ DAILY_RESULT_RECOVERY_DEPENDENCIES = {
     # Keep the display/finance auxiliary collector independently managed;
     # strategy announcement evidence comes from qmt_announcement_pit.
     "notice_eastmoney": (),
+    "qmt_membership_snapshot": (),
     "capital_flow_batch_fast": ("qmt_stock_daily_canonical",),
     "target_turnover_snapshot": ("qmt_stock_daily_canonical",),
     "analysis_upper_evidence_prepare": (
         "target_turnover_snapshot",
         "capital_flow_batch_fast",
-        "qmt_membership_snapshot",
         "qmt_announcement_pit",
         "qmt_stock_daily_canonical",
         "stock_finance",
     ),
     "analysis_fast": (
         "target_turnover_snapshot",
-        "qmt_membership_snapshot",
         "qmt_announcement_pit",
         "qmt_stock_daily_canonical",
         "capital_flow_batch_fast",

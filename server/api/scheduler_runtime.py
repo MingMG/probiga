@@ -8233,7 +8233,8 @@ def _activate_analysis_strategy_pool(
         SELECT run_uid, scheduler_job_id, publisher_task_type, trade_date,
                status, total, passed, executable_count,
                canonical_pool_sha256, build_sha, membership_snapshot_date,
-               membership_snapshot_source, membership_proof_sha256
+               membership_snapshot_source, membership_proof_sha256,
+               execution_time
         FROM st_recommended_run_history
         WHERE run_uid=:run_uid
         LIMIT 2
@@ -8294,14 +8295,34 @@ def _activate_analysis_strategy_pool(
     ):
         raise RuntimeError("analysis pool activation membership identity differs")
     from server.engine.strategy_industry_history import (
+        IndustrySnapshotIntegrityError,
+        IndustrySnapshotNotReady,
         resolve_analysis_industry_membership_binding,
     )
+    from server.common.pit_facts import normalize_decision_at
 
-    membership_binding = resolve_analysis_industry_membership_binding(
-        connection.engine,
-        trade_date=trade_date,
-        decision_known_at=decision_known_at or datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None),
+    score_decision = (
+        ((publication_receipt or {}).get("score_snapshot") or {}).get("decision_at")
+        or history.get("execution_time")
     )
+    score_decision_at = normalize_decision_at(score_decision) if score_decision else None
+    if (
+        decision_known_at is not None
+        and score_decision_at is not None
+        and normalize_decision_at(decision_known_at) != score_decision_at
+    ):
+        raise RuntimeError("analysis pool activation score decision time differs")
+    try:
+        membership_binding = resolve_analysis_industry_membership_binding(
+            connection,
+            trade_date=trade_date,
+            decision_known_at=(
+                score_decision_at or decision_known_at or _now_shanghai_naive()
+            ),
+            expected_proof_sha256=membership["proof_sha256"],
+        )
+    except (IndustrySnapshotIntegrityError, IndustrySnapshotNotReady) as exc:
+        raise RuntimeError("analysis pool activation membership proof differs") from exc
     if (
         membership_binding.get("snapshot_date") != trade_date
         or membership_binding.get("source") != membership["source"]
@@ -8394,6 +8415,7 @@ def _activate_analysis_strategy_pool(
             "executable_count": executable_count,
             "canonical_pool_sha256": history_hash,
             "membership_proof_sha256": membership["proof_sha256"],
+            "membership_source_snapshot_date": membership_binding["source_snapshot_date"],
             "publication_status": "EMPTY" if empty_pool else "ACTIVE",
         }
         return {

@@ -230,8 +230,13 @@ def publish_prepared_premarket_pool(
     with bind_external_market_overlay(external_context):
         governance = persist_frozen_governance_revision(
             connection,
-            fixed_scoring={"trade_date": target, "analysis_run_uid": run_uid,
-                           "decision_known_at": score["cutoff_at"], "fixed_market_context": market_context},
+            fixed_scoring={
+                "trade_date": target,
+                "analysis_run_uid": run_uid,
+                "decision_known_at": score["score_snapshot"]["decision_at"],
+                "fixed_market_context": market_context,
+                "membership_proof_sha256": score["score_snapshot"]["input_proof"]["membership_proof_sha256"],
+            },
             prepared_analysis_publication=publication,
             expected_prior_governance_run_uid=initial["governance_run_uid"], expected_build_sha=build,
         )
