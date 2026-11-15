@@ -32,6 +32,9 @@ from server.common.strategy_governance_mode import (
 )
 
 
+GOVERNANCE_DAILY_RESULT_SCHEMA = "probiga.strategy-governance-daily-result.v1"
+
+
 def _load_project_env() -> None:
     from tools.env_config import load_project_env
 
@@ -150,6 +153,45 @@ def _valid_iso_date(value: object, *, allow_empty: bool = True) -> bool:
         return False
 
 
+def validated_canonical_governance_replay(payload: dict) -> dict | None:
+    if "reused_canonical_governance" not in payload:
+        return None
+    from server.common.daily_delivery_control import canonical_sha256
+
+    replay = payload["reused_canonical_governance"]
+    if not isinstance(replay, dict):
+        raise ValueError("invalid canonical governance replay")
+    proof = {key: value for key, value in replay.items() if key != "replay_sha256"}
+    fields = {
+        "schema", "trade_date", "run_uid", "canonical_result_hash", "build_commit_sha",
+        "analysis_run_uid", "analysis_score_snapshot_sha256", "decision_known_at",
+        "membership_proof_sha256",
+    }
+    if (
+        set(proof) != fields or proof.get("schema") != "probiga.governance-canonical-replay.v1"
+        or payload.get("status") != "ok"
+        or any(proof[key] != payload.get(key) for key in ("trade_date", "run_uid", "build_commit_sha"))
+        or not _valid_iso_date(proof["trade_date"], allow_empty=False)
+        or canonical_sha256(proof) != replay.get("replay_sha256")
+    ):
+        raise ValueError("canonical governance replay identity differs")
+    for field, width in (
+        ("run_uid", 32), ("analysis_run_uid", 32), ("build_commit_sha", 40),
+        ("canonical_result_hash", 64), ("analysis_score_snapshot_sha256", 64),
+        ("membership_proof_sha256", 64),
+    ):
+        value = proof[field]
+        if not isinstance(value, str) or not re.fullmatch(f"[0-9a-f]{{{width}}}", value) or value == "0" * width:
+            raise ValueError("canonical governance replay digest is invalid")
+    cutoff = proof["decision_known_at"]
+    if not isinstance(cutoff, str):
+        raise ValueError("canonical governance replay cutoff is invalid")
+    parsed = datetime.fromisoformat(cutoff)
+    if parsed.tzinfo is not None or parsed.isoformat() != cutoff:
+        raise ValueError("canonical governance replay cutoff is invalid")
+    return replay
+
+
 def validate_cli_result(
     payload: object,
     process_exit: int,
@@ -204,8 +246,11 @@ def validate_cli_result(
             )
         ):
             raise ValueError("治理完成输出与退出码不一致")
+        validated_canonical_governance_replay(payload)
         return "completed"
 
+    if "reused_canonical_governance" in payload:
+        raise ValueError("canonical governance replay requires completion")
     if status == "not_due" and orchestration == NOT_DUE:
         current_run = payload.get("current_run")
         if (
@@ -342,6 +387,7 @@ def _load_fixed_initial_scoring(engine, target: str, build_sha: str) -> dict:
         return {"error": "正式评分尚未完成"}
     snapshot = snapshots[0]
     cutoff = snapshot.get("decision_at")
+    score_root = str((receipt.get("score_snapshot") or {}).get("payload_sha256") or "")
     try:
         decision = datetime.fromisoformat(str(cutoff))
         earliest = datetime.combine(date.fromisoformat(target), STRATEGY_POOL_INITIAL_TIME)
@@ -353,6 +399,7 @@ def _load_fixed_initial_scoring(engine, target: str, build_sha: str) -> dict:
         receipt.get("trade_date") != target
         or receipt.get("publisher_task_type") != "analysis_fast"
         or receipt.get("build_sha") != build_sha
+        or re.fullmatch(r"[0-9a-f]{64}", score_root) is None or score_root == "0" * 64
         or snapshot.get("input_decision_at") != cutoff
         or decision.tzinfo is not None
         or decision < earliest
@@ -376,6 +423,7 @@ def _load_fixed_initial_scoring(engine, target: str, build_sha: str) -> dict:
         "trade_date": target,
         "decision_known_at": cutoff,
         "analysis_run_uid": receipt["run_uid"],
+        "analysis_score_snapshot_sha256": score_root,
         "fixed_market_context": snapshot["fixed_market_context"],
         "membership_proof_sha256": membership[0]["proof_sha256"],
     }
@@ -391,7 +439,7 @@ def run_daily_governance(
     """Execute one canonical governance run and return its validated payload."""
 
     if strategy_governance_database_deferred():
-        output = _deferred_database_blocked_output()
+        output = {"schema": GOVERNANCE_DAILY_RESULT_SCHEMA, **_deferred_database_blocked_output()}
         process_exit = 2
         validate_cli_result(output, process_exit)
         return output, process_exit
@@ -432,12 +480,23 @@ def run_daily_governance(
                 process_preflight=_bootstrap_execution_adapters,
                 ensure_build_commit_sha=expected_build_sha,
                 fixed_scoring=fixed_scoring,
+                adopt_existing_committed=bool(expected_build_sha and fixed_scoring and "error" not in fixed_scoring),
             )
     finally:
         engine.dispose()
-    output = result
+    if result.get("reason_code") == "GOVERNANCE_DATABASE_TRANSIENT" and fixed_scoring and "error" not in fixed_scoring:
+        result = {
+            **result,
+            "blocking_record": {
+                **result["blocking_record"],
+                "analysis_run_uid": fixed_scoring["analysis_run_uid"],
+                "analysis_score_snapshot_sha256": fixed_scoring["analysis_score_snapshot_sha256"],
+            },
+        }
+    output = {"schema": GOVERNANCE_DAILY_RESULT_SCHEMA, **result}
     if result.get("status") == "ok":
         output = {
+            "schema": GOVERNANCE_DAILY_RESULT_SCHEMA,
             "status": result.get("status"),
             "orchestration_status": result.get("orchestration_status"),
             "reason_code": result.get("reason_code"),
@@ -453,6 +512,8 @@ def run_daily_governance(
             ),
             "real_order_authority": result.get("real_order_authority"),
         }
+        if "reused_canonical_governance" in result:
+            output["reused_canonical_governance"] = result["reused_canonical_governance"]
     process_exit = _process_exit_for_result(result)
     try:
         validate_cli_result(

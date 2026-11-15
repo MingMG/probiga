@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import sqlite3
 from datetime import datetime, timezone
 
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
+from sqlalchemy.exc import OperationalError
 
 from server.engine import strategy_governance_orchestrator as orchestrator_module
 from server.engine import strategy_governance as governance_module
@@ -63,8 +66,8 @@ def test_blocked_attempt_hash_explicitly_binds_both_real_flags_off():
     assert len(payload["evidence"]["attempt_hash"]) == 64
 
 
-def _engine():
-    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+def _engine(url="sqlite+pysqlite:///:memory:"):
+    engine = create_engine(url, future=True)
     with engine.begin() as connection:
         connection.execute(text("""
             CREATE TABLE si_trade_calendar (
@@ -1092,3 +1095,196 @@ def test_governance_evidence_gap_is_retryable_and_binds_industry_snapshot():
     assert result["blocking_stage"] == "GOVERNANCE_INPUT"
     assert result["industry_snapshot"]["snapshot_id"] == "a" * 64
     assert result["allocations"][0]["simulated_weight_pct"] == 100.0
+
+
+_GOVERNANCE_TARGET = "2026-08-21"
+_GOVERNANCE_BUILD = "d" * 40
+_GOVERNANCE_FIXED_SCORE = {
+    "trade_date": _GOVERNANCE_TARGET, "analysis_run_uid": "b" * 32,
+    "decision_known_at": "2026-08-21T18:00:00", "fixed_market_context": {"context_sha256": "e" * 64},
+    "membership_proof_sha256": "3" * 64, "analysis_score_snapshot_sha256": "4" * 64,
+}
+_GOVERNANCE_TEST_SECRET = "secret-db-value-not-for-logs"
+
+
+def _insert_frozen_completion(connection):
+    frozen = _GOVERNANCE_FIXED_SCORE
+    payload = {
+        **_governance(trade_date=_GOVERNANCE_TARGET),
+        "build_commit_sha": _GOVERNANCE_BUILD,
+        "candidate_source": {"publication_proof": {
+            "status": "COMPLETED", "build_sha": _GOVERNANCE_BUILD,
+            "trade_date": _GOVERNANCE_TARGET, "publisher_run_uid": frozen["analysis_run_uid"],
+            "decision_known_at": frozen["decision_known_at"],
+            "membership_proof_sha256": frozen["membership_proof_sha256"],
+            "analysis_score_snapshot_sha256": frozen["analysis_score_snapshot_sha256"],
+        }},
+    }
+    payload.pop("canonical_result_hash")
+    result_json = governance_module._json_text(payload)
+    result_hash = hashlib.sha256(result_json.encode()).hexdigest()
+    connection.execute(text("""
+        INSERT INTO st_strategy_governance_run (
+            run_uid, trade_date, run_revision, input_hash, decision_hash, build_commit_sha,
+            status, is_canonical, result_json, result_hash, finished_at
+        ) VALUES (:run_uid, :trade_date, 1, :input_hash, :decision_hash, :build_commit_sha,
+                  'COMPLETED', 1, :result_json, :result_hash, '2026-08-21 23:00:01')
+    """), {**payload, "result_json": result_json, "result_hash": result_hash})
+    return {**payload, "canonical_result_hash": result_hash}
+
+
+@pytest.mark.parametrize("server_committed", [False, True])
+def test_governance_write_reconciles_an_actual_dbapi_commit_failure_without_rerunning(
+    monkeypatch, caplog, server_committed, tmp_path,
+):
+    from test_frozen_governance_transaction import _SQLiteGovernanceEngine
+
+    engine = _engine(f"sqlite+pysqlite:///{tmp_path / 'governance-commit.db'}")
+    writer = _SQLiteGovernanceEngine(engine)
+    monkeypatch.setattr(governance_module, "get_engine", lambda: writer)
+    monkeypatch.setattr(governance_module, "ensure_and_seed_governance", lambda: None)
+    monkeypatch.setattr(governance_module, "_validate_canonical_governance_result", lambda _value: None)
+    from server.engine import strategy_center
+    monkeypatch.setattr(strategy_center, "ensure_strategy_center_tables", lambda: None)
+    monkeypatch.setattr(governance_module, "_table_exists", lambda _name: True)
+    production_snapshot = governance_module.governance_snapshot
+    commits = []
+    writes = []
+    prepared = []
+    do_commit = engine.dialect.do_commit
+
+    def commit(dbapi_connection):
+        if not writes or commits:
+            return do_commit(dbapi_connection)
+        commits.append(server_committed)
+        if server_committed:
+            do_commit(dbapi_connection)
+        # SQLAlchemy itself translates this DBAPI failure into OperationalError.
+        raise sqlite3.OperationalError(2013, _GOVERNANCE_TEST_SECRET)
+
+    def runner(**kwargs):
+        connection = kwargs.get("_governance_connection")
+        if connection is None:
+            return production_snapshot(**kwargs)
+        writes.append(connection)
+        result = _insert_frozen_completion(connection)
+        prepared.append(result)
+        return result
+
+    monkeypatch.setattr(engine.dialect, "do_commit", commit)
+    monkeypatch.setattr(governance_module, "governance_snapshot", runner)
+    result = orchestrate_strategy_governance(
+        engine=engine, now=datetime(2026, 8, 24, 10), industry_capture=lambda engine, **kw: _industry(engine, trade_date=kw["trade_date"]),
+        ensure_build_commit_sha=_GOVERNANCE_BUILD, fixed_scoring=_GOVERNANCE_FIXED_SCORE,
+    )
+    assert len(writes) == len(commits) == 1
+    assert _GOVERNANCE_TEST_SECRET not in caplog.text and _GOVERNANCE_TEST_SECRET not in json.dumps(result)
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT COUNT(*) FROM st_strategy_governance_run")).scalar() == int(server_committed)
+    if server_committed:
+        assert result["orchestration_status"] == "COMPLETED"
+        assert result["canonical_result_hash"] == prepared[0]["canonical_result_hash"]
+        assert result.get("reused_canonical_governance") is None
+    else:
+        assert result["orchestration_status"] == "NOT_READY" and result["retryable"] is True
+        assert result["reason_code"] == "GOVERNANCE_DATABASE_TRANSIENT"
+        assert result["blocking_record"]["db_errno"] == 2013 and result["blocking_record"]["phase"] == "COMMIT"
+        assert result["blocking_record"]["prepared_result"]["run_uid"] == prepared[0]["run_uid"]
+        assert result["blocking_record"]["prepared_result"]["canonical_result_hash"] == prepared[0]["canonical_result_hash"]
+
+
+@pytest.mark.parametrize("errno,expected", [(1043, NOT_READY), (1045, PROGRAM_ERROR), (1146, PROGRAM_ERROR)])
+def test_runner_distinguishes_retryable_transport_from_blocked_credentials_and_schema(monkeypatch, caplog, errno, expected):
+    engine = _engine()
+
+    def raised(**kwargs):
+        raise OperationalError("SELECT secret", {"password": _GOVERNANCE_TEST_SECRET},
+                               sqlite3.OperationalError(errno, _GOVERNANCE_TEST_SECRET))
+
+    result = orchestrate_strategy_governance(
+        engine=engine, now=datetime(2026, 8, 24, 10), industry_capture=_industry, governance_runner=raised,
+    )
+    assert result["orchestration_status"] == expected
+    assert result["retryable"] is (expected == NOT_READY)
+    assert f"db_errno={errno}" in caplog.text
+    assert _GOVERNANCE_TEST_SECRET not in caplog.text + json.dumps(result)
+
+
+@pytest.mark.parametrize("adopt,source_valid", [(True, True), (True, False), (False, False)])
+def test_explicit_same_build_replay_requires_original_frozen_score_and_skips_writer(monkeypatch, adopt, source_valid):
+    engine = _engine()
+    with engine.begin() as connection:
+        expected = _insert_frozen_completion(connection)
+    monkeypatch.setattr(governance_module, "_validate_canonical_governance_result", lambda _result: None)
+    monkeypatch.setattr(governance_module, "governance_snapshot", lambda **_: pytest.fail("replay called writer"))
+    scope = {**_GOVERNANCE_FIXED_SCORE}
+    if not source_valid:
+        scope["analysis_score_snapshot_sha256"] = "f" * 64
+    result = orchestrate_strategy_governance(
+        engine=engine, now=datetime(2026, 8, 24, 10), industry_capture=lambda *_a, **_kw: pytest.fail("replay captured industry"),
+        ensure_build_commit_sha=_GOVERNANCE_BUILD, fixed_scoring=scope, adopt_existing_committed=adopt,
+    )
+    if not adopt:
+        assert result["orchestration_status"] == NOT_DUE
+    elif not source_valid:
+        assert result["orchestration_status"] == INTEGRITY_ERROR
+        assert "reused_canonical_governance" not in result
+    else:
+        assert result["orchestration_status"] == "COMPLETED"
+        proof = result["reused_canonical_governance"]
+        assert proof["run_uid"] == expected["run_uid"]
+        assert proof["canonical_result_hash"] == expected["canonical_result_hash"]
+        assert proof == orchestrator_module.canonical_governance_replay_proof(result, scope)
+
+
+def test_completion_readback_retries_exact_select_after_dbapi_error(monkeypatch):
+    engine = _engine()
+    with engine.begin() as connection:
+        expected = _insert_frozen_completion(connection)
+    attempts = []
+    monkeypatch.setattr(governance_module, "_validate_canonical_governance_result", lambda _result: None)
+
+    @event.listens_for(engine, "before_cursor_execute")
+    def read_failure(_conn, _cursor, sql, params, context, many):
+        if "run_uid, trade_date, input_hash, decision_hash" in sql:
+            attempts.append(params)
+            if len(attempts) == 1:
+                raise OperationalError(sql, params, sqlite3.OperationalError(2013, _GOVERNANCE_TEST_SECRET))
+
+    result = orchestrate_strategy_governance(
+        engine=engine, now=datetime(2026, 8, 24, 10), industry_capture=lambda *_a, **_kw: pytest.fail("replay captured industry"),
+        ensure_build_commit_sha=_GOVERNANCE_BUILD, fixed_scoring=_GOVERNANCE_FIXED_SCORE, adopt_existing_committed=True,
+    )
+    assert len(attempts) == 2 and attempts[0] == attempts[1]
+    assert result["orchestration_status"] == "COMPLETED"
+    assert result["canonical_result_hash"] == expected["canonical_result_hash"]
+
+
+@pytest.mark.parametrize("track_failure_phase", [False, True])
+def test_governance_lock_cleanup_preserves_real_primary_dbapi_error(monkeypatch, tmp_path, caplog, track_failure_phase):
+    from test_frozen_governance_transaction import _SQLiteGovernanceEngine
+
+    engine = _engine(f"sqlite+pysqlite:///{tmp_path / 'governance-cleanup.db'}")
+    writer = _SQLiteGovernanceEngine(engine)
+    do_execute = engine.dialect.do_execute
+
+    def execute(cursor, statement, parameters, context=None):
+        if statement == "SELECT 1" and writer.lock_log == ["GET_LOCK", "RELEASE_LOCK"]:
+            raise sqlite3.OperationalError(2013, _GOVERNANCE_TEST_SECRET)
+        if statement == "SELECT 2":
+            raise sqlite3.OperationalError(1205, _GOVERNANCE_TEST_SECRET)
+        return do_execute(cursor, statement, parameters, context)
+
+    monkeypatch.setattr(engine.dialect, "do_execute", execute)
+    expected_type = governance_module.GovernanceDatabaseFailure if track_failure_phase else OperationalError
+    with pytest.raises(expected_type) as caught:
+        with governance_module.governance_write_transaction(writer, track_failure_phase=track_failure_phase) as connection:
+            _insert_frozen_completion(connection)
+            connection.execute(text("SELECT 2"))
+    diagnostic = governance_module.governance_database_diagnostic(caught.value)
+    assert diagnostic["db_errno"] == 1205
+    assert diagnostic["phase"] == ("WRITE" if track_failure_phase else "")
+    assert "db_errno=2013" in caplog.text and _GOVERNANCE_TEST_SECRET not in caplog.text
+    assert writer.lock_log == ["GET_LOCK", "RELEASE_LOCK"]
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT COUNT(*) FROM st_strategy_governance_run")).scalar() == 0

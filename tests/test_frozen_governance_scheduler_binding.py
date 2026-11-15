@@ -140,6 +140,7 @@ def test_natural_governance_child_consumes_the_scheduler_builds_frozen_score(
     assert observed["fixed_scoring"] == {
         "trade_date": DAY, "decision_known_at": cutoff, "analysis_run_uid": SCORE_RUN,
         "fixed_market_context": snapshot["fixed_market_context"],
+        "analysis_score_snapshot_sha256": receipt["score_snapshot"]["payload_sha256"],
         "membership_proof_sha256": snapshot["input_proof"]["membership_proof_sha256"],
     }
     assert observed["allow_revision"] is False

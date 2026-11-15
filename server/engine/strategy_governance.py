@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -25,7 +26,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 from typing import Any, Callable, Iterable, Mapping
 
 from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from server.api.routers._engine import get_engine
 from server.common.canonical_json import validate_canonical_json
@@ -179,6 +180,47 @@ class GovernanceEvidenceNotReady(RuntimeError):
             "reason": str(message),
             "automatic_real_order_submission": False,
         }
+
+
+_GOVERNANCE_TRANSIENT_DB_ERRNOS = frozenset({1043, 1205, 1213, 2003, 2006, 2013, 2055})
+_GOVERNANCE_PREPARED_RESULT_FIELDS = (
+    "status", "result_mode", "is_canonical", "run_uid", "trade_date",
+    "canonical_result_hash", "build_commit_sha", "input_hash", "decision_hash",
+)
+
+
+class GovernanceDatabaseFailure(RuntimeError):
+    """Database failure from one governance writer phase."""
+
+    def __init__(self, phase: str):
+        super().__init__("governance database operation failed")
+        self.phase = phase if phase in {"CONNECT", "ACQUIRE_LOCK", "WRITE", "COMMIT", "RELEASE_LOCK"} else "UNKNOWN"
+        self.prepared_result: dict[str, Any] | None = None
+
+
+def governance_database_diagnostic(exc: BaseException) -> dict[str, Any] | None:
+    """Extract only safe driver metadata from a known DBAPI error."""
+    phase = exc.phase if isinstance(exc, GovernanceDatabaseFailure) else ""
+    cause: BaseException | None = exc
+    for _ in range(4):
+        if isinstance(cause, DBAPIError):
+            args = getattr(cause.orig, "args", ())
+            errno = args[0] if args and type(args[0]) is int and 1000 <= args[0] <= 9999 else None
+            return {
+                "phase": phase, "db_errno": errno,
+                "connection_invalidated": cause.connection_invalidated is True,
+            }
+        cause = cause.__cause__ if cause is not None else None
+    return None
+
+
+def governance_database_transient(diagnostic: dict[str, Any] | None) -> bool:
+    if diagnostic is None:
+        return False
+    errno = diagnostic["db_errno"]
+    return errno in _GOVERNANCE_TRANSIENT_DB_ERRNOS or (
+        errno is None and diagnostic["connection_invalidated"] is True
+    )
 
 
 METRIC_ARTIFACT_MAX_BYTES = 48 * 1024 * 1024
@@ -27649,32 +27691,72 @@ def _governance_source_input_hash(
 
 
 @contextmanager
-def governance_write_transaction(engine=None):
+def governance_write_transaction(engine=None, *, track_failure_phase: bool = False):
     """Hold the existing governance writer lock across one database commit."""
     if _GOVERNANCE_WRITE_CONNECTION.get() is not None:
         raise RuntimeError("governance write transactions cannot be nested")
-    with (engine if engine is not None else get_engine()).connect() as connection:
-        acquired = False
-        try:
-            acquired = int(connection.execute(text(
-                "SELECT GET_LOCK('probiga_strategy_governance_daily_v1', 30)"
-            )).scalar() or 0) == 1
-            connection.commit()
-            if not acquired:
-                raise RuntimeError("治理日终单写者锁获取超时")
-            connection = connection.execution_options(isolation_level="REPEATABLE READ")
-            with connection.begin(), bind_sql_connection(connection):
-                token = _GOVERNANCE_WRITE_CONNECTION.set(connection)
-                try:
-                    yield connection
-                finally:
-                    _GOVERNANCE_WRITE_CONNECTION.reset(token)
-        finally:
-            if connection.in_transaction():
-                connection.rollback()
-            if acquired:
-                connection.execute(text("SELECT RELEASE_LOCK('probiga_strategy_governance_daily_v1')"))
+    phase = "CONNECT"
+    try:
+        with (engine if engine is not None else get_engine()).connect() as connection:
+            acquired = False
+            failed = False
+            discard_session = False
+            try:
+                phase = "ACQUIRE_LOCK"
+                acquired = int(connection.execute(text(
+                    "SELECT GET_LOCK('probiga_strategy_governance_daily_v1', 30)"
+                )).scalar() or 0) == 1
                 connection.commit()
+                if not acquired:
+                    raise RuntimeError("治理日终单写者锁获取超时")
+                phase = "WRITE"
+                connection = connection.execution_options(isolation_level="REPEATABLE READ")
+                transaction = connection.begin()
+                with bind_sql_connection(connection):
+                    token = _GOVERNANCE_WRITE_CONNECTION.set(connection)
+                    try:
+                        yield connection
+                    finally:
+                        _GOVERNANCE_WRITE_CONNECTION.reset(token)
+                phase = "COMMIT"
+                transaction.commit()
+            except BaseException as exc:
+                failed = True
+                discard_session = isinstance(exc, DBAPIError) and phase in {"ACQUIRE_LOCK", "COMMIT"}
+                if discard_session:
+                    # A failed acknowledgement must release the physical session,
+                    # never issue a second COMMIT while releasing its named lock.
+                    try:
+                        connection.invalidate()
+                    except Exception:
+                        pass
+                raise
+            finally:
+                try:
+                    if connection.in_transaction():
+                        connection.rollback()
+                    if acquired and not discard_session and not connection.invalidated:
+                        connection.execute(text("SELECT RELEASE_LOCK('probiga_strategy_governance_daily_v1')"))
+                        connection.commit()
+                except Exception as cleanup_error:
+                    # A damaged pool connection must not retain a named lock or
+                    # replace the original write/commit exception.
+                    try:
+                        connection.invalidate()
+                    except Exception:
+                        pass
+                    if not failed:
+                        phase = "RELEASE_LOCK"
+                        raise
+                    diagnostic = governance_database_diagnostic(cleanup_error) or {}
+                    logging.getLogger(__name__).warning(
+                        "strategy-governance writer cleanup failed phase=RELEASE_LOCK error_type=%s db_errno=%s",
+                        type(cleanup_error).__name__, diagnostic.get("db_errno"),
+                    )
+    except DBAPIError as exc:
+        if not track_failure_phase:
+            raise
+        raise GovernanceDatabaseFailure(phase) from exc
 
 
 def _require_governance_write_transaction(connection) -> None:
@@ -27742,19 +27824,26 @@ def governance_snapshot(
     elif not _table_exists("st_strategy_registry"):
         raise RuntimeError("策略治理表尚未由部署流程创建，读取接口不会现场建表")
     if persist and _governance_connection is None:
-        with governance_write_transaction() as connection:
-            return governance_snapshot(
-                trade_date=trade_date,
-                strategy_snapshot=strategy_snapshot,
-                persist=True,
-                operator=operator,
-                strategy_limit=strategy_limit,
-                _governance_connection=connection,
-                fixed_market_context=fixed_market_context,
-                decision_known_at=decision_known_at,
-                analysis_run_uid=analysis_run_uid,
-                membership_proof_sha256=membership_proof_sha256,
-            )
+        result = None
+        try:
+            with governance_write_transaction(track_failure_phase=True) as connection:
+                result = governance_snapshot(
+                    trade_date=trade_date,
+                    strategy_snapshot=strategy_snapshot,
+                    persist=True,
+                    operator=operator,
+                    strategy_limit=strategy_limit,
+                    _governance_connection=connection,
+                    fixed_market_context=fixed_market_context,
+                    decision_known_at=decision_known_at,
+                    analysis_run_uid=analysis_run_uid,
+                    membership_proof_sha256=membership_proof_sha256,
+                )
+        except GovernanceDatabaseFailure as exc:
+            if isinstance(result, dict) and exc.phase in {"COMMIT", "RELEASE_LOCK"}:
+                exc.prepared_result = {field: result.get(field) for field in _GOVERNANCE_PREPARED_RESULT_FIELDS}
+            raise
+        return result
     fixed_fields = (fixed_market_context, decision_known_at, analysis_run_uid)
     if any(value is not None for value in fixed_fields):
         if any(value is None for value in fixed_fields) or strategy_snapshot is not None:

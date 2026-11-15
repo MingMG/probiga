@@ -468,6 +468,12 @@ def _terminal_snapshot(conn):
 def _daily_result_recovery_target(conn):
     return conn.older()
 
+def _daily_delivery_runtime_health(conn):
+    return conn.health()
+
+def _build_daily_result_delivery_receipt(conn):
+    return conn.receipt()
+
 def calculate(conn):
     return conn.score()
 """

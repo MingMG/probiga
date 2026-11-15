@@ -4882,6 +4882,25 @@ def validate_scheduler_task_result(
                 or staged_initial["analysis_count"] < requirements[0].min_rows
             ):
                 raise ValueError("prepared analysis score universe is incomplete")
+        governance_replay = None
+        if task_type == "strategy_governance_daily":
+            from tools.run_strategy_governance_daily import validated_canonical_governance_replay
+
+            output_lines = str(output or "").strip().splitlines()
+            if len(output_lines) == 1:
+                try:
+                    governance_output = json.loads(output_lines[0])
+                except ValueError:
+                    governance_output = None
+                if isinstance(governance_output, dict):
+                    governance_replay = validated_canonical_governance_replay(governance_output)
+            if governance_replay is not None:
+                if (
+                    governance_replay["build_commit_sha"] != task.get("_scheduler_expected_build_sha")
+                    or governance_replay["trade_date"] != task.get("_scheduler_target_trade_date")
+                ):
+                    raise ValueError("canonical governance replay differs from the scheduled scope")
+                flow_target_date = date.fromisoformat(governance_replay["trade_date"])
         # The final transaction writes and verifies the projection. At this
         # point a staged initial score can only be read from its immutable store.
         for requirement in (() if staged_initial is not None else requirements or ()):
@@ -4889,6 +4908,7 @@ def validate_scheduler_task_result(
                 replace(requirement, require_fresh=False)
                 if (
                     task_type == "stock_finance"
+                    or governance_replay is not None
                     or task_type == _CAPITAL_FLOW_BATCH_TASK_TYPE
                     and (historical_flow_receipt or direct_flow_receipt)
                 )
