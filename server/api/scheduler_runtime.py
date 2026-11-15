@@ -4519,6 +4519,106 @@ def _attach_qmt_minute_scope_recovery(engine, rows: list[dict], *, now: datetime
     row.pop("_dependency_latest_at", None)
 
 
+def _governance_database_retry_allowed(
+    engine, *, trade_date: str, build_sha: str, score_run_uid: str, now: datetime,
+) -> tuple[bool, str]:
+    """Bound automatic retries using terminal attempts and the exact published score."""
+    from server.common.daily_delivery_control import load_published_analysis_receipt
+
+    unavailable = (False, "governance_database_retry_evidence_unavailable")
+    reason = "GOVERNANCE_DATABASE_TRANSIENT"
+    current = now.astimezone(PRODUCTION_TIMEZONE).replace(tzinfo=None) if now.tzinfo else now
+    if not re.fullmatch(r"[0-9a-f]{32}", score_run_uid or ""):
+        return unavailable
+    try:
+        scope = daily_session_identity(trade_date, runtime_contract_build_sha(expected_build_sha=build_sha))
+        with engine.connect() as connection:
+            receipt = load_published_analysis_receipt(
+                connection, trade_date, decision_at=current, run_uid=score_run_uid,
+            )
+            score_hash = receipt["score_snapshot"]["payload_sha256"]
+            published_at = datetime.fromisoformat(str(receipt["published_at"]))
+            if (
+                receipt["publisher_task_type"] != "analysis_fast" or receipt["trade_date"] != trade_date
+                or receipt["run_uid"] != score_run_uid or receipt["build_sha"] != build_sha
+                or not re.fullmatch(r"[0-9a-f]{64}", score_hash or "") or score_hash == "0" * 64
+                or published_at.tzinfo is not None or published_at > current
+            ):
+                return unavailable
+            attempts = connection.execute(text("""
+                SELECT /*+ MAX_EXECUTION_TIME(3000) */ a.status AS stage_status, a.started_at, a.finished_at,
+                    a.lease_owner, h.scheduler_instance_id, h.status AS audit_status, h.exit_code,
+                    h.finished_at AS audit_finished_at, h.build_sha, h.task_type, SUBSTR(h.output, 1, 60000) AS output
+                FROM st_daily_stage_attempt AS a
+                LEFT JOIN st_scheduled_task_history AS h ON h.run_uid=a.scheduler_run_uid
+                WHERE a.session_uid=:session_uid AND a.stage_name='strategy_governance_daily'
+                  AND a.shard_id='main' AND a.error_code=:reason
+                  AND (h.build_sha=:build_sha OR h.build_sha IS NULL)
+                  AND (a.finished_at>=:published_at OR a.finished_at IS NULL)
+                ORDER BY a.fencing_token DESC LIMIT 4
+            """), {
+                "session_uid": scope["session_uid"], "reason": reason,
+                "build_sha": build_sha, "published_at": published_at,
+            }).mappings().all()
+    except Exception:
+        return unavailable
+
+    completed_attempts = 0
+    for attempt in attempts:
+        started = _coerce_datetime(attempt["started_at"])
+        stage_finished = _coerce_datetime(attempt["finished_at"])
+        audit_finished = _coerce_datetime(attempt["audit_finished_at"])
+        if (
+            attempt["stage_status"] != "BLOCKED" or attempt["audit_status"] != "blocked"
+            or attempt["exit_code"] != 2 or attempt["build_sha"] != build_sha
+            or attempt["task_type"] != "strategy_governance_daily"
+            or not attempt["lease_owner"] or attempt["lease_owner"] != attempt["scheduler_instance_id"]
+            or started is None or stage_finished is None or audit_finished is None
+            or not started <= audit_finished <= stage_finished <= current
+        ):
+            return unavailable
+        payloads = {
+            canonical_sha256(payload): payload
+            for payload in _iter_scheduler_output_payloads(attempt["output"])
+            if payload.get("reason_code") == reason
+            and payload.get("schema") != "probiga.scheduler-transient-block.v1"
+        }
+        if len(payloads) != 1:
+            return unavailable
+        payload = next(iter(payloads.values()))
+        proof = payload.get("blocking_record")
+        if (
+            payload.get("status") != "blocked" or payload.get("orchestration_status") != "NOT_READY"
+            or payload.get("retryable") is not True or payload.get("target_trade_date") != trade_date
+            or not isinstance(proof, dict)
+        ):
+            return unavailable
+        previous_uid = proof.get("analysis_run_uid")
+        previous_sha = proof.get("analysis_score_snapshot_sha256")
+        if (
+            not isinstance(previous_uid, str) or not re.fullmatch(r"[0-9a-f]{32}", previous_uid)
+            or previous_uid == "0" * 32
+            or not isinstance(previous_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", previous_sha)
+            or previous_sha == "0" * 64
+        ):
+            return unavailable
+        if previous_uid != score_run_uid:
+            # An older owner may have terminalized while this score was being
+            # published. Its explicitly different input has its own budget.
+            if started > published_at:
+                return unavailable
+            continue
+        if previous_sha != score_hash:
+            return unavailable
+        completed_attempts += 1
+
+    if completed_attempts >= 2:
+        return False, "governance_database_retry_exhausted"
+    if len(attempts) == 4:
+        return unavailable
+    return True, "ready"
+
+
 def _strategy_pipeline_dependencies_ready(
     row: dict, engine, now: datetime
 ) -> tuple[bool, str]:
@@ -4691,6 +4791,11 @@ def _strategy_pipeline_dependencies_ready(
             completed_stock_finance_history=finance_history,
             certified_initial_announcement_history=announcement_history,
         )
+        if ready and task_type == "strategy_governance_daily" and _daily_delivery_requires_production_runtime():
+            ready, reason = _governance_database_retry_allowed(
+                engine, trade_date=expected_trade_date, build_sha=expected_build_sha,
+                score_run_uid=latest_histories["analysis_fast"]["run_uid"], now=now,
+            )
         if ready and announcement_history is not None:
             row["_certified_initial_announcement_history"] = announcement_history
         if ready and "qmt_stock_daily_canonical" in evidence_dependencies:
@@ -8841,6 +8946,9 @@ def _daily_delivery_runtime_health(
         raise RuntimeError(
             "daily delivery ticket-pool evidence is unavailable"
         ) from exc
+    from tools.run_strategy_governance_daily import validated_canonical_governance_replay
+    replay = validated_canonical_governance_replay(governance)
+
     governance_api = _load_local_delivery_api(
         "/api/strategy-center/governance?trade_date=" + target
     )
@@ -8866,6 +8974,7 @@ def _daily_delivery_runtime_health(
         or str(governance_api.get("trade_date") or "")[:10] != target
         or str(governance_api.get("run_uid") or "").strip().lower()
         != governance_run_uid
+        or (replay is not None and governance_api.get("canonical_result_hash") != replay["canonical_result_hash"])
         or governance_api.get("automatic_real_order_submission") is not False
         or governance_api.get("real_order_authority") is not False
     ):
@@ -9126,6 +9235,17 @@ def _build_daily_result_delivery_receipt(
             connection, governance_row=governance_row, analysis_run_uid=producer_run_uid,
             score_snapshot=scoring_snapshot,
         )
+    from tools.run_strategy_governance_daily import validated_canonical_governance_replay
+    replay = validated_canonical_governance_replay(governance)
+    if replay is not None and (
+        not is_frozen_initial
+        or replay["canonical_result_hash"] != governance_row["result_hash"]
+        or replay["analysis_run_uid"] != producer_run_uid
+        or replay["analysis_score_snapshot_sha256"] != scoring_snapshot["payload_sha256"]
+        or replay["decision_known_at"] != scoring_snapshot["input_decision_at"]
+        or replay["membership_proof_sha256"] != producer["membership_proof_sha256"]
+    ):
+        raise RuntimeError("daily delivery governance replay proof differs from the active formal score")
     manifest = read_persisted_pool_manifest(connection, target, score_snapshot=publication["score_snapshot"])
     membership_proofs = manifest.get("membership_proofs")
     analysis_count = int(manifest.get("analysis_count") or 0)
@@ -10985,7 +11105,10 @@ def _run_task_impl(
                 "success" if proc.returncode == 0 else "failed"
             )
         )
-        machine_output = (stdout or "") + "\n" + (stderr or "")
+        machine_output = (
+            stdout or "" if task_type == "strategy_governance_daily"
+            else (stdout or "") + "\n" + (stderr or "")
+        )
         # Apply the bounded, redacted history budget once. Cutting stderr to
         # 2 KB first loses SQL error codes ahead of executemany parameters.
         output = _terminal_history_output(stdout, stderr, machine_output)

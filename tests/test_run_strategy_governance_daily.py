@@ -563,6 +563,7 @@ def test_daily_release_argument_forces_exact_build_orchestration(
         return {
             "build_sha": expected_sha, "run_uid": "b" * 32,
             "trade_date": target, "publisher_task_type": "analysis_fast",
+            "score_snapshot": {"payload_sha256": "8" * 64},
             "membership_proofs": [{
                 "snapshot_date": target, "source": "gj_big_qmt_inner",
                 "proof_sha256": "d" * 64,
@@ -607,13 +608,18 @@ def test_daily_release_argument_forces_exact_build_orchestration(
     payload = json.loads(capsys.readouterr().out)
     assert captured["ensure_build_commit_sha"] == expected_sha
     assert captured["allow_revision"] is False
+    assert captured["adopt_existing_committed"] is True
     assert captured["fixed_scoring"] == {
         "trade_date": "2026-08-21", "decision_known_at": cutoff,
         "analysis_run_uid": "b" * 32, "fixed_market_context": market_context,
+        "analysis_score_snapshot_sha256": "8" * 64,
         "membership_proof_sha256": "d" * 64,
     }
     assert payload["build_commit_sha"] == expected_sha
     assert payload["automatic_real_order_submission"] is False
+    from server.api.scheduler_runtime import _history_validation_replay_output
+
+    assert json.loads(_history_validation_replay_output(json.dumps(payload)))["schema"] == daily.GOVERNANCE_DAILY_RESULT_SCHEMA
 
 
 def test_daily_completed_output_does_not_mask_real_order_authority_drift(
@@ -657,3 +663,102 @@ def test_daily_completed_output_does_not_mask_real_order_authority_drift(
         "real_order_authority": False,
     }]
     assert daily.validate_cli_result(payload, 4) == "program_error"
+
+
+def test_scheduler_governance_adopts_only_well_bound_replay_of_old_completion(monkeypatch):
+    from sqlalchemy import create_engine, inspect as inspect_db, text
+
+    from server.common.daily_delivery_control import canonical_sha256
+    from server.common import scheduler_validation
+
+    monkeypatch.setattr(
+        scheduler_validation, "_table_columns",
+        lambda engine, name: {field["name"] for field in inspect_db(engine).get_columns(name)},
+    )
+    engine = create_engine("sqlite://")
+    with engine.begin() as connection:
+        connection.execute(text("""
+            CREATE TABLE st_strategy_governance_run (trade_date TEXT, status TEXT, finished_at TEXT)
+        """))
+        connection.execute(text("""
+            INSERT INTO st_strategy_governance_run VALUES ('2026-11-13', 'COMPLETED', '2026-11-15 21:01:00')
+        """))
+    build = "b" * 40
+    scope = {
+        "task_type": "strategy_governance_daily",
+        "_scheduler_target_trade_date": "2026-11-13",
+        "_scheduler_expected_build_sha": build,
+    }
+    proof = {
+        "schema": "probiga.governance-canonical-replay.v1",
+        "trade_date": "2026-11-13",
+        "run_uid": "a" * 32,
+        "canonical_result_hash": "c" * 64,
+        "build_commit_sha": build,
+        "analysis_run_uid": "d" * 32,
+        "analysis_score_snapshot_sha256": "e" * 64,
+        "decision_known_at": "2026-11-15T21:00:00",
+        "membership_proof_sha256": "f" * 64,
+    }
+    output = {
+        "status": "ok",
+        "orchestration_status": "COMPLETED",
+        "reason_code": "GOVERNANCE_COMPLETED",
+        "summary": {},
+        "run_uid": proof["run_uid"],
+        "build_commit_sha": build,
+        "trade_date": proof["trade_date"],
+        "allocations": [{"target_type": "CASH", "simulated_weight_pct": 100, "real_order_authority": False}],
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+        "reused_canonical_governance": {**proof, "replay_sha256": canonical_sha256(proof)},
+    }
+    started = datetime.fromisoformat("2026-11-15T23:41:00")
+
+    def validate(task, payload):
+        return scheduler_validation.validate_scheduler_task_result(
+            task, engine=engine, started_at=started, now=started, output=json.dumps(payload),
+        )
+
+    assert daily.validate_cli_result(output, 0, expected_build_sha=build) == "completed"
+    assert validate(scope, output).ok
+    assert not validate({**scope, "_scheduler_target_trade_date": "2026-11-12"}, output).ok
+    assert not validate({**scope, "_scheduler_expected_build_sha": "9" * 40}, output).ok
+    output["reused_canonical_governance"]["analysis_score_snapshot_sha256"] = "9" * 64
+    with pytest.raises(ValueError, match="replay identity"):
+        daily.validate_cli_result(output, 0, expected_build_sha=build)
+    assert not validate(scope, output).ok
+
+
+def test_governance_worker_uses_machine_stdout_and_retains_stderr_for_audit():
+    import ast
+
+    from server.api import scheduler_runtime as runtime
+    from server.common.scheduler_validation import scheduler_output_status
+
+    statements = ast.parse(inspect.getsource(runtime._run_task_impl))
+    assignment = next(
+        node for node in ast.walk(statements)
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.IfExp)
+        and any(isinstance(target, ast.Name) and target.id == "machine_output" for target in node.targets)
+    )
+    stdout = json.dumps({
+        "schema": daily.GOVERNANCE_DAILY_RESULT_SCHEMA,
+        "status": "blocked",
+        "orchestration_status": "NOT_READY",
+        "reason_code": "GOVERNANCE_DATABASE_TRANSIENT",
+        "blocking_stage": "GOVERNANCE_DATABASE",
+        "error_class": "NOT_READY",
+        "reason": "temporary checkout failure",
+        "retryable": True,
+        "input_ready": False,
+        "target_trade_date": "2026-11-13",
+        "allocations": [{"target_type": "CASH", "simulated_weight_pct": 100, "real_order_authority": False}],
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }) + "\n"
+    stderr = "strategy-governance incident_id=abc error_type=OperationalError errno=2013"
+    state = {"task_type": "strategy_governance_daily", "stdout": stdout, "stderr": stderr}
+    exec(compile(ast.Module(body=[assignment], type_ignores=[]), "<scheduler worker>", "exec"), state)
+    assert scheduler_output_status({"task_type": state["task_type"]}, state["machine_output"], return_code=2) == "blocked"
+    assert stderr in runtime._terminal_history_output(stdout, stderr, state["machine_output"])

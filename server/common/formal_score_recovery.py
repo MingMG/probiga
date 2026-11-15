@@ -47,6 +47,11 @@ _PERMITTED_VALIDATION_FILES = frozenset({
     "server/common/formal_score_recovery.py",
     "server/common/formal_score_source_evidence.py",
     "server/common/scheduler_validation.py",
+    "server/engine/strategy_governance.py",
+    "server/engine/strategy_governance_orchestrator.py",
+    "server/static/js/trading-v3.js",
+    "server/static/trading-v3.html",
+    "tools/run_strategy_governance_daily.py",
     "server/static/index.html",
     "server/static/js/app.js",
     "tools/run_ai_recommendation_premarket.py",
@@ -67,7 +72,10 @@ _SHA40 = re.compile(r"[0-9a-f]{40}")
 _RUN_UID = re.compile(r"[0-9a-f]{32}")
 _VALIDATION_ONLY_BODIES = {
     "server/api/routers/hot_data.py": ("_recommended_stocks_v2", "_recommended_data_freshness"),
-    "server/api/scheduler_runtime.py": ("_terminal_snapshot", "_daily_result_recovery_target"),
+    "server/api/scheduler_runtime.py": (
+        "_terminal_snapshot", "_daily_result_recovery_target",
+        "_daily_delivery_runtime_health", "_build_daily_result_delivery_receipt",
+    ),
     "server/engine/strategy_center.py": ("_dynamic_execution_signals",),
     "server/engine/strategy_shadow_trials.py": ("native_trial_candidate_batch",),
 }
@@ -177,6 +185,39 @@ def _scorer_source(root: Path, relative: str) -> bytes:
 
 def _without_validation_body(path: str, source: bytes) -> str:
     tree = ast.parse(source, filename=path)
+    if path == "server/api/scheduler_runtime.py":
+        # Only the governance retry gate is independent of shared input selection.
+        retry_gate = ast.dump(ast.parse(
+            """
+if ready and task_type == "strategy_governance_daily" and _daily_delivery_requires_production_runtime():
+    ready, reason = _governance_database_retry_allowed(
+        engine, trade_date=expected_trade_date, build_sha=expected_build_sha,
+        score_run_uid=latest_histories["analysis_fast"]["run_uid"], now=now,
+    )
+"""
+        ).body[0])
+        dependencies = next((
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_strategy_pipeline_dependencies_ready"
+        ), None)
+        for branch in ast.walk(dependencies) if dependencies is not None else ():
+            body = getattr(branch, "body", None)
+            if isinstance(body, list):
+                body[:] = [node for node in body if ast.dump(node) != retry_gate]
+        old_output = ast.parse('(stdout or "") + "\\n" + (stderr or "")', mode="eval").body
+        governance_output = ast.parse(
+            'stdout or "" if task_type == "strategy_governance_daily" else (stdout or "") + "\\n" + (stderr or "")',
+            mode="eval",
+        ).body
+        for function in tree.body:
+            if isinstance(function, ast.FunctionDef) and function.name == "_run_task_impl":
+                for node in ast.walk(function):
+                    if isinstance(node, ast.Assign) and ast.dump(node.value) == ast.dump(governance_output):
+                        node.value = old_output
+        tree.body[:] = [
+            node for node in tree.body
+            if not isinstance(node, ast.FunctionDef) or node.name != "_governance_database_retry_allowed"
+        ]
     for name in _VALIDATION_ONLY_BODIES[path]:
         functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == name]
         if len(functions) != 1:

@@ -14,7 +14,7 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from server.api.routers._engine import get_engine
 from server.common.authoritative_market_clock import (
@@ -59,11 +59,16 @@ def _log_incident(*, level: str, stage: str, exc: BaseException) -> str:
 
     incident_id = uuid.uuid4().hex
     log_method = getattr(logger, level)
+    from server.engine.strategy_governance import governance_database_diagnostic
+
+    diagnostic = governance_database_diagnostic(exc) or {}
     log_method(
-        "strategy-governance incident_id=%s error_type=%s stage=%s",
+        "strategy-governance incident_id=%s error_type=%s stage=%s db_phase=%s db_errno=%s connection_invalidated=%s",
         incident_id,
         type(exc).__name__,
         str(stage or "UNKNOWN")[:64],
+        diagnostic.get("phase") or (stage if diagnostic else None),
+        diagnostic.get("db_errno"), diagnostic.get("connection_invalidated"),
     )
     return incident_id
 
@@ -187,24 +192,70 @@ def _calendar_status(engine, trade_date: str) -> int | None:
     return None if value is None else int(value)
 
 
-def _canonical_run(engine, trade_date: str) -> dict[str, Any] | None:
+def _canonical_run(engine, trade_date: str, *, include_result_identity: bool = False) -> dict[str, Any] | None:
+    identity = ", input_hash, result_hash" if include_result_identity else ""
     with engine.connect() as connection:
-        row = connection.execute(text("""
+        rows = connection.execute(text(f"""
             SELECT run_uid, trade_date, run_revision, decision_hash,
-                   build_commit_sha, finished_at
+                   build_commit_sha, finished_at{identity}
             FROM st_strategy_governance_run
             WHERE trade_date=:trade_date AND status='COMPLETED'
               AND is_canonical=1
             ORDER BY run_revision DESC, finished_at DESC
-            LIMIT 1
-        """), {"trade_date": trade_date}).mappings().first()
-    return dict(row) if row is not None else None
+            LIMIT 2
+        """), {"trade_date": trade_date}).mappings().all()
+    if len(rows) > 1:
+        raise RuntimeError("治理目标日存在多条canonical记录")
+    return dict(rows[0]) if rows else None
+
+
+def canonical_governance_replay_proof(result: dict[str, Any], fixed_scoring: dict[str, Any]) -> dict[str, Any]:
+    """Bind a verified canonical result to the exact currently authorized frozen score."""
+    from server.common.daily_delivery_control import canonical_sha256
+    from server.common.pit_facts import normalize_decision_at
+
+    proof = (result.get("candidate_source") or {}).get("publication_proof")
+    try:
+        value = {
+            "schema": "probiga.governance-canonical-replay.v1",
+            "trade_date": fixed_scoring["trade_date"],
+            "run_uid": result["run_uid"],
+            "canonical_result_hash": result["canonical_result_hash"],
+            "build_commit_sha": result["build_commit_sha"],
+            "analysis_run_uid": fixed_scoring["analysis_run_uid"],
+            "analysis_score_snapshot_sha256": fixed_scoring["analysis_score_snapshot_sha256"],
+            "decision_known_at": normalize_decision_at(fixed_scoring["decision_known_at"]).isoformat(),
+            "membership_proof_sha256": fixed_scoring["membership_proof_sha256"],
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("治理没有可回读的正式评分身份") from exc
+    if (
+        result.get("status") != "ok" or result.get("is_canonical") is not True
+        or result.get("result_mode") != "CANONICAL_PERSISTED"
+        or result.get("trade_date") != value["trade_date"]
+        or re.fullmatch(r"[0-9a-f]{40}", str(value["build_commit_sha"])) is None
+        or value["build_commit_sha"] == "0" * 40
+        or any(not _RUN_UID_PATTERN.fullmatch(str(value[k])) or value[k] == "0" * 32
+               for k in ("run_uid", "analysis_run_uid"))
+        or any(not _HASH_PATTERN.fullmatch(str(value[k])) or value[k] == "0" * 64
+               for k in ("canonical_result_hash", "analysis_score_snapshot_sha256", "membership_proof_sha256"))
+        or not isinstance(proof, dict)
+        or any(proof.get(key) != expected for key, expected in {
+            "status": "COMPLETED", "trade_date": value["trade_date"],
+            "publisher_run_uid": value["analysis_run_uid"], "build_sha": value["build_commit_sha"],
+            "analysis_score_snapshot_sha256": value["analysis_score_snapshot_sha256"],
+            "decision_known_at": value["decision_known_at"],
+            "membership_proof_sha256": value["membership_proof_sha256"],
+        }.items())
+    ):
+        raise RuntimeError("canonical治理结果与正式评分身份不一致")
+    return {**value, "replay_sha256": canonical_sha256(value)}
 
 
 def _exact_canonical_governance_readback(
     engine, *, runner_result: dict[str, Any], target_trade_date: str,
-    expected_build_sha: str = "",
-) -> dict[str, Any]:
+    expected_build_sha: str = "", allow_missing: bool = False,
+) -> dict[str, Any] | None:
     """Bind a successful persistent runner receipt to one exact DB row."""
 
     run_uid = str(runner_result.get("run_uid") or "")
@@ -225,7 +276,7 @@ def _exact_canonical_governance_readback(
     try:
         with (nullcontext(engine) if hasattr(engine, "execute") else engine.connect()) as connection:
             rows = connection.execute(text("""
-                SELECT run_uid, trade_date, input_hash, decision_hash,
+                SELECT /*+ MAX_EXECUTION_TIME(3000) */ run_uid, trade_date, input_hash, decision_hash,
                        build_commit_sha, status, is_canonical,
                        result_json, result_hash
                 FROM st_strategy_governance_run
@@ -236,6 +287,8 @@ def _exact_canonical_governance_readback(
             }).mappings().all()
     except Exception as exc:
         raise RuntimeError("canonical治理结果数据库精确回读失败") from exc
+    if not rows and allow_missing:
+        return None
     if len(rows) != 1:
         raise RuntimeError("canonical治理结果数据库精确回读不唯一")
     row = dict(rows[0])
@@ -266,6 +319,27 @@ def _exact_canonical_governance_readback(
     ):
         raise RuntimeError("canonical治理完整回读与运行器回执不一致")
     return readback
+
+
+def _reconcile_canonical_governance_readback(
+    engine, *, runner_result: dict[str, Any], target_trade_date: str,
+    expected_build_sha: str, commit_uncertain: bool = False,
+) -> dict[str, Any] | None:
+    from server.engine.strategy_governance import governance_database_diagnostic, governance_database_transient
+
+    for attempt in range(2):
+        try:
+            options = {"allow_missing": True} if commit_uncertain else {}
+            result = _exact_canonical_governance_readback(
+                engine, runner_result=runner_result, target_trade_date=target_trade_date,
+                expected_build_sha=expected_build_sha, **options,
+            )
+            if result is not None or attempt == 1:
+                return result
+        except (RuntimeError, DBAPIError) as exc:
+            if attempt == 1 or not governance_database_transient(governance_database_diagnostic(exc)):
+                raise
+    return None
 
 
 def _fixed_governance_inputs(fixed_scoring: dict[str, Any], target: str) -> dict[str, Any]:
@@ -595,6 +669,26 @@ def _blocked_result(
     return result
 
 
+def _transient_governance_result(
+    database, *, exc: BaseException, stage: str, operator: str,
+    target: str, requested: str, industry: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    from server.engine.strategy_governance import GovernanceDatabaseFailure, governance_database_diagnostic
+
+    diagnostic = governance_database_diagnostic(exc) or {}
+    diagnostic["phase"] = diagnostic.get("phase") or stage
+    if isinstance(exc, GovernanceDatabaseFailure) and exc.prepared_result is not None:
+        diagnostic["prepared_result"] = exc.prepared_result
+    _log_incident(level="warning", stage=stage, exc=exc)
+    return _blocked_result(
+        database, orchestration_status=NOT_READY, error_class="NOT_READY", retryable=True,
+        reason_code="GOVERNANCE_DATABASE_TRANSIENT", blocking_stage="GOVERNANCE_DATABASE",
+        reason="治理数据库连接或事务暂时中断，需核对原运行后恢复",
+        operator=operator, target_trade_date=target, requested_trade_date=requested,
+        input_trade_date=target, blocking_record=diagnostic, industry_snapshot=industry,
+    )
+
+
 def _not_due_result(
     *, reason_code: str, reason: str, target_trade_date: str,
     requested_trade_date: str = "", current_run: dict[str, Any] | None = None,
@@ -631,6 +725,7 @@ def orchestrate_strategy_governance(
     process_preflight: Callable[[], Any] | None = None,
     ensure_build_commit_sha: str = "",
     fixed_scoring: dict[str, Any] | None = None,
+    adopt_existing_committed: bool = False,
 ) -> dict[str, Any]:
     """Run exact-date input capture and governance through one shared path.
 
@@ -829,10 +924,28 @@ def orchestrate_strategy_governance(
             requested_trade_date=requested,
         )
     target = requested or authoritative
+    from server.engine.strategy_governance import (
+        GovernanceDatabaseFailure, GovernanceEvidenceNotReady,
+        governance_database_diagnostic, governance_database_transient, governance_snapshot,
+    )
+
+    authoritative_persistent_runner = governance_runner is None or governance_runner is governance_snapshot
+    governance_runner = governance_runner or governance_snapshot
+    adopt = (
+        adopt_existing_committed is True and authoritative_persistent_runner and bool(fixed_scoring)
+        and re.fullmatch(r"[0-9a-f]{40}", ensure_build_commit_sha) is not None
+    )
+    replay = None
     if not allow_revision:
         try:
-            existing = _canonical_run(database, target)
+            existing = (_canonical_run(database, target, include_result_identity=True)
+                        if adopt else _canonical_run(database, target))
         except Exception as exc:
+            if governance_database_transient(governance_database_diagnostic(exc)):
+                return _transient_governance_result(
+                    database, exc=exc, stage="CANONICAL_RUN_LOOKUP",
+                    operator=operator, target=target, requested=requested,
+                )
             _log_incident(
                 level="error", stage="CANONICAL_RUN_LOOKUP", exc=exc,
             )
@@ -853,13 +966,18 @@ def orchestrate_strategy_governance(
             or str(existing.get("build_commit_sha") or "")
             == str(ensure_build_commit_sha)
         ):
-            return _not_due_result(
-                reason_code="CANONICAL_ALREADY_COMPLETED",
-                reason=f"{target}已有生效治理结果，本次调度无需重复运行",
-                target_trade_date=target,
-                requested_trade_date=requested,
-                current_run=existing,
-            )
+            if not adopt:
+                return _not_due_result(
+                    reason_code="CANONICAL_ALREADY_COMPLETED",
+                    reason=f"{target}已有生效治理结果，本次调度无需重复运行",
+                    target_trade_date=target,
+                    requested_trade_date=requested,
+                    current_run=existing,
+                )
+            replay = {
+                **existing, "status": "ok", "result_mode": "CANONICAL_PERSISTED", "is_canonical": True,
+                "canonical_result_hash": existing["result_hash"],
+            }
         # Release cutover is stricter than the ordinary once-per-session
         # scheduler.  A canonical result produced by another build proves the
         # date is complete, but it cannot prove this release.  Continue through
@@ -883,115 +1001,120 @@ def orchestrate_strategy_governance(
             input_trade_date=target,
         )
 
-    capture = industry_capture or capture_industry_history
-    fixed_inputs = {}
-    try:
-        if fixed_scoring is not None:
-            fixed_inputs = _fixed_governance_inputs(fixed_scoring, target)
-        selection = {}
-        if "membership_proof_sha256" in fixed_inputs:
-            selection = {
-                "decision_known_at": fixed_inputs["decision_known_at"],
-                "expected_proof_sha256": fixed_inputs["membership_proof_sha256"],
-            }
-        industry = capture(database, trade_date=target, **selection)
-    except IndustrySnapshotNotReady as exc:
-        return _blocked_result(
-            database,
-            orchestration_status=NOT_READY,
-            error_class="NOT_READY",
-            retryable=True,
-            reason_code="QMT_INDUSTRY_SNAPSHOT_NOT_READY",
-            blocking_stage="INDUSTRY_SNAPSHOT",
-            reason=str(exc),
-            operator=operator,
-            target_trade_date=target,
-            requested_trade_date=requested,
-            input_trade_date=target,
-        )
-    except IndustrySnapshotIntegrityError as exc:
-        return _blocked_result(
-            database,
-            orchestration_status=INTEGRITY_ERROR,
-            error_class="INTEGRITY",
-            retryable=False,
-            reason_code="QMT_INDUSTRY_SNAPSHOT_INTEGRITY",
-            blocking_stage="INDUSTRY_SNAPSHOT",
-            reason=str(exc),
-            operator=operator,
-            target_trade_date=target,
-            requested_trade_date=requested,
-            input_trade_date=target,
-        )
-    except Exception as exc:
-        _log_incident(
-            level="error", stage="INDUSTRY_SNAPSHOT_PROGRAM", exc=exc,
-        )
-        return _blocked_result(
-            database,
-            orchestration_status=PROGRAM_ERROR,
-            error_class="PROGRAM",
-            retryable=False,
-            reason_code="INDUSTRY_CAPTURE_PROGRAM_ERROR",
-            blocking_stage="PROGRAM",
-            reason=f"行业快照程序执行失败（{type(exc).__name__}）",
-            operator=operator,
-            target_trade_date=target,
-            requested_trade_date=requested,
-            input_trade_date=target,
-        )
-
-    from server.engine.strategy_governance import governance_snapshot
-
-    authoritative_persistent_runner = (
-        governance_runner is None or governance_runner is governance_snapshot
-    )
-    if governance_runner is None:
-        governance_runner = governance_snapshot
-    try:
-        result = governance_runner(
-            trade_date=target,
-            persist=True,
-            operator=operator,
-            strategy_limit=max(1, min(500, int(strategy_limit))),
-            **fixed_inputs,
-        )
-    except Exception as exc:
-        from server.engine.strategy_governance import GovernanceEvidenceNotReady
-
-        if isinstance(exc, GovernanceEvidenceNotReady):
+    industry: dict[str, Any] = {}
+    commit_error = None
+    if replay is None:
+        capture = industry_capture or capture_industry_history
+        fixed_inputs = {}
+        try:
+            if fixed_scoring is not None:
+                fixed_inputs = _fixed_governance_inputs(fixed_scoring, target)
+            selection = {}
+            if "membership_proof_sha256" in fixed_inputs:
+                selection = {
+                    "decision_known_at": fixed_inputs["decision_known_at"],
+                    "expected_proof_sha256": fixed_inputs["membership_proof_sha256"],
+                }
+            industry = capture(database, trade_date=target, **selection)
+        except IndustrySnapshotNotReady as exc:
             return _blocked_result(
                 database,
                 orchestration_status=NOT_READY,
                 error_class="NOT_READY",
                 retryable=True,
-                reason_code="GOVERNANCE_EVIDENCE_NOT_READY",
-                blocking_stage="GOVERNANCE_INPUT",
+                reason_code="QMT_INDUSTRY_SNAPSHOT_NOT_READY",
+                blocking_stage="INDUSTRY_SNAPSHOT",
                 reason=str(exc),
                 operator=operator,
                 target_trade_date=target,
                 requested_trade_date=requested,
                 input_trade_date=target,
-                blocking_record=exc.blocking_record,
-                industry_snapshot=industry,
             )
-        _log_incident(
-            level="error", stage="GOVERNANCE_PROGRAM", exc=exc,
-        )
-        return _blocked_result(
-            database,
-            orchestration_status=PROGRAM_ERROR,
-            error_class="PROGRAM",
-            retryable=False,
-            reason_code="GOVERNANCE_PROGRAM_ERROR",
-            blocking_stage="PROGRAM",
-            reason=f"治理程序执行失败（{type(exc).__name__}）",
-            operator=operator,
-            target_trade_date=target,
-            requested_trade_date=requested,
-            input_trade_date=target,
-            industry_snapshot=industry,
-        )
+        except IndustrySnapshotIntegrityError as exc:
+            return _blocked_result(
+                database,
+                orchestration_status=INTEGRITY_ERROR,
+                error_class="INTEGRITY",
+                retryable=False,
+                reason_code="QMT_INDUSTRY_SNAPSHOT_INTEGRITY",
+                blocking_stage="INDUSTRY_SNAPSHOT",
+                reason=str(exc),
+                operator=operator,
+                target_trade_date=target,
+                requested_trade_date=requested,
+                input_trade_date=target,
+            )
+        except Exception as exc:
+            _log_incident(
+                level="error", stage="INDUSTRY_SNAPSHOT_PROGRAM", exc=exc,
+            )
+            return _blocked_result(
+                database,
+                orchestration_status=PROGRAM_ERROR,
+                error_class="PROGRAM",
+                retryable=False,
+                reason_code="INDUSTRY_CAPTURE_PROGRAM_ERROR",
+                blocking_stage="PROGRAM",
+                reason=f"行业快照程序执行失败（{type(exc).__name__}）",
+                operator=operator,
+                target_trade_date=target,
+                requested_trade_date=requested,
+                input_trade_date=target,
+            )
+
+        try:
+            result = governance_runner(
+                trade_date=target,
+                persist=True,
+                operator=operator,
+                strategy_limit=max(1, min(500, int(strategy_limit))),
+                **fixed_inputs,
+            )
+        except Exception as exc:
+            if isinstance(exc, GovernanceEvidenceNotReady):
+                return _blocked_result(
+                    database,
+                    orchestration_status=NOT_READY,
+                    error_class="NOT_READY",
+                    retryable=True,
+                    reason_code="GOVERNANCE_EVIDENCE_NOT_READY",
+                    blocking_stage="GOVERNANCE_INPUT",
+                    reason=str(exc),
+                    operator=operator,
+                    target_trade_date=target,
+                    requested_trade_date=requested,
+                    input_trade_date=target,
+                    blocking_record=exc.blocking_record,
+                    industry_snapshot=industry,
+                )
+            if governance_database_transient(governance_database_diagnostic(exc)):
+                if not authoritative_persistent_runner or not isinstance(exc, GovernanceDatabaseFailure) or exc.prepared_result is None:
+                    return _transient_governance_result(
+                        database, exc=exc, stage="GOVERNANCE_RUNNER", operator=operator,
+                        target=target, requested=requested, industry=industry,
+                    )
+                commit_error = exc
+                result = exc.prepared_result
+            else:
+                _log_incident(
+                    level="error", stage="GOVERNANCE_PROGRAM", exc=exc,
+                )
+                return _blocked_result(
+                    database,
+                    orchestration_status=PROGRAM_ERROR,
+                    error_class="PROGRAM",
+                    retryable=False,
+                    reason_code="GOVERNANCE_PROGRAM_ERROR",
+                    blocking_stage="PROGRAM",
+                    reason=f"治理程序执行失败（{type(exc).__name__}）",
+                    operator=operator,
+                    target_trade_date=target,
+                    requested_trade_date=requested,
+                    input_trade_date=target,
+                    industry_snapshot=industry,
+                )
+    else:
+        result = replay
     if not isinstance(result, dict) or result.get("status") != "ok":
         return _blocked_result(
             database,
@@ -1007,15 +1130,31 @@ def orchestrate_strategy_governance(
             input_trade_date=target,
             industry_snapshot=industry,
         )
+    replay_proof = None
     if authoritative_persistent_runner:
         try:
-            result = _exact_canonical_governance_readback(
-                database,
-                runner_result=result,
-                target_trade_date=target,
-                expected_build_sha=ensure_build_commit_sha,
+            result = _reconcile_canonical_governance_readback(
+                database, runner_result=result, target_trade_date=target,
+                expected_build_sha=ensure_build_commit_sha, commit_uncertain=commit_error is not None,
             )
-        except RuntimeError as exc:
+            if result is None and commit_error is not None:
+                return _transient_governance_result(
+                    database, exc=commit_error, stage="COMPLETION_CANONICAL_READBACK", operator=operator,
+                    target=target, requested=requested, industry=industry,
+                )
+            if result is None:
+                raise RuntimeError("canonical治理完整结果数据库未返回")
+            if fixed_scoring is not None and ("analysis_score_snapshot_sha256" in fixed_scoring or adopt):
+                verified_proof = canonical_governance_replay_proof(result, fixed_scoring)
+                if replay is not None:
+                    replay_proof = verified_proof
+                    industry = dict(result.get("candidate_industry_snapshot") or {})
+        except (RuntimeError, DBAPIError) as exc:
+            if governance_database_transient(governance_database_diagnostic(exc)):
+                return _transient_governance_result(
+                    database, exc=commit_error or exc, stage="COMPLETION_CANONICAL_READBACK",
+                    operator=operator, target=target, requested=requested, industry=industry,
+                )
             _log_incident(
                 level="error", stage="COMPLETION_CANONICAL_READBACK", exc=exc,
             )
@@ -1107,6 +1246,7 @@ def orchestrate_strategy_governance(
         "target_trade_date": target,
         "requested_trade_date": requested,
         "industry_snapshot": industry,
+        **({"reused_canonical_governance": replay_proof} if replay_proof else {}),
     }
 
 
@@ -1116,6 +1256,7 @@ __all__ = [
     "NOT_DUE",
     "NOT_READY",
     "PROGRAM_ERROR",
+    "canonical_governance_replay_proof",
     "canonical_unavailable_context",
     "orchestrate_strategy_governance",
     "persist_blocked_attempt",
