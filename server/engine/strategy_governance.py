@@ -77,9 +77,15 @@ from server.engine.strategy_execution_adapters import (
     verify_persisted_strategy_adapter_run_receipt,
 )
 from server.engine.strategy_industry_history import (
+    PROVIDER_ID,
     QMT_EXPLICIT_SESSION_FALLBACK_SOURCE_DATES,
+    QMT_PREVIOUS_OPEN_SESSION_REASON,
     QMT_PREVIOUS_SESSION_FALLBACKS,
+    IndustrySnapshotIntegrityError,
+    IndustrySnapshotNotReady,
+    prepare_industry_history,
 )
+from server.common.pit_facts import normalize_decision_at
 from server.engine.dynamic_shadow_ledger_schema import (
     DYNAMIC_SHADOW_LEDGER_SCHEMA_CONTRACT_HASH,
     DYNAMIC_SHADOW_LEDGER_COLUMN_NAMES,
@@ -326,6 +332,7 @@ POOL_ROW_EVIDENCE_SCHEMA = "probiga.strategy-pool-row-evidence.v1"
 POOL_SNAPSHOT_SCHEMA = "probiga.strategy-pool-snapshot.v1"
 INDUSTRY_BINDING_SCHEMA = "probiga.governance-industry-binding.v1"
 INDUSTRY_SNAPSHOT_SCHEMA = "probiga.governance-industry-snapshot.v2"
+PINNED_INDUSTRY_SNAPSHOT_SCHEMA = "probiga.governance-industry-snapshot.v3"
 INDUSTRY_SNAPSHOT_PATH_SCHEMA = (
     "probiga.governance-industry-snapshot-path.v1"
 )
@@ -19469,8 +19476,75 @@ def _internal_combination_portfolio_ledger(
         return {"valid": False, "reason": str(exc)[:500]}
 
 
+def _pinned_industry_membership(
+    proof: Any, target: str,
+) -> dict[str, Any] | None:
+    if not isinstance(proof, dict) or set(proof) != {
+        "proof_sha256", "source", "source_snapshot_date",
+        "source_snapshot_captured_at", "decision_known_at", "fallback_reason",
+    }:
+        return None
+    if (
+        not all(isinstance(value, str) for value in proof.values())
+        or proof["source"] != PROVIDER_ID
+        or not _HASH_PATTERN.fullmatch(proof["proof_sha256"])
+        or proof["proof_sha256"] == "0" * 64
+    ):
+        return None
+    try:
+        source = date.fromisoformat(proof["source_snapshot_date"])
+        captured = datetime.fromisoformat(proof["source_snapshot_captured_at"])
+        decision = datetime.fromisoformat(proof["decision_known_at"])
+    except ValueError:
+        return None
+    if (
+        source.isoformat() != proof["source_snapshot_date"]
+        or captured.tzinfo is not None or decision.tzinfo is not None
+        or captured.isoformat() != proof["source_snapshot_captured_at"]
+        or decision.isoformat() != proof["decision_known_at"]
+        or captured.date() != source or captured.hour < 15
+        or captured > decision
+        or source.isoformat() > target
+        or (source.isoformat() == target and proof["fallback_reason"])
+        or (source.isoformat() < target and (
+            proof["fallback_reason"] != QMT_PREVIOUS_SESSION_FALLBACKS.get(
+                target, QMT_PREVIOUS_OPEN_SESSION_REASON,
+            )
+            or QMT_EXPLICIT_SESSION_FALLBACK_SOURCE_DATES.get(
+                target, source.isoformat(),
+            ) != source.isoformat()
+        ))
+    ):
+        return None
+    return proof
+
+
+def _industry_proof_matches_publication(
+    candidate_source: Any, *, proof_sha256: str, decision_known_at: datetime | str,
+) -> bool:
+    publication = (
+        candidate_source.get("publication_proof")
+        if isinstance(candidate_source, dict) else None
+    )
+    if (
+        not isinstance(publication, dict)
+        or publication.get("status") != "COMPLETED"
+        or publication.get("membership_snapshot_source") != PROVIDER_ID
+        or publication.get("membership_proof_sha256") != proof_sha256
+    ):
+        return False
+    try:
+        return normalize_decision_at(publication.get("decision_known_at")) == normalize_decision_at(
+            decision_known_at
+        )
+    except (TypeError, ValueError):
+        return False
+
+
 def _frozen_industry_snapshot(
-    trade_date: str, stock_codes: Iterable[str],
+    trade_date: str, stock_codes: Iterable[str], *,
+    decision_known_at: datetime | str | None = None,
+    membership_proof_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Freeze an as-of industry mapping; missing facts fail replay closed."""
 
@@ -19484,6 +19558,34 @@ def _frozen_industry_snapshot(
     fallback_audit_reason = ""
     status = "COMPLETED"
     snapshot_id = ""
+    membership_proof = None
+    pinned_rows: dict[str, str] = {}
+    if membership_proof_sha256 is not None:
+        try:
+            report, expected_rows = prepare_industry_history(
+                current_bound_sql_connection() or get_engine(),
+                trade_date=target, decision_known_at=decision_known_at,
+                expected_proof_sha256=membership_proof_sha256,
+            )
+        except (IndustrySnapshotIntegrityError, IndustrySnapshotNotReady) as exc:
+            raise GovernanceEvidenceNotReady(str(exc)) from exc
+        snapshot_id = str(report.get("snapshot_id") or "")
+        membership_proof = _pinned_industry_membership({
+            "proof_sha256": membership_proof_sha256,
+            "source": report.get("source"),
+            "source_snapshot_date": report.get("source_snapshot_date"),
+            "source_snapshot_captured_at": _normalize_evidence_revision(
+                report.get("source_snapshot_captured_at")
+            ),
+            "decision_known_at": normalize_decision_at(decision_known_at).isoformat(),
+            "fallback_reason": report.get("fallback_reason"),
+        }, target)
+        if membership_proof is None or not _HASH_PATTERN.fullmatch(snapshot_id):
+            raise GovernanceEvidenceNotReady("正式评分QMT板块成员证明与治理冻结身份不符")
+        pinned_rows = {
+            row["stock_code"]: row["row_hash"]
+            for row in expected_rows if row["stock_code"] in codes
+        }
     if not codes:
         status, reason = (
             "INCOMPLETE",
@@ -19507,6 +19609,7 @@ def _frozen_industry_snapshot(
         cutoff = (
             date.fromisoformat(target) + timedelta(days=1)
         ).isoformat() + "T00:00:00"
+        snapshot_clause = "AND snapshot_id=:industry_snapshot_id " if membership_proof else ""
         try:
             industry_rows = _db_read(
                 "SELECT snapshot_id, trade_date, as_of_exclusive, stock_code, "
@@ -19516,14 +19619,18 @@ def _frozen_industry_snapshot(
                 f"WHERE stock_code IN ({placeholders}) "
                 "AND trade_date=:industry_trade_date "
                 "AND as_of_exclusive=:industry_cutoff "
+                f"{snapshot_clause}"
                 "ORDER BY stock_code, snapshot_id",
                 {
                     **code_params,
                     "industry_trade_date": target,
                     "industry_cutoff": cutoff,
+                    **({"industry_snapshot_id": snapshot_id} if membership_proof else {}),
                 },
             )
-        except Exception:
+        except Exception as exc:
+            if membership_proof is not None:
+                raise GovernanceEvidenceNotReady("治理未读回正式评分绑定的QMT行业账本") from exc
             industry_rows = []
             status = "INCOMPLETE"
             reason = "行业快照查询未完成"
@@ -19531,10 +19638,15 @@ def _frozen_industry_snapshot(
         snapshot_ids: set[str] = set()
         source_snapshot_dates: set[str] = set()
         raw_source_snapshot_dates: set[str] = set()
-        allowed_source_dates = {target}
-        fallback_reason = QMT_PREVIOUS_SESSION_FALLBACKS.get(target, "")
+        allowed_source_dates = {
+            membership_proof["source_snapshot_date"] if membership_proof else target
+        }
+        fallback_reason = (
+            membership_proof["fallback_reason"] if membership_proof
+            else QMT_PREVIOUS_SESSION_FALLBACKS.get(target, "")
+        )
         target_raw_run_count = 0
-        if fallback_reason:
+        if fallback_reason and membership_proof is None:
             try:
                 target_run_rows = _db_read(
                     "SELECT COUNT(*) AS run_count "
@@ -19608,6 +19720,12 @@ def _frozen_industry_snapshot(
                 or not _HASH_PATTERN.fullmatch(observed_snapshot_id)
                 or not source_effective_at or not source_etl_sync_at
                 or source_effective_at != source_etl_sync_at
+                or (membership_proof is not None and (
+                    observed_snapshot_id != snapshot_id
+                    or source_system != membership_proof["source"]
+                    or source_effective_at != membership_proof["source_snapshot_captured_at"]
+                    or pinned_rows.get(code) != row.get("row_hash")
+                ))
                 or source_snapshot_date not in allowed_source_dates
                 or source_effective_at
                 < source_snapshot_date + "T15:00:00"
@@ -19660,8 +19778,13 @@ def _frozen_industry_snapshot(
                 fallback_audit_reason + ";" + missing_reason
                 if fallback_audit_reason else missing_reason
             )
+    if membership_proof is not None and (
+        status in {"INVALID", "MISSING"}
+        or {row["stock_code"] for row in rows_payload} != set(pinned_rows)
+    ):
+        raise GovernanceEvidenceNotReady("治理未读回与正式评分绑定的QMT行业账本")
     payload = {
-        "schema": INDUSTRY_SNAPSHOT_SCHEMA,
+        "schema": PINNED_INDUSTRY_SNAPSHOT_SCHEMA if membership_proof else INDUSTRY_SNAPSHOT_SCHEMA,
         "snapshot_id": snapshot_id,
         "trade_date": target,
         "as_of_exclusive": (
@@ -19671,6 +19794,7 @@ def _frozen_industry_snapshot(
         "requested_stock_codes": codes,
         "rows": sorted(rows_payload, key=lambda item: item["stock_code"]),
         "reason": reason,
+        **({"membership_proof": membership_proof} if membership_proof else {}),
     }
     return {**payload, "snapshot_hash": _digest(payload)}
 
@@ -19698,6 +19822,12 @@ def _industry_snapshot_binding_map(
         "status", "requested_stock_codes", "rows", "reason",
         "snapshot_hash",
     }
+    pinned = snapshot.get("schema") == PINNED_INDUSTRY_SNAPSHOT_SCHEMA
+    membership_proof = _pinned_industry_membership(
+        snapshot.get("membership_proof"), target,
+    ) if pinned else None
+    if pinned:
+        wrapper_fields.add("membership_proof")
     payload = {
         str(key): value for key, value in snapshot.items()
         if str(key) != "snapshot_hash"
@@ -19714,11 +19844,15 @@ def _industry_snapshot_binding_map(
         })
     if (
         set(snapshot) != wrapper_fields
-        or snapshot.get("schema") != INDUSTRY_SNAPSHOT_SCHEMA
+        or (pinned and membership_proof is None)
+        or snapshot.get("schema") not in {INDUSTRY_SNAPSHOT_SCHEMA, PINNED_INDUSTRY_SNAPSHOT_SCHEMA}
         or str(snapshot.get("trade_date") or "") != target
         or str(snapshot.get("as_of_exclusive") or "") != cutoff
         or str(snapshot.get("status") or "")
         not in {"COMPLETED", "INCOMPLETE", "INVALID", "MISSING"}
+        or (pinned and snapshot.get("status") not in {"COMPLETED", "INCOMPLETE"})
+        or (membership_proof is not None and membership_proof["fallback_reason"]
+            and membership_proof["proof_sha256"] != snapshot_id)
         or not isinstance(requested, list)
         or requested != sorted(set(str(code) for code in requested))
         or any(re.fullmatch(r"[0-9]{6}", str(code)) is None for code in requested)
@@ -19726,28 +19860,21 @@ def _industry_snapshot_binding_map(
         or not isinstance(rows, list)
         or _HASH_PATTERN.fullmatch(snapshot_hash) is None
         or _digest(payload) != snapshot_hash
-        or (rows and _HASH_PATTERN.fullmatch(snapshot_id) is None)
-        or (not rows and snapshot_id)
+        or ((rows or pinned) and _HASH_PATTERN.fullmatch(snapshot_id) is None)
+        or (not rows and not pinned and snapshot_id)
     ):
         return {}, "目标日QMT一级行业冻结快照身份、日期或哈希无效", False
 
     bindings: dict[str, dict[str, Any]] = {}
-    allowed_source_dates = {target}
-    fallback_reason = QMT_PREVIOUS_SESSION_FALLBACKS.get(target, "")
-    target_raw_run_count = 0
-    if fallback_reason:
+    allowed_source_dates = {
+        membership_proof["source_snapshot_date"] if membership_proof else target
+    }
+    fallback_reason = (
+        membership_proof["fallback_reason"] if membership_proof
+        else QMT_PREVIOUS_SESSION_FALLBACKS.get(target, "")
+    )
+    if fallback_reason and membership_proof is None:
         try:
-            target_run_rows = _db_read(
-                "SELECT COUNT(*) AS run_count "
-                "FROM qmt_membership_snapshot_run "
-                "WHERE snapshot_date=:trade_date",
-                {"trade_date": target},
-            )
-            target_raw_run_count = int(
-                (target_run_rows[0] if target_run_rows else {}).get(
-                    "run_count"
-                ) or 0
-            )
             fallback_date = (
                 QMT_EXPLICIT_SESSION_FALLBACK_SOURCE_DATES.get(target)
             )
@@ -19763,7 +19890,7 @@ def _industry_snapshot_binding_map(
                         "trade_date"
                     ) or ""
                 )[:10]
-            if fallback_date and target_raw_run_count == 0:
+            if fallback_date:
                 allowed_source_dates.add(fallback_date)
         except Exception:
             pass
@@ -19794,8 +19921,6 @@ def _industry_snapshot_binding_map(
         )
         row_hash = str(raw.get("row_hash") or "")
         source_snapshot_date = source_effective_at[:10]
-        if source_snapshot_date != target and target_raw_run_count:
-            return {}, "目标日已存在原始QMT run，拒绝前一日行业降级", False
         source_cutoff = (
             date.fromisoformat(source_snapshot_date) + timedelta(days=1)
         ).isoformat() + "T00:00:00" if re.fullmatch(
@@ -19813,6 +19938,10 @@ def _industry_snapshot_binding_map(
             or _QMT_INDUSTRY_FACT_ID_PATTERN.fullmatch(source_fact_id) is None
             or not source_effective_at or not source_etl_sync_at
             or source_effective_at != source_etl_sync_at
+            or (membership_proof is not None and (
+                source_system != membership_proof["source"]
+                or source_effective_at != membership_proof["source_snapshot_captured_at"]
+            ))
             or source_snapshot_date not in allowed_source_dates
             or source_effective_at
             < source_snapshot_date + "T15:00:00"
@@ -19840,8 +19969,6 @@ def _industry_snapshot_binding_map(
     if len(observed_source_dates) > 1:
         return {}, "目标日QMT一级行业冻结快照混入多个来源快照日", False
     if observed_source_dates and next(iter(observed_source_dates)) != target:
-        if target_raw_run_count:
-            return {}, "目标日已存在原始QMT run，拒绝前一日行业降级", False
         expected_reason = (
             "append-only行业历史使用已验收前一开市日QMT快照；"
             f"source_snapshot_date={next(iter(observed_source_dates))};"
@@ -26871,6 +26998,16 @@ def _validate_canonical_governance_result(result: dict[str, Any]) -> None:
     industry_snapshot_status = str(
         candidate_industry_snapshot.get("status") or ""
     )
+    pinned_membership = candidate_industry_snapshot.get("membership_proof")
+    if candidate_industry_snapshot.get("schema") == PINNED_INDUSTRY_SNAPSHOT_SCHEMA and (
+        not isinstance(pinned_membership, dict)
+        or not _industry_proof_matches_publication(
+            result.get("candidate_source"),
+            proof_sha256=pinned_membership.get("proof_sha256"),
+            decision_known_at=pinned_membership.get("decision_known_at"),
+        )
+    ):
+        raise RuntimeError("canonical治理行业证明与已封存正式评分不一致")
     if (
         not industry_snapshot_valid
         or industry_snapshot_hash
@@ -27583,6 +27720,7 @@ def governance_snapshot(
     fixed_market_context: dict[str, Any] | None = None,
     decision_known_at: datetime | str | None = None,
     analysis_run_uid: str | None = None,
+    membership_proof_sha256: str | None = None,
     prepared_analysis_publication: dict[str, Any] | None = None,
     expected_prior_governance_run_uid: str | None = None,
 ) -> dict[str, Any]:
@@ -27615,11 +27753,19 @@ def governance_snapshot(
                 fixed_market_context=fixed_market_context,
                 decision_known_at=decision_known_at,
                 analysis_run_uid=analysis_run_uid,
+                membership_proof_sha256=membership_proof_sha256,
             )
     fixed_fields = (fixed_market_context, decision_known_at, analysis_run_uid)
     if any(value is not None for value in fixed_fields):
         if any(value is None for value in fixed_fields) or strategy_snapshot is not None:
             raise ValueError("fixed governance requires one exact score, cutoff, and market context")
+    if membership_proof_sha256 is not None and (
+        decision_known_at is None
+        or not isinstance(membership_proof_sha256, str)
+        or not _HASH_PATTERN.fullmatch(membership_proof_sha256)
+        or membership_proof_sha256 == "0" * 64
+    ):
+        raise ValueError("fixed governance requires an exact sealed membership proof")
     persist_built_strategy_snapshot = strategy_snapshot is None and persist
     if strategy_snapshot is None:
         from server.engine.strategy_center import (
@@ -27642,6 +27788,12 @@ def governance_snapshot(
             **fixed_inputs,
         )
     target = _trade_date(strategy_snapshot.get("trade_date") or trade_date)
+    if membership_proof_sha256 is not None and not _industry_proof_matches_publication(
+        strategy_snapshot.get("candidate_source"),
+        proof_sha256=membership_proof_sha256,
+        decision_known_at=decision_known_at,
+    ):
+        raise GovernanceEvidenceNotReady("治理候选源与正式评分的QMT板块成员证明不一致")
     input_ready, input_reason = governance_input_ready(strategy_snapshot)
     authoritative_windows: dict[int, dict[str, Any]] | None = None
     if persist:
@@ -28061,10 +28213,13 @@ def governance_snapshot(
             r"[0-9]{1,6}", str(row.get("stock_code") or "").strip()
         )
     })
-    # Load one exact-date immutable QMT L1 view before any pool decision.  All
-    # pool levels and the paper plan below consume this same hash-bound object.
+    # Pool levels and the paper plan consume the same immutable industry view.
+    industry_selection = ({
+        "decision_known_at": decision_known_at,
+        "membership_proof_sha256": membership_proof_sha256,
+    } if membership_proof_sha256 is not None else {})
     candidate_industry_snapshot = _frozen_industry_snapshot(
-        target, candidate_stock_codes,
+        target, candidate_stock_codes, **industry_selection,
     )
     pools = _build_pools(
         strategy_snapshot, rankings,

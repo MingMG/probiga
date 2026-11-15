@@ -235,18 +235,9 @@ def test_release_analysis_validation_uses_hash_bound_scheduler_target(monkeypatc
     monkeypatch.setattr(
         scheduler_validation,
         "_validate_analysis_strategy_pool",
-        lambda *_args, **_kwargs: (
-            True,
-            "non-empty actionable strategy pool verified",
-        ),
-    )
-    membership_targets = []
-    monkeypatch.setattr(
-        "integrations.bigqmt.membership_snapshot."
-        "verify_existing_membership_snapshot",
-        lambda _engine, *, snapshot_date, decision_known_at: (
-            membership_targets.append((snapshot_date, decision_known_at))
-            or _membership_proof(snapshot_date.isoformat())
+        lambda *_args, **kwargs: (
+            observed.update(pool_target=kwargs["target_date"])
+            or (True, "non-empty actionable strategy pool verified")
         ),
     )
     result = scheduler_validation.validate_scheduler_task_result(
@@ -264,9 +255,7 @@ def test_release_analysis_validation_uses_hash_bound_scheduler_target(monkeypatc
     assert observed["target"] == date(2026, 8, 26)
     assert observed["coverage_task"] == "analysis_fast"
     assert observed["coverage_target"] == date(2026, 8, 26)
-    assert membership_targets == [
-        (date(2026, 8, 26), datetime(2026, 8, 27, 3, 6))
-    ]
+    assert observed["pool_target"] == date(2026, 8, 26)
 
 
 def test_analysis_membership_proof_tracks_downstream_target_across_cutoffs(
@@ -282,18 +271,13 @@ def test_analysis_membership_proof_tracks_downstream_target_across_cutoffs(
         "_validate_daily_universe_coverage",
         lambda *_args, **_kwargs: (True, "exact market universe verified"),
     )
+    observed = []
     monkeypatch.setattr(
         scheduler_validation,
         "_validate_analysis_strategy_pool",
-        lambda *_args, **_kwargs: (True, "current-run pool verified"),
-    )
-    observed = []
-    monkeypatch.setattr(
-        "integrations.bigqmt.membership_snapshot."
-        "verify_existing_membership_snapshot",
-        lambda _engine, *, snapshot_date, decision_known_at: (
-            observed.append((snapshot_date, decision_known_at))
-            or _membership_proof(snapshot_date.isoformat())
+        lambda _engine, **kwargs: (
+            observed.append(kwargs["target_date"])
+            or (True, "current-run pool verified")
         ),
     )
     cases = (
@@ -316,10 +300,7 @@ def test_analysis_membership_proof_tracks_downstream_target_across_cutoffs(
         )
         assert result.checked and result.ok
 
-    assert observed == [
-        (date.fromisoformat(target), decision_time)
-        for _task_type, decision_time, target in cases
-    ]
+    assert observed == [date.fromisoformat(target) for _, _, target in cases]
 
 
 def test_capital_flow_batch_validation_fails_when_full_universe_proof_fails(
@@ -842,6 +823,17 @@ def _strategy_pool_engine(
 ):
     engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
     with engine.begin() as connection:
+        connection.execute(text("""
+            CREATE TABLE qmt_membership_snapshot_run (
+                snapshot_date DATE, source TEXT, quality_status TEXT,
+                capture_mode TEXT, captured_at DATETIME, industry_count INTEGER,
+                industry_relation_count INTEGER, industry_hash TEXT
+            )
+        """))
+        _insert_pool_row(connection, "qmt_membership_snapshot_run", {
+            key: value for key, value in _membership_proof().items()
+            if not key.startswith("concept_") and key != "industry_stock_count"
+        })
         connection.execute(text(
             "CREATE TABLE stock_analysis_result ("
             + ", ".join(
@@ -880,7 +872,8 @@ def _strategy_pool_engine(
                 executable_count INTEGER,
                 membership_snapshot_date DATE,
                 membership_snapshot_source TEXT,
-                membership_proof_sha256 TEXT
+                membership_proof_sha256 TEXT,
+                execution_time DATETIME
             )
         """))
         analysis_row = dict.fromkeys(CANONICAL_ANALYSIS_COLUMNS)
@@ -961,7 +954,7 @@ def _strategy_pool_engine(
                     1, :passed, '2026-08-27 03:05:05',
                     '2026-08-27 03:06:30', 'analysis_fast', :pool_hash,
                     :published_at, :executable_count, '2026-08-26',
-                    'gj_big_qmt_inner', :membership_hash)
+                    'gj_big_qmt_inner', :membership_hash, :execution_time)
         """), {
             "run_uid": _STRATEGY_RUN_UID,
             "trade_date": history_trade_date,
@@ -976,6 +969,7 @@ def _strategy_pool_engine(
             "published_at": published_at,
             "executable_count": manifest["executable_count"],
             "membership_hash": canonical_sha256(_membership_proof()),
+            "execution_time": snapshot["decision_at"],
         })
     engine._test_publications = {_STRATEGY_RUN_UID: receipt}
     return engine, receipt
@@ -2055,7 +2049,7 @@ def test_analysis_strategy_pool_rejects_ambiguous_current_run_history():
                    total, passed, started_at, finished_at,
                    publisher_task_type, canonical_pool_sha256, published_at,
                    executable_count, membership_snapshot_date,
-                   membership_snapshot_source, membership_proof_sha256
+                   membership_snapshot_source, membership_proof_sha256, execution_time
             FROM st_recommended_run_history WHERE id=1
         """), {
         })
@@ -2136,7 +2130,7 @@ def _overwrite_strategy_partition(
                     1, 1, '2026-08-27 03:06:31',
                     '2026-08-27 03:06:50', 'analysis_fast',
                     :pool_hash, '2026-08-27 03:06:40', 1,
-                    '2026-08-26', 'gj_big_qmt_inner', :membership_hash)
+                    '2026-08-26', 'gj_big_qmt_inner', :membership_hash, NULL)
         """), {
             "run_uid": second_uid,
             "build_sha": _STRATEGY_BUILD_SHA,

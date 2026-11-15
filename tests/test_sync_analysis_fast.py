@@ -1203,6 +1203,9 @@ class SyncAnalysisFastTest(unittest.TestCase):
             "biz.analysis.sync_analysis_fast.pd.read_sql",
             return_value=memberships,
         ), patch(
+            "server.engine.strategy_industry_history.select_industry_history_source",
+            return_value=("2026-08-11", ""),
+        ), patch(
             "integrations.bigqmt.membership_snapshot."
             "verify_existing_membership_snapshot",
             return_value={

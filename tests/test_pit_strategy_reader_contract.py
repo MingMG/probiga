@@ -53,7 +53,8 @@ def test_v3_industry_reader_requires_explicit_research_for_last_known_fallback()
         "server/trading_v3/daily_features.py", "_load_industries"
     )
     assert "allow_research_last_known: bool = False" in body
-    assert "if not source_date and allow_research_last_known:" in body
+    assert "select_industry_history_source(" in body
+    assert "if allow_research_last_known:" in body
     assert "RETROSPECTIVE_RESEARCH_LAST_KNOWN_QMT_SNAPSHOT" in body
     assert "si_industry_sw" not in body
     assert "st_strategy_industry_history" not in body

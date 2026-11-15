@@ -9,10 +9,12 @@ from integrations.bigqmt.reference import PROVIDER_ID
 from server.engine.strategy_industry_history import (
     IndustrySnapshotIntegrityError,
     IndustrySnapshotNotReady,
+    QMT_PREVIOUS_OPEN_SESSION_REASON,
     _canonical_qmt_industry_hash,
     _digest,
     build_history_rows,
     capture_industry_history,
+    prepare_industry_history,
     resolve_analysis_industry_membership_binding,
 )
 
@@ -62,7 +64,7 @@ def _engine():
         """))
         connection.execute(text("""
             INSERT INTO si_trade_calendar VALUES
-            ('2026-08-20', 1), ('2026-08-21', 1),
+            ('2026-08-19', 1), ('2026-08-20', 1), ('2026-08-21', 1),
             ('2026-08-27', 1), ('2026-08-28', 1)
         """))
         connection.execute(text("""
@@ -147,7 +149,7 @@ def _publish(engine, rows: list[dict], *, trade_date: str = TARGET) -> str:
             "industry_count": len({row["industry_code"] for row in rows}),
             "relation_count": len(rows),
             "industry_hash": industry_hash,
-            "captured_at": CAPTURED_AT,
+            "captured_at": rows[0]["captured_at"],
         })
         for row in rows:
             connection.execute(text("""
@@ -232,7 +234,7 @@ def test_exact_date_snapshot_supports_safe_missed_day_recovery_and_idempotency()
 def test_mutable_current_table_cannot_fill_a_missing_historical_snapshot():
     engine = _engine()
 
-    with pytest.raises(IndustrySnapshotNotReady, match="精确日期.*尚未发布"):
+    with pytest.raises(IndustrySnapshotNotReady, match="均没有可用的QMT行业快照"):
         capture_industry_history(engine, trade_date=TARGET)
 
     with engine.connect() as connection:
@@ -241,36 +243,125 @@ def test_mutable_current_table_cannot_fill_a_missing_historical_snapshot():
         )).scalar() == 0
 
 
-def test_nearest_older_qmt_snapshot_cannot_substitute_for_exact_date():
+def test_older_qmt_snapshot_cannot_skip_the_previous_open_session():
     engine = _engine()
-    older = "2026-08-20"
+    older = "2026-08-19"
     old_row = _row(
         "000001", "801780", "银行", trade_date=older,
     )
-    old_row["captured_at"] = "2026-08-20 15:12:00"
-    # Use a local insertion because the helper's capture timestamp is frozen to
-    # TARGET for the normal recovery tests.
-    industry_hash = _canonical_qmt_industry_hash([old_row])
-    with engine.begin() as connection:
-        connection.execute(text("""
-            INSERT INTO qmt_membership_snapshot_run VALUES
-            (:snapshot_date, :source, 'QMT_VALIDATED',
-             'qmt_close_full_refresh', 1, 1, :industry_hash, :captured_at)
-        """), {
-            "snapshot_date": older,
-            "source": PROVIDER_ID,
-            "industry_hash": industry_hash,
-            "captured_at": old_row["captured_at"],
-        })
-        connection.execute(text("""
-            INSERT INTO qmt_industry_member_snapshot VALUES
-            (:snapshot_date, :source, :industry_code, :industry_name,
-             :industry_type, :stock_code, :short_name, :quality_status,
-             :captured_at)
-        """), old_row)
+    old_row["captured_at"] = f"{older} 15:12:00"
+    _publish(engine, [old_row], trade_date=older)
 
     with pytest.raises(IndustrySnapshotNotReady):
         capture_industry_history(engine, trade_date=TARGET)
+
+
+@pytest.mark.parametrize("exact_capture_time", ("22:21:00", "22:15:00"))
+def test_missed_close_uses_only_the_prior_open_snapshot_and_replays_its_sealed_proof(
+    monkeypatch, exact_capture_time,
+):
+    from integrations.bigqmt import membership_snapshot
+
+    engine = _engine()
+    prior, target = "2026-11-12", "2026-11-13"
+    cutoff = f"{target}T22:20:00"
+    prior_row = _row("000001", "801780", "银行", trade_date=prior)
+    prior_row["captured_at"] = f"{prior} 15:53:30"
+    with engine.begin() as connection:
+        connection.execute(text("INSERT INTO si_trade_calendar VALUES (:prior,1),(:target,1)"), {
+            "prior": prior, "target": target,
+        })
+    prior_hash = _publish(engine, [prior_row], trade_date=prior)
+
+    binding = resolve_analysis_industry_membership_binding(
+        engine, trade_date=target, decision_known_at=cutoff,
+    )
+    assert binding["source_snapshot_date"] == prior
+    assert binding["fallback_reason"] == QMT_PREVIOUS_OPEN_SESSION_REASON
+    assert binding["captured_at"] == f"{prior}T15:53:30"
+    captured = capture_industry_history(
+        engine, trade_date=target, decision_known_at=cutoff,
+        expected_proof_sha256=binding["proof_sha256"],
+    )
+    assert captured["snapshot_id"] == binding["proof_sha256"]
+    assert captured["source_snapshot_hash"] == prior_hash
+
+    # Publish the exact target partition after scoring. Its recorded capture
+    # time can be either before or after the already sealed scoring decision.
+    exact_row = _row("000001", "801790", "非银金融", trade_date=target)
+    exact_row["captured_at"] = f"{target} {exact_capture_time}"
+    _publish(engine, [exact_row], trade_date=target)
+    concept = ("黄金股", "黄金股", "000001", "股票000001")
+    with engine.begin() as connection:
+        connection.execute(text("ALTER TABLE qmt_membership_snapshot_run ADD concept_count INTEGER"))
+        connection.execute(text("ALTER TABLE qmt_membership_snapshot_run ADD concept_relation_count INTEGER"))
+        connection.execute(text("ALTER TABLE qmt_membership_snapshot_run ADD concept_hash TEXT"))
+        connection.execute(text("""
+            UPDATE qmt_membership_snapshot_run
+            SET concept_count=1,concept_relation_count=1,concept_hash=:hash
+            WHERE snapshot_date=:target
+        """), {"hash": membership_snapshot._canonical_hash([concept]), "target": target})
+        connection.execute(text("""
+            CREATE TABLE qmt_concept_member_snapshot (
+                snapshot_date TEXT, source TEXT, concept_code TEXT, concept_name TEXT,
+                stock_code TEXT, short_name TEXT, quality_status TEXT, captured_at TEXT
+            )
+        """))
+        connection.execute(text("""
+            INSERT INTO qmt_concept_member_snapshot VALUES
+            (:target,:source,'黄金股','黄金股','000001','股票000001','QMT_VALIDATED',:captured)
+        """), {"target": target, "source": PROVIDER_ID, "captured": exact_row["captured_at"]})
+    monkeypatch.setattr(membership_snapshot, "ensure_membership_snapshot_tables", lambda _engine: None)
+    for threshold in (
+        "MIN_CONCEPT_COUNT", "MIN_CONCEPT_STOCK_COUNT", "MIN_CONCEPT_RELATION_COUNT",
+        "MIN_INDUSTRY_STOCK_COUNT", "MIN_INDUSTRY_RELATION_COUNT",
+    ):
+        monkeypatch.setattr(membership_snapshot, threshold, 1)
+
+    new_binding = resolve_analysis_industry_membership_binding(
+        engine, trade_date=target, decision_known_at=f"{target}T23:00:00",
+    )
+    assert new_binding["source_snapshot_date"] == target
+    assert new_binding["proof_mode"] == "EXACT_QMT_MEMBERSHIP_SNAPSHOT"
+    original = resolve_analysis_industry_membership_binding(
+        engine, trade_date=target, decision_known_at=cutoff,
+        expected_proof_sha256=binding["proof_sha256"],
+    )
+    assert original == binding
+    report, rows = prepare_industry_history(
+        engine, trade_date=target, decision_known_at=cutoff,
+        expected_proof_sha256=binding["proof_sha256"],
+    )
+    assert report["snapshot_id"] == binding["proof_sha256"]
+    assert rows[0]["industry_name"] == "银行"
+    assert capture_industry_history(
+        engine, trade_date=target, decision_known_at=cutoff,
+        expected_proof_sha256=binding["proof_sha256"],
+    )["idempotent_replay"] is True
+    with pytest.raises(IndustrySnapshotIntegrityError, match="已封存分析证据不一致"):
+        prepare_industry_history(
+            engine, trade_date=target, decision_known_at=cutoff,
+            expected_proof_sha256="0" * 64,
+        )
+
+    receipt = {
+        "trade_date": target,
+        "decision_known_at": f"{target}T23:00:00",
+        "expected_proof_sha256": new_binding["proof_sha256"],
+    }
+    count_snapshots = text("SELECT COUNT(DISTINCT snapshot_id) FROM st_strategy_industry_history")
+    with engine.connect() as connection:
+        transaction = connection.begin()
+        successor = capture_industry_history(connection, **receipt)
+        assert successor["source_snapshot_date"] == target
+        assert successor["snapshot_id"] != captured["snapshot_id"]
+        assert connection.execute(count_snapshots).scalar_one() == 2
+        transaction.rollback()
+    with engine.begin() as connection:
+        assert connection.execute(count_snapshots).scalar_one() == 1
+        assert capture_industry_history(connection, **receipt)["snapshot_id"] == successor["snapshot_id"]
+    with engine.connect() as connection:
+        assert connection.execute(count_snapshots).scalar_one() == 2
 
 
 def test_authorized_target_uses_only_previous_open_snapshot_with_audit_fields():
@@ -418,7 +509,7 @@ def test_authorized_fallback_does_not_hide_present_bad_target_snapshot():
             "industry_hash": "a" * 64,
         })
 
-    with pytest.raises(IndustrySnapshotNotReady, match="尚未达到"):
+    with pytest.raises(IndustrySnapshotIntegrityError, match="尚未达到"):
         capture_industry_history(engine, trade_date="2026-08-28")
 
 
@@ -432,7 +523,7 @@ def test_authorized_fallback_rejects_any_other_source_target_run():
              '2026-08-29 00:01:00')
         """), {"industry_hash": "a" * 64})
 
-    with pytest.raises(IndustrySnapshotNotReady):
+    with pytest.raises(IndustrySnapshotIntegrityError):
         capture_industry_history(engine, trade_date="2026-08-28")
 
 

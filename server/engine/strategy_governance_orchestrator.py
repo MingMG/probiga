@@ -25,6 +25,7 @@ from server.engine.strategy_execution_adapters import (
     strategy_execution_adapter_capabilities,
 )
 from server.engine.strategy_industry_history import (
+    PROVIDER_ID,
     IndustrySnapshotIntegrityError,
     IndustrySnapshotNotReady,
     capture_industry_history,
@@ -271,7 +272,13 @@ def _fixed_governance_inputs(fixed_scoring: dict[str, Any], target: str) -> dict
     fields = ("fixed_market_context", "decision_known_at", "analysis_run_uid")
     if fixed_scoring.get("trade_date") != target or not all(fixed_scoring.get(field) for field in fields):
         raise ValueError("fixed governance scoring identity differs from the target session")
-    return {field: fixed_scoring[field] for field in fields}
+    result = {field: fixed_scoring[field] for field in fields}
+    if "membership_proof_sha256" in fixed_scoring:
+        proof = fixed_scoring["membership_proof_sha256"]
+        if not isinstance(proof, str) or not _HASH_PATTERN.fullmatch(proof) or proof == "0" * 64:
+            raise IndustrySnapshotIntegrityError("正式评分的QMT板块成员证明哈希无效")
+        result["membership_proof_sha256"] = proof
+    return result
 
 
 def persist_frozen_governance_revision(
@@ -311,6 +318,17 @@ def persist_frozen_governance_revision(
         or (expected_build_sha and publication_build != expected_build_sha)
     ):
         raise ValueError("prepared score publication identity differs from the governance revision")
+    membership = inputs.get("membership_proof_sha256")
+    if membership is not None:
+        if prepared_analysis_publication.get("membership_proofs") != [{
+            "snapshot_date": target, "source": PROVIDER_ID, "proof_sha256": membership,
+        }]:
+            raise ValueError("prepared score membership proof differs from the governance revision")
+        capture_industry_history(
+            connection, trade_date=target,
+            decision_known_at=inputs["decision_known_at"],
+            expected_proof_sha256=membership,
+        )
     result = governance_snapshot(
         trade_date=target,
         persist=True,
@@ -866,8 +884,17 @@ def orchestrate_strategy_governance(
         )
 
     capture = industry_capture or capture_industry_history
+    fixed_inputs = {}
     try:
-        industry = capture(database, trade_date=target)
+        if fixed_scoring is not None:
+            fixed_inputs = _fixed_governance_inputs(fixed_scoring, target)
+        selection = {}
+        if "membership_proof_sha256" in fixed_inputs:
+            selection = {
+                "decision_known_at": fixed_inputs["decision_known_at"],
+                "expected_proof_sha256": fixed_inputs["membership_proof_sha256"],
+            }
+        industry = capture(database, trade_date=target, **selection)
     except IndustrySnapshotNotReady as exc:
         return _blocked_result(
             database,
@@ -921,9 +948,6 @@ def orchestrate_strategy_governance(
     )
     if governance_runner is None:
         governance_runner = governance_snapshot
-    fixed_inputs = {}
-    if fixed_scoring is not None:
-        fixed_inputs = _fixed_governance_inputs(fixed_scoring, target)
     try:
         result = governance_runner(
             trade_date=target,

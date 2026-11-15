@@ -563,6 +563,10 @@ def test_daily_release_argument_forces_exact_build_orchestration(
         return {
             "build_sha": expected_sha, "run_uid": "b" * 32,
             "trade_date": target, "publisher_task_type": "analysis_fast",
+            "membership_proofs": [{
+                "snapshot_date": target, "source": "gj_big_qmt_inner",
+                "proof_sha256": "d" * 64,
+            }],
         }
 
     monkeypatch.setattr(daily_delivery_control, "load_published_analysis_receipt", load_score)
@@ -606,6 +610,7 @@ def test_daily_release_argument_forces_exact_build_orchestration(
     assert captured["fixed_scoring"] == {
         "trade_date": "2026-08-21", "decision_known_at": cutoff,
         "analysis_run_uid": "b" * 32, "fixed_market_context": market_context,
+        "membership_proof_sha256": "d" * 64,
     }
     assert payload["build_commit_sha"] == expected_sha
     assert payload["automatic_real_order_submission"] is False

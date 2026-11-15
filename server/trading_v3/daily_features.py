@@ -12,19 +12,20 @@ import pandas as pd
 from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Engine
 
+from integrations.bigqmt.membership_snapshot import _canonical_hash as _membership_hash
 from integrations.bigqmt.reference import PROVIDER_ID
 from server.engine.strategy_industry_history import (
     IndustrySnapshotIntegrityError,
     IndustrySnapshotNotReady,
     _exact_snapshot_contract,
-    _snapshot_run_count,
-    authorized_industry_fallback,
+    select_industry_history_source,
 )
 from server.common.pit_facts import (
     PIT_AVAILABLE,
     PIT_DATA_BLOCKED,
     load_event_facts,
     load_finance_facts,
+    normalize_decision_at,
     resolve_common_fact_cutoff,
 )
 from server.common.strategy_daily_input_window import (
@@ -624,62 +625,32 @@ def _load_industries(
             },
         }
         return ({}, evidence) if include_evidence else {}
-    cutoff = decision_at or datetime.combine(
-        as_of + timedelta(days=1), datetime.min.time()
-    )
+    day_end = datetime.combine(as_of + timedelta(days=1), datetime.min.time())
+    cutoff = normalize_decision_at(decision_at) if decision_at is not None else day_end
     result: dict[str, tuple[str, str]] = {}
     reason = ""
     run_payload: dict[str, Any] = {}
     try:
         target = as_of.isoformat()
         fallback_reason = ""
-        rows: list[dict[str, Any]] = []
+        source_date = ""
         run: dict[str, Any] | None = None
+        rows: list[dict[str, Any]] = []
         try:
-            run, rows = _exact_snapshot_contract(
-                engine, trade_date=target,
-            )
-        except IndustrySnapshotNotReady:
-            # A target-date run from the wrong provider, or one which has not
-            # reached QMT_VALIDATED, is present-but-bad.  It must never be
-            # hidden behind the explicitly authorized previous-session row.
-            if _snapshot_run_count(engine, trade_date=target):
-                reason = "PIT_INDUSTRY_SNAPSHOT_PROVENANCE_INVALID"
-            else:
-                source_date, fallback_reason = authorized_industry_fallback(
-                    engine,
-                    trade_date=target,
+            try:
+                source_date, fallback_reason = select_industry_history_source(
+                    engine, trade_date=target, decision_known_at=cutoff,
                 )
-                if not source_date and allow_research_last_known:
-                    source_date = _latest_research_industry_snapshot_date(
-                        engine,
-                        as_of=as_of,
-                    )
+            except IndustrySnapshotNotReady:
+                if allow_research_last_known:
+                    source_date = _latest_research_industry_snapshot_date(engine, as_of=as_of)
                     if source_date:
-                        fallback_reason = (
-                            "RETROSPECTIVE_RESEARCH_LAST_KNOWN_QMT_SNAPSHOT"
-                        )
-                if not source_date or not fallback_reason:
-                    reason = "PIT_INDUSTRY_EXACT_DATE_SNAPSHOT_MISSING"
-                else:
-                    try:
-                        run, rows = _exact_snapshot_contract(
-                            engine, trade_date=source_date,
-                        )
-                    except IndustrySnapshotNotReady:
-                        reason = (
-                            "PIT_INDUSTRY_PREVIOUS_SESSION_SNAPSHOT_MISSING"
-                        )
-                        run = None
-                        rows = []
-                    except IndustrySnapshotIntegrityError as exc:
-                        reason = (
-                            "PIT_INDUSTRY_SNAPSHOT_INCOMPLETE"
-                            if "数不完整" in str(exc)
-                            else "PIT_INDUSTRY_SNAPSHOT_PROVENANCE_INVALID"
-                        )
-                        run = None
-                        rows = []
+                        fallback_reason = "RETROSPECTIVE_RESEARCH_LAST_KNOWN_QMT_SNAPSHOT"
+                if not source_date:
+                    raise
+            run, rows = _exact_snapshot_contract(engine, trade_date=source_date)
+        except IndustrySnapshotNotReady:
+            reason = "PIT_INDUSTRY_EXACT_DATE_SNAPSHOT_MISSING"
         except IndustrySnapshotIntegrityError as exc:
             reason = (
                 "PIT_INDUSTRY_SNAPSHOT_INCOMPLETE"
@@ -689,13 +660,7 @@ def _load_industries(
 
         if run is not None:
             captured_at = datetime.fromisoformat(str(run["captured_at"]))
-            historical_day_end = datetime.combine(
-                as_of + timedelta(days=1), datetime.min.time()
-            )
-            research_snapshot_late = bool(
-                allow_research_last_known
-                and captured_at >= historical_day_end
-            )
+            research_snapshot_late = allow_research_last_known and captured_at >= day_end
             if captured_at > cutoff or research_snapshot_late:
                 reason = "PIT_INDUSTRY_SNAPSHOT_PROVENANCE_INVALID"
                 run = None
@@ -801,13 +766,10 @@ def _load_theme_memberships(
     as_of: date,
     codes: list[str],
     industries: dict[str, tuple[str, str]],
+    decision_at: datetime | None = None,
+    allow_research_last_known: bool = False,
 ) -> tuple[dict[str, list[Membership]], date | None]:
-    """Load true as-of QMT concepts and retain SW L1 as a fallback.
-
-    Concept membership is used only when a captured snapshot exists on or
-    before the decision date.  Current constituent tables are deliberately
-    not used to backfill older dates.
-    """
+    """Read eligible immutable concepts and retain available SW L1 memberships."""
 
     result: dict[str, list[Membership]] = defaultdict(list)
     for code in codes:
@@ -816,21 +778,28 @@ def _load_theme_memberships(
             result[code].append(
                 (industry_code, industry_name, "industry")
             )
-    snapshot_date: date | None = None
+    as_of_exclusive = datetime.combine(as_of + timedelta(days=1), datetime.min.time())
+    cutoff = normalize_decision_at(decision_at) if decision_at is not None else as_of_exclusive
     try:
         with engine.connect() as connection:
-            as_of_exclusive = datetime.combine(
-                as_of + timedelta(days=1),
-                datetime.min.time(),
-            )
             run = connection.execute(
                 text(
                     """
                     SELECT snapshot_date, source, captured_at,
-                           concept_relation_count
+                           concept_relation_count, concept_hash
                     FROM qmt_membership_snapshot_run
                     WHERE snapshot_date <= :as_of
+                      AND (
+                        :allow_research_last_known = 1 OR snapshot_date = :as_of
+                        OR snapshot_date = (
+                            SELECT MAX(trade_date) FROM si_trade_calendar
+                            WHERE trade_status = 1 AND trade_date < :as_of
+                        )
+                      )
+                      AND source = :source
                       AND quality_status = 'QMT_VALIDATED'
+                      AND capture_mode = 'qmt_close_full_refresh'
+                      AND captured_at <= :decision_cutoff
                       AND captured_at < :as_of_exclusive
                     ORDER BY snapshot_date DESC, captured_at DESC, source
                     LIMIT 1
@@ -838,6 +807,9 @@ def _load_theme_memberships(
                 ),
                 {
                     "as_of": as_of,
+                    "allow_research_last_known": allow_research_last_known,
+                    "source": PROVIDER_ID,
+                    "decision_cutoff": cutoff,
                     "as_of_exclusive": as_of_exclusive,
                 },
             ).mappings().first()
@@ -850,15 +822,17 @@ def _load_theme_memberships(
                 return dict(result), None
             source = str(run.get("source") or "").strip()
             captured_at = run.get("captured_at")
-            if isinstance(captured_at, str):
-                captured_at = datetime.fromisoformat(captured_at)
+            captured_at = normalize_decision_at(captured_at)
             expected_relations = int(run.get("concept_relation_count") or 0)
-            if not source or not isinstance(captured_at, datetime):
+            source_close = datetime.combine(snapshot_date, datetime.min.time()).replace(hour=15)
+            if captured_at.date() != snapshot_date or not source_close <= captured_at <= cutoff:
                 return dict(result), None
+            verify_prior = snapshot_date != as_of and not allow_research_last_known
             relation_evidence = connection.execute(
                 text(
                     """
                     SELECT COUNT(*) AS relation_count,
+                           MIN(captured_at) AS first_captured_at,
                            MAX(captured_at) AS last_captured_at
                     FROM qmt_concept_member_snapshot
                     WHERE snapshot_date = :snapshot_date
@@ -874,42 +848,54 @@ def _load_theme_memberships(
             actual_relations = int(
                 relation_evidence.get("relation_count") or 0
             )
+            first_captured_at = relation_evidence.get("first_captured_at")
             last_captured_at = relation_evidence.get("last_captured_at")
-            if isinstance(last_captured_at, str):
-                last_captured_at = datetime.fromisoformat(last_captured_at)
             if (
                 expected_relations <= 0
                 or actual_relations != expected_relations
-                or not isinstance(last_captured_at, datetime)
-                or last_captured_at >= as_of_exclusive
+                or first_captured_at is None or last_captured_at is None
+                or normalize_decision_at(first_captured_at) != normalize_decision_at(captured_at)
+                or normalize_decision_at(last_captured_at) != normalize_decision_at(captured_at)
             ):
                 return dict(result), None
-            statement = text(
-                """
-                SELECT stock_code, concept_code, concept_name, source
+            stock_predicate = "" if verify_prior else "AND stock_code IN :codes"
+            statement = text(f"""
+                SELECT stock_code, concept_code, concept_name, short_name
                 FROM qmt_concept_member_snapshot
                 WHERE snapshot_date = :snapshot_date
                   AND source = :source
-                  AND stock_code IN :codes
+                  {stock_predicate}
                   AND quality_status = 'QMT_VALIDATED'
-                  AND captured_at < :as_of_exclusive
+                  AND captured_at = :captured_at
                 ORDER BY stock_code, concept_code
-                """
-            ).bindparams(bindparam("codes", expanding=True))
-            rows = connection.execute(
-                statement,
-                {
-                    "snapshot_date": snapshot_date,
-                    "source": source,
-                    "codes": codes,
-                    "as_of_exclusive": as_of_exclusive,
-                },
-            ).mappings().all()
+            """)
+            params = {
+                "snapshot_date": snapshot_date,
+                "source": source,
+                "captured_at": captured_at,
+            }
+            if not verify_prior:
+                statement = statement.bindparams(bindparam("codes", expanding=True))
+                params["codes"] = codes
+            rows = connection.execute(statement, params).mappings().all()
+            if verify_prior:
+                identities = [
+                    tuple(str(row[column] or "") for column in (
+                        "concept_code", "concept_name", "stock_code", "short_name",
+                    ))
+                    for row in rows
+                ]
+                if (
+                    len(identities) != expected_relations
+                    or _membership_hash(identities) != run.get("concept_hash")
+                ):
+                    return dict(result), None
+                requested = set(codes)
+                rows = [row for row in rows if row["stock_code"] in requested]
     except Exception:
-        # The industry fallback remains deterministic on installations that
-        # have not yet migrated the QMT snapshot tables.
+        # L1 membership remains available even if optional concepts cannot be read.
         return dict(result), None
-    recorded_at = max(captured_at, last_captured_at)
+    recorded_at = captured_at
     if recorded_at.tzinfo is None or recorded_at.utcoffset() is None:
         recorded_at = recorded_at.replace(tzinfo=MARKET_TIMEZONE)
     else:
@@ -1381,6 +1367,8 @@ def load_daily_feature_universe(
         as_of=as_of,
         codes=codes,
         industries=industries,
+        decision_at=context_cutoff_at,
+        allow_research_last_known=allow_research_industry_last_known,
     )
     latest_names = {
         str(row.stock_code)[:6]: str(row.short_name or "")

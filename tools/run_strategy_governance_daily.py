@@ -44,14 +44,16 @@ def _create_tool_engine():
     return create_tool_engine()
 
 
-def _capture_industry_history(target_trade_date: str) -> dict:
-    """Copy the exact-date immutable QMT facts before governance."""
+def _capture_industry_history(target_trade_date: str, **selection) -> dict:
+    """Copy the QMT facts bound to the original scoring decision."""
 
     from tools.sync_strategy_industry_history import capture_industry_history
 
     engine = _create_tool_engine()
     try:
-        return capture_industry_history(engine, trade_date=target_trade_date)
+        return capture_industry_history(
+            engine, trade_date=target_trade_date, **selection,
+        )
     finally:
         engine.dispose()
 
@@ -328,6 +330,7 @@ def _load_fixed_initial_scoring(engine, target: str, build_sha: str) -> dict:
     from server.common.daily_delivery_control import (
         DailyDeliveryControlError, load_published_analysis_receipt,
     )
+    from server.engine.strategy_industry_history import PROVIDER_ID
 
     target = target or authoritative_closed_trade_date(engine)
     snapshots: list[dict] = []
@@ -358,11 +361,23 @@ def _load_fixed_initial_scoring(engine, target: str, build_sha: str) -> dict:
         or not isinstance(snapshot.get("fixed_market_context"), dict)
     ):
         return {"error": "正式首版评分与已封存输入或当前版本不匹配"}
+    membership = receipt.get("membership_proofs")
+    if (
+        not isinstance(membership, list)
+        or len(membership) != 1
+        or not isinstance(membership[0], dict)
+        or membership[0].get("snapshot_date") != target
+        or membership[0].get("source") != PROVIDER_ID
+        or re.fullmatch(r"[0-9a-f]{64}", str(membership[0].get("proof_sha256") or "")) is None
+        or membership[0].get("proof_sha256") == "0" * 64
+    ):
+        return {"error": "正式首版评分缺少唯一且已封存的QMT板块成员证明"}
     return {
         "trade_date": target,
         "decision_known_at": cutoff,
         "analysis_run_uid": receipt["run_uid"],
         "fixed_market_context": snapshot["fixed_market_context"],
+        "membership_proof_sha256": membership[0]["proof_sha256"],
     }
 
 
@@ -407,8 +422,8 @@ def run_daily_governance(
                 allow_revision=bool(requested_trade_date) and fixed_scoring is None,
                 engine=engine,
                 industry_capture=(
-                    lambda _engine, *, trade_date: _capture_industry_history(
-                        trade_date
+                    lambda _engine, *, trade_date, **selection: _capture_industry_history(
+                        trade_date, **selection,
                     )
                 ),
                 governance_runner=governance_engine.governance_snapshot,

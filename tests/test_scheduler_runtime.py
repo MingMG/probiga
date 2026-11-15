@@ -1327,7 +1327,6 @@ class SchedulerRuntimeTest(unittest.TestCase):
 
     def test_core_capacity_covers_only_canonical_delivery_dependencies(self):
         self.assertEqual(scheduler_runtime.DAILY_RESULT_CORE_TASK_TYPES, {
-            "qmt_membership_snapshot",
             "qmt_stock_daily_canonical",
             "qmt_announcement_pit",
             "stock_finance",
@@ -5056,7 +5055,6 @@ def test_release_catchup_dependency_graph_is_acyclic_and_never_holds_worker_lane
     }
     fast_dependencies = morning_dependencies | {
         "target_turnover_snapshot",
-        "qmt_membership_snapshot",
     }
     assert set(graph["analysis_fast"]) == fast_dependencies
     assert tuple(
@@ -5069,7 +5067,6 @@ def test_release_catchup_dependency_graph_is_acyclic_and_never_holds_worker_lane
     assert set(graph["analysis_upper_evidence_prepare"]) == {
         "target_turnover_snapshot",
         "capital_flow_batch_fast",
-        "qmt_membership_snapshot",
         "qmt_announcement_pit",
         "qmt_stock_daily_canonical",
         "stock_finance",
@@ -5090,7 +5087,9 @@ def test_release_catchup_dependency_graph_is_acyclic_and_never_holds_worker_lane
         "qmt_membership_snapshot"
         not in readiness_contract.RELEASE_DATA_READINESS_TASK_TYPES
     )
-    assert "qmt_membership_snapshot" in graph["analysis_fast"]
+    assert readiness_contract.DAILY_RESULT_RECOVERY_DEPENDENCIES[
+        "qmt_membership_snapshot"
+    ] == ()
     assert "analysis_morning_strict" not in nodes
     assert {
         "target_turnover_snapshot",
@@ -6706,6 +6705,48 @@ def test_initial_recovery_uses_certified_original_announcement_after_recheck_blo
     scheduler_runtime._attach_daily_dependency_recovery([*upstreams, downstream], now=now)
     assert downstream["_dependency_recovery_due"] is True
     assert downstream["_dependency_latest_at"] == finished
+
+
+def test_formal_analysis_can_recover_while_target_membership_capture_is_blocked():
+    target = "2026-11-13"
+    now = datetime(2026, 11, 15, 15, 5)
+    upstreams = [
+        {
+            "id": index,
+            "task_type": task_type,
+            "enabled": 1,
+            "last_run_status": "success",
+            "last_triggered_at": now - timedelta(minutes=5),
+            "last_run_output": json.dumps({"target_trade_date": target}),
+        }
+        for index, task_type in enumerate((
+            "target_turnover_snapshot",
+            "qmt_announcement_pit",
+            "qmt_stock_daily_canonical",
+            "capital_flow_batch_fast",
+            "stock_finance",
+        ), 1)
+    ]
+    membership = {
+        "task_type": "qmt_membership_snapshot",
+        "enabled": 1,
+        "last_run_status": "blocked",
+        "last_triggered_at": now - timedelta(minutes=1),
+        "last_run_output": json.dumps({"target_trade_date": target}),
+    }
+    analysis = {
+        "task_type": "analysis_fast",
+        "_scheduler_target_available": True,
+        "_scheduler_target_trade_date": target,
+        "last_run_status": "blocked",
+    }
+
+    scheduler_runtime._attach_daily_dependency_recovery(
+        [*upstreams, membership, analysis], now=now,
+    )
+
+    assert analysis["_dependency_recovery_due"] is True
+    assert analysis["_dependency_latest_at"] == now - timedelta(minutes=5)
 
 
 def test_final_pool_sender_is_target_bound_and_wakes_only_after_governance():

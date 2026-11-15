@@ -4,10 +4,14 @@ from datetime import date, datetime
 
 from sqlalchemy import create_engine, text
 
+from integrations.bigqmt.membership_snapshot import _canonical_hash as _membership_hash
 from integrations.bigqmt.reference import PROVIDER_ID
 from server.common.pit_facts import PIT_AVAILABLE, PIT_DATA_BLOCKED
-from server.engine.strategy_industry_history import _canonical_qmt_industry_hash
-from server.trading_v3.daily_features import _load_industries
+from server.engine.strategy_industry_history import (
+    QMT_PREVIOUS_OPEN_SESSION_REASON,
+    _canonical_qmt_industry_hash,
+)
+from server.trading_v3.daily_features import _load_industries, _load_theme_memberships
 
 
 def _engine():
@@ -22,6 +26,8 @@ def _engine():
                 industry_count INTEGER NOT NULL,
                 industry_relation_count INTEGER NOT NULL,
                 industry_hash TEXT NOT NULL,
+                concept_relation_count INTEGER NOT NULL DEFAULT 0,
+                concept_hash TEXT NOT NULL DEFAULT '',
                 captured_at DATETIME NOT NULL
             )
         """))
@@ -32,7 +38,7 @@ def _engine():
         """))
         connection.execute(text("""
             INSERT INTO si_trade_calendar VALUES
-                ('2026-08-11', 1), ('2026-08-12', 1),
+                ('2026-08-11', 1), ('2026-08-12', 1), ('2026-08-13', 1),
                 ('2026-08-27', 1), ('2026-08-28', 1)
         """))
         connection.execute(text("""
@@ -46,6 +52,14 @@ def _engine():
                 short_name TEXT NOT NULL,
                 quality_status TEXT NOT NULL,
                 captured_at DATETIME NOT NULL
+            )
+        """))
+        connection.execute(text("""
+            CREATE TABLE qmt_concept_member_snapshot (
+                snapshot_date DATE NOT NULL, source TEXT NOT NULL,
+                stock_code TEXT NOT NULL, concept_code TEXT NOT NULL,
+                concept_name TEXT NOT NULL, short_name TEXT NOT NULL,
+                quality_status TEXT NOT NULL, captured_at DATETIME NOT NULL
             )
         """))
         # If the loader ever reintroduces the mutable fallback, these values
@@ -176,7 +190,7 @@ def test_industry_migration_uses_each_exact_date_snapshot():
     assert after == {"000001": ("801080", "电子")}
 
 
-def test_missing_exact_date_never_uses_stale_or_mutable_current_industry():
+def test_missing_exact_date_uses_only_the_previous_open_session():
     engine = _engine()
     _insert_snapshot(
         engine,
@@ -192,11 +206,104 @@ def test_missing_exact_date_never_uses_stale_or_mutable_current_industry():
         decision_at=datetime(2026, 8, 12, 19),
         include_evidence=True,
     )
-    assert result == {}
-    assert evidence["status"] == PIT_DATA_BLOCKED
-    assert evidence["status_by_code"]["000001"] == PIT_DATA_BLOCKED
-    assert evidence["reason"] == "PIT_INDUSTRY_EXACT_DATE_SNAPSHOT_MISSING"
-    assert evidence["snapshot_hash"]
+    assert result == {"000001": ("801780", "银行")}
+    assert evidence["status"] == PIT_AVAILABLE
+    assert evidence["target_snapshot_date"] == "2026-08-12"
+    assert evidence["source_snapshot_date"] == "2026-08-11"
+    assert evidence["captured_at"] == "2026-08-11T18:00:00"
+    assert evidence["fallback_reason"] == QMT_PREVIOUS_OPEN_SESSION_REASON
+    assert evidence["retrospective_last_known"] is False
+
+    stale, stale_evidence = _load_industries(
+        engine,
+        ["000001"],
+        as_of=date(2026, 8, 13),
+        decision_at=datetime(2026, 8, 13, 19),
+        include_evidence=True,
+    )
+    assert stale == {}
+    assert stale_evidence["reason"] == "PIT_INDUSTRY_EXACT_DATE_SNAPSHOT_MISSING"
+
+
+def test_late_valid_target_does_not_hide_previous_open_session_at_the_cutoff():
+    engine = _engine()
+    for snapshot_date, hour, code, name in (
+        ("2026-08-11", 18, "801780", "银行"),
+        ("2026-08-12", 20, "801080", "电子"),
+    ):
+        _insert_snapshot(
+            engine, snapshot_date=snapshot_date,
+            captured_at=f"{snapshot_date} {hour}:00:00",
+            industry_code=code, industry_name=name,
+        )
+
+    prior, evidence = _load_industries(
+        engine, ["000001"], as_of=date(2026, 8, 12),
+        decision_at=datetime(2026, 8, 12, 19), include_evidence=True,
+    )
+    exact = _load_industries(
+        engine, ["000001"], as_of=date(2026, 8, 12),
+        decision_at=datetime(2026, 8, 12, 21),
+    )
+    assert prior == {"000001": ("801780", "银行")}
+    assert evidence["source_snapshot_date"] == "2026-08-11"
+    assert exact == {"000001": ("801080", "电子")}
+
+
+def test_formal_concepts_bind_cutoff_and_prior_date_while_research_may_use_older():
+    engine = _engine()
+    _insert_snapshot(
+        engine, snapshot_date="2026-08-11", captured_at="2026-08-11 18:00:00",
+        industry_code="801780", industry_name="银行",
+    )
+    _insert_snapshot(
+        engine, snapshot_date="2026-08-12", captured_at="2026-08-12 20:00:00",
+        industry_code="801780", industry_name="银行",
+    )
+    with engine.begin() as connection:
+        connection.execute(text("""
+            UPDATE qmt_membership_snapshot_run
+            SET concept_relation_count = 1, concept_hash = :concept_hash
+            WHERE snapshot_date = '2026-08-11'
+        """), {"concept_hash": _membership_hash([("A", "人工智能", "000001", "平安银行")])})
+        connection.execute(text("""
+            INSERT INTO qmt_concept_member_snapshot
+            VALUES ('2026-08-11', :source, '000001', 'A', '人工智能',
+                    '平安银行', 'QMT_VALIDATED', '2026-08-11 18:00:00')
+        """), {"source": PROVIDER_ID})
+    kwargs = {"codes": ["000001"], "industries": {"000001": ("801780", "银行")}}
+    prior, source_date = _load_theme_memberships(
+        engine, as_of=date(2026, 8, 12),
+        decision_at=datetime(2026, 8, 12, 19), **kwargs,
+    )
+    assert prior["000001"] == [("801780", "银行", "industry"), ("A", "人工智能", "concept")]
+    assert source_date == date(2026, 8, 11)
+
+    formal, source_date = _load_theme_memberships(
+        engine, as_of=date(2026, 8, 13),
+        decision_at=datetime(2026, 8, 13, 21), **kwargs,
+    )
+    assert formal["000001"] == [("801780", "银行", "industry")]
+    assert source_date is None
+    with engine.begin() as connection:
+        connection.execute(text("DELETE FROM qmt_membership_snapshot_run WHERE snapshot_date = '2026-08-12'"))
+
+    research, source_date = _load_theme_memberships(
+        engine, as_of=date(2026, 8, 13),
+        decision_at=datetime(2026, 8, 13, 21),
+        allow_research_last_known=True, **kwargs,
+    )
+    assert research == prior
+    assert source_date == date(2026, 8, 11)
+
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE qmt_concept_member_snapshot SET concept_name = 'tampered'"))
+    tampered, source_date = _load_theme_memberships(
+        engine, as_of=date(2026, 8, 12),
+        decision_at=datetime(2026, 8, 12, 19), **kwargs,
+    )
+    assert tampered["000001"] == [("801780", "银行", "industry")]
+    assert source_date is None
 
 
 def test_retrospective_research_may_use_verified_last_known_snapshot():
