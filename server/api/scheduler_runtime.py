@@ -1663,12 +1663,101 @@ def _daily_result_recovery_target(
                 },
             ).mappings()
         ]
-    return _select_daily_result_recovery_target(
-        trade_dates,
-        latest_target=latest_target,
-        session_rows=session_rows,
-        current_build_sha=_scheduler_build_commit_sha(),
+    build_sha = _scheduler_build_commit_sha()
+
+    def select(rows):
+        return _select_daily_result_recovery_target(
+            trade_dates, latest_target=latest_target, session_rows=rows, current_build_sha=build_sha,
+        )
+
+    if not _daily_delivery_requires_production_runtime() or _scheduler_executor_role("standalone") != SCHEDULER_OWNER_LINUX:
+        return select(session_rows)
+    reopening = [
+        row for row in session_rows
+        if row["status"] == "RUNNING" and row["stored_receipt_status"] == "BLOCKED"
+        and row["stored_retryable"] == 0
+    ]
+    if not reopening:
+        return select(session_rows)
+
+    from server.common.component_release import load_runtime_component_release
+    from server.common.formal_score_recovery import (
+        FORMAL_SCORE_WORK_SCHEMA,
+        _compatible_recovery_builds,
+        _published_terminal,
+        _verify_terminal_publication,
     )
+    from server.common.scheduler_validation import _single_nested_machine_payload
+
+    runtime = load_runtime_component_release()
+    matching = [row for row in reopening if row["release_id"] == runtime["contract_build_sha"]]
+    if runtime["scope"] != "LINUX" or runtime["linux_build_sha"] != build_sha or len(matching) != 1:
+        return select(session_rows)
+    row = matching[0]
+    # Verify the old receipt under its recorded terminal state. The live
+    # RUNNING projection can supersede its block only with newer exact proof.
+    historical = {**row, "status": "BLOCKED"}
+    _validated_daily_recovery_session(historical)
+    receipt = json.loads(row["receipt_json"])
+    if (
+        receipt["error_code"] != "GOVERNANCE_PROGRAM_ERROR"
+        or receipt["terminal_stage"] != "PROGRAM"
+        or row["strategy_release_id"] != strategy_release_identity()
+    ):
+        return select(session_rows)
+
+    with engine.connect() as connection:
+        successor = connection.execute(text("""
+            SELECT /*+ MAX_EXECUTION_TIME(3000) */ a.scheduler_run_uid AS run_uid,
+                a.status AS stage_status, a.started_at AS stage_started_at, a.finished_at AS stage_finished_at,
+                a.output_dataset_id, h.status AS audit_status, h.finished_at, h.exit_code, h.build_sha, h.task_type,
+                a.lease_owner, h.scheduler_instance_id, SUBSTR(h.output, 1, 60000) AS output,
+                r.trade_date AS score_trade_date, r.status AS score_status, r.published_at, r.canonical_pool_sha256,
+                prior.finished_at AS prior_stage_finished_at, old.finished_at AS prior_audit_finished_at,
+                old.build_sha AS prior_build
+            FROM st_daily_stage_attempt AS prior
+            JOIN st_scheduled_task_history AS old ON old.run_uid=prior.scheduler_run_uid
+            JOIN st_daily_stage_attempt AS a ON a.session_uid=prior.session_uid AND a.fencing_token>prior.fencing_token
+            LEFT JOIN st_scheduled_task_history AS h ON h.run_uid=a.scheduler_run_uid
+            LEFT JOIN st_recommended_run_history AS r ON r.run_uid=h.run_uid AND r.scheduler_job_id=h.run_uid
+            WHERE prior.session_uid=:session_uid AND prior.scheduler_run_uid=:blocked_run_uid
+                AND prior.stage_name='strategy_governance_daily' AND prior.shard_id='main'
+                AND prior.status='FAILED' AND prior.error_code='GOVERNANCE_PROGRAM_ERROR'
+                AND old.task_type='strategy_governance_daily' AND old.status='failed' AND old.exit_code<>0
+                AND prior.lease_owner<>'' AND prior.lease_owner=old.scheduler_instance_id
+                AND a.stage_name='analysis_fast' AND a.shard_id='main' AND a.status='SUCCESS'
+            ORDER BY a.fencing_token DESC LIMIT 1
+        """), {"session_uid": row["session_uid"], "blocked_run_uid": receipt["scheduler_run_uid"]}).mappings().first()
+        if successor is None:
+            return select(session_rows)
+        allowed_publishers = {build_sha, runtime["parent_linux_build_sha"]}
+        if (
+            not _published_terminal(successor, allowed_publishers, latest_target)
+            or not successor["lease_owner"] or successor["lease_owner"] != successor["scheduler_instance_id"]
+        ):
+            return select(session_rows)
+        builds = _compatible_recovery_builds(connection, runtime)
+
+    prior_finished = _coerce_datetime(successor["prior_audit_finished_at"])
+    prior_stage_finished = _coerce_datetime(successor["prior_stage_finished_at"])
+    score_started = _coerce_datetime(successor["stage_started_at"])
+    if (
+        successor["prior_build"] == successor["build_sha"]
+        or not {successor["prior_build"], successor["build_sha"]} <= builds
+        or prior_finished is None or prior_stage_finished is None or score_started is None
+        or not prior_finished <= prior_stage_finished < score_started <= current
+    ):
+        return select(session_rows)
+    work = _single_nested_machine_payload(successor["output"], schema=FORMAL_SCORE_WORK_SCHEMA)
+    if work is None:
+        return select(session_rows)
+    _verify_terminal_publication(
+        engine, successor, work, trade_date=latest_target, consumer_started_at=current,
+    )
+    # The normal selector still validates the calendar, release and session
+    # uniqueness. Its terminal-block result is superseded only by this receipt.
+    select([historical if other is row else other for other in session_rows])
+    return latest_target
 
 
 def _release_history_evidence_valid(row: dict, build_sha: str) -> bool:
