@@ -38,6 +38,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
 from integrations.qmt.runtime import connect_xtdata
+from server.common.official_historical_daily_evidence import official_daily_delisting_evidence
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -334,6 +335,48 @@ def canonical_hash(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
+def _reconstruction_delisted_codes(
+    truth: Mapping[str, Any],
+    reconciliation: Mapping[str, Any],
+    *,
+    target_trade_date: date,
+    known_at: datetime | None,
+) -> list[str]:
+    entities = reconciliation.get("official_delisted_entities", [])
+    if not isinstance(entities, list):
+        raise ValueError("official daily delisting entities are invalid")
+    if not entities:
+        return []
+    if truth.get("provider") != "qmt_datadir":
+        raise ValueError("official daily delisting requires an attested local-cache partition")
+    cutoff = _dt(truth.get("decision_known_at"))
+    if known_at is not None and cutoff > _dt(known_at):
+        raise ValueError("official daily delisting authority was not yet known")
+    day = target_trade_date.isoformat()
+    codes = []
+    for entity in entities:
+        if not isinstance(entity, Mapping):
+            raise ValueError("official daily delisting entity is invalid")
+        code = entity.get("stock_code")
+        evidence = entity.get("evidence")
+        if (not isinstance(code, str) or not _CODE_RE.fullmatch(code)
+                or not isinstance(evidence, Mapping) or not isinstance(evidence.get("documents"), list)):
+            raise ValueError("official daily delisting entity identity differs")
+        proof = official_daily_delisting_evidence(
+            evidence["documents"], stock_code=code, day=day, cutoff=cutoff,
+        )
+        expected = {"stock_code": code, "classification": "DELISTED", "evidence": proof}
+        if dict(entity) != {**expected, "row_hash": canonical_hash(expected)}:
+            raise ValueError("official daily delisting entity proof differs")
+        codes.append(code)
+    other_codes = set(reconciliation["native_no_trade_codes"])
+    for field in ("added_to_prior", "excluded_from_prior"):
+        other_codes.update(item.get("stock_code") for item in reconciliation[field] if isinstance(item, Mapping))
+    if codes != sorted(set(codes)) or set(codes) & other_codes:
+        raise ValueError("official daily delisting entities overlap or are unordered")
+    return codes
+
+
 def _reconstruction_authority_matches(
     authority: Mapping[str, Any],
     *,
@@ -375,7 +418,10 @@ def _reconstruction_authority_matches(
         attested_count = int(reconciliation.get("attested_daily_count"))
         no_trade_count = int(reconciliation.get("native_no_trade_count"))
         prior_count = int(reconciliation.get("prior_eligible_count"))
-    except (TypeError, ValueError, OverflowError):
+        delisted_codes = _reconstruction_delisted_codes(
+            truth, reconciliation, target_trade_date=target_trade_date, known_at=known_at,
+        )
+    except (KeyError, TypeError, ValueError, OverflowError):
         return False
     try:
         return bool(
@@ -408,7 +454,8 @@ def _reconstruction_authority_matches(
                     for item in additions)
             and attested_count > 0
             and no_trade_count == len(no_trade_codes)
-            and attested_count + no_trade_count == len(catalog.codes)
+            and set(delisted_codes).issubset(catalog.codes)
+            and attested_count + no_trade_count + len(delisted_codes) == len(catalog.codes)
             and reconciliation.get("native_no_trade_codes_sha256")
             == canonical_hash(no_trade_codes)
         )
@@ -3263,8 +3310,10 @@ def validate_complete_historical_reconstruction_batch(
                         known_at=reconstructed,
                     ):
                         raise ValueError("reconstruction authority differs")
-                    additions = authority["reconciliation"]["added_to_prior"]
-                    if additions:
+                    reconciliation = authority["reconciliation"]
+                    additions = reconciliation["added_to_prior"]
+                    delisted = reconciliation.get("official_delisted_entities", [])
+                    if additions or delisted:
                         from server.common.qmt_datadir_daily_coverage import load_daily_manifest
 
                         truth = authority["qmt_daily_truth"]
@@ -3273,6 +3322,8 @@ def validate_complete_historical_reconstruction_batch(
                         entities = {item["stock_code"]: item for item in (native or {}).get("entities", ())}
                         if any(entities.get(item["stock_code"]) != item["native_daily_entity"] for item in additions):
                             raise ValueError("reconstruction added listing native trade proof differs")
+                        if any(entities.get(item["stock_code"]) != item for item in delisted):
+                            raise ValueError("reconstruction effective-day delisting proof differs from the daily manifest")
                     requested_start = _qmt_time(
                         datetime.combine(batch_start, datetime.min.time())
                     )
@@ -5205,7 +5256,10 @@ def validate_task_result(payload: Any, process_exit: int) -> str:
             attested_count = int(reconciliation.get("attested_daily_count"))
             no_trade_count = int(reconciliation.get("native_no_trade_count"))
             prior_count = int(reconciliation.get("prior_eligible_count"))
-        except (TypeError, ValueError, OverflowError) as exc:
+            delisted_codes = _reconstruction_delisted_codes(
+                truth, reconciliation, target_trade_date=target, known_at=received,
+            )
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
             raise ValueError(
                 "announcement reconstruction provenance is invalid"
             ) from exc
@@ -5302,7 +5356,7 @@ def validate_task_result(payload: Any, process_exit: int) -> str:
             != int(provenance.get("catalog_member_count") or -2)
             or attested_count <= 0
             or no_trade_count != len(no_trade_codes)
-            or attested_count + no_trade_count
+            or attested_count + no_trade_count + len(delisted_codes)
             != int(provenance.get("catalog_member_count") or -2)
             or reconciliation.get("native_no_trade_codes_sha256")
             != canonical_hash(no_trade_codes)
