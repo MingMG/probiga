@@ -711,10 +711,11 @@ def test_authoritative_windows_require_exact_calendar_qmt_date_set(monkeypatch):
     monkeypatch.setattr(governance_module, "_db_read", fake_read)
     monkeypatch.setattr(governance_module, "current_bound_sql_connection", lambda: SimpleNamespace(engine=object()))
     monkeypatch.setattr(governance_module, "datadir_manifest_days", lambda *_args, **_kwargs: set())
+    calendar_cutoffs = []
+
     def exact_receipt(*, required_sessions, end_date, decision_known_at):
         assert required_sessions == 120
-        assert decision_known_at == f"{end_date} 23:59:59"
-        del decision_known_at
+        calendar_cutoffs.append(decision_known_at)
         sessions = tuple(sorted(descending))
         receipt = SimpleNamespace(
             batch_id="exact-calendar",
@@ -740,6 +741,7 @@ def test_authoritative_windows_require_exact_calendar_qmt_date_set(monkeypatch):
         )
     )
     assert windows[120]["session_count"] == 120
+    assert calendar_cutoffs == [f"{descending[0]} 23:59:59"]
     assert windows[20]["end_date"] == descending[0]
     assert len(windows[120]["session_attestations"]) == 120
     latest_attestation = windows[120]["session_attestations"][-1]
@@ -801,6 +803,40 @@ def test_authoritative_windows_require_exact_calendar_qmt_date_set(monkeypatch):
     ]
     assert len(target_queries) == 24
     assert len(attestation_queries) == 24
+
+    # An authentic 120-session proof must leave no raw row owned by a
+    # completed worker result, even if a Future keeps that result alive.
+    from weakref import ref
+
+    class TrackedRow(dict):
+        pass
+
+    raw_rows = []
+
+    def tracked_read(sql, params=None, *, database=None):
+        returned = fake_read(sql, params, database=database)
+        if "FROM sm_stock_kline k" not in sql and "FROM qmt_kline_attestation_row a" not in sql:
+            return returned
+        tracked = [TrackedRow(row) for row in returned]
+        raw_rows.extend(ref(row) for row in tracked)
+        return tracked
+
+    def observe_completed_batches(batches, reader, *, deadline):
+        for batch in batches:
+            raw_rows.clear()
+            result = reader(batch)
+            assert raw_rows and all(reference() is None for reference in raw_rows)
+            yield batch, result
+
+    with monkeypatch.context() as tracked:
+        tracked.setattr(governance_module, "_db_read", tracked_read)
+        tracked.setattr(governance_module, "read_close_batches", observe_completed_batches)
+        assert governance_module._authoritative_session_windows_with_proof(
+            descending[0], decision_known_at=f"{descending[0]}T16:00:00",
+        ) == (
+            windows, row_binding_proof,
+        )
+        assert calendar_cutoffs[-1] == f"{descending[0]} 16:00:00"
 
     invalid_manifest = deepcopy(valid_tolerance)
     invalid_manifest["daily_universe"][descending[-1]]["stock_count"] = 1

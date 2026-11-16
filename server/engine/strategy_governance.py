@@ -7024,10 +7024,14 @@ def _authoritative_session_windows_with_proof(
 ) -> tuple[dict[int, dict[str, Any]], dict[str, Any]]:
     """Resolve windows and one reusable, hash-bound QMT row proof."""
 
+    day_end = normalize_decision_at(f"{as_of_date} 23:59:59")
+    cutoff = normalize_decision_at(decision_known_at) if decision_known_at is not None else day_end
+    if cutoff.date().isoformat() < as_of_date:
+        raise ValueError("治理交易日窗口晚于知识截止时点")
     calendar_receipt = _immutable_calendar_window_receipt(
         end_date=as_of_date,
         required_sessions=max(WINDOWS),
-        decision_known_at=f"{as_of_date} 23:59:59",
+        decision_known_at=min(day_end, cutoff).isoformat(sep=" "),
     )
     calendar_binding = _calendar_receipt_binding(calendar_receipt)
     descending = sorted(
@@ -7039,9 +7043,6 @@ def _authoritative_session_windows_with_proof(
     if len(descending) < max(WINDOWS):
         raise ValueError("权威交易日历不足120个已收盘交易日")
     oldest_required = descending[max(WINDOWS) - 1]
-    cutoff = normalize_decision_at(decision_known_at or f"{as_of_date} 23:59:59")
-    if cutoff.date().isoformat() < as_of_date:
-        raise ValueError("治理交易日窗口晚于知识截止时点")
     try:
         session_days = sorted(descending[:max(WINDOWS)])
         batch_size = max(1, min(20, int(os.environ.get(
@@ -7069,105 +7070,174 @@ def _authoritative_session_windows_with_proof(
                 "decision_known_at": cutoff,
             },
         )
-        manifest_days_by_run: dict[str, set[str]] = {}
+        expected_days = set(session_days)
+        if not native_days <= expected_days:
+            raise ValueError("交易日历与QMT逐行认证日期集合不一致")
+        manifests_by_day: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
         for run_row in completed_run_rows:
             run_id = str(run_row.get("run_id") or "").strip()
+            if not run_id:
+                continue
             try:
-                run_start = _trade_date(
-                    run_row.get("start_date"), default_today=False
-                )
-                run_end = _trade_date(
-                    run_row.get("end_date"), default_today=False
-                )
                 daily_manifest = validated_universe_manifest(
                     run_row.get("tolerance_json"),
-                    start_date=run_start,
-                    end_date=run_end,
+                    start_date=_trade_date(run_row.get("start_date"), default_today=False),
+                    end_date=_trade_date(run_row.get("end_date"), default_today=False),
                 )
             except (TypeError, ValueError):
                 continue
-            manifest_days_by_run[run_id] = set(daily_manifest)
-        covered_days = native_days | {
-            day for days in manifest_days_by_run.values() for day in days
-        }
-        uncovered = [day for day in session_days if day not in covered_days]
+            for day in expected_days.intersection(daily_manifest):
+                manifests_by_day[day][run_id] = daily_manifest[day]
+        del completed_run_rows
+        uncovered = [day for day in session_days if day not in native_days and not manifests_by_day.get(day)]
         if uncovered:
             raise ValueError(
                 f"缺少 {len(uncovered)} 个交易日的 QMT 原生收盘清单："
                 + "、".join(uncovered[:8])
             )
-        universe_index: dict[tuple[str, str], dict[str, Any]] = {}
-        exact_summary: dict[str, dict[str, Any]] = {}
-        target_rows_by_key: dict[tuple[str, str], dict[str, Any]] = {}
-        target_keys_by_day: dict[str, list[tuple[str, str]]] = defaultdict(list)
-        attestation_facts: dict[
-            tuple[str, str], set[tuple[Decimal, ...]]
-        ] = defaultdict(set)
-        native_manifest_hashes: dict[str, str] = {}
+
+        def summarize_day(
+            day, codes, batch_ids, data_versions, latest_received_at, *, native_hash=None,
+        ):
+            if not codes or not batch_ids or not data_versions:
+                raise ValueError("QMT收盘日线认证摘要无效")
+            latest_received_at = _normalize_evidence_revision(latest_received_at)
+            if not latest_received_at:
+                raise ValueError("QMT收盘日线认证摘要无效")
+            stock_contract = expected_stock_set_contract(day, codes)
+            count = stock_contract["stock_count"]
+            stock_hash = stock_contract["stock_set_hash"]
+            manifest_count = 1 if native_hash is not None else sum(
+                manifest["stock_count"] == count and manifest["stock_set_hash"] == stock_hash
+                for manifest in manifests_by_day[day].values()
+            )
+            if not manifest_count:
+                raise ValueError("QMT V2已完成认证运行缺少与生产目标精确匹配的逐日股票全集清单；" + day)
+            native_binding = {"source_manifest_hash": native_hash} if native_hash is not None else {}
+            return ({
+                "trade_date": day,
+                "attested_bar_count": count,
+                "expected_stock_count": count,
+                "expected_stock_set_hash": stock_hash,
+                "batch_count": len(batch_ids),
+                "min_data_version": min(data_versions),
+                "max_data_version": max(data_versions),
+                "latest_received_at": latest_received_at,
+                "pre_close_attestation_protocol": (
+                    DATADIR_COVERAGE_SCHEMA if native_binding else QMT_PRECLOSE_ATTESTATION_PROTOCOL
+                ),
+                **native_binding,
+            }, {
+                "trade_date": day,
+                "target_stock_count": count,
+                "target_stock_set_hash": stock_hash,
+                "completed_attestation_stock_count": count,
+                "completed_attestation_stock_set_hash": stock_hash,
+                "exact_attestation_stock_count": count,
+                "exact_attestation_stock_set_hash": stock_hash,
+                "attested_bar_count": count,
+                "matching_completed_manifest_run_count": manifest_count,
+                **native_binding,
+            })
+
         def read_native(day: str):
             with market_engine.connect() as connection:
-                return load_native_datadir_close(connection, day, cutoff=cutoff)
-
-        for day, native in read_close_batches(sorted(native_days), read_native, deadline=phase_deadline):
-            codes = {str(row["stock_code"]) for row in native.rows}
+                native = load_native_datadir_close(connection, day, cutoff=cutoff)
+            codes = {str(row["stock_code"]).strip() for row in native.rows}
             if len(codes) != len(native.rows):
                 raise ValueError(f"{day} 的 QMT DAT 股票代码重复")
-            for code in codes:
-                universe_index[day, code] = {
-                    "trade_date": day, "stock_code": code, "in_target": 1,
-                    "in_completed_attestation": 1, "in_exact_attestation": 1,
-                }
-            exact_summary[day] = {
-                "stock_codes": codes,
-                "batch_ids": {str(row["batch_id"]) for row in native.rows},
-                "data_versions": {str(row["data_version"]) for row in native.rows},
-                "latest_received_at": max(str(row["received_at"]) for row in native.rows),
-            }
-            native_manifest_hashes[day] = native.manifest_hash
+            return summarize_day(
+                day, codes,
+                {str(row["batch_id"]) for row in native.rows} - {""},
+                {str(row["data_version"]) for row in native.rows} - {""},
+                max((str(row["received_at"]) for row in native.rows), default=""),
+                native_hash=native.manifest_hash,
+            )
 
-        def record_rows(
-            rows: list[dict[str, Any]], *, flag: str,
-        ) -> None:
-            for source_row in rows:
-                day = _trade_date(
-                    source_row.get("trade_date"), default_today=False
-                )
+        def collapse_legacy(batch, targets, attestations):
+            # This worker owns at most one date batch. Futures return only
+            # the immutable daily summaries, so completed batches cannot
+            # retain any per-stock rows, sets or Decimals.
+            targets_by_day = {day: {} for day in batch}
+            completed_codes_by_day = {day: set() for day in batch}
+            matching_codes_by_day = {day: set() for day in batch}
+            for row in targets:
+                day = _trade_date(row.get("trade_date"), default_today=False)
                 if day in native_days:
                     continue
-                run_id = str(source_row.get("run_id") or "").strip()
-                if flag != "in_target" and (
-                    day not in manifest_days_by_run.get(run_id, set())
-                ):
+                if day not in targets_by_day:
+                    raise ValueError("交易日历与QMT逐行认证日期集合不一致")
+                code = str(row.get("stock_code") or "").strip()
+                if not code or code in targets_by_day[day]:
+                    raise ValueError("QMT逐日股票集合绑定行无效")
+                targets_by_day[day][code] = row
+            for row in attestations:
+                day = _trade_date(row.get("trade_date"), default_today=False)
+                if day in native_days:
                     continue
-                code = str(source_row.get("stock_code") or "").strip()
-                key = (day, code)
-                item = universe_index.setdefault(key, {
-                    "trade_date": day,
-                    "stock_code": code,
-                    "in_target": 0,
-                    "in_completed_attestation": 0,
-                    "in_exact_attestation": 0,
-                })
-                item[flag] = 1
-                if flag == "in_target":
-                    if key not in target_rows_by_key:
-                        target_keys_by_day[day].append(key)
-                    target_rows_by_key[key] = source_row
-                elif flag == "in_completed_attestation":
-                    try:
-                        attestation_facts[key].add(tuple(Decimal(str(
-                            source_row[field]
-                        )) for field in (
-                            "source_pre_close",
-                            "attested_open",
-                            "attested_close",
-                            "attested_high",
-                            "attested_low",
-                            "attested_volume",
-                            "attested_amount",
-                        )))
-                    except (InvalidOperation, KeyError, TypeError, ValueError):
+                if day not in completed_codes_by_day:
+                    raise ValueError("交易日历与QMT逐行认证日期集合不一致")
+                run_id = str(row.get("run_id") or "").strip()
+                if run_id not in manifests_by_day[day]:
+                    continue
+                code = str(row.get("stock_code") or "").strip()
+                if not code:
+                    raise ValueError("QMT逐日股票集合绑定行无效")
+                completed_codes_by_day[day].add(code)
+                matching_codes = matching_codes_by_day[day]
+                target = targets_by_day[day].get(code)
+                if target is None or code in matching_codes:
+                    continue
+                try:
+                    attested = tuple(Decimal(str(row[field])) for field in (
+                        "source_pre_close", "attested_open", "attested_close",
+                        "attested_high", "attested_low", "attested_volume", "attested_amount",
+                    ))
+                    expected = tuple(Decimal(str(target[field])) for field in (
+                        "pre_close", "open", "close", "high", "low", "volume", "amount",
+                    ))
+                except (InvalidOperation, KeyError, TypeError, ValueError):
+                    continue
+                if all(value.is_finite() for value in attested) and expected == attested:
+                    matching_codes.add(code)
+
+            summaries = {}
+            for day in batch:
+                target_rows = targets_by_day[day]
+                completed_codes = completed_codes_by_day[day]
+                matching_codes = matching_codes_by_day[day]
+                exact_count = 0
+                batch_ids, data_versions = set(), set()
+                latest_received_at = ""
+                close_time = datetime.fromisoformat(f"{day}T15:00:00")
+                for code, row in target_rows.items():
+                    if code not in matching_codes:
                         continue
+                    try:
+                        source_time = datetime.fromisoformat(str(row.get("source_time") or ""))
+                        received_at = datetime.fromisoformat(str(row.get("received_at") or ""))
+                    except (TypeError, ValueError):
+                        continue
+                    if (
+                        str(row.get("data_source") or "") != "gj_big_qmt_inner"
+                        or str(row.get("quality_status") or "") != "QMT_ATTESTED"
+                        or str(row.get("permission_status") or "") != "SUPPORTED"
+                        or not str(row.get("batch_id") or "")
+                        or not str(row.get("data_version") or "")
+                        or not close_time <= source_time <= received_at <= cutoff
+                    ):
+                        continue
+                    exact_count += 1
+                    batch_ids.add(str(row["batch_id"]))
+                    data_versions.add(str(row["data_version"]))
+                    latest_received_at = max(latest_received_at, str(row["received_at"]))
+                if not target_rows or target_rows.keys() != completed_codes or exact_count != len(target_rows):
+                    raise ValueError(
+                        "QMT生产目标、已完成历史认证与当前精确绑定股票集合必须逐日非空且完全一致；"
+                        f"{day}(目标{len(target_rows)}/历史认证{len(completed_codes)}/当前绑定{exact_count})"
+                    )
+                summaries[day] = summarize_day(day, target_rows, batch_ids, data_versions, latest_received_at)
+            return summaries
 
         def read_legacy(batch: list[str]):
             params = {
@@ -7209,240 +7279,21 @@ def _authoritative_session_windows_with_proof(
                 "AND a.trade_date BETWEEN :start_date AND :as_of_date",
                 params, database=market_engine,
             )
-            return targets, attestations
+            return collapse_legacy(batch, targets, attestations)
 
+        daily_summaries = dict(read_close_batches(sorted(native_days), read_native, deadline=phase_deadline))
         legacy_days = [day for day in session_days if day not in native_days]
         batches = [legacy_days[offset:offset + batch_size] for offset in range(0, len(legacy_days), batch_size)]
-        for batch, (targets, attestations) in read_close_batches(batches, read_legacy, deadline=phase_deadline):
-            target_rows_by_key.clear()
-            target_keys_by_day.clear()
-            attestation_facts.clear()
-            record_rows(targets, flag="in_target")
-            record_rows(attestations, flag="in_completed_attestation")
-            for day in batch:
-                for key in target_keys_by_day.get(day, []):
-                    target_row = target_rows_by_key[key]
-                    try:
-                        target_fact = tuple(Decimal(str(
-                            target_row[field]
-                        )) for field in (
-                            "pre_close", "open", "close", "high", "low",
-                            "volume", "amount",
-                        ))
-                        source_time = datetime.fromisoformat(str(
-                            target_row.get("source_time") or ""
-                        ))
-                        received_at = datetime.fromisoformat(str(
-                            target_row.get("received_at") or ""
-                        ))
-                    except (
-                        InvalidOperation, KeyError, TypeError, ValueError,
-                    ):
-                        continue
-                    if (
-                        target_fact not in attestation_facts.get(key, set())
-                        or str(target_row.get("data_source") or "")
-                        != "gj_big_qmt_inner"
-                        or str(target_row.get("quality_status") or "")
-                        != "QMT_ATTESTED"
-                        or str(target_row.get("permission_status") or "")
-                        != "SUPPORTED"
-                        or not str(target_row.get("batch_id") or "")
-                        or not str(target_row.get("data_version") or "")
-                        or source_time
-                        < datetime.combine(
-                            date.fromisoformat(day), datetime.min.time()
-                        ) + timedelta(hours=15)
-                        or received_at < source_time
-                        or received_at > cutoff
-                    ):
-                        continue
-                    universe_index[key]["in_exact_attestation"] = 1
-                    summary = exact_summary.setdefault(day, {
-                        "stock_codes": set(),
-                        "batch_ids": set(),
-                        "data_versions": set(),
-                        "latest_received_at": "",
-                    })
-                    summary["stock_codes"].add(key[1])
-                    summary["batch_ids"].add(str(target_row["batch_id"]))
-                    summary["data_versions"].add(str(
-                        target_row["data_version"]
-                    ))
-                    summary["latest_received_at"] = max(
-                        summary["latest_received_at"],
-                        str(target_row["received_at"]),
-                    )
-        universe_rows = list(universe_index.values())
-        attestation_rows = [{
-            "trade_date": day,
-            "attested_bar_count": len(summary["stock_codes"]),
-            "batch_count": len(summary["batch_ids"] - {""}),
-            "min_data_version": min(summary["data_versions"] - {""}),
-            "max_data_version": max(summary["data_versions"] - {""}),
-            "latest_received_at": summary["latest_received_at"],
-        } for day, summary in sorted(exact_summary.items())]
+        for _, summaries in read_close_batches(batches, read_legacy, deadline=phase_deadline):
+            daily_summaries.update(summaries)
     except TimeoutError as exc:
         raise ValueError(str(exc)) from exc
     except ValueError:
         raise
     except Exception as exc:
         raise ValueError("QMT原始前收盘价逐行认证读取失败") from exc
-    expected_days = set(descending[:max(WINDOWS)])
-    universe_sets: dict[str, dict[str, set[str]]] = {
-        day: {
-            "target": set(),
-            "completed_attestation": set(),
-            "exact_attestation": set(),
-        }
-        for day in expected_days
-    }
-    for row in universe_rows:
-        day = _trade_date(row.get("trade_date"), default_today=False)
-        if day not in universe_sets:
-            raise ValueError("交易日历与QMT逐行认证日期集合不一致")
-        stock_code = str(row.get("stock_code") or "").strip()
-        flags = {
-            "target": _int(row.get("in_target"), -1),
-            "completed_attestation": _int(
-                row.get("in_completed_attestation"), -1
-            ),
-            "exact_attestation": _int(
-                row.get("in_exact_attestation"), -1
-            ),
-        }
-        if (
-            not stock_code
-            or any(flag not in {0, 1} for flag in flags.values())
-            or not any(flags.values())
-        ):
-            raise ValueError("QMT逐日股票集合绑定行无效")
-        for set_name, present in flags.items():
-            if present:
-                universe_sets[day][set_name].add(stock_code)
-
-    universe_failures: list[str] = []
-    for day in descending[:max(WINDOWS)]:
-        day_sets = universe_sets[day]
-        target_set = day_sets["target"]
-        completed_set = day_sets["completed_attestation"]
-        exact_set = day_sets["exact_attestation"]
-        if (
-            not target_set
-            or target_set != completed_set
-            or target_set != exact_set
-        ):
-            universe_failures.append(
-                f"{day}(目标{len(target_set)}/"
-                f"历史认证{len(completed_set)}/"
-                f"当前绑定{len(exact_set)})"
-            )
-    if universe_failures:
-        raise ValueError(
-            "QMT生产目标、已完成历史认证与当前精确绑定股票集合"
-            "必须逐日非空且完全一致；"
-            + "、".join(universe_failures[:5])
-        )
-    expected_universes = {
-        day: expected_stock_set_contract(
-            day, universe_sets[day]["target"]
-        )
-        for day in expected_days
-    }
-    matching_manifest_runs: dict[str, set[str]] = {
-        day: ({native_manifest_hashes[day]} if day in native_manifest_hashes else set())
-        for day in expected_days
-    }
-    for row in completed_run_rows:
-        run_id = str(row.get("run_id") or "").strip()
-        try:
-            run_start = _trade_date(
-                row.get("start_date"), default_today=False
-            )
-            run_end = _trade_date(row.get("end_date"), default_today=False)
-        except ValueError:
-            continue
-        if not run_id or run_start > run_end:
-            continue
-        try:
-            daily_universe = validated_universe_manifest(
-                row.get("tolerance_json"),
-                start_date=run_start,
-                end_date=run_end,
-            )
-        except (TypeError, ValueError):
-            continue
-        for day in expected_days:
-            if day in native_manifest_hashes:
-                continue
-            if not (run_start <= day <= run_end):
-                continue
-            manifest = daily_universe.get(day)
-            expected = expected_universes[day]
-            if (
-                isinstance(manifest, dict)
-                and type(manifest.get("stock_count")) is int
-                and manifest.get("stock_count") == expected["stock_count"]
-                and manifest.get("stock_set_hash")
-                == expected["stock_set_hash"]
-            ):
-                matching_manifest_runs[day].add(run_id)
-    missing_manifest_days = sorted(
-        day for day, run_ids in matching_manifest_runs.items()
-        if not run_ids
-    )
-    if missing_manifest_days:
-        raise ValueError(
-            "QMT V2已完成认证运行缺少与生产目标精确匹配的"
-            "逐日股票全集清单；"
-            + "、".join(missing_manifest_days[:5])
-        )
-    attestation_days = [
-        _trade_date(row.get("trade_date"), default_today=False)
-        for row in attestation_rows
-    ]
-    if len(attestation_days) != len(set(attestation_days)):
-        raise ValueError("QMT收盘日线认证摘要存在重复交易日")
-    missing_attestations = sorted(expected_days - set(attestation_days))
-    extra_attested_sessions = sorted(set(attestation_days) - expected_days)
-    if missing_attestations or extra_attested_sessions:
-        raise ValueError(
-            "交易日历与QMT已收盘日线日期集合不一致；缺少："
-            + ("、".join(missing_attestations[:5]) or "无")
-            + "；额外："
-            + ("、".join(extra_attested_sessions[:5]) or "无")
-        )
-    attestations: dict[str, dict[str, Any]] = {}
-    for row in attestation_rows:
-        day = _trade_date(row.get("trade_date"), default_today=False)
-        attested_count = _int(row.get("attested_bar_count"), 0)
-        batch_count = _int(row.get("batch_count"), 0)
-        if (
-            day in attestations or attested_count <= 0 or batch_count <= 0
-            or not str(row.get("min_data_version") or "")
-            or not str(row.get("max_data_version") or "")
-            or not _normalize_evidence_revision(row.get("latest_received_at"))
-        ):
-            raise ValueError("QMT收盘日线认证摘要无效")
-        expected_universe = expected_universes[day]
-        if attested_count != expected_universe["stock_count"]:
-            raise ValueError("QMT收盘日线认证行数与精确股票集合不一致")
-        attestations[day] = {
-            "trade_date": day,
-            "attested_bar_count": attested_count,
-            "expected_stock_count": expected_universe["stock_count"],
-            "expected_stock_set_hash": expected_universe["stock_set_hash"],
-            "batch_count": batch_count,
-            "min_data_version": str(row.get("min_data_version") or ""),
-            "max_data_version": str(row.get("max_data_version") or ""),
-            "latest_received_at": _normalize_evidence_revision(
-                row.get("latest_received_at")
-            ),
-            "pre_close_attestation_protocol": (
-                DATADIR_COVERAGE_SCHEMA if day in native_manifest_hashes else QMT_PRECLOSE_ATTESTATION_PROTOCOL
-            ),
-            **({"source_manifest_hash": native_manifest_hashes[day]} if day in native_manifest_hashes else {}),
-        }
+    if daily_summaries.keys() != expected_days:
+        raise ValueError("交易日历与QMT已收盘日线日期集合不一致")
     result: dict[int, dict[str, Any]] = {}
     for window in WINDOWS:
         if len(descending) < window:
@@ -7450,7 +7301,7 @@ def _authoritative_session_windows_with_proof(
         sessions = list(reversed(descending[:window]))
         payload = {
             "schema": ("probiga.authoritative-session-window.v2"
-                       if any(day in native_manifest_hashes for day in sessions)
+                       if any(day in native_days for day in sessions)
                        else "probiga.authoritative-session-window.v1"),
             "window_days": window,
             "start_date": sessions[0],
@@ -7458,7 +7309,7 @@ def _authoritative_session_windows_with_proof(
             "session_count": len(sessions),
             "sessions": sessions,
             "session_attestations": [
-                attestations[day] for day in sessions
+                daily_summaries[day][0] for day in sessions
             ],
             "calendar_manifest_hash": calendar_receipt.manifest_hash,
             "calendar_session_set_hash": calendar_receipt.session_set_hash,
@@ -7471,36 +7322,9 @@ def _authoritative_session_windows_with_proof(
             **payload,
             "session_hash": _digest(payload),
         }
-    proof_sessions: list[dict[str, Any]] = []
-    for day in sorted(expected_days):
-        # Equality of all three concrete sets was established above.  Reuse
-        # the already-computed target contract instead of hashing the same
-        # 120-day stock universe three more times.
-        stock_contract = expected_universes[day]
-        proof_sessions.append({
-            "trade_date": day,
-            "target_stock_count": stock_contract["stock_count"],
-            "target_stock_set_hash": stock_contract["stock_set_hash"],
-            "completed_attestation_stock_count": stock_contract[
-                "stock_count"
-            ],
-            "completed_attestation_stock_set_hash": stock_contract[
-                "stock_set_hash"
-            ],
-            "exact_attestation_stock_count": stock_contract["stock_count"],
-            "exact_attestation_stock_set_hash": stock_contract[
-                "stock_set_hash"
-            ],
-            "attested_bar_count": attestations[day][
-                "attested_bar_count"
-            ],
-            "matching_completed_manifest_run_count": len(
-                matching_manifest_runs[day]
-            ),
-            **({"source_manifest_hash": native_manifest_hashes[day]} if day in native_manifest_hashes else {}),
-        })
+    proof_sessions = [daily_summaries[day][1] for day in session_days]
     proof_payload = {
-        "schema": ("probiga.qmt-row-binding-proof.v2" if native_manifest_hashes
+        "schema": ("probiga.qmt-row-binding-proof.v2" if native_days
                    else "probiga.qmt-row-binding-proof.v1"),
         "as_of_date": as_of_date,
         "start_date": oldest_required,
@@ -7508,7 +7332,7 @@ def _authoritative_session_windows_with_proof(
         "session_count": len(proof_sessions),
         "protocol_version": QMT_PRECLOSE_ATTESTATION_PROTOCOL,
         "source_pre_close_origin": "NATIVE_QMT",
-        "row_run_binding": ("EXACT_COMPLETED_SESSION_SOURCE" if native_manifest_hashes
+        "row_run_binding": ("EXACT_COMPLETED_SESSION_SOURCE" if native_days
                             else "SAME_COMPLETED_RUN_ID"),
         "sessions": proof_sessions,
         "calendar_receipt": calendar_binding,
