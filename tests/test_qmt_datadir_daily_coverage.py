@@ -375,6 +375,7 @@ def test_separate_official_halt_and_resumption_close_the_historical_interval():
 def test_delisted_stock_last_trading_day_retains_verified_public_provider(monkeypatch):
     from server.common import historical_daily_bar_evidence as public
     from server.common import qmt_daily_market_truth
+    from tools import import_qmt_datadir_daily as importer
 
     day, previous, code = "2026-10-27", "2026-10-26", "301139"
     capture = datetime(2026, 11, 7, 10, 0)
@@ -396,12 +397,14 @@ def test_delisted_stock_last_trading_day_retains_verified_public_provider(monkey
         public.verify_public_bar(wrong_close, stock_code=code, day=day, previous_day=previous, cutoff=capture)
     engine = database(monkeypatch)
     catalog, calendar = authorities()
-    catalog.eligible_codes = lambda target: [code]
+    catalog.eligible_codes = lambda target: [code, TRADED]
+    catalog.members = ({"qmt_code": code + ".SZ"}, {"qmt_code": TRADED + ".SH"})
     calendar.sessions_between = lambda start, end: [day] if start == end == day else [previous, day]
     monkeypatch.setattr(coverage, "load_stock_catalog", lambda *args, **kwargs: catalog)
     monkeypatch.setattr(coverage, "load_trade_calendar_receipt", lambda *args, **kwargs: calendar)
     monkeypatch.setattr(qmt_daily_market_truth, "load_trade_calendar_receipt", lambda *args, **kwargs: calendar)
-    proof = coverage.build_manifest(catalog=catalog, calendar=calendar, day=day, rows=[traded],
+    other = {**bar(), "trade_date": day}
+    proof = coverage.build_manifest(catalog=catalog, calendar=calendar, day=day, rows=[traded, other],
                                     run_id="mixed-historical", captured_at=capture, historical_documents={},
                                     historical_public_bars={code: evidence}, previous_session=previous)
     with engine.begin() as connection:
@@ -409,21 +412,135 @@ def test_delisted_stock_last_trading_day_retains_verified_public_provider(monkey
             dataset TEXT, trade_date TEXT, source_root TEXT, status TEXT, code_count INTEGER, row_count INTEGER,
             content_sha256 TEXT, run_id TEXT, started_at TEXT, finished_at TEXT, detail_json TEXT)"""))
         connection.execute(text("""INSERT INTO qmt_datadir_import_partition VALUES (
-            'stock_daily', :day, 'DAT', 'COMPLETE', 1, 1, 'source', 'mixed-historical', :captured, :captured, :detail)"""),
+            'stock_daily', :day, 'DAT', 'COMPLETE', 2, 2, 'source', 'mixed-historical', :captured, :captured, :detail)"""),
                            {"day": day, "captured": capture, "detail": json.dumps({
                                "full_market_manifest_hash": proof["manifest_hash"], "coverage": 1.0,
-                               "readback_rows": 1, "readback_codes": 1,
+                               "readback_rows": 2, "readback_codes": 2,
                            })})
         coverage.insert_manifest(connection, proof)
-        connection.execute(text("INSERT INTO sm_stock_kline VALUES (:stock_code,:trade_date,:open,:close,:high,:low,:volume,:amount,:pre_close,'qmt_datadir',1,0,'VERIFIED','SUPPORTED')"), traded)
+        connection.execute(text("INSERT INTO sm_stock_kline VALUES (:stock_code,:trade_date,:open,:close,:high,:low,:volume,:amount,:pre_close,'qmt_datadir',1,0,'VERIFIED','SUPPORTED')"), [traded, other])
         with pytest.raises(ValueError, match="provider or quality differs"):
             coverage.load_daily_manifest(connection, day, decision_known_at=capture)
         connection.execute(text("UPDATE sm_stock_kline SET data_source='sina_history', quality_status='SOURCE_VERIFIED' WHERE stock_code=:code"), {"code": code})
         result = qmt_daily_market_truth.load_qmt_daily_market_truth(connection, start_date=day, end_date=day,
                                                                    decision_known_at=capture)
-        assert result.as_dict()["bar_providers"] == {"qmt_datadir": 0, "sina_history": 1}
+        assert result.as_dict()["bar_providers"] == {"qmt_datadir": 1, "sina_history": 1}
         assert result.as_dict()["public_bar_codes"] == [code]
+        prior = coverage.load_daily_manifest_completion(connection, day, manifest=proof, decision_known_at=capture)
+        observed = datetime(2026, 11, 16, 8, 26, 16)
+        finished = observed + timedelta(seconds=10)
+        native = {**traded, "volume": 12414000, "amount": 8577381}
+        replacement_args = {"prior_completion": prior, "bar": native, "run_id": "native-historical",
+                            "qmt_code": code + ".SZ", "native_event_at": day,
+                            "observed_at": observed, "native_record_sha256": "7" * 64}
+        replaced = coverage.seal_native_public_replacement(proof, **replacement_args)
+        assert replaced["entities"][1] == proof["entities"][1]
+        assert coverage.validate_manifest(replaced, catalog=catalog, calendar=calendar) == replaced
+        with pytest.raises(ValueError, match="source or scope differs"):
+            coverage.seal_native_public_replacement(proof, **{**replacement_args, "native_event_at": previous})
+        assert importer._native_public_replacement_predecessor(connection, manifest=replaced, day=day) == prior
+        connection.execute(text("UPDATE sm_stock_kline SET data_source='qmt_datadir', quality_status='VERIFIED', "
+                                "amount=:amount, volume=:volume WHERE stock_code=:stock_code"), native)
+        coverage.insert_manifest(connection, replaced)
+        detail = {**prior["detail"], "full_market_manifest_hash": replaced["manifest_hash"], "prior_completion": prior}
+        completion = text("""UPDATE qmt_datadir_import_partition SET run_id=:run,content_sha256=:content,
+            started_at=:observed,finished_at=:finished,detail_json=:detail""")
+        values = {"run": replaced["run_id"], "content": "7" * 64, "observed": observed, "finished": finished}
+        connection.execute(completion, {**values, "detail": json.dumps(detail, default=str)})
+        assert coverage.load_daily_manifest(connection, day, decision_known_at=observed,
+                                            manifest_hash=replaced["manifest_hash"]) is None
+        for cutoff in (capture, observed):
+            retained = qmt_daily_market_truth.load_qmt_daily_market_truth(
+                connection, start_date=day, end_date=day, decision_known_at=cutoff,
+            )
+            assert retained.run_id == proof["run_id"] and retained.public_bar_codes == (code,)
+        restored = qmt_daily_market_truth.load_qmt_daily_market_truth(
+            connection, start_date=day, end_date=day, decision_known_at=finished,
+        )
+        assert restored.run_id == replaced["run_id"] and not restored.public_bar_codes
+        assert restored.run_finished_at == finished.isoformat(" ")
+        with pytest.raises(ValueError, match="predecessor changed"):
+            importer._native_public_replacement_predecessor(connection, manifest=replaced, day=day)
+        tampered = {**detail, "prior_completion": {**prior, "finished_at": previous}}
+        connection.execute(completion, {**values, "detail": json.dumps(tampered, default=str)})
+        with pytest.raises(ValueError, match="completion receipt differs"):
+            coverage.load_daily_manifest(connection, day, decision_known_at=finished)
     engine.dispose()
+
+
+def test_historical_native_evidence_archives_overlap_without_rewriting_legacy_rows(monkeypatch):
+    from contextlib import contextmanager
+    from sqlalchemy import event
+    from sqlalchemy.exc import IntegrityError
+    from tools import import_qmt_datadir_daily as importer
+
+    engine = database(monkeypatch)
+    day = "2026-10-26"
+    suspended = "002827"
+    captured = datetime(2026, 11, 16, 9, 10, 0)
+    finished = captured + timedelta(seconds=8)
+    catalog, calendar = authorities()
+    catalog.eligible_codes = lambda target: [suspended, TRADED]
+    calendar.sessions_between = lambda start, end: [day]
+    monkeypatch.setattr(coverage, "load_stock_catalog", lambda *args, **kwargs: catalog)
+    monkeypatch.setattr(coverage, "load_trade_calendar_receipt", lambda *args, **kwargs: calendar)
+    monkeypatch.delenv("PROBIGA_DEPLOYMENT_MODE", raising=False)
+
+    @event.listens_for(engine, "before_cursor_execute", retval=True)
+    def database_clock(connection, cursor, statement, params, context, many):
+        return statement.replace("CURRENT_TIMESTAMP", f"'{finished.isoformat(' ')}'"), params
+
+    @contextmanager
+    def database_transaction(engine, *, lock_name):
+        assert lock_name.endswith(day)
+        with engine.begin() as connection:
+            yield connection
+
+    monkeypatch.setattr(importer, "_daily_transaction", database_transaction)
+    old = {**bar(), "trade_date": day, "volume": 101, "amount": 1111}
+    documents = {
+        suspended: [historical_document("证券代码：002827。公司股票停牌情况。公司股票自2026年10月26日开市起开始停牌，"
+                                        "公司股票将于2026年11月2日开市起复牌。")],
+    }
+    proof = coverage.build_manifest(catalog=catalog, calendar=calendar, day=day,
+                                    rows=[{**bar(), "trade_date": day}], run_id="native-evidence", captured_at=captured,
+                                    historical_documents=documents, native_content_sha256="5" * 64)
+    with engine.begin() as connection:
+        connection.execute(text("""CREATE TABLE qmt_datadir_import_partition (
+            dataset TEXT, trade_date TEXT, source_root TEXT, status TEXT, code_count INTEGER, row_count INTEGER,
+            content_sha256 TEXT, run_id TEXT, started_at TEXT, finished_at TEXT, detail_json TEXT,
+            PRIMARY KEY(dataset, trade_date))"""))
+        connection.execute(text("""INSERT INTO sm_stock_kline VALUES (
+            :stock_code,:trade_date,:open,:close,:high,:low,:volume,:amount,:pre_close,
+            'tencent_qt',1,0,'SOURCE_VERIFIED','SUPPORTED')"""), old)
+        connection.execute(text("INSERT INTO qmt_datadir_import_partition(dataset,trade_date) VALUES (:dataset,:day)"),
+                           {"dataset": coverage.NATIVE_EVIDENCE_DATASET, "day": day})
+    with pytest.raises(IntegrityError):
+        importer._publish_native_archive(engine, manifest=proof, source_root="DAT")
+    with engine.begin() as connection:
+        assert coverage.load_daily_native_evidence(connection, day, decision_known_at=finished) is None
+        assert connection.execute(text(f"SELECT COUNT(*) FROM {coverage.ENTITY_TABLE} WHERE manifest_hash=:hash"),
+                                  {"hash": proof["manifest_hash"]}).scalar_one() == 0
+        connection.execute(text("DELETE FROM qmt_datadir_import_partition WHERE dataset=:dataset AND trade_date=:day"),
+                           {"dataset": coverage.NATIVE_EVIDENCE_DATASET, "day": day})
+    result = importer._publish_native_archive(engine, manifest=proof, source_root="DAT")
+    assert result["status"] == "COMPLETE" and result["dataset"] == coverage.NATIVE_EVIDENCE_DATASET
+    assert importer._publish_native_archive(engine, manifest=proof, source_root="DAT")["status"] == "REUSED"
+    with engine.begin() as connection:
+        assert coverage.load_daily_manifest(connection, day, decision_known_at=finished) is None
+        assert coverage.load_daily_native_evidence(connection, day, decision_known_at=captured) is None
+        archived, receipt = coverage.load_daily_native_evidence(connection, day, decision_known_at=finished)
+        assert archived == proof and receipt["finished_at"] == finished.isoformat(" ")
+        assert len(archived["entities"]) == 2 and archived["entities"][0]["classification"] == "NO_TRADE"
+        assert connection.execute(text("SELECT data_source,volume,amount FROM sm_stock_kline WHERE trade_date=:day"),
+                                  {"day": day}).one() == (
+            "tencent_qt", 101, 1111,
+        )
+        connection.execute(text(f"UPDATE {coverage.ENTITY_TABLE} SET row_hash='damaged' "
+                                "WHERE manifest_hash=:hash AND stock_code=:code"),
+                           {"hash": proof["manifest_hash"], "code": TRADED})
+        with pytest.raises(ValueError, match="persisted daily entity inventory differs"):
+            coverage.load_daily_native_evidence(connection, day, decision_known_at=finished)
 
 
 def test_uint64_repair_preserves_original_scope_and_blocks_old_daily_cutoff(monkeypatch):

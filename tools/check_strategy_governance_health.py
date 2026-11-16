@@ -44,6 +44,7 @@ from server.common.scheduler_runtime_health import (
     check_qmt_windows_edge_release_receipt,
 )
 from server.common.qmt_stock_catalog import a_share_stock_code_sql
+from server.common.qmt_datadir_daily_coverage import SCHEMA as DATADIR_COVERAGE_SCHEMA
 from tools.qmt_host_ownership_contract import (
     WINDOWS_QMT_EDGE_TASKS,
     WINDOWS_QMT_EDGE_TASK_TYPES,
@@ -1132,6 +1133,7 @@ def _authoritative_trade_date(engine, explicit: str = "") -> tuple[str, str]:
 
 def _authoritative_session_window_attestation_check(
     trade_date: str,
+    *, decision_known_at: str | None = None,
 ) -> tuple[bool, dict[str, Any]]:
     """Verify exact 20/60/120-session hashes include QMT close attestations."""
 
@@ -1141,7 +1143,9 @@ def _authoritative_session_window_attestation_check(
         )
 
         windows, row_binding_proof = (
-            _authoritative_session_windows_with_proof(trade_date)
+            _authoritative_session_windows_with_proof(
+                trade_date, **({"decision_known_at": decision_known_at} if decision_known_at else {}),
+            )
         )
     except Exception as exc:
         return False, {"error": _safe_exception_message(exc)}
@@ -1192,7 +1196,10 @@ def _authoritative_session_window_attestation_check(
                 if not isinstance(attestation, dict):
                     attestation_valid = False
                     break
-                if set(attestation) != attestation_fields:
+                protocol = attestation.get("pre_close_attestation_protocol")
+                native_datadir = protocol == DATADIR_COVERAGE_SCHEMA
+                expected_fields = attestation_fields | ({"source_manifest_hash"} if native_datadir else set())
+                if set(attestation) != expected_fields:
                     attestation_valid = False
                     break
                 if (
@@ -1215,13 +1222,10 @@ def _authoritative_session_window_attestation_check(
                     or not _normalized_datetime_text(
                         attestation.get("latest_received_at")
                     )
-                    or str(
-                        attestation.get(
-                            "pre_close_attestation_protocol"
-                        )
-                        or ""
-                    )
-                    != QMT_PRECLOSE_ATTESTATION_PROTOCOL
+                    or protocol not in (QMT_PRECLOSE_ATTESTATION_PROTOCOL, DATADIR_COVERAGE_SCHEMA)
+                    or (native_datadir and not RESULT_HASH_RE.fullmatch(
+                        str(attestation.get("source_manifest_hash") or "")
+                    ))
                 ):
                     attestation_valid = False
                     break
@@ -1242,10 +1246,20 @@ def _authoritative_session_window_attestation_check(
             )
         except Exception:
             calendar_valid = False
+        native_window = any(
+            isinstance(row, dict) and row.get("pre_close_attestation_protocol") == DATADIR_COVERAGE_SCHEMA
+            for row in attestations
+        )
         valid = (
-            set(window) == window_fields
-            and window.get("schema")
-            == "probiga.authoritative-session-window.v1"
+            set(window) == window_fields | ({"source_knowledge_cutoff_at"} if native_window else set())
+            and window.get("schema") == (
+                "probiga.authoritative-session-window.v2" if native_window
+                else "probiga.authoritative-session-window.v1"
+            )
+            and (not native_window or (
+                _normalized_datetime_text(window.get("source_knowledge_cutoff_at"))
+                and str(window["source_knowledge_cutoff_at"])[:10] >= trade_date
+            ))
             and _integer(window.get("window_days")) == expected_window
             and _integer(window.get("session_count")) == expected_window
             and len(normalized_sessions) == expected_window
@@ -1285,6 +1299,8 @@ def _authoritative_session_window_attestation_check(
                     "expected_stock_set_hash": str(
                         attestation.get("expected_stock_set_hash") or ""
                     ),
+                    **({"source_manifest_hash": attestation["source_manifest_hash"]}
+                       if "source_manifest_hash" in attestation else {}),
                 }
                 for attestation in attestations
                 if isinstance(attestation, dict)
@@ -1348,13 +1364,20 @@ def _reused_qmt_row_attestation_binding_check(
     }
     proof_sessions = raw_proof.get("sessions")
     proof_sessions = proof_sessions if isinstance(proof_sessions, list) else []
+    native_window = any(
+        isinstance(row, dict) and "source_manifest_hash" in row for row in proof_sessions
+    )
+    binding = "EXACT_COMPLETED_SESSION_SOURCE" if native_window else "SAME_COMPLETED_RUN_ID"
     payload = {
         key: value for key, value in raw_proof.items() if key != "proof_hash"
     }
     errors: list[dict[str, Any]] = []
     if (
-        set(raw_proof) != proof_fields
-        or raw_proof.get("schema") != "probiga.qmt-row-binding-proof.v1"
+        set(raw_proof) != proof_fields | ({"calendar_receipt"} if "calendar_receipt" in raw_proof else set())
+        or (native_window and "calendar_receipt" not in raw_proof)
+        or raw_proof.get("schema") != (
+            "probiga.qmt-row-binding-proof.v2" if native_window else "probiga.qmt-row-binding-proof.v1"
+        )
         or _iso_date(raw_proof.get("as_of_date")) != trade_date
         or _iso_date(raw_proof.get("start_date"))
         != expected_sessions[0]
@@ -1364,7 +1387,7 @@ def _reused_qmt_row_attestation_binding_check(
         or str(raw_proof.get("protocol_version") or "")
         != QMT_PRECLOSE_ATTESTATION_PROTOCOL
         or raw_proof.get("source_pre_close_origin") != "NATIVE_QMT"
-        or raw_proof.get("row_run_binding") != "SAME_COMPLETED_RUN_ID"
+        or raw_proof.get("row_run_binding") != binding
         or RESULT_HASH_RE.fullmatch(str(raw_proof.get("proof_hash") or ""))
         is None
         or _canonical_digest(payload) != raw_proof.get("proof_hash")
@@ -1399,7 +1422,8 @@ def _reused_qmt_row_attestation_binding_check(
         total_completed += completed_count
         total_exact += exact_count
         if (
-            set(row) != session_fields
+            set(row) != session_fields | ({"source_manifest_hash"} if "source_manifest_hash" in row else set())
+            or row.get("source_manifest_hash") != contract.get("source_manifest_hash")
             or day != session
             or target_count <= 0
             or completed_count != target_count
@@ -1432,7 +1456,7 @@ def _reused_qmt_row_attestation_binding_check(
         "table_exists": True,
         "protocol_version": QMT_PRECLOSE_ATTESTATION_PROTOCOL,
         "source_pre_close_origin": "NATIVE_QMT",
-        "row_run_binding": "SAME_COMPLETED_RUN_ID",
+        "row_run_binding": binding,
         "proof_reused": True,
         "proof_hash": raw_proof.get("proof_hash"),
         "database_query_count": 0,
@@ -13228,9 +13252,11 @@ def collect_governance_health(
             run_disposition = (
                 "completed" if run.get("status") == "COMPLETED" else "invalid"
             )
+        source_proof = (run_result.get("candidate_source") or {}).get("publication_proof") or {}
+        cutoff = source_proof.get("decision_known_at")
         session_windows_ok, session_windows_detail = (
             _authoritative_session_window_attestation_check(
-                validation_trade_date
+                validation_trade_date, **({"decision_known_at": cutoff} if cutoff else {})
             )
         )
         add(

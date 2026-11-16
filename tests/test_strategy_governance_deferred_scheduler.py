@@ -497,7 +497,10 @@ def test_daily_governance_deferred_mode_blocks_before_engine(monkeypatch, capsys
     assert daily.main() == 2
 
     payload = json.loads(capsys.readouterr().out)
-    assert payload == daily._deferred_database_blocked_output()
+    assert payload == {
+        "schema": "probiga.strategy-governance-daily-result.v1",
+        **daily._deferred_database_blocked_output(),
+    }
     assert payload["reason_code"] == "GOVERNANCE_DATABASE_DEFERRED"
     assert payload["allocations"] == [{
         "target_type": "CASH",

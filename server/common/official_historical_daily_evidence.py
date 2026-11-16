@@ -28,8 +28,20 @@ _URL = re.compile(r"/finalpage/(\d{4}-\d{2}-\d{2})/\d+\.PDF", re.I)
 _HASH = re.compile(r"[0-9a-f]{64}")
 _DAY = r"(\d{4})年(\d{1,2})月(\d{1,2})日"
 _WEEKDAY = r"(?:[（(](?:星期|周)[一二三四五六日天][）)])?"
-_SUSPEND = re.compile(r"(?:自|于)" + _DAY + _WEEKDAY + r"(?:开市)?起(?:开始)?停牌")
-_RESUME = re.compile(r"(?:将于|自|于)" + _DAY + _WEEKDAY + r"(?:开市)?起复牌")
+_SUSPEND = re.compile(r"(?:自|于)" + _DAY + _WEEKDAY + r"(?:开市(?:时)?)?起(?:开始)?停牌")
+_RESUME = re.compile(r"(?:将于|自|于)" + _DAY + _WEEKDAY + r"(?:开市(?:时)?)?起(?:开始)?复牌")
+_VOLUNTARY_DELIST_HALT = re.compile(
+    r"公司股票(?:[（(][^）)]{1,100}[）)])?将?自" + _DAY + _WEEKDAY
+    + r"开市(?:时)?起(?:开始)?停牌[，,]直至(?:深交所|深圳证券交易所)"
+    + r"[^。；;]{1,80}对公司股票予以摘牌"
+)
+_REGULATORY_DELIST_HALT = re.compile(
+    r"公司股票(?:[（(][^）)]{1,100}[）)])?自" + _DAY + _WEEKDAY
+    + r"(?:开市(?:时)?)?起继续(?:实施)?停牌"
+)
+_DELISTING_BOARD_RESUME = re.compile(
+    r"公司股票于" + _DAY + _WEEKDAY + r"(?:开市(?:时)?)?起?复牌并进入退市整理期"
+)
 _FULL_DAY_SUSPEND = re.compile(
     r"(?:本公司|公司)股票(?:将)?(?:于|自)" + _DAY + _WEEKDAY
     + r"(?:全天停牌|停牌全天|停牌(?:一天|1天)(?![半0-9]))"
@@ -65,12 +77,55 @@ def _explicit_sessions(text: str) -> set[date]:
     return result
 
 
+def _paired_delisting_halt(texts: list[tuple[date, str]], target: date, resumes: set[date]) -> bool:
+    # These dedicated notices give the start and the realized end of the same
+    # issuer's suspension. Each endpoint must be stated on its effective date.
+    voluntary_starts: set[date] = set()
+    voluntary_ends: set[date] = set()
+    regulatory_starts: set[date] = set()
+    regulatory_ends: set[date] = set()
+    notice_types = (
+        ("终止上市事项的停牌公告", "", _VOLUNTARY_DELIST_HALT, voluntary_starts),
+        ("股票终止上市暨摘牌的公告", "同意公司股票主动终止上市", _DELIST, voluntary_ends),
+        ("股票将被终止上市暨继续停牌的风险提示公告", "规范类退市", _REGULATORY_DELIST_HALT, regulatory_starts),
+        ("股票进入退市整理期交易首日的风险提示公告", "", _DELISTING_BOARD_RESUME, regulatory_ends),
+    )
+    for published, body in texts:
+        headline = body[:400]
+        for title, context, pattern, endpoint_dates in notice_types:
+            if title in headline and context in body:
+                effective_dates = _dates(pattern, body)
+                if effective_dates and effective_dates != {published}:
+                    raise ValueError("official paired suspension interval is ambiguous")
+                endpoint_dates.update(effective_dates)
+
+    intervals = []
+    for starts, ends in ((voluntary_starts, voluntary_ends), (regulatory_starts, regulatory_ends)):
+        if starts and ends:
+            if len(starts) != 1 or len(ends) != 1 or min(starts) >= min(ends):
+                raise ValueError("official paired suspension interval is ambiguous")
+            intervals.append((min(starts), min(ends)))
+    if len(intervals) > 1:
+        raise ValueError("official paired suspension interval is ambiguous")
+    if not intervals:
+        return False
+    start, end = intervals[0]
+    if start <= target < end and any(start <= resume < end for resume in resumes):
+        raise ValueError("official paired suspension interval is contradicted by a resumption")
+    return start <= target < end
+
+
 def _classification(texts: list[tuple[date, str]], target: date) -> str:
+    resumes = {resume for _, body in texts
+               for resume in _dates(_RESUME, body) | _dates(_DELISTING_BOARD_RESUME, body)}
     # Explicit resumed sessions always invalidate any competing no-trade inference.
-    if any(target in _dates(_RESUME, body) for _, body in texts):
+    if target in resumes:
         raise ValueError("official evidence shows trading resumed on target session")
+    paired_delisting_halt = _paired_delisting_halt(texts, target, resumes)
     if any(target in _dates(_DELIST, body) and "股票终止上市暨摘牌" in body for _, body in texts):
         return "DELISTED"
+    if paired_delisting_halt:
+        return "NO_TRADE"
     for published, body in texts:
         starts = _dates(_SUSPEND, body)
         resumes = _dates(_RESUME, body)

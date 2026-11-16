@@ -69,6 +69,12 @@ from server.trading_v3.forward_evidence import (
     INTENT_EPISODE_PROTOCOL,
     intent_episode_id,
 )
+from server.engine.governance_daily_market import (
+    DATADIR_COVERAGE_SCHEMA,
+    datadir_manifest_days,
+    load_native_datadir_close,
+    read_close_batches,
+)
 from server.engine.strategy_execution_adapters import (
     batch_dynamic_shadow_ledger_readiness,
     normalize_execution_binding,
@@ -1026,9 +1032,10 @@ def _require_authoritative_closed_trade_date(target: str) -> str:
     return authoritative_target
 
 
-def _db_read(sql: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-    connection = _GOVERNANCE_WRITE_CONNECTION.get()
-    database = connection if connection is not None and connection is current_bound_sql_connection() else get_engine()
+def _db_read(sql: str, params: dict[str, Any] | None = None, *, database=None) -> list[dict[str, Any]]:
+    if database is None:
+        connection = _GOVERNANCE_WRITE_CONNECTION.get()
+        database = connection if connection is not None and connection is current_bound_sql_connection() else get_engine()
     return read_sql_rows(
         database, sql, params, context="strategy_governance", stringify_datetime=True,
     )
@@ -7013,7 +7020,7 @@ def _authoritative_maturity_sessions(
 
 
 def _authoritative_session_windows_with_proof(
-    as_of_date: str,
+    as_of_date: str, *, decision_known_at: datetime | str | None = None,
 ) -> tuple[dict[int, dict[str, Any]], dict[str, Any]]:
     """Resolve windows and one reusable, hash-bound QMT row proof."""
 
@@ -7032,25 +7039,34 @@ def _authoritative_session_windows_with_proof(
     if len(descending) < max(WINDOWS):
         raise ValueError("权威交易日历不足120个已收盘交易日")
     oldest_required = descending[max(WINDOWS) - 1]
+    cutoff = normalize_decision_at(decision_known_at or f"{as_of_date} 23:59:59")
+    if cutoff.date().isoformat() < as_of_date:
+        raise ValueError("治理交易日窗口晚于知识截止时点")
     try:
         session_days = sorted(descending[:max(WINDOWS)])
         batch_size = max(1, min(20, int(os.environ.get(
-            "PROBIGA_GOVERNANCE_QMT_WINDOW_BATCH_DAYS", "10"
+            "PROBIGA_GOVERNANCE_QMT_WINDOW_BATCH_DAYS", "5"
         ))))
         phase_timeout = max(60, min(900, int(os.environ.get(
             "PROBIGA_GOVERNANCE_QMT_WINDOW_TIMEOUT_SECONDS", "300"
         ))))
         phase_deadline = time.monotonic() + phase_timeout
+        bound_connection = current_bound_sql_connection()
+        market_engine = bound_connection.engine if bound_connection is not None else get_engine()
+        with (nullcontext(bound_connection) if bound_connection is not None else market_engine.connect()) as connection:
+            native_days = datadir_manifest_days(connection, session_days, cutoff=cutoff)
         completed_run_rows = _db_read(
             "SELECT run_id, start_date, end_date, tolerance_json "
             "FROM qmt_kline_attestation_run "
             "WHERE BINARY status=BINARY 'COMPLETED' "
             "AND BINARY provider=BINARY 'gj_big_qmt_inner' "
             "AND start_date<=:as_of_date AND end_date>=:start_date "
+            "AND finished_at<=:decision_known_at "
             "ORDER BY finished_at DESC, run_id",
             {
                 "start_date": oldest_required,
                 "as_of_date": as_of_date,
+                "decision_known_at": cutoff,
             },
         )
         manifest_days_by_run: dict[str, set[str]] = {}
@@ -7071,6 +7087,15 @@ def _authoritative_session_windows_with_proof(
             except (TypeError, ValueError):
                 continue
             manifest_days_by_run[run_id] = set(daily_manifest)
+        covered_days = native_days | {
+            day for days in manifest_days_by_run.values() for day in days
+        }
+        uncovered = [day for day in session_days if day not in covered_days]
+        if uncovered:
+            raise ValueError(
+                f"缺少 {len(uncovered)} 个交易日的 QMT 原生收盘清单："
+                + "、".join(uncovered[:8])
+            )
         universe_index: dict[tuple[str, str], dict[str, Any]] = {}
         exact_summary: dict[str, dict[str, Any]] = {}
         target_rows_by_key: dict[tuple[str, str], dict[str, Any]] = {}
@@ -7078,6 +7103,27 @@ def _authoritative_session_windows_with_proof(
         attestation_facts: dict[
             tuple[str, str], set[tuple[Decimal, ...]]
         ] = defaultdict(set)
+        native_manifest_hashes: dict[str, str] = {}
+        def read_native(day: str):
+            with market_engine.connect() as connection:
+                return load_native_datadir_close(connection, day, cutoff=cutoff)
+
+        for day, native in read_close_batches(sorted(native_days), read_native, deadline=phase_deadline):
+            codes = {str(row["stock_code"]) for row in native.rows}
+            if len(codes) != len(native.rows):
+                raise ValueError(f"{day} 的 QMT DAT 股票代码重复")
+            for code in codes:
+                universe_index[day, code] = {
+                    "trade_date": day, "stock_code": code, "in_target": 1,
+                    "in_completed_attestation": 1, "in_exact_attestation": 1,
+                }
+            exact_summary[day] = {
+                "stock_codes": codes,
+                "batch_ids": {str(row["batch_id"]) for row in native.rows},
+                "data_versions": {str(row["data_version"]) for row in native.rows},
+                "latest_received_at": max(str(row["received_at"]) for row in native.rows),
+            }
+            native_manifest_hashes[day] = native.manifest_hash
 
         def record_rows(
             rows: list[dict[str, Any]], *, flag: str,
@@ -7086,6 +7132,8 @@ def _authoritative_session_windows_with_proof(
                 day = _trade_date(
                     source_row.get("trade_date"), default_today=False
                 )
+                if day in native_days:
+                    continue
                 run_id = str(source_row.get("run_id") or "").strip()
                 if flag != "in_target" and (
                     day not in manifest_days_by_run.get(run_id, set())
@@ -7121,18 +7169,14 @@ def _authoritative_session_windows_with_proof(
                     except (InvalidOperation, KeyError, TypeError, ValueError):
                         continue
 
-        for offset in range(0, len(session_days), batch_size):
-            if time.monotonic() >= phase_deadline:
-                raise ValueError(
-                    "DATA_BLOCKED: QMT认证窗口分批读取超过阶段超时"
-                )
-            batch = session_days[offset:offset + batch_size]
+        def read_legacy(batch: list[str]):
             params = {
                 "start_date": batch[0],
                 "as_of_date": batch[-1],
                 "protocol_version": QMT_PRECLOSE_ATTESTATION_PROTOCOL,
+                "decision_known_at": cutoff,
             }
-            record_rows(_db_read(
+            targets = _db_read(
                 "SELECT /*+ MAX_EXECUTION_TIME(20000) */ "
                 "k.trade_date, k.stock_code, k.pre_close, k.`open`, "
                 "k.`close`, k.high, k.low, k.volume, k.amount, "
@@ -7142,17 +7186,19 @@ def _authoritative_session_windows_with_proof(
                 "WHERE k.k_type=1 AND k.adjust_type=0 "
                 f"AND {a_share_stock_code_sql('k.stock_code')} "
                 "AND k.trade_date BETWEEN :start_date AND :as_of_date",
-                params,
-            ), flag="in_target")
-            record_rows(_db_read(
+                params, database=market_engine,
+            )
+            attestations = _db_read(
                 "SELECT /*+ MAX_EXECUTION_TIME(20000) */ "
                 "a.trade_date, a.stock_code, a.run_id, "
                 "a.source_pre_close, a.attested_open, a.attested_close, "
                 "a.attested_high, a.attested_low, a.attested_volume, "
                 "a.attested_amount "
-                "FROM qmt_kline_attestation_row a "
-                "WHERE BINARY a.protocol_version=BINARY :protocol_version "
+                "FROM qmt_kline_attestation_row a FORCE INDEX (idx_qmt_kline_attestation_row_date) "
+                "WHERE a.protocol_version=:protocol_version "
+                "AND BINARY a.protocol_version=BINARY :protocol_version "
                 "AND a.qmt_id>0 "
+                "AND a.created_at<=:decision_known_at "
                 "AND BINARY a.source_pre_close_origin=BINARY 'NATIVE_QMT' "
                 "AND BINARY a.attestation_id=BINARY SHA2(CONCAT_WS('|', "
                 "a.protocol_version, a.target_id, a.qmt_id, "
@@ -7161,8 +7207,18 @@ def _authoritative_session_windows_with_proof(
                 "a.attested_low, a.attested_volume, a.attested_amount), 256) "
                 f"AND {a_share_stock_code_sql('a.stock_code')} "
                 "AND a.trade_date BETWEEN :start_date AND :as_of_date",
-                params,
-            ), flag="in_completed_attestation")
+                params, database=market_engine,
+            )
+            return targets, attestations
+
+        legacy_days = [day for day in session_days if day not in native_days]
+        batches = [legacy_days[offset:offset + batch_size] for offset in range(0, len(legacy_days), batch_size)]
+        for batch, (targets, attestations) in read_close_batches(batches, read_legacy, deadline=phase_deadline):
+            target_rows_by_key.clear()
+            target_keys_by_day.clear()
+            attestation_facts.clear()
+            record_rows(targets, flag="in_target")
+            record_rows(attestations, flag="in_completed_attestation")
             for day in batch:
                 for key in target_keys_by_day.get(day, []):
                     target_row = target_rows_by_key[key]
@@ -7198,6 +7254,7 @@ def _authoritative_session_windows_with_proof(
                             date.fromisoformat(day), datetime.min.time()
                         ) + timedelta(hours=15)
                         or received_at < source_time
+                        or received_at > cutoff
                     ):
                         continue
                     universe_index[key]["in_exact_attestation"] = 1
@@ -7225,10 +7282,12 @@ def _authoritative_session_windows_with_proof(
             "max_data_version": max(summary["data_versions"] - {""}),
             "latest_received_at": summary["latest_received_at"],
         } for day, summary in sorted(exact_summary.items())]
+    except TimeoutError as exc:
+        raise ValueError(str(exc)) from exc
+    except ValueError:
+        raise
     except Exception as exc:
-        raise ValueError(
-            "QMT原始前收盘价逐行认证尚未就绪"
-        ) from exc
+        raise ValueError("QMT原始前收盘价逐行认证读取失败") from exc
     expected_days = set(descending[:max(WINDOWS)])
     universe_sets: dict[str, dict[str, set[str]]] = {
         day: {
@@ -7291,7 +7350,8 @@ def _authoritative_session_windows_with_proof(
         for day in expected_days
     }
     matching_manifest_runs: dict[str, set[str]] = {
-        day: set() for day in expected_days
+        day: ({native_manifest_hashes[day]} if day in native_manifest_hashes else set())
+        for day in expected_days
     }
     for row in completed_run_rows:
         run_id = str(row.get("run_id") or "").strip()
@@ -7313,6 +7373,8 @@ def _authoritative_session_windows_with_proof(
         except (TypeError, ValueError):
             continue
         for day in expected_days:
+            if day in native_manifest_hashes:
+                continue
             if not (run_start <= day <= run_end):
                 continue
             manifest = daily_universe.get(day)
@@ -7377,8 +7439,9 @@ def _authoritative_session_windows_with_proof(
                 row.get("latest_received_at")
             ),
             "pre_close_attestation_protocol": (
-                QMT_PRECLOSE_ATTESTATION_PROTOCOL
+                DATADIR_COVERAGE_SCHEMA if day in native_manifest_hashes else QMT_PRECLOSE_ATTESTATION_PROTOCOL
             ),
+            **({"source_manifest_hash": native_manifest_hashes[day]} if day in native_manifest_hashes else {}),
         }
     result: dict[int, dict[str, Any]] = {}
     for window in WINDOWS:
@@ -7386,7 +7449,9 @@ def _authoritative_session_windows_with_proof(
             continue
         sessions = list(reversed(descending[:window]))
         payload = {
-            "schema": "probiga.authoritative-session-window.v1",
+            "schema": ("probiga.authoritative-session-window.v2"
+                       if any(day in native_manifest_hashes for day in sessions)
+                       else "probiga.authoritative-session-window.v1"),
             "window_days": window,
             "start_date": sessions[0],
             "end_date": sessions[-1],
@@ -7400,6 +7465,8 @@ def _authoritative_session_windows_with_proof(
             "calendar_receipt_binding_hash": calendar_binding["binding_hash"],
             "calendar_receipt": calendar_binding,
         }
+        if payload["schema"] == "probiga.authoritative-session-window.v2":
+            payload["source_knowledge_cutoff_at"] = cutoff.isoformat(timespec="seconds")
         result[window] = {
             **payload,
             "session_hash": _digest(payload),
@@ -7430,16 +7497,19 @@ def _authoritative_session_windows_with_proof(
             "matching_completed_manifest_run_count": len(
                 matching_manifest_runs[day]
             ),
+            **({"source_manifest_hash": native_manifest_hashes[day]} if day in native_manifest_hashes else {}),
         })
     proof_payload = {
-        "schema": "probiga.qmt-row-binding-proof.v1",
+        "schema": ("probiga.qmt-row-binding-proof.v2" if native_manifest_hashes
+                   else "probiga.qmt-row-binding-proof.v1"),
         "as_of_date": as_of_date,
         "start_date": oldest_required,
         "end_date": as_of_date,
         "session_count": len(proof_sessions),
         "protocol_version": QMT_PRECLOSE_ATTESTATION_PROTOCOL,
         "source_pre_close_origin": "NATIVE_QMT",
-        "row_run_binding": "SAME_COMPLETED_RUN_ID",
+        "row_run_binding": ("EXACT_COMPLETED_SESSION_SOURCE" if native_manifest_hashes
+                            else "SAME_COMPLETED_RUN_ID"),
         "sessions": proof_sessions,
         "calendar_receipt": calendar_binding,
     }
@@ -7450,11 +7520,13 @@ def _authoritative_session_windows_with_proof(
 
 
 def _authoritative_session_windows(
-    as_of_date: str,
+    as_of_date: str, *, decision_known_at: datetime | str | None = None,
 ) -> dict[int, dict[str, Any]]:
     """Resolve exact closed-session windows from the exchange calendar."""
 
-    windows, _proof = _authoritative_session_windows_with_proof(as_of_date)
+    windows, _proof = _authoritative_session_windows_with_proof(
+        as_of_date, decision_known_at=decision_known_at,
+    )
     return windows
 
 
@@ -14413,6 +14485,7 @@ def _prefetch_internal_strategy_ledger_facts(
     records_by_strategy: dict[str, list[dict[str, Any]]],
     *, as_of_date: str,
     replay_plans: dict[str, dict[str, Any]] | None = None,
+    market_cutoff: str | None = None,
 ) -> dict[str, Any]:
     """Load shared calendar, account and QMT marks in bounded batches."""
 
@@ -14474,6 +14547,7 @@ def _prefetch_internal_strategy_ledger_facts(
     calendar_binding = _calendar_receipt_binding(calendar_receipt)
     price_rows: list[dict[str, Any]] = []
     ordered_codes = sorted(stock_codes)
+    cutoff = normalize_decision_at(market_cutoff or f"{as_of_date} 23:59:59")
     for offset in range(0, len(ordered_codes), _LEDGER_PREFETCH_BATCH_SIZE):
         batch = ordered_codes[offset: offset + _LEDGER_PREFETCH_BATCH_SIZE]
         code_params = {
@@ -14503,7 +14577,14 @@ def _prefetch_internal_strategy_ledger_facts(
             "AND a.attested_open=k.`open` AND a.attested_close=k.`close` "
             "AND a.attested_high=k.`high` AND a.attested_low=k.`low` "
             "AND a.attested_volume=k.volume AND a.attested_amount=k.amount "
+            "AND a.created_at<=:market_cutoff "
+            "JOIN qmt_kline_attestation_run r ON r.run_id=a.run_id "
+            "AND BINARY r.run_id=BINARY a.run_id "
+            "AND BINARY r.status=BINARY 'COMPLETED' "
+            "AND BINARY r.provider=BINARY 'gj_big_qmt_inner' "
+            "AND r.finished_at<=:market_cutoff "
             "WHERE k.k_type=1 AND k.adjust_type=0 "
+            "AND k.received_at<=:market_cutoff "
             f"AND k.stock_code IN ({placeholders}) "
             "AND k.trade_date BETWEEN :start_day AND :as_of_date "
             "ORDER BY k.trade_date, k.stock_code",
@@ -14511,9 +14592,19 @@ def _prefetch_internal_strategy_ledger_facts(
                 **code_params,
                 "start_day": earliest,
                 "as_of_date": as_of_date,
+                "market_cutoff": cutoff,
                 "protocol_version": QMT_PRECLOSE_ATTESTATION_PROTOCOL,
             },
         ))
+    if market_cutoff and ordered_codes:
+        days = [row["trade_date"] for row in calendar_rows]
+        connection = current_bound_sql_connection()
+        with (nullcontext(connection) if connection is not None else get_engine().connect()) as connection:
+            native_days = datadir_manifest_days(connection, days, cutoff=cutoff)
+            price_rows = [row for row in price_rows if str(row["trade_date"])[:10] not in native_days]
+            for day in sorted(native_days):
+                native = load_native_datadir_close(connection, day, cutoff=cutoff)
+                price_rows.extend(row for row in native.rows if row["stock_code"] in stock_codes)
     account_rows: list[dict[str, Any]] = []
     ordered_accounts = sorted(account_ids)
     for offset in range(0, len(ordered_accounts), _LEDGER_PREFETCH_BATCH_SIZE):
@@ -15040,6 +15131,7 @@ def _internal_strategy_portfolio_ledger(
             f"code_{index}": code for index, code in enumerate(sorted(codes))
         }
         placeholders = ",".join(f":{key}" for key in code_params)
+        cutoff = normalize_decision_at(f"{as_of_date} 23:59:59")
         price_rows = _db_read(
             "SELECT k.stock_code, k.trade_date, k.close, k.pre_close, "
             "k.data_source, k.quality_status, k.permission_status, "
@@ -15063,7 +15155,14 @@ def _internal_strategy_portfolio_ledger(
             "AND a.attested_open=k.`open` AND a.attested_close=k.`close` "
             "AND a.attested_high=k.`high` AND a.attested_low=k.`low` "
             "AND a.attested_volume=k.volume AND a.attested_amount=k.amount "
+            "AND a.created_at<=:market_cutoff "
+            "JOIN qmt_kline_attestation_run r ON r.run_id=a.run_id "
+            "AND BINARY r.run_id=BINARY a.run_id "
+            "AND BINARY r.status=BINARY 'COMPLETED' "
+            "AND BINARY r.provider=BINARY 'gj_big_qmt_inner' "
+            "AND r.finished_at<=:market_cutoff "
             "WHERE k.k_type=1 AND k.adjust_type=0 "
+            "AND k.received_at<=:market_cutoff "
             f"AND k.stock_code IN ({placeholders}) "
             "AND k.trade_date "
             + (">:start_day " if incremental else ">=:start_day ")
@@ -15073,6 +15172,7 @@ def _internal_strategy_portfolio_ledger(
                 **code_params,
                 "start_day": start_day,
                 "as_of_date": as_of_date,
+                "market_cutoff": cutoff,
                 "protocol_version": QMT_PRECLOSE_ATTESTATION_PROTOCOL,
             },
         ) if prefetched_facts is None and code_params else [
@@ -15326,8 +15426,11 @@ def _internal_strategy_portfolio_ledger(
             )
             close_cutoff = f"{trade_day}T15:00:00"
             if (
-                fact.get("data_source") != "gj_big_qmt_inner"
-                or fact.get("quality_status") != "QMT_ATTESTED"
+                (fact.get("data_source"), fact.get("quality_status"),
+                 fact.get("pre_close_attestation_protocol")) not in {
+                    ("gj_big_qmt_inner", "QMT_ATTESTED", QMT_PRECLOSE_ATTESTATION_PROTOCOL),
+                    ("qmt_datadir", "VERIFIED", DATADIR_COVERAGE_SCHEMA),
+                }
                 or fact.get("permission_status") != "SUPPORTED"
                 or not source_time
                 or not received_at
@@ -15338,8 +15441,6 @@ def _internal_strategy_portfolio_ledger(
                 or not _HASH_PATTERN.fullmatch(
                     str(fact.get("attestation_id") or "")
                 )
-                or fact.get("pre_close_attestation_protocol")
-                != QMT_PRECLOSE_ATTESTATION_PROTOCOL
                 or fact.get("source_pre_close_origin") != "NATIVE_QMT"
             ):
                 raise ValueError(
@@ -16775,11 +16876,6 @@ def _metrics_for_registry(
     records = _load_forward_records(
         trade_date, registry, replay_plans=replay_plans,
     )
-    ledger_facts = _prefetch_internal_strategy_ledger_facts(
-        records,
-        as_of_date=trade_date,
-        replay_plans=replay_plans,
-    )
     result: dict[str, dict[int, dict[str, Any]]] = {}
     selected_checkpoint_storage_bytes = _initial_selected_storage_bytes
     target = date.fromisoformat(trade_date)
@@ -16793,6 +16889,12 @@ def _metrics_for_registry(
     except (TypeError, ValueError) as exc:
         session_windows = {}
         session_window_error = str(exc)[:500]
+    publication_proof = (snapshot.get("candidate_source") or {}).get("publication_proof") or {}
+    market_cutoff = publication_proof.get("decision_known_at")
+    ledger_facts = _prefetch_internal_strategy_ledger_facts(
+        records, as_of_date=trade_date, replay_plans=replay_plans,
+        **({"market_cutoff": market_cutoff} if market_cutoff else {}),
+    )
     def replay_mode(item: dict[str, Any]) -> str:
         return str((replay_plans.get(
             str(item.get("strategy_key") or "")
@@ -27994,7 +28096,13 @@ def governance_snapshot(
             )
         _require_authoritative_closed_trade_date(target)
         try:
-            authoritative_windows = _authoritative_session_windows(target)
+            candidate_source = strategy_snapshot.get("candidate_source") or {}
+            publication_proof = candidate_source.get("publication_proof") or {}
+            cutoff = publication_proof.get("decision_known_at")
+            authoritative_windows = (
+                _authoritative_session_windows(target, decision_known_at=cutoff)
+                if cutoff else _authoritative_session_windows(target)
+            )
         except (TypeError, ValueError) as exc:
             raise GovernanceEvidenceNotReady(
                 f"治理交易日窗口未通过QMT收盘交叉认证：{exc}"

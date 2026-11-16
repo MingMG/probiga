@@ -7,10 +7,12 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 import uuid
 from contextlib import contextmanager
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 
@@ -23,6 +25,7 @@ if str(ROOT) not in sys.path:
 from integrations.qmt.datadir import (  # noqa: E402
     CST,
     DAILY_PERIOD,
+    WORD_TIME,
     iter_daily_rows,
     load_dat,
     session_slice,
@@ -60,14 +63,20 @@ from server.common.qmt_datadir_result import (  # noqa: E402
 )
 from server.common.qmt_datadir_daily_coverage import (  # noqa: E402
     NATIVE_AMOUNT_WORD,
+    NATIVE_EVIDENCE_DATASET,
     build_manifest,
     canonical_bar,
     insert_manifest,
     load_daily_manifest,
+    load_daily_manifest_completion,
+    load_daily_native_evidence,
     native_amount_correction,
+    native_evidence_fingerprint,
     retained_listing_evidence,
     seal_native_amount_corrections,
+    seal_native_public_replacement,
     suspension_evidence,
+    validate_manifest,
     validate_native_revision,
 )
 from server.common.qmt_post_close_block_evidence import (  # noqa: E402
@@ -168,7 +177,7 @@ def _harvest(root: Path, universe, session: dt.date, *, deadline=None) -> dict:
             continue
         digest.update(member.qmt_code.encode("ascii"))
         digest.update(selected.tobytes())
-        for _, row in iter_daily_rows(dat, [session]):
+        for _, row in iter_daily_rows(replace(dat, records=selected), [session]):
             rows.append(row)
             codes.add(row[0])
     return {
@@ -234,7 +243,7 @@ def _reusable_partition(engine, *, session, harvested):
 
 
 def _coverage_manifest(engine, *, session, harvested, run_id, historical_documents=None,
-                       historical_public_bars=None, previous_session=""):
+                       historical_public_bars=None, previous_session="", archive_native_evidence=False):
     """Account for every catalog security before touching the live partition."""
     cutoff = dt.datetime.now(CST).replace(tzinfo=None, microsecond=0)
     day = session.isoformat()
@@ -246,12 +255,14 @@ def _coverage_manifest(engine, *, session, harvested, run_id, historical_documen
     rows = _harvested_daily_rows(harvested)
     missing = sorted(set(catalog.eligible_codes(day)) - set(harvested["codes"]))
     if historical_documents is not None:
-        return build_manifest(
+        manifest = build_manifest(
             catalog=catalog, calendar=calendar, day=day, rows=rows, run_id=run_id,
             captured_at=cutoff, historical_documents={code: historical_documents[code] for code in missing
                                                       if code in historical_documents},
             historical_public_bars=historical_public_bars, previous_session=previous_session,
+            native_content_sha256=harvested["digest"] if archive_native_evidence else "",
         )
+        return validate_manifest(manifest, catalog=catalog, calendar=calendar) if archive_native_evidence else manifest
     snapshot = {}
     unresolved = []
     delisting_documents = {}
@@ -297,11 +308,71 @@ def _coverage_manifest(engine, *, session, harvested, run_id, historical_documen
 
 
 @contextmanager
-def _daily_transaction(engine):
-    with mysql_named_lock(engine, STOCK_KLINE_FREEZE_LOCK_NAME, timeout_seconds=10) as connection:
+def _daily_transaction(engine, *, lock_name=STOCK_KLINE_FREEZE_LOCK_NAME):
+    with mysql_named_lock(engine, lock_name, timeout_seconds=10) as connection:
         connection.commit()
         with connection.begin():
             yield connection
+
+
+def _require_linux_daily_evidence_reader(connection, *, evidence="no-bar"):
+    from server.api.scheduler_runtime import _verified_linux_activation_build
+    from server.common.component_release import runtime_component_build_sha
+    from server.common.config import get_scheduler_runtime_config
+
+    linux_sha, reason = _verified_linux_activation_build(
+        connection, build_sha=runtime_component_build_sha("windows"),
+        expected_poll_seconds=int(get_scheduler_runtime_config()["poll_seconds"]),
+    )
+    if linux_sha is None:
+        raise RuntimeError(f"daily {evidence} evidence Linux reader is unavailable: {reason}")
+
+
+def _archived_result(archive, *, reused=False):
+    manifest, receipt = archive
+    counts = native_evidence_fingerprint(manifest)
+    return {
+        **counts, "status": "REUSED" if reused else "COMPLETE",
+        "dataset": NATIVE_EVIDENCE_DATASET, "run_id": manifest["run_id"],
+        "manifest_hash": manifest["manifest_hash"], "finished_at": str(receipt["finished_at"]),
+    }
+
+
+def _publish_native_archive(engine, *, manifest, source_root):
+    """Commit historical QMT evidence independently of the ordinary daily product."""
+    day = manifest["trade_date"]
+    counts = native_evidence_fingerprint(manifest)
+    with _daily_transaction(engine, lock_name=f"probiga:qmt-native-daily:{day}") as connection:
+        now = connection.execute(text("SELECT CURRENT_TIMESTAMP")).scalar_one()
+        existing = load_daily_native_evidence(connection, day, decision_known_at=now)
+        if existing is not None:
+            return _archived_result(existing, reused=True)
+        if os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip().lower() == "production":
+            _require_linux_daily_evidence_reader(connection, evidence="historical native")
+        insert_manifest(connection, manifest)
+        detail = {
+            "row_hash": counts["row_hash"], "coverage": 1.0,
+            "readback_rows": counts["row_count"], "readback_codes": counts["code_count"],
+            "eligible_code_count": len(manifest["entities"]),
+            "full_market_manifest_hash": manifest["manifest_hash"],
+        }
+        connection.execute(text(f"""
+            INSERT INTO `{RECEIPT_TABLE}`
+              (dataset,trade_date,source_root,status,code_count,row_count,content_sha256,
+               run_id,started_at,finished_at,detail_json)
+            VALUES (:dataset,:day,:root,'COMPLETE',:codes,:rows,:sha,:run_id,:started_at,CURRENT_TIMESTAMP,:detail)
+        """), {"dataset": NATIVE_EVIDENCE_DATASET, "day": day, "root": str(source_root),
+               "codes": counts["code_count"], "rows": counts["row_count"],
+               "sha": manifest["native_content_sha256"], "run_id": manifest["run_id"],
+               "started_at": now, "detail": json.dumps(detail, ensure_ascii=False, separators=(",", ":"))})
+        cutoff = connection.execute(text("SELECT CURRENT_TIMESTAMP")).scalar_one()
+        written = load_daily_native_evidence(connection, day, decision_known_at=cutoff)
+        if written is None or written[0]["manifest_hash"] != manifest["manifest_hash"]:
+            raise ValueError("historical native evidence readback differs before commit")
+    committed = load_daily_native_evidence(engine, day, decision_known_at=cutoff)
+    if committed is None or committed[0]["manifest_hash"] != manifest["manifest_hash"]:
+        raise ValueError("historical native evidence committed readback differs")
+    return _archived_result(committed)
 
 
 def _historical_append_plan(connection, *, day, proof):
@@ -401,6 +472,57 @@ def _exact_amount_repair_manifest(engine, *, session, harvested, run_id, require
         {**original, "captured_at": cutoff.isoformat(" "), "run_id": run_id, "entities": updated},
         prior_run_id=original["run_id"], prior_manifest_hash=original["manifest_hash"], corrections=corrections,
     )
+
+
+def _prepare_native_public_replacement(engine, *, session, symbol, root, run_id):
+    """Read one native DAT record and bind it to a previously published public bar."""
+    day = session.isoformat()
+    code, market = symbol.split(".")
+    cutoff = dt.datetime.now(CST).replace(tzinfo=None, microsecond=0)
+    with engine.connect() as connection:
+        prior = load_daily_manifest(connection, day, decision_known_at=cutoff)
+        if prior is None:
+            raise ValueError("native public replacement requires an existing complete daily publication")
+        catalog = load_stock_catalog(connection, batch_id=prior["catalog_batch_id"], decision_known_at=cutoff)
+        if not any(member.get("qmt_code") == symbol for member in catalog.members):
+            raise ValueError("native public replacement security differs from the pinned catalog")
+        receipt = load_daily_manifest_completion(connection, day, manifest=prior, decision_known_at=cutoff)
+        if receipt is None:
+            raise ValueError("native public replacement predecessor has no durable completion")
+    dat = load_dat(root, market, DAILY_PERIOD, code)
+    selected = session_slice(dat.records, session) if dat is not None else ()
+    observed_at = dt.datetime.now(CST).replace(tzinfo=None, microsecond=0)
+    if len(selected) != 1:
+        raise ValueError("native public replacement requires one exact DAT record")
+    [(target, row)] = iter_daily_rows(replace(dat, records=selected), [session])
+    harvested = {"rows": [row], "codes": {code}, "digest": hashlib.sha256(selected.tobytes()).hexdigest()}
+    native = _harvested_daily_rows(harvested)[0]
+    if code not in (prior.get("historical_public_bars") or {}):
+        existing = prior.get("native_public_replacement") or {}
+        if (existing.get("qmt_code") == symbol and existing.get("native_record_sha256") == harvested["digest"]
+                and existing.get("native_bar_sha256") == canonical_digest(canonical_bar(native))):
+            return prior, harvested, True
+        raise ValueError("native public replacement requires the exact public predecessor bar")
+    if target != session or row[0] != code:
+        raise ValueError("native public replacement DAT record identity differs")
+    proof = seal_native_public_replacement(
+        prior, prior_completion=receipt, bar=native, run_id=run_id, qmt_code=symbol,
+        native_event_at=dt.datetime.fromtimestamp(int(selected[0][WORD_TIME]), CST),
+        observed_at=observed_at, native_record_sha256=harvested["digest"],
+    )
+    return proof, harvested, False
+
+
+def _native_public_replacement_predecessor(connection, *, manifest, day):
+    replacement = manifest["native_public_replacement"]
+    cutoff = replacement["observed_at"]
+    prior = load_daily_manifest(connection, day, decision_known_at=cutoff)
+    receipt = load_receipt(connection, dataset=DATASET, trade_date=day)
+    if (prior is None or prior["manifest_hash"] != replacement["prior_manifest_hash"] or receipt is None
+            or receipt["run_id"] != replacement["prior_run_id"]
+            or canonical_digest(receipt) != replacement["prior_completion_sha256"]):
+        raise ValueError("native public replacement predecessor changed before publication")
+    return receipt
 
 
 def _with_public_bars(harvested, public, *, session):
@@ -504,9 +626,11 @@ def _publish(
     row_template = "(" + ",".join(["%s"] * 24) + ")"
     temp_table = f"tmp_qmt_daily_{run_id}"
     historical = coverage_manifest.get("historical_reconstruction") is True
+    native_public = coverage_manifest.get("native_public_replacement")
     repair = historical or bool(coverage_manifest.get("native_amount_correction"))
+    expected_rows = len(covered_codes) if native_public else len(rows)
     with _daily_transaction(engine) as connection:
-        if os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip().lower() == "production" and any(
+        if os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip().lower() == "production" and (native_public or any(
             entity["evidence"].get("kind") == DAILY_SUSPENSION_KIND
             or (
                 not historical and (
@@ -516,21 +640,21 @@ def _publish(
                 )
             )
             for entity in coverage_manifest["entities"]
-        ):
+        )):
             # The older DAT-only writer can start during Windows handoff.
             # Publish this new proof only after its Linux reader is active.
-            from server.api.scheduler_runtime import _verified_linux_activation_build
-            from server.common.component_release import runtime_component_build_sha
-            from server.common.config import get_scheduler_runtime_config
-
-            linux_sha, reason = _verified_linux_activation_build(
-                connection, build_sha=runtime_component_build_sha("windows"),
-                expected_poll_seconds=int(get_scheduler_runtime_config()["poll_seconds"]),
+            _require_linux_daily_evidence_reader(
+                connection, evidence="native public replacement" if native_public else "no-bar",
             )
-            if linux_sha is None:
-                raise RuntimeError(f"daily no-bar evidence Linux reader is unavailable: {reason}")
         previous = None
-        if repair:
+        if native_public:
+            previous = _native_public_replacement_predecessor(
+                connection, manifest=coverage_manifest, day=session.isoformat(),
+            )
+            if len(payload) != 1 or payload[0][0] != native_public["stock_code"]:
+                raise ValueError("native public replacement write scope differs")
+            missing, corrections = set(), []
+        elif repair:
             missing, corrections, previous = _historical_append_plan(connection, day=session.isoformat(), proof=coverage_manifest)
             if historical and corrections:
                 coverage_manifest = seal_native_amount_corrections(coverage_manifest, prior_run_id=previous["run_id"],
@@ -611,8 +735,13 @@ def _publish(
             )}})
             if updated.rowcount != 1:
                 raise ValueError("BSE post-close revision write count differs")
-        if not repair:
-            connection.execute(
+        if not repair or native_public:
+            predecessor_guard = (
+                "AND target.data_source=:prior_source AND target.quality_status=:prior_quality "
+                "AND target.permission_status='SUPPORTED'"
+                if native_public else ""
+            )
+            updated = connection.execute(
                 text(
                 f"""
                 UPDATE `{TARGET_TABLE}` AS target
@@ -644,25 +773,29 @@ def _publish(
                 WHERE target.trade_date=:d
                   AND target.k_type=1
                   AND target.adjust_type=0
+                  {predecessor_guard}
                 """
                 ),
-                {"d": session},
+                {"d": session, "prior_source": SINA_PROVIDER, "prior_quality": SINA_QUALITY},
             )
-        inserted = connection.exec_driver_sql(
-            f"""
-            INSERT INTO `{TARGET_TABLE}` ({columns})
-            SELECT {stage_columns}
-            FROM `{temp_table}` AS stage
-            LEFT JOIN `{TARGET_TABLE}` AS target
-              ON target.stock_code=stage.stock_code
-             AND target.trade_date=stage.trade_date
-             AND target.k_type=stage.k_type
-             AND target.adjust_type=stage.adjust_type
-            WHERE target.id IS NULL
-            """
-        )
-        if repair and inserted.rowcount != len(missing):
-            raise ValueError("historical daily missing row insert count differs")
+            if native_public and updated.rowcount != 1:
+                raise ValueError("native public replacement write count differs")
+        if not native_public:
+            inserted = connection.exec_driver_sql(
+                f"""
+                INSERT INTO `{TARGET_TABLE}` ({columns})
+                SELECT {stage_columns}
+                FROM `{temp_table}` AS stage
+                LEFT JOIN `{TARGET_TABLE}` AS target
+                  ON target.stock_code=stage.stock_code
+                 AND target.trade_date=stage.trade_date
+                 AND target.k_type=stage.k_type
+                 AND target.adjust_type=stage.adjust_type
+                WHERE target.id IS NULL
+                """
+            )
+            if repair and inserted.rowcount != len(missing):
+                raise ValueError("historical daily missing row insert count differs")
         if not repair:
             connection.execute(
                 text(
@@ -683,7 +816,7 @@ def _publish(
                 {"d": session},
             )
         fingerprint = _completion_fingerprint(connection, day=session.isoformat(), proof=coverage_manifest)
-        if (fingerprint["row_count"] != len(rows)
+        if (fingerprint["row_count"] != expected_rows
                 or fingerprint["code_count"] != len(covered_codes)):
             raise ValueError("daily database readback differs before completion")
         insert_manifest(connection, coverage_manifest)
@@ -721,7 +854,7 @@ def _publish(
                 "d": session,
                 "root": str(source_root),
                 "codes": len(covered_codes),
-                "rows": len(rows),
+                "rows": expected_rows,
                 "sha": content_sha256,
                 "run_id": run_id,
                 "repair": repair,
@@ -733,7 +866,7 @@ def _publish(
                                manifest_hash=coverage_manifest["manifest_hash"]) is None:
             raise ValueError("daily immutable proof readback failed before completion")
     result = {
-        "row_count": len(rows),
+        "row_count": expected_rows,
         "code_count": len(covered_codes),
         "readback_rows": int(fingerprint["row_count"]),
         "readback_codes": int(fingerprint["code_count"]),
@@ -747,6 +880,8 @@ def _publish(
                       finished_at=str(receipt["finished_at"]), appended_codes=sorted(missing),
                       retained_rows=previous["row_count"] - len(corrections),
                       amount_corrected_codes=[row["stock_code"] for row in amount_repairs])
+        if native_public:
+            result["native_replaced_code"] = native_public["qmt_code"]
         if close_repairs:
             result["post_close_scope_corrected_codes"] = [row["stock_code"] for row in close_repairs]
         if public:
@@ -768,17 +903,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--replace-existing", action="store_true")
     parser.add_argument("--historical-lifecycle", type=Path,
                         help="JSON object of security codes to official CNINFO PDF locators; preserve existing rows")
+    parser.add_argument("--archive-native-evidence", action="store_true",
+                        help="Publish historical native evidence without changing the ordinary daily product")
     parser.add_argument("--repair-native-amount-only", action="store_true",
                         help="Correct truncated native amounts for one exact closed partition")
     parser.add_argument("--repair-native-post-close-code", default="",
                         help="Attest one published BSE block trade and correct the same exact closed partition")
+    parser.add_argument("--repair-native-public-code", default="",
+                        help="Supersede one exact corroborated public bar with its native QMT DAT record")
     parser.add_argument("--public-fallback-code", action="append", default=[],
                         help="Require corroborated public fallback for a missing code in one explicit historical session")
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     exact_repair = bool(args.repair_native_amount_only or args.repair_native_post_close_code)
-    repair = bool(args.historical_lifecycle or exact_repair)
+    native_public_repair = bool(args.repair_native_public_code)
+    repair = bool(args.historical_lifecycle or exact_repair or native_public_repair)
     load_project_env()
     engine = (create_batch_engine(connect_args={"connect_timeout": 5, "read_timeout": 30, "write_timeout": 15})
               if repair else create_batch_engine())
@@ -793,6 +933,8 @@ def main(argv: list[str] | None = None) -> int:
         end = dt.date.fromisoformat(args.end)
     if args.public_fallback_code and (not args.historical_lifecycle or start != end):
         parser.error("public fallback requires a single explicit historical lifecycle session")
+    if args.archive_native_evidence and (not args.historical_lifecycle or args.public_fallback_code):
+        parser.error("native archive requires historical lifecycle evidence and exclusively native traded bars")
     locators = historical_documents = None
     deadline = None
     if args.historical_lifecycle:
@@ -805,24 +947,55 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("historical lifecycle locator file exceeds 32 KiB")
         deadline = time.monotonic() + 300
         locators = json.loads(raw_locators)
-    if exact_repair:
+    if exact_repair or native_public_repair:
         latest = dt.date.fromisoformat(authoritative_closed_trade_date(engine))
         if (args.latest_session or args.replace_existing or args.historical_lifecycle or start != end or end > latest
-                or (args.repair_native_amount_only and args.repair_native_post_close_code)):
+                or sum(bool(mode) for mode in (args.repair_native_amount_only, args.repair_native_post_close_code,
+                                               args.repair_native_public_code)) != 1):
             parser.error("exact native repair requires one explicit closed session and repair mode")
+        if native_public_repair and not re.fullmatch(r"[0-9]{6}\.(SH|SZ|BJ)", args.repair_native_public_code):
+            parser.error("native public repair requires an exact six-digit QMT symbol with market suffix")
         deadline = time.monotonic() + 180
     root = Path(args.datadir_root)
     if not root.is_dir():
         parser.error(f"datadir root does not exist: {root}")
     sessions = _sessions(engine, start, end)
-    universe = load_universe(engine, start=start, end=end)
-    short_names = _short_names(engine)
+    if native_public_repair and sessions != [start]:
+        parser.error("native public repair requires an authoritative trading session")
+    universe = None if native_public_repair else load_universe(engine, start=start, end=end)
+    short_names = {} if args.archive_native_evidence else _short_names(engine)
     results = []
     unavailable = {}
     for position, session in enumerate(sessions, 1):
         if repair:
             print(f"Daily repair {position}/{len(sessions)} {session}: validating DAT and authority", file=sys.stderr)
-        sources = _existing_sources(engine, session)
+        if native_public_repair:
+            run_id = new_run_id()
+            proof, harvested, reused = _prepare_native_public_replacement(
+                engine, session=session, symbol=args.repair_native_public_code, root=root, run_id=run_id,
+            )
+            if time.monotonic() >= deadline:
+                raise TimeoutError("native public daily repair deadline exceeded before publication")
+            if reused or not args.apply:
+                results.append({"session": session.isoformat(), "status": "REUSED" if reused else "READY",
+                                "native_replaced_code": args.repair_native_public_code,
+                                "run_id": proof["run_id"], "manifest_hash": proof["manifest_hash"]})
+                continue
+            traded = {entity["stock_code"] for entity in proof["entities"]
+                      if entity["classification"] == "TRADED"}
+            published = _publish(
+                engine, session=session, rows=harvested["rows"], covered_codes=traded, short_names=short_names,
+                run_id=run_id, source_root=root, content_sha256=harvested["digest"],
+                eligible_code_count=len(proof["entities"]), coverage_manifest=proof,
+            )
+            results.append({"session": session.isoformat(), "status": "COMPLETE", **published})
+            continue
+        if args.archive_native_evidence:
+            archived = load_daily_native_evidence(engine, session.isoformat(), decision_known_at=dt.datetime.now(CST))
+            if archived is not None:
+                results.append({"session": session.isoformat(), **_archived_result(archived, reused=True)})
+                continue
+        sources = [] if args.archive_native_evidence else _existing_sources(engine, session)
         if sources and not args.replace_existing and not repair:
             results.append({
                 "session": session.isoformat(),
@@ -831,7 +1004,7 @@ def main(argv: list[str] | None = None) -> int:
             })
             continue
         harvested = _harvest(root, universe, session, deadline=deadline)
-        reused = _reusable_partition(engine, session=session, harvested=harvested)
+        reused = None if args.archive_native_evidence else _reusable_partition(engine, session=session, harvested=harvested)
         if reused is not None:
             results.append({"session": session.isoformat(), "status": "REUSED",
                             "run_id": reused["run_id"], "manifest_hash": reused["manifest_hash"]})
@@ -878,7 +1051,22 @@ def main(argv: list[str] | None = None) -> int:
                 engine, session=session, harvested=harvested, run_id=run_id,
                 historical_documents=historical_documents,
                 historical_public_bars=public, previous_session=previous_day,
+                archive_native_evidence=args.archive_native_evidence,
             )
+        if args.archive_native_evidence:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("historical native evidence deadline exceeded before publication")
+            if args.apply:
+                archived_result = _publish_native_archive(engine, manifest=coverage_manifest, source_root=root)
+            else:
+                archived_result = {
+                    "status": "READY", "dataset": NATIVE_EVIDENCE_DATASET,
+                    "manifest_hash": coverage_manifest["manifest_hash"],
+                    "eligible_code_count": len(coverage_manifest["entities"]),
+                    **native_evidence_fingerprint(coverage_manifest),
+                }
+            results.append({"session": session.isoformat(), **archived_result})
+            continue
         if not args.apply:
             append_detail = {}
             if repair or coverage_manifest.get("native_amount_correction"):
@@ -931,6 +1119,8 @@ def main(argv: list[str] | None = None) -> int:
         "failures": len(unavailable),
         "results": results,
     }
+    if args.archive_native_evidence:
+        payload["dataset"] = NATIVE_EVIDENCE_DATASET
     if not args.apply or repair:
         print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
         return 1 if unavailable else 0

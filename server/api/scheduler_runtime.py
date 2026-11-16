@@ -6902,10 +6902,14 @@ def _renew_daily_stage_lease_until_stopped(
     proc,
     stop_event: threading.Event,
     lease_lost_event: threading.Event,
+    owner_authorized=None,
 ) -> None:
     """Keep one writer lease alive and terminate it after a proven fence loss."""
 
     while not stop_event.wait(DAILY_STAGE_LEASE_HEARTBEAT_SECONDS):
+        if owner_authorized is not None and not owner_authorized():
+            lease_lost_event.set()
+            return
         try:
             renewed = renew_daily_stage_lease(
                 engine,
@@ -10220,7 +10224,13 @@ def _task_history_finish(
                 @contextmanager
                 def transaction():
                     with _analysis_execution_lock(engine, evidence["target_trade_date"]) as verify_owner:
-                        with engine.begin() as connection:
+                        # Staging reads sealed data before the final locking reads.
+                        # MySQL must see renewals and newer fences at that boundary.
+                        publisher = (
+                            engine.execution_options(isolation_level="READ COMMITTED")
+                            if engine.dialect.name == "mysql" else engine
+                        )
+                        with publisher.begin() as connection:
                             verify_owner()
                             yield connection
                             verify_owner()
@@ -10244,16 +10254,62 @@ def _task_history_finish(
                             require_premarket_publication_window(slot)
         terminal_step = "commit_terminal_audit"
         with transaction() as conn:
+            staged_initial = None
+            stage_lost = False
+            if initial_selection is not None:
+                from server.common.formal_score_publication import publish_initial_selection
+
+                # The two heartbeats must be able to renew their exact control
+                # rows while the full-market projection is being staged.
+                stage = intent["stage_identity"]
+                stage_lease_lost = threading.Event()
+                stage_renewal_stop = threading.Event()
+                stage_renewal = None
+                if (
+                    stage is not None and stage["lease_owner"] == _scheduler_instance_id
+                    and owner_lease is not None and owner_lease.authorized()
+                ):
+                    stage_renewal = threading.Thread(
+                        target=_renew_daily_stage_lease_until_stopped,
+                        kwargs=dict(
+                            engine=engine, attempt_uid=stage["attempt_uid"],
+                            fencing_token=stage["fencing_token"], lease_owner=stage["lease_owner"],
+                            proc=None, stop_event=stage_renewal_stop, lease_lost_event=stage_lease_lost,
+                            owner_authorized=owner_lease.authorized,
+                        ),
+                        daemon=True,
+                        name=f"daily-stage-publication-{run_uid[:12]}",
+                    )
+                    stage_renewal.start()
+                try:
+                    terminal_step = "publish_initial_scores"
+                    staged_initial = publish_initial_selection(
+                        conn, initial_selection, run_uid=run_uid,
+                        build_sha=intent["identity"]["build_sha"],
+                        trade_date=evidence["target_trade_date"],
+                    )
+                finally:
+                    if stage_renewal is not None:
+                        stage_renewal_stop.set()
+                        stage_renewal.join(timeout=2.0)
+                stage_lost = stage_lease_lost.is_set()
+                terminal_step = "verify_initial_publication_fence"
             if not _terminal_check_running(conn, run_uid, intent, for_update=True):
                 raise _TerminalPersistencePending("scheduler terminal run changed before transaction")
             intent = _terminal_expired_publication(
                 conn, journal, run_uid, intent,
-                owner_lost=owner_lease is not None and owner_lease.lost.is_set(),
+                owner_lost=stage_lost or (owner_lease is not None and owner_lease.lost.is_set()),
             )
             values = intent["outcome"]
             status, duration, exit_code, output, publication_receipt = (
                 values["status"], values["duration"], values["exit_code"],
                 values["output"], values["publication_receipt"])
+            if initial_selection is not None:
+                if status != "success":
+                    # Roll back the staged score writes before the normal
+                    # terminal replay persists the journal's rejection.
+                    raise _TerminalPersistencePending("staged formal publication lost its lease")
+                publication_receipt = staged_initial
             with _running_lock:
                 _pending_terminal_writes[run_uid] = dict(values, _durable=True)
             activation_receipt: dict[str, object] = {}
@@ -10266,15 +10322,6 @@ def _task_history_finish(
             )
             history_evidence = _history_validation_evidence(output)
             stage_checkpoint = history_evidence
-            if initial_selection is not None and status == "success":
-                from server.common.formal_score_publication import publish_initial_selection
-
-                terminal_step = "publish_initial_scores"
-                publication_receipt = publish_initial_selection(
-                    conn, initial_selection, run_uid=run_uid,
-                    build_sha=intent["identity"]["build_sha"],
-                    trade_date=history_evidence["target_trade_date"],
-                )
             if revision_context is not None and status == "success":
                 from server.common.frozen_strategy_pool_work import publish_prepared_premarket_pool
 

@@ -324,7 +324,7 @@ def load_qmt_daily_market_truth(
     if start > end:
         raise ValueError("QMT daily truth range is invalid")
     decision_time = _timestamp(decision_known_at)
-    from server.common.qmt_datadir_daily_coverage import load_daily_manifest
+    from server.common.qmt_datadir_daily_coverage import load_daily_manifest, load_daily_manifest_completion
     cache = (load_daily_manifest(connection, start, decision_known_at=decision_time)
              if start == end else None)
     if cache is not None:
@@ -335,9 +335,8 @@ def load_qmt_daily_market_truth(
         traded = [entity for entity in cache["entities"] if entity["classification"] == "TRADED"]
         available_at = cache["captured_at"]
         if cache.get("historical_reconstruction") is True or cache.get("native_amount_correction"):
-            from server.common.qmt_datadir_result import load_receipt
-            receipt = load_receipt(connection, dataset="stock_daily", trade_date=start)
-            if receipt is None or receipt.get("run_id") != cache["run_id"]:
+            receipt = load_daily_manifest_completion(connection, start, manifest=cache, decision_known_at=decision_time)
+            if receipt is None:
                 raise RuntimeError("historical QMT daily completion receipt differs")
             available_at = _qmt_datadir_receipt_finished_at(receipt, trade_date=start)
             if available_at > decision_time:
