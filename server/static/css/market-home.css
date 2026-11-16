@@ -33,7 +33,159 @@ body.market-home-active .header :is(button:focus-visible, .date-input:focus-visi
 }
 
 body.market-home-active .main-content > .content {
-    padding: 8px 8px 18px;
+    padding: 0 16px 24px;
+    background-color: #0b0e12;
+    background-image: linear-gradient(#a99a7421 1px, transparent 1px), linear-gradient(90deg, #a99a7421 1px, transparent 1px);
+    background-size: 36px 36px;
+}
+
+.mh-hub {
+    --hub-panel: #11161c;
+    --hub-edge: #282b2e;
+    --hub-ink: #f0eee5;
+    --hub-muted: #afb4bc;
+    --hub-gold: #d6bd85;
+    max-width: 1160px;
+    margin: 0 auto;
+    padding: 24px 0 28px;
+    color: var(--hub-ink);
+}
+
+.mh-hub-head,
+.mh-calendar-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.mh-hub-head { margin-bottom: 14px; }
+.mh-hub-head > div,
+.mh-calendar-head > div { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.mh-hub h2, .mh-hub h3, .mh-hub h4, .mh-hub p { margin: 0; }
+.mh-hub h2 { font-size: clamp(21px, 3vw, 28px); font-weight: 750; }
+.mh-hub-head p, .mh-hub-meta { color: var(--hub-muted); font-size: 12px; }
+.mh-hub time, .mh-update-feed time { font-variant-numeric: tabular-nums; }
+
+.mh-hub-top { display: grid; grid-template-columns: 1.6fr 1fr; gap: 12px; }
+.mh-hub-panel {
+    min-width: 0;
+    padding: 14px;
+    background: var(--hub-panel);
+    border: 1px solid var(--hub-edge);
+    border-radius: 11px;
+}
+
+.mh-calendar-head h3, .mh-hub-section h3 { font-size: 14px; }
+.mh-calendar-head time { font-size: 12px; }
+.mh-calendar-head select {
+    background: #191d24;
+    color: var(--hub-ink);
+    border: 1px solid var(--hub-edge);
+    border-radius: 5px;
+    padding: 4px 8px;
+}
+
+.mh-update-feed {
+    max-height: 264px;
+    overflow: auto;
+    margin: 10px 0 0;
+    padding: 0;
+    list-style: none;
+    scrollbar-width: thin;
+    scrollbar-color: var(--hub-edge) transparent;
+}
+
+.mh-update-feed li { border-bottom: 1px solid #ffffff0c; }
+.mh-update-feed button {
+    display: grid;
+    grid-template-columns: minmax(46px, auto) 42px minmax(0, 1fr);
+    align-items: center;
+    gap: 9px;
+    width: 100%;
+    text-align: left;
+    padding: 8px 5px;
+    border: 0;
+    background: transparent;
+    color: var(--hub-ink);
+    cursor: pointer;
+}
+.mh-update-feed time { color: var(--hub-muted); font-size: 11px; }
+.mh-update-feed span { color: var(--hub-gold); font-size: 11px; }
+.mh-update-feed strong { font-size: 12px; font-weight: 550; overflow-wrap: anywhere; }
+
+.mh-calendar-grid {
+    display: grid;
+    grid-template-columns: repeat(7, minmax(0, 1fr));
+    gap: 4px;
+    margin: 12px 0 9px;
+    text-align: center;
+}
+.mh-calendar-grid > span { color: var(--hub-muted); font-size: 11px; }
+.mh-calendar-grid button {
+    position: relative;
+    min-height: 27px;
+    padding: 2px;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    background: #191d24;
+    color: var(--hub-ink);
+    cursor: pointer;
+    font-size: 12px;
+}
+.mh-calendar-grid button[aria-pressed="true"] { border-color: var(--hub-gold); background: #302a21; }
+.mh-calendar-grid i { position: absolute; right: 4px; top: 4px; width: 4px; height: 4px; border-radius: 50%; background: var(--hub-gold); }
+
+.mh-hub-section { margin-top: 22px; }
+.mh-hub-section > h3 { display: flex; gap: 12px; align-items: center; margin-bottom: 10px; }
+.mh-hub-section > h3::after { content: ""; flex: 1; height: 1px; background: var(--hub-edge); }
+.mh-hub-cards { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+.mh-hub-card {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 134px;
+    padding: 13px;
+    background: linear-gradient(155deg, #191d24, var(--hub-panel) 65%);
+    border: 1px solid var(--hub-edge);
+    border-left-color: #a793617d;
+    border-radius: 9px;
+}
+.mh-hub-card:hover, .mh-hub-card:focus-within { border-color: #a793618f; background: #191d24; }
+.mh-hub-card h4 { font-size: 14px; color: var(--hub-ink); }
+.mh-hub-card p { margin: 6px 0 11px; color: var(--hub-muted); font-size: 12px; line-height: 1.55; }
+.mh-hub-card footer { display: flex; align-items: end; justify-content: end; gap: 6px; margin-top: auto; }
+.mh-card-state { margin-right: auto; min-width: 0; color: var(--hub-gold); font-size: 11px; }
+.mh-card-state small { display: block; overflow-wrap: anywhere; color: var(--hub-muted); font-size: 10px; }
+.mh-hub-button {
+    flex: none;
+    cursor: pointer;
+    display: inline-block;
+    border: 1px solid #7e6d4c;
+    border-radius: 5px;
+    background: #171a20;
+    padding: 4px 8px;
+    color: var(--hub-gold);
+    text-decoration: none;
+    line-height: 1.5;
+    font-size: 12px;
+}
+.mh-hub :is(button, a, select):focus-visible { outline: 2px solid var(--hub-gold); outline-offset: 2px; }
+.mh-hub button:disabled { opacity: .44; cursor: default; }
+.mh-hub :is(button:not(:disabled), a):hover { background: #302a21; }
+#mh-market-observation { scroll-margin-top: 76px; }
+
+@media (max-width: 1050px) {
+    .mh-hub-cards { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+@media (max-width: 760px) {
+    .mh-hub-top { grid-template-columns: minmax(0, 1fr); }
+    .mh-hub-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 400px) {
+    body.market-home-active .main-content > .content { padding-inline: 10px; }
+    .mh-hub-card { padding: 9px; }
 }
 
 .market-home {

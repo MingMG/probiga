@@ -84,9 +84,9 @@ assert.doesNotMatch(invalid, /上涨占比 25/);
 def test_home_requests_read_only_sources_and_discards_prior_date_response():
     run_node(r"""
 global.document = {activeElement:null};
-const container = {innerHTML:'', listeners:new Set(), contains:() => false,
-    addEventListener(_type, listener) {this.listeners.add(listener);},
-    removeEventListener(_type, listener) {this.listeners.delete(listener);}};
+const container = {innerHTML:'', listeners:new Map(), contains:() => false,
+    addEventListener(type, listener) {this.listeners.set(type, listener);},
+    removeEventListener(type, listener) {if (this.listeners.get(type) === listener) this.listeners.delete(type);}};
 const calls = [];
 const request = (url, timeout, options) => new Promise(resolve => calls.push({url,timeout,options,resolve}));
 (async function () {
@@ -94,19 +94,22 @@ const request = (url, timeout, options) => new Promise(resolve => calls.push({ur
         const old = page.load('2026-11-05', container, {request});
         const current = page.load('2026-11-06', container, {request});
         const paths = ['/api/monitor/data', '/api/hot-data/market-trend', '/api/monitor/board', '/api/monitor/sector-heatmap'];
-        const expected = ['2026-11-05','2026-11-06'].flatMap(date => paths.map(path => path + '?date=' + date));
+        const expected = ['2026-11-05','2026-11-06'].flatMap(date => [
+            ...paths.map(path => path + '?date=' + date), '/api/hot-data/daily-review-dates',
+            '/api/scheduler/daily-delivery?trade_date=' + date + '&attempt_limit=12'
+        ]);
         assert.deepEqual(calls.map(call => call.url), expected);
         assert.ok(calls.every(call => call.timeout === 15000 && call.options.cache === 'no-store'));
-        assert.equal(container.listeners.size, 1);
-        calls.slice(paths.length).forEach(call => call.resolve({trade_date:'2026-11-06', data_source:'新日期来源'}));
+        assert.equal(container.listeners.size, 2);
+        calls.slice(paths.length + 2).forEach(call => call.resolve({trade_date:'2026-11-06', data_source:'新日期来源'}));
         await current;
-        const listener = Array.from(container.listeners)[0];
+        const listener = container.listeners.get('click');
         container.contains = target => Boolean(target);
         listener({target:{closest:() => ({dataset:{mhHeatMode:'concept:net_inflow'}})}});
         assert.match(container.innerHTML, /aria-pressed="true"[^>]*data-mh-heat-mode="concept:net_inflow"/);
         assert.match(container.innerHTML, /aria-pressed="true"[^>]*data-mh-heat-mode="industry:change"/);
-        assert.equal(calls.length, 8);
-        calls.slice(0,paths.length).forEach(call => call.resolve({trade_date:'2026-11-05', data_source:'旧日期来源'}));
+        assert.equal(calls.length, expected.length);
+        calls.slice(0,paths.length + 2).forEach(call => call.resolve({trade_date:'2026-11-05', data_source:'旧日期来源'}));
         await old;
         assert.match(container.innerHTML, /新日期来源/);
         assert.doesNotMatch(container.innerHTML, /旧日期来源/);
@@ -115,6 +118,28 @@ const request = (url, timeout, options) => new Promise(resolve => calls.push({ur
         assert.equal(container.listeners.size, 0);
     }
 })().catch(error => {console.error(error); process.exitCode = 1;});
+""")
+
+
+def test_home_hub_only_claims_accepted_delivery_with_matching_receipt():
+    run_node(r"""
+const date = '2026-11-06';
+const clock = {today:'2026-11-10'};
+const attempt = {status:'SUCCESS',stage_name:'stock_daily',finished_at:date + ' 15:40:00'};
+const reviewDates = {dates:[date]};
+const delivery = {trade_date:date,status:'PASS',data:{session:{updated_at:date + ' 15:42:00'},attempts:[attempt]}};
+const html = page.render({reviewDates,delivery},date,clock);
+for (const text of ['A股大看板','更新时间流','研究日历','信息和数据看板','选股专题','策略跟踪',
+    '15:40','股票日线 · 阶段完成','有复盘记录','data-mh-tab="trading-v3-candidates"']) {
+    assert.ok(html.includes(text),text);
+}
+assert.match(html, /data-mh-date="2026-11-06"[^>]*aria-pressed="true"/);
+assert.match(html, /data-mh-date="2026-11-11"[^>]*disabled/);
+assert.doesNotMatch(html,/交付已验收/);
+delivery.data.receipt = {schema:'probiga.daily-delivery.v1',status:'PASS',trade_date:date};
+assert.match(page.render({reviewDates,delivery},date,clock),/交付已验收/);
+assert.doesNotMatch(page.render({reviewDates,delivery},'2026-11-05',clock),/交付已验收|股票日线 · 阶段完成/);
+assert.doesNotMatch(page.render({reviewDates,delivery},date,clock,{feed:'复盘'}),/股票日线 · 阶段完成/);
 """)
 
 

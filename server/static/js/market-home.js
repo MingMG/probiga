@@ -13,6 +13,59 @@
     const heatModes = [
         ['change', '行情'], ['net_inflow', '资金净流入'], ['five_day_return', '5日涨幅榜']
     ];
+    const homeSections = [
+        ['信息和数据看板', [
+            ['review', '盘前盘后', '同一交易日的收盘复盘、下一交易日早报与假设验证。', 'review'],
+            ['quant-workbench', '量化工作台', '查看量化能力、运行证据与任务进度。', 'delivery'],
+            ['trading-day', '今日看盘', '按交易阶段查看市场状态、观察条件与候选。'],
+            ['research-radar', '研报与题材雷达', '汇总研报、新闻催化、题材强度和研究对象。'],
+            ['news', '财经信息看板', '按来源查看快讯和重点新闻。'],
+            ['notice', 'A股公告', '按日期查询市场公告和个股披露。'],
+            ['market-context', '市场环境', '查看全市场广度、指数趋势、轮动与假设。', 'quotes'],
+            ['monitor', '市场监控中心', '成交、涨跌分布、板块表现和市场证据。', 'quotes'],
+            ['market-stage', '大盘与指数结构', '对照日、周、月阶段及其验证条件。', 'indices'],
+            ['market-radar', '盘中异动雷达', '跟踪个股与板块异动，进入明细核对。'],
+            ['intraday-alert', '实时盯盘与播报', '查看盘中事件、阶段观察与已保存播报。'],
+            ['broad-etf-flow', '宽基ETF资金', '对照成交额、公开份额变化和金额估算。'],
+            ['sentiment', '涨跌停与市场情绪', '查看市场情绪、连板反馈与风格变化。', 'ladder'],
+            ['sector', '行业与板块热度', '对照行业行情、资金及近五日表现。', 'sectors'],
+            ['concept', '概念与行业', '查看概念、成分和多日热度。', 'concepts'],
+            ['commentary', '股评监控', '跟踪公开市场观点与相关标的。']
+        ]],
+        ['选股专题', [
+            ['daily-pool', '每日研究票池', '按交易日查看已保存的研究候选与排除信息。', 'delivery'],
+            ['recommended', 'AI研究建议', '查看事件和量价研究、入选依据及风险条件。'],
+            ['screen', '条件选股', '按趋势、放量、连板或龙虎榜等条件缩小范围。'],
+            ['strong', '强势股研究', '查看强势股票及对应交易日的排名。', 'quotes'],
+            ['fused', '个股热榜', '交叉查看多源个股热度与市场表现。'],
+            ['portfolio', '自选股跟踪', '集中查看自选股票、行情、资金和异动。'],
+            ['stock-list', '全市场股票', '查询股票并打开个股行情与研究资料。', 'quotes']
+        ]],
+        ['策略跟踪', [
+            ['alist', '龙虎榜与公开席位', '从每日披露清单进入单股公开席位明细。'],
+            ['trading-v3-candidates', '策略选股结果', '查看正式候选、确认条件和阻断理由。'],
+            ['trading-v3-hypotheses', '策略与假设跟踪', '查阅持续跟踪的市场或策略假设。'],
+            ['strategy-center', '策略研究与竞技', '对照策略版本、研究表现和正式资格。'],
+            ['strategy-backtest', '策略回测', '按已有登记版本查看或运行可复算的回测。'],
+            ['qmt-strategy-results', 'QMT每日模拟', '查看每日模拟结果和执行记录。'],
+            ['weekly-strategy', '周度策略', '用完整收盘周的证据回顾市场变化。']
+        ]],
+        ['资料与运行', [
+            ['ai-stock', '个股研究问答', '围绕个股行情、公告和研究问题提问。'],
+            ['ai-general', '通用研究问答', '梳理市场、资料与研究方法。'],
+            ['datasource', '数据获取监控', '核对数据来源、完成记录和真实缺口。'],
+            ['engineering-acceptance', '工程验收', '查看发布版本、运行状态及验收证据。']
+        ]]
+    ];
+    const deliveryStates = {
+        SUCCESS: '阶段完成', RUNNING: '运行中', FAILED: '失败', BLOCKED: '受阻',
+        DEGRADED: '部分可用', TIMEOUT: '超时', STOPPED: '已停止', SUPERSEDED: '已被替代'
+    };
+    const dailyStages = {
+        stock_daily: '股票日线', stock_finance: '财务数据', stock_notice: '公告',
+        stock_minute: '分钟行情', score: '策略评分', stock_score: '策略评分',
+        publish: '结果发布', stock_pool: '股票池', analysis_premarket_external: '盘前外围'
+    };
     let active = null;
 
     function escape(value) {
@@ -97,6 +150,112 @@
 
     function snapshotObservation(payload, requested) {
         return requested && day(payload?.trade_date) === requested && ['available', 'partial'].includes(payload.status) ? payload : null;
+    }
+
+    function monthShift(month, offset) {
+        const [year, index] = month.split('-').map(Number);
+        return new Date(Date.UTC(year, index - 1 + offset, 1)).toISOString().slice(0, 7);
+    }
+
+    function dashboardFacts(state, requested, market, snapshot) {
+        const reviewDates = new Set(rows(state.reviewDates?.dates).map(day).filter(Boolean));
+        const delivery = day(state.delivery?.trade_date) === requested ? state.delivery.data : null;
+        const receipt = delivery?.receipt;
+        const deliveryStatus = state.delivery?.status;
+        const receiptMatches = receipt?.schema === 'probiga.daily-delivery.v1' &&
+            day(receipt.trade_date) === requested && receipt.status === deliveryStatus;
+        const deliveryLabel = receiptMatches && deliveryStatus === 'PASS' ? '交付已验收' :
+            receiptMatches && deliveryStatus === 'DEGRADED' ? '交付部分可用' :
+            deliveryStatus === 'BLOCKED' ? '交付受阻' :
+            deliveryStatus === 'RUNNING' ? '交付运行中' : '有交付记录';
+        const trend = rows(state.trend?.indices).map(row => day(row.data_cutoff)).filter(date => date && date <= requested).sort().at(-1);
+        const heatmap = day(state.heatmap?.trade_date) === requested ? state.heatmap : null;
+        const boardStamp = snapshot?.as_of || market?.data_time || market?.trade_date;
+        const ladder = day(snapshot?.limit_ladder?.trade_date) === requested ? snapshot.limit_ladder : null;
+        const facts = {
+            review: reviewDates.has(requested) ? ['有复盘记录', requested] : null,
+            delivery: delivery?.session ? [deliveryLabel, delivery.session.updated_at] : null,
+            quotes: boardStamp ? [
+                !snapshot && market?.trade_date !== requested ? '历史行情' :
+                    snapshot?.status === 'partial' ? '部分可用' :
+                    market?.freshness_status === 'stale' ? '行情已过期' : '有行情记录',
+                boardStamp
+            ] : null,
+            indices: trend ? ['指数截止', trend] : null,
+            ladder: ladder ? ['有连板记录', ladder.trade_date] : null,
+            sectors: rows(heatmap?.industry?.change?.rows).length ? ['有行业记录', requested] : null,
+            concepts: rows(heatmap?.concept?.change?.rows).length ? ['有概念记录', requested] : null
+        };
+        return {facts, reviewDates, delivery};
+    }
+
+    function renderCalendar(requested, clock, reviewDates, month, reviewDatesState) {
+        if (!month || !requested) return empty('观察日期待核验');
+        const [year, index] = month.split('-').map(Number);
+        const firstWeekday = (new Date(Date.UTC(year, index - 1, 1)).getUTCDay() + 6) % 7;
+        const days = new Date(Date.UTC(year, index, 0)).getUTCDate();
+        const end = day(clock?.today) || requested;
+        const cells = Array.from({length: firstWeekday}, () => '<span aria-hidden="true"></span>');
+        for (let n = 1; n <= days; n++) {
+            const date = month + '-' + String(n).padStart(2, '0');
+            const hasReview = reviewDates.has(date);
+            cells.push(`<button type="button" data-mh-date="${date}" aria-label="${date}${hasReview ? '，有复盘记录' : ''}" aria-pressed="${date === requested}"${date > end ? ' disabled' : ''}>${n}${hasReview ? '<i aria-hidden="true"></i>' : ''}</button>`);
+        }
+        const legend = reviewDatesState === undefined ? '正在读取复盘记录' :
+            reviewDatesState === null || reviewDatesState.warnings?.length ? '复盘日期索引未完整返回 · 金点为已返回的复盘记录' :
+            '金点为有复盘记录 · 选择日期查看当日看板';
+        return `<div class="mh-calendar-head"><h3>研究日历</h3><div>
+            <button type="button" class="mh-hub-button" data-mh-month="-1" aria-label="上个月"${month <= '1900-01' ? ' disabled' : ''}>‹</button>
+            <time datetime="${month}">${year}年${index}月</time>
+            <button type="button" class="mh-hub-button" data-mh-month="1" aria-label="下个月"${month >= end.slice(0, 7) ? ' disabled' : ''}>›</button>
+            </div></div><div class="mh-calendar-grid">
+            ${['一','二','三','四','五','六','日'].map(name => `<span>${name}</span>`).join('')}${cells.join('')}
+            </div><p class="mh-hub-meta">${legend}</p>`;
+    }
+
+    function renderTimeline(requested, market, snapshot, reviewDates, delivery, filter) {
+        const items = [];
+        if (snapshot || market?.trade_date === requested) {
+            const count = number(snapshot?.sample_size ?? market?.breadth?.total);
+            items.push({kind:'行情', tab:'monitor', stamp:snapshot?.as_of || market?.data_time || requested,
+                text: (snapshot?.as_of_basis === 'exchange_close' ? '收盘行情' : '行情观测') + (count === null ? '' : ` · ${metric(count, '只', 0)}样本`)});
+        }
+        if (reviewDates.has(requested)) items.push({kind:'复盘', tab:'review', stamp:requested, text:'可查看所选日期的复盘记录'});
+        for (const attempt of rows(delivery?.attempts)) {
+            const label = deliveryStates[attempt.status];
+            const stamp = attempt.finished_at || attempt.started_at;
+            if (!label || !day(stamp)) continue;
+            items.push({kind:'交付', tab:'daily-pool', stamp, text:`${dailyStages[attempt.stage_name] || attempt.stage_name || '数据阶段'} · ${label}`});
+        }
+        const visible = items.filter(item => filter === '全部' || filter === item.kind)
+            .sort((left, right) => String(right.stamp).replace('T', ' ').localeCompare(String(left.stamp).replace('T', ' '))).slice(0, 10);
+        return `<div class="mh-calendar-head"><h3>更新时间流</h3>
+            <label><span class="sr-only">筛选更新类型</span><select data-mh-feed>
+            ${['全部', '行情', '复盘', '交付'].map(kind => `<option${filter === kind ? ' selected' : ''}>${kind}</option>`).join('')}
+            </select></label></div>
+            ${visible.length ? `<ol class="mh-update-feed">${visible.map(item => `<li><button type="button" data-mh-tab="${item.tab}">
+                <time datetime="${escape(String(item.stamp).replace(' ', 'T'))}">${escape(day(item.stamp) === requested && String(item.stamp).length >= 16 ? item.stamp.slice(11, 16) : day(item.stamp))}</time><span>${item.kind}</span><strong>${escape(item.text)}</strong></button></li>`).join('')}</ol>` :
+            empty('所选日期暂无此类可核验记录')}`;
+    }
+
+    function renderHub(state, requested, clock, modes, market, snapshot) {
+        const {facts, reviewDates, delivery} = dashboardFacts(state, requested, market, snapshot);
+        const month = modes.month || requested.slice(0, 7);
+        const sections = homeSections.map(([title, cards]) => `<section class="mh-hub-section">
+            <h3>${title}</h3><div class="mh-hub-cards">${cards.map(([tab, name, description, key]) => {
+                const fact = facts[key];
+                return `<article class="mh-hub-card">
+                    <h4>${name}</h4><p>${description}</p>
+                    <footer>${fact ? `<span class="mh-card-state"><strong>${escape(fact[0])}</strong><small>${escape(String(fact[1] || '').replace('T', ' ').slice(0, 16))}</small></span>` : ''}
+                    <button type="button" class="mh-hub-button" data-mh-tab="${tab}" aria-label="打开${name}">打开 <span aria-hidden="true">↗</span></button></footer>
+                    </article>`;
+            }).join('')}</div></section>`).join('');
+        return `<section class="mh-hub" aria-label="A股大看板">
+            <header class="mh-hub-head"><div><h2>A股大看板</h2><p>观察日期 <time>${escape(requested || '待核验')}</time></p></div>
+            <div><button type="button" class="mh-hub-button" data-mh-observation>行情概览 ↓</button>
+            <button type="button" class="mh-hub-button" data-mh-refresh>检查更新</button></div></header>
+            <div class="mh-hub-top"><div class="mh-hub-panel">${renderTimeline(requested, market, snapshot, reviewDates, delivery, modes.feed || '全部')}</div>
+            <div class="mh-hub-panel">${renderCalendar(requested, clock, reviewDates, month, state.reviewDates)}</div></div>${sections}</section>`;
     }
 
     function freshestIndex(code, requested, market, trend, snapshot) {
@@ -317,11 +476,12 @@
         const boardPhase = {qmt_snapshot: '盘中快照', exchange_close: '收盘观察'}[snapshot?.as_of_basis] || '数据待核验';
         const phase = !market ? boardPhase : market.trade_date < requested ? '历史回退' : labels[market.freshness_status] || '已存行情';
         const stamp = market?.data_time || market?.trade_date || snapshot?.as_of;
-        const markup = '<section class="market-home" aria-label="市场看板"><header class="mh-head"><div><span class="mh-eyebrow">PROBIGA · A股</span>' +
-            '<h2>市场看板</h2><span class="mh-badge">' + phase + '</span>' + link('market-context', '市场环境') + '</div>' +
+        const markup = '<section class="market-home" id="mh-market-observation" tabindex="-1" aria-label="行情概览"><header class="mh-head"><div>' +
+            '<h2>行情概览</h2><span class="mh-badge">' + phase + '</span>' + link('market-context', '市场环境') + '</div>' +
             `<div class="mh-head-actions"><span class="mh-meta">请求 ${escape(requested || '日期待核验')} · 行情 ${escape(stamp || '待核验')}${observationLag(market, clock, requested)}</span>` +
             '<button type="button" class="mh-retry" data-mh-refresh>重载</button></div></header>';
-        return markup + renderIndexStrip(requested, market, state.trend, snapshot) + renderMetrics(market, snapshot) +
+        return renderHub(state, requested, clock, modes, market, snapshot) + markup +
+            renderIndexStrip(requested, market, state.trend, snapshot) + renderMetrics(market, snapshot) +
             '<div class="mh-grid">' + renderBreadth(market, snapshot) + renderEmotion(market) + renderTrend(state.trend, market, snapshot, requested) +
             renderLadder(snapshot) +
             renderSector('concept', '概念热度', state.heatmap, requested, modes.concept || 'change') +
@@ -334,27 +494,31 @@
         if (!active) return;
         clearTimeout(active.timer);
         active.container.removeEventListener('click', active.click);
+        active.container.removeEventListener('change', active.change);
         active = null;
     }
 
     function load(date, container, options = {}) {
         const requested = day(date) || day(options.clock?.()?.ui_trade_date);
         const retained = active?.container === container && active.requested === requested ? active.state : {};
-        const modes = active?.container === container ? active.modes : {concept: 'change', industry: 'change'};
+        const modes = active?.container === container && active.requested === requested ? active.modes :
+            {concept: 'change', industry: 'change', month: requested.slice(0, 7), feed: '全部'};
         stop();
-        const session = {container, requested, state: retained, modes, timer: null, pending: null, click: null};
+        const session = {container, requested, state: retained, modes, timer: null, pending: null, click: null, change: null};
         active = session;
         const query = encodeURIComponent(requested);
         const paths = {market: '/api/monitor/data?date=' + query,
             trend: '/api/hot-data/market-trend?date=' + query,
             snapshot: '/api/monitor/board?date=' + query,
-            heatmap: '/api/monitor/sector-heatmap?date=' + query};
+            heatmap: '/api/monitor/sector-heatmap?date=' + query,
+            reviewDates: '/api/hot-data/daily-review-dates',
+            delivery: '/api/scheduler/daily-delivery?trade_date=' + query + '&attempt_limit=12'};
         const current = () => active === session;
 
         function paint() {
             if (!current()) return;
             const focused = document.activeElement;
-            const attributes = ['data-mh-refresh', 'data-mh-stock', 'data-mh-tab', 'data-mh-heat-mode'];
+            const attributes = ['data-mh-refresh', 'data-mh-stock', 'data-mh-tab', 'data-mh-heat-mode', 'data-mh-feed', 'data-mh-month', 'data-mh-date', 'data-mh-observation'];
             const action = container.contains(focused) ? attributes.find(name => focused.hasAttribute(name)) : null;
             const value = action && focused.getAttribute(action);
             container.innerHTML = render(session.state, requested, options.clock?.(), session.modes);
@@ -391,7 +555,7 @@
                     if (document.hidden || options.isActive?.() === false) return;
                     const clock = options.refreshClock ? await options.refreshClock() : options.clock?.();
                     if (current() && clock?.is_intraday === true && day(clock.active_trade_date) === requested) {
-                        await refresh(Object.keys(paths).filter(key => key !== 'trend'));
+                        await refresh(['market', 'snapshot', 'heatmap']);
                     }
                 } catch {
                     // A failed clock refresh must not relabel the previous observation.
@@ -404,6 +568,16 @@
             if (!button || !container.contains(button)) return;
             if (button.dataset.mhTab) options.navigate?.(button.dataset.mhTab);
             else if (button.dataset.mhStock) options.stock?.(button.dataset.mhStock);
+            else if (button.dataset.mhDate) options.selectDate?.(button.dataset.mhDate);
+            else if (button.dataset.mhMonth && requested) {
+                const shift = Number(button.dataset.mhMonth);
+                if (shift !== -1 && shift !== 1) return;
+                const month = monthShift(session.modes.month, shift);
+                if (month >= '1900-01' && month <= (day(options.clock?.()?.today) || requested).slice(0, 7)) {
+                    session.modes.month = month;
+                    paint();
+                }
+            }
             else if (button.dataset.mhHeatMode) {
                 const [kind, mode] = button.dataset.mhHeatMode.split(':');
                 if (Object.hasOwn(session.modes, kind) && heatModes.some(([key]) => mode === key)) {
@@ -415,9 +589,20 @@
                 refresh(Object.keys(paths)).then(outcome => {
                     if (current()) options.status?.(outcome.loadError || '市场看板已重载', Boolean(outcome.loadError));
                 });
+            } else if (button.hasAttribute('data-mh-observation')) {
+                const observation = container.querySelector('#mh-market-observation');
+                observation?.focus({preventScroll: true});
+                observation?.scrollIntoView({block: 'start'});
+            }
+        };
+        session.change = event => {
+            if (event.target.hasAttribute('data-mh-feed') && ['全部', '行情', '复盘', '交付'].includes(event.target.value)) {
+                session.modes.feed = event.target.value;
+                paint();
             }
         };
         container.addEventListener('click', session.click);
+        container.addEventListener('change', session.change);
         paint();
         return refresh(Object.keys(paths)).finally(schedule);
     }
