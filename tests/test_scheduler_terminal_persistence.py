@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 import json
 import sqlite3
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -332,6 +333,116 @@ def test_superseding_fence_never_gets_expired_failed_finalization(case,monkeypat
     finish(case)
     assert rows(case)[0]["status"] == "running" and rows(case)[1]["status"] == "SUPERSEDED"
     assert runtime._terminal_journal().read(case.uid,"FAILED_FINALIZATION") is None
+
+
+@pytest.mark.parametrize("expires", [False, True], ids=["live-owner", "expired-owner"])
+def test_initial_score_stages_before_terminal_locks_and_rolls_back_on_lease_loss(case, monkeypatch, expires):
+    from server.common import formal_score_publication, scheduler_task_lease
+    from tests.score_snapshot_helpers import scored_publication
+
+    case.start(task_type="analysis_fast")
+    target = "2026-09-30"
+    identity = {**runtime._terminal_run_identities[case.uid], "host_name": runtime.gethostname()}
+    runtime._terminal_run_identities[case.uid] = identity
+    marker = scheduler_task_lease.encode(identity, case.now)
+    now = case.now
+    monkeypatch.setattr(runtime, "_now_shanghai_naive", lambda: now)
+    monkeypatch.setattr(daily, "_control_now", lambda: now)
+    monkeypatch.setattr(runtime, "_scheduler_build_commit_sha", lambda: identity["build_sha"])
+    monkeypatch.setattr(runtime, "runtime_contract_build_sha", lambda **_: identity["build_sha"])
+    with case.engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE st_scheduled_task_history SET host_name=:host,output=:marker WHERE run_uid=:uid
+        """), {"host": identity["host_name"], "marker": marker, "uid": case.uid})
+        conn.exec_driver_sql("""
+            CREATE TABLE st_recommended_run_history (run_uid TEXT PRIMARY KEY, publication_state TEXT)
+        """)
+        conn.execute(text("INSERT INTO st_recommended_run_history VALUES (:uid,'STAGED')"), {"uid": case.uid})
+    receipt = scored_publication(trade_date=target, run_uid=case.uid, build_sha=identity["build_sha"])
+    reference = {"schema": formal_score_publication.FORMAL_SCORE_WORK_SCHEMA, "run_uid": case.uid}
+    evidence = runtime._build_history_validation_evidence(
+        dict(id=case.task_id, task_type="analysis_fast", _scheduler_target_trade_date=target),
+        run_uid=case.uid, machine_output=json.dumps(reference), status="success", exit_code=0,
+        started_at=case.now, validation_message="DATA_VALIDATION_OK",
+    )
+    daily_renewed = threading.Event()
+    task_owner = None
+    if not expires:
+        task_owner = scheduler_task_lease.TaskOwnerLease(
+            case.engine, identity, marker, clock=lambda: now, on_lost=lambda: None,
+        )
+        monkeypatch.setattr(runtime, "_task_owner_leases", {case.uid: task_owner})
+        monkeypatch.setattr(runtime, "DAILY_STAGE_LEASE_HEARTBEAT_SECONDS", 0.01)
+        renew_daily = runtime.renew_daily_stage_lease
+
+        def observe_renewal(*args, **kwargs):
+            renewed = renew_daily(*args, **kwargs)
+            if renewed and threading.current_thread().name.startswith("daily-stage-publication-"):
+                daily_renewed.set()
+            return renewed
+
+        monkeypatch.setattr(runtime, "renew_daily_stage_lease", observe_renewal)
+    order = []
+    check_running = runtime._terminal_check_running
+
+    def lock_fence(conn, uid, intent, *, for_update=False):
+        if for_update:
+            order.append("lock fence")
+        return check_running(conn, uid, intent, for_update=for_update)
+
+    def prepare(conn, score, *, run_uid, build_sha, trade_date):
+        nonlocal now
+        assert score == reference and run_uid == case.uid and build_sha == identity["build_sha"] and trade_date == target
+        assert conn.in_transaction()
+        if task_owner is not None:
+            assert daily_renewed.wait(timeout=2)
+            now += timedelta(seconds=1)
+            assert task_owner.renew()
+        assert conn.execute(text("""
+            UPDATE st_recommended_run_history SET publication_state='WRITTEN' WHERE run_uid=:uid
+        """), {"uid": run_uid}).rowcount == 1
+        order.append("write scores")
+        if expires:
+            now += timedelta(seconds=scheduler_task_lease.LEASE_SECONDS + 1)
+        return receipt
+
+    def activate(conn, *, run_uid, task_type, publication_receipt, staged_in_transaction):
+        assert staged_in_transaction is True and publication_receipt == receipt and task_type == "analysis_fast"
+        assert conn.execute(text("""
+            UPDATE st_recommended_run_history SET publication_state='ACTIVE'
+            WHERE run_uid=:uid AND publication_state='WRITTEN'
+        """), {"uid": run_uid}).rowcount == 1
+        order.append("activate")
+        return {"schema": "MODEL-activation-receipt", "run_uid": run_uid}
+
+    def business_projection():
+        with case.engine.connect() as conn:
+            return conn.execute(text("SELECT publication_state FROM st_recommended_run_history")).scalar_one()
+
+    monkeypatch.setattr(runtime, "_terminal_check_running", lock_fence)
+    monkeypatch.setattr(runtime, "_activate_analysis_strategy_pool", activate)
+    monkeypatch.setattr(formal_score_publication, "publish_initial_selection", prepare)
+    finish(case, output=evidence)
+
+    if expires:
+        assert order == ["write scores", "lock fence"]
+        assert business_projection() == "STAGED"
+        history, stage, task = rows(case)
+        assert (history["status"], stage["status"], task["last_run_status"]) == ("running", "RUNNING", "running")
+        journal = runtime._terminal_journal()
+        rejected = json.loads(journal.read(case.uid, "FAILED_FINALIZATION"))
+        assert "TASK_OWNER_LEASE_EXPIRED" in rejected["outcome"]["output"]
+        assert json.loads(journal.read(case.uid, "OBSERVED"))["outcome"]["exit_code"] == 0
+        finish(case, output=evidence)
+        assert order == ["write scores", "lock fence", "lock fence"]
+        assert business_projection() == "STAGED"
+        history, stage, task = rows(case)
+        assert (history["status"], stage["status"], task["last_run_status"]) == ("failed", "FAILED", "failed")
+    else:
+        assert order == ["write scores", "lock fence", "activate"]
+        assert business_projection() == "ACTIVE"
+        history, stage, task = rows(case)
+        assert (history["status"], stage["status"], task["last_run_status"]) == ("success", "SUCCESS", "success")
 
 
 @pytest.mark.parametrize("missing",["OBSERVED","prepared"])

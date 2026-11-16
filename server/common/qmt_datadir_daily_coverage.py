@@ -11,6 +11,7 @@ from contextlib import nullcontext
 from datetime import datetime, time
 from decimal import Decimal, InvalidOperation
 import json
+import re
 from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
@@ -30,11 +31,14 @@ from server.common.qmt_trade_calendar import load_trade_calendar_receipt
 
 SCHEMA = "probiga.qmt-datadir-daily-coverage.v1"
 PROVIDER = "qmt_datadir"
+NATIVE_EVIDENCE_DATASET = "stock_daily_native_evidence"
 CHINA = ZoneInfo("Asia/Shanghai")
 MANIFEST_TABLE = "qmt_history_coverage_manifest"
 ENTITY_TABLE = "qmt_history_coverage_entity"
 NATIVE_AMOUNT_WORD = 2 ** 32
 ENTITY_INSERT_BATCH_SIZE = 256
+_MAX_NATIVE_PUBLIC_REPLACEMENTS = 32
+_SHA256 = re.compile(r"[a-f0-9]{64}")
 
 
 def _scope(engine):
@@ -160,6 +164,67 @@ def validate_native_revision(old, new, correction, *, prior_hash, cutoff):
     return native_amount_correction(old, new) == correction
 
 
+def seal_native_public_replacement(
+    prior: Mapping[str, Any], *, prior_completion: Mapping[str, Any], bar: Mapping[str, Any],
+    run_id: str, qmt_code: str, native_event_at: datetime | str, observed_at: datetime | str,
+    native_record_sha256: str,
+) -> dict:
+    """Replace one corroborated public bar while retaining all unrelated evidence."""
+    native = canonical_bar(bar)
+    code, day = native["stock_code"], prior["trade_date"]
+    fallback = dict(prior.get("historical_public_bars") or {})
+    if code not in fallback:
+        raise ValueError("native public replacement requires the exact public predecessor bar")
+    del fallback[code]
+    core = {key: value for key, value in prior.items() if key not in {
+        "manifest_hash", "native_amount_correction", "native_public_replacement", "historical_public_bars",
+    }}
+    replacement = {"stock_code": code, "classification": "TRADED", "evidence": native}
+    core.update(
+        run_id=run_id, captured_at=_stamp(observed_at).isoformat(" "),
+        entities=[{**replacement, "row_hash": canonical_digest(replacement)} if item["stock_code"] == code else item
+                  for item in prior["entities"]],
+        native_public_replacement={
+            "stock_code": code, "qmt_code": qmt_code, "trade_date": day, "prior_run_id": prior["run_id"],
+            "prior_manifest_hash": prior["manifest_hash"],
+            "prior_completion_sha256": canonical_digest(prior_completion),
+            "native_event_at": _stamp(native_event_at).isoformat(" "),
+            "observed_at": _stamp(observed_at).isoformat(" "),
+            "native_record_sha256": native_record_sha256,
+            "native_bar_sha256": canonical_digest(native),
+        },
+    )
+    if fallback:
+        core["historical_public_bars"] = fallback
+    _validate_native_public_replacement(core)
+    return {**core, "manifest_hash": canonical_digest(core)}
+
+
+def _validate_native_public_replacement(manifest: Mapping[str, Any], *, catalog=None) -> None:
+    proof = manifest["native_public_replacement"]
+    day = manifest["trade_date"]
+    code = proof["stock_code"]
+    matches = [item for item in manifest["entities"] if item["stock_code"] == code]
+    if (manifest.get("historical_reconstruction") is not True or manifest.get("native_amount_correction")
+            or proof["trade_date"] != day or not re.fullmatch(r"[0-9]{6}", code)
+            or proof["qmt_code"] not in {f"{code}.SH", f"{code}.SZ", f"{code}.BJ"}
+            or (catalog is not None and not any(member.get("qmt_code") == proof["qmt_code"]
+                                                for member in catalog.members))
+            or code in (manifest.get("historical_public_bars") or {})
+            or len(matches) != 1 or matches[0]["classification"] != "TRADED"
+            or matches[0]["evidence"]["trade_date"] != day
+            or canonical_digest(matches[0]["evidence"]) != proof["native_bar_sha256"]
+            or Decimal(matches[0]["evidence"]["volume"]) <= 0
+            or not proof["prior_run_id"] or proof["prior_run_id"] == manifest["run_id"]
+            or any(not _SHA256.fullmatch(proof[key]) for key in (
+                "prior_manifest_hash", "prior_completion_sha256", "native_record_sha256",
+            ))
+            or _stamp(proof["native_event_at"]).date().isoformat() != day
+            or _stamp(proof["observed_at"]) != _stamp(manifest["captured_at"])
+            or _stamp(proof["observed_at"]).date().isoformat() <= day):
+        raise ValueError("native public replacement source or scope differs")
+
+
 def _delisting_evidence(catalog, documents: list[dict], *, code: str, day: str, cutoff: datetime) -> dict:
     expiry_dates = {str(member.get("expire_date") or "") for member in catalog.members
                     if member["stock_code"] == code}
@@ -175,7 +240,7 @@ def build_manifest(*, catalog, calendar, day: str, rows: Sequence[Mapping[str, A
                    daily_delisting_documents: Mapping[str, list[dict]] | None = None,
                    historical_documents: Mapping[str, list[dict]] | None = None,
                    historical_public_bars: Mapping[str, dict] | None = None,
-                   previous_session: str = "") -> dict:
+                   previous_session: str = "", native_content_sha256: str = "") -> dict:
     captured = _stamp(captured_at).replace(microsecond=0)
     if captured < datetime.combine(datetime.fromisoformat(day).date(), time(15, 35)):
         raise ValueError("daily source is not final")
@@ -242,6 +307,9 @@ def build_manifest(*, catalog, calendar, day: str, rows: Sequence[Mapping[str, A
         core["historical_reconstruction"] = True
     if public:
         core.update(historical_public_bars=public, previous_session=previous_session)
+    if native_content_sha256:
+        core.update(dataset=NATIVE_EVIDENCE_DATASET, native_content_sha256=native_content_sha256)
+        native_evidence_fingerprint(core)
     return {**core, "manifest_hash": canonical_digest(core)}
 
 
@@ -254,6 +322,10 @@ def validate_manifest(manifest: Mapping[str, Any], *, catalog, calendar) -> dict
     public = original.get("historical_public_bars") or {}
     previous_session = original.get("previous_session", "")
     correction = original.get("native_amount_correction")
+    if "native_public_replacement" in original:
+        _validate_native_public_replacement(original, catalog=catalog)
+    if original.get("dataset") == NATIVE_EVIDENCE_DATASET:
+        native_evidence_fingerprint(original)
     no_trade = [entity for entity in entities if entity.get("classification") == "NO_TRADE"] if not historical else []
     # Each entity binds its own snapshot envelope; validate those separately
     # rather than assigning one generated timestamp to unrelated observations.
@@ -275,7 +347,8 @@ def validate_manifest(manifest: Mapping[str, Any], *, catalog, calendar) -> dict
     if [entity.get("stock_code") for entity in entities] != expected or not expected:
         raise ValueError("daily manifest catalog inventory differs")
     if (original.get("schema") != SCHEMA or original.get("provider") != PROVIDER
-            or original.get("dataset") != "stock_daily" or original.get("status") != "EXACT"
+            or original.get("dataset") not in {"stock_daily", NATIVE_EVIDENCE_DATASET}
+            or original.get("status") != "EXACT"
             or original.get("strategy_eligible") is not True
             or original.get("catalog_batch_id") != catalog.batch_id
             or original.get("catalog_manifest_hash") != catalog.manifest_hash
@@ -397,13 +470,109 @@ def insert_manifest(connection, manifest: dict) -> None:
         connection.execute(statement, persisted_entities[offset:offset + ENTITY_INSERT_BATCH_SIZE])
 
 
+def native_evidence_fingerprint(manifest: Mapping[str, Any]) -> dict:
+    """Fingerprint full immutable native evidence without consulting canonical vendor rows."""
+    if (manifest.get("dataset") != NATIVE_EVIDENCE_DATASET
+            or manifest.get("historical_reconstruction") is not True
+            or manifest.get("historical_public_bars") or manifest.get("native_amount_correction")
+            or manifest.get("native_public_replacement")
+            or not _SHA256.fullmatch(str(manifest.get("native_content_sha256") or ""))):
+        raise ValueError("historical native evidence authority differs")
+    bars = [item for item in manifest["entities"] if item["classification"] == "TRADED"]
+    if not bars or any(Decimal(item["evidence"]["volume"]) <= 0 for item in bars):
+        raise ValueError("historical native evidence requires actual traded bars")
+    return {"row_count": len(bars), "code_count": len(bars),
+            "row_hash": canonical_digest([item["row_hash"] for item in bars])}
+
+
+def _daily_manifest_completion(connection, day: str, manifest: Mapping[str, Any]) -> tuple[dict, bool]:
+    from server.common.qmt_datadir_result import load_receipt
+
+    dataset = manifest["dataset"]
+    receipt = load_receipt(connection, dataset=dataset, trade_date=day)
+    archived = False
+    for _ in range(_MAX_NATIVE_PUBLIC_REPLACEMENTS + 1):
+        detail = (receipt or {}).get("detail") or {}
+        if (receipt is None or receipt.get("status") != "COMPLETE"
+                or receipt.get("dataset") != dataset or str(receipt.get("trade_date"))[:10] != day
+                or not _SHA256.fullmatch(str(detail.get("full_market_manifest_hash") or ""))):
+            break
+        if receipt["run_id"] == manifest["run_id"] and detail["full_market_manifest_hash"] == manifest["manifest_hash"]:
+            traded_count = sum(item["classification"] == "TRADED" for item in manifest["entities"])
+            if (detail.get("coverage") != 1.0 or any(value != traded_count for value in (
+                receipt.get("row_count"), receipt.get("code_count"), detail.get("readback_rows"), detail.get("readback_codes"),
+            ))):
+                break
+            replacement = manifest.get("native_public_replacement")
+            if replacement and receipt.get("content_sha256") != replacement["native_record_sha256"]:
+                raise ValueError("native public replacement receipt source digest differs")
+            if dataset == NATIVE_EVIDENCE_DATASET and (
+                receipt.get("content_sha256") != manifest["native_content_sha256"]
+                or detail.get("row_hash") != native_evidence_fingerprint(manifest)["row_hash"]
+                or detail.get("eligible_code_count") != len(manifest["entities"])
+            ):
+                raise ValueError("historical native evidence completion fingerprint differs")
+            if _stamp(manifest["captured_at"]) > _stamp(receipt["finished_at"]):
+                raise ValueError("repaired daily publication completion time differs")
+            return receipt, archived
+        preceding = detail.get("prior_completion")
+        if dataset != "stock_daily" or not isinstance(preceding, dict):
+            break
+        link_json = connection.execute(text(f"""
+            SELECT JSON_EXTRACT(manifest_json, '$.native_public_replacement') FROM {MANIFEST_TABLE}
+            WHERE manifest_hash=:hash AND trade_date=:day AND run_id=:run_id
+              AND schema_version=:schema AND dataset='stock_daily' AND provider=:provider
+              AND status='EXACT' AND strategy_eligible=1
+        """), {"hash": detail["full_market_manifest_hash"], "day": day, "run_id": receipt["run_id"],
+               "schema": SCHEMA, "provider": PROVIDER}).scalar_one_or_none()
+        link = json.loads(link_json) if isinstance(link_json, str) else link_json
+        if (not isinstance(link, dict) or link.get("trade_date") != day
+                or link.get("native_record_sha256") != receipt.get("content_sha256")
+                or link.get("prior_run_id") != preceding.get("run_id")
+                or link.get("prior_manifest_hash") != (preceding.get("detail") or {}).get("full_market_manifest_hash")
+                or link.get("prior_completion_sha256") != canonical_digest(preceding)
+                or _stamp(preceding["finished_at"]) > _stamp(link["observed_at"])
+                or _stamp(link["observed_at"]) > _stamp(receipt["finished_at"])):
+            break
+        receipt = preceding
+        archived = True
+    raise ValueError("repaired daily publication completion receipt differs")
+
+
+def load_daily_manifest_completion(engine, day: str, *, manifest: Mapping[str, Any],
+                                   decision_known_at: datetime | str) -> dict | None:
+    """Resolve an exact validated manifest's own durable completion at its cutoff."""
+    with _scope(engine) as connection:
+        receipt, _ = _daily_manifest_completion(connection, day, manifest)
+    return receipt if _stamp(receipt["finished_at"]) <= _stamp(decision_known_at) else None
+
+
 def load_daily_manifest(engine, day: str, *, decision_known_at: datetime | str,
                         manifest_hash: str = "", verify_rows: bool = True) -> dict | None:
+    return _load_daily_manifest(engine, day, decision_known_at=decision_known_at, manifest_hash=manifest_hash,
+                                verify_rows=verify_rows, dataset="stock_daily")
+
+
+def load_daily_native_evidence(engine, day: str, *,
+                               decision_known_at: datetime | str) -> tuple[dict, dict] | None:
+    """Read a historical native-only market proof and its own exact archival completion."""
+    with _scope(engine) as connection:
+        manifest = _load_daily_manifest(connection, day, decision_known_at=decision_known_at,
+                                        verify_rows=False, dataset=NATIVE_EVIDENCE_DATASET)
+        if manifest is None:
+            return None
+        receipt, _ = _daily_manifest_completion(connection, day, manifest)
+        return manifest, receipt
+
+
+def _load_daily_manifest(engine, day: str, *, decision_known_at: datetime | str, dataset: str,
+                         manifest_hash: str = "", verify_rows: bool) -> dict | None:
     cutoff = _stamp(decision_known_at)
     with _scope(engine) as connection:
         condition = " AND manifest_hash=:hash" if manifest_hash else ""
-        row = connection.execute(text(f"SELECT manifest_hash,manifest_json,schema_version,dataset,provider,trade_date,status,strategy_eligible,run_id,captured_at,catalog_batch_id,catalog_manifest_hash,calendar_batch_id,calendar_manifest_hash FROM {MANIFEST_TABLE} WHERE schema_version=:schema AND dataset='stock_daily' AND provider=:provider AND trade_date=:day AND status='EXACT' AND captured_at<=:cutoff{condition} ORDER BY captured_at DESC,manifest_hash DESC LIMIT 1"),
-                                 {"schema": SCHEMA, "provider": PROVIDER, "day": day, "cutoff": cutoff, "hash": manifest_hash}).mappings().first()
+        row = connection.execute(text(f"SELECT manifest_hash,manifest_json,schema_version,dataset,provider,trade_date,status,strategy_eligible,run_id,captured_at,catalog_batch_id,catalog_manifest_hash,calendar_batch_id,calendar_manifest_hash FROM {MANIFEST_TABLE} WHERE schema_version=:schema AND dataset=:dataset AND provider=:provider AND trade_date=:day AND status='EXACT' AND captured_at<=:cutoff{condition} ORDER BY captured_at DESC,manifest_hash DESC LIMIT 1"),
+                                 {"schema": SCHEMA, "dataset": dataset, "provider": PROVIDER, "day": day,
+                                  "cutoff": cutoff, "hash": manifest_hash}).mappings().first()
         if row is None:
             return None
         manifest = json.loads(str(row["manifest_json"]))
@@ -423,22 +592,36 @@ def load_daily_manifest(engine, day: str, *, decision_known_at: datetime | str,
                                                start_date=manifest.get("previous_session", day),
                                                end_date=day, decision_known_at=cutoff)
         validate_manifest(manifest, catalog=catalog, calendar=calendar)
+        archived = False
         if manifest.get("historical_reconstruction") is True or manifest.get("native_amount_correction"):
-            from server.common.qmt_datadir_result import load_receipt
-            receipt = load_receipt(connection, dataset="stock_daily", trade_date=day)
-            traded_count = sum(item["classification"] == "TRADED" for item in manifest["entities"])
-            detail = (receipt or {}).get("detail") or {}
-            if (receipt is None or receipt.get("status") != "COMPLETE"
-                    or receipt.get("run_id") != manifest["run_id"]
-                    or detail.get("full_market_manifest_hash") != manifest["manifest_hash"]
-                    or detail.get("coverage") != 1.0
-                    or any(value != traded_count for value in (receipt.get("row_count"), receipt.get("code_count"),
-                                                                detail.get("readback_rows"), detail.get("readback_codes")))):
-                raise ValueError("repaired daily publication completion receipt differs")
-            if not _stamp(manifest["captured_at"]) <= _stamp(receipt["finished_at"]):
-                raise ValueError("repaired daily publication completion time differs")
+            receipt, archived = _daily_manifest_completion(connection, day, manifest)
+            detail = receipt["detail"]
+            replacement = manifest.get("native_public_replacement")
             if _stamp(receipt["finished_at"]) > cutoff:
+                if replacement and not manifest_hash:
+                    return load_daily_manifest(connection, day, decision_known_at=cutoff,
+                                               manifest_hash=replacement["prior_manifest_hash"], verify_rows=verify_rows)
                 return None
+            if replacement:
+                prior = detail.get("prior_completion")
+                previous = load_daily_manifest(connection, day, decision_known_at=cutoff,
+                                               manifest_hash=replacement["prior_manifest_hash"], verify_rows=False)
+                if (not isinstance(prior, dict) or not previous
+                        or prior.get("run_id") != previous["run_id"]
+                        or canonical_digest(prior) != replacement["prior_completion_sha256"]
+                        or _stamp(prior["finished_at"]) > _stamp(replacement["observed_at"])
+                        or _stamp(previous["captured_at"]) >= _stamp(replacement["observed_at"])):
+                    raise ValueError("native public replacement predecessor differs")
+                native = next(item["evidence"] for item in manifest["entities"]
+                              if item["stock_code"] == replacement["stock_code"])
+                expected = seal_native_public_replacement(
+                    previous, prior_completion=prior, bar=native, run_id=manifest["run_id"],
+                    qmt_code=replacement["qmt_code"],
+                    native_event_at=replacement["native_event_at"], observed_at=replacement["observed_at"],
+                    native_record_sha256=replacement["native_record_sha256"],
+                )
+                if manifest != expected:
+                    raise ValueError("native public replacement changes unrelated evidence")
             correction = manifest.get("native_amount_correction")
             if correction:
                 prior = detail.get("prior_completion") or {}
@@ -479,7 +662,7 @@ def load_daily_manifest(engine, day: str, *, decision_known_at: datetime | str,
                              "source_row_hash": canonical_digest(item["evidence"]), "row_hash": item["row_hash"]})
         if [dict(item) for item in stored] != expected:
             raise ValueError("persisted daily entity inventory differs")
-        if verify_rows:
+        if verify_rows and not archived:
             rows = connection.execute(text("SELECT stock_code,trade_date,open,close,high,low,volume,amount,pre_close,data_source,quality_status,permission_status FROM sm_stock_kline WHERE trade_date=:day AND k_type=1 AND adjust_type=0 ORDER BY stock_code"), {"day": day}).mappings().all()
             fallback = manifest.get("historical_public_bars") or {}
             if any((item.get("data_source"), item.get("quality_status")) != (

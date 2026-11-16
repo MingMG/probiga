@@ -660,7 +660,7 @@ def test_authoritative_windows_require_exact_calendar_qmt_date_set(monkeypatch):
     ]
     observed_sql = []
 
-    def fake_read(sql, _params=None):
+    def fake_read(sql, _params=None, *, database=None):
         observed_sql.append(sql)
         if "FROM si_trade_calendar" in sql:
             return [{"trade_date": day} for day in descending]
@@ -709,6 +709,8 @@ def test_authoritative_windows_require_exact_calendar_qmt_date_set(monkeypatch):
         raise AssertionError(sql)
 
     monkeypatch.setattr(governance_module, "_db_read", fake_read)
+    monkeypatch.setattr(governance_module, "current_bound_sql_connection", lambda: SimpleNamespace(engine=object()))
+    monkeypatch.setattr(governance_module, "datadir_manifest_days", lambda *_args, **_kwargs: set())
     def exact_receipt(*, required_sessions, end_date, decision_known_at):
         assert required_sessions == 120
         assert decision_known_at == f"{end_date} 23:59:59"
@@ -797,8 +799,8 @@ def test_authoritative_windows_require_exact_calendar_qmt_date_set(monkeypatch):
         sql for sql in observed_sql
         if "FROM qmt_kline_attestation_row a" in sql
     ]
-    assert len(target_queries) == 12
-    assert len(attestation_queries) == 12
+    assert len(target_queries) == 24
+    assert len(attestation_queries) == 24
 
     invalid_manifest = deepcopy(valid_tolerance)
     invalid_manifest["daily_universe"][descending[-1]]["stock_count"] = 1
@@ -810,8 +812,10 @@ def test_authoritative_windows_require_exact_calendar_qmt_date_set(monkeypatch):
     missing_manifest = deepcopy(valid_tolerance)
     missing_manifest["daily_universe"].pop(descending[-1])
     completed_run_rows[0]["tolerance_json"] = json.dumps(missing_manifest)
-    with pytest.raises(ValueError, match="股票集合"):
+    observed_sql.clear()
+    with pytest.raises(ValueError, match=f"原生收盘清单：{descending[-1]}"):
         REAL_AUTHORITATIVE_SESSION_WINDOWS(descending[0])
+    assert all("FROM qmt_kline_attestation_row" not in sql for sql in observed_sql)
     completed_run_rows[0]["tolerance_json"] = json.dumps(valid_tolerance)
 
     universe_rows[-1]["in_completed_attestation"] = 0
@@ -834,6 +838,38 @@ def test_authoritative_windows_require_exact_calendar_qmt_date_set(monkeypatch):
     with pytest.raises(ValueError, match="非空"):
         REAL_AUTHORITATIVE_SESSION_WINDOWS(descending[0])
     universe_rows.extend(removed_rows)
+
+    from contextlib import nullcontext
+    from tools.check_strategy_governance_health import _reused_qmt_row_attestation_binding_check
+
+    completed_run_rows[0]["tolerance_json"] = json.dumps(missing_manifest)
+    fake_engine = SimpleNamespace(connect=lambda: nullcontext(object()))
+    monkeypatch.setattr(
+        governance_module, "current_bound_sql_connection",
+        lambda: SimpleNamespace(engine=fake_engine),
+    )
+    monkeypatch.setattr(
+        governance_module, "datadir_manifest_days",
+        lambda *_args, **_kwargs: {removed_day},
+    )
+    native_hash = "9" * 64
+    monkeypatch.setattr(
+        governance_module, "load_native_datadir_close",
+        lambda _db, day, *, cutoff: SimpleNamespace(manifest_hash=native_hash, rows=[{
+            "stock_code": "600000", "batch_id": "exact-datadir", "data_version": "native",
+            "received_at": f"{day}T18:00:00",
+        }]),
+    )
+    mixed, mixed_proof = governance_module._authoritative_session_windows_with_proof(descending[0])
+    assert mixed[120]["schema"] == "probiga.authoritative-session-window.v2"
+    assert mixed[20]["schema"] == "probiga.authoritative-session-window.v1"
+    assert mixed[120]["session_attestations"][0]["source_manifest_hash"] == native_hash
+    assert mixed[120]["session_attestations"][0]["expected_stock_count"] == 1
+    proof_ok, _ = _reused_qmt_row_attestation_binding_check(
+        descending[0], mixed[120]["sessions"],
+        {row["trade_date"]: row for row in mixed[120]["session_attestations"]}, mixed_proof,
+    )
+    assert proof_ok
 
 def test_reduce_lifecycle_halves_competitive_budget_and_keeps_cash():
     base = {
@@ -7422,7 +7458,7 @@ def test_bound_sql_snapshot_routes_cross_module_reads_and_writes_into_one_transa
 
 def test_idempotent_decision_is_checked_before_strategy_center_facts_are_written():
     source = inspect.getsource(governance_module.governance_snapshot)
-    assert source.index("if existing is not None:") < source.index(
+    assert source.index("if existing is not None and not revision:") < source.index(
         "persist_strategy_center_snapshot("
     )
 
