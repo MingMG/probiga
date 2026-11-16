@@ -6609,6 +6609,7 @@
                 request:fetchRawJsonWithTimeout,
                 clock:function(){return MARKET_CLOCK || {};}, refreshClock:refreshMarketClockSilently,
                 isActive:function(){return activeTabId() === 'workbench';},
+                selectDate:function(date){el('datePicker').value = date; return window.onDecisionDateChange();},
                 navigate:window.switchTab, stock:window.openStockDetail, status:setStatus
             });
         },
@@ -7999,7 +8000,7 @@
     /* ===== 功能导航 ===== */
     var APP_NAV = [
         {id:'desk', group:'今日工作台', items:[
-            {id:'workbench', icon:'◉', label:'市场看板'},
+            {id:'workbench', icon:'◉', label:'A股大看板'},
             {id:'trading-day', icon:'◷', label:'今日看盘'},
             {id:'command', icon:'🧭', label:'智能决策'},
             {id:'trading', icon:'◎', label:'交易与复盘总览'}
