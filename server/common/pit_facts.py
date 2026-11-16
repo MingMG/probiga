@@ -1373,6 +1373,11 @@ def _insert_pit_rows(
     connection.execute(statement, rows if len(rows) > 1 else rows[0])
 
 
+PITRowWriter = Callable[
+    [Connection, str, list[dict[str, Any]], dict[str, list[Any] | None]], None
+]
+
+
 def _finance_revision_arguments(
     row: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -1568,8 +1573,9 @@ def append_event_revisions(
     received_at: datetime | str | None = None,
     source: str,
     batch_id: str,
+    write_rows: PITRowWriter | None = None,
 ) -> list[PITRevisionReceipt]:
-    """Append distinct events within the caller's locked publication transaction."""
+    """Plan distinct event revisions and write them through the transaction's destination."""
     if not connection.in_transaction():
         raise ValueError("event revision batch requires a publication transaction")
     receipts: list[PITRevisionReceipt] = []
@@ -1602,7 +1608,12 @@ def append_event_revisions(
             values for identity, (values, _) in sorted(plans.items())
             if values is not None and identity not in existing
         ]
-        if inserts:
+        if write_rows is not None:
+            write_rows(connection, EVENT_REVISION_TABLE, inserts, {
+                identity: [int(row["revision_no"]), str(row["revision_id"])] if row else None
+                for identity, row in latest.items()
+            })
+        elif inserts:
             _insert_pit_rows(connection, EVENT_REVISION_TABLE, inserts)
         receipts.extend(
             _receipt(existing[identity], idempotent=True)
@@ -1939,6 +1950,8 @@ _SOURCE_COVERAGE_RECEIPT_COLUMNS = (
 def _write_source_coverage_chunk(
     connection: Connection,
     prepared: list[tuple[dict[str, Any], dict[str, Any]]],
+    *,
+    write_rows: PITRowWriter | None = None,
 ) -> list[PITCoverageReceipt]:
     by_scope = {row["scope_hash"]: row for _, row in prepared}
     if len(by_scope) != len(prepared):
@@ -2043,7 +2056,12 @@ def _write_source_coverage_chunk(
         },
     )
     inserts = [pending[scope] for scope in sorted(pending) if scope not in existing]
-    if inserts:
+    if write_rows is not None:
+        write_rows(connection, SOURCE_COVERAGE_TABLE, inserts, {
+            scope: [int(row["revision_no"]), str(row["coverage_id"])] if (row := latest.get(scope)) else None
+            for scope in scopes
+        })
+    elif inserts:
         _insert_pit_rows(connection, SOURCE_COVERAGE_TABLE, inserts)
 
     receipts = []
@@ -2064,6 +2082,8 @@ def _write_source_coverage_chunk(
 def append_source_coverages(
     target: Engine | Connection,
     receipts: Iterable[Mapping[str, Any]],
+    *,
+    write_rows: PITRowWriter | None = None,
 ) -> list[PITCoverageReceipt]:
     """Append validated source-query receipts atomically in bounded SQL batches.
 
@@ -2090,13 +2110,13 @@ def append_source_coverages(
                 len(prepared) == _PIT_WRITE_BATCH_ROWS
                 or batch_bytes + row_bytes > _PIT_WRITE_BATCH_BYTES
             ):
-                output.extend(_write_source_coverage_chunk(connection, prepared))
+                output.extend(_write_source_coverage_chunk(connection, prepared, write_rows=write_rows))
                 prepared.clear()
                 batch_bytes = 0
             prepared.append((payload, row))
             batch_bytes += row_bytes
         if prepared:
-            output.extend(_write_source_coverage_chunk(connection, prepared))
+            output.extend(_write_source_coverage_chunk(connection, prepared, write_rows=write_rows))
         if transaction is not None:
             transaction.commit()
         return output

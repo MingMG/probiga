@@ -40,6 +40,7 @@ from server.common.qmt_announcement_pit import (
     validate_complete_qmt_announcement_batch,
     validate_task_result,
 )
+from server.db.formal_analysis_schema import privileged_migrate_formal_analysis_schema
 from server.common.pit_facts import (
     PIT_AVAILABLE,
     PIT_DATA_BLOCKED,
@@ -512,6 +513,7 @@ def test_historical_reconstruction_reconciles_official_effective_day_delisting(
         )
         engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
         ensure_pit_fact_schema(engine)
+        privileged_migrate_formal_analysis_schema(engine)
         times = iter((started, reconstructed))
         return engine, synchronize_historical_cninfo_announcements(
             engine,
@@ -859,6 +861,7 @@ def test_cninfo_post_cutoff_insert_does_not_change_frozen_sweeps(
     )
     engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
     ensure_pit_fact_schema(engine)
+    privileged_migrate_formal_analysis_schema(engine)
     result = synchronize_qmt_announcements(
         engine, xtdata=ProviderBackedAnnouncementAdapter(provider), checkpoint_root=tmp_path,
         source=CNINFO_ANNOUNCEMENT_SOURCE, fallback_reason=next(iter(ANNOUNCEMENT_FALLBACK_REASON_CODES)),
@@ -1398,6 +1401,7 @@ def test_cninfo_exact_receipts_publish_one_atomic_catalog_batch(
     )
     engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
     ensure_pit_fact_schema(engine)
+    privileged_migrate_formal_analysis_schema(engine)
     times = iter((
         cutoff,
         cutoff + timedelta(seconds=1),
@@ -1454,6 +1458,7 @@ def test_cninfo_delta_validates_frozen_source_window_and_merged_parent(
     monkeypatch.setattr("server.common.qmt_stock_catalog.load_stock_catalog", lambda *_args, **_kwargs: stock_catalog)
     engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
     ensure_pit_fact_schema(engine)
+    privileged_migrate_formal_analysis_schema(engine)
     master = _master(*codes)
     initial_cutoff = datetime(2026, 8, 25, 18, 20)
     delta_cutoff = datetime(2026, 8, 26, 18, 20)
@@ -1721,6 +1726,7 @@ def test_historical_reconstruction_uses_target_cutoff_and_actual_known_time(
     values = iter((started, reconstructed))
     engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
     ensure_pit_fact_schema(engine)
+    privileged_migrate_formal_analysis_schema(engine)
 
     result = synchronize_historical_cninfo_announcements(
         engine,
@@ -2264,6 +2270,7 @@ def test_cninfo_same_date_late_rows_keep_raw_pagination_and_atomic_pit_proof(
     )
     engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
     ensure_pit_fact_schema(engine)
+    privileged_migrate_formal_analysis_schema(engine)
     result = synchronize_qmt_announcements(
         engine, xtdata=ProviderBackedAnnouncementAdapter(provider), checkpoint_root=tmp_path,
         source=CNINFO_ANNOUNCEMENT_SOURCE, fallback_reason=next(iter(ANNOUNCEMENT_FALLBACK_REASON_CODES)),
@@ -2373,6 +2380,7 @@ def test_cninfo_failed_stock_resumes_only_matching_directory(
     )
     engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
     ensure_pit_fact_schema(engine)
+    privileged_migrate_formal_analysis_schema(engine)
     fallback_reason = "QMT_ANNOUNCEMENT_TERMINAL_DEPENDENCY_UNAVAILABLE"
     first_client = _Client(
         masters=[master], rows_by_code={"000001": [_row("000001", 0)]}
@@ -2526,6 +2534,7 @@ def test_historical_reconstruction_retry_resumes_same_sealed_checkpoint(
                                     days=[target], dataset="qmt_announcement_pit", checkpoint={})
     engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
     ensure_pit_fact_schema(engine)
+    privileged_migrate_formal_analysis_schema(engine)
     with pytest.raises(QMTAnnouncementBlocked) as exc:
         synchronize_historical_cninfo_announcements(
             engine,

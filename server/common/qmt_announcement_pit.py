@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 import hashlib
@@ -1470,6 +1470,40 @@ class AnnouncementCheckpoint:
                 **({"publication_batch_id": publication_batch_id} if publication_batch_id else {}),
             },
         )
+
+    def _historical_publication_path(self, origin: str) -> Path:
+        filename = ("prepared-history-research.json" if origin == QMT_ANNOUNCEMENT_MANUAL_RESEARCH_ORIGIN
+                    else "prepared-history-production.json")
+        return self.root / filename
+
+    def load_historical_publication(self, origin: str, scope: str) -> dict | None:
+        path = self._historical_publication_path(origin)
+        if not path.exists():
+            return None
+        try:
+            prepared = json.loads(path.read_text(encoding="utf-8"))
+            digest = prepared.pop("payload_sha256")
+            provenance = prepared["reconstruction_provenance"]
+            if (
+                digest != canonical_hash(prepared)
+                or prepared["schema"] != "probiga.qmt-announcement-historical-prepared.v1"
+                or provenance["source_query_scope_sha256"] != scope
+                or provenance["execution_origin"] != origin
+            ):
+                raise ValueError("historical publication inputs changed")
+        except (AttributeError, KeyError, OSError, TypeError, ValueError) as exc:
+            raise QMTAnnouncementBlocked("QMT_ANNOUNCEMENT_PREPARED_CHECKPOINT_TAMPERED") from exc
+        return prepared
+
+    def freeze_historical_publication(self, *, provenance: dict, delta_root: str, receipts: dict) -> None:
+        prepared = {
+            "schema": "probiga.qmt-announcement-historical-prepared.v1",
+            "delta_root_sha256": delta_root,
+            "reconstruction_provenance": provenance,
+            "provider_receipts": receipts,
+        }
+        _atomic_write(self._historical_publication_path(provenance["execution_origin"]),
+                      {**prepared, "payload_sha256": canonical_hash(prepared)})
 
     def load_complete(self) -> dict[str, list[dict[str, Any]]]:
         results: dict[str, list[dict[str, Any]]] = {}
@@ -3817,6 +3851,46 @@ def _finish_publish_connection(
             ))
 
 
+def _publication_generation(batch_id: str, batch_root_hash: str) -> str:
+    return canonical_hash({
+        "schema": "probiga.qmt-announcement-write.v1", "batch_id": batch_id,
+        "batch_root_hash": batch_root_hash,
+    })
+
+
+def _publication_resume_proof(provenance: Mapping[str, Any], *, batch_id: str, batch_root_hash: str,
+                              scheduler_run_uid: str, build_sha: str) -> dict[str, str]:
+    payload = {
+        "schema": "probiga.qmt-announcement-publication-resume.v1",
+        "generation_sha256": _publication_generation(batch_id, batch_root_hash),
+        "origin_run_uid": str(provenance.get("scheduler_run_uid") or ""),
+        "origin_build_sha": str(provenance.get("build_sha") or ""),
+        "reconstruction_sha256": str(provenance.get("reconstruction_sha256") or ""),
+        "publisher_run_uid": scheduler_run_uid,
+        "publisher_build_sha": build_sha,
+    }
+    return {**payload, "binding_sha256": canonical_hash(payload)}
+
+
+def reconstruction_publication_identity_matches(payload: Mapping[str, Any], *, scheduler_run_uid: str,
+                                                build_sha: str) -> bool:
+    """Check the current signed publisher and, on resume, the frozen source producer."""
+    provenance = payload.get("reconstruction_provenance")
+    if not isinstance(provenance, Mapping):
+        return False
+    if provenance.get("scheduler_run_uid") == scheduler_run_uid and provenance.get("build_sha") == build_sha:
+        return "publication_resume" not in payload
+    return (
+        provenance.get("execution_origin") == payload.get("execution_origin")
+        and bool(_SHA256_RE.fullmatch(str(provenance.get("reconstruction_sha256") or "")))
+        and payload.get("publication_resume") == _publication_resume_proof(
+            provenance, batch_id=str(payload.get("batch_id") or ""),
+            batch_root_hash=str(payload.get("batch_root_hash") or ""),
+            scheduler_run_uid=scheduler_run_uid, build_sha=build_sha,
+        )
+    )
+
+
 def _publish_batch(
     engine: Engine,
     *,
@@ -3837,10 +3911,19 @@ def _publish_batch(
     deadline_at: datetime | None = None,
     deadline_monotonic: float | None = None,
     now_fn: Callable[[], datetime] = datetime.now,
+    progress: Any = None,
 ) -> tuple[list[str], datetime]:
     from server.common.pit_facts import (
+        EVENT_REVISION_TABLE,
+        SOURCE_COVERAGE_TABLE,
         append_event_revisions,
         append_source_coverages,
+    )
+    from server.common.formal_analysis_store import FormalAnalysisStore, FormalAnalysisStoreError
+    from server.common.qmt_announcement_publish_store import (
+        AnnouncementPublishConflict,
+        AnnouncementPublishError,
+        AnnouncementPublishStore,
     )
 
     # Keep the transactional boundary guarded as a defence-in-depth recheck;
@@ -3856,7 +3939,6 @@ def _publish_batch(
         str(item["stock_code"]): str(item["source_response_hash"])
         for item in entries
     }
-    coverage_ids: list[str] = []
     source_name = str(source or "").strip()
     fallback_code = str(fallback_reason or "").strip()
     reconstruction = dict(reconstruction_provenance or {})
@@ -4040,17 +4122,23 @@ def _publish_batch(
                     check_deadline(f"db-event:{index}:{item_index}")
                 yield item
 
-    def bindings_by_stock(connection: Any) -> Iterator[tuple[str, list[dict[str, str]]]]:
+    def plan_shard(connection: Any, store: AnnouncementPublishStore, key: str, offset: int, codes: Sequence[str]) -> tuple[list[dict], str]:
         nonlocal db_phase
-        for offset in range(0, len(catalog.codes), DEFAULT_BATCH_SIZE):
-            codes = catalog.codes[offset:offset + DEFAULT_BATCH_SIZE]
-            db_phase = "event_revision_write"
-            event_receipts = iter(append_event_revisions(
-                connection, checked_events(codes, offset),
-                known_at=received_at, received_at=received_at,
-                source=source_name, batch_id=batch_id,
-            ))
-            db_phase = "coverage_write"
+        rows: dict[str, list[dict]] = {EVENT_REVISION_TABLE: [], SOURCE_COVERAGE_TABLE: []}
+        predecessors: dict[str, dict] = {EVENT_REVISION_TABLE: {}, SOURCE_COVERAGE_TABLE: {}}
+
+        def collect(_connection, table, inserts, heads):
+            rows[table].extend(inserts)
+            predecessors[table].update(heads)
+
+        db_phase = "event_revision_write"
+        event_receipts = iter(append_event_revisions(
+            connection, checked_events(codes, offset),
+            known_at=received_at, received_at=received_at,
+            source=source_name, batch_id=batch_id, write_rows=collect,
+        ))
+
+        def bindings_by_stock() -> Iterator[tuple[str, list[dict[str, str]]]]:
             for code in codes:
                 yield code, [
                     {
@@ -4060,8 +4148,22 @@ def _publish_batch(
                     for receipt in islice(event_receipts, len(results[code]))
                 ]
 
-    def coverage_arguments(connection: Any) -> Iterator[dict[str, Any]]:
-        for code, bindings in bindings_by_stock(connection):
+        db_phase = "coverage_write"
+        coverages = append_source_coverages(connection, coverage_arguments(bindings_by_stock()), write_rows=collect)
+        for code, coverage in zip(codes, coverages, strict=True):
+            if coverage.source_response_hash != response_hashes[code]:
+                raise QMTAnnouncementBlocked("QMT_ANNOUNCEMENT_RESPONSE_HASH_DRIFT", code)
+        db_phase = "checkpoint_write"
+        digest = store.put_shard(
+            key, event_rows=rows[EVENT_REVISION_TABLE], coverage_rows=rows[SOURCE_COVERAGE_TABLE],
+            event_predecessors=predecessors[EVENT_REVISION_TABLE],
+            coverage_predecessors=predecessors[SOURCE_COVERAGE_TABLE],
+            coverage_receipts=[asdict(receipt) for receipt in coverages],
+        )
+        return [asdict(receipt) for receipt in coverages], digest
+
+    def coverage_arguments(bindings_by_stock: Iterator[tuple[str, list[dict[str, str]]]]) -> Iterator[dict[str, Any]]:
+        for code, bindings in bindings_by_stock:
             provider_receipt = (
                 dict(receipts[code])
                 if source_name != QMT_ANNOUNCEMENT_SOURCE
@@ -4113,15 +4215,6 @@ def _publish_batch(
                 batch_id=batch_id,
             )
 
-    def write_rows(connection: Any) -> None:
-        coverages = append_source_coverages(connection, coverage_arguments(connection))
-        for code, coverage in zip(catalog.codes, coverages, strict=True):
-            if coverage.source_response_hash != response_hashes[code]:
-                raise QMTAnnouncementBlocked(
-                    "QMT_ANNOUNCEMENT_RESPONSE_HASH_DRIFT", code
-                )
-            coverage_ids.append(coverage.coverage_id)
-
     check_deadline("db-publish-start")
     db_phase = "connect"
     commit_state = "not_committed"
@@ -4146,17 +4239,69 @@ def _publish_batch(
             # implicit SELECT transaction before starting the atomic DML unit.
             db_phase = "lock_transaction_end"
             connection.commit()
-        db_phase = "transaction_begin"
-        transaction = connection.begin()
-        db_phase = "coverage_write"
-        write_rows(connection)
-        # This check is still inside the transaction: exceeding the total SLA
-        # rolls every PIT row back before commit.
-        publish_checked_at = check_deadline("db-precommit")
-        db_phase = "commit"
-        commit_state = "unknown"
-        transaction.commit()
-        commit_state = "committed"
+        base_generation = _publication_generation(batch_id, batch_root_hash)
+        generation = base_generation
+        plan_stage = "qmt-announcement-publication-replan"
+        stage_store = FormalAnalysisStore(connection)
+        with connection.begin():
+            for revision in range(3):
+                if stage_store.get(generation, plan_stage, "frontier-conflict") is None:
+                    break
+                generation = canonical_hash({"base": base_generation, "revision": revision + 1})
+            else:
+                raise QMTAnnouncementBlocked("QMT_ANNOUNCEMENT_PUBLICATION_FRONTIER_CONFLICT", "replan-budget-exhausted")
+        store = AnnouncementPublishStore(
+            connection, generation, source=source_name,
+            watermark_kind="HISTORICAL_RECONSTRUCTION" if reconstruction_mode else "QUERY_CUTOFF",
+        )
+        coverage_ids: list[str] = []
+        expected_shards: dict[str, str] = {}
+        db_phase = "checkpoint_inventory"
+        with connection.begin():
+            saved_shards = store.list_shards()
+        for offset in range(0, len(catalog.codes), DEFAULT_BATCH_SIZE):
+            check_deadline(f"db-checkpoint:{offset}")
+            codes = catalog.codes[offset:offset + DEFAULT_BATCH_SIZE]
+            key = f"{offset:06d}"
+            db_phase = "checkpoint_read"
+            resumed = key in saved_shards
+            with connection.begin():
+                if not resumed:
+                    shard_receipts, digest = plan_shard(connection, store, key, offset, codes)
+                else:
+                    digest = saved_shards[key]
+                    shard_receipts = store.get_shard_proof(key, digest)["coverage_receipts"]
+                for code, receipt in zip(codes, shard_receipts, strict=True):
+                    if receipt["source_response_hash"] != response_hashes[code]:
+                        raise QMTAnnouncementBlocked("QMT_ANNOUNCEMENT_RESPONSE_HASH_DRIFT", code)
+                    coverage_ids.append(receipt["coverage_id"])
+                expected_shards[key] = digest
+            if progress is not None:
+                progress.emit(
+                    "database_checkpoint", current_unit=key, advanced=not resumed,
+                    published_checkpoint_units=offset + len(codes),
+                    publication_generation_sha256=generation, resumed_publication_checkpoint=resumed,
+                )
+
+        with connection.begin() as transaction:
+            db_phase = "atomic_publish"
+            store.promote(
+                connection, expected_shards=expected_shards, batch_id=batch_id,
+                batch_root_hash=batch_root_hash, expected_coverage_count=len(catalog.codes),
+                expected_stock_codes=catalog.codes, check_deadline=check_deadline,
+            )
+            # The deadline check is part of the same transaction as the seal.
+            publish_checked_at = check_deadline("db-precommit")
+            db_phase = "commit"
+            commit_state = "unknown"
+            transaction.commit()
+            commit_state = "committed"
+    except AnnouncementPublishConflict as exc:
+        with connection.begin():
+            stage_store.put(generation, plan_stage, "frontier-conflict", {"generation_sha256": generation})
+        raise QMTAnnouncementBlocked("QMT_ANNOUNCEMENT_PUBLICATION_FRONTIER_CONFLICT", db_phase) from exc
+    except (AnnouncementPublishError, FormalAnalysisStoreError) as exc:
+        raise QMTAnnouncementBlocked("QMT_ANNOUNCEMENT_PUBLICATION_CHECKPOINT_INVALID", db_phase) from exc
     except Exception as exc:
         if not isinstance(exc, SQLAlchemyError) and commit_state != "unknown":
             raise
@@ -4844,12 +4989,17 @@ def synchronize_historical_cninfo_announcements(
             "source_query_scope_sha256": query_scope_sha256,
         },
     )
-    _connect_announcement_transport(adapter, source=CNINFO_ANNOUNCEMENT_SOURCE)
+    prepared = checkpoint.load_historical_publication(identity["execution_origin"], query_scope_sha256)
+    if prepared is None:
+        _connect_announcement_transport(adapter, source=CNINFO_ANNOUNCEMENT_SOURCE)
     staged_receipts = {}
+    prepared_results = {}
     for code in catalog.codes:
         check_capture_deadline(f"restore:{code}")
         result = checkpoint._load_result(code)
         if result is None:
+            if prepared is not None:
+                raise QMTAnnouncementBlocked("QMT_ANNOUNCEMENT_PREPARED_CHECKPOINT_TAMPERED", code)
             continue
         receipt = result.get("provider_receipt")
         if not _fallback_receipt_valid(
@@ -4879,7 +5029,9 @@ def synchronize_historical_cninfo_announcements(
         if not source_cutoff < master_at <= captured_at <= observed_at:
             raise QMTAnnouncementBlocked("QMT_ANNOUNCEMENT_RECONSTRUCTION_STAGED_RECEIPT_INVALID", code)
         staged_receipts[code] = receipt
-    if staged_receipts:
+        if prepared is not None:
+            prepared_results[code] = result["events"]
+    if staged_receipts and prepared is None:
         restorer = getattr(adapter, "restore_capture_receipts", None)
         if not callable(restorer):
             raise QMTAnnouncementBlocked(
@@ -4907,27 +5059,25 @@ def synchronize_historical_cninfo_announcements(
                           committed_units_per_second=round(rate, 3))
             last_report = current
 
-    try:
-        results = _download_and_read(
-            adapter,
-            checkpoint=checkpoint,
-            catalog=catalog,
-            fact_cutoff_at=source_cutoff,
-            window_start=window_start,
-            batch_size=int(batch_size),
-            source=CNINFO_ANNOUNCEMENT_SOURCE,
-            before_fetch=check_capture_deadline,
-            after_save=report_saved_stock,
-        )
-    except Exception:
-        if progress is not None:
-            progress.emit("source_checkpoint", status="FAILED", completed_units=completed_units)
-        raise
-    check_capture_deadline("security-master-end")
+    if prepared is None:
+        try:
+            results = _download_and_read(
+                adapter, checkpoint=checkpoint, catalog=catalog, fact_cutoff_at=source_cutoff,
+                window_start=window_start, batch_size=int(batch_size), source=CNINFO_ANNOUNCEMENT_SOURCE,
+                before_fetch=check_capture_deadline, after_save=report_saved_stock,
+            )
+            check_capture_deadline("security-master-end")
+            receipt_reader = getattr(adapter, "capture_receipts", None)
+            raw_receipts = receipt_reader() if callable(receipt_reader) else None
+        except Exception:
+            if progress is not None:
+                progress.emit("source_checkpoint", status="FAILED", completed_units=completed_units)
+            raise
+    else:
+        results = prepared_results
+        raw_receipts = prepared.get("provider_receipts")
     if progress is not None:
         progress.emit("source_checkpoint", status="COMPLETE", completed_units=completed_units)
-    receipt_reader = getattr(adapter, "capture_receipts", None)
-    raw_receipts = receipt_reader() if callable(receipt_reader) else None
     if not isinstance(raw_receipts, Mapping) or set(raw_receipts) != set(
         catalog.codes
     ):
@@ -5054,6 +5204,13 @@ def synchronize_historical_cninfo_announcements(
             for code in catalog.codes
         ],
     })
+    if prepared is None:
+        checkpoint.freeze_historical_publication(provenance=provenance, delta_root=delta_root, receipts=receipts)
+    else:
+        if prepared["delta_root_sha256"] != delta_root:
+            raise QMTAnnouncementBlocked("QMT_ANNOUNCEMENT_PREPARED_CHECKPOINT_TAMPERED")
+        provenance = prepared["reconstruction_provenance"]
+        reconstructed_at = _dt(provenance["reconstructed_at"])
     publication_identity = canonical_hash({
         "schema": "probiga.cninfo-announcement-publication-id.v1",
         "source_query_scope_sha256": query_scope_sha256,
@@ -5110,6 +5267,7 @@ def synchronize_historical_cninfo_announcements(
         deadline_at=publish_deadline,
         deadline_monotonic=publish_monotonic,
         now_fn=now_fn,
+        progress=progress,
     )
     try:
         checkpoint.mark_complete(
@@ -5155,7 +5313,15 @@ def synchronize_historical_cninfo_announcements(
         "validation_build_sha": identity["build_sha"],
         "execution_origin": identity["execution_origin"],
         **(
-            {"research_run_uid": identity["scheduler_run_uid"]}
+            {"publication_resume": _publication_resume_proof(
+                provenance, batch_id=batch_id, batch_root_hash=batch_root,
+                scheduler_run_uid=identity["scheduler_run_uid"], build_sha=identity["build_sha"],
+            )}
+            if provenance["scheduler_run_uid"] != identity["scheduler_run_uid"]
+            or provenance["build_sha"] != identity["build_sha"] else {}
+        ),
+        **(
+            {"research_run_uid": provenance["scheduler_run_uid"]}
             if identity["execution_origin"]
             == QMT_ANNOUNCEMENT_MANUAL_RESEARCH_ORIGIN
             else {}

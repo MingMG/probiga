@@ -43,9 +43,11 @@ class MinuteImportProgress:
         return datetime.now(PRODUCTION_TIMEZONE).isoformat(timespec="milliseconds")
 
     def emit(self, phase: str, *, completed_units=None, current_unit="", status="RUNNING",
-             console=False, **metrics):
+             console=False, advanced=False, **metrics):
         if completed_units is not None and completed_units > self.completed:
             self.completed = int(completed_units)
+            self.last_progress_at = self._now()
+        elif advanced:
             self.last_progress_at = self._now()
         event = dict(schema="probiga.qmt-datadir-progress.v1", dataset=self.dataset,
             run_id=self.run_id, operation=self.operation, operation_uid=self.operation_uid,

@@ -49,6 +49,7 @@ from server.common.qmt_announcement_pit import (
     HistoricalReconstructionContext,
     _explicit_qmt_unavailability_reason,
     _reconstruction_authority_matches,
+    reconstruction_publication_identity_matches,
     synchronize_qmt_announcements,
     synchronize_historical_cninfo_announcements,
     canonical_hash,
@@ -1806,9 +1807,8 @@ def validate_existing_task_result(
             )
             or (
                 payload.get("mode") == "HISTORICAL_RECONSTRUCTION"
-                and (
-                    scheduler_run_uid != validation_run_uid
-                    or build_sha != validation_build_sha
+                and not reconstruction_publication_identity_matches(
+                    payload, scheduler_run_uid=validation_run_uid, build_sha=validation_build_sha,
                 )
             )
             or provenance.get("automatic_real_order_submission") is not False

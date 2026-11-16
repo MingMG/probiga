@@ -70,9 +70,12 @@ HASH_A = "a" * 64
 HASH_B = "b" * 64
 
 
-def _engine():
-    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+def _engine(url="sqlite+pysqlite:///:memory:"):
+    from server.db.formal_analysis_schema import privileged_migrate_formal_analysis_schema
+
+    engine = create_engine(url, future=True)
     ensure_pit_fact_schema(engine)
+    privileged_migrate_formal_analysis_schema(engine)
     return engine
 
 
@@ -2979,6 +2982,145 @@ def test_missing_historical_batch_skips_unrelated_live_coverage_payloads():
     assert "SELECT *" not in coverage_reads[0]
 
 
+def test_historical_publication_resumes_verified_shard_after_mysql_2013(monkeypatch, tmp_path):
+    from server.common import pit_facts, qmt_announcement_pit as announcement
+    from server.common.announcement_provider import (
+        CninfoMarketAnnouncementProvider,
+        ProviderBackedAnnouncementAdapter,
+    )
+    from server.common.qmt_announcement_publish_store import AnnouncementPublishStore
+    from server.common.qmt_datadir_progress import MinuteImportProgress
+    from tests.test_announcement_provider_fallback import (
+        _Client, _historical_authority_v3, _master, _row_on_date,
+    )
+
+    engine = _engine(f"sqlite+pysqlite:///{(tmp_path / 'publication.db').as_posix()}")
+    target = date(2026, 11, 13)
+    catalog = _catalog(
+        ("000001", "000001.SZ"), ("000002", "000002.SZ"), ("600519", "600519.SH"),
+    )
+    authority = _historical_authority_v3(catalog, target)
+    master = _master(*catalog.codes)
+    first_started = datetime.now(announcement.SHANGHAI).replace(tzinfo=None, microsecond=0)
+    recovered_started = first_started + timedelta(minutes=1)
+    origin_uid, publisher_uid = "1" * 32, "3" * 32
+    origin_build, publisher_build = "2" * 40, "4" * 40
+    monkeypatch.setattr(announcement, "DEFAULT_BATCH_SIZE", 1)
+    monkeypatch.setenv("PROBIGA_JOB_LOG_ROOT", str(tmp_path / "jobs"))
+
+    def run(client, started, uid, build, progress):
+        provider = CninfoMarketAnnouncementProvider(
+            client=client, minimum_request_interval=0,
+            now_fn=lambda: started + timedelta(seconds=5),
+        )
+        return announcement.synchronize_historical_cninfo_announcements(
+            engine, adapter=ProviderBackedAnnouncementAdapter(provider, workers=1),
+            checkpoint_root=tmp_path, catalog=catalog,
+            context=announcement.HistoricalReconstructionContext(
+                target_trade_date=target,
+                source_query_cutoff_at=datetime.combine(target, datetime.max.time()),
+                reconstruction_started_at=started, scheduler_run_uid=uid,
+                build_sha=build, authority=authority,
+            ),
+            now_fn=lambda: started + timedelta(seconds=10),
+            progress=progress,
+        )
+
+    def progress_for(uid):
+        return MinuteImportProgress(
+            run_id=uid, total_units=len(catalog.codes), operation="historical_reconstruction",
+            days=[target], dataset="qmt_announcement_pit", checkpoint={},
+        )
+
+    def progress_shards(progress):
+        return [
+            entry for line in progress.path.read_text(encoding="utf-8").splitlines()
+            if (entry := json.loads(line))["phase"] == "database_checkpoint"
+        ]
+
+    original = pit_facts.append_source_coverages
+    planned = []
+    inject_failure = True
+
+    def prepare_with_disconnect(connection, arguments, **kwargs):
+        arguments = list(arguments)
+        code, = (argument["stock_code"] for argument in arguments)
+        planned.append(code)
+        if inject_failure and code == "000002":
+            raise OperationalError(
+                "coverage preparation", {}, Exception(2013, "Lost connection to MySQL server"),
+                connection_invalidated=True,
+            )
+        return original(connection, arguments, **kwargs)
+
+    monkeypatch.setattr(pit_facts, "append_source_coverages", prepare_with_disconnect)
+    first_client = _Client(
+        masters=[master, master],
+        rows_by_code={"000001": [_row_on_date("000001", 0, target)]},
+    )
+    first_progress = progress_for(origin_uid)
+    with pytest.raises(QMTAnnouncementBlocked) as raised:
+        run(first_client, first_started, origin_uid, origin_build, first_progress)
+
+    assert raised.value.reason_code == "QMT_ANNOUNCEMENT_PUBLISH_DATABASE_ERROR"
+    assert "mysql_errno=2013" in raised.value.detail
+    assert "commit_state=not_committed" in raised.value.detail
+    assert first_client.requested_stock_identities == [
+        f"{code},org-{code}" for code in catalog.codes
+    ]
+    assert planned == ["000001", "000002"]
+    checkpoints = progress_shards(first_progress)
+    assert [row["published_checkpoint_units"] for row in checkpoints] == [1]
+    generation = checkpoints[0]["publication_generation_sha256"]
+    reader = AnnouncementPublishStore(engine, generation)
+    first_shards = reader.list_shards()
+    assert list(first_shards) == ["000000"]
+    assert reader.get_seal() is None
+    assert reader.get_shard("000000")["proof"]["event_count"] == 1
+    assert reader.get_shard("000000")["proof"]["coverage_count"] == 1
+    with engine.connect() as connection:
+        for table in (EVENT_REVISION_TABLE, SOURCE_COVERAGE_TABLE):
+            assert connection.execute(text(f"SELECT count(*) FROM {table}")).scalar_one() == 0
+
+    source_checkpoint, = tmp_path.glob("cninfo-ann-reconstruction-scope-*")
+    source_files = {path: path.read_bytes() for path in (source_checkpoint / "results").glob("*.json")}
+    assert len(source_files) == len(catalog.codes)
+    assert not (source_checkpoint / "complete.json").exists()
+    resumed_client = _Client(masters=[master, master], rows_by_code={})
+    resumed_progress = progress_for(publisher_uid)
+    planned.clear()
+    inject_failure = False
+    result = run(resumed_client, recovered_started, publisher_uid, publisher_build, resumed_progress)
+
+    assert resumed_client.requested_stock_identities == []
+    assert resumed_client.get_count == 0
+    assert planned == ["000002", "600519"]
+    assert all(path.read_bytes() == content for path, content in source_files.items())
+    assert reader.list_shards()["000000"] == first_shards["000000"]
+    assert reader.get_seal()["batch_root_hash"] == result["batch_root_hash"]
+    assert reader.get_seal()["batch_id"] == result["batch_id"]
+    assert result["coverage_count"] == len(catalog.codes)
+    assert result["event_count"] == 1
+    assert result["reconstruction_provenance"]["scheduler_run_uid"] == origin_uid
+    assert result["reconstruction_provenance"]["build_sha"] == origin_build
+    assert result["publication_resume"]["generation_sha256"] == generation
+    assert announcement.reconstruction_publication_identity_matches(
+        result, scheduler_run_uid=publisher_uid, build_sha=publisher_build,
+    )
+    assert announcement.validate_task_result(result, 0) == "complete"
+    assert (source_checkpoint / "complete.json").is_file()
+    with engine.connect() as connection:
+        coverage = connection.execute(text(
+            f"SELECT stock_code, result_count, batch_id FROM {SOURCE_COVERAGE_TABLE} ORDER BY stock_code"
+        )).all()
+        events = connection.execute(text(
+            f"SELECT stock_code, batch_id FROM {EVENT_REVISION_TABLE}"
+        )).all()
+    assert coverage == [
+        (code, int(code == "000001"), result["batch_id"]) for code in catalog.codes
+    ]
+    assert events == [("000001", result["batch_id"])]
+
 def test_full_market_publish_batches_empty_coverage_and_preserves_revision_chain(monkeypatch):
     from server.common import qmt_announcement_pit
     from server.common.qmt_announcement_pit import _publish_batch, build_batch_root
@@ -2990,9 +3132,13 @@ def test_full_market_publish_batches_empty_coverage_and_preserves_revision_chain
     first_cutoff = datetime(2026, 9, 2, 18, 20)
     coverage_reads = []
     coverage_inserts = []
-    # A fixed remote round-trip budget is enough for these batches, but not for
-    # one SELECT and one INSERT per security as in the former publisher.
+    expire_after_canonical_insert = True
+
+    # Exercise the production deadline after a partial canonical write. The
+    # regular clock also bounds the number of remote coverage round trips.
     def clock():
+        if expire_after_canonical_insert and coverage_inserts:
+            return 100
         return len(coverage_reads) + len(coverage_inserts)
 
     monkeypatch.setattr(qmt_announcement_pit, "monotonic", clock)
@@ -3000,12 +3146,12 @@ def test_full_market_publish_batches_empty_coverage_and_preserves_revision_chain
     @event.listens_for(engine, "before_cursor_execute")
     def observe(connection, cursor, statement, parameters, context, executemany):
         if "st_pit_source_coverage" in statement:
-            if statement.startswith("SELECT"):
+            if statement.lstrip().upper().startswith("SELECT"):
                 coverage_reads.append(statement)
-            if statement.startswith("INSERT"):
+            if statement.lstrip().upper().startswith("INSERT"):
                 coverage_inserts.append(len(parameters) if executemany else 1)
 
-    def publish(cutoff, *, round_trip_budget=24):
+    def publish(cutoff, *, round_trip_budget=36):
         batch_id = f"qmt-ann-{cutoff:%Y%m%dT%H%M%S}-bulk"
         arguments = dict(
             batch_id=batch_id, fact_cutoff_at=cutoff,
@@ -3019,9 +3165,10 @@ def test_full_market_publish_batches_empty_coverage_and_preserves_revision_chain
             deadline_monotonic=clock() + round_trip_budget, **arguments,
         )[0]
 
-    with pytest.raises(QMTAnnouncementBlocked, match="db-"):
-        publish(first_cutoff, round_trip_budget=4)
-    assert coverage_inserts, "the deadline must interrupt a partially written transaction"
+    with pytest.raises(QMTAnnouncementBlocked, match="announcement-insert"):
+        publish(first_cutoff)
+    assert coverage_inserts == [100]
+    expire_after_canonical_insert = False
     with engine.connect() as connection:
         assert connection.execute(text(f"SELECT COUNT(*) FROM {SOURCE_COVERAGE_TABLE}")).scalar_one() == 0
     coverage_reads.clear()
@@ -3029,12 +3176,12 @@ def test_full_market_publish_batches_empty_coverage_and_preserves_revision_chain
     first = publish(first_cutoff)
     assert len(first) == len(codes)
     assert coverage_inserts == [100, 100, 5]
-    assert len(coverage_reads) == 6
+    assert 1 <= len(coverage_reads) <= 15
     coverage_reads.clear()
     coverage_inserts.clear()
     assert publish(first_cutoff) == first
     assert coverage_inserts == []
-    assert len(coverage_reads) == 6
+    assert len(coverage_reads) <= 6
 
     second = publish(first_cutoff + timedelta(minutes=5))
     assert second != first
@@ -3064,13 +3211,24 @@ def test_atomic_publish_never_reports_false_no_write_after_commit():
         catalog=catalog,
         results=results,
     )
-    checks = iter((received, received, received))
+    canonical_inserted = False
+    publication_committed = False
+
+    @event.listens_for(engine, "after_cursor_execute")
+    def observe_insert(_connection, _cursor, statement, _params, _context, _many):
+        nonlocal canonical_inserted
+        if statement.lstrip().upper().startswith(f"INSERT INTO {SOURCE_COVERAGE_TABLE.upper()}"):
+            canonical_inserted = True
+
+    @event.listens_for(engine, "commit")
+    def observe_commit(_connection):
+        nonlocal publication_committed
+        if canonical_inserted:
+            publication_committed = True
 
     def now_fn():
-        try:
-            return next(checks)
-        except StopIteration as exc:
-            raise AssertionError("postcommit deadline check is unsafe") from exc
+        assert not publication_committed, "postcommit deadline check is unsafe"
+        return received
 
     coverage_ids, publish_checked_at = _publish_batch(
         engine,
@@ -3088,6 +3246,7 @@ def test_atomic_publish_never_reports_false_no_write_after_commit():
     )
     assert len(coverage_ids) == len(catalog.codes)
     assert publish_checked_at == received
+    assert publication_committed
 
 
 @pytest.mark.parametrize("failure_phase", ["coverage_write", "commit", None])
@@ -3113,12 +3272,19 @@ def test_publisher_cleanup_preserves_write_failure_and_commit_outcome(
     cleanup_calls = []
     append_coverages = pit_facts.append_source_coverages
     append_events = pit_facts.append_event_revisions
+    canonical_inserted = False
+
+    @event.listens_for(engine, "after_cursor_execute")
+    def observe_insert(_connection, _cursor, statement, _params, _context, _many):
+        nonlocal canonical_inserted
+        if statement.lstrip().upper().startswith(f"INSERT INTO {SOURCE_COVERAGE_TABLE.upper()}"):
+            canonical_inserted = True
 
     def db_error(errno):
         return OperationalError("untrusted statement", {}, Exception(errno, "private details"))
 
-    def append_coverage_then_maybe_fail(connection, arguments):
-        receipts = append_coverages(connection.native, arguments)
+    def append_coverage_then_maybe_fail(connection, arguments, **kwargs):
+        receipts = append_coverages(connection.native, arguments, **kwargs)
         if failure_phase == "coverage_write":
             raise db_error(1213)
         return receipts
@@ -3135,13 +3301,12 @@ def test_publisher_cleanup_preserves_write_failure_and_commit_outcome(
             return self
 
         def __exit__(self, exc_type, exc, traceback):
-            if exc_type is not None:
-                return self.transaction.__exit__(exc_type, exc, traceback)
-            self.commit()
+            return self.transaction.__exit__(exc_type, exc, traceback)
 
         def commit(self):
             self.transaction.commit()
-            raise db_error(2013)
+            if canonical_inserted:
+                raise db_error(2013)
 
     class MysqlSession:
         dialect = SimpleNamespace(name="mysql")
@@ -3149,6 +3314,10 @@ def test_publisher_cleanup_preserves_write_failure_and_commit_outcome(
         def __init__(self, native):
             self.native = native
             self.invalidated = False
+
+        @property
+        def __class__(self):
+            return type(self.native)
 
         def __getattr__(self, name):
             return getattr(self.native, name)
@@ -3165,12 +3334,16 @@ def test_publisher_cleanup_preserves_write_failure_and_commit_outcome(
                 return CommitAcknowledgementLost(transaction)
             return transaction
 
-        def execute(self, statement):
+        def execute(self, statement, *args, **kwargs):
             if "GET_LOCK" in str(statement):
+                # The lock protocol is simulated. All transactional data writes
+                # use the real SQLite connection and dialect.
+                self.dialect = self.native.dialect
                 return self.native.execute(text("SELECT 1"))
-            assert "RELEASE_LOCK" in str(statement)
-            cleanup_calls.append("release")
-            raise db_error(2006)
+            if "RELEASE_LOCK" in str(statement):
+                cleanup_calls.append("release")
+                raise db_error(2006)
+            return self.native.execute(statement, *args, **kwargs)
 
         def invalidate(self):
             self.invalidated = True

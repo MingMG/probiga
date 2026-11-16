@@ -333,7 +333,11 @@ def _read_signed_announcement_completion(
     required_run_uid: str | None = None, consumer_release_id: str | None = None,
 ) -> FrozenInitialAnnouncement | None:
     from server.common.analysis_pool_receipt import FROZEN_INITIAL_ANNOUNCEMENT_SCHEMA
-    from server.common.qmt_announcement_pit import QMT_ANNOUNCEMENT_TASK_SCHEMA, validate_task_result
+    from server.common.qmt_announcement_pit import (
+        QMT_ANNOUNCEMENT_TASK_SCHEMA,
+        reconstruction_publication_identity_matches,
+        validate_task_result,
+    )
 
     stage = "qmt_announcement_pit"
     session = date.fromisoformat(target)
@@ -417,14 +421,13 @@ def _read_signed_announcement_completion(
             if batch is None and item.get("mode"):
                 validation_uid = str(attempt["scheduler_run_uid"])
                 validation_build = checkpoint["build_sha"]
-                provenance = item["reconstruction_provenance"]
                 if (
                     item.get("validation_run_uid") != validation_uid
                     or item.get("validation_build_sha") != validation_build
-                    or (item["mode"] == "HISTORICAL_RECONSTRUCTION" and (
-                        provenance.get("scheduler_run_uid") != validation_uid
-                        or provenance.get("build_sha") != validation_build
-                    ))
+                    or (item["mode"] == "HISTORICAL_RECONSTRUCTION"
+                        and not reconstruction_publication_identity_matches(
+                            item, scheduler_run_uid=validation_uid, build_sha=validation_build,
+                        ))
                 ):
                     raise ValueError("historical announcement scheduler identity differs")
         except (TypeError, ValueError) as exc:

@@ -10,6 +10,7 @@ from server.common import daily_delivery_control as control
 from server.common import pit_facts
 from server.common.analysis_pool_receipt import build_score_snapshot, decode_score_snapshot
 from server.common.authoritative_market_clock import PRODUCTION_TIMEZONE, resolve_strategy_pool_decision_slot
+from server.db.formal_analysis_schema import privileged_migrate_formal_analysis_schema
 from server.common.qmt_announcement_pit import QMT_ANNOUNCEMENT_TASK_SCHEMA
 from tests.score_snapshot_helpers import scored_publication
 from tests.test_daily_delivery_control import BUILD_SHA, STRATEGY_RELEASE_ID, _engine, _legacy_delivery
@@ -24,6 +25,7 @@ SCHEDULED = datetime(2026, 11, 10, 22, 20)
 def test_signed_cninfo_accepts_only_unchanged_disclosure_with_source_clock_correction(change, accepted):
     engine = _engine()
     pit_facts.ensure_pit_fact_schema(engine)
+    privileged_migrate_formal_analysis_schema(engine)
     cutoff = datetime.fromisoformat(TARGET + "T23:59:59.999999")
     received = cutoff + timedelta(hours=3)
     previous_time = datetime.fromisoformat(TARGET + "T19:26:27")
@@ -305,6 +307,7 @@ def test_signed_cninfo_reconstruction_is_usable_only_after_actual_completion(
     engine = pool_calendar
     monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "development")
     pit_facts.ensure_pit_fact_schema(engine)
+    privileged_migrate_formal_analysis_schema(engine)
     target = date.fromisoformat(TARGET)
     start = target - timedelta(days=30)
     scoring_start = target - timedelta(days=14)
