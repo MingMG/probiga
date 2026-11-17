@@ -62,9 +62,13 @@
         DEGRADED: '部分可用', TIMEOUT: '超时', STOPPED: '已停止', SUPERSEDED: '已被替代'
     };
     const dailyStages = {
-        stock_daily: '股票日线', stock_finance: '财务数据', stock_notice: '公告',
-        stock_minute: '分钟行情', score: '策略评分', stock_score: '策略评分',
-        publish: '结果发布', stock_pool: '股票池', analysis_premarket_external: '盘前外围'
+        stock_daily: '股票日线', qmt_stock_daily_canonical: '股票日线', stock_finance: '财务数据',
+        target_turnover_snapshot: '换手率快照', qmt_membership_snapshot: '行业与板块成员',
+        capital_flow_batch_fast: '股票资金流', notice_eastmoney: '东方财富公告',
+        qmt_announcement_pit: '公告历史证据', qmt_announcement_premarket_prepare: '盘前公告准备',
+        stock_notice: '公告', stock_minute: '分钟行情', score: '策略评分', stock_score: '策略评分',
+        publish: '结果发布', stock_pool: '股票池', analysis_premarket_external: '盘前外围',
+        analysis_upper_evidence_prepare: '涨停证据准备'
     };
     let active = null;
 
@@ -225,7 +229,8 @@
             const label = deliveryStates[attempt.status];
             const stamp = attempt.finished_at || attempt.started_at;
             if (!label || !day(stamp)) continue;
-            items.push({kind:'交付', tab:'daily-pool', stamp, text:`${dailyStages[attempt.stage_name] || attempt.stage_name || '数据阶段'} · ${label}`});
+            const stage = Object.hasOwn(dailyStages, attempt.stage_name) ? dailyStages[attempt.stage_name] : '其他交付阶段';
+            items.push({kind:'交付', tab:'daily-pool', stamp, text:`${stage} · ${label}`});
         }
         const visible = items.filter(item => filter === '全部' || filter === item.kind)
             .sort((left, right) => String(right.stamp).replace('T', ' ').localeCompare(String(left.stamp).replace('T', ' '))).slice(0, 10);
@@ -234,7 +239,8 @@
             ${['全部', '行情', '复盘', '交付'].map(kind => `<option${filter === kind ? ' selected' : ''}>${kind}</option>`).join('')}
             </select></label></div>
             ${visible.length ? `<ol class="mh-update-feed">${visible.map(item => `<li><button type="button" data-mh-tab="${item.tab}">
-                <time datetime="${escape(String(item.stamp).replace(' ', 'T'))}">${escape(day(item.stamp) === requested && String(item.stamp).length >= 16 ? item.stamp.slice(11, 16) : day(item.stamp))}</time><span>${item.kind}</span><strong>${escape(item.text)}</strong></button></li>`).join('')}</ol>` :
+                <time datetime="${escape(String(item.stamp).replace(' ', 'T'))}">${escape(String(item.stamp).length >= 16 ?
+                    item.stamp.slice(day(item.stamp) === requested ? 11 : 5, 16).replace('T', ' ') : day(item.stamp))}</time><span>${item.kind}</span><strong>${escape(item.text)}</strong></button></li>`).join('')}</ol>` :
             empty('所选日期暂无此类可核验记录')}`;
     }
 

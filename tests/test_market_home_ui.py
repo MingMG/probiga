@@ -125,17 +125,18 @@ def test_home_hub_only_claims_accepted_delivery_with_matching_receipt():
     run_node(r"""
 const date = '2026-11-06';
 const clock = {today:'2026-11-10'};
-const attempt = {status:'SUCCESS',stage_name:'stock_daily',finished_at:date + ' 15:40:00'};
+const attempt = {status:'SUCCESS',stage_name:'qmt_stock_daily_canonical',finished_at:date + ' 15:40:00'};
+const overnight = {status:'SUCCESS',stage_name:'target_turnover_snapshot',finished_at:'2026-11-07T01:17:54'};
 const reviewDates = {dates:[date]};
-const delivery = {trade_date:date,status:'PASS',data:{session:{updated_at:date + ' 15:42:00'},attempts:[attempt]}};
+const delivery = {trade_date:date,status:'PASS',data:{session:{updated_at:date + ' 15:42:00'},attempts:[attempt,overnight]}};
 const html = page.render({reviewDates,delivery},date,clock);
 for (const text of ['A股大看板','更新时间流','研究日历','信息和数据看板','选股专题','策略跟踪',
-    '15:40','股票日线 · 阶段完成','有复盘记录','data-mh-tab="trading-v3-candidates"']) {
+    '15:40','股票日线 · 阶段完成','11-07 01:17','换手率快照 · 阶段完成','有复盘记录','data-mh-tab="trading-v3-candidates"']) {
     assert.ok(html.includes(text),text);
 }
 assert.match(html, /data-mh-date="2026-11-06"[^>]*aria-pressed="true"/);
 assert.match(html, /data-mh-date="2026-11-11"[^>]*disabled/);
-assert.doesNotMatch(html,/交付已验收/);
+assert.doesNotMatch(html,/交付已验收|target_turnover_snapshot|qmt_stock_daily_canonical/);
 delivery.data.receipt = {schema:'probiga.daily-delivery.v1',status:'PASS',trade_date:date};
 assert.match(page.render({reviewDates,delivery},date,clock),/交付已验收/);
 assert.doesNotMatch(page.render({reviewDates,delivery},'2026-11-05',clock),/交付已验收|股票日线 · 阶段完成/);
