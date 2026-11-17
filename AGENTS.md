@@ -11,6 +11,14 @@ For every new Codex conversation that changes this project:
 
 Read-only investigation does not require a branch until a file change is needed.
 
+# Ponytail 开发方式
+
+在 ProBigA 实现、修复、重构和审查代码时，默认采用 [Ponytail 核心 Skill](.agents/skills/ponytail/SKILL.md) 的 `full` 模式。支持 Skill 的代理使用仓库内的 `$ponytail`，其他代理直接读取该文件。
+
+动手前先查调用方、配置和测试，确认根因和完整改动范围。优先复用项目已有实现，其次用标准库、平台能力或已装依赖；只增加完整解决问题所需的代码。Ponytail 不改变本文件的分支、发布、生产验收、数据完整性和交易安全要求，也不能用来引入临时方案或省略必要验证。
+
+来源：[DietrichGebert/ponytail @ 96608e0](https://github.com/DietrichGebert/ponytail/tree/96608e078b2d5ea607c5c3b8b5a54d1c1fba6846)，[MIT 许可证](.agents/skills/ponytail/LICENSE)。项目只纳入核心 Skill 文档，不启用上游插件或 hooks。
+
 # Deployment scope policy
 
 For every task, scan the planned and actual change scope before implementation
