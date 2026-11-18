@@ -966,6 +966,7 @@ def _existing_live_batch_inventory(
     mysql = connection.dialect.name == "mysql"
     query_budget = "/*+ MAX_EXECUTION_TIME(10000) */ " if mysql else ""
     index_hint = f" FORCE INDEX (`{PIT_SOURCE_COVERAGE_DATE_INDEX_NAME}`)" if mysql else ""
+    target_close = datetime.combine(target, DAILY_CLOSE_READY_TIME)
     # Group first so a pre-close batch cannot displace exact-session evidence,
     # while all rows of a mixed batch remain subject to envelope validation.
     statement = text(
@@ -1008,10 +1009,10 @@ def _existing_live_batch_inventory(
             for row in connection.execute(statement, {
                 "source": source,
                 "batch_pattern": _FULL_MARKET_BATCH_PREFIX[source] + "%",
-                "known_from": datetime.combine(target, datetime.min.time()),
+                "known_from": target_close,
                 "decision_at": decision_at,
                 "capture_deadline": capture_deadline,
-                "target_close": datetime.combine(target, DAILY_CLOSE_READY_TIME),
+                "target_close": target_close,
             }).mappings()
         ]
     except SQLAlchemyError as exc:
