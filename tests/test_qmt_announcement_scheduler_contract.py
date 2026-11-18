@@ -18,6 +18,8 @@ from tools.check_strategy_governance_health import (
 
 from server.api.scheduler_runtime import (
     WINDOWS_QMT_BRIDGE_TASK_TYPES,
+    _announcement_recovery_target,
+    _attach_release_catchup_history,
     _should_skip_task_for_host,
     _task_argument_row,
     evaluate_strategy_pipeline_dependencies,
@@ -315,6 +317,68 @@ def test_release_recovery_rewrites_capture_to_historical_recovery():
         "--expected-trade-date",
         "2026-09-01",
     ]
+
+
+def test_announcement_recovery_keeps_prior_gap_after_current_session_rolls():
+    engine = create_engine("sqlite://")
+    with engine.begin() as connection:
+        connection.execute(text("""
+            CREATE TABLE st_daily_delivery_session (session_uid TEXT, trade_date DATE, release_id TEXT)
+        """))
+        connection.execute(text("""
+            CREATE TABLE st_daily_stage_attempt (session_uid TEXT, stage_name TEXT,
+                status TEXT, started_at DATETIME, finished_at DATETIME, lease_until DATETIME,
+                scheduler_run_uid TEXT, id INTEGER PRIMARY KEY)
+        """))
+        connection.execute(text("""
+            INSERT INTO st_daily_delivery_session VALUES
+                ('older', '2026-11-16', 'old-release'),
+                ('gap', '2026-11-17', 'old-release'),
+                ('current', '2026-11-18', 'active-release')
+        """))
+        connection.execute(text("""
+            INSERT INTO st_daily_stage_attempt VALUES
+                ('older', 'qmt_announcement_pit', 'SUCCESS', '2026-11-16 18:20:00', '2026-11-16 18:30:00', NULL, 'older', 1),
+                ('gap', 'qmt_announcement_pit', 'BLOCKED', '2026-11-18 14:42:10', '2026-11-18 14:42:34', NULL, 'gap-first', 2),
+                ('current', 'qmt_announcement_pit', 'BLOCKED', '2026-11-18 16:21:44', '2026-11-18 16:30:00', NULL, 'wrong-date', 3)
+        """))
+
+        def select(latest, now):
+            return _announcement_recovery_target(
+                connection, latest=latest, now=now, release_id="active-release",
+            )
+
+        assert select("2026-11-17", datetime(2026, 11, 18, 16, 30)) == ("2026-11-17", True, False)
+        now = datetime(2026, 11, 18, 19, 40)
+        assert select("2026-11-18", now) == ("2026-11-18", False, False)
+        connection.execute(text("""
+            INSERT INTO st_daily_stage_attempt VALUES
+                ('current', 'qmt_announcement_pit', 'SUCCESS', '2026-11-18 18:20:00', '2026-11-18 19:30:00', NULL, 'live', 4)
+        """))
+        assert select("2026-11-18", now) == ("2026-11-17", True, False)
+        connection.execute(text("""
+            INSERT INTO st_daily_stage_attempt VALUES
+                ('gap', 'qmt_announcement_pit', 'BLOCKED', '2026-11-18 19:35:00', '2026-11-18 19:39:00', NULL, 'gap-retry', 5)
+        """))
+        assert select("2026-11-18", now) == ("2026-11-18", False, True)
+        connection.execute(text("""
+            INSERT INTO st_daily_stage_attempt VALUES
+                ('gap', 'qmt_announcement_pit', 'SUCCESS', '2026-11-18 20:00:00', '2026-11-18 20:10:00', NULL, 'gap-repaired', 6)
+        """))
+        assert select("2026-11-18", datetime(2026, 11, 18, 21)) == ("2026-11-18", False, True)
+        connection.execute(text("""
+            CREATE TABLE st_scheduled_task_history (id INTEGER PRIMARY KEY, run_uid TEXT,
+                task_id INTEGER, task_type TEXT, status TEXT, build_sha TEXT, run_at DATETIME,
+                finished_at DATETIME, exit_code INTEGER, output TEXT, trigger_source TEXT)
+        """))
+        connection.execute(text("""
+            INSERT INTO st_scheduled_task_history VALUES
+                (1, 'live', 127, 'qmt_announcement_pit', 'success', 'build', NULL, NULL, 0, '', 'release_catchup'),
+                (2, 'gap-repaired', 127, 'qmt_announcement_pit', 'success', 'build', NULL, NULL, 0, '', 'release_catchup')
+        """))
+    row = {**TASK, "id": 127, "_scheduler_target_trade_date": "2026-11-18"}
+    assert _attach_release_catchup_history(engine, [row])
+    assert row["_release_terminal_run_uid"] == "live"
 
 
 @pytest.mark.parametrize(

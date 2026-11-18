@@ -35,6 +35,7 @@ from server.common.qmt_daily_market_truth import (
 )
 from server.api.routers._engine import get_engine
 from server.common.authoritative_market_clock import (
+    DAILY_CLOSE_READY_TIME,
     PRODUCTION_TIMEZONE,
     STOCK_MINUTE_CAPTURE_READY_TIME,
     STRATEGY_POOL_PREMARKET_PUBLICATION_DEADLINE,
@@ -1877,10 +1878,14 @@ def _attach_release_catchup_history(engine, rows: list[dict]) -> bool:
         row["_release_history_available"] = False
     if not selected:
         return True
+    announcement_row = next((
+        row for row in selected
+        if row.get("task_type") == "qmt_announcement_pit" and row.get("_scheduler_target_trade_date")
+    ), None)
     task_pairs = sorted(
         {
             (int(row["id"]), str(row.get("task_type") or "").strip())
-            for row in selected
+            for row in selected if row is not announcement_row
         }
     )
     pair_predicates = " OR ".join(
@@ -1918,7 +1923,25 @@ def _attach_release_catchup_history(engine, rows: list[dict]) -> bool:
             history_rows = {
                 (int(item["task_id"]), str(item.get("task_type") or "")): dict(item)
                 for item in connection.execute(statement, params).mappings()
-            }
+            } if task_pairs else {}
+            if announcement_row is not None:
+                task_id = int(announcement_row["id"])
+                history = connection.execute(text("""
+                    SELECT /*+ MAX_EXECUTION_TIME(8000) */ h.id, h.run_uid, h.task_id,
+                           h.task_type, h.status, h.build_sha, h.run_at, h.finished_at,
+                           h.exit_code, h.output, h.trigger_source
+                    FROM st_scheduled_task_history h
+                    WHERE h.task_id=:task_id AND h.task_type='qmt_announcement_pit'
+                      AND h.run_uid=(
+                        SELECT a.scheduler_run_uid FROM st_daily_delivery_session s
+                        JOIN st_daily_stage_attempt a ON a.session_uid=s.session_uid
+                        WHERE s.trade_date=:target AND a.stage_name='qmt_announcement_pit'
+                          AND a.status IN ('SUCCESS','DEGRADED','BLOCKED','FAILED','TIMEOUT','STOPPED')
+                        ORDER BY a.started_at DESC, a.id DESC LIMIT 1
+                      )
+                """), {"task_id": task_id, "target": announcement_row["_scheduler_target_trade_date"]}).mappings().first()
+                if history is not None:
+                    history_rows[(task_id, "qmt_announcement_pit")] = dict(history)
     except Exception as exc:
         logger.error(
             "Release data catch-up history is unavailable; fail closed: %s",
@@ -4165,6 +4188,48 @@ def evaluate_immutable_daily_dependency_histories(
 
 
 
+def _announcement_recovery_target(
+    connection, *, latest: str, now: datetime, release_id: str,
+) -> tuple[str, bool, bool]:
+    """Keep one dated announcement gap eligible after the live session rolls."""
+
+    today = now.date().isoformat()
+    rows = connection.execute(text("""
+        SELECT /*+ MAX_EXECUTION_TIME(8000) */ s.trade_date,
+               MAX(COALESCE(a.finished_at, a.lease_until)) AS last_attempt,
+               MAX(CASE WHEN a.status='SUCCESS' THEN 1 ELSE 0 END) AS completed,
+               MAX(CASE WHEN a.status='SUCCESS' AND s.release_id=:release_id
+                        THEN 1 ELSE 0 END) AS completed_this_release
+        FROM st_daily_delivery_session s
+        JOIN st_daily_stage_attempt a ON a.session_uid=s.session_uid
+        WHERE s.trade_date BETWEEN :earliest AND :latest
+          AND a.stage_name='qmt_announcement_pit'
+          AND (s.trade_date < :today OR a.started_at >= :today_close)
+        GROUP BY s.trade_date
+        ORDER BY last_attempt, s.trade_date
+    """), {
+        "earliest": (now.date() - timedelta(days=DAILY_RESULT_RECOVERY_MAX_AGE_DAYS)).isoformat(),
+        "latest": latest,
+        "today": today,
+        "today_close": datetime.combine(now.date(), DAILY_CLOSE_READY_TIME),
+        "release_id": release_id,
+    }).mappings().all()
+    current = next((row for row in rows if str(row["trade_date"]) == latest), None)
+    if latest == today and current is None:
+        return latest, False, False
+
+    retry_before = now - timedelta(minutes=RELEASE_CATCHUP_BLOCKED_RETRY_INTERVAL_MINUTES)
+    for row in rows:
+        target = str(row["trade_date"])
+        last_attempt = _coerce_datetime(row["last_attempt"])
+        if (
+            target < today and not row["completed"]
+            and last_attempt is not None and last_attempt <= retry_before
+        ):
+            return target, True, False
+    return latest, False, bool(current and current["completed_this_release"])
+
+
 def _attach_daily_recovery_targets(
     engine,
     rows: list[dict],
@@ -4268,6 +4333,31 @@ def _attach_daily_recovery_targets(
             row["_scheduler_historical_recovery"] = parsed_target < current.date()
     for row in ingestion_rows:
         if (
+            row.get("task_type") == "qmt_announcement_pit"
+            and _scheduler_executor_role("standalone") == SCHEDULER_OWNER_WINDOWS_QMT
+        ):
+            try:
+                latest = authoritative_closed_trade_date(
+                    engine, now=current, close_ready_time=DAILY_CLOSE_READY_TIME,
+                )
+                release_id = runtime_contract_build_sha(
+                    expected_build_sha=_scheduler_build_commit_sha(),
+                )
+                with engine.connect() as connection:
+                    target, backfill_due, complete = _announcement_recovery_target(
+                        connection, latest=latest, now=current, release_id=release_id,
+                    )
+            except Exception as exc:
+                row["_scheduler_target_available"] = False
+                row["_scheduler_target_block_reason"] = f"announcement_target_unavailable: {type(exc).__name__}"
+                authorities_available = False
+            else:
+                row["_scheduler_target_trade_date"] = target
+                row["_scheduler_target_available"] = True
+                row["_scheduler_historical_recovery"] = target < current.date().isoformat()
+                row["_announcement_backfill_due"] = backfill_due
+                row["_announcement_current_complete"] = complete
+        if (
             str(row.get("task_type") or "").strip() != "qmt_stock_daily_canonical"
             or row.get("_scheduler_target_available") is not True
             or str(row.get("last_run_status") or "").strip().lower() != "success"
@@ -4298,7 +4388,9 @@ def _attach_daily_recovery_targets(
     if _scheduler_executor_role("standalone") == SCHEDULER_OWNER_LINUX and _daily_delivery_requires_production_runtime():
         histories = {}
         for row in selected:
-            if row.get("task_type") not in {"analysis_fast", "strategy_governance_daily"}:
+            if row.get("task_type") not in {
+                "analysis_upper_evidence_prepare", "analysis_fast", "strategy_governance_daily",
+            }:
                 continue
             row.pop("_certified_initial_announcement_history", None)
             target = row.get("_scheduler_target_trade_date")
@@ -11785,12 +11877,12 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                 release_authorized = False
                 release_authorization_reason = "governance_database_deferred"
             else:
-                _attach_release_catchup_history(engine, rows)
                 _attach_release_catchup_expected_targets(
                     engine,
                     rows,
                     now=now,
                 )
+                _attach_release_catchup_history(engine, rows)
                 if os.name != "nt":
                     _attach_completed_stock_finance_target(engine, rows, now=now)
                 release_authorized, release_authorization_reason = (
@@ -11868,6 +11960,12 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                     row,
                     now=now,
                 )
+                if row.get("_announcement_current_complete") is True:
+                    continue
+                if row.get("_announcement_backfill_due") is True:
+                    if row.get("_release_catchup_authorized") is not True:
+                        continue
+                    release_catchup_due = True
                 release_recovery_requested = (
                     row.get("_release_analysis_recovery_requested") is True
                 )
