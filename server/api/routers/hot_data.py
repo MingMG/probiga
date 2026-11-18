@@ -16,6 +16,7 @@ import pandas as pd
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import HTMLResponse, Response
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
 from server.api.routers._engine import get_engine
 from server.api.scheduler_runtime import (
@@ -2238,128 +2239,54 @@ def capital_flow_realtime(stock_code: str = Query()):
 
 @router.get("/hot-data/concept-stocks")
 def concept_stocks(concept_code: str = Query(), trade_date: str = Query(default_factory=lambda: date.today().isoformat())):
-    """获取某个概念/行业下的个股及当日表现"""
+    """Join the requested session's quotes to the exact provider board."""
     try:
         selected = date.fromisoformat(trade_date)
-        next_day = selected + timedelta(days=1)
-        quote_params = {
-            "selected": selected, "next_day": next_day,
-            "allow_live": selected == date.today() and _is_monitor_trading_time(),
-        }
-        kline_join = """
-            LEFT JOIN sm_stock_current s ON c.stock_code = s.stock_code AND :allow_live
-                AND s.snapshot_at >= :selected AND s.snapshot_at < :next_day
-            LEFT JOIN sm_stock_kline k ON c.stock_code = k.stock_code AND k.trade_date = :selected
-                AND k.k_type = 1 AND k.adjust_type = 0
-        """
-        change_expr = """
-            CASE WHEN sub.chg_pct IS NOT NULL THEN sub.chg_pct
-                 WHEN sub.kline_close IS NOT NULL AND sub.prev_close IS NOT NULL AND sub.prev_close > 0
-                 THEN ROUND((sub.kline_close - sub.prev_close) / sub.prev_close * 100, 2)
-                 ELSE NULL END AS change_pct
-        """
-
-        def _resolve_ths_keys(code: str) -> list[str]:
-            keys = [code]
-            try:
-                rows = _read_sql(
-                    "SELECT index_code FROM si_concept_code_ths WHERE index_code = :c",
-                    {"c": code}
-                )
-                for r in rows:
-                    v = str(r.get("index_code", "")).strip()
-                    if v and v not in keys:
-                        keys.append(v)
-            except Exception as exc:
-                _record_fallback('_resolve_ths_keys:1363', exc)
-            return keys
-
-        def _resolve_east_codes(code: str) -> list[str]:
-            codes = [code]
-            if code.startswith("BK"):
-                return codes
-            try:
-                rows = _read_sql(
-                    "SELECT concept_name FROM st_hot_concept_ths_daily WHERE concept_code = :c LIMIT 1",
-                    {"c": code}
-                )
-                if rows:
-                    name = str(rows[0].get("concept_name", "")).strip()
-                    if name:
-                        east_rows = _read_sql(
-                            "SELECT concept_code FROM si_concept_code_east "
-                            "WHERE name LIKE :n ORDER BY LENGTH(name) ASC LIMIT 3",
-                            {"n": f"%{name}%"}
-                        )
-                        for r in east_rows:
-                            v = str(r.get("concept_code", "")).strip()
-                            if v and v not in codes:
-                                codes.append(v)
-            except Exception as exc:
-                _record_fallback('_resolve_east_codes:1388', exc)
-            return codes
-
-        ths_keys = _resolve_ths_keys(concept_code)
-        placeholders = " OR ".join([f"c.query_key = :k{i}" for i in range(len(ths_keys))])
-        params = {f"k{i}": v for i, v in enumerate(ths_keys)}
-        ths_sql = f"""
-            SELECT /*+ MAX_EXECUTION_TIME(5000) */ sub.stock_code, sub.short_name, sub.price, {change_expr}
-            FROM (
-                SELECT DISTINCT c.stock_code, c.short_name,
-                       COALESCE(s.price, k.close) AS price,
-                       COALESCE(s.change_pct, k.change_pct) AS chg_pct,
-                       k.close AS kline_close,
-                       k.pre_close AS prev_close
-                FROM si_concept_constituent_ths c
-                {kline_join}
-                WHERE {placeholders}
-            ) sub
-            ORDER BY change_pct IS NOT NULL DESC, change_pct DESC
-        """
-        rows = _read_sql(ths_sql, {**params, **quote_params})
-
-        # 如果没查到且可能是行业代码，尝试用 industry_code 查询
-        if not rows:
-            ind_sql = f"""
-                SELECT /*+ MAX_EXECUTION_TIME(5000) */ sub.stock_code, sub.short_name, sub.price, {change_expr}
-                FROM (
-                    SELECT DISTINCT c.stock_code, c.short_name,
-                           COALESCE(s.price, k.close) AS price,
-                           COALESCE(s.change_pct, k.change_pct) AS chg_pct,
-                           k.close AS kline_close,
-                           k.pre_close AS prev_close
-                    FROM si_concept_constituent_ths c
-                    {kline_join}
-                    WHERE c.query_type = 'industry_code' AND c.query_key = :ind_code
-                ) sub
-                ORDER BY change_pct IS NOT NULL DESC, change_pct DESC
-            """
-            rows = _read_sql(ind_sql, {"ind_code": concept_code, **quote_params})
-
-        if not rows:
-            east_codes = _resolve_east_codes(concept_code)
-            e_placeholders = " OR ".join([f"c.concept_code = :e{i}" for i in range(len(east_codes))])
-            e_params = {f"e{i}": v for i, v in enumerate(east_codes)}
-            east_sql = f"""
-                SELECT /*+ MAX_EXECUTION_TIME(5000) */ sub.stock_code, sub.short_name, sub.price, {change_expr}
-                FROM (
-                    SELECT DISTINCT c.stock_code, c.short_name,
-                           COALESCE(s.price, k.close) AS price,
-                           COALESCE(s.change_pct, k.change_pct) AS chg_pct,
-                           k.close AS kline_close,
-                           k.pre_close AS prev_close
-                    FROM si_concept_constituent_east c
-                    {kline_join}
-                    WHERE {e_placeholders}
-                ) sub
-                ORDER BY change_pct IS NOT NULL DESC, change_pct DESC
-            """
-            rows = _read_sql(east_sql, {**e_params, **quote_params})
-
-        return {"concept_code": concept_code, "date": trade_date, "data": rows,
-                "total": len(rows), "membership_scope": "latest_catalog"}
-    except Exception as e:
-        return {"concept_code": concept_code, "data": [], "total": 0, "error": str(e)}
+        params = {"code": concept_code}
+        if concept_code.startswith("BK"):
+            members = _read_sql("""
+                SELECT /*+ MAX_EXECUTION_TIME(4000) */ stock_code, MAX(short_name) AS short_name
+                FROM si_concept_constituent_east WHERE concept_code=:code
+                GROUP BY stock_code LIMIT 7001
+            """, params)
+        else:
+            members = _read_sql("""
+                SELECT /*+ MAX_EXECUTION_TIME(4000) */ stock_code, MAX(short_name) AS short_name
+                FROM si_concept_constituent_ths
+                WHERE query_type IN ('index_code','concept_code','industry_code') AND query_key=:code
+                GROUP BY stock_code LIMIT 7001
+            """, params)
+        if len(members) > 7000:
+            raise ValueError("concept constituent scope exceeds limit")
+        if members:
+            bindings = {f"stock_{i}": member["stock_code"] for i, member in enumerate(members)}
+            codes = ",".join(f":{key}" for key in bindings)
+            quotes = _read_sql(f"""
+                SELECT /*+ MAX_EXECUTION_TIME(8000) INDEX(sm_stock_kline idx_date_ktype) */ stock_code, close AS price,
+                       COALESCE(change_pct, ROUND(100 * (close - pre_close) / NULLIF(pre_close, 0), 2)) AS change_pct
+                FROM sm_stock_kline WHERE stock_code IN ({codes})
+                  AND trade_date=:selected AND k_type=1 AND adjust_type=0
+            """, {**bindings, "selected": selected})
+            prices = {row["stock_code"]: row for row in quotes}
+            if selected == date.today() and _is_monitor_trading_time():
+                live = _read_sql(f"""
+                    SELECT /*+ MAX_EXECUTION_TIME(4000) */ stock_code, price, change_pct
+                    FROM sm_stock_current WHERE stock_code IN ({codes})
+                      AND snapshot_at >= :selected AND snapshot_at < :next_day
+                      AND snapshot_at >= NOW() - INTERVAL 2 MINUTE
+                """, {**bindings, "selected": selected, "next_day": selected + timedelta(days=1)})
+                prices.update((row["stock_code"], row) for row in live if row["price"] is not None)
+            for member in members:
+                quote = prices.get(member["stock_code"], {})
+                member["price"] = quote.get("price")
+                member["change_pct"] = quote.get("change_pct")
+            members.sort(key=lambda row: (row["change_pct"] is None, -(row["change_pct"] or 0), row["stock_code"]))
+        return {"concept_code": concept_code, "date": trade_date, "data": members,
+                "total": len(members), "membership_scope": "latest_catalog"}
+    except (SQLAlchemyError, ValueError, RuntimeError) as exc:
+        _record_fallback("concept_stocks", exc)
+        return {"concept_code": concept_code, "date": trade_date, "data": [], "total": 0,
+                "error": "成分股或所选交易日行情读取失败"}
 
 
 def _safe_float(value):

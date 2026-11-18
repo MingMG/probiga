@@ -152,8 +152,9 @@ def load_verified_index_daily_bars(
         """), bounds).mappings()}
         if monotonic() >= deadline:
             raise TimeoutError("公开指数回执查询超时")
-        free = {str(row["trade_date"])[:10]: row for row in connection.execute(text("""
-            SELECT /*+ MAX_EXECUTION_TIME(2500) */ target_date AS trade_date, request_id,
+        free_budget_ms = max(1, min(8000, int((deadline - monotonic()) * 1000)))
+        free = {str(row["trade_date"])[:10]: row for row in connection.execute(text(f"""
+            SELECT /*+ MAX_EXECUTION_TIME({free_budget_ms}) */ target_date AS trade_date, request_id,
                    written_rows, last_success_at AS available_at, detail_json
             FROM acquisition_partition_state
             WHERE dataset='index_daily' AND source='tencent_east_verified'
@@ -163,8 +164,9 @@ def load_verified_index_daily_bars(
         if monotonic() >= deadline:
             raise TimeoutError("指数单条补采回执查询超时")
         repairs: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
-        for row in connection.execute(text("""
-            SELECT /*+ MAX_EXECUTION_TIME(2500) */ target_date AS trade_date, partition_key,
+        repair_budget_ms = max(1, min(8000, int((deadline - monotonic()) * 1000)))
+        for row in connection.execute(text(f"""
+            SELECT /*+ MAX_EXECUTION_TIME({repair_budget_ms}) */ target_date AS trade_date, partition_key,
                    request_id, written_rows, last_success_at AS available_at, detail_json
             FROM acquisition_partition_state
             WHERE dataset='index_daily' AND source='tencent_east_verified' AND status='complete'
