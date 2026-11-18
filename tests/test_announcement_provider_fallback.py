@@ -1429,6 +1429,78 @@ def test_cninfo_exact_receipts_publish_one_atomic_catalog_batch(
         ), {"batch_id": result["batch_id"]}).scalar_one() == 1
 
 
+@pytest.mark.parametrize("state", ["sealed", "legacy-uncommitted", "legacy-committed"])
+def test_cninfo_publish_retry_reuses_capture_after_directory_clock_advances(
+    monkeypatch, tmp_path, state,
+) -> None:
+    from server.common import qmt_announcement_pit as announcement
+
+    cutoff = datetime(2026, 8, 29, 9)
+    code = "000001"
+    master = _master(code)
+    catalog = AnnouncementCatalog(
+        batch_id="catalog-cninfo-retry", manifest_hash="a" * 64, member_set_hash="b" * 64,
+        codes=(code,), qmt_by_code={code: f"{code}.SZ"},
+    )
+    monkeypatch.setattr(announcement, "_load_catalog", lambda *_: catalog)
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    ensure_pit_fact_schema(engine)
+    publish = announcement._publish_batch
+
+    def interrupt_publish(*args, **kwargs):
+        raise QMTAnnouncementBlocked("TEST_PUBLISH_INTERRUPTED")
+
+    def run(seconds, client):
+        provider = CninfoMarketAnnouncementProvider(
+            client=client, minimum_request_interval=0,
+            now_fn=lambda: cutoff + timedelta(seconds=seconds),
+        )
+        return synchronize_qmt_announcements(
+            engine, xtdata=ProviderBackedAnnouncementAdapter(provider),
+            checkpoint_root=tmp_path, capture_fact_cutoff_at=cutoff,
+            now_fn=lambda: cutoff + timedelta(seconds=seconds + 1),
+            source=CNINFO_ANNOUNCEMENT_SOURCE,
+            fallback_reason="QMT_ANNOUNCEMENT_API_UNAVAILABLE",
+        )
+
+    committed = state == "legacy-committed"
+    legacy = committed or state == "legacy-uncommitted"
+    if not committed:
+        monkeypatch.setattr(announcement, "_publish_batch", interrupt_publish)
+    initial = run(1, _Client(masters=[master, master], rows_by_code={code: [_row(code, 0)]}))
+    if committed:
+        assert initial["status"] == "COMPLETE"
+        (tmp_path / initial["batch_id"] / "complete.json").unlink()
+    else:
+        assert initial["reason_code"] == "TEST_PUBLISH_INTERRUPTED"
+    path = tmp_path / initial["batch_id"] / "prepared.json"
+    prepared = json.loads(path.read_bytes())
+    original_root = prepared["batch_root_hash"]
+    if legacy:
+        del prepared["provider_receipts"]
+        del prepared["payload_hash"]
+        path.write_text(json.dumps({**prepared, "payload_hash": canonical_hash(prepared)}), encoding="utf-8")
+
+    monkeypatch.setattr(announcement, "_publish_batch", publish)
+    client = _Client(masters=[master, master] if legacy else [master], rows_by_code={})
+    result = run(5, client)
+    assert client.requested_stock_identities == []
+    if committed:
+        assert result["reason_code"] == "QMT_ANNOUNCEMENT_PREPARED_ROOT_MISMATCH"
+        assert json.loads(path.read_bytes())["batch_root_hash"] == original_root
+        return
+    assert result["status"] == "COMPLETE"
+    assert result["batch_id"] == initial["batch_id"]
+    assert result["coverage_count"] == result["event_count"] == 1
+    if legacy:
+        recovered = json.loads(path.read_bytes())
+        assert recovered["superseded_batch_root_hash"] == original_root
+        assert result["batch_root_hash"] != original_root
+    else:
+        assert result["batch_root_hash"] == original_root
+        assert result["received_at"] == prepared["received_at"]
+
+
 def test_cninfo_delta_validates_frozen_source_window_and_merged_parent(
     monkeypatch, tmp_path,
 ) -> None:
