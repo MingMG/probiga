@@ -1407,7 +1407,9 @@ class AnnouncementCheckpoint:
         )
 
     def prepare_publish(
-        self, *, batch_root_hash: str, received_at: datetime, publication_batch_id: str = ""
+        self, *, batch_root_hash: str, received_at: datetime, publication_batch_id: str = "",
+        provider_receipts: Mapping[str, Mapping[str, Any]] | None = None,
+        superseded_batch_root_hash: str = "",
     ) -> None:
         unsigned = {
             "schema": QMT_ANNOUNCEMENT_PREPARED_SCHEMA,
@@ -1418,12 +1420,22 @@ class AnnouncementCheckpoint:
         }
         if publication_batch_id:
             unsigned["publication_batch_id"] = publication_batch_id
+        if provider_receipts is not None:
+            unsigned["provider_receipts"] = provider_receipts
+        if superseded_batch_root_hash:
+            unsigned["superseded_batch_root_hash"] = superseded_batch_root_hash
         _atomic_write(
             self.root / "prepared.json",
             {**unsigned, "payload_hash": canonical_hash(unsigned)},
         )
 
     def load_prepared_publish(self) -> tuple[datetime, str] | None:
+        prepared = self._read_prepared_publish()
+        if prepared is None:
+            return None
+        return _dt(prepared["received_at"]), prepared["batch_root_hash"]
+
+    def _read_prepared_publish(self) -> dict[str, Any] | None:
         path = self.root / "prepared.json"
         if not path.exists():
             return None
@@ -1434,6 +1446,8 @@ class AnnouncementCheckpoint:
                 "QMT_ANNOUNCEMENT_PREPARED_CHECKPOINT_INVALID",
                 type(exc).__name__,
             ) from exc
+        if not isinstance(payload, dict):
+            raise QMTAnnouncementBlocked("QMT_ANNOUNCEMENT_PREPARED_CHECKPOINT_TAMPERED")
         unsigned = dict(payload)
         payload_hash = str(unsigned.pop("payload_hash", ""))
         received_text = str(unsigned.get("received_at") or "")
@@ -1451,12 +1465,12 @@ class AnnouncementCheckpoint:
                 "QMT_ANNOUNCEMENT_PREPARED_CHECKPOINT_TAMPERED"
             )
         try:
-            received_at = _dt(received_text)
+            _dt(received_text)
         except (TypeError, ValueError) as exc:
             raise QMTAnnouncementBlocked(
                 "QMT_ANNOUNCEMENT_PREPARED_CHECKPOINT_INVALID_TIME"
             ) from exc
-        return received_at, root_hash
+        return unsigned
 
     def mark_complete(self, *, batch_root_hash: str, received_at: datetime, publication_batch_id: str = "") -> None:
         _atomic_write(
@@ -4414,7 +4428,9 @@ def synchronize_qmt_announcements(
         check_capture_deadline("checkpoint")
         if cninfo_directory is None:
             _connect_announcement_transport(xtdata, source=source_name)
-        if source_name != QMT_ANNOUNCEMENT_SOURCE:
+        prepared = checkpoint._read_prepared_publish()
+        frozen_receipts = (prepared or {}).get("provider_receipts")
+        if source_name != QMT_ANNOUNCEMENT_SOURCE and frozen_receipts is None:
             restored_receipts: dict[str, dict[str, Any]] = {}
             for code in catalog.codes:
                 check_capture_deadline(f"restore-provider:{code}")
@@ -4449,22 +4465,27 @@ def synchronize_qmt_announcements(
                         "QMT_ANNOUNCEMENT_FALLBACK_RESUME_UNSUPPORTED"
                     )
                 restorer(restored_receipts)
-        delta_results = _download_and_read(
-            xtdata,
-            checkpoint=checkpoint,
-            catalog=catalog,
-            fact_cutoff_at=fact_cutoff,
-            window_start=capture_window_start,
-            batch_size=int(batch_size),
-            source=source_name,
-            check_capture_deadline=check_capture_deadline if require_exact_capture_cutoff else None,
-        )
+        if frozen_receipts is not None:
+            delta_results = checkpoint.load_complete()
+        else:
+            delta_results = _download_and_read(
+                xtdata,
+                checkpoint=checkpoint,
+                catalog=catalog,
+                fact_cutoff_at=fact_cutoff,
+                window_start=capture_window_start,
+                batch_size=int(batch_size),
+                source=source_name,
+                check_capture_deadline=check_capture_deadline if require_exact_capture_cutoff else None,
+            )
         check_capture_deadline("source-complete")
         provider_receipts: dict[str, dict[str, Any]] = {}
         cninfo_directory_anchors: set[tuple[Any, ...]] = set()
         if source_name != QMT_ANNOUNCEMENT_SOURCE:
-            receipt_reader = getattr(xtdata, "capture_receipts", None)
-            raw_receipts = receipt_reader() if callable(receipt_reader) else None
+            raw_receipts = frozen_receipts
+            if raw_receipts is None:
+                receipt_reader = getattr(xtdata, "capture_receipts", None)
+                raw_receipts = receipt_reader() if callable(receipt_reader) else None
             if not isinstance(raw_receipts, Mapping) or set(raw_receipts) != set(
                 catalog.codes
             ):
@@ -4563,8 +4584,27 @@ def synchronize_qmt_announcements(
             baseline=baseline_results,
             delta=delta_results,
         )
-        prepared = checkpoint.load_prepared_publish()
-        received_at = prepared[0] if prepared is not None else _dt(now_fn())
+        superseded_root = ""
+        if prepared is not None and source_name == CNINFO_ANNOUNCEMENT_SOURCE and frozen_receipts is None:
+            # Earlier checkpoints kept the root but lost the sealed directory
+            # timestamp. Reseal only a batch that never committed.
+            try:
+                with engine.connect() as connection:
+                    committed = connection.execute(text("""
+                        SELECT /*+ MAX_EXECUTION_TIME(8000) */ 1
+                        FROM st_pit_source_coverage WHERE batch_id=:batch_id
+                        LIMIT 1
+                    """), {"batch_id": batch_id}).first()
+            except SQLAlchemyError as exc:
+                raise QMTAnnouncementBlocked(
+                    "QMT_ANNOUNCEMENT_PUBLISH_DATABASE_ERROR",
+                    _publish_error_detail("verify_legacy_prepared", exc, commit_state="unknown"),
+                ) from None
+            if committed is not None:
+                raise QMTAnnouncementBlocked("QMT_ANNOUNCEMENT_PREPARED_ROOT_MISMATCH")
+            superseded_root = prepared["batch_root_hash"]
+            prepared = None
+        received_at = _dt(prepared["received_at"]) if prepared is not None else _dt(now_fn())
         if source_name != QMT_ANNOUNCEMENT_SOURCE and any(
             _dt(receipt["captured_at"]) > received_at
             for receipt in provider_receipts.values()
@@ -4625,7 +4665,7 @@ def synchronize_qmt_announcements(
             )
         incremental_proof["chain_root_hash"] = canonical_hash(incremental_proof)
         if prepared is not None:
-            if prepared[1] != batch_root:
+            if prepared["batch_root_hash"] != batch_root:
                 raise QMTAnnouncementBlocked(
                     "QMT_ANNOUNCEMENT_PREPARED_ROOT_MISMATCH"
                 )
@@ -4637,6 +4677,8 @@ def synchronize_qmt_announcements(
             checkpoint.prepare_publish(
                 batch_root_hash=batch_root,
                 received_at=received_at,
+                provider_receipts=provider_receipts if source_name == CNINFO_ANNOUNCEMENT_SOURCE else None,
+                superseded_batch_root_hash=superseded_root,
             )
         coverage_ids, _publish_completed_at = _publish_batch(
             engine,
