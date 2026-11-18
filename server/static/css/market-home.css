@@ -68,6 +68,19 @@ body.market-home-active .main-content > .content {
 .mh-hub-head p, .mh-hub-meta { color: var(--hub-muted); font-size: 12px; }
 .mh-hub time, .mh-update-feed time { font-variant-numeric: tabular-nums; }
 
+.mh-board-detail {
+    width: min(540px, calc(100vw - 32px));
+    padding: 20px;
+    color: #edf1f8;
+    background: #11161c;
+    border: 1px solid #313b4a;
+    border-radius: 12px;
+}
+
+.mh-board-detail::backdrop { background: #080a0dbb; }
+.mh-board-detail .mh-panel-head { align-items: flex-start; }
+.mh-board-detail .mh-row { grid-template-columns: 1fr auto; }
+
 .mh-hub-top { display: grid; grid-template-columns: 1.6fr 1fr; gap: 12px; }
 .mh-hub-panel {
     min-width: 0;

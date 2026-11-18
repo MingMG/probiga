@@ -2240,22 +2240,17 @@ def capital_flow_realtime(stock_code: str = Query()):
 def concept_stocks(concept_code: str = Query(), trade_date: str = Query(default_factory=lambda: date.today().isoformat())):
     """获取某个概念/行业下的个股及当日表现"""
     try:
+        selected = date.fromisoformat(trade_date)
+        next_day = selected + timedelta(days=1)
+        quote_params = {
+            "selected": selected, "next_day": next_day,
+            "allow_live": selected == date.today() and _is_monitor_trading_time(),
+        }
         kline_join = """
-            LEFT JOIN sm_stock_current s ON c.stock_code = s.stock_code
-            LEFT JOIN (
-                SELECT k1.stock_code, k1.close, k1.change_pct,
-                       COALESCE(
-                           k1.pre_close,
-                           (SELECT k0.close FROM sm_stock_kline k0
-                            WHERE k0.stock_code = k1.stock_code AND k0.trade_date < k1.trade_date
-                            ORDER BY k0.trade_date DESC LIMIT 1)
-                       ) AS pre_close
-                FROM sm_stock_kline k1
-                INNER JOIN (
-                    SELECT stock_code, MAX(trade_date) AS max_date
-                    FROM sm_stock_kline GROUP BY stock_code
-                ) k2 ON k1.stock_code = k2.stock_code AND k1.trade_date = k2.max_date
-            ) k ON c.stock_code = k.stock_code
+            LEFT JOIN sm_stock_current s ON c.stock_code = s.stock_code AND :allow_live
+                AND s.snapshot_at >= :selected AND s.snapshot_at < :next_day
+            LEFT JOIN sm_stock_kline k ON c.stock_code = k.stock_code AND k.trade_date = :selected
+                AND k.k_type = 1 AND k.adjust_type = 0
         """
         change_expr = """
             CASE WHEN sub.chg_pct IS NOT NULL THEN sub.chg_pct
@@ -2308,7 +2303,7 @@ def concept_stocks(concept_code: str = Query(), trade_date: str = Query(default_
         placeholders = " OR ".join([f"c.query_key = :k{i}" for i in range(len(ths_keys))])
         params = {f"k{i}": v for i, v in enumerate(ths_keys)}
         ths_sql = f"""
-            SELECT sub.stock_code, sub.short_name, sub.price, {change_expr}
+            SELECT /*+ MAX_EXECUTION_TIME(5000) */ sub.stock_code, sub.short_name, sub.price, {change_expr}
             FROM (
                 SELECT DISTINCT c.stock_code, c.short_name,
                        COALESCE(s.price, k.close) AS price,
@@ -2321,12 +2316,12 @@ def concept_stocks(concept_code: str = Query(), trade_date: str = Query(default_
             ) sub
             ORDER BY change_pct IS NOT NULL DESC, change_pct DESC
         """
-        rows = _read_sql(ths_sql, params)
+        rows = _read_sql(ths_sql, {**params, **quote_params})
 
         # 如果没查到且可能是行业代码，尝试用 industry_code 查询
         if not rows:
             ind_sql = f"""
-                SELECT sub.stock_code, sub.short_name, sub.price, {change_expr}
+                SELECT /*+ MAX_EXECUTION_TIME(5000) */ sub.stock_code, sub.short_name, sub.price, {change_expr}
                 FROM (
                     SELECT DISTINCT c.stock_code, c.short_name,
                            COALESCE(s.price, k.close) AS price,
@@ -2339,14 +2334,14 @@ def concept_stocks(concept_code: str = Query(), trade_date: str = Query(default_
                 ) sub
                 ORDER BY change_pct IS NOT NULL DESC, change_pct DESC
             """
-            rows = _read_sql(ind_sql, {"ind_code": concept_code})
+            rows = _read_sql(ind_sql, {"ind_code": concept_code, **quote_params})
 
         if not rows:
             east_codes = _resolve_east_codes(concept_code)
             e_placeholders = " OR ".join([f"c.concept_code = :e{i}" for i in range(len(east_codes))])
             e_params = {f"e{i}": v for i, v in enumerate(east_codes)}
             east_sql = f"""
-                SELECT sub.stock_code, sub.short_name, sub.price, {change_expr}
+                SELECT /*+ MAX_EXECUTION_TIME(5000) */ sub.stock_code, sub.short_name, sub.price, {change_expr}
                 FROM (
                     SELECT DISTINCT c.stock_code, c.short_name,
                            COALESCE(s.price, k.close) AS price,
@@ -2359,9 +2354,10 @@ def concept_stocks(concept_code: str = Query(), trade_date: str = Query(default_
                 ) sub
                 ORDER BY change_pct IS NOT NULL DESC, change_pct DESC
             """
-            rows = _read_sql(east_sql, e_params)
+            rows = _read_sql(east_sql, {**e_params, **quote_params})
 
-        return {"concept_code": concept_code, "date": trade_date, "data": rows, "total": len(rows)}
+        return {"concept_code": concept_code, "date": trade_date, "data": rows,
+                "total": len(rows), "membership_scope": "latest_catalog"}
     except Exception as e:
         return {"concept_code": concept_code, "data": [], "total": 0, "error": str(e)}
 

@@ -7,12 +7,36 @@ from fastapi import HTTPException
 from sqlalchemy import create_engine, text
 from sqlalchemy.pool import StaticPool
 
-from server.api.routers import market_home
+from server.api.routers import hot_data, market_home
 from server.common.turnover_snapshot import _qmt_target_from_row, _row_insert_params, parse_eastmoney_turnover_response
 
 
 DAY = date(2026, 11, 6)
 DAY_TEXT = DAY.isoformat()
+
+
+def test_concept_members_use_selected_session_quotes(monkeypatch):
+    engine = create_engine("sqlite://")
+    with engine.begin() as connection:
+        for statement in (
+            "CREATE TABLE si_concept_code_ths (index_code TEXT)",
+            "CREATE TABLE si_concept_constituent_ths (query_key TEXT, query_type TEXT, stock_code TEXT, short_name TEXT)",
+            "CREATE TABLE sm_stock_current (stock_code TEXT, price REAL, change_pct REAL, snapshot_at DATETIME)",
+            "CREATE TABLE sm_stock_kline (stock_code TEXT, trade_date DATE, close REAL, pre_close REAL, change_pct REAL, k_type INT, adjust_type INT)",
+            "INSERT INTO si_concept_constituent_ths VALUES ('880001','concept_code','000001','示例')",
+            "INSERT INTO sm_stock_current VALUES ('000001',80,-20,'2026-11-07 09:35:00')",
+            "INSERT INTO sm_stock_kline VALUES ('000001','2026-11-06',11,10,NULL,1,0), ('000001','2026-11-07',100,11,809,1,0)",
+        ):
+            connection.exec_driver_sql(statement)
+
+    def read(sql, params):
+        with engine.connect() as connection:
+            return [dict(row) for row in connection.execute(text(sql), params).mappings()]
+
+    monkeypatch.setattr(hot_data, "_read_sql", read)
+    result = hot_data.concept_stocks("880001", DAY_TEXT)
+    assert result["membership_scope"] == "latest_catalog"
+    assert result["data"] == [{"stock_code": "000001", "short_name": "示例", "price": 11, "change_pct": 10}]
 
 
 @pytest.fixture

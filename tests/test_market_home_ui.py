@@ -127,15 +127,21 @@ const date = '2026-11-06';
 const clock = {today:'2026-11-10'};
 const attempt = {status:'SUCCESS',stage_name:'qmt_stock_daily_canonical',finished_at:date + ' 15:40:00'};
 const overnight = {status:'SUCCESS',stage_name:'target_turnover_snapshot',finished_at:'2026-11-07T01:17:54'};
+const finance = {status:'DEGRADED',stage_name:'stock_finance',finished_at:date+' 20:00:00'};
 const reviewDates = {dates:[date]};
-const delivery = {trade_date:date,status:'PASS',data:{session:{updated_at:date + ' 15:42:00'},attempts:[attempt,overnight]}};
-const html = page.render({reviewDates,delivery},date,clock);
+const delivery = {trade_date:date,status:'PASS',data:{session:{updated_at:date + ' 15:42:00'},attempts:[attempt,overnight,finance]}};
+const snapshot = {status:'partial',trade_date:date,as_of:date+' 15:00:00',unavailable_fields:['limit_ladder']};
+const html = page.render({reviewDates,delivery,snapshot},date,clock);
 for (const text of ['A股大看板','更新时间流','研究日历','信息和数据看板','选股专题','策略跟踪',
     '15:40','股票日线 · 阶段完成','11-07 01:17','换手率快照 · 阶段完成','有复盘记录','data-mh-tab="trading-v3-candidates"']) {
     assert.ok(html.includes(text),text);
 }
 assert.match(html, /data-mh-date="2026-11-06"[^>]*aria-pressed="true"/);
 assert.match(html, /data-mh-date="2026-11-11"[^>]*disabled/);
+assert.match(html, /data-mh-tab="datasource"[^>]*>\s*<time[^>]*>20:00<\/time><span>交付<\/span><strong>财务数据 · 部分可用/);
+assert.match(html, /data-mh-tab="stock-list"[^>]*>\s*<time[^>]*>15:40<\/time>/);
+assert.match(html, /待补：连板梯队/);
+assert.match(html, /data-mh-tab="sector" data-mh-view="heat" aria-label="打开行业与板块热度"/);
 assert.doesNotMatch(html,/交付已验收|target_turnover_snapshot|qmt_stock_daily_canonical/);
 delivery.data.receipt = {schema:'probiga.daily-delivery.v1',status:'PASS',trade_date:date};
 assert.match(page.render({reviewDates,delivery},date,clock),/交付已验收/);
@@ -166,6 +172,7 @@ const heatmap = {requested_date:date,trade_date:date,
 };
 const state = {heatmap};
 const quotes = page.render(state,date);
+assert.match(quotes, /data-mh-board="concept" data-mh-board-code="A">正向/);
 assert.match(quotes, /class="mh-heat-cell mh-up"[^>]*>.*正向.*\+2\.35%/);
 assert.match(quotes, /class="mh-heat-cell mh-down"[^>]*>.*负向.*-1\.25%/);
 assert.match(quotes, /class="mh-heat-cell mh-neutral"[^>]*>.*持平.*0\.00%/);

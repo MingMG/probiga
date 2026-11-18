@@ -22,13 +22,13 @@
             ['news', '财经信息看板', '按来源查看快讯和重点新闻。'],
             ['notice', 'A股公告', '按日期查询市场公告和个股披露。'],
             ['market-context', '市场环境', '查看全市场广度、指数趋势、轮动与假设。', 'quotes'],
-            ['monitor', '市场监控中心', '成交、涨跌分布、板块表现和市场证据。', 'quotes'],
+            ['monitor', '市场监控中心', '成交、涨跌分布、板块表现和市场证据。', 'monitor'],
             ['market-stage', '大盘与指数结构', '对照日、周、月阶段及其验证条件。', 'indices'],
             ['market-radar', '盘中异动雷达', '跟踪个股与板块异动，进入明细核对。'],
             ['intraday-alert', '实时盯盘与播报', '查看盘中事件、阶段观察与已保存播报。'],
             ['broad-etf-flow', '宽基ETF资金', '对照成交额、公开份额变化和金额估算。'],
             ['sentiment', '涨跌停与市场情绪', '查看市场情绪、连板反馈与风格变化。', 'ladder'],
-            ['sector', '行业与板块热度', '对照行业行情、资金及近五日表现。', 'sectors'],
+            ['sector', '行业与板块热度', '对照行业行情、资金及近五日表现。', 'sectors', 'heat'],
             ['concept', '概念与行业', '查看概念、成分和多日热度。', 'concepts'],
             ['commentary', '股评监控', '跟踪公开市场观点与相关标的。']
         ]],
@@ -36,7 +36,7 @@
             ['daily-pool', '每日研究票池', '按交易日查看已保存的研究候选与排除信息。', 'delivery'],
             ['recommended', 'AI研究建议', '查看事件和量价研究、入选依据及风险条件。'],
             ['screen', '条件选股', '按趋势、放量、连板或龙虎榜等条件缩小范围。'],
-            ['strong', '强势股研究', '查看强势股票及对应交易日的排名。', 'quotes'],
+            ['strong', '强势股研究', '查看强势股票及对应交易日的排名。'],
             ['fused', '个股热榜', '交叉查看多源个股热度与市场表现。'],
             ['portfolio', '自选股跟踪', '集中查看自选股票、行情、资金和异动。'],
             ['stock-list', '全市场股票', '查询股票并打开个股行情与研究资料。', 'quotes']
@@ -68,7 +68,21 @@
         qmt_announcement_pit: '公告历史证据', qmt_announcement_premarket_prepare: '盘前公告准备',
         stock_notice: '公告', stock_minute: '分钟行情', score: '策略评分', stock_score: '策略评分',
         publish: '结果发布', stock_pool: '股票池', analysis_premarket_external: '盘前外围',
-        analysis_upper_evidence_prepare: '涨停证据准备'
+        analysis_upper_evidence_prepare: '涨停证据准备', analysis_fast: '盘后分析',
+        strategy_governance_daily: '策略验证'
+    };
+    const stagePages = {
+        stock_daily: 'stock-list', qmt_stock_daily_canonical: 'stock-list', stock_finance: 'datasource',
+        target_turnover_snapshot: 'monitor', qmt_membership_snapshot: 'concept',
+        capital_flow_batch_fast: 'monitor', notice_eastmoney: 'notice', stock_notice: 'notice',
+        qmt_announcement_pit: 'datasource', qmt_announcement_premarket_prepare: 'datasource',
+        stock_minute: 'datasource', analysis_upper_evidence_prepare: 'sentiment',
+        analysis_fast: 'recommended', strategy_governance_daily: 'trading-v3-candidates',
+        score: 'recommended', stock_score: 'recommended', publish: 'daily-pool', stock_pool: 'daily-pool'
+    };
+    const boardFields = {
+        limit_ladder: '连板梯队', events: '异动事件', indices: '指数行情', distribution: '涨跌分布',
+        'rankings.amount': '成交额榜', 'rankings.turnover': '活跃换手'
     };
     let active = null;
 
@@ -123,8 +137,8 @@
         return `<span class="${tone(n)}">${n !== null && n > 0 ? '+' : ''}${metric(n, unit)}</span>`;
     }
 
-    function link(tab, text) {
-        return `<button type="button" class="mh-link" data-mh-tab="${tab}">${text}</button>`;
+    function link(tab, text, view) {
+        return `<button type="button" class="mh-link" data-mh-tab="${tab}"${view ? ` data-mh-view="${view}"` : ''}>${text}</button>`;
     }
 
     function stock(code, name) {
@@ -176,15 +190,19 @@
         const heatmap = day(state.heatmap?.trade_date) === requested ? state.heatmap : null;
         const boardStamp = snapshot?.as_of || market?.data_time || market?.trade_date;
         const ladder = day(snapshot?.limit_ladder?.trade_date) === requested ? snapshot.limit_ladder : null;
+        const missing = rows(snapshot?.unavailable_fields).map(field =>
+            Object.hasOwn(boardFields, field) ? boardFields[field] : null).filter(Boolean);
+        if (snapshot?.turnover_coverage?.status === 'partial' && !missing.includes('活跃换手')) missing.push('活跃换手');
         const facts = {
             review: reviewDates.has(requested) ? ['有复盘记录', requested] : null,
             delivery: delivery?.session ? [deliveryLabel, delivery.session.updated_at] : null,
             quotes: boardStamp ? [
                 !snapshot && market?.trade_date !== requested ? '历史行情' :
-                    snapshot?.status === 'partial' ? '部分可用' :
                     market?.freshness_status === 'stale' ? '行情已过期' : '有行情记录',
                 boardStamp
             ] : null,
+            monitor: snapshot ? [missing.length ? '待补：' + missing.join('、') :
+                snapshot.status === 'partial' ? '部分市场指标待核验' : '有市场数据', boardStamp] : null,
             indices: trend ? ['指数截止', trend] : null,
             ladder: ladder ? ['有连板记录', ladder.trade_date] : null,
             sectors: rows(heatmap?.industry?.change?.rows).length ? ['有行业记录', requested] : null,
@@ -230,7 +248,8 @@
             const stamp = attempt.finished_at || attempt.started_at;
             if (!label || !day(stamp)) continue;
             const stage = Object.hasOwn(dailyStages, attempt.stage_name) ? dailyStages[attempt.stage_name] : '其他交付阶段';
-            items.push({kind:'交付', tab:'daily-pool', stamp, text:`${stage} · ${label}`});
+            const tab = Object.hasOwn(stagePages, attempt.stage_name) ? stagePages[attempt.stage_name] : 'scheduler';
+            items.push({kind:'交付', tab, stamp, text:`${stage} · ${label}`, reason:attempt.error_code});
         }
         const visible = items.filter(item => filter === '全部' || filter === item.kind)
             .sort((left, right) => String(right.stamp).replace('T', ' ').localeCompare(String(left.stamp).replace('T', ' '))).slice(0, 10);
@@ -238,7 +257,7 @@
             <label><span class="sr-only">筛选更新类型</span><select data-mh-feed>
             ${['全部', '行情', '复盘', '交付'].map(kind => `<option${filter === kind ? ' selected' : ''}>${kind}</option>`).join('')}
             </select></label></div>
-            ${visible.length ? `<ol class="mh-update-feed">${visible.map(item => `<li><button type="button" data-mh-tab="${item.tab}">
+            ${visible.length ? `<ol class="mh-update-feed">${visible.map(item => `<li><button type="button" data-mh-tab="${item.tab}"${item.reason ? ` title="${escape(item.reason)}"` : ''}>
                 <time datetime="${escape(String(item.stamp).replace(' ', 'T'))}">${escape(String(item.stamp).length >= 16 ?
                     item.stamp.slice(day(item.stamp) === requested ? 11 : 5, 16).replace('T', ' ') : day(item.stamp))}</time><span>${item.kind}</span><strong>${escape(item.text)}</strong></button></li>`).join('')}</ol>` :
             empty('所选日期暂无此类可核验记录')}`;
@@ -248,12 +267,12 @@
         const {facts, reviewDates, delivery} = dashboardFacts(state, requested, market, snapshot);
         const month = modes.month || requested.slice(0, 7);
         const sections = homeSections.map(([title, cards]) => `<section class="mh-hub-section">
-            <h3>${title}</h3><div class="mh-hub-cards">${cards.map(([tab, name, description, key]) => {
+            <h3>${title}</h3><div class="mh-hub-cards">${cards.map(([tab, name, description, key, view]) => {
                 const fact = facts[key];
                 return `<article class="mh-hub-card">
                     <h4>${name}</h4><p>${description}</p>
                     <footer>${fact ? `<span class="mh-card-state"><strong>${escape(fact[0])}</strong><small>${escape(String(fact[1] || '').replace('T', ' ').slice(0, 16))}</small></span>` : ''}
-                    <button type="button" class="mh-hub-button" data-mh-tab="${tab}" aria-label="打开${name}">打开 <span aria-hidden="true">↗</span></button></footer>
+                    <button type="button" class="mh-hub-button" data-mh-tab="${tab}"${view ? ` data-mh-view="${view}"` : ''} aria-label="打开${name}">打开 <span aria-hidden="true">↗</span></button></footer>
                     </article>`;
             }).join('')}</div></section>`).join('');
         return `<section class="mh-hub" aria-label="A股大看板">
@@ -422,13 +441,37 @@
             const value = number(item.value) || 0;
             const fill = max && value !== 0 ? Math.round(12 + 26 * (Math.abs(value) / max)) : 0;
             const source = escape(item.source || '来源待核验');
-            return `<li class="mh-heat-cell ${tone(value)}" style="--mh-heat-fill:${fill}%"><span class="mh-heat-name">${escape(item.name)}</span>` +
+            return `<li class="mh-heat-cell ${tone(value)}" style="--mh-heat-fill:${fill}%"><button type="button" class="mh-link mh-heat-name" data-mh-board="${kind}" data-mh-board-code="${escape(item.code)}">${escape(item.name)}</button>` +
                 `<strong>${heatValue(value, mode)}</strong>${heatSeries(item.series, item.series_label)}<small class="mh-heat-source">${source}</small></li>`;
         }).join('') + '</ul>' : empty(payload === undefined && requested ? '正在加载板块热力图…' : `所选交易日暂无可核验的${label}数据`);
         const note = metricResult?.note ? `<p class="mh-meta mh-heat-note">${escape(metricResult.note)}</p>` : '';
         return panel(title, escape(exact ? requested : '证据待核验'), controls +
             `<div id="mh-heatmap-${kind}">${plot}${note}</div>` +
-            link(kind === 'concept' ? 'concept' : 'sector', '查看板块详情'), 'mh-third');
+            (kind === 'concept' ? link('concept', '查看概念详情', mode === 'five_day_return' ? 'c5' : 'c0') :
+                link('sector', '查看行业热度矩阵', 'heat')), 'mh-third');
+    }
+
+    function openBoardDetail(container, payload, tradeDate, kind, mode, code) {
+        if (payload?.trade_date !== tradeDate || payload?.requested_date !== tradeDate) return;
+        const item = rows(payload[kind]?.[mode]?.rows).find(row => String(row.code) === code);
+        if (!item) return;
+        const sameBoard = heatModes.flatMap(([metric, title]) => {
+            const match = rows(payload[kind]?.[metric]?.rows).find(row => String(row.code) === code);
+            if (!match || number(match.value) === null) return [];
+            return [`<div class="mh-row"><span>${title}<small class="mh-meta">${escape(match.source || '')}</small></span>
+                <strong class="${tone(match.value)}">${heatValue(match.value, metric)}</strong></div>`];
+        });
+        const dialog = document.createElement('dialog');
+        dialog.className = 'mh-board-detail market-home';
+        dialog.innerHTML = `<header class="mh-panel-head"><div><h3 id="mh-board-title">${escape(item.name)}</h3>
+            <p class="mh-meta">${kind === 'industry' ? '行业' : '概念'} · <time>${escape(tradeDate)}</time></p></div>
+            <form method="dialog"><button class="mh-retry" autofocus>关闭</button></form></header>
+            <div class="mh-list">${sameBoard.join('')}</div>${heatSeries(item.series, item.series_label)}`;
+        dialog.setAttribute('aria-labelledby', 'mh-board-title');
+        dialog.addEventListener('close', () => dialog.remove(), {once:true});
+        container.appendChild(dialog);
+        dialog.showModal();
+        return dialog;
     }
 
     function renderEvents(snapshot, requested) {
@@ -501,6 +544,7 @@
         clearTimeout(active.timer);
         active.container.removeEventListener('click', active.click);
         active.container.removeEventListener('change', active.change);
+        active.detail?.remove();
         active = null;
     }
 
@@ -572,7 +616,12 @@
         session.click = event => {
             const button = event.target.closest('button');
             if (!button || !container.contains(button)) return;
-            if (button.dataset.mhTab) options.navigate?.(button.dataset.mhTab);
+            if (button.dataset.mhTab) options.navigate?.(button.dataset.mhTab, button.dataset.mhView);
+            else if (button.dataset.mhBoard) {
+                const kind = button.dataset.mhBoard;
+                session.detail?.remove();
+                session.detail = openBoardDetail(document.body, session.state.heatmap, requested, kind, session.modes[kind], button.dataset.mhBoardCode);
+            }
             else if (button.dataset.mhStock) options.stock?.(button.dataset.mhStock);
             else if (button.dataset.mhDate) options.selectDate?.(button.dataset.mhDate);
             else if (button.dataset.mhMonth && requested) {

@@ -6610,7 +6610,11 @@
                 clock:function(){return MARKET_CLOCK || {};}, refreshClock:refreshMarketClockSilently,
                 isActive:function(){return activeTabId() === 'workbench';},
                 selectDate:function(date){el('datePicker').value = date; return window.onDecisionDateChange();},
-                navigate:window.switchTab, stock:window.openStockDetail, status:setStatus
+                navigate:function(tab, view){
+                    if (view) (window._subViewState || (window._subViewState = {}))[tab] = view;
+                    window.switchTab(tab);
+                },
+                stock:window.openStockDetail, status:setStatus
             });
         },
         'market-context': function (d, c) {
@@ -6714,23 +6718,29 @@
             var prepared = prepareSubViewContainer(c, 'concept', views, 'c0', 'conceptBody');
             var body = prepared.body;
             var state = prepared.state;
+            var requestNumber = 0;
             state['_handler_concept'] = function (vid) {
+                var request = ++requestNumber;
                 if (vid === 'c0') {
-                    apiGet('/concept-ths-live').then(function (live) {
-                        if (live.data && live.data.length) { renderConceptData(body, live.data, true, live.time); }
-                        else {
-                            apiGet('/concept-ths?snapshot_date=' + d).then(function (res) {
-                                syncDateFromResponse(res);
-                                if (!res.data || !res.data.length) { body.innerHTML = '<div class="loading">暂无数据</div>'; return; }
-                                renderConceptData(body, res.data, false, res.date || d);
-                            });
+                    var liveRequest = hotRankCanUseLiveDate(d)
+                        ? apiGet('/concept-ths-live').catch(function () { return null; })
+                        : Promise.resolve(null);
+                    return liveRequest.then(function (live) {
+                        if (request !== requestNumber || !c.contains(body)) return;
+                        if (live && live.data && live.data.length) {
+                            renderConceptData(body, live.data, true, live.time);
+                            return;
                         }
-                    }).catch(function () {
-                        apiGet('/concept-ths?snapshot_date=' + d).then(function (res) {
-                            syncDateFromResponse(res);
-                            if (!res.data || !res.data.length) { body.innerHTML = '<div class="loading">暂无数据</div>'; return; }
-                            renderConceptData(body, res.data, false, res.date || d);
+                        return apiGet('/concept-ths?snapshot_date=' + encodeURIComponent(d)).then(function (res) {
+                            if (request !== requestNumber || !c.contains(body)) return;
+                            if (res.date !== d || !res.data || !res.data.length) {
+                                body.innerHTML = '<div class="loading">所选交易日暂无可核验的概念与行业数据</div>';
+                                return;
+                            }
+                            renderConceptData(body, res.data, false, d);
                         });
+                    }).catch(function () {
+                        if (request === requestNumber && c.contains(body)) body.innerHTML = '<div class="loading">加载失败</div>';
                     });
                 } else if (vid === 'c3') loadConceptMulti(d, 3, 1, body);
                 else if (vid === 'c5') loadConceptMulti(d, 5, 1, body);
@@ -9173,20 +9183,22 @@
         var d = el('datePicker').value;
         var myId = ++window._csReqId;
         var body = document.getElementById('conceptModalBody');
-        document.getElementById('conceptModalTitle').textContent = '📋 ' + name + ' 成分股 | 日期: ' + d;
+        document.getElementById('conceptModalTitle').textContent = '📋 ' + name + ' 成分股 | 行情日期: ' + d;
         body.innerHTML = '<div class="loading">加载中...</div>';
         document.getElementById('conceptModal').classList.add('show');
 
-        apiGet('/concept-stocks?concept_code=' + code + '&trade_date=' + d + '&_=' + Date.now()).then(function (res) {
+        apiGet('/concept-stocks?concept_code=' + encodeURIComponent(code) + '&trade_date=' + encodeURIComponent(d) + '&_=' + Date.now()).then(function (res) {
             if (myId !== window._csReqId) return;
-            if (!res.data || !res.data.length) { body.innerHTML = '<div class="loading">暂无成分股数据</div>'; return; }
-            renderConceptTable(body, res.data);
+            if (res.error) { body.innerHTML = '<div class="loading">成分股加载失败</div>'; return; }
+            if (res.date !== d || !res.data || !res.data.length) { body.innerHTML = '<div class="loading">暂无成分股数据</div>'; return; }
+            renderConceptTable(body, res.data, res.membership_scope);
         }).catch(function () { if (myId === window._csReqId) body.innerHTML = '<div class="loading">加载失败</div>'; });
     };
 
-    function renderConceptTable(container, rows) {
+    function renderConceptTable(container, rows, membershipScope) {
         var id = window._csReqId;
         var toolbar = '<div class="stats-bar"><div class="stat-card"><div class="label">成分股数量</div><div class="value blue">' + rows.length + '</div></div></div>';
+        if (membershipScope === 'latest_catalog') toolbar += '<p>成分为最新目录，行情按所选交易日读取。</p>';
         toolbar += '<div class="search-bar paged-table-toolbar"><input type="text" id="cs_s_' + id + '" placeholder="🔍 搜索..." oninput="csSearch(' + id + ')"><span id="cs_i_' + id + '"></span></div>';
         renderPagedTable(container, 'cs_' + id, toolbar, tableHeadHtml(['代码', '名称', '最新价', '涨跌幅', 'K线']), 'cs_t_' + id, 'cs_p_' + id);
         window['_cs_' + window._csReqId] = { rows: rows, page: 1, ps: 30 };
