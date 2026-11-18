@@ -966,8 +966,9 @@ def _existing_live_batch_inventory(
     mysql = connection.dialect.name == "mysql"
     query_budget = "/*+ MAX_EXECUTION_TIME(10000) */ " if mysql else ""
     index_hint = f" FORCE INDEX (`{PIT_SOURCE_COVERAGE_DATE_INDEX_NAME}`)" if mysql else ""
-    # The indexed date comes from the observed timestamp, so legacy batch IDs
-    # and existing ambiguity/envelope checks retain their original meaning.
+    target_close = datetime.combine(target, DAILY_CLOSE_READY_TIME)
+    # Group first so a pre-close batch cannot displace exact-session evidence,
+    # while all rows of a mixed batch remain subject to envelope validation.
     statement = text(
         f"SELECT {query_budget}batch_id, MIN(stock_code) AS sample_stock_code, "
         "MIN(known_at) AS min_known_at, "
@@ -999,6 +1000,7 @@ def _existing_live_batch_inventory(
         "GROUP BY batch_id "
         "HAVING SUM(CASE WHEN coverage_status='COMPLETE' THEN 0 "
         "ELSE 1 END)=0 "
+        "AND (MAX(covered_through_at) IS NULL OR MAX(covered_through_at)>=:target_close) "
         "ORDER BY max_known_at DESC, batch_id DESC LIMIT 2"
     )
     try:
@@ -1007,9 +1009,10 @@ def _existing_live_batch_inventory(
             for row in connection.execute(statement, {
                 "source": source,
                 "batch_pattern": _FULL_MARKET_BATCH_PREFIX[source] + "%",
-                "known_from": datetime.combine(target, datetime.min.time()),
+                "known_from": target_close,
                 "decision_at": decision_at,
                 "capture_deadline": capture_deadline,
+                "target_close": target_close,
             }).mappings()
         ]
     except SQLAlchemyError as exc:

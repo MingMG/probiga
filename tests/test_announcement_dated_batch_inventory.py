@@ -24,10 +24,11 @@ def test_dated_inventory_retains_the_legacy_batch_window_without_scanning_histor
     def row(
         batch, known, code="000001", count=0, *,
         source=source, status="COMPLETE", watermark="QUERY_CUTOFF",
+        cutoff="2026-11-12 18:00:00.000000", window_start="2026-10-01",
     ):
         return (
-            "event", source, watermark, known, known, "2026-11-12 15:00:00",
-            "2026-10-01", "2026-11-12", status, count, batch, code,
+            "event", source, watermark, known, known, cutoff,
+            window_start, "2026-11-12", status, count, batch, code,
         )
 
     original_query = False
@@ -62,9 +63,14 @@ def test_dated_inventory_retains_the_legacy_batch_window_without_scanning_histor
                 row(f"cninfo-ann-old-{index:05d}", "2026-11-11 23:59:59.999999")
                 for index in range(6000)
             ] + [
-                row(legacy, "2026-11-12 00:00:00.000000"),
-                row(legacy, "2026-11-12 00:00:00.000000", "000002", 2),
+                row(legacy, "2026-11-12 18:00:00.000000"),
+                row(legacy, "2026-11-12 18:00:00.000000", "000002", 2),
                 row(newer, "2026-11-12 22:00:00.000000", count=3),
+                # A completed prior-session batch can arrive on the target day.
+                row("cninfo-ann-prior-session", "2026-11-12 22:15:00",
+                    cutoff="2026-11-12 15:11:16.811711", window_start="2026-09-30", count=10),
+                row("cninfo-ann-preclose-readback", "2026-11-12 15:29:14.010608",
+                    cutoff="2026-11-12 15:11:16.811711", window_start="2026-09-30", count=10),
                 row("cninfo-ann-invalid", "2026-11-12 22:30:00", status="PARTIAL"),
                 row("cninfo-ann-wrong-watermark", "2026-11-12 22:30:00", watermark="HISTORICAL"),
                 row("cninfo-ann-foreign", "2026-11-12 22:30:00", source="eastmoney.notice"),
