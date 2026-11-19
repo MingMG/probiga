@@ -859,9 +859,11 @@ def render_draft(draft: dict, packet: dict, metadata: dict) -> str:
                       f"[查看同日龙虎榜席位](/?tab=alist&trade_date={task['review_date']}&stock_code={entity['code']}&reason={quote(str(values['reason']), safe='')})",
                       "当日涨跌：" + _format("change_pct", price) + "；上榜原因：" + str(values["reason"]),
                       "榜内买入 " + _format("a_buy_amount", values["a_buy_amount"]) + "；卖出 " + _format("a_sell_amount", values["a_sell_amount"]) + "；净额 " + _format("a_net_amount", values["a_net_amount"]) + "。"]
-            if price is not None:
+            if price is not None and "日" in str(values["reason"]) and not any(word in str(values["reason"]) for word in ("连续", "累计")):
                 relation = "价格与榜内净额方向一致" if price * values["a_net_amount"] > 0 else "价格与榜内净额方向背离" if price * values["a_net_amount"] < 0 else "方向关系待确认"
-                lines.append("交叉观察：" + relation + "；累计榜的统计窗口与单日涨跌不同，不能据此归因涨跌或确认龙头。")
+                lines.append("交叉观察：" + relation + "；不能据此归因涨跌或确认龙头。")
+            else:
+                lines.append("此披露窗口与单日涨跌未证明一致，不判断同日资金支持或背离。")
             for seat in values["seats"]:
                 lines.append("- 公开席位样本：" + seat["name"] + "，买入 " + _format("a_buy_amount", seat["a_buy_amount"]) + "，卖出 " + _format("a_sell_amount", seat["a_sell_amount"]) + "，净额 " + _format("a_net_amount", seat["a_net_amount"]))
             if not values["seats"]:

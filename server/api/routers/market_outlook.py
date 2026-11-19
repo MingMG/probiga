@@ -12,6 +12,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from server.api.routers._engine import get_engine
+from server.common.authoritative_market_clock import PRODUCTION_TIMEZONE, authoritative_closed_trade_date
 
 
 router = APIRouter(tags=["market-outlook"])
@@ -58,15 +59,6 @@ def _json_list(value: Any) -> list[Any]:
     except (TypeError, ValueError, json.JSONDecodeError):
         return []
     return list(parsed) if isinstance(parsed, list) else []
-
-
-def _active_pool_date(connection) -> str:
-    row = connection.execute(text(
-        "SELECT pick_date FROM st_recommended_stocks "
-        "WHERE publication_status='ACTIVE' "
-        "GROUP BY pick_date ORDER BY pick_date DESC LIMIT 1"
-    )).first()
-    return str(row[0])[:10] if row and row[0] else ""
 
 
 def _calendar_neighbors(connection, trade_date: str) -> tuple[str, str]:
@@ -405,11 +397,11 @@ def build_market_outlook(
 ) -> dict[str, Any]:
     with engine.connect() as connection:
         requested = str(trade_date or "").strip()[:10]
-        target = requested or _active_pool_date(connection)
+        target = requested or authoritative_closed_trade_date(connection, now=datetime.now(PRODUCTION_TIMEZONE))
         if not target:
             return {
                 "status": "DATA_BLOCKED",
-                "reason": "当前没有 ACTIVE 策略票池",
+                "reason": "无法核验最近已闭市交易日",
                 "scenarios": [],
                 "stocks": [],
             }
@@ -435,18 +427,10 @@ def build_market_outlook(
             "GROUP BY publisher_run_uid ORDER BY active_count DESC "
             "LIMIT 2"
         ), {"d": target}).mappings().all()
-        if len(active_identity) > 1:
-            return {
-                "status": "DATA_BLOCKED",
-                "reason": "当前 ACTIVE 票池存在多个发布身份",
-                "trade_date": target,
-                "next_trade_date": next_date,
-                "scenarios": [],
-                "stocks": [],
-            }
+        pool_reason = "当前 ACTIVE 票池存在多个发布身份" if len(active_identity) > 1 else ""
         active_run_uid = (
             str(active_identity[0].get("publisher_run_uid") or "")
-            if active_identity else ""
+            if len(active_identity) == 1 else ""
         )
         history_params: dict[str, Any] = {"d": target}
         history_condition = "trade_date=:d AND status='done'"
@@ -459,7 +443,7 @@ def build_market_outlook(
             "FROM st_recommended_run_history "
             f"WHERE {history_condition} "
             "ORDER BY published_at DESC,run_uid DESC LIMIT 1"
-        ), history_params).mappings().first()
+        ), history_params).mappings().first() if active_run_uid else None
         pool_rows = connection.execute(text(
             "SELECT r.stock_code,r.short_name,r.short_term_score,"
             "r.capital_score,r.technical,r.signal_status,r.signal_reason,"
@@ -475,7 +459,7 @@ def build_market_outlook(
             "ORDER BY CASE WHEN r.signal_reason LIKE '%龙头%' THEN 0 "
             "WHEN r.signal_reason LIKE '%跟随%' THEN 1 ELSE 2 END, "
             "r.short_term_score DESC,r.stock_code"
-        ), {"d": target}).mappings().all()
+        ), {"d": target}).mappings().all() if history and active_run_uid else []
     if not current.get("available") or not previous.get("available"):
         return {
             "status": "DATA_BLOCKED",
@@ -485,15 +469,9 @@ def build_market_outlook(
             "scenarios": [],
             "stocks": [],
         }
-    if history is None:
-        return {
-            "status": "DATA_BLOCKED",
-            "reason": "当前正式策略池缺少 done 发布记录",
-            "trade_date": target,
-            "next_trade_date": next_date,
-            "scenarios": [],
-            "stocks": [],
-        }
+    if not history and not pool_reason:
+        pool_reason = "候选池尚未完成发布；市场层研究独立运行"
+    history = dict(history or {})
     mode, mode_label, tactic, evidence = _market_mode(current, previous)
     stocks = [
         item
@@ -524,6 +502,8 @@ def build_market_outlook(
         "stocks": stocks[:6],
         "session_timeline": _session_timeline(stocks),
         "pool": {
+            "status": "READY" if history else "BLOCKED" if len(active_identity) > 1 else "WAITING",
+            "reason": pool_reason,
             "run_uid": str(history.get("run_uid") or ""),
             "build_sha": str(history.get("build_sha") or ""),
             "analysis_count": int(history.get("total") or 0),
