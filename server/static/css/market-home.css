@@ -582,6 +582,13 @@ body.market-home-active .main-content > .content {
     padding: 0;
 }
 
+.market-home .mh-event-scroll {
+    max-height: 460px;
+    overflow-y: auto;
+    overscroll-behavior-y: contain;
+    scrollbar-gutter: stable;
+}
+
 .market-home .mh-row {
     display: flex;
     align-items: baseline;

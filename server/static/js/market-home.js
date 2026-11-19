@@ -488,9 +488,9 @@
     function renderEvents(snapshot, requested) {
         const events = rows(snapshot?.events).filter(item => day(item.snapshot_at) === requested && requested);
         const heading = escape(requested || '日期待核验');
-        if (!events.length) return panel('监控中心', heading, empty('所选交易日的异动事件证据待核验') + link('market-radar', '查看异动雷达'), 'mh-third');
+        if (!events.length && !snapshot?.next_cursor) return panel('监控中心', heading, empty('所选交易日的异动事件证据待核验') + link('market-radar', '查看异动雷达'), 'mh-third');
         const limitLabels = {TOUCH:'触及涨停', SEAL:'涨停封板', RESEAL:'涨停回封', BREAK:'涨停开板'};
-        return panel('监控中心', heading, '<div class="mh-list">' + events.slice(0, 8).map(item => {
+        return panel('监控中心', heading, '<div class="mh-list mh-event-scroll" data-mh-events tabindex="0" role="region" aria-label="监控事件，向下滚动查看更早记录">' + events.map(item => {
             const detail = item.detail_json || {};
             const name = item.stock_code ? stock(item.stock_code, detail.short_name) : escape(item.sector_name || '板块异动');
             const limitEvent = item.event_family === 'LIMIT_UP_LIFECYCLE' && Object.hasOwn(limitLabels, item.event_type);
@@ -500,7 +500,8 @@
             return `<div class="mh-row"><span>${name}<small class="mh-meta">${escape(provider)}</small></span>` +
                 `<span class="mh-badge ${tone}">${label}</span>` +
                 `<span class="mh-meta">${escape(item.snapshot_at)}${item.available_at ? `<small class="mh-meta">记录 ${escape(item.available_at)}</small>` : ''}</span></div>`;
-        }).join('') + '</div>', 'mh-third');
+        }).join('') + (snapshot?.next_cursor ? '<button type="button" class="mh-retry" data-mh-events-more' +
+            (snapshot.loading ? ' disabled' : '') + '>' + (snapshot.loading ? '正在加载…' : snapshot.error ? '加载失败，点击重试' : '加载更早事件') + '</button>' : '<p class="mh-meta">已显示当天全部事件</p>') + '</div>', 'mh-third');
     }
 
     function renderRanking(snapshot, key, title, field, unit) {
@@ -561,7 +562,7 @@
             renderLadder(snapshot) + renderDrawdowns(snapshot) +
             renderSector('concept', '概念热度', state.heatmap, requested, modes.concept || 'change') +
             renderSector('industry', '行业热度', state.heatmap, requested, modes.industry || 'change') +
-            renderEvents(snapshot, requested) + rankings.map(([key, title, field, unit]) => renderRanking(snapshot, key, title, field, unit)).join('') +
+            renderEvents(state.events, requested) + rankings.map(([key, title, field, unit]) => renderRanking(snapshot, key, title, field, unit)).join('') +
             '</div></section>';
     }
 
@@ -570,6 +571,7 @@
         clearTimeout(active.timer);
         active.container.removeEventListener('click', active.click);
         active.container.removeEventListener('change', active.change);
+        active.container.removeEventListener('scroll', active.scroll, true);
         active.detail?.remove();
         active = null;
     }
@@ -587,6 +589,7 @@
             trend: '/api/hot-data/market-trend?date=' + query,
             snapshot: '/api/monitor/board?date=' + query,
             heatmap: '/api/monitor/sector-heatmap?date=' + query,
+            events: '/api/monitor/events?date=' + query,
             reviewDates: '/api/hot-data/daily-review-dates',
             delivery: '/api/scheduler/daily-delivery?trade_date=' + query + '&attempt_limit=12'};
         const current = () => active === session;
@@ -594,12 +597,36 @@
         function paint() {
             if (!current()) return;
             const focused = document.activeElement;
-            const attributes = ['data-mh-refresh', 'data-mh-stock', 'data-mh-tab', 'data-mh-heat-mode', 'data-mh-feed', 'data-mh-month', 'data-mh-date', 'data-mh-observation'];
+            const attributes = ['data-mh-refresh', 'data-mh-stock', 'data-mh-tab', 'data-mh-heat-mode', 'data-mh-feed', 'data-mh-month', 'data-mh-date', 'data-mh-observation', 'data-mh-events'];
             const action = container.contains(focused) ? attributes.find(name => focused.hasAttribute(name)) : null;
             const value = action && focused.getAttribute(action);
+            const eventScroll = container.querySelector?.('[data-mh-events]')?.scrollTop || 0;
             container.innerHTML = render(session.state, requested, options.clock?.(), session.modes);
+            const eventList = container.querySelector?.('[data-mh-events]');
+            if (eventList) eventList.scrollTop = eventScroll;
             if (action) Array.from(container.querySelectorAll(`[${action}]`))
                 .find(button => button.getAttribute(action) === value)?.focus({preventScroll: true});
+        }
+
+        async function olderEvents() {
+            const feed = session.state.events;
+            if (!current() || !feed?.next_cursor || feed.loading) return;
+            feed.loading = true;
+            feed.error = false;
+            paint();
+            try {
+                const page = await options.request(paths.events + '&before=' + encodeURIComponent(feed.next_cursor), 15000, {cache: 'no-store'});
+                if (current() && session.state.events === feed) {
+                    if (page?.requested_date !== requested || !Array.isArray(page.events)) throw new Error('invalid event page');
+                    feed.events.push(...page.events);
+                    feed.next_cursor = page.next_cursor;
+                }
+            } catch {
+                feed.error = true;
+            } finally {
+                feed.loading = false;
+                paint();
+            }
         }
 
         function refresh(keys) {
@@ -631,7 +658,8 @@
                     if (document.hidden || options.isActive?.() === false) return;
                     const clock = options.refreshClock ? await options.refreshClock() : options.clock?.();
                     if (current() && clock?.is_intraday === true && day(clock.active_trade_date) === requested) {
-                        await refresh(['market', 'snapshot', 'heatmap']);
+                        const readingHistory = (container.querySelector?.('[data-mh-events]')?.scrollTop || 0) > 0;
+                        await refresh(['market', 'snapshot', 'heatmap', ...(readingHistory ? [] : ['events'])]);
                     }
                 } catch {
                     // A failed clock refresh must not relabel the previous observation.
@@ -642,7 +670,8 @@
         session.click = event => {
             const button = event.target.closest('button');
             if (!button || !container.contains(button)) return;
-            if (button.dataset.mhTab) options.navigate?.(button.dataset.mhTab, button.dataset.mhView);
+            if (button.dataset.mhEventsMore !== undefined) olderEvents();
+            else if (button.dataset.mhTab) options.navigate?.(button.dataset.mhTab, button.dataset.mhView);
             else if (button.dataset.mhBoard) {
                 const kind = button.dataset.mhBoard;
                 session.detail?.remove();
@@ -684,6 +713,11 @@
         };
         container.addEventListener('click', session.click);
         container.addEventListener('change', session.change);
+        session.scroll = event => {
+            const list = event.target;
+            if (list.hasAttribute?.('data-mh-events') && list.scrollTop + list.clientHeight >= list.scrollHeight - 80 && !session.state.events?.error) olderEvents();
+        };
+        container.addEventListener('scroll', session.scroll, true);
         paint();
         return refresh(Object.keys(paths)).finally(schedule);
     }
