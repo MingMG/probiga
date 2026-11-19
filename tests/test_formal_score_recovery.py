@@ -514,6 +514,7 @@ def calculate(conn):
     for relative in (
         "server/static/js/app.js", "server/api/main.py", "server/api/routers/market_home.py",
         "server/api/routers/research_futures.py", "server/static/js/research-tools.js",
+        "server/static/js/market-home.js",
         "server/static/css/research-tools.css",
     ):
         display_file = source / relative
