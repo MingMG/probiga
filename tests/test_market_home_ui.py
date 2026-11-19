@@ -296,6 +296,10 @@ const html=page.render({snapshot,market:{status:'unavailable'},liquidity},date);
 for(const value of ['上涨占比 60.0%','1.23亿','2.35% / 1.23倍','盘中量比中位','已核验行情样本','10:29:50']) assert.ok(html.includes(value),value);
 assert.ok(!html.includes('市场情绪观察待核验'));
 assert.ok(!html.includes('涨跌家数待核验'));
+const prior={...overview,trade_date:'2026-11-18',data_source:'yesterday_only',up_count:1,flat_count:1,down_count:8};
+const current=page.render({snapshot,market:prior,liquidity},date);
+assert.ok(current.includes('上涨占比 60.0%'));
+assert.ok(!current.includes('yesterday_only'));
 assert.ok(!page.render({snapshot,liquidity:{...liquidity,trade_date:'2026-11-18'}},date).includes('2.35% / 1.23倍'));
 """)
 

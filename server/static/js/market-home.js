@@ -167,6 +167,10 @@
 
     function marketObservation(payload, requested, fallback) {
         const date = day(payload?.trade_date);
+        if (date < requested && day(fallback?.trade_date) === requested) {
+            const newer = marketObservation(fallback, requested);
+            if (newer?.breadth) return newer;
+        }
         if (!date || !requested || date > requested || payload.error || payload.status === 'unavailable') return fallback ? marketObservation(fallback, requested) : null;
         const counts = [payload.up_count, payload.flat_count, payload.down_count, payload.total_count].map(number);
         const [up, flat, down, total] = counts;
