@@ -742,7 +742,10 @@
             });
         }
         function inline(value) {
-            return escHtml(plain(value)).replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+            return escHtml(plain(value))
+                .replace(/\[([^\]\n]+)\]\((\/\?tab=alist&amp;trade_date=\d{4}-\d{2}-\d{2}&amp;stock_code=\d{6}(?:&amp;reason=[a-z0-9%_.~-]*)?)\)/gi,
+                    '<a href="$2" style="color:#60a5fa;text-decoration:underline">$1</a>')
+                .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
         }
         var input = String(text).replace(/\r\n?/g, '\n');
         // Some imported documents escape every Markdown block marker. Only
