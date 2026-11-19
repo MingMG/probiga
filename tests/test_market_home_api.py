@@ -185,6 +185,11 @@ def test_board_uses_only_verified_exact_session_and_keeps_unsupported_values_unk
     assert {"rankings.turnover", "indices", "limit_ladder", "events"} <= set(result["unavailable_fields"])
     assert [row["index_code"] for row in result["indices"]] == ["000680"]
     assert result["indices"][0]["source"] == "sm_index_kline"
+    overview = result["market_overview"]
+    assert overview["total_count"] == 9
+    assert overview["up_count"]+overview["flat_count"]+overview["down_count"] == 9
+    assert overview["total_amount"] == 1000
+    assert overview["trade_date"] == DAY_TEXT and overview["data_source"] == "sm_stock_kline"
 
 
 def test_complete_close_survives_slower_quote_read_and_caches_exact_date(market_db, monkeypatch):
