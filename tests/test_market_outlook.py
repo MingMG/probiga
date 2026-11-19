@@ -163,20 +163,31 @@ def test_market_outlook_builds_scenarios_and_core_stock_plan(tmp_path):
     assert payload["session_timeline"][0]["time"] == "09:25"
 
 
-def test_market_outlook_blocks_without_active_pool(tmp_path):
-    engine = create_engine(
-        f"sqlite:///{(tmp_path / 'empty-outlook.db').as_posix()}",
-        future=True,
-    )
+def test_market_outlook_remains_available_without_a_published_pool(tmp_path):
+    engine = _database(tmp_path)
     with engine.begin() as connection:
-        connection.execute(text(
-            "CREATE TABLE st_recommended_stocks "
-            "(stock_code TEXT, pick_date DATE, publication_status TEXT, "
-            "publisher_run_uid TEXT)"
-        ))
+        connection.execute(text("UPDATE st_recommended_stocks SET publication_status='PENDING'"))
+        connection.execute(text("DELETE FROM st_recommended_run_history"))
+    payload = build_market_outlook(engine, trade_date="2026-10-23")
+    assert payload["status"] == "READY"
+    assert payload["market_mode"] == "PANIC_REBOUND"
+    assert payload["scenarios"] and payload["stocks"] == []
+    assert payload["pool"]["status"] == "WAITING"
+    assert payload["pool"]["run_uid"] == ""
 
-    payload = build_market_outlook(engine)
 
-    assert payload["status"] == "DATA_BLOCKED"
-    assert payload["scenarios"] == []
-    assert payload["stocks"] == []
+def test_market_outlook_still_blocks_when_its_own_market_data_is_missing(tmp_path):
+    engine = _database(tmp_path)
+    with engine.begin() as connection:
+        connection.execute(text("DELETE FROM sm_stock_kline WHERE trade_date='2026-10-23'"))
+    payload = build_market_outlook(engine, trade_date="2026-10-23")
+    assert payload["status"] == "DATA_BLOCKED" and payload["scenarios"] == []
+
+
+def test_market_outlook_does_not_publish_stock_plans_with_ambiguous_pool_identity(tmp_path):
+    engine = _database(tmp_path)
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE st_recommended_stocks SET publisher_run_uid=:uid WHERE stock_code='002724'"), {"uid": "b" * 32})
+    payload = build_market_outlook(engine, trade_date="2026-10-23")
+    assert payload["status"] == "READY" and payload["scenarios"]
+    assert payload["stocks"] == [] and payload["pool"]["status"] == "BLOCKED"
