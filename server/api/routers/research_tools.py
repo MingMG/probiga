@@ -300,22 +300,33 @@ def build_period_drawdowns(day, *, start, tmt=False):
 
 
 def build_industry_breadth(day, *, period=20):
-    deadline = monotonic() + 18
+    deadline = monotonic() + 28
     now, calendar = _scope(day, deadline, period)
     if len(calendar) != period:
         raise ValueError("均线所需交易日历不完整")
-    clause, params = _bindings(calendar, "day")
-    params.update(day=day, now=now, count=period)
-    quality = _quality(params)
-    quotes = _read(get_kline_engine, f"""
-        SELECT /*+ MAX_EXECUTION_TIME(4500) */ stock_code,AVG(close) AS moving_average,
-               MAX(CASE WHEN trade_date=:day THEN close END) AS last_close
-        FROM sm_stock_kline WHERE trade_date IN ({clause}) AND k_type=1 AND adjust_type=0
-          AND etl_sync_at<=:now AND close>0 AND {quality}
-        GROUP BY stock_code HAVING COUNT(*)=:count AND COUNT(DISTINCT trade_date)=:count
-        LIMIT 7001
-    """, params, deadline=deadline, limit=7000, stage="industry-breadth-aggregate")
-    valid = {row["stock_code"]: float(row["last_close"]) > float(row["moving_average"]) for row in quotes}
+    totals = None
+    # The live full-window aggregate timed out; use the same proven five-date
+    # indexed partitions as the drawdown reader and intersect complete samples.
+    for offset in range(0,len(calendar),5):
+        batch = calendar[offset:offset+5]
+        clause, params = _bindings(batch, "day")
+        params.update(day=day, now=now, count=len(batch))
+        quality = _quality(params)
+        quotes = _read(get_kline_engine, f"""
+            SELECT /*+ INDEX(sm_stock_kline idx_date_ktype) MAX_EXECUTION_TIME(4000) */ stock_code,
+                   SUM(close) AS total_close,MAX(CASE WHEN trade_date=:day THEN close END) AS last_close
+            FROM sm_stock_kline WHERE trade_date IN ({clause}) AND k_type=1 AND adjust_type=0
+              AND etl_sync_at<=:now AND close>0 AND {quality}
+            GROUP BY stock_code HAVING COUNT(*)=:count AND COUNT(DISTINCT trade_date)=:count LIMIT 7001
+        """, params, deadline=deadline, limit=7000, stage=f"industry-breadth-batch:{offset//5+1}")
+        current = {row["stock_code"]:row for row in quotes}
+        if totals is None:
+            totals = current
+        else:
+            totals = {code:{"stock_code":code,"total_close":float(row["total_close"])+float(current[code]["total_close"]),
+                            "last_close":current[code]["last_close"]}
+                      for code,row in totals.items() if code in current}
+    valid = {code: float(row["last_close"]) > float(row["total_close"])/period for code,row in totals.items()}
     run, members = _membership(day, deadline)
     groups = defaultdict(set)
     for row in members:
@@ -350,7 +361,7 @@ def _serve(builder, *args, **kwargs):
     except ValueError as exc:
         raise HTTPException(422, detail=str(exc)) from exc
     except (SQLAlchemyError, RuntimeError, TimeoutError, requests.RequestException) as exc:
-        raise HTTPException(503, detail={"stage": builder.__name__, "reason": str(exc)[:200]}) from exc
+        raise HTTPException(503, detail=builder.__name__ + ": " + str(exc)[:200]) from exc
 
 
 @router.get("/research/seat-observation")
