@@ -307,19 +307,35 @@ assert.ok(!page.render({snapshot,liquidity:{...liquidity,trade_date:'2026-11-18'
 def test_home_keeps_refreshing_through_lunch_and_after_close():
     run_node(r"""
 global.document={activeElement:null,hidden:false};
-let tick;
-global.setTimeout=fn=>{tick=fn;return 1;};global.clearTimeout=()=>{};
+let tick, delay, now=0;
+global.performance={now:()=>now};
+global.setTimeout=(fn,ms)=>{tick=fn;delay=ms;return 1;};global.clearTimeout=()=>{};
 const calls=[];
 const container={innerHTML:'',contains:()=>false,addEventListener:()=>{},removeEventListener:()=>{}};
 const clock={phase:'midday_break',active_trade_date:'2026-11-19',is_intraday:false};
-const request=async url=>{calls.push(url);return {};};
+let complete;
+let hold=false;
+const request=async url=>{calls.push(url);if(hold && url.includes('/monitor/board')) await new Promise(resolve=>{complete=resolve;});return {};};
 (async()=>{try {
  await page.load('2026-11-19',container,{request,refreshClock:async()=>clock});
- calls.length=0;await tick();
+ assert.equal(delay,20000);
+ calls.length=0;hold=true;
+ const previous=tick;const pending=tick();
+ await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(tick,previous); // No next timer while this batch is in flight.
+ now+=7000;complete();await pending;hold=false;
+ assert.equal(delay,13000); // Request duration is part of the 20-second cycle.
  assert.ok(calls.some(url=>url.includes('/monitor/liquidity')));
  assert.ok(calls.some(url=>url.includes('/monitor/board')));
  calls.length=0;clock.phase='postmarket';await tick();
+ assert.equal(delay,20000);
  assert.ok(calls.some(url=>url.includes('/monitor/liquidity')));
  assert.ok(calls.some(url=>url.includes('/monitor/board')));
+ calls.length=0;clock.is_intraday=true;clock.phase='morning';hold=true;
+ const slow=tick();await new Promise(resolve=>setImmediate(resolve));
+ now+=25000;complete();await slow;hold=false;
+ assert.equal(delay,0); // A slow batch finishes before the next cycle can start.
+ calls.length=0;document.hidden=true;await tick();
+ assert.equal(calls.length,0);assert.equal(delay,20000);
 }finally{page.stop();}})().catch(e=>{console.error(e);process.exitCode=1;});
 """)

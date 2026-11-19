@@ -28,6 +28,8 @@ def test_live_turnover_persists_ranked_source_and_reuses_checkpoint(tmp_path, mo
     again = turnover_live.read_live_turnover(DAY, now=NOW+timedelta(seconds=1), deadline=monotonic()+8)
     assert first == again and calls == [3]
     assert first["rows"][0]["turnover_rate"] == 49
+    turnover_live.read_live_turnover(DAY, now=NOW+timedelta(seconds=20), deadline=monotonic()+22)
+    assert len(calls) == 2
     assert first["rows"][0]["turnover_rate_source"] == "eastmoney.push2.f8"
     assert first["provider_total"] == 5931 and first["observed_count"] == 20
 

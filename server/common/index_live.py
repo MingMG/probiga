@@ -58,7 +58,7 @@ def _normalize(rows, names, selected, now):
 
 
 def read_live_indices(names, selected, *, now, deadline):
-    """One bounded bulk request, or a 30-second verified durable checkpoint."""
+    """One bounded bulk request, or a 15-second verified durable checkpoint."""
     if selected != now.date().isoformat():
         return []
     remaining = deadline - monotonic()
@@ -68,7 +68,7 @@ def read_live_indices(names, selected, *, now, deadline):
         with closing(sqlite3.connect(_path(create=True), timeout=1)) as db:
             db.execute("CREATE TABLE IF NOT EXISTS live_index_snapshot (slot INTEGER PRIMARY KEY CHECK(slot=1), day TEXT, captured_at TEXT, digest TEXT, payload TEXT)")
             stored = db.execute("SELECT day,captured_at,digest,payload FROM live_index_snapshot WHERE slot=1").fetchone()
-            if stored and stored[0] == selected and 0 <= (now - datetime.fromisoformat(stored[1])).total_seconds() < 30:
+            if stored and stored[0] == selected and 0 <= (now - datetime.fromisoformat(stored[1])).total_seconds() < 15:
                 rows = json.loads(stored[3])
                 if canonical_digest(rows) != stored[2]:
                     raise ValueError("index_live: persisted digest differs")

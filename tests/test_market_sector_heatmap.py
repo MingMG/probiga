@@ -186,6 +186,8 @@ def test_intraday_endpoint_uses_live_observations_and_previous_four_closes(heatm
     again = market_home.build_sector_heatmap(date.fromisoformat(DAY), now=now + timedelta(seconds=10))
     assert again["concept"] == payload["concept"]
     assert sorted(calls) == [2, 3]  # Durable snapshot reused without new source capture.
+    market_home.build_sector_heatmap(date.fromisoformat(DAY), now=now + timedelta(seconds=20))
+    assert sorted(calls) == [2, 2, 3, 3]
 
 
 @pytest.mark.parametrize("clock,source,available", [("10:30", "10:20", False), ("12:30", "11:29", True)])
