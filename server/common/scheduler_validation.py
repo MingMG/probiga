@@ -12,11 +12,12 @@ import zlib
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
-from time import monotonic
+from time import monotonic, sleep
 from typing import Any, Mapping
 
 from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import OperationalError
 
 from biz.market_context.external_market import (
     PREMARKET_EXTERNAL_CAPTURE_TIME,
@@ -6566,14 +6567,26 @@ def _read_notice_validation_window(engine, *, codes, window_start, window_end):
             ordering = "GROUP BY notice.stock_code"
         else:
             selection, ordering = columns, "ORDER BY notice.stock_code, notice.art_code"
-        fetched = _read_all(engine, f"""
+        statement = f"""
             SELECT /*+ MAX_EXECUTION_TIME(15000) */ {selection}
               FROM si_notice_eastmoney AS notice{index_hint}
              WHERE notice.stock_code IN ({placeholders})
                AND notice.notice_date >= :request_window_start
                AND notice.notice_date <= :request_window_end
              {ordering}
-        """, params)
+        """
+        for attempt in range(3):
+            try:
+                fetched = _read_all(engine, statement, params)
+                break
+            except OperationalError as exc:
+                error_code = exc.orig.args[0] if exc.orig.args else None
+                if error_code not in {1205, 1213, 2006, 2013, 3024} or attempt == 2:
+                    raise
+                delay = 0.25 * (attempt + 1)
+                if monotonic() + delay >= deadline:
+                    raise RuntimeError("notice_readback: total deadline exceeded") from exc
+                sleep(delay)
         if mysql:
             seen_groups = set()
             if len(fetched) > len(batch):
