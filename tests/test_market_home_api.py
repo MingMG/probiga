@@ -299,6 +299,25 @@ def test_board_keeps_missing_amount_and_unbound_live_quotes_out(market_db):
     assert daily["rankings"]["turnover"][0]["stock_code"] == "000002"
 
 
+@pytest.mark.parametrize("age, expected", [(100, 1), (121, 0)])
+def test_live_board_uses_the_verified_batch_age_not_the_last_trade_time(market_db, age, expected):
+    from datetime import timedelta
+    with market_db.begin() as connection:
+        connection.execute(text("""
+            INSERT INTO st_qmt_realtime_sync_receipt_v2 VALUES
+            ('id','gj_big_qmt_inner','token','2026-11-06 10:00:00',1,1,1,'2026-11-06 10:00:01',
+             'LIVE_FORWARD','PASS','{"full_batch_id":"verified"}','2026-11-06 10:00:01')
+        """))
+        connection.execute(text("""
+            INSERT INTO sm_stock_current VALUES
+            ('000003','bound',12,6,12,'2026-11-06 09:59:00','verified','gj_big_qmt_inner','VALIDATED','SUPPORTED')
+        """))
+    now = datetime(2026, 11, 6, 10) + timedelta(seconds=age)
+    result = market_home.build_market_board(DAY, now=now)
+    assert result["sample_size"] == expected
+    assert result["strong"]["up_3pct"] == (1 if expected else None)
+
+
 @pytest.mark.parametrize("problem", [None, "stage", "field_root", "missing_capture", "quote_mismatch", "ipo", "ipo_prior_subset"])
 def test_board_native_turnover_requires_complete_evidence_and_exact_quotes(market_db, monkeypatch, problem):
     items = [{"stock_code": code, "trade_date": DAY_TEXT, "turnover_percent": rate}
@@ -495,7 +514,7 @@ def test_board_invalid_date_is_rejected_and_repeat_uses_bounded_cache(monkeypatc
 
 
 @pytest.mark.parametrize(("stamp", "before", "after"), [
-    ("10:00:00", "10:01:30", "10:01:31"),
+    ("10:00:00", "10:02:00", "10:02:01"),
     ("11:29:50", "11:30:00", "11:30:01"),
 ])
 def test_cache_never_serves_live_quotes_past_freshness_or_session(market_db, monkeypatch, stamp, before, after):
@@ -535,7 +554,7 @@ def test_live_snapshot_that_expires_during_reads_is_withheld(market_db, monkeypa
     }], datetime(2026, 11, 6, 10)))
     monkeypatch.setattr(market_home, "_market_events", load_events)
 
-    result = market_home.build_market_board(DAY, now=datetime(2026, 11, 6, 10, 1, 29))
+    result = market_home.build_market_board(DAY, now=datetime(2026, 11, 6, 10, 1, 59))
     assert result["sample_size"] == 0
     assert result["reason"] == "live_quote_expired"
 
