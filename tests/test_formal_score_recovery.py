@@ -511,9 +511,14 @@ def calculate(conn):
     previous = git("rev-parse", "HEAD")
 
     scheduler_file.write_bytes(scheduler_source.replace(b"conn.older()", b"conn.exact()"))
-    display_file = source / "server/static/js/app.js"
-    display_file.parent.mkdir(parents=True)
-    display_file.write_bytes(b"renderVerifiedEmpty();\n")
+    for relative in (
+        "server/static/js/app.js", "server/api/main.py", "server/api/routers/market_home.py",
+        "server/api/routers/research_futures.py", "server/static/js/research-tools.js",
+        "server/static/css/research-tools.css",
+    ):
+        display_file = source / relative
+        display_file.parent.mkdir(parents=True, exist_ok=True)
+        display_file.write_bytes(b"display_only = True\n")
     git("add", ".")
     git("commit", "-m", "display and exact recovery selector")
     current = git("rev-parse", "HEAD")
