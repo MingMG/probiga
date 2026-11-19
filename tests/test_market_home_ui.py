@@ -40,6 +40,7 @@ const snapshot = {
         {index_code:'399001.SZ', trade_date:'2026-11-09', price:12345.67, change_pct:1}],
     limit_ladder:{trade_date:date, source:'东财涨停池', scope:'东财收录样本', rows:[{streak:5,count:2}]},
     turnover_coverage:{verified_count:9,sample_size:10},
+    liquidity:{turnover_median_pct:2.34,turnover_sample_count:9,volume_ratio5:0.91,volume_sample_count:8},
     rankings:{gainers:[{stock_code:'600001', short_name:'当日股票', trade_date:date, change_pct:0},
         {stock_code:'600002', short_name:'错日排名', trade_date:'2026-11-05', change_pct:20}],
         turnover:[{stock_code:'600003', short_name:'有换手率股票', trade_date:date, turnover_rate:12.34}]}
@@ -51,7 +52,7 @@ for (const expected of ['<section class="market-home"', '盘中快照', '延迟 
     '0.0%', '1.00亿', 'P0', '涨跌幅达到 ±3%', '跌3%以上', '分布样本 10只', '所选交易日的异动事件证据待核验',
     '沪深300 · 2026-11-05', '4,600.25', '3,999.01', '指数日行情', '&lt;b&gt;可核验主题&lt;/b&gt;',
     '当日股票', 'data-mh-stock="600001"', '12.34%', '已核验 9/10只', '5板', '东财收录样本',
-    'data-mh-tab="market-context"']) assert.ok(html.includes(expected), expected);
+    'data-mh-tab="market-context"', '换手中位 / 收盘日量比', '2.34% / 0.91倍', '日量比同样本 8只']) assert.ok(html.includes(expected), expected);
 assert.doesNotMatch(html, /12,345\.67|未来主题|错日排名|<b>可核验主题|NaN|undefined/);
 assert.doesNotMatch(page.render({market,snapshot:{...snapshot,limit_ladder:{...snapshot.limit_ladder,trade_date:'2026-11-05'}}}, date), /5板/);
 assert.doesNotMatch(page.render({market}, date), /延迟/);
@@ -59,7 +60,7 @@ assert.doesNotMatch(page.render({market}, date, {server_time:date + ' 10:29:54'}
 const later = page.render({market,snapshot,heatmap}, '2026-11-09', {server_time:'2026-11-09 10:30:00'});
 assert.match(later, /历史回退/);
 assert.match(later, /有效行情/);
-assert.doesNotMatch(later, /延迟|跌3%以上|当日股票|可核验主题/);
+assert.doesNotMatch(later, /延迟|跌3%以上|当日股票|可核验主题|2\.34% \/ 0\.91倍/);
 """)
 
 
