@@ -56,6 +56,12 @@ _PERMITTED_VALIDATION_FILES = frozenset({
     "tools/run_strategy_governance_daily.py",
     "server/static/index.html",
     "server/static/js/app.js",
+    # These display-only modules are not imported by the scoring process.
+    "server/api/main.py",
+    "server/api/routers/market_home.py",
+    "server/api/routers/research_futures.py",
+    "server/static/js/research-tools.js",
+    "server/static/css/research-tools.css",
     "tools/run_ai_recommendation_premarket.py",
 })
 _SCORER_FILES = (
