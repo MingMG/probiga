@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy.exc import SQLAlchemyError
 
-from biz.intraday_alert.core import QualityGateError, validate_qmt_snapshot
+from biz.intraday_alert.core import MAX_SOURCE_AGE_SECONDS, QualityGateError, validate_qmt_snapshot
 from server.api.routers._engine import get_engine
 from server.common.current_data import get_current_engine
 from server.common.daily_delivery_control import load_completed_market_capture_receipt
@@ -27,7 +27,8 @@ from server.common.limit_up_event_schema import LIMIT_UP_EVENT_TABLE
 from server.common.market_close_ladder import load_market_close_ladder
 from server.common.qmt_attestation_contract import canonical_digest
 from server.common.sector_heatmap_store import read_concept_names, read_industry_flow
-from server.common.sql_reader import read_sql_rows
+from server.common.sql_reader import bind_sql_connection, read_sql_rows
+from server.common.qmt_announcement_pit import _live_announcement_reply_budget
 from server.common.turnover_snapshot import (
     TURNOVER_CAPTURE_KIND,
     TURNOVER_PROVIDER,
@@ -74,7 +75,7 @@ _TURNOVER_CORRECTION_LIMIT = 16
 _CACHE_TTL = 10
 _CLOSED_CACHE_TTL = 30
 _CACHE_SIZE = 32
-_LIVE_MAX_AGE = timedelta(seconds=90)
+_LIVE_MAX_AGE = timedelta(seconds=MAX_SOURCE_AGE_SECONDS)
 _HEATMAP_SESSIONS = 5
 _HEATMAP_TAIL = 6
 _HEATMAP_BOARD_LIMIT = 1_500
@@ -278,16 +279,27 @@ def _verified_turnover(day: str, quotes: list[dict], stocks: list[dict], now: da
 
 def _live_quotes(day: str, now: datetime, deadline: float) -> tuple[list[dict], datetime | None]:
     engine = get_current_engine()
+    with engine.connect() as connection:
+        if connection.dialect.name == "mysql":
+            connection = connection.execution_options(isolation_level="REPEATABLE READ")
+        with (_live_announcement_reply_budget(connection, deadline=deadline, stage="market-board-live-snapshot"),
+              bind_sql_connection(connection)):
+            return _live_quote_batch(engine, day, now, deadline)
+
+
+def _live_quote_batch(engine, day: str, now: datetime, deadline: float) -> tuple[list[dict], datetime | None]:
+    started = monotonic()
     rows = _read(engine, """
         SELECT /*+ MAX_EXECUTION_TIME(1500) */ receipt_id, source_provider,
                source_snapshot_token, source_generated_at, expected_count,
                observed_count, coverage, published_at, capture_mode, quality_status, evidence_json
         FROM st_qmt_realtime_sync_receipt_v2
-        WHERE source_provider=:source AND published_at<=:now
+        WHERE source_provider=:source
         ORDER BY published_at DESC, created_at DESC LIMIT 1
-    """, {"source": LIVE_SOURCE, "now": now}, deadline=deadline)
+    """, {"source": LIVE_SOURCE}, deadline=deadline)
     if not rows:
         return [], None
+    now += timedelta(seconds=monotonic() - started)
     receipt = rows[0]
     evidence = receipt.get("evidence_json")
     evidence = json.loads(evidence) if isinstance(evidence, (str, bytes)) else evidence
@@ -295,7 +307,6 @@ def _live_quotes(day: str, now: datetime, deadline: float) -> tuple[list[dict], 
     generated = _clock(receipt.get("source_generated_at"))
     published = _clock(receipt.get("published_at"))
     expected, observed = _number(receipt.get("expected_count")), _number(receipt.get("observed_count"))
-    earliest = now - _LIVE_MAX_AGE
     if (not isinstance(batch_id, str) or not batch_id or not generated or not published
             or not generated <= published <= now
             or generated.date().isoformat() != day or not _fresh_live_stamp(generated, now)
@@ -306,10 +317,10 @@ def _live_quotes(day: str, now: datetime, deadline: float) -> tuple[list[dict], 
                snapshot_at, batch_id, data_source, quality_status, permission_status
         FROM sm_stock_current
         WHERE batch_id=:batch_id AND data_source=:source
-          AND snapshot_at BETWEEN :earliest AND :now AND permission_status='SUPPORTED'
+          AND snapshot_at<=:now AND permission_status='SUPPORTED'
           AND quality_status IN ('VALIDATED','VERIFIED','VERIFIED_LIVE','QMT_ATTESTED')
         LIMIT :limit
-    """, {"batch_id": batch_id, "source": LIVE_SOURCE, "earliest": earliest,
+    """, {"batch_id": batch_id, "source": LIVE_SOURCE,
           "now": now, "limit": _STOCK_LIMIT + 1}, deadline=deadline)
     if len(stocks) > _STOCK_LIMIT:
         raise ValueError("market board live rows exceed bound")
