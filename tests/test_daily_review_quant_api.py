@@ -275,6 +275,11 @@ assert.match(importedHtml, /<td>开盘<\/td>/);
 const literal = context._renderProReview('这是 \\# 字面符号，不是报告标题。');
 assert.doesNotMatch(literal, /<h1/);
 assert.match(literal, /\\# 字面符号/);
+const disclosure = context._renderProReview('[查看同日龙虎榜席位](/?tab=alist&trade_date=2026-11-19&stock_code=002584&reason=%E6%97%A5)');
+assert.match(disclosure, /<a href="\/\?tab=alist&amp;trade_date=2026-11-19&amp;stock_code=002584&amp;reason=%E6%97%A5"/);
+assert.match(disclosure, />查看同日龙虎榜席位<\/a>/);
+const unsafeLinks = context._renderProReview('[x](javascript:alert(1))\n[x](https://other.example/)\n[x](/?tab=alist&trade_date=bad&stock_code=002584)');
+assert.doesNotMatch(unsafeLinks, /<a\b/);
 """.replace("ESCAPING", json.dumps(escaping)).replace("RENDERER", json.dumps(renderer)), encoding="utf-8")
     result = subprocess.run([node, str(runner)], capture_output=True, text=True, encoding="utf-8", timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
