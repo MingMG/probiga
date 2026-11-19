@@ -19,6 +19,11 @@ def _raw(*, qdate=20261106, count=2, duplicate=False):
     ]}})
 
 
+def _fetch_result(raw, kwargs):
+    return [], (raw if kwargs.get("pool_kind") == "limit_up" else
+                json.dumps({"rc": 0, "data": {"qdate": 20261106, "tc": 0, "pool": []}}))
+
+
 @pytest.fixture
 def source(monkeypatch, tmp_path):
     monkeypatch.setenv("PROBIGA_JOB_LOG_ROOT", str(tmp_path))
@@ -57,14 +62,14 @@ def test_capture_is_exact_immutable_and_uses_actual_availability(source, monkeyp
     def fetch(day, **kwargs):
         assert day == DAY and kwargs["timeout_seconds"] == 8 and kwargs["max_payload_bytes"] > 0
         calls.append(day)
-        return [], _raw()
+        return _fetch_result(_raw(), kwargs)
 
     monkeypatch.setattr(ladder, "_fetch_pool", fetch)
     first = ladder.capture_market_close_ladder(source, source, DAY)
     second = ladder.capture_market_close_ladder(source, source, DAY)
     assert first["status"] == second["status"] == "COMPLETE"
     assert first["receipt_sha256"] == second["receipt_sha256"]
-    assert not first["reused"] and second["reused"] and calls == [DAY]
+    assert not first["reused"] and second["reused"] and calls == [DAY] * 3
     quotes = ladder._load_qmt_closes(source, DAY, ladder._pool(_raw(), DAY), OBSERVED)
     result = ladder.load_market_close_ladder(DAY, quotes=quotes, now=OBSERVED)
     assert result["available_at"] == "2026-11-07T02:00:00.123456+08:00"
@@ -79,14 +84,14 @@ def test_capture_is_exact_immutable_and_uses_actual_availability(source, monkeyp
 
 
 def test_mismatched_close_cannot_be_published(source, monkeypatch):
-    monkeypatch.setattr(ladder, "_fetch_pool", lambda *_args, **_kwargs: ([], _raw().replace("10100", "10110")))
+    monkeypatch.setattr(ladder, "_fetch_pool", lambda *_args, **kwargs: _fetch_result(_raw().replace("10100", "10110"), kwargs))
     with pytest.raises(ladder.MarketCloseLadderBlocked, match="differs from QMT"):
         ladder.capture_market_close_ladder(source, source, DAY)
     assert not ladder._path(DAY).exists()
 
 
 def test_historical_pool_with_latest_quote_date_is_bound_to_exact_qmt_closes(source, monkeypatch):
-    monkeypatch.setattr(ladder, "_fetch_pool", lambda *_args, **_kwargs: ([], _raw(qdate=20261107)))
+    monkeypatch.setattr(ladder, "_fetch_pool", lambda *_args, **kwargs: _fetch_result(_raw(qdate=20261107), kwargs))
     result = ladder.capture_market_close_ladder(source, source, DAY)
     assert result["status"] == "COMPLETE" and result["sample_count"] == 2
     assert result["trade_date"] == DAY.isoformat()
@@ -113,6 +118,46 @@ def test_exact_explicit_empty_pool_does_not_create_streaks(source, monkeypatch):
     assert ladder.capture_market_close_ladder(source, source, DAY)["sample_count"] == 0
     result = ladder.load_market_close_ladder(DAY, quotes=[], now=OBSERVED)
     assert result["limit_up_count"] == 0 and result["max_streak"] is None and result["rows"] == []
+
+
+def test_down_and_opened_pools_are_independently_verified_and_resume(source, monkeypatch):
+    with source.begin() as conn:
+        conn.execute(text("""INSERT INTO sm_stock_kline VALUES
+            ('000003','2026-11-06',9.50,'qmt_datadir','VERIFIED','SUPPORTED',1,0,'2026-11-06 17:00:00'),
+            ('000004','2026-11-06',13.40,'qmt_datadir','VERIFIED','SUPPORTED',1,0,'2026-11-06 17:00:00')
+        """))
+    bad_down = True
+    calls = []
+
+    def fetch(day, **kwargs):
+        kind = kwargs["pool_kind"]
+        calls.append(kind)
+        if kind == "limit_up":
+            return [], _raw()
+        code, price = ("000003", 9510 if bad_down else 9500) if kind == "limit_down" else ("000004", 13400)
+        return [], json.dumps({"rc": 0, "data": {"qdate": 20261107, "tc": 1, "pool": [
+            {"c": code, "n": "实际收盘样本", "p": price},
+        ]}})
+
+    monkeypatch.setattr(ladder, "_fetch_pool", fetch)
+    with pytest.raises(ladder.MarketCloseLadderBlocked, match="differs from QMT"):
+        ladder.capture_market_close_ladder(source, source, DAY)
+    assert ladder._path(DAY).exists()
+    assert not ladder._path(DAY, "limit_down").exists()
+    bad_down = False
+    captured = ladder.capture_market_close_ladder(source, source, DAY)
+    assert calls == ["limit_up", "limit_down", "limit_down", "opened_limit_up"]
+    verified = ladder.verify_market_close_ladder_capture(source, DAY, now=OBSERVED)
+    assert captured["pool_receipts"] == verified["pool_receipts"]
+    pools = [ladder._load_record(DAY, OBSERVED, kind)[1] for kind in ladder._POOL_ENDPOINTS]
+    quotes = ladder._load_qmt_closes(source, DAY, sum(pools, []), OBSERVED)
+    result = ladder.load_market_close_ladder(DAY, quotes=quotes, now=OBSERVED)
+    assert result["limit_up_count"] == 2
+    assert result["limit_down_count"] == result["opened_limit_up_count"] == 1
+    assert result["seal_rate_pct"] == pytest.approx(200 / 3)
+    ladder._path(DAY, "opened_limit_up").unlink()
+    with pytest.raises(ladder.MarketCloseLadderBlocked, match="durable receipt is missing"):
+        ladder.verify_market_close_ladder_capture(source, DAY, now=OBSERVED)
 
 
 def test_manual_ladder_dispatch_binds_closed_friday_without_overview_write(
@@ -157,7 +202,7 @@ def test_manual_ladder_dispatch_binds_closed_friday_without_overview_write(
     assert _task_dispatch_date(overview_task, source, now=OBSERVED) == selected
     assert build_scheduler_task_args(overview_task, registered["script_path"], selected) == [DAY.isoformat()]
 
-    monkeypatch.setattr(ladder, "_fetch_pool", lambda *_args, **_kwargs: ([], _raw()))
+    monkeypatch.setattr(ladder, "_fetch_pool", lambda *_args, **kwargs: _fetch_result(_raw(), kwargs))
     monkeypatch.setattr(overview, "load_project_env", lambda: None)
     monkeypatch.setattr(overview, "create_batch_engine", lambda **kwargs: source)
     monkeypatch.setattr(overview, "get_kline_engine", lambda: source)
