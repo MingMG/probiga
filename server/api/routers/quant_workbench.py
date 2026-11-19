@@ -287,7 +287,7 @@ def load_operation_status(engine: Any) -> list[dict[str, Any]]:
     return projected
 
 
-def load_strategy_pool_status(engine: Any) -> dict[str, Any]:
+def load_strategy_pool_status(engine: Any, *, trade_date: str) -> dict[str, Any]:
     try:
         latest = _rows(
             engine,
@@ -295,19 +295,22 @@ def load_strategy_pool_status(engine: Any) -> dict[str, Any]:
             SELECT pick_date, COUNT(*) AS row_count,
                    SUM(CASE WHEN publication_status='ACTIVE' THEN 1 ELSE 0 END)
                        AS active_count,
+                   SUM(CASE WHEN publication_status='PENDING' THEN 1 ELSE 0 END)
+                       AS pending_count,
                    COUNT(DISTINCT publisher_run_uid) AS publisher_count
               FROM st_recommended_stocks
+             WHERE pick_date=:trade_date
              GROUP BY pick_date
              ORDER BY pick_date DESC
              LIMIT 1
             """,
-            {},
+            {"trade_date": trade_date},
         )
     except Exception:
         return {
             "status": "BLOCKED",
             "reason": "STRATEGY_POOL_READ_FAILED",
-            "trade_date": "",
+            "trade_date": trade_date,
             "active_count": 0,
             "run_uid": "",
             "result_entry_tab": "recommended",
@@ -318,7 +321,7 @@ def load_strategy_pool_status(engine: Any) -> dict[str, Any]:
         return {
             "status": "NOT_STARTED",
             "reason": "NO_STRATEGY_POOL",
-            "trade_date": "",
+            "trade_date": trade_date,
             "active_count": 0,
             "run_uid": "",
             "result_entry_tab": "recommended",
@@ -356,15 +359,16 @@ def load_strategy_pool_status(engine: Any) -> dict[str, Any]:
         analysis_count = 0
     row_count = int(row.get("row_count") or 0)
     active_count = int(row.get("active_count") or 0)
-    complete = bool(
+    identity_valid = bool(
         trade_date
         and run_uid
         and int(row.get("publisher_count") or 0) == 1
-        and active_count == row_count
     )
+    complete = identity_valid and active_count == row_count
+    pending = identity_valid and int(row.get("pending_count") or 0) == row_count
     return {
-        "status": "ACTIVE" if complete else "BLOCKED",
-        "reason": "" if complete else "STRATEGY_POOL_IDENTITY_OR_ACTIVATION_UNPROVEN",
+        "status": "ACTIVE" if complete else "PENDING" if pending else "BLOCKED",
+        "reason": "" if complete else "STRATEGY_POOL_PENDING_PUBLICATION" if pending else "STRATEGY_POOL_IDENTITY_OR_ACTIVATION_UNPROVEN",
         "trade_date": trade_date,
         "row_count": row_count,
         "active_count": active_count,
@@ -423,15 +427,15 @@ def load_decision_gate_status(
     trade_date: str,
     run_uid: str,
 ) -> dict[str, Any]:
-    if not trade_date:
+    if not trade_date or not run_uid:
         return {
-            "status": "BLOCKED",
-            "trade_date": "",
+            "status": "WAITING",
+            "trade_date": trade_date,
             "run_uid": run_uid,
             "candidate_count": 0,
             "executable_count": 0,
             "blocked_count": 0,
-            "blocking_reason": "STRATEGY_POOL_TRADE_DATE_UNAVAILABLE",
+            "blocking_reason": "STRATEGY_POOL_NOT_READY",
             "top_reasons": [],
         }
     try:
@@ -488,15 +492,13 @@ def load_decision_gate_status(
     ]
     blocked_count = max(0, len(rows) - executable_count)
     return {
-        "status": "READY" if executable_count > 0 else "BLOCKED",
+        "status": "READY" if executable_count > 0 else "OBSERVE",
         "trade_date": trade_date,
         "run_uid": run_uid,
         "candidate_count": len(rows),
         "executable_count": executable_count,
         "blocked_count": blocked_count,
-        "blocking_reason": (
-            "" if executable_count > 0 else "NO_CANDIDATE_PASSED_EXECUTION_GATES"
-        ),
+        "blocking_reason": "",
         "top_reasons": top_reasons,
         "automatic_real_order_submission": False,
         "real_order_authority": False,
@@ -1025,18 +1027,18 @@ def load_research_status(engine: Any) -> dict[str, Any]:
 def quant_workbench_overview():
     engine = get_engine()
     operations = load_operation_status(engine)
-    strategy_pool = load_strategy_pool_status(engine)
     strategy_target = load_strategy_target_status(engine)
     lifecycle_trade_date = str(
-        strategy_pool.get("trade_date")
+        strategy_target.get("authoritative_trade_date")
         or strategy_target.get("default_trade_date")
         or ""
     )[:10]
+    strategy_pool = load_strategy_pool_status(engine, trade_date=lifecycle_trade_date)
     market = load_market_lifecycle_status(engine, lifecycle_trade_date)
     decision_gate = load_decision_gate_status(
         engine,
         trade_date=lifecycle_trade_date,
-        run_uid=str(strategy_pool.get("run_uid") or ""),
+        run_uid=str(strategy_pool.get("run_uid") or "") if strategy_pool.get("status") == "ACTIVE" else "",
     )
     governance = load_governance_lifecycle_status(engine)
     simulation = load_simulation_lifecycle_status(engine, lifecycle_trade_date)

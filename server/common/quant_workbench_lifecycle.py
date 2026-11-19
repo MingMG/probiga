@@ -10,9 +10,6 @@ from typing import Any, Mapping
 
 
 LIFECYCLE_SCHEMA = "probiga.quant-workbench-lifecycle.v1"
-_BLOCKING_STATES = frozenset(
-    {"BLOCKED", "STALE", "WAITING", "UNAVAILABLE", "PARTIAL"}
-)
 
 
 def _status(value: Any) -> str:
@@ -120,11 +117,15 @@ def build_quant_workbench_lifecycle(
         _stage(
             "STRATEGY_POOL",
             "策略候选池",
-            "READY" if _status(pool.get("status")) == "ACTIVE" else "BLOCKED",
+            {"ACTIVE": "READY", "PENDING": "WAITING", "NOT_STARTED": "NOT_STARTED"}.get(_status(pool.get("status")), "BLOCKED"),
             (
                 f"{pool.get('active_count', 0)} 只 ACTIVE · 分析 {pool.get('analysis_count', 0)} 只"
                 if _status(pool.get("status")) == "ACTIVE"
-                else str(pool.get("reason") or "没有可证明有效的策略池")
+                else "当日候选池待生成；市场研究与复盘继续运行"
+                if _status(pool.get("status")) == "NOT_STARTED"
+                else "候选池待发布；执行资格单独核验"
+                if _status(pool.get("status")) == "PENDING"
+                else "候选池身份或发布校验未通过"
             ),
             {
                 "status": _status(pool.get("status")),
@@ -203,15 +204,16 @@ def build_quant_workbench_lifecycle(
         _stage(
             "EXECUTION_GATE",
             "候选执行门禁",
-            "READY" if int(decision_gate.get("executable_count") or 0) > 0 else "BLOCKED",
+            str(decision_gate.get("status") or ("READY" if int(decision_gate.get("executable_count") or 0) > 0 else "OBSERVE")),
             (
                 f"{decision_gate.get('executable_count', 0)} / "
                 f"{decision_gate.get('candidate_count', 0)} 只通过全部执行门禁"
+                + ("；保持观察" if _status(decision_gate.get("status")) == "OBSERVE" else "；等待有效候选池" if _status(decision_gate.get("status")) == "WAITING" else "")
             ),
             dict(decision_gate),
             blocking_reason=(
                 ""
-                if int(decision_gate.get("executable_count") or 0) > 0
+                if _status(decision_gate.get("status")) in {"READY", "OBSERVE"} or int(decision_gate.get("executable_count") or 0) > 0
                 else str(
                     decision_gate.get("blocking_reason")
                     or "NO_CANDIDATE_PASSED_EXECUTION_GATES"
@@ -277,25 +279,26 @@ def build_quant_workbench_lifecycle(
         ),
     ]
     first_blocking = next(
-        (item for item in stages if item["state"] in _BLOCKING_STATES),
+        (item for item in stages if item["state"] in {"BLOCKED", "UNAVAILABLE", "STALE"}),
         None,
     )
-    ready_count = sum(1 for item in stages if item["state"] == "READY")
-    if first_blocking is None:
+    next_pending = next((item for item in stages if item["state"] not in {"READY", "OBSERVE"}), None)
+    ready_count = sum(1 for item in stages if item["state"] in {"READY", "OBSERVE"})
+    if next_pending is None:
         overall = "READY"
-    elif any(item["state"] in {"BLOCKED", "STALE"} for item in stages[:5]):
-        overall = "BLOCKED"
-    else:
+    elif ready_count:
         overall = "PARTIAL"
+    else:
+        overall = "BLOCKED"
     next_action = None
-    if first_blocking is not None:
+    if next_pending is not None:
         next_action = {
-            "stage_code": first_blocking["code"],
-            "stage_label": first_blocking["label"],
-            "reason": first_blocking["blocking_reason"],
-            "operation_ids": first_blocking["operation_ids"],
-            "entry_tab": first_blocking["entry_tab"],
-            "entry_label": first_blocking["entry_label"],
+            "stage_code": next_pending["code"],
+            "stage_label": next_pending["label"],
+            "reason": next_pending["blocking_reason"],
+            "operation_ids": next_pending["operation_ids"],
+            "entry_tab": next_pending["entry_tab"],
+            "entry_label": next_pending["entry_label"],
         }
     return {
         "schema": LIFECYCLE_SCHEMA,

@@ -27,6 +27,32 @@ def packet(**kwargs):
                         previous_research=None, now=NOW, source_digest_sha256="source-hash", **kwargs)
 
 
+def test_dragon_tiger_fact_cards_render_stock_theme_link_and_separate_windows():
+    data, context = material()
+    stock = next(row for row in context["theme_evidence"]["stocks"] if row["price_verification"]["status"] == "OBSERVED")
+    stock["dragon_tiger"] = {"status": "OBSERVED", "trade_date": "2026-10-30", "disclosures": [
+        {"reason": "单日涨幅", "a_buy_amount": 200000000, "a_sell_amount": 100000000, "a_net_amount": 100000000,
+         "received_at": "2026-10-30T20:00:00+08:00", "seats": [{"name": "机构专用", "a_buy_amount": 80000000,
+          "a_sell_amount": 20000000, "a_net_amount": 60000000, "received_at": "2026-10-30T20:00:00+08:00"}]},
+        {"reason": "三日累计", "a_buy_amount": 300000000, "a_sell_amount": 400000000, "a_net_amount": -100000000,
+         "received_at": "2026-10-30T20:00:00+08:00", "seats": []},
+    ]}
+    p = build_packet(data, report_kind="review", next_trade_date="2026-11-02", context=context,
+                     previous_research=None, now=NOW, source_digest_sha256="source-hash")
+    facts = [row for row in p["facts"].values() if row["metric"] == "dragon_tiger_disclosure"]
+    assert len(facts) == 2 and facts[0]["entity_id"] == facts[1]["entity_id"]
+    content = render_draft(run(p=p), p, {})
+    assert "龙虎榜交叉核对" in content and "机构专用" in content
+    assert "单日涨幅" in content and "三日累计" in content
+    assert "1.00亿元" in content and "-1.00亿元" in content
+    assert "tab=alist&trade_date=2026-10-30&stock_code=" + stock["stock_code"] in content
+    assert "实际资金身份" in content and "关联方向" in content
+    stock["dragon_tiger"]["disclosures"][0]["received_at"] = "2026-11-03T20:00:00+08:00"
+    p = build_packet(data, report_kind="review", next_trade_date="2026-11-02", context=context,
+                     previous_research=None, now=NOW, source_digest_sha256="source-hash")
+    assert len([row for row in p["facts"].values() if row["metric"] == "dragon_tiger_disclosure"]) == 1
+
+
 def find_fact(p, metric, eid=None):
     return next(key for key, card in p["facts"].items() if card["metric"] == metric and (eid is None or card.get("entity_id") == eid))
 

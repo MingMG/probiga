@@ -3920,8 +3920,8 @@
             var target = summary.strategy_target || {};
             var lifecycle = res.lifecycle || {}, stages = Array.isArray(lifecycle.stages) ? lifecycle.stages : [];
             var progress = risk.progress || {}, receipt = risk.receipt || {};
-            var statusText = {AVAILABLE:'可用',READY:'已就绪',PARTIAL:'部分可用',UNAVAILABLE:'暂不可用',NOT_STARTED:'未开始',RUNNING:'运行中',STALE:'已过期',WAITING:'等待输入',STALE_RUNNING:'回执陈旧',SUCCEEDED:'调度成功',BLOCKED:'阻断',FAILED:'失败',COMPLETE:'完成',ACTIVE:'有效',QUEUED:'排队中'};
-            var statusClass = function (value) { value=String(value||'').toUpperCase(); return value==='AVAILABLE'||value==='READY'||value==='COMPLETE'||value==='SUCCEEDED'||value==='ACTIVE'?'qwb-ok':value==='PARTIAL'||value==='RUNNING'||value==='QUEUED'||value==='STALE_RUNNING'||value==='STALE'||value==='WAITING'?'qwb-warn':value==='UNAVAILABLE'||value==='BLOCKED'||value==='FAILED'?'qwb-bad':'qwb-muted'; };
+            var statusText = {AVAILABLE:'可用',READY:'已就绪',PARTIAL:'部分可用',OBSERVE:'仅作观察',UNAVAILABLE:'暂不可用',NOT_STARTED:'未开始',RUNNING:'运行中',STALE:'已过期',WAITING:'等待输入',STALE_RUNNING:'回执陈旧',SUCCEEDED:'调度成功',BLOCKED:'阻断',FAILED:'失败',COMPLETE:'完成',ACTIVE:'有效',QUEUED:'排队中'};
+            var statusClass = function (value) { value=String(value||'').toUpperCase(); return value==='AVAILABLE'||value==='READY'||value==='COMPLETE'||value==='SUCCEEDED'||value==='ACTIVE'?'qwb-ok':value==='PARTIAL'||value==='OBSERVE'||value==='RUNNING'||value==='QUEUED'||value==='STALE_RUNNING'||value==='STALE'||value==='WAITING'?'qwb-warn':value==='UNAVAILABLE'||value==='BLOCKED'||value==='FAILED'?'qwb-bad':'qwb-muted'; };
             var categoryOrder = ['MARKET_RESEARCH','DATA','STRATEGY_PORTFOLIO','RISK_PERFORMANCE','TRADING_REVIEW','DERIVATIVES_RELATIVE_VALUE','ENGINEERING_OPERATIONS'];
             var recommended = Array.isArray(res.recommended_workflows) ? res.recommended_workflows : [];
             var byCode = {};
@@ -4206,12 +4206,12 @@
             var executableCount = Number(executionEvidence.executable_count || 0);
             var primaryHeadline = pool.status === 'ACTIVE'
                 ? (candidateCount + ' 只票池已出，' + executableCount + ' 只可执行')
-                : '今日策略票池尚未形成';
+                : (pool.status === 'PENDING' ? '当日候选池待发布' : '当日候选池待生成');
             var primaryReason = nextAction.reason === 'CANONICAL_DECISION_TRADE_DATE_STALE'
                 ? ('规范治理结果仍停留在 ' + (governanceEvidence.trade_date || '更早交易日') + '，没有推进到 ' + (pool.trade_date || target.default_trade_date || '当前交易日'))
-                : (nextStage.blocking_reason || nextAction.reason || '当前闭环存在断点');
+                : (nextStage.summary || '研究与复盘继续运行；无可执行候选时保持观察');
             var h = '<div class="qwb-page">';
-            h += '<section class="qwb-executive-summary"><div class="qwb-executive-main"><span>当前量化结论 · ' + escHtml(pool.trade_date || lifecycle.trade_date || target.default_trade_date || '') + '</span><h2>' + escHtml(primaryHeadline) + '</h2><p>' + escHtml(primaryReason) + '。当前全流程 ' + escHtml(lifecycleReady) + '。</p><div class="qwb-executive-actions"><button type="button" onclick="qwbRunLifecycleNext()">' + escHtml(nextAction.entry_label || '处理当前断点') + '</button><button type="button" class="qwb-secondary" onclick="openQuantOperationResult(\'strategy_pool\')"' + (pool.status === 'ACTIVE' ? '' : ' disabled') + '>查看 ' + escHtml(candidateCount) + ' 只票池</button></div></div><div class="qwb-executive-kpis"><article class="' + (pool.status === 'ACTIVE' ? 'qwb-kpi-good' : 'qwb-kpi-bad') + '"><span>正式票池</span><strong>' + escHtml(candidateCount) + '</strong><small>只 ACTIVE</small></article><article class="' + (executableCount > 0 ? 'qwb-kpi-good' : 'qwb-kpi-bad') + '"><span>执行门禁</span><strong>' + escHtml(executableCount) + '</strong><small>/ ' + escHtml(candidateCount) + ' 可执行</small></article><article class="qwb-kpi-warn"><span>规范治理</span><strong>' + escHtml(governanceEvidence.trade_date || '—') + '</strong><small>' + escHtml(recoveryText) + '</small></article></div></section>';
+            h += '<section class="qwb-executive-summary"><div class="qwb-executive-main"><span>当前量化结论 · ' + escHtml(lifecycle.trade_date || target.default_trade_date || pool.trade_date || '') + '</span><h2>' + escHtml(primaryHeadline) + '</h2><p>' + escHtml(primaryReason) + '。当前全流程 ' + escHtml(lifecycleReady) + '。</p><div class="qwb-executive-actions"><button type="button" onclick="qwbRunLifecycleNext()">' + escHtml(nextAction.entry_label || '处理当前断点') + '</button><button type="button" class="qwb-secondary" onclick="openQuantOperationResult(\'strategy_pool\')"' + (pool.status === 'ACTIVE' ? '' : ' disabled') + '>查看 ' + escHtml(candidateCount) + ' 只票池</button></div></div><div class="qwb-executive-kpis"><article class="' + (pool.status === 'ACTIVE' ? 'qwb-kpi-good' : pool.status === 'BLOCKED' ? 'qwb-kpi-bad' : 'qwb-kpi-warn') + '"><span>正式票池</span><strong>' + escHtml(candidateCount) + '</strong><small>只 ACTIVE</small></article><article class="' + (executableCount > 0 ? 'qwb-kpi-good' : 'qwb-kpi-warn') + '"><span>执行门禁</span><strong>' + escHtml(executableCount) + '</strong><small>/ ' + escHtml(candidateCount) + ' 可执行</small></article><article class="qwb-kpi-warn"><span>规范治理</span><strong>' + escHtml(governanceEvidence.trade_date || '—') + '</strong><small>' + escHtml(recoveryText) + '</small></article></div></section>';
 
             h += '<section class="qwb-lifecycle"><div class="qwb-section-head"><div><span>DAILY VALUE CHAIN</span><h3>量化生产闭环</h3></div><b class="qwb-status ' + statusClass(lifecycle.overall_status) + '">' + escHtml(statusText[String(lifecycle.overall_status || '').toUpperCase()] || lifecycle.overall_status || '未知') + '</b></div><div class="qwb-lifecycle-grid">';
             stages.forEach(function (stage, index) { h += renderLifecycleStage(stage, index); });
@@ -4226,7 +4226,7 @@
                     if (candidate && candidate.can_run) { nextOperation = candidate; return true; }
                     return false;
                 });
-                h += '<section class="qwb-next-action"><div><span>当前第一断点 · ' + escHtml(nextStage.label || nextAction.stage_label || nextAction.stage_code) + '</span><h3>' + escHtml(nextAction.reason || nextStage.blocking_reason || '需要处理当前门禁') + '</h3><p>' + escHtml(lifecycleEvidenceText(nextStage)) + '</p></div><button type="button" onclick="qwbRunLifecycleNext()">' + escHtml(nextOperation ? operationButtonLabel(nextOperation) : (nextAction.entry_label || '打开处理入口')) + '</button></section>';
+                h += '<section class="qwb-next-action"><div><span>下一项待处理 · ' + escHtml(nextStage.label || nextAction.stage_label || nextAction.stage_code) + '</span><h3>' + escHtml(nextStage.summary || nextAction.reason || '查看当前环节') + '</h3><p>' + escHtml(lifecycleEvidenceText(nextStage)) + '</p></div><button type="button" onclick="qwbRunLifecycleNext()">' + escHtml(nextOperation ? operationButtonLabel(nextOperation) : (nextAction.entry_label || '打开处理入口')) + '</button></section>';
             } else {
                 h += '<section class="qwb-next-action qwb-all-ready"><div><span>流程状态</span><h3>全部阶段已就绪</h3><p>继续查看策略池、执行门禁、模拟结果和复盘证据。</p></div></section>';
             }
@@ -9936,14 +9936,14 @@
     });
 
     /* ===== 龙虎榜详情 ===== */
-    window.showAListDetail = function (date, code, name) {
+    window.showAListDetail = function (date, code, name, reason) {
         var modal = document.getElementById('alistModal');
         var body = document.getElementById('alistModalBody');
         document.getElementById('alistModalTitle').textContent = '🐲 ' + code + ' ' + (name || '') + ' 龙虎榜席位 | ' + date;
         body.innerHTML = '<div class="loading">加载中...</div>';
         modal.classList.add('show');
 
-        apiGet('/a-list-info?trade_date=' + date + '&stock_code=' + code).then(function (res) {
+        apiGet('/a-list-info?trade_date=' + date + '&stock_code=' + code + '&reason=' + encodeURIComponent(reason || '')).then(function (res) {
             if (!res.data || !res.data.length) { body.innerHTML = '<div class="loading">暂无席位数据</div>'; return; }
             var rows = res.data;
             var summary = res.summary || {};
@@ -13445,7 +13445,8 @@
             var linkedStockCode = linkedStockCodeFromLocation();
             if (linkedStockCode && routeTab !== 'ai-stock' && typeof window.openStockDetail === 'function') {
                 setTimeout(function () {
-                    window.openStockDetail(linkedStockCode);
+                    if (routeTab === 'alist') window.showAListDetail(routeDate || el('datePicker').value, linkedStockCode, '', new URLSearchParams(window.location.search || '').get('reason') || '');
+                    else window.openStockDetail(linkedStockCode);
                 }, 120);
             }
         });

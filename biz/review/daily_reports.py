@@ -75,6 +75,7 @@ def _interpret(engine, digest, *, kind, target, context, now):
         rules = before + remaining + after
     schema = draft_json_schema()
     instruction = "你是本报告的唯一解读模型。根据提供的量化事实分析，缺失材料如实说明。"
+    instruction += "分析板块与个股强弱时，关联同一股票的dragon_tiger_disclosure事实，比较价格反馈与榜内买卖方向的支持或背离；单日榜与多日累计榜不加总，席位名称不等于实际资金身份，没有披露不能当作资金为零。"
     if kind == "briefing":
         instruction += "先处理隔夜美股收盘与已核实的显著外盘风险，再评估A股延续条件。外盘涨跌不能写成A股已发生的走势。"
     messages = _messages(

@@ -12,6 +12,7 @@ import json
 import math
 from typing import Any
 from zoneinfo import ZoneInfo
+from urllib.parse import quote
 
 INPUT_VERSION = "probiga.research-input.v3"
 DRAFT_VERSION = "probiga.research-draft.v3"
@@ -394,6 +395,26 @@ def build_packet(digest: dict, *, report_kind: str, next_trade_date: str, contex
             if _number(heat.get(key)) is not None:
                 values["heat_" + key] = heat[key]
         card("market_measurement", "stock_prices", values, eid, "已校验个股行情", scope="attention_candidate_sample")
+        dragon = row.get("dragon_tiger") or {}
+        if dragon.get("status") == "OBSERVED" and dragon.get("trade_date") == review_date:
+            for disclosure in dragon.get("disclosures", [])[:2]:
+                received = _stamp(disclosure.get("received_at"))
+                amounts = measurements(disclosure, ("a_buy_amount", "a_sell_amount", "a_net_amount"))
+                if (not received or received > asof or len(amounts) != 3
+                        or min(amounts["a_buy_amount"], amounts["a_sell_amount"]) < 0
+                        or abs(amounts["a_buy_amount"] - amounts["a_sell_amount"] - amounts["a_net_amount"]) > 0.02):
+                    continue
+                seats = []
+                for seat in disclosure.get("seats", [])[:3]:
+                    seat_time = _stamp(seat.get("received_at"))
+                    seat_values = measurements(seat, ("a_buy_amount", "a_sell_amount", "a_net_amount"))
+                    if (seat.get("name") and seat_time and seat_time <= asof and len(seat_values) == 3
+                            and min(seat_values["a_buy_amount"], seat_values["a_sell_amount"]) >= 0
+                            and abs(seat_values["a_buy_amount"] - seat_values["a_sell_amount"] - seat_values["a_net_amount"]) <= 0.02):
+                        seats.append({"name": seat["name"], "received_at": seat_time.isoformat(), **seat_values})
+                card("market_measurement", "dragon_tiger_disclosure",
+                     {**amounts, "reason": disclosure["reason"], "received_at": received.isoformat(), "seats": seats},
+                     eid, "东财龙虎榜公开披露", scope="same_stock_same_disclosure_reason_not_whole_market_flow")
     # Optional evidence is projected only from a frozen, independently gated
     # source snapshot. A status receipt is never substituted for a measurement.
     linked = {(item["kind"], item.get("code")): eid for eid, item in packet["entities"].items()}
@@ -824,6 +845,28 @@ def render_draft(draft: dict, packet: dict, metadata: dict) -> str:
             entity = packet["entities"][watch["entity_id"]]
             lines += [f"**{entity['name']}（{entity['code']}）｜{identities[watch['identity']]}**", "", text_units(watch["assessment_units"]), "",
                       "观察验证：" + text_units(watch["trigger_units"]), "", "放弃条件：" + text_units(watch["abandon_units"]), ""]
+    dragon_facts = [fact for fact in packet["facts"].values() if fact.get("metric") == "dragon_tiger_disclosure"]
+    if dragon_facts:
+        lines += ["## 板块与个股强弱｜龙虎榜交叉核对", "",
+                  "仅核对观察样本的公开披露；不同上榜原因、单日榜和多日累计榜分开列示，不加总为板块或全市场资金流。公开席位名称不证明实际资金身份。", ""]
+        for fact in dragon_facts:
+            entity = packet["entities"][fact["entity_id"]]
+            values = fact["values"]
+            sector_names = "、".join(packet["entities"][key]["name"] for key in entity.get("sector_ids", []))
+            price = next((item["values"].get("change_pct") for item in packet["facts"].values()
+                          if item.get("metric") == "stock_prices" and item.get("entity_id") == fact["entity_id"]), None)
+            lines += [f"**{entity['name']}（{entity['code']}）**" + (f"｜关联方向：{sector_names}" if sector_names else ""), "",
+                      f"[查看同日龙虎榜席位](/?tab=alist&trade_date={task['review_date']}&stock_code={entity['code']}&reason={quote(str(values['reason']), safe='')})",
+                      "当日涨跌：" + _format("change_pct", price) + "；上榜原因：" + str(values["reason"]),
+                      "榜内买入 " + _format("a_buy_amount", values["a_buy_amount"]) + "；卖出 " + _format("a_sell_amount", values["a_sell_amount"]) + "；净额 " + _format("a_net_amount", values["a_net_amount"]) + "。"]
+            if price is not None:
+                relation = "价格与榜内净额方向一致" if price * values["a_net_amount"] > 0 else "价格与榜内净额方向背离" if price * values["a_net_amount"] < 0 else "方向关系待确认"
+                lines.append("交叉观察：" + relation + "；累计榜的统计窗口与单日涨跌不同，不能据此归因涨跌或确认龙头。")
+            for seat in values["seats"]:
+                lines.append("- 公开席位样本：" + seat["name"] + "，买入 " + _format("a_buy_amount", seat["a_buy_amount"]) + "，卖出 " + _format("a_sell_amount", seat["a_sell_amount"]) + "，净额 " + _format("a_net_amount", seat["a_net_amount"]))
+            if not values["seats"]:
+                lines.append("公开席位明细尚无可核验的匹配样本。")
+            lines += ["入库时间：" + _time_text(values["received_at"]) + "；来源：东财龙虎榜日表及同原因席位明细。", ""]
     if report["event_units"]:
         lines += ["## 新消息改变了什么", "", text_units(report["event_units"]), ""]
     if report["continuity"]:
