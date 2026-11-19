@@ -160,6 +160,19 @@ def test_down_and_opened_pools_are_independently_verified_and_resume(source, mon
         ladder.verify_market_close_ladder_capture(source, DAY, now=OBSERVED)
 
 
+def test_capture_failure_preserves_the_source_stage_reason(monkeypatch, capsys):
+    from server.common.eastmoney_upper_limit_history import EastmoneyUpperLimitHistoryBlocked
+    from tools import refresh_market_overview_daily as overview
+
+    reason = "DATA_BLOCKED: Eastmoney limit pool failed for 2026-11-16"
+    def unavailable(*_args):
+        raise EastmoneyUpperLimitHistoryBlocked(reason)
+    monkeypatch.setattr(overview, "capture_market_close_ladder", unavailable)
+    assert overview._publish_limit_ladder(None, None, "2026-11-16", exact=True) is False
+    receipt = json.loads(capsys.readouterr().out)
+    assert receipt["status"] == "BLOCKED" and receipt["reason"] == reason
+
+
 def test_manual_ladder_dispatch_binds_closed_friday_without_overview_write(
     source, monkeypatch, capsys,
 ):
