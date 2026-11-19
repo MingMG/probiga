@@ -150,7 +150,7 @@ def _daily_source_valid(row: dict) -> bool:
 def _day_quotes(day: str, now: datetime, deadline: float) -> list[dict]:
     rows = _read(get_kline_engine(), """
         SELECT /*+ MAX_EXECUTION_TIME(2500) */ id, stock_code, short_name, trade_date,
-               close AS price, high, pre_close, amount, turnover_ratio AS turnover_rate,
+               open, high, low, close AS price, volume, pre_close, amount, turnover_ratio AS turnover_rate,
                data_source, quality_status, permission_status
         FROM sm_stock_kline
         WHERE trade_date=:day AND k_type=1 AND adjust_type=0 AND etl_sync_at<=:now
@@ -160,6 +160,27 @@ def _day_quotes(day: str, now: datetime, deadline: float) -> list[dict]:
     if len(rows) > _STOCK_LIMIT:
         raise ValueError("market board daily rows exceed bound")
     return [row for row in rows if _daily_source_valid(row)]
+
+
+def _turnover_quote_binding(row: dict, quote: dict, rate: float) -> str | None:
+    # Bind to the already-read daily partition instead of thousands of random kline lookups.
+    fields = (("target_row_id", "id"), ("qmt_open", "open"), ("qmt_high", "high"),
+              ("qmt_low", "low"), ("qmt_close", "price"), ("qmt_data_source", "data_source"),
+              ("qmt_quality_status", "quality_status"), ("qmt_permission_status", "permission_status"))
+    if any(row[key] is None or row[key] != quote[field] for key, field in fields):
+        return None
+    original = all(quote[field] is not None and quote[field] == row[key]
+                   for key, field in (("qmt_volume_shares", "volume"), ("qmt_amount", "amount")))
+    if original and (quote["turnover_rate"] is None or quote["turnover_rate"] == rate):
+        return "exact"
+    source_fields = (("source_open", "open"), ("source_high", "high"), ("source_low", "low"),
+                     ("source_close", "price"), ("source_volume_shares", "volume"))
+    if (quote["data_source"] == "qmt_datadir" and quote["turnover_rate"] == rate
+            and all(row[key] is not None and row[key] == quote[field] for key, field in source_fields)
+            and row["source_amount"] is not None and quote["amount"] is not None
+            and abs(Decimal(str(quote["amount"])) - Decimal(str(row["source_amount"]))) <= Decimal("0.50")):
+        return "corrected"
+    return None
 
 
 def _verified_turnover(day: str, quotes: list[dict], stocks: list[dict], now: datetime, deadline: float) -> dict | None:
@@ -195,19 +216,10 @@ def _verified_turnover(day: str, quotes: list[dict], stocks: list[dict], now: da
         return None
     rows = _read(engine, f"""
         SELECT /*+ MAX_EXECUTION_TIME(2000) */ r.stock_code, CAST(r.field_value_decimal AS CHAR) AS rate,
-               q.id, q.close AS price, q.pre_close, q.amount, q.data_source,
-               CASE WHEN q.volume<>r.qmt_volume_shares OR q.amount<>r.qmt_amount THEN 1 ELSE 0 END AS corrected
-        FROM {TURNOVER_SNAPSHOT_ROW_TABLE} r LEFT JOIN sm_stock_kline q
-          ON q.id=r.target_row_id AND q.stock_code=r.stock_code AND q.trade_date=r.trade_date AND q.k_type=r.k_type
-          AND q.adjust_type=r.adjust_type AND q.open=r.qmt_open AND q.high=r.qmt_high
-          AND q.low=r.qmt_low AND q.close=r.qmt_close
-          AND q.data_source=r.qmt_data_source AND q.quality_status=r.qmt_quality_status
-          AND q.permission_status=r.qmt_permission_status
-          AND ((q.volume=r.qmt_volume_shares AND q.amount=r.qmt_amount
-                AND (q.turnover_ratio IS NULL OR q.turnover_ratio=r.field_value_decimal))
-            OR (q.data_source='qmt_datadir' AND q.open=r.source_open AND q.high=r.source_high
-                AND q.low=r.source_low AND q.close=r.source_close AND q.volume=r.source_volume_shares
-                AND ABS(q.amount-r.source_amount)<=0.50 AND q.turnover_ratio=r.field_value_decimal))
+               r.target_row_id, r.qmt_open, r.qmt_high, r.qmt_low, r.qmt_close,
+               r.qmt_volume_shares, r.qmt_amount, r.qmt_data_source, r.qmt_quality_status, r.qmt_permission_status,
+               r.source_open, r.source_high, r.source_low, r.source_close, r.source_volume_shares, r.source_amount
+        FROM {TURNOVER_SNAPSHOT_ROW_TABLE} r
         WHERE r.run_id=:run_id AND r.trade_date=:day AND r.k_type=1 AND r.adjust_type=0
           AND r.validation_status='MATCHED' AND r.promoted_at<=:now
         ORDER BY r.stock_code LIMIT :limit
@@ -216,7 +228,6 @@ def _verified_turnover(day: str, quotes: list[dict], stocks: list[dict], now: da
         return None
     quote_by_code = {row["stock_code"]: row for row in _unique_rows(quotes, "stock_code")}
     stock_by_code = {row["stock_code"]: row for row in stocks}
-    fields = ("id", "price", "pre_close", "amount", "data_source")
     seen, values, corrected, root_items = set(), {}, {}, []
     for row in rows:
         code = row["stock_code"]
@@ -227,8 +238,9 @@ def _verified_turnover(day: str, quotes: list[dict], stocks: list[dict], now: da
         seen.add(code)
         root_items.append({"stock_code": code, "trade_date": day,
                            "turnover_percent": format(Decimal(str(row["rate"])).normalize(), "f") if rate else "0"})
-        if row["id"] is not None and all(row[field] == quote[field] for field in fields):
-            (corrected if row["corrected"] else values)[code] = rate
+        binding = _turnover_quote_binding(row, quote, rate)
+        if binding is not None:
+            (corrected if binding == "corrected" else values)[code] = rate
     if canonical_digest(root_items) != run["field_value_root_sha256"]:
         return None
     if 0 < len(corrected) <= _TURNOVER_CORRECTION_LIMIT:

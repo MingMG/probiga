@@ -418,6 +418,63 @@ def test_corrected_native_turnover_requires_exact_retained_source(market_db, mon
         assert result["turnover_evidence"]["corrected_binding_count"] == 1
 
 
+def test_turnover_binding_completes_with_bounded_database_work(market_db, monkeypatch):
+    count = 2000
+    root = market_home.canonical_digest([
+        {"stock_code": f"{code:06d}", "trade_date": DAY_TEXT, "turnover_percent": "2"}
+        for code in range(1, count + 1)
+    ])
+    with market_db.begin() as connection:
+        connection.exec_driver_sql("""
+            WITH RECURSIVE codes(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM codes WHERE n<2000)
+            INSERT INTO sm_stock_kline
+              (id,stock_code,short_name,trade_date,close,pre_close,amount,turnover_ratio,
+               data_source,quality_status,permission_status,k_type,adjust_type,etl_sync_at)
+            SELECT n,printf('%06d',n),'sample','2026-11-06',102,100,100,NULL,
+                   'qmt_datadir','VERIFIED','SUPPORTED',1,0,'2026-11-06 16:00:00' FROM codes
+        """)
+        connection.execute(text("""
+            INSERT INTO st_market_field_capture_run VALUES
+            ('capture','build',:day,'2026-11-06 16:30:00','2026-11-06 16:20:00','DAILY_TURNOVER_F61',
+             'eastmoney.push2his.kline','f61','PERCENT','COMPLETED',2000,2000,2000,2000,2000,'semantic',:root)
+        """), {"day": DAY_TEXT, "root": root})
+        connection.exec_driver_sql("""
+            INSERT INTO st_market_field_capture_row
+              (run_id,stock_code,trade_date,k_type,adjust_type,target_row_id,field_value_decimal,
+               qmt_open,qmt_high,qmt_low,qmt_close,qmt_volume_shares,qmt_amount,qmt_data_source,
+               qmt_quality_status,qmt_permission_status,validation_status,promoted_at)
+            SELECT 'capture',stock_code,trade_date,1,0,id,2,open,high,low,close,volume,amount,
+                   data_source,quality_status,permission_status,'MATCHED','2026-11-06 16:30:00'
+            FROM sm_stock_kline
+        """)
+    monkeypatch.setattr(market_home, "load_completed_market_capture_receipt", lambda *_a, **_k: {
+        "known_at": "2026-11-06 16:31:00", "receipt": {
+            "expected_count": count, "promoted_count": count, "semantic_sha256": "semantic",
+            "field_value_root_sha256": root, "decision_at": "2026-11-06 16:20:00",
+            "published_at": "2026-11-06 16:30:00",
+        },
+    })
+    now = datetime(2026, 11, 7)
+    deadline = market_home.monotonic() + 10
+    quotes = market_home._day_quotes(DAY_TEXT, now, deadline)
+    stocks = market_home._stock_rows(quotes, DAY_TEXT, live=False)
+    with market_db.connect() as connection:
+        dbapi = connection.connection.driver_connection
+        steps = 0
+        def budget():
+            nonlocal steps
+            steps += 100
+            return int(steps > 160_000)
+        # A real SQL execution budget reproduces the interrupted full-market join.
+        dbapi.set_progress_handler(budget, 100)
+        try:
+            result = market_home._verified_turnover(DAY_TEXT, quotes, stocks, now, deadline)
+        finally:
+            dbapi.set_progress_handler(None, 0)
+    assert result["verified_count"] == count
+    assert all(row["turnover_rate"] == 2 for row in stocks)
+
+
 def test_board_invalid_date_is_rejected_and_repeat_uses_bounded_cache(monkeypatch):
     route = next(item for item in market_home.router.routes if item.path == "/monitor/board")
     assert route.methods == {"GET"}
