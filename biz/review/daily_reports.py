@@ -14,7 +14,7 @@ from biz.review.market_decision import (
     ResearchError, _call_codex, _load_rules, _messages, source_digest_identity,
 )
 from biz.review.quant_digest import generate_quant_digest, persist_quant_digest, render_compact_review
-from biz.review.research_contract import build_packet, draft_json_schema, render_draft, validate_draft
+from biz.review.research_contract import build_packet, draft_json_schema, render_draft, render_dragon_tiger, validate_draft
 from biz.review.research_flow import (
     TZ, artifact_hash, assert_digest, collect_context, decode_digest, load_digest, next_session, read_records,
 )
@@ -25,7 +25,7 @@ log = logging.getLogger(__name__)
 FACTS_NOTE = "> 已发布量化事实。AI 解读暂未生成。"
 
 
-def _update_report(engine, digest, *, review=None, briefing=None, expected_briefing=None):
+def _update_report(engine, digest, *, review=None, briefing=None, expected_briefing=None, disclosure_facts=None):
     """Attach to the exact facts used by the producer and preserve the other report."""
     with engine.begin() as conn:
         suffix = " FOR UPDATE" if conn.dialect.name == "mysql" else ""
@@ -38,6 +38,19 @@ def _update_report(engine, digest, *, review=None, briefing=None, expected_brief
             raise RuntimeError("DATA_BLOCKED stage=daily_report_write: review facts changed")
         factors = current["factor_validation_json"]
         compact = current["compact_review"]
+        if disclosure_facts is not None:
+            if factors.get("market_decision") or factors.get("early_briefing"):
+                raise RuntimeError("DATA_BLOCKED stage=daily_report_write: successor research exists")
+            compact = compact.removesuffix("\n\n" + FACTS_NOTE)
+            previous_content = (factors.get("dragon_tiger_evidence") or {}).get("content")
+            if previous_content:
+                if not compact.endswith("\n\n" + previous_content):
+                    raise RuntimeError("DATA_BLOCKED stage=daily_report_write: disclosure facts differ")
+                compact = compact.removesuffix("\n\n" + previous_content)
+            factors["dragon_tiger_evidence"] = disclosure_facts
+            if disclosure_facts["content"]:
+                compact += "\n\n" + disclosure_facts["content"]
+            compact += "\n\n" + FACTS_NOTE
         if briefing is not None:
             previous = factors.get("early_briefing") or {}
             if expected_briefing is not None and previous != expected_briefing:
@@ -92,7 +105,7 @@ def _interpret(engine, digest, *, kind, target, context, now):
         "mode": "codex", "status": "COMPLETE", "report_kind": kind,
         "review_date": digest["review_date"], "next_trade_date": target,
         "generated_at": now.isoformat(), "source_digest_sha256": source,
-        "content": render_draft(draft, packet, {}), "draft": draft, "raw_response": reply.raw_response,
+        "content": render_draft(draft, packet, {}, include_disclosures=kind != "review"), "draft": draft, "raw_response": reply.raw_response,
         "input_packet": packet, "provider_receipt": reply.provider_receipt,
     }
 
@@ -134,6 +147,15 @@ def publish_review(engine, target, *, force=False):
     # The source data is already visible while optional research runs.
     try:
         context = collect_context(engine, target, now=now)
+        packet = build_packet(existing, report_kind="review", next_trade_date=next_session(engine, target),
+                              context=context, previous_research=None, now=now,
+                              source_digest_sha256=source_digest_identity(existing), allow_fact_baseline=True)
+        facts = {key: fact for key, fact in packet["facts"].items()
+                 if fact.get("metric") in {"stock_prices", "dragon_tiger_disclosure"}}
+        disclosures = {"trade_date": target, "asof_at": now.isoformat(), "entities": packet["entities"],
+                       "facts": facts, "sources": packet["sources"], "content": render_dragon_tiger(packet)}
+        _update_report(engine, existing, disclosure_facts=disclosures)
+        existing = load_digest(engine, target)
         interpretation = _optional_interpretation(
             engine, existing, kind="review", target=next_session(engine, target), context=context, now=now,
         )

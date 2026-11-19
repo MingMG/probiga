@@ -116,6 +116,30 @@ def test_scheduled_review_saves_facts_before_codex_and_keeps_them_on_failure(db,
     assert "market_decision" not in _stored(db)["factor_validation_json"]
 
 
+def test_dragon_tiger_facts_are_durable_before_ai_and_survive_its_failure(db, monkeypatch):
+    from biz.review import daily_reports
+    monkeypatch.setattr(daily_reports, "generate_quant_digest", lambda *args, **kw: _digest())
+    monkeypatch.setattr(daily_reports, "persist_quant_digest", _insert)
+    monkeypatch.setattr(daily_reports, "collect_context", lambda *args, **kw: {
+        "theme_evidence": {"stocks": [{"stock_code": "000001", "short_name": "样本股", "price_verification": {"status": "OBSERVED"},
+            "change_pct": 2, "dragon_tiger": {"status": "OBSERVED", "trade_date": REVIEW, "disclosures": [{
+                "reason": "单日涨幅", "a_buy_amount": 200000000, "a_sell_amount": 100000000, "a_net_amount": 100000000,
+                "received_at": REVIEW + "T18:00:00+08:00", "seats": []}]}}]}})
+    def unavailable(*args, **kwargs):
+        stored = _stored(db)
+        assert "龙虎榜交叉核对" in stored["compact_review"]
+        assert stored["factor_validation_json"]["dragon_tiger_evidence"]["facts"]
+        raise market_decision.ResearchError("RESEARCH_CONTRACT_BLOCKED wrong_unit_kind path=report.audit")
+    monkeypatch.setattr(daily_reports, "_call_codex", unavailable)
+    report = daily_reports.publish_review(db, REVIEW)
+    assert report["publish_status"] == "ready"
+    assert "样本股" in report["compact_review"] and "1.00亿元" in report["compact_review"]
+    assert report["compact_review"].endswith(daily_reports.FACTS_NOTE)
+    assert "market_decision" not in report["factor_validation_json"]
+    report = daily_reports.publish_review(db, REVIEW)
+    assert report["compact_review"].count("龙虎榜交叉核对") == 1
+
+
 def test_scheduled_briefing_publishes_without_ai_parent_or_model(db, monkeypatch):
     from biz.review import daily_reports
 
