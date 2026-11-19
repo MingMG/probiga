@@ -8,8 +8,10 @@ import os
 import re
 import stat
 import subprocess
+from contextlib import nullcontext
 from datetime import date, datetime
 from pathlib import Path
+from time import monotonic
 from typing import Any, Mapping
 
 from sqlalchemy import text
@@ -79,7 +81,7 @@ _VALIDATION_ONLY_BODIES = {
     "server/engine/strategy_center.py": ("_dynamic_execution_signals",),
     "server/engine/strategy_shadow_trials.py": ("native_trial_candidate_batch",),
 }
-_MAX_COMPONENT_PARENT_LINKS = 8
+_COMPONENT_LINEAGE_TIMEOUT_SECONDS = 60
 _MAX_RECOVERY_ATTEMPTS = 8
 _ABANDONED_PUBLICATION_MARKERS = frozenset({
     "TASK_OWNER_LEASE_EXPIRED: exact run lease expired; original process result retained in OBSERVED; no publication retried.",
@@ -496,10 +498,17 @@ def _verify_component_lineage(connection, runtime: Mapping[str, str]) -> dict[st
 
 
 def _compatible_recovery_builds(connection, runtime: Mapping[str, str]) -> set[str]:
+    from server.common.qmt_announcement_pit import _live_announcement_reply_budget
+
+    deadline = monotonic() + _COMPONENT_LINEAGE_TIMEOUT_SECONDS
+    mysql = getattr(getattr(connection, "dialect", None), "name", None) == "mysql"
     builds = {runtime["linux_build_sha"]}
     parent_sha = runtime["parent_linux_build_sha"]
-    parent = _verify_component_lineage(connection, runtime)
-    for _ in range(_MAX_COMPONENT_PARENT_LINKS):
+    with (_live_announcement_reply_budget(connection, deadline=deadline, stage="formal-component-lineage")
+          if mysql else nullcontext()):
+        parent = _verify_component_lineage(connection, runtime)
+    # Release count does not invalidate a signed, unchanged scoring contract.
+    while monotonic() < deadline:
         if (
             parent_sha in builds or parent["linux_build_sha"] != parent_sha
             or parent["contract_build_sha"] != runtime["contract_build_sha"]
@@ -516,8 +525,10 @@ def _compatible_recovery_builds(connection, runtime: Mapping[str, str]) -> set[s
         parent_sha = parent["parent_linux_build_sha"]
         if parent_sha in builds:
             raise FormalScoreContractError("formal recovery component lineage contains a cycle")
-        parent = load_component_attestation(connection, parent_sha)
-    raise FormalScoreContractError("formal recovery component lineage exceeds its bound")
+        with (_live_announcement_reply_budget(connection, deadline=deadline, stage="formal-component-lineage")
+              if mysql else nullcontext()):
+            parent = load_component_attestation(connection, parent_sha)
+    raise RuntimeError("formal recovery component lineage validation deadline exceeded")
 
 
 def _candidate(

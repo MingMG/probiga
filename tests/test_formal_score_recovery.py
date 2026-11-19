@@ -405,6 +405,32 @@ def test_component_path_fails_closed_for_unrelated_ancestor(monkeypatch):
         recovery._compatible_recovery_builds(object(), current)
 
 
+def test_recovery_retains_compatible_history_after_more_than_eight_releases(monkeypatch):
+    builds = [f"{number:040x}" for number in range(1, 25)]
+    anchor = builds[-1]
+    manifests = {
+        build: {**RUNTIME, "linux_build_sha": build, "windows_build_sha": anchor,
+                "contract_build_sha": anchor,
+                "parent_linux_build_sha": builds[min(index + 1, len(builds) - 1)],
+                "scope": "COORDINATED" if build == anchor else "LINUX"}
+        for index, build in enumerate(builds)
+    }
+    monkeypatch.setattr(recovery, "_verify_component_lineage", lambda *_: manifests[builds[1]])
+    monkeypatch.setattr(recovery, "load_component_attestation", lambda _, build: manifests[build])
+    assert recovery._compatible_recovery_builds(object(), manifests[builds[0]]) == set(builds)
+
+
+def test_component_lineage_has_a_time_deadline_even_when_parents_keep_arriving(monkeypatch):
+    ticks = iter((0, 1, 61))
+    monkeypatch.setattr(recovery, "monotonic", lambda: next(ticks))
+    current = {**RUNTIME, "parent_linux_build_sha": INTERMEDIATE}
+    parent = {**RUNTIME, "linux_build_sha": INTERMEDIATE}
+    monkeypatch.setattr(recovery, "_verify_component_lineage", lambda *_: parent)
+    monkeypatch.setattr(recovery, "load_component_attestation", lambda _, build: ORIGIN_COMPONENT)
+    with pytest.raises(RuntimeError, match="lineage validation deadline exceeded"):
+        recovery._compatible_recovery_builds(object(), current)
+
+
 @pytest.mark.parametrize(
     "path,definition",
     [(path, name) for path, names in recovery._VALIDATION_ONLY_BODIES.items() for name in names],
