@@ -101,6 +101,30 @@ def _index(connection, code, *, day=DAY_TEXT, trade_time="close", etl="after_clo
            "etl": f"{day} 16:00:00" if etl == "after_close" else etl})
 
 
+def test_close_drawdowns_use_verified_same_day_highs_and_strict_threshold(market_db):
+    with market_db.begin() as connection:
+        for code, price in (("000001", 93), ("000002", 92.99), ("000003", 100), ("000004", 101)):
+            _stock(connection, code, price)
+        _stock(connection, "000005", 50, source="unverified_vendor")
+        connection.execute(text("UPDATE sm_stock_kline SET high=100"))
+    board = market_home.build_market_board(DAY, now=datetime(2026, 11, 6, 20))
+    result = board["close_drawdowns"]
+    assert result["status"] == "partial"
+    assert result["count"] == 1
+    assert result["sample_count"] == 3
+    assert result["expected_sample_count"] == 4
+    assert result["rows"][0]["stock_code"] == "000002"
+    assert result["rows"][0]["drawdown_pct"] == pytest.approx(7.01)
+
+
+def test_close_drawdowns_distinguish_no_matches_from_missing_highs():
+    stock = {"stock_code": "000001", "price": 100}
+    complete = market_home._close_drawdowns([stock], [{"stock_code": "000001", "high": 100}])
+    assert complete["count"] == 0 and complete["sample_count"] == 1
+    missing = market_home._close_drawdowns([stock], [{"stock_code": "000001", "high": None}])
+    assert missing["count"] is None and missing["sample_count"] == 0
+
+
 def test_board_uses_only_verified_exact_session_and_keeps_unsupported_values_unknown(market_db):
     with market_db.begin() as connection:
         for i, value in enumerate((93, 95, 97, 99, 100, 101, 103, 105, 107), 1):

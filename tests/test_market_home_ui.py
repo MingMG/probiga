@@ -21,6 +21,23 @@ def run_node(body):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_drawdown_panel_keeps_formula_samples_and_requested_date():
+    run_node(r"""
+const date = '2026-11-06';
+const snapshot = {status:'available',trade_date:date,as_of:date+'T15:00:00+08:00',as_of_basis:'exchange_close',
+    close_drawdowns:{count:1,sample_count:9,expected_sample_count:10,formula:'(最高 - 收盘) / 最高 > 7%',
+        rows:[{stock_code:'000001',short_name:'回撤样本',high:100,price:92,drawdown_pct:8}]}};
+const html = page.render({snapshot}, date, {});
+assert.match(html,/大幅回撤/);
+assert.match(html,/回撤样本/);
+assert.match(html,/-8\.00%/);
+assert.match(html,/有效最高价 9只 \/ 行情样本 10只/);
+assert.match(html,/最高 &gt; 7%/);
+const wrongDate = page.render({snapshot}, '2026-11-09', {});
+assert.doesNotMatch(wrongDate,/回撤样本/);
+""");
+
+
 def test_dashboard_distinguishes_current_stale_and_missing_evidence():
     run_node(r"""
 const date = '2026-11-06';

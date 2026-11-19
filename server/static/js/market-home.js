@@ -24,11 +24,14 @@
             ['market-context', '市场环境', '查看全市场广度、指数趋势、轮动与假设。', 'quotes'],
             ['monitor', '市场监控中心', '成交、涨跌分布、板块表现和市场证据。', 'monitor'],
             ['market-stage', '大盘与指数结构', '对照日、周、月阶段及其验证条件。', 'indices'],
+            ['macro-release', '宏观经济原表', '核对国家统计局经济运行发布，分别展示当月与累计指标。'],
+            ['global-context', '外围与大类资产', '按采集批次核对海外指数、期货、商品、汇率和行业ETF。'],
             ['market-radar', '盘中异动雷达', '跟踪个股与板块异动，进入明细核对。'],
             ['intraday-alert', '实时盯盘与播报', '查看盘中事件、阶段观察与已保存播报。'],
             ['broad-etf-flow', '宽基ETF资金', '对照成交额、公开份额变化和金额估算。'],
             ['sentiment', '涨跌停与市场情绪', '查看市场情绪、连板反馈与风格变化。', 'ladder'],
             ['sector', '行业与板块热度', '对照行业行情、资金及近五日表现。', 'sectors', 'heat'],
+            ['industry-breadth', '行业均线宽度', '逐只核验20或30日均线，比较行业内站上均线的比例。'],
             ['concept', '概念与行业', '查看概念、成分和多日热度。', 'concepts'],
             ['commentary', '股评监控', '跟踪公开市场观点与相关标的。']
         ]],
@@ -37,12 +40,14 @@
             ['recommended', 'AI研究建议', '查看事件和量价研究、入选依据及风险条件。'],
             ['screen', '条件选股', '按趋势、放量、连板或龙虎榜等条件缩小范围。'],
             ['strong', '强势股研究', '查看强势股票及对应交易日的排名。'],
+            ['period-drawdowns', '区间高点回撤', '在完整行情窗口的成交额前100样本中研究高点回撤与TMT行业。'],
             ['fused', '个股热榜', '交叉查看多源个股热度与市场表现。'],
             ['portfolio', '自选股跟踪', '集中查看自选股票、行情、资金和异动。'],
             ['stock-list', '全市场股票', '查询股票并打开个股行情与研究资料。', 'quotes']
         ]],
         ['策略跟踪', [
             ['alist', '龙虎榜与公开席位', '从每日披露清单进入单股公开席位明细。'],
+            ['seat-observation', '公开席位交易观察', '追踪榜单披露、后续股价分布和共同上榜，核对成熟样本。'],
             ['trading-v3-candidates', '策略选股结果', '查看正式候选、确认条件和阻断理由。'],
             ['trading-v3-hypotheses', '策略与假设跟踪', '查阅持续跟踪的市场或策略假设。'],
             ['strategy-center', '策略研究与竞技', '对照策略版本、研究表现和正式资格。'],
@@ -522,6 +527,21 @@
             empty(noMatches ? (key === 'gainers' ? '当日样本无上涨标的' : '当日样本无下跌标的') : '缺少所选交易日可核验的排名') + link('stock-list', '查看全市场股票'));
     }
 
+    function renderDrawdowns(snapshot) {
+        const data = snapshot?.close_drawdowns;
+        const valid = snapshot?.as_of_basis === 'exchange_close' && data && number(data.sample_count) > 0;
+        const heading = snapshot?.trade_date || '交易日待核验';
+        if (!valid) return panel('大幅回撤', heading, empty('收盘后按已核验的当日最高价与收盘价统计'));
+        const samples = `有效最高价 ${metric(data.sample_count, '只', 0)} / 行情样本 ${metric(data.expected_sample_count, '只', 0)}`;
+        return panel('大幅回撤', heading, '<div class="mh-stat-grid">' +
+            stat('日内高点回落超过7%', metric(data.count, '只', 0)) + '</div>' +
+            `<p class="mh-meta">${escape(data.formula)} · ${escape(samples)}</p>` +
+            (rows(data.rows).length ? '<div class="mh-list">' + rows(data.rows).map(row =>
+                `<div class="mh-row"><span>${stock(row.stock_code, row.short_name)}<small class="mh-meta">最高 ${metric(row.high)} → 收盘 ${metric(row.price)}</small></span>` +
+                `<span class="mh-down">-${metric(row.drawdown_pct, '%')}</span></div>`).join('') + '</div>' :
+                '<p class="mh-meta">有效样本中没有超过阈值的股票</p>'));
+    }
+
     function render(state, requested, clock, modes = {}) {
         const market = marketObservation(state.market, requested);
         const snapshot = snapshotObservation(state.snapshot, requested);
@@ -536,7 +556,7 @@
         return renderHub(state, requested, clock, modes, market, snapshot) + markup +
             renderIndexStrip(requested, market, state.trend, snapshot) + renderMetrics(market, snapshot) +
             '<div class="mh-grid">' + renderBreadth(market, snapshot) + renderEmotion(market) + renderTrend(state.trend, market, snapshot, requested) +
-            renderLadder(snapshot) +
+            renderLadder(snapshot) + renderDrawdowns(snapshot) +
             renderSector('concept', '概念热度', state.heatmap, requested, modes.concept || 'change') +
             renderSector('industry', '行业热度', state.heatmap, requested, modes.industry || 'change') +
             renderEvents(snapshot, requested) + rankings.map(([key, title, field, unit]) => renderRanking(snapshot, key, title, field, unit)).join('') +

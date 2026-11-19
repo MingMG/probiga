@@ -529,7 +529,10 @@ def test_historical_native_evidence_archives_overlap_without_rewriting_legacy_ro
     with engine.begin() as connection:
         assert coverage.load_daily_manifest(connection, day, decision_known_at=finished) is None
         assert coverage.load_daily_native_evidence(connection, day, decision_known_at=captured) is None
-        archived, receipt = coverage.load_daily_native_evidence(connection, day, decision_known_at=finished)
+        archived, receipt = coverage.load_daily_native_evidence(connection, day, decision_known_at=finished,
+                                                               manifest_hash=proof["manifest_hash"])
+        assert coverage.load_daily_native_evidence(connection, day, decision_known_at=finished,
+                                                  manifest_hash="f"*64) is None
         assert archived == proof and receipt["finished_at"] == finished.isoformat(" ")
         assert len(archived["entities"]) == 2 and archived["entities"][0]["classification"] == "NO_TRADE"
         assert connection.execute(text("SELECT data_source,volume,amount FROM sm_stock_kline WHERE trade_date=:day"),
