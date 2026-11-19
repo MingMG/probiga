@@ -1,6 +1,6 @@
 (function (root) {
     'use strict';
-    const titles = {seats:'公开席位交易观察', drawdowns:'区间高点回撤研究', breadth:'行业均线宽度', macro:'宏观经济原表', global:'外围与大类资产'};
+    const titles = {seats:'公开席位交易观察', drawdowns:'区间高点回撤研究', breadth:'行业均线宽度', macro:'宏观经济原表', global:'外围与大类资产', futures:'全球期货监测'};
     const escape = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     const number = value => value !== null && value !== undefined && Number.isFinite(Number(value)) ? Number(value) : null;
     const format = (value, unit='', digits=2) => number(value) === null ? '—' : Number(value).toLocaleString('zh-CN', {minimumFractionDigits:digits,maximumFractionDigits:digits}) + unit;
@@ -12,6 +12,14 @@
     const row = cells => '<tr>'+cells.map(x=>'<td>'+x+'</td>').join('')+'</tr>';
 
     function render(kind, data) {
+        if (kind==='futures') return '<div class="rt-kpis">'+metric('取得报价',format(data.available_count,'项',0))+
+            metric('目标品种',format(data.expected_count,'项',0))+metric('观察日期',escape(data.observation_date))+metric('刷新频率','2分钟')+'</div>'+
+            '<section class="rt-panel"><h3>当前期货与CFD参考报价</h3>'+table(['品种 / 合约','报价点位','较前参考价','30分钟','1小时','4小时','24小时','市场时间'],(data.rows||[]).map(x=>row([
+                escape(x.display_name)+'<small>'+escape(x.contract)+' · '+escape(x.source)+'</small>',format(x.price),pct(x.change_pct),
+                ...['30m','1h','4h','24h'].map(key=>pct(x.horizons?.[key]?.change_pct)),
+                escape(x.market_time)+'<small>'+(x.freshness==='RECENT'?'最近报价':'最近一次观察，非当前成交')+'</small>'
+            ])))+'</section><p class="rt-note">'+escape(data.method)+'<br>'+escape(data.horizon_method)+
+            '<br>缺少来源：'+(data.missing_instruments||[]).map(escape).join('；')+'</p>';
         if (kind==='macro') return '<section class="rt-panel"><h3>'+escape(data.title)+'</h3><p>官方发布时间 '+escape(data.published_at)+' · <a href="'+escape(data.source_url)+'" target="_blank" rel="noopener noreferrer">国家统计局原文</a></p>'+
             table(['指标（原单位）',escape(data.headers?.[1] || '当月')+' · 绝对量','当月同比(%)',escape(data.headers?.[2] || '累计')+' · 绝对量','累计同比(%)'],(data.rows||[]).map(x=>row([
                 escape(x.indicator),escape(x.current_value),escape(x.current_yoy),escape(x.cumulative_value),escape(x.cumulative_yoy)
@@ -50,7 +58,7 @@
     }
 
     function controls(kind, state, data) {
-        if (kind==='macro' || kind==='global') return '';
+        if (kind==='macro' || kind==='global' || kind==='futures') return '';
         const select = (key,label,options) => `<label>${label}<select data-rt-control="${key}">${options.map(([value,text])=>`<option value="${escape(value)}"${String(state[key])===String(value)?' selected':''}>${escape(text)}</option>`).join('')}</select></label>`;
         if (kind==='seats') return select('seat','公开营业部',(data?.seats||[]).map(x=>[x.seat,x.seat]))+
             select('sessions','观察窗口',[[5,'近5个交易日'],[10,'近10个交易日']])+select('horizon','披露后观察',[[1,'1个交易日'],[3,'3个交易日'],[5,'5个交易日'],[10,'10个交易日']]);
@@ -63,29 +71,32 @@
         const state = {date,seat:'',sessions:5,horizon:1,period:20,tmt:'false',start:date.slice(0,4)+(date.slice(5,7)>='07'?'-07-01':'-01-01')};
         const generation = String(Date.now())+Math.random();
         container.dataset.rtGeneration = generation;
-        let latest = null, sequence = 0;
+        let latest = null, sequence = 0, timer = null;
         function current() {return container.dataset.rtGeneration===generation && (!options.isActive || options.isActive());}
         function shell(body, busy=false) {
-            container.innerHTML='<div class="research-tools"><header><div><h2>'+titles[kind]+'</h2><p>观察日期 '+escape(date)+' · 公开数据研究</p></div><button type="button" data-rt-refresh'+(busy?' disabled':'')+'>刷新</button></header>'+
+            container.innerHTML='<div class="research-tools"><header><div><h2>'+titles[kind]+'</h2><p>'+(kind==='futures'?'当前监测 · 不按全局历史日期回放':'观察日期 '+escape(date)+' · 公开数据研究')+'</p></div><button type="button" data-rt-refresh'+(busy?' disabled':'')+'>刷新</button></header>'+
                 '<form class="rt-controls">'+controls(kind,state,latest)+'</form>'+body+'</div>';
         }
         async function refresh() {
+            clearTimeout(timer);
             const request = ++sequence;
-            const query = new URLSearchParams({date});
-            const path = {seats:'seat-observation',drawdowns:'period-drawdowns',breadth:'industry-breadth',macro:'macro-release',global:'global-context'}[kind];
-            const keys = {seats:['seat','sessions','horizon'],drawdowns:['start','tmt'],breadth:['period'],macro:[],global:[]}[kind];
+            const query = new URLSearchParams(kind==='futures'?{}:{date});
+            const path = {seats:'seat-observation',drawdowns:'period-drawdowns',breadth:'industry-breadth',macro:'macro-release',global:'global-context',futures:'global-futures'}[kind];
+            const keys = {seats:['seat','sessions','horizon'],drawdowns:['start','tmt'],breadth:['period'],macro:[],global:[],futures:[]}[kind];
             keys.forEach(key=>query.set(key,state[key]));
             shell('<p class="rt-loading" role="status">正在读取所选日期的正式数据…</p>',true);
             try {
                 const data = await options.request('/api/research/'+path+'?'+query,kind==='drawdowns'?115000:kind==='breadth'?35000:30000,{cache:'no-store'});
                 if (!current() || request!==sequence) return;
-                if (data.trade_date!==date) throw new Error('返回的数据日期与所选日期不一致');
+                if (kind!=='futures' && data.trade_date!==date) throw new Error('返回的数据日期与所选日期不一致');
                 if (data.status==='unavailable') throw new Error('所选范围尚未取得可核验的公开记录');
                 latest=data;
                 if (kind==='seats') state.seat=data.selected_seat;
-                shell(render(kind,data)+'<footer>数据可用时间 '+escape(data.known_at)+' · 历史研究按当前取得的证据展示</footer>');
+                shell(render(kind,data)+'<footer>数据可用时间 '+escape(data.known_at)+(kind==='futures'?' · 当前行情观察':' · 历史研究按当前取得的证据展示')+'</footer>');
             } catch (error) {
                 if (current() && request===sequence) shell('<p class="rt-error" role="alert">'+escape(error.message || '数据读取失败')+'</p>');
+            } finally {
+                if (kind==='futures' && current() && request===sequence) timer=setTimeout(()=>{if(current())refresh();},120000);
             }
         }
         container.onchange = event => {

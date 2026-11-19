@@ -6804,6 +6804,9 @@
         'global-context': function (d,c) {
             return window.ResearchTools.load('global',d,c,{request:fetchRawJsonWithTimeout,isActive:function(){return activeTabId()==='global-context';}});
         },
+        'global-futures': function (d,c) {
+            return window.ResearchTools.load('futures',d,c,{request:fetchRawJsonWithTimeout,isActive:function(){return activeTabId()==='global-futures';}});
+        },
         /* ── 主力行为 ── */
         mainforce: function (d, c) {
             loadMainforcePage(d, c);
@@ -8038,7 +8041,8 @@
             {id:'industry-breadth', icon:'▥', label:'行业均线宽度'},
             {id:'period-drawdowns', icon:'↘', label:'区间高点回撤'},
             {id:'macro-release', icon:'▦', label:'宏观经济原表'},
-            {id:'global-context', icon:'◎', label:'外围与大类资产'}
+            {id:'global-context', icon:'◎', label:'外围与大类资产'},
+            {id:'global-futures', icon:'◷', label:'全球期货监测'}
         ]},
         {id:'theme', group:'板块与题材', items:[
             {id:'sector', icon:'🌊', label:'板块分析', aliases:['sector-movement','sector-rotation','sector-heat']},
