@@ -155,6 +155,27 @@ def test_public_index_sources_map_beijing_index_to_bj_market():
     assert sync_stock_market._east_index_secid("399001") == "0.399001"
 
 
+def test_shenzhen_index_uses_official_bar_when_vendors_disagree(monkeypatch):
+    target = pd.Timestamp("2026-11-16")
+    official = pd.DataFrame([dict(
+        index_code="399006", trade_date=target, trade_time=target + pd.Timedelta(hours=15),
+        k_type=1, open=2395.5245, close=2320.0199, high=2398.1919, low=2308.897,
+        volume=2912350000, amount=164536000000, change=-106.0646, change_pct=-4.37,
+    )])
+    tencent = official.assign(volume=152931711)
+    east = official.assign(volume=161239543)
+    monkeypatch.setattr(sync_stock_market, "_fetch_cnindex_index_kline", lambda *_: official)
+    monkeypatch.setattr(sync_stock_market, "_fetch_tencent_index_kline", lambda *_: tencent)
+    monkeypatch.setattr(sync_stock_market, "_fetch_east_index_kline", lambda *_: east)
+
+    frame, source = sync_stock_market._fetch_verified_external_index_kline(
+        "399006", "2026-11-16", "2026-11-16",
+    )
+
+    assert source == "cnindex_official"
+    pd.testing.assert_frame_equal(frame, official)
+
+
 def test_beijing_index_accepts_target_day_cross_check(monkeypatch):
     target = pd.Timestamp("2026-10-28")
     columns = [
