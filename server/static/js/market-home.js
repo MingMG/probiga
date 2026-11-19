@@ -294,11 +294,6 @@
     function freshestIndex(code, requested, market, trend, snapshot) {
         const identity = code.split('.')[0];
         const sources = rows(snapshot?.indices).filter(item => String(item.index_code || '').split('.')[0] === identity);
-        if (identity === '000852' && market?.csi1000) sources.push({
-            price: market.csi1000.price, change_pct: market.csi1000.change,
-            trade_date: market.csi1000.trade_date, data_time: market.csi1000.data_time,
-            source: market.csi1000.data_source
-        });
         for (const item of rows(trend?.indices)) {
             if (item.index_code !== identity || item.source_status === 'missing') continue;
             sources.push({price: item.periods?.daily?.metrics?.close, trade_date: item.data_cutoff,
@@ -314,7 +309,7 @@
         return '<div class="mh-tape">' + indices.map(([code, name]) => {
             const row = freshestIndex(code, requested, market, trend, snapshot);
             const foot = row
-                ? `<span>${code}</span><span title="${escape(indexStamp(row) + ' · ' + (row.source || '来源待核验'))}">${escape(day(row.trade_date))}${day(row.trade_date) < requested ? ' · 历史' : ''}</span>`
+                ? `<span>${code}</span><span title="${escape(indexStamp(row) + ' · ' + (row.source || '来源待核验'))}">${escape(day(row.trade_date))}${row.evidence_mode === 'LIVE_OBSERVATION' ? ' ' + escape(indexStamp(row).slice(11, 19)) : ''}${day(row.trade_date) < requested ? ' · 历史' : ''}</span>`
                 : `<span>${code}</span><span>行情待核验</span>`;
             return tile(name, `<span class="mh-tile-change">${signed(row?.change_pct)}</span><span class="${tone(row?.change_pct)}">${metric(row?.price)}</span>`, foot, 'mh-index-tile');
         }).join('') + '</div>';
@@ -326,7 +321,7 @@
 
     function snapshotMeta(snapshot) {
         if (!snapshot) return '证据待核验';
-        const kind = {qmt_snapshot: '盘中样本', exchange_close: '收盘样本'}[snapshot.as_of_basis];
+        const kind = {qmt_snapshot: '盘中样本', exchange_close: '收盘样本', public_index_snapshot: '盘中指数'}[snapshot.as_of_basis];
         return `${kind ? kind + ' · ' : ''}${escape(snapshot.as_of || snapshot.trade_date)} · ${escape(snapshot.source || '来源待核验')}`;
     }
 
@@ -549,7 +544,7 @@
         const market = marketObservation(state.market, requested);
         const snapshot = snapshotObservation(state.snapshot, requested);
         const labels = {realtime: '盘中快照', close: '收盘观察', paused: '午间快照', stale: '行情已过期'};
-        const boardPhase = {qmt_snapshot: '盘中快照', exchange_close: '收盘观察'}[snapshot?.as_of_basis] || '数据待核验';
+        const boardPhase = {qmt_snapshot: '盘中快照', exchange_close: '收盘观察', public_index_snapshot: '盘中指数'}[snapshot?.as_of_basis] || '数据待核验';
         const phase = !market ? boardPhase : market.trade_date < requested ? '历史回退' : labels[market.freshness_status] || '已存行情';
         const stamp = market?.data_time || market?.trade_date || snapshot?.as_of;
         const markup = '<section class="market-home" id="mh-market-observation" tabindex="-1" aria-label="行情概览"><header class="mh-head"><div>' +

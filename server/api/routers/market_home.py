@@ -22,6 +22,7 @@ from server.api.routers._engine import get_engine
 from server.common.current_data import get_current_engine
 from server.common.daily_delivery_control import load_completed_market_capture_receipt
 from server.common.kline_data import get_kline_engine
+from server.common.index_live import read_live_indices
 from server.common.limit_up_events import LIMIT_STATUS_BASIS
 from server.common.limit_up_event_schema import LIMIT_UP_EVENT_TABLE
 from server.common.market_close_ladder import load_market_close_ladder
@@ -653,6 +654,11 @@ def build_market_board(day: date, *, now: datetime) -> dict:
         if trading:
             stage = "lunch_pause" if lunch else "market_data_unavailable"
             close = datetime.combine(day, time(15))
+            if live or lunch:
+                try:
+                    indices = read_live_indices(INDEX_NAMES, day_text, now=now, deadline=deadline)
+                except (OSError, sqlite3.Error, RuntimeError, TimeoutError, ValueError) as exc:
+                    logger.warning("market board live indices unavailable: %s", type(exc).__name__)
             if live or close_ready:
                 try:
                     quotes, observed_at = _live_quotes(day_text, now, deadline) if live else (
@@ -664,8 +670,8 @@ def build_market_board(day: date, *, now: datetime) -> dict:
                         source = "sm_stock_current" if live else "sm_stock_kline"
                 except (SQLAlchemyError, RuntimeError, TimeoutError, ValueError, QualityGateError) as exc:
                     logger.warning("market board stock data unavailable: %s", type(exc).__name__)
-            # The current index table is shared by publishers and has no
-            # per-row provenance. A fresh timestamp alone cannot attest it.
+            # Shared current-table timestamps cannot attest index provenance.
+            # Intraday observations above retain the direct provider identity.
             if close_ready:
                 try:
                     indices = _index_rows(_index_quotes(day_text, close, now, deadline), day_text, close, now)
@@ -724,7 +730,8 @@ def build_market_board(day: date, *, now: datetime) -> dict:
     if missing_indices or any(row["change_pct"] is None for row in indices):
         unavailable.append("indices")
     if not stocks and indices:
-        as_of, source = datetime.combine(day, time(15)), "sm_index_kline"
+        as_of = min(_clock(row["as_of"]) for row in indices)
+        source = indices[0]["source"]
     if not as_of and events:
         as_of = _clock(events[0]["snapshot_at"])
         source = LIMIT_UP_EVENT_TABLE if events[0].get("event_family") == "LIMIT_UP_LIFECYCLE" else "sm_market_radar_event"
@@ -740,7 +747,7 @@ def build_market_board(day: date, *, now: datetime) -> dict:
         "as_of": _timestamp(as_of) if as_of else None, "source": source,
         "as_of_basis": {"sm_stock_current": "qmt_snapshot", "sm_stock_kline": "exchange_close",
                         "sm_index_kline": "exchange_close", "sm_market_radar_event": "radar_observation",
-                        LIMIT_UP_EVENT_TABLE: "qmt_limit_event"}.get(source),
+                        LIMIT_UP_EVENT_TABLE: "qmt_limit_event", "eastmoney.push2.index": "public_index_snapshot"}.get(source),
         "sample_size": len(return_stocks), "sample_scope": "verified_quotes_with_price_and_change_pct",
         "price_sample_size": len(stocks),
         "close_drawdowns": _close_drawdowns(stocks, quotes) if source == "sm_stock_kline" else None,

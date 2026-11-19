@@ -252,3 +252,19 @@ const request=async url=>{
     } finally {page.stop();}
 })().catch(e=>{console.error(e);process.exitCode=1;});
 """)
+
+
+def test_all_seven_indices_show_intraday_quotes_and_visible_source_time_without_breadth():
+    run_node(r"""
+const date='2026-11-19';
+const codes=['000001','399001','399006','000680','000688','000852','000300'];
+const snapshot={status:'partial',trade_date:date,as_of:date+'T10:30:00+08:00',as_of_basis:'public_index_snapshot',
+    indices:codes.map((index_code,i)=>({index_code,trade_date:date,price:1000+i,change_pct:1.25,
+        as_of:date+'T10:29:59+08:00',source:'eastmoney.push2.index',evidence_mode:'LIVE_OBSERVATION'}))};
+const html=page.render({snapshot,market:{status:'unavailable'}},date);
+assert.equal((html.match(/mh-index-tile/g)||[]).length,7);
+assert.equal((html.match(/\+1\.25%/g)||[]).length,7);
+assert.equal((html.match(/2026-11-19 10:29:59<\/span>/g)||[]).length,7);
+assert.ok(html.includes('盘中指数'));
+assert.ok(html.includes('1,006.00'));
+""")
