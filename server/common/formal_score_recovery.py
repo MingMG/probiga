@@ -61,6 +61,7 @@ _PERMITTED_VALIDATION_FILES = frozenset({
     "server/api/routers/market_home.py",
     "server/api/routers/research_futures.py",
     "server/static/js/research-tools.js",
+    "server/static/js/market-home.js",
     "server/static/css/research-tools.css",
     "tools/run_ai_recommendation_premarket.py",
 })
