@@ -187,6 +187,8 @@ def test_close_volume_ratio_uses_common_verified_securities_and_previous_session
     assert result["volume_sample_count"] == 2
     assert result["volume_ratio5"] == 3
     assert result["volume_reference_dates"] == sessions[:-1]
+    assert result["trade_date"] == DAY_TEXT and result["known_at"] == "2026-11-07T00:00:00+08:00"
+    assert result["evidence_mode"] == "CURRENT_OBSERVATION"
 
 
 def test_missing_volume_baseline_does_not_erase_verified_turnover(market_db, monkeypatch):
