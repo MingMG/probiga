@@ -82,7 +82,8 @@
     };
     const boardFields = {
         limit_ladder: '连板梯队', events: '异动事件', indices: '指数行情', distribution: '涨跌分布',
-        'rankings.amount': '成交额榜', 'rankings.turnover': '活跃换手'
+        'rankings.amount': '成交额榜', 'rankings.turnover': '活跃换手',
+        'liquidity.volume_ratio5': '收盘日量比'
     };
     let active = null;
 
@@ -330,6 +331,7 @@
         const breadth = market?.breadth;
         const strong = snapshot?.strong || {};
         const limits = snapshot?.limit_ladder;
+        const liquidity = snapshot?.liquidity;
         const limitMeta = limits ? [limits.scope, limits.source].filter(Boolean).map(escape).join(' · ') : '涨跌停证据待核验';
         const count = breadth ? `<span class="mh-up">${metric(breadth.up, '', 0)}</span><span class="mh-muted"> / ${metric(breadth.flat, '', 0)} / </span><span class="mh-down">${metric(breadth.down, '', 0)}</span>` : '—';
         return '<div class="mh-metrics">' +
@@ -338,7 +340,8 @@
             tile('涨停 / 跌停', pair(limits?.limit_up_count, limits?.limit_down_count), limitMeta) +
             tile('最高连板', metric(limits?.max_streak, '板', 0), limits ? limitMeta : '连板证据待核验') +
             tile('成交额', amount(market?.total_amount), observationMeta(market)) +
-            tile('换手 / 量比', '— / —', '缺少统一市场换手与量比口径') + '</div>';
+            tile('换手中位 / 收盘日量比', metric(liquidity?.turnover_median_pct, '%') + ' / ' + metric(liquidity?.volume_ratio5, '倍'),
+                liquidity ? `换手 ${metric(liquidity.turnover_sample_count, '只', 0)} · 日量比同样本 ${metric(liquidity.volume_sample_count, '只', 0)} · 较前5个完整交易日均量` : '收盘换手和成交量证据待核验') + '</div>';
     }
 
     function renderBreadth(market, snapshot) {

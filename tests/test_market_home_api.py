@@ -150,6 +150,7 @@ def test_complete_close_survives_slower_quote_read_and_caches_exact_date(market_
     monkeypatch.setattr(market_home, "_day_quotes", slow_quotes)
     monkeypatch.setattr(market_home, "load_market_close_ladder", lambda *_, **__: {"count": 1})
     monkeypatch.setattr(market_home, "_limit_up_events", lambda *_: [{"snapshot_at": "2026-11-06T10:00:00"}])
+    monkeypatch.setattr(market_home, "_close_liquidity", lambda *_: {"volume_ratio5": 1})
 
     result = market_home.build_market_board(DAY, now=datetime(2026, 11, 7))
     assert result["status"] == "available"
@@ -161,6 +162,51 @@ def test_complete_close_survives_slower_quote_read_and_caches_exact_date(market_
     assert market_home.market_board(DAY_TEXT) == result
     elapsed = 31.0
     assert market_home.market_board(DAY_TEXT)["status"] == "unavailable"
+
+
+def test_close_volume_ratio_uses_common_verified_securities_and_previous_sessions(market_db):
+    sessions = ["2026-10-30", "2026-11-02", "2026-11-03", "2026-11-04", "2026-11-05", DAY_TEXT]
+    with market_db.begin() as connection:
+        for session in sessions[:-1]:
+            connection.execute(text("INSERT INTO si_trade_calendar VALUES (:day,1)"), {"day": session})
+        for code in ("000001", "000002", "000004", "999999"):
+            for session in sessions:
+                source = "unknown" if code == "000004" else "qmt_datadir"
+                _stock(connection, code, 100, day=session, source=source)
+                value = (200 if code == "000001" else 400) if session == DAY_TEXT else 100
+                connection.execute(text("UPDATE sm_stock_kline SET volume=:volume WHERE stock_code=:code AND trade_date=:day"),
+                    {"volume": value, "code": code, "day": session})
+        _stock(connection, "000003", 100)
+        _stock(connection, "000001", 100, day="2026-11-09")
+        connection.execute(text("UPDATE sm_stock_kline SET volume=9999999 WHERE trade_date='2026-11-09' OR stock_code='000003'"))
+    stocks = [{"stock_code": code, "turnover_rate": value} for code, value in
+              (("000001", 1), ("000002", 3), ("000003", 5), ("000004", None))]
+    result = market_home._close_liquidity(DAY_TEXT, stocks, datetime(2026, 11, 7), float("inf"))
+    assert result["turnover_median_pct"] == 3 and result["turnover_sample_count"] == 3
+    assert result["volume_sample_count"] == 2
+    assert result["volume_ratio5"] == 3
+    assert result["volume_reference_dates"] == sessions[:-1]
+
+
+def test_missing_volume_baseline_does_not_erase_verified_turnover(market_db, monkeypatch):
+    monkeypatch.setattr(market_home, "_close_volume_ratio", lambda *_: (_ for _ in ()).throw(TimeoutError("deadline")))
+    result = market_home._close_liquidity(DAY_TEXT, [{"stock_code": "000001", "turnover_rate": 0}],
+        datetime(2026, 11, 7), float("inf"))
+    assert result["turnover_median_pct"] == 0
+    assert result["turnover_sample_count"] == 1 and result["volume_ratio5"] is None
+
+
+def test_zero_reference_volume_is_unknown_instead_of_fabricated_zero(market_db):
+    sessions = ["2026-10-30", "2026-11-02", "2026-11-03", "2026-11-04", "2026-11-05"]
+    with market_db.begin() as connection:
+        for session in sessions:
+            connection.execute(text("INSERT INTO si_trade_calendar VALUES (:day,1)"), {"day": session})
+        for session in sessions + [DAY_TEXT]:
+            _stock(connection, "000001", 100, day=session)
+        connection.execute(text("UPDATE sm_stock_kline SET volume=0 WHERE trade_date<>:day"), {"day": DAY_TEXT})
+    result = market_home._close_liquidity(DAY_TEXT, [{"stock_code": "000001", "turnover_rate": 1}],
+        datetime(2026, 11, 7), float("inf"))
+    assert result["volume_ratio5"] is None and result["volume_sample_count"] == 1
 
 
 def test_index_close_requires_exact_marker_and_post_close_ingestion(market_db):

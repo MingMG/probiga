@@ -10,6 +10,7 @@ from collections import OrderedDict, defaultdict
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from threading import Lock
+from statistics import median
 from time import monotonic
 from zoneinfo import ZoneInfo
 
@@ -476,6 +477,58 @@ def _rank(rows: list[dict], key: str, *, descending: bool) -> list[dict]:
     return sorted(rows, key=lambda row: (order * row[key], row["stock_code"]))[:_RANK_LIMIT]
 
 
+def _close_liquidity(day: str, stocks: list[dict], now: datetime, deadline: float) -> dict:
+    rates = [row["turnover_rate"] for row in stocks if row["turnover_rate"] is not None]
+    result = {"turnover_median_pct": median(rates) if rates else None,
+              "turnover_sample_count": len(rates), "volume_ratio5": None,
+              "volume_sample_count": 0, "volume_reference_dates": [],
+              "volume_definition": "同样本当日成交股数 / 前5个完整交易日平均成交股数"}
+    try:
+        result.update(_close_volume_ratio(day, stocks, now, deadline))
+    except (SQLAlchemyError, RuntimeError, TimeoutError, ValueError) as exc:
+        logger.warning("market board close volume ratio unavailable: %s", type(exc).__name__)
+    return result
+
+
+def _close_volume_ratio(day: str, stocks: list[dict], now: datetime, deadline: float) -> dict:
+    sessions = _read(get_engine(), """
+        SELECT /*+ MAX_EXECUTION_TIME(1200) */ DISTINCT trade_date FROM si_trade_calendar
+        WHERE trade_date<=:day AND trade_status=1 ORDER BY trade_date DESC LIMIT 6
+    """, {"day": day}, deadline=deadline)
+    days = [str(row["trade_date"])[:10] for row in sessions]
+    if len(days) != 6 or days[0] != day:
+        return {}
+    params = {f"session_{index}": value for index, value in enumerate(days)}
+    slots = ",".join(":" + key for key in params)
+    codes = {f"sample_{index}": row["stock_code"] for index, row in enumerate(stocks)}
+    code_slots = ",".join(":" + key for key in codes)
+    rows = _read(get_kline_engine(), f"""
+        SELECT /*+ MAX_EXECUTION_TIME(2500) */
+               COUNT(*) AS sample_count, SUM(current_volume) AS current_volume,
+               SUM(previous_volume)/5.0 AS baseline_volume
+        FROM (
+            SELECT /*+ INDEX(sm_stock_kline idx_date_ktype) */ stock_code,
+                   SUM(CASE WHEN trade_date=:day THEN volume ELSE 0 END) AS current_volume,
+                   SUM(CASE WHEN trade_date<>:day THEN volume ELSE 0 END) AS previous_volume
+            FROM sm_stock_kline WHERE trade_date IN ({slots}) AND k_type=1 AND adjust_type=0
+              AND stock_code IN ({code_slots})
+              AND permission_status='SUPPORTED' AND quality_status IN ('VERIFIED','QMT_ATTESTED')
+              AND data_source IN ('qmt_datadir','gj_big_qmt_inner') AND volume>=0
+              AND close>0 AND pre_close>0 AND etl_sync_at<=:now
+            GROUP BY stock_code HAVING COUNT(*)=6 AND COUNT(DISTINCT trade_date)=6
+        ) AS common_sample
+    """, {**params, **codes, "day": day, "now": now}, deadline=deadline)
+    if len(rows) != 1:
+        return {}
+    row = rows[0]
+    current, baseline = _nonnegative(row["current_volume"]), _number(row["baseline_volume"])
+    count = row["sample_count"]
+    if type(count) is int and 0 < count <= len(stocks) and current is not None and baseline is not None and baseline >= 0:
+        return {"volume_ratio5": current / baseline if baseline else None, "volume_sample_count": count,
+                "volume_reference_dates": sorted(days[1:])}
+    return {}
+
+
 def build_market_board(day: date, *, now: datetime) -> dict:
     """Keep exact dated reads and unavailable data boundaries independent."""
     started_at = monotonic()
@@ -547,6 +600,14 @@ def build_market_board(day: date, *, now: datetime) -> dict:
     turnover_rows = [row for row in stocks if row["turnover_rate"] is not None]
     if turnover_evidence is None and len(turnover_rows) != len(stocks):
         turnover_rows = []
+    liquidity = None
+    if close_ready and stocks:
+        try:
+            liquidity = _close_liquidity(day_text, stocks, now, deadline)
+        except (SQLAlchemyError, RuntimeError, TimeoutError, ValueError) as exc:
+            logger.warning("market board liquidity unavailable: %s", type(exc).__name__)
+        if not liquidity or liquidity["volume_ratio5"] is None:
+            unavailable.append("liquidity.volume_ratio5")
     return_stocks = [row for row in stocks if row["change_pct"] is not None]
     if not return_stocks:
         unavailable.extend(("distribution", "strong", "rankings.gainers", "rankings.losers"))
@@ -589,6 +650,7 @@ def build_market_board(day: date, *, now: datetime) -> dict:
             "turnover": _rank(turnover_rows, "turnover_rate", descending=True),
         },
         "turnover_evidence": turnover_evidence,
+        "liquidity": liquidity,
         "turnover_coverage": {
             "status": ("unavailable" if not turnover_rows else
                        "complete" if len(turnover_rows) == len(stocks) else "partial"),
