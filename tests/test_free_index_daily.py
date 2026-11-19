@@ -80,6 +80,35 @@ def test_exact_index_repair_preserves_original_rows_and_scope(index_repair_datab
         assert collector._repair_publish(connection, target, candidate) == []
 
 
+def test_individual_index_receipt_reads_its_security_without_scanning_history(index_repair_database):
+    from time import monotonic
+    from server.common.index_daily_publication import load_verified_index_daily_bars
+
+    engine = index_repair_database
+    day = "2026-11-06"
+    values = dict(index_code="000300", trade_time=f"{day} 15:00:00", trade_date=day,
+        k_type=1, open=4010, close=4054.27, high=4060, low=4001, volume=100, amount=None,
+        change=54.27, change_pct=1.36)
+    with engine.begin() as connection:
+        connection.execute(text("DELETE FROM acquisition_partition_state"))
+        collector._repair_publish(connection, day, {"000300": ("tencent_only", values)})
+        connection.execute(text("""
+            INSERT INTO sm_index_kline VALUES
+              (:code,'2020-01-02 15:00:00','2020-01-02',1,10,11,12,9,100,1000,1,10,'2020-01-02 17:00:00')
+        """), [{"code": f"{code:06}"} for code in range(10000, 30000)])
+    with engine.connect() as connection:
+        sqlite = connection.connection.driver_connection
+        sqlite.set_progress_handler(lambda: 1, 6000)
+        try:
+            rows = load_verified_index_daily_bars(
+                engine, engine, sessions=[day], codes=["000300"],
+                as_of=datetime(2026, 11, 20), deadline=monotonic() + 5,
+            )
+        finally:
+            sqlite.set_progress_handler(None, 0)
+    assert [row["index_code"] for row in rows] == ["000300"]
+
+
 def test_index_repair_rolls_back_if_receipt_cannot_be_saved(index_repair_database):
     with index_repair_database.begin() as connection:
         connection.execute(text("""CREATE TRIGGER reject_repair_receipt BEFORE INSERT ON acquisition_partition_state
