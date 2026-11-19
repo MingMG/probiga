@@ -5,7 +5,7 @@ import shutil
 import subprocess
 
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, event
 
 from server.api.routers import research_tools as tools
 from server.db.formal_analysis_schema import privileged_migrate_formal_analysis_schema
@@ -85,17 +85,30 @@ def test_period_drawdowns_exclude_missing_sessions_and_unverified_sources(databa
     assert result["rows"][0]["drawdown_pct"] == pytest.approx(100/3)
 
 
-def test_industry_width_requires_complete_verified_window_and_strict_ma(database):
+@pytest.mark.parametrize('period',[20,30])
+def test_industry_width_requires_complete_verified_window_and_strict_ma(database,period):
     engine, days = database
     with engine.begin() as conn:
-        for day in days[-20:]:
+        for day in days[-period:]:
             quote(conn,"000001",day,120 if day == DAY else 100)
             quote(conn,"000002",day,100)  # Equal to MA is not above it.
             if day != days[-2]:
                 quote(conn,"000003",day,120)
             quote(conn,"000004",day,500,source="unknown")
         quote(conn,"000001","2026-11-19",1)
-    result = tools.build_industry_breadth(DAY)
+    # Reproduce the production boundary: a large single aggregation cannot
+    # finish, while bounded partitions must preserve the exact whole-window MA.
+    batches=[]
+    def bounded(_conn,_cursor,sql,_parameters,context,_many):
+        if 'SUM(close)' in sql or 'AVG(close)' in sql:
+            values=context.compiled_parameters[0]
+            count=values['count']
+            if count>5:
+                raise TimeoutError('whole-window aggregate deadline exceeded')
+            batches.append(count)
+    event.listen(engine,'before_cursor_execute',bounded)
+    result = tools.build_industry_breadth(DAY,period=period)
+    assert sum(batches)==period
     assert result["sample_count"] == 2 and result["above_count"] == 1
     assert result["breadth_pct"] == 50
     assert result["rows"] == [{"industry_code":"I1","industry_name":"电子","member_count":3,

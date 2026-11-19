@@ -77,7 +77,7 @@
             keys.forEach(key=>query.set(key,state[key]));
             shell('<p class="rt-loading" role="status">正在读取所选日期的正式数据…</p>',true);
             try {
-                const data = await options.request('/api/research/'+path+'?'+query,kind==='drawdowns'?115000:30000,{cache:'no-store'});
+                const data = await options.request('/api/research/'+path+'?'+query,kind==='drawdowns'?115000:kind==='breadth'?35000:30000,{cache:'no-store'});
                 if (!current() || request!==sequence) return;
                 if (data.trade_date!==date) throw new Error('返回的数据日期与所选日期不一致');
                 if (data.status==='unavailable') throw new Error('所选范围尚未取得可核验的公开记录');
