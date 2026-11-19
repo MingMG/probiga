@@ -117,7 +117,7 @@ const request = (url, timeout, options) => new Promise(resolve => calls.push({ur
             '/api/scheduler/daily-delivery?trade_date=' + date + '&attempt_limit=12'
         ]);
         assert.deepEqual(calls.map(call => call.url), expected);
-        assert.ok(calls.every(call => call.timeout === 15000 && call.options.cache === 'no-store'));
+        assert.ok(calls.every(call => call.timeout === (call.url.includes('sector-heatmap') ? 30000 : 15000) && call.options.cache === 'no-store'));
         assert.equal(container.listeners.size, 2);
         calls.slice(paths.length + 2).forEach(call => call.resolve({trade_date:'2026-11-06', data_source:'新日期来源'}));
         await current;
