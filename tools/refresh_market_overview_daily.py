@@ -25,6 +25,7 @@ from server.common.auxiliary_runtime_schema import (
     validate_market_overview_daily_runtime_schema,
 )
 from server.common.kline_data import get_kline_engine
+from server.common.eastmoney_upper_limit_history import EastmoneyUpperLimitHistoryBlocked
 from server.common.market_close_ladder import CAPTURE_SCHEMA, MarketCloseLadderBlocked, capture_market_close_ladder
 from tools.env_config import load_project_env
 
@@ -189,7 +190,7 @@ def refresh_one(
 def _publish_limit_ladder(engine, kline_engine, trade_date: str, *, exact: bool = False) -> bool:
     try:
         receipt = capture_market_close_ladder(engine, kline_engine, datetime.fromisoformat(trade_date).date())
-    except MarketCloseLadderBlocked as exc:
+    except (MarketCloseLadderBlocked, EastmoneyUpperLimitHistoryBlocked) as exc:
         receipt = {"status": "BLOCKED", "trade_date": trade_date, "reason": str(exc)}
     except (OSError, RuntimeError, ValueError, RequestException, SQLAlchemyError) as exc:
         receipt = {"status": "BLOCKED", "trade_date": trade_date, "reason": type(exc).__name__}
