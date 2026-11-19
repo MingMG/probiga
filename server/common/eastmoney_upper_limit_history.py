@@ -29,6 +29,11 @@ EASTMONEY_HISTORY_SOURCE_TABLE = "sm_stock_kline+eastmoney.push2ex.zt_pool"
 EASTMONEY_HISTORY_TRANSPORT = "HTTPS_TLS_VERIFIED_DIRECT_V1"
 EASTMONEY_HISTORY_API_PATH = "/getTopicZTPool"
 EASTMONEY_HISTORY_URL = "https://push2ex.eastmoney.com/getTopicZTPool"
+EASTMONEY_CLOSE_POOL_CONFIG = {
+    "limit_up": (EASTMONEY_HISTORY_URL, "fbt:asc"),
+    "limit_down": ("https://push2ex.eastmoney.com/getTopicDTPool", "fund:asc"),
+    "opened_limit_up": ("https://push2ex.eastmoney.com/getTopicZBPool", "fbt:asc"),
+}
 EASTMONEY_HISTORY_UT = "7eea3edcaed734bea9cbfc24409ed989"
 EASTMONEY_HISTORY_CACHE_SCHEMA = "probiga.eastmoney-upper-limit-history-cache.v1"
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -100,7 +105,9 @@ def _pool_codes_from_rows(pool: Sequence[Any], target: date) -> list[str]:
 
 def _fetch_pool(
     target: date, timeout_seconds: float = 20.0, *, max_payload_bytes: int | None = None,
+    pool_kind: str = "limit_up",
 ) -> tuple[list[str], str]:
+    endpoint, sort = EASTMONEY_CLOSE_POOL_CONFIG[pool_kind]
     timeout = max(1.0, float(timeout_seconds))
     deadline = monotonic() + timeout
     params = {
@@ -108,7 +115,7 @@ def _fetch_pool(
             "dpt": "wz.ztzt",
             "Pageindex": "0",
             "pagesize": "10000",
-            "sort": "fbt:asc",
+            "sort": sort,
             "date": target.strftime("%Y%m%d"),
     }
     headers = {
@@ -118,11 +125,11 @@ def _fetch_pool(
     with requests.Session() as session:
         session.trust_env = False
         if max_payload_bytes is None:
-            response = session.get(EASTMONEY_HISTORY_URL, params=params, headers=headers, timeout=timeout)
+            response = session.get(endpoint, params=params, headers=headers, timeout=timeout)
             response.raise_for_status()
             payload, raw = response.json(), response.text
         else:
-            with session.get(EASTMONEY_HISTORY_URL, params=params, headers=headers, stream=True,
+            with session.get(endpoint, params=params, headers=headers, stream=True,
                              allow_redirects=False, timeout=(min(3.0, timeout), min(3.0, timeout))) as response:
                 response.raise_for_status()
                 if response.status_code != 200:
