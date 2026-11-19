@@ -28,8 +28,10 @@ _URL = re.compile(r"/finalpage/(\d{4}-\d{2}-\d{2})/\d+\.PDF", re.I)
 _HASH = re.compile(r"[0-9a-f]{64}")
 _DAY = r"(\d{4})年(\d{1,2})月(\d{1,2})日"
 _WEEKDAY = r"(?:[（(](?:星期|周)[一二三四五六日天][）)])?"
-_SUSPEND = re.compile(r"(?:自|于)" + _DAY + _WEEKDAY + r"(?:开市(?:时)?)?起(?:开始)?停牌")
-_RESUME = re.compile(r"(?:将于|自|于)" + _DAY + _WEEKDAY + r"(?:开市(?:时)?)?起(?:开始)?复牌")
+_SUSPEND = re.compile(r"(?:自|于)" + _DAY + _WEEKDAY + r"(?:开市(?:时)?)?(?:起(?:开始)?|开始)停牌")
+_RESUME = re.compile(r"(?:将于|自|于)" + _DAY + _WEEKDAY + r"(?:上午)?(?:开市(?:时)?)?起?(?:开始)?复牌")
+_MERGER_HALT = re.compile(r"公司A股股票将?自" + _DAY
+    + r"(?:[（(][^）)]{1,80}[）)])?开市起连续停牌[，,][^。；;]{0,50}不再交易")
 _VOLUNTARY_DELIST_HALT = re.compile(
     r"公司股票(?:[（(][^）)]{1,100}[）)])?将?自" + _DAY + _WEEKDAY
     + r"开市(?:时)?起(?:开始)?停牌[，,]直至(?:深交所|深圳证券交易所)"
@@ -44,7 +46,7 @@ _DELISTING_BOARD_RESUME = re.compile(
 )
 _FULL_DAY_SUSPEND = re.compile(
     r"(?:本公司|公司)股票(?:将)?(?:于|自)" + _DAY + _WEEKDAY
-    + r"(?:全天停牌|停牌全天|停牌(?:一天|1天)(?![半0-9]))"
+    + r"(?:开市(?:时)?起)?(?:全天停牌|停牌全天|停牌(?:一天|1天|一日)(?![半0-9]))"
 )
 _SAME_DAY_RESUME = re.compile(r"(?:将于|自|于)" + _DAY + _WEEKDAY + r"(?:开市)?(?:起)?(?:复牌|恢复交易)")
 _DELIST = re.compile(r"摘牌日期[:：]" + _DAY)
@@ -64,7 +66,7 @@ def _document_date(url: str) -> date:
 
 def _dates(pattern, text: str) -> set[date]:
     return {date(*(int(part) for part in match.groups())) for match in pattern.finditer(text)
-            if not re.search(r"预计|如果|假如|拟于", text[max(0, match.start() - 12):match.start() + 1])}
+            if not re.search(r"预计|如果|假如|拟于|若|可能", text[max(0, match.start() - 12):match.start() + 1])}
 
 
 def _explicit_sessions(text: str) -> set[date]:
@@ -116,17 +118,23 @@ def _paired_delisting_halt(texts: list[tuple[date, str]], target: date, resumes:
 
 
 def _classification(texts: list[tuple[date, str]], target: date) -> str:
-    resumes = {resume for _, body in texts
+    all_resumes = {resume for _, body in texts
                for resume in _dates(_RESUME, body) | _dates(_DELISTING_BOARD_RESUME, body)}
     # Explicit resumed sessions always invalidate any competing no-trade inference.
-    if target in resumes:
+    if target in all_resumes:
         raise ValueError("official evidence shows trading resumed on target session")
-    paired_delisting_halt = _paired_delisting_halt(texts, target, resumes)
+    paired_delisting_halt = _paired_delisting_halt(texts, target, all_resumes)
     if any(target in _dates(_DELIST, body) and "股票终止上市暨摘牌" in body for _, body in texts):
         return "DELISTED"
     if paired_delisting_halt:
         return "NO_TRADE"
     for published, body in texts:
+        if target in _dates(_FULL_DAY_SUSPEND, body):
+            return "NO_TRADE"
+        if ("股票连续停牌直至终止上市、实施换股吸收合并" in body[:400]
+                and any(start <= target and not any(start <= resume <= target for resume in all_resumes)
+                        for start in _dates(_MERGER_HALT, body))):
+            return "NO_TRADE"
         starts = _dates(_SUSPEND, body)
         resumes = _dates(_RESUME, body)
         if target in _explicit_sessions(body):
@@ -142,8 +150,9 @@ def _classification(texts: list[tuple[date, str]], target: date) -> str:
             return "NO_TRADE"
     # Two dedicated same-issuer notices may bind one interval even when the
     # resumption notice does not repeat the original suspension date.
-    starts = {start for published, body in texts if "停牌公告" in body
-              for start in _dates(_SUSPEND, body) if start == published}
+    starts = {start for published, body in texts
+              if "停牌公告" in body or "股票停牌暨可能被终止上市的风险提示公告" in body[:400]
+              for start in _dates(_SUSPEND, body) if published <= start <= published + timedelta(days=7)}
     resumes = {resume for published, body in texts if "复牌" in body and published >= target
                for resume in _dates(_RESUME, body)}
     if len(starts) == len(resumes) == 1 and min(starts) <= target < min(resumes):
