@@ -83,7 +83,8 @@
     const boardFields = {
         limit_ladder: '连板梯队', events: '异动事件', indices: '指数行情', distribution: '涨跌分布',
         'rankings.amount': '成交额榜', 'rankings.turnover': '活跃换手',
-        'liquidity.volume_ratio5': '收盘日量比'
+        'liquidity.volume_ratio5': '收盘日量比',
+        'limit_ladder.limit_down_count': '跌停数据', 'limit_ladder.opened_limit_up_count': '炸板数据'
     };
     let active = null;
 

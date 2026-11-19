@@ -21,7 +21,7 @@ from server.common.qmt_attestation_contract import canonical_digest
 
 SCHEMA = "probiga.market-close-limit-pool.v1"
 CAPTURE_SCHEMA = "probiga.market-close-ladder-capture.v1"
-SOURCE = "东财收盘涨停池 · QMT 收盘价复核"
+SOURCE = "东财收盘股票池 · QMT 收盘价复核"
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _MAX_RAW = 512 * 1024
 _MAX_RECORD = 2 * _MAX_RAW + 16 * 1024
