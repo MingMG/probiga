@@ -79,7 +79,7 @@ def read_live_turnover(selected, *, now, deadline):
         with closing(sqlite3.connect(_path(create=True), timeout=1)) as db:
             db.execute("CREATE TABLE IF NOT EXISTS live_turnover_snapshot (slot INTEGER PRIMARY KEY CHECK(slot=1), day TEXT, captured_at TEXT, digest TEXT, payload TEXT)")
             stored = db.execute("SELECT day,captured_at,digest,payload FROM live_turnover_snapshot WHERE slot=1").fetchone()
-            if stored and stored[0] == selected and 0 <= (now-datetime.fromisoformat(stored[1])).total_seconds() < 30:
+            if stored and stored[0] == selected and 0 <= (now-datetime.fromisoformat(stored[1])).total_seconds() < 15:
                 payload = json.loads(stored[3])
                 if canonical_digest(payload) != stored[2]:
                     raise ValueError("turnover_live: persisted digest differs")

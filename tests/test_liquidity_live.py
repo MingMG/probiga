@@ -27,6 +27,8 @@ def test_liquidity_full_source_capture_is_durable_and_reused(tmp_path, monkeypat
     again = liquidity_live.read_live_liquidity(DAY, now=NOW+timedelta(seconds=1), deadline=monotonic()+22)
     assert first == again and len(calls) == 1
     assert first["turnover_median_pct"] == 9.5
+    liquidity_live.read_live_liquidity(DAY, now=NOW+timedelta(seconds=20), deadline=monotonic()+22)
+    assert len(calls) == 2
     assert first["volume_ratio_median"] == pytest.approx(0.95)
     assert first["provider_total"] == first["dated_quote_count"] == 20
 

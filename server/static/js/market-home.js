@@ -658,10 +658,11 @@
             return session.pending;
         }
 
-        function schedule() {
+        function schedule(started = performance.now()) {
             if (!current()) return;
             session.timer = setTimeout(async () => {
                 if (!current()) return;
+                const started = performance.now();
                 try {
                     if (document.hidden || options.isActive?.() === false) return;
                     const clock = options.refreshClock ? await options.refreshClock() : options.clock?.();
@@ -671,8 +672,8 @@
                     }
                 } catch {
                     // A failed clock refresh must not relabel the previous observation.
-                } finally { schedule(); }
-            }, 60000);
+                } finally { schedule(started); }
+            }, Math.max(0, 20000 - (performance.now() - started)));
         }
 
         session.click = event => {

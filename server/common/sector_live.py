@@ -1,6 +1,6 @@
 """Bounded, demand-driven Eastmoney board observations for the Linux dashboard.
 
-The visible dashboard renews these complete bulk snapshots once a minute. They
+The visible dashboard renews these complete bulk snapshots every 20 seconds. They
 are private observations, never published as completed daily acquisition rows.
 """
 from __future__ import annotations
@@ -70,7 +70,7 @@ def _fetch(kind, selected, now, deadline):
 
 
 def read_live_boards(selected: str, *, now: datetime) -> dict:
-    """Reuse a verified 45-second checkpoint; refresh each source independently."""
+    """Reuse a verified 15-second checkpoint; refresh each source independently."""
     now = now.astimezone(_ZONE).replace(tzinfo=None) if now.tzinfo else now
     if selected != now.date().isoformat():
         raise ValueError("sector_live: only the current session may be captured")
@@ -82,7 +82,7 @@ def read_live_boards(selected: str, *, now: datetime) -> dict:
             result, missing = {}, []
             for kind in (3, 2):
                 stored = db.execute("SELECT day,captured_at,digest,payload FROM live_board_snapshot WHERE kind=?", (str(kind),)).fetchone()
-                if stored and stored[0] == selected and 0 <= (now - datetime.fromisoformat(stored[1])).total_seconds() < 45:
+                if stored and stored[0] == selected and 0 <= (now - datetime.fromisoformat(stored[1])).total_seconds() < 15:
                     rows = json.loads(stored[3])
                     if canonical_digest(rows) != stored[2]:
                         raise ValueError("sector_live: persisted digest differs")

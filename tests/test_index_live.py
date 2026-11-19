@@ -29,6 +29,8 @@ def test_capture_all_seven_indices_and_reuse_durable_snapshot(tmp_path, monkeypa
     again = index_live.read_live_indices(market_home.INDEX_NAMES, DAY, now=NOW+timedelta(seconds=1), deadline=monotonic()+8)
     assert first == again and len(first) == 7
     assert calls == [3]
+    index_live.read_live_indices(market_home.INDEX_NAMES, DAY, now=NOW+timedelta(seconds=20), deadline=monotonic()+22)
+    assert len(calls) == 2
     assert {row["source"] for row in first} == {"eastmoney.push2.index"}
     assert {row["as_of"] for row in first} == {DAY + "T10:30:00+08:00"}
 
