@@ -110,6 +110,7 @@ def market_db(monkeypatch):
     for name in ("get_engine", "get_kline_engine", "get_current_engine"):
         monkeypatch.setattr(market_home, name, lambda: engine)
     monkeypatch.setattr(market_home, "read_live_indices", lambda *args, **kwargs: [])
+    monkeypatch.setattr(market_home, "read_live_turnover", lambda *args, **kwargs: None)
     market_home._cache.clear()
     yield engine
     market_home._cache.clear()
@@ -348,6 +349,38 @@ def test_live_board_uses_the_verified_batch_age_not_the_last_trade_time(market_d
     result = market_home.build_market_board(DAY, now=now)
     assert result["sample_size"] == expected
     assert result["strong"]["up_3pct"] == (1 if expected else None)
+
+
+@pytest.mark.parametrize("request_time,source_time,published,available", [
+    ("10:00:10", "10:00:00", "10:00:01", True),
+    ("12:15:00", "11:29:40", "11:29:41", True),
+    ("12:15:00", "11:35:00", "11:35:01", True),
+    ("12:15:00", "11:20:00", "11:20:01", False),
+])
+def test_all_stock_rankings_remain_available_intraday_and_at_lunch(market_db, monkeypatch, request_time, source_time, published, available):
+    with market_db.begin() as c:
+        c.execute(text("""INSERT INTO st_qmt_realtime_sync_receipt_v2 VALUES
+            ('id','gj_big_qmt_inner','token',:source,3,3,1,:published,
+             'LIVE_FORWARD','PASS','{"full_batch_id":"verified"}',:published)
+        """), {"source": f"{DAY_TEXT} {source_time}", "published": f"{DAY_TEXT} {published}"})
+        c.execute(text("""INSERT INTO sm_stock_current VALUES
+            (:code,:code,12,:change,:amount,:stamp,'verified','gj_big_qmt_inner','VALIDATED','SUPPORTED')
+        """), [{"code": code, "change": change, "amount": amount, "stamp": f"{DAY_TEXT} {source_time}"}
+               for code, change, amount in (("000001", 8, 100), ("000002", -6, 300), ("000003", 2, 200))])
+    monkeypatch.setattr(market_home, "read_live_turnover", lambda *args, **kwargs: {
+        "rows": [{"stock_code": "000003", "short_name": "stock", "trade_date": DAY_TEXT,
+                  "turnover_rate": 5, "source": "eastmoney.push2.f8", "turnover_rate_source": "eastmoney.push2.f8"}],
+        "as_of": DAY_TEXT+"T"+request_time+"+08:00", "source": "eastmoney.push2.f8", "trade_date": DAY_TEXT,
+        "scope": "vendor-ranked snapshot", "observed_count": 1, "excluded_count": 0})
+    result = market_home.build_market_board(DAY, now=datetime.fromisoformat(f"{DAY_TEXT} {request_time}"))
+    assert [r["stock_code"] for r in result["rankings"]["turnover"]] == ["000003"]
+    if available:
+        assert result["rankings"]["gainers"][0]["stock_code"] == "000001"
+        assert result["rankings"]["losers"][0]["stock_code"] == "000002"
+        assert result["rankings"]["amount"][0]["stock_code"] == "000002"
+        assert result["as_of"] == DAY_TEXT+"T"+source_time+"+08:00"
+    else:
+        assert result["rankings"]["gainers"] == result["rankings"]["losers"] == result["rankings"]["amount"] == []
 
 
 @pytest.mark.parametrize("problem", [None, "stage", "field_root", "missing_capture", "quote_mismatch", "ipo", "ipo_prior_subset"])
