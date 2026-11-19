@@ -181,19 +181,38 @@ def load_verified_index_daily_bars(
     eligible = [day for day in sessions if day in datadir or day in free or day in repair_dates]
     if not eligible:
         return []
-    select = text("""
-        SELECT /*+ MAX_EXECUTION_TIME(2500) */ index_code, trade_time, trade_date, k_type,
-               open, close, high, low, volume, amount, `change`, change_pct, etl_sync_at
-        FROM sm_index_kline WHERE k_type=1 AND trade_date IN :dates
-        ORDER BY trade_date, index_code, trade_time LIMIT :limit
-    """).bindparams(bindparam("dates", expanding=True))
+    full_partition_dates = set(datadir) | set(free)
     result = []
     with history.connect() as connection:
         for offset in range(0, len(eligible), _BATCH_DAYS):
             if monotonic() >= deadline:
                 raise TimeoutError("指数发布内容核验超时")
             dates = eligible[offset:offset + _BATCH_DAYS]
-            rows = connection.execute(select, {"dates": dates, "limit": _MAX_ROWS_PER_BATCH + 1}).mappings().all()
+            # Whole-partition receipts bind every original row. Individual
+            # repair receipts bind only the requested securities.
+            whole_dates = [day for day in dates if day in full_partition_dates]
+            repair_only_dates = [day for day in dates if day not in full_partition_dates]
+            budget_ms = max(1, min(8000, int((deadline - monotonic()) * 1000)))
+            conditions = []
+            if whole_dates:
+                conditions.append("trade_date IN :whole_dates")
+            if repair_only_dates:
+                conditions.append("(index_code IN :codes AND trade_date IN :repair_dates)")
+            select = text(f"""
+        SELECT /*+ MAX_EXECUTION_TIME({budget_ms}) */ index_code, trade_time, trade_date, k_type,
+               open, close, high, low, volume, amount, `change`, change_pct, etl_sync_at
+        FROM sm_index_kline WHERE k_type=1
+          AND ({" OR ".join(conditions)})
+        ORDER BY trade_date, index_code, trade_time LIMIT :limit
+    """)
+            if whole_dates:
+                select = select.bindparams(bindparam("whole_dates", expanding=True))
+            if repair_only_dates:
+                select = select.bindparams(bindparam("repair_dates", expanding=True), bindparam("codes", expanding=True))
+            rows = connection.execute(select, {
+                "whole_dates": whole_dates, "repair_dates": repair_only_dates, "codes": sorted(selected),
+                "limit": _MAX_ROWS_PER_BATCH + 1,
+            }).mappings().all()
             if len(rows) > _MAX_ROWS_PER_BATCH:
                 raise ValueError("指数发布内容超过核验上限")
             grouped: dict[str, list[dict]] = {}
