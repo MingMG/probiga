@@ -429,20 +429,34 @@ def _index_rows(rows: list[dict], day: str, close_at: datetime, now: datetime) -
     return [result[code] for code in INDEX_NAMES if code in result]
 
 
-def _market_events(day: date, now: datetime, deadline: float) -> list[dict]:
+def _event_boundary(column: str, source: int, before) -> tuple[str, dict]:
+    if before is None:
+        return "", {}
+    stamp, cursor_source, identity = before
+    operator = "<=" if source < cursor_source else "<"
+    clause = f" AND ({column} {operator} :before_stamp"
+    if source == cursor_source:
+        clause += f" OR ({column}=:before_stamp AND event_id<:before_id)"
+    return clause + ")", {"before_stamp": stamp, "before_id": identity}
+
+
+def _market_events(day: date, now: datetime, deadline: float, *, before=None, paged=False) -> list[dict]:
+    boundary, bindings = _event_boundary("snapshot_at", 0, before)
+
     start = datetime.combine(day, time.min)
-    rows = _read(get_engine(), """
-        SELECT /*+ MAX_EXECUTION_TIME(1500) */ event_type, direction, stock_code, sector_name,
+    rows = _read(get_engine(), f"""
+        SELECT /*+ MAX_EXECUTION_TIME(1500) */ event_id, event_type, direction, stock_code, sector_name,
                snapshot_at, data_source, detail_json
         FROM sm_market_radar_event
         WHERE snapshot_at>=:start AND snapshot_at<:end AND snapshot_at<=:now
           AND created_at>=snapshot_at AND created_at<=:now AND data_source='qmt_full_tick_5level'
           AND event_type IN ('stock_anomaly','sector_anomaly')
+        {boundary}
         ORDER BY snapshot_at DESC, event_id DESC LIMIT :limit
     """, {"start": start, "end": start + timedelta(days=1), "now": now,
-          "limit": _EVENT_LIMIT}, deadline=deadline)
-    result = []
-    for row in rows:
+          "limit": 50 if paged else _EVENT_LIMIT, **bindings}, deadline=deadline)
+    result = [{"_cursor": (_clock(row["snapshot_at"]).isoformat(sep=" "), 0, int(row["event_id"]))} for row in rows] if paged else []
+    for index, row in enumerate(rows):
         stamp = _clock(row.get("snapshot_at"))
         code = str(row.get("stock_code") or "")
         sector = str(row.get("sector_name") or "")
@@ -459,27 +473,34 @@ def _market_events(day: date, now: datetime, deadline: float) -> list[dict]:
                 detail["short_name"] = str(raw["stock"].get("short_name") or "")[:128]
         except (TypeError, ValueError):
             pass
-        result.append({"event_type": row["event_type"], "direction": row["direction"],
+        item = {"event_type": row["event_type"], "direction": row["direction"],
                        "stock_code": code or None, "sector_name": sector or None, "snapshot_at": _timestamp(stamp),
-                       "data_source": row["data_source"], "detail_json": detail})
+                       "data_source": row["data_source"], "detail_json": detail}
+        if paged:
+            result[index].update(item)
+        else:
+            result.append(item)
     return result
 
 
-def _limit_up_events(day: date, now: datetime, deadline: float) -> list[dict]:
+def _limit_up_events(day: date, now: datetime, deadline: float, *, before=None, paged=False) -> list[dict]:
+    boundary, bindings = _event_boundary("event_at", 1, before)
+
     rows = _read(get_current_engine(), f"""
-        SELECT /*+ MAX_EXECUTION_TIME(1500) INDEX(sm_limit_up_event idx_limit_up_event_time) */ event_type, stock_code, short_name,
+        SELECT /*+ MAX_EXECUTION_TIME(1500) INDEX(sm_limit_up_event idx_limit_up_event_time) */ event_id, event_type, stock_code, short_name,
                event_at, source_snapshot_at, created_at, source_provider, evidence_json
         FROM {LIMIT_UP_EVENT_TABLE}
         WHERE trade_date=:day AND event_at BETWEEN :opening AND :close_window
           AND event_at<=source_snapshot_at AND source_snapshot_at<=created_at AND created_at<=:now
           AND source_provider=:provider AND limit_status_basis=:basis
           AND event_type IN ('TOUCH','SEAL','RESEAL','BREAK')
+        {boundary}
         ORDER BY event_at DESC, event_id DESC LIMIT :limit
     """, {"day": day.isoformat(), "opening": datetime.combine(day, time(9, 30)),
           "close_window": datetime.combine(day, time(15, 1)), "now": now,
-          "provider": LIVE_SOURCE, "basis": LIMIT_STATUS_BASIS, "limit": _EVENT_LIMIT}, deadline=deadline)
-    result = []
-    for row in rows:
+          "provider": LIVE_SOURCE, "basis": LIMIT_STATUS_BASIS, "limit": 50 if paged else _EVENT_LIMIT, **bindings}, deadline=deadline)
+    result = [{"_cursor": (_clock(row["event_at"]).isoformat(sep=" "), 1, int(row["event_id"]))} for row in rows] if paged else []
+    for index, row in enumerate(rows):
         event_at, source_at, known_at = (_clock(row.get(key)) for key in ("event_at", "source_snapshot_at", "created_at"))
         code, kind = row.get("stock_code"), row.get("event_type")
         if (not event_at or not source_at or not known_at or not event_at <= source_at <= known_at <= now
@@ -494,12 +515,46 @@ def _limit_up_events(day: date, now: datetime, deadline: float) -> list[dict]:
                 or evidence.get("at_limit") is not (kind != "BREAK")
                 or (kind in {"SEAL", "RESEAL", "BREAK"} and evidence.get("sealed") is not (kind != "BREAK"))):
             continue
-        result.append({"event_type": kind, "event_family": "LIMIT_UP_LIFECYCLE", "stock_code": code,
+        item = {"event_type": kind, "event_family": "LIMIT_UP_LIFECYCLE", "stock_code": code,
                        "snapshot_at": event_at.replace(tzinfo=SHANGHAI).isoformat(),
                        "source_snapshot_at": source_at.replace(tzinfo=SHANGHAI).isoformat(),
                        "available_at": known_at.replace(tzinfo=SHANGHAI).isoformat(),
-                       "data_source": row["source_provider"], "detail_json": {"short_name": str(row.get("short_name") or "")[:128]}})
+                       "data_source": row["source_provider"], "detail_json": {"short_name": str(row.get("short_name") or "")[:128]}}
+        if paged:
+            result[index].update(item)
+        else:
+            result.append(item)
     return result
+
+
+@router.get("/monitor/events")
+def monitor_events(requested: str = Query(alias="date", pattern=r"^\d{4}-\d{2}-\d{2}$"),
+                   before: str | None = Query(default=None, max_length=100)) -> dict:
+    now = datetime.now(SHANGHAI).replace(tzinfo=None)
+    try:
+        selected = date.fromisoformat(requested)
+        boundary = None
+        if before:
+            stamp, source, identity = before.split("|")
+            stamp = datetime.fromisoformat(stamp)
+            source, identity = int(source), int(identity)
+            if stamp.tzinfo or stamp.date() != selected or source not in (0, 1) or identity < 1:
+                raise ValueError("invalid cursor")
+            boundary = (stamp, source, identity)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="invalid event date or cursor") from exc
+    deadline = monotonic() + 5
+    try:
+        rows = [*_limit_up_events(selected, now, deadline, before=boundary, paged=True),
+                *_market_events(selected, now, deadline, before=boundary, paged=True)]
+    except (SQLAlchemyError, RuntimeError, TimeoutError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail="event history unavailable; retry") from exc
+    rows.sort(key=lambda row: row["_cursor"], reverse=True)
+    page = rows[:50]
+    cursor = "|".join(map(str, page[-1]["_cursor"])) if len(page) == 50 else None
+    return {"requested_date": requested,
+            "events": [{key: value for key, value in row.items() if key != "_cursor"}
+                       for row in page if "event_type" in row], "next_cursor": cursor}
 
 
 def _distribution(rows: list[dict]) -> list[dict]:

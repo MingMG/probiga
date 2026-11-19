@@ -111,14 +111,14 @@ const request = (url, timeout, options) => new Promise(resolve => calls.push({ur
     try {
         const old = page.load('2026-11-05', container, {request});
         const current = page.load('2026-11-06', container, {request});
-        const paths = ['/api/monitor/data', '/api/hot-data/market-trend', '/api/monitor/board', '/api/monitor/sector-heatmap'];
+        const paths = ['/api/monitor/data', '/api/hot-data/market-trend', '/api/monitor/board', '/api/monitor/sector-heatmap', '/api/monitor/events'];
         const expected = ['2026-11-05','2026-11-06'].flatMap(date => [
             ...paths.map(path => path + '?date=' + date), '/api/hot-data/daily-review-dates',
             '/api/scheduler/daily-delivery?trade_date=' + date + '&attempt_limit=12'
         ]);
         assert.deepEqual(calls.map(call => call.url), expected);
         assert.ok(calls.every(call => call.timeout === (call.url.includes('sector-heatmap') ? 30000 : 15000) && call.options.cache === 'no-store'));
-        assert.equal(container.listeners.size, 2);
+        assert.equal(container.listeners.size, 3);
         calls.slice(paths.length + 2).forEach(call => call.resolve({trade_date:'2026-11-06', data_source:'新日期来源'}));
         await current;
         const listener = container.listeners.get('click');
@@ -216,3 +216,39 @@ def test_sector_heatmap_asset_versions_match_served_bytes():
     for relative in ("js/market-home.js", "css/market-home.css"):
         digest = hashlib.sha256((root / relative).read_bytes()).hexdigest()[:16]
         assert f"/static/{relative}?v={digest}" in index
+
+
+def test_monitor_scroll_loads_older_records_and_retains_scroll_position():
+    run_node(r"""
+global.document = {activeElement:null};
+const list = {scrollTop:0,clientHeight:100,scrollHeight:400,hasAttribute:name=>name==='data-mh-events'};
+const container = {innerHTML:'',listeners:new Map(),contains:target=>Boolean(target),querySelector:()=>list,
+    addEventListener(type,listener) {this.listeners.set(type,listener);},
+    removeEventListener(type) {this.listeners.delete(type);}};
+const date='2026-11-06';
+const event=i=>({stock_code:String(i).padStart(6,'0'),snapshot_at:date+'T10:00:00',detail_json:{short_name:'事件'+i}});
+let olderCalls=0;
+const request=async url=>{
+    if(url.includes('/monitor/events')) {
+        if(url.includes('&before=')) {olderCalls++;return {requested_date:date,events:[event(99)],next_cursor:null};}
+        return {requested_date:date,events:Array.from({length:50},(_,i)=>event(i)),next_cursor:'cursor'};
+    }
+    return {};
+};
+(async()=>{
+    try {
+        await page.load(date,container,{request});
+        assert.ok(container.innerHTML.includes('事件49'));
+        assert.ok(container.innerHTML.includes('mh-event-scroll'));
+        list.scrollTop=280;
+        container.listeners.get('scroll')({target:list});
+        container.listeners.get('scroll')({target:list});
+        await new Promise(resolve=>setImmediate(resolve));
+        assert.equal(olderCalls,1);
+        assert.equal(list.scrollTop,280);
+        assert.ok(container.innerHTML.includes('事件99'));
+        assert.ok(container.innerHTML.includes('事件0'));
+        assert.ok(container.innerHTML.includes('已显示当天全部事件'));
+    } finally {page.stop();}
+})().catch(e=>{console.error(e);process.exitCode=1;});
+""")

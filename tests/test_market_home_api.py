@@ -15,6 +15,37 @@ DAY = date(2026, 11, 6)
 DAY_TEXT = DAY.isoformat()
 
 
+def test_event_history_pages_equal_timestamps_across_sources_without_gaps(market_db):
+    with market_db.begin() as c:
+        for i in range(1, 76):
+            c.execute(text("INSERT INTO sm_limit_up_event VALUES (:id,:day,'RESEAL',:code,'sample',"
+                           "'2026-11-06 10:00:00','2026-11-06 10:00:01','2026-11-06 10:00:02',"
+                           "'gj_big_qmt_inner',:basis,:evidence)"),
+                      {"id": i, "day": DAY_TEXT, "code": f"{i:06d}", "basis": market_home.LIMIT_STATUS_BASIS,
+                       "evidence": json.dumps({"at_limit": True, "sealed": True, "limit_status_basis": market_home.LIMIT_STATUS_BASIS})})
+            c.execute(text("INSERT INTO sm_market_radar_event VALUES (:id,'stock_anomaly','UP',:code,NULL,"
+                           "'2026-11-06 10:00:00','2026-11-06 10:00:03','qmt_full_tick_5level','{}')"),
+                      {"id": i, "code": f"{i + 100:06d}"})
+    seen, cursor = [], None
+    for _ in range(5):
+        page = market_home.monitor_events(DAY_TEXT, before=cursor)
+        seen.extend(row["stock_code"] for row in page["events"])
+        cursor = page["next_cursor"]
+        if not cursor:
+            break
+    assert len(seen) == len(set(seen)) == 150
+    assert seen[:75] == [f"{i:06d}" for i in range(75, 0, -1)]
+    assert seen[75:] == [f"{i+100:06d}" for i in range(75, 0, -1)]
+    assert cursor is None
+
+
+@pytest.mark.parametrize("cursor", ["bad", "2026-11-05 10:00:00|1|2", "2026-11-06 10:00:00|2|1"])
+def test_event_history_rejects_invalid_cursor(cursor):
+    with pytest.raises(HTTPException) as exc:
+        market_home.monitor_events(DAY_TEXT, before=cursor)
+    assert exc.value.status_code == 422
+
+
 def test_concept_members_use_selected_session_quotes(monkeypatch):
     engine = create_engine("sqlite://")
     with engine.begin() as connection:
