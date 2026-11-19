@@ -423,7 +423,7 @@ def _market_events(day: date, now: datetime, deadline: float) -> list[dict]:
 
 def _limit_up_events(day: date, now: datetime, deadline: float) -> list[dict]:
     rows = _read(get_current_engine(), f"""
-        SELECT /*+ MAX_EXECUTION_TIME(1500) */ event_type, stock_code, short_name,
+        SELECT /*+ MAX_EXECUTION_TIME(1500) INDEX(sm_limit_up_event idx_limit_up_event_time) */ event_type, stock_code, short_name,
                event_at, source_snapshot_at, created_at, source_provider, evidence_json
         FROM {LIMIT_UP_EVENT_TABLE}
         WHERE trade_date=:day AND event_at BETWEEN :opening AND :close_window
