@@ -6789,6 +6789,21 @@
         'broad-etf-flow': function (d, c) {
             return loadBroadEtfFlowPage(d, c);
         },
+        'seat-observation': function (d,c) {
+            return window.ResearchTools.load('seats',d,c,{request:fetchRawJsonWithTimeout,stock:window.openStockDetail,isActive:function(){return activeTabId()==='seat-observation';}});
+        },
+        'period-drawdowns': function (d,c) {
+            return window.ResearchTools.load('drawdowns',d,c,{request:fetchRawJsonWithTimeout,stock:window.openStockDetail,isActive:function(){return activeTabId()==='period-drawdowns';}});
+        },
+        'industry-breadth': function (d,c) {
+            return window.ResearchTools.load('breadth',d,c,{request:fetchRawJsonWithTimeout,stock:window.openStockDetail,isActive:function(){return activeTabId()==='industry-breadth';}});
+        },
+        'macro-release': function (d,c) {
+            return window.ResearchTools.load('macro',d,c,{request:fetchRawJsonWithTimeout,isActive:function(){return activeTabId()==='macro-release';}});
+        },
+        'global-context': function (d,c) {
+            return window.ResearchTools.load('global',d,c,{request:fetchRawJsonWithTimeout,isActive:function(){return activeTabId()==='global-context';}});
+        },
         /* ── 主力行为 ── */
         mainforce: function (d, c) {
             loadMainforcePage(d, c);
@@ -8019,7 +8034,11 @@
             {id:'market-context', icon:'◉', label:'市场环境'},
             {id:'market-stage', icon:'◈', label:'大盘走势阶段'},
             {id:'sentiment', icon:'🧠', label:'市场情绪与风格'},
-            {id:'market-outlook', icon:'🔭', label:'明日推演'}
+            {id:'market-outlook', icon:'🔭', label:'明日推演'},
+            {id:'industry-breadth', icon:'▥', label:'行业均线宽度'},
+            {id:'period-drawdowns', icon:'↘', label:'区间高点回撤'},
+            {id:'macro-release', icon:'▦', label:'宏观经济原表'},
+            {id:'global-context', icon:'◎', label:'外围与大类资产'}
         ]},
         {id:'theme', group:'板块与题材', items:[
             {id:'sector', icon:'🌊', label:'板块分析', aliases:['sector-movement','sector-rotation','sector-heat']},
@@ -8037,7 +8056,8 @@
             {id:'capital', icon:'💰', label:'个股资金', aliases:['capital-rt']},
             {id:'broad-etf-flow', icon:'🏛', label:'宽基 ETF 资金'},
             {id:'mainforce', icon:'🔍', label:'主力行为'},
-            {id:'alist', icon:'🐲', label:'龙虎榜'}
+            {id:'alist', icon:'🐲', label:'龙虎榜'},
+            {id:'seat-observation', icon:'◫', label:'公开席位观察'}
         ]},
         {id:'stocks', group:'个股与自选', items:[
             {id:'stock-list', icon:'📋', label:'全市场股票'},

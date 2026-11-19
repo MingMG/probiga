@@ -554,10 +554,10 @@ def load_daily_manifest(engine, day: str, *, decision_known_at: datetime | str,
 
 
 def load_daily_native_evidence(engine, day: str, *,
-                               decision_known_at: datetime | str) -> tuple[dict, dict] | None:
+                               decision_known_at: datetime | str, manifest_hash: str = "") -> tuple[dict, dict] | None:
     """Read a historical native-only market proof and its own exact archival completion."""
     with _scope(engine) as connection:
-        manifest = _load_daily_manifest(connection, day, decision_known_at=decision_known_at,
+        manifest = _load_daily_manifest(connection, day, decision_known_at=decision_known_at, manifest_hash=manifest_hash,
                                         verify_rows=False, dataset=NATIVE_EVIDENCE_DATASET)
         if manifest is None:
             return None

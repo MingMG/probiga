@@ -150,7 +150,7 @@ def _daily_source_valid(row: dict) -> bool:
 def _day_quotes(day: str, now: datetime, deadline: float) -> list[dict]:
     rows = _read(get_kline_engine(), """
         SELECT /*+ MAX_EXECUTION_TIME(2500) */ id, stock_code, short_name, trade_date,
-               close AS price, pre_close, amount, turnover_ratio AS turnover_rate,
+               close AS price, high, pre_close, amount, turnover_ratio AS turnover_rate,
                data_source, quality_status, permission_status
         FROM sm_stock_kline
         WHERE trade_date=:day AND k_type=1 AND adjust_type=0 AND etl_sync_at<=:now
@@ -359,6 +359,27 @@ def _stock_rows(rows: list[dict], day: str, *, live: bool) -> list[dict]:
             "source": row.get("data_source"),
         })
     return result
+
+
+def _close_drawdowns(stocks: list[dict], quotes: list[dict]) -> dict:
+    highs = {row["stock_code"]: _number(row.get("high")) for row in _unique_rows(quotes, "stock_code")}
+    measured = []
+    for row in stocks:
+        high = highs.get(row["stock_code"])
+        if high is None or high < row["price"] or high <= 0:
+            continue
+        measured.append({**row, "high": high, "drawdown_pct": (high - row["price"]) / high * 100})
+    # The video says "more than 7%"; exactly 7% is not above the threshold.
+    large = [row for row in measured if row["drawdown_pct"] > 7 + 1e-9]
+    large.sort(key=lambda row: (-row["drawdown_pct"], row["stock_code"]))
+    return {
+        "status": "unavailable" if not measured else "complete" if len(measured) == len(stocks) else "partial",
+        "threshold_pct": 7, "comparison": "strictly_greater",
+        "count": len(large) if measured else None,
+        "sample_count": len(measured), "expected_sample_count": len(stocks),
+        "formula": "(当日最高价 - 收盘价) / 当日最高价 × 100% > 7%",
+        "rows": large[:_RANK_LIMIT],
+    }
 
 
 def _index_rows(rows: list[dict], day: str, close_at: datetime, now: datetime) -> list[dict]:
@@ -644,6 +665,7 @@ def build_market_board(day: date, *, now: datetime) -> dict:
                         LIMIT_UP_EVENT_TABLE: "qmt_limit_event"}.get(source),
         "sample_size": len(return_stocks), "sample_scope": "verified_quotes_with_price_and_change_pct",
         "price_sample_size": len(stocks),
+        "close_drawdowns": _close_drawdowns(stocks, quotes) if source == "sm_stock_kline" else None,
         "sample_sources": sorted({row["source"] for row in stocks}),
         "distribution": _distribution(return_stocks) if return_stocks else [],
         "strong": {"up_3pct": sum(row["change_pct"] >= 3 for row in up) if return_stocks else None,
