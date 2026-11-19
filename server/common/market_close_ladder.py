@@ -53,7 +53,7 @@ def _path(target: date) -> Path:
     return _cache_root() / f"close-ladder-{target.isoformat()}.json"
 
 
-def _pool(raw: str, target: date) -> list[dict]:
+def _pool(raw: str, target: date, *, observed_at: datetime | None = None) -> list[dict]:
     if not isinstance(raw, str) or len(raw.encode("utf-8")) > _MAX_RAW:
         raise MarketCloseLadderBlocked("close-pool raw response exceeds bound")
     try:
@@ -61,11 +61,21 @@ def _pool(raw: str, target: date) -> list[dict]:
     except ValueError as exc:
         raise MarketCloseLadderBlocked("close-pool response is invalid JSON") from exc
     data = payload.get("data") if isinstance(payload, dict) and type(payload.get("rc")) is int and payload["rc"] == 0 else None
-    if not isinstance(data, dict) or str(data.get("qdate")) != target.strftime("%Y%m%d"):
+    if not isinstance(data, dict):
         raise MarketCloseLadderBlocked("close-pool response does not prove the requested session")
+    try:
+        quote_date = datetime.strptime(str(data.get("qdate")), "%Y%m%d").date()
+    except (TypeError, ValueError) as exc:
+        raise MarketCloseLadderBlocked("close-pool quote date is invalid") from exc
+    # Historical date requests retain the provider's latest quote date. Bind
+    # their nonempty rows to the requested session through every QMT close.
+    if not target <= quote_date <= (observed_at or _now()).date():
+        raise MarketCloseLadderBlocked("close-pool quote date is outside the capture window")
     rows, count = data.get("pool"), data.get("tc")
     if type(count) is not int or not isinstance(rows, list) or not 0 <= count == len(rows) <= _MAX_CODES:
         raise MarketCloseLadderBlocked("close-pool count differs from provider coverage")
+    if not rows and quote_date != target:
+        raise MarketCloseLadderBlocked("empty close-pool does not prove the requested session")
     result = {}
     for row in rows:
         if not isinstance(row, dict):
@@ -150,7 +160,7 @@ def _load_record(target: date, cutoff: datetime) -> tuple[dict, list[dict]] | No
             or digest != canonical_digest(record)):
         raise MarketCloseLadderBlocked("close-pool receipt identity or availability differs")
     raw = record.get("raw_payload")
-    pool = _pool(raw, target)
+    pool = _pool(raw, target, observed_at=observed)
     if len(pool) != record.get("sample_count") or hashlib.sha256(raw.encode("utf-8")).hexdigest() != record.get("raw_sha256"):
         raise MarketCloseLadderBlocked("close-pool response evidence differs")
     return {**record, "receipt_sha256": digest}, pool
@@ -192,7 +202,7 @@ def capture_market_close_ladder(primary, history, target: date) -> dict:
             return {"status": "COMPLETE", "reused": True, **_receipt_summary(record)}
         _, raw = _fetch_pool(target, timeout_seconds=8, max_payload_bytes=_MAX_RAW)
         observed = _now()
-        pool = _pool(raw, target)
+        pool = _pool(raw, target, observed_at=observed)
         quotes = _load_qmt_closes(history, target, pool, observed)
         price_hash = _qmt_close_hash(target, pool, quotes)
         published = _now()

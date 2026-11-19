@@ -85,6 +85,28 @@ def test_mismatched_close_cannot_be_published(source, monkeypatch):
     assert not ladder._path(DAY).exists()
 
 
+def test_historical_pool_with_latest_quote_date_is_bound_to_exact_qmt_closes(source, monkeypatch):
+    monkeypatch.setattr(ladder, "_fetch_pool", lambda *_args, **_kwargs: ([], _raw(qdate=20261107)))
+    result = ladder.capture_market_close_ladder(source, source, DAY)
+    assert result["status"] == "COMPLETE" and result["sample_count"] == 2
+    assert result["trade_date"] == DAY.isoformat()
+    record, pool = ladder._load_record(DAY, OBSERVED)
+    assert json.loads(record["raw_payload"])["data"]["qdate"] == 20261107
+    assert len(pool) == 2
+
+
+@pytest.mark.parametrize("raw", [
+    _raw(qdate=20261107).replace("10100", "10110"),
+    _raw(qdate=20261108),
+    json.dumps({"rc": 0, "data": {"qdate": 20261107, "tc": 0, "pool": []}}),
+])
+def test_historical_quote_date_cannot_publish_wrong_prices_future_or_ambiguous_empty(source, monkeypatch, raw):
+    monkeypatch.setattr(ladder, "_fetch_pool", lambda *_args, **_kwargs: ([], raw))
+    with pytest.raises(ladder.MarketCloseLadderBlocked):
+        ladder.capture_market_close_ladder(source, source, DAY)
+    assert not ladder._path(DAY).exists()
+
+
 def test_exact_explicit_empty_pool_does_not_create_streaks(source, monkeypatch):
     raw = json.dumps({"rc": 0, "data": {"qdate": 20261106, "tc": 0, "pool": []}})
     monkeypatch.setattr(ladder, "_fetch_pool", lambda *_args, **_kwargs: ([], raw))
