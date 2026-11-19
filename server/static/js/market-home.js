@@ -165,12 +165,13 @@
         return `<article class="mh-tile ${extra}"><span class="mh-tile-name">${name}</span><strong class="mh-tile-value">${value}</strong><small class="mh-meta">${foot}</small></article>`;
     }
 
-    function marketObservation(payload, requested) {
+    function marketObservation(payload, requested, fallback) {
         const date = day(payload?.trade_date);
-        if (!date || !requested || date > requested || payload.error || payload.status === 'unavailable') return null;
+        if (!date || !requested || date > requested || payload.error || payload.status === 'unavailable') return fallback ? marketObservation(fallback, requested) : null;
         const counts = [payload.up_count, payload.flat_count, payload.down_count, payload.total_count].map(number);
         const [up, flat, down, total] = counts;
         const valid = counts.every(count => Number.isInteger(count) && count >= 0) && total > 0 && up + flat + down === total;
+        if (!valid && fallback) return marketObservation(fallback, requested);
         return {...payload, trade_date: date, breadth: valid ? {up, flat, down, total} : null};
     }
 
@@ -316,7 +317,7 @@
     }
 
     function observationMeta(market) {
-        return market ? `${escape(market.trade_date)} · ${escape(market.data_source || '来源待核验')}` : '证据待核验';
+        return market ? `${escape(market.trade_date)} · ${escape(market.data_source || '来源待核验')}${market.scope_label ? ' · ' + escape(market.scope_label) : ''}` : '证据待核验';
     }
 
     function snapshotMeta(snapshot) {
@@ -329,11 +330,13 @@
         return `<span class="mh-up">${metric(a, af, digits)}</span><span class="mh-muted"> / </span><span class="mh-down">${metric(b, bf, digits)}</span>`;
     }
 
-    function renderMetrics(market, snapshot) {
+    function renderMetrics(market, snapshot, liveLiquidity, requested) {
         const breadth = market?.breadth;
         const strong = snapshot?.strong || {};
         const limits = snapshot?.limit_ladder;
-        const liquidity = snapshot?.liquidity;
+        const hasLiveLiquidity = liveLiquidity?.status === 'available' && liveLiquidity.trade_date === requested;
+        const liquidity = hasLiveLiquidity ? liveLiquidity : snapshot?.liquidity;
+        const ratio = hasLiveLiquidity ? liquidity.volume_ratio_median : liquidity?.volume_ratio5;
         const limitMeta = limits ? [limits.scope, limits.source].filter(Boolean).map(escape).join(' · ') : '涨跌停证据待核验';
         const count = breadth ? `<span class="mh-up">${metric(breadth.up, '', 0)}</span><span class="mh-muted"> / ${metric(breadth.flat, '', 0)} / </span><span class="mh-down">${metric(breadth.down, '', 0)}</span>` : '—';
         return '<div class="mh-metrics">' +
@@ -342,8 +345,9 @@
             tile('涨停 / 跌停', pair(limits?.limit_up_count, limits?.limit_down_count), limitMeta) +
             tile('最高连板', metric(limits?.max_streak, '板', 0), limits ? limitMeta : '连板证据待核验') +
             tile('成交额', amount(market?.total_amount), observationMeta(market)) +
-            tile('换手中位 / 收盘日量比', metric(liquidity?.turnover_median_pct, '%') + ' / ' + metric(liquidity?.volume_ratio5, '倍'),
-                liquidity ? `换手 ${metric(liquidity.turnover_sample_count, '只', 0)} · 日量比同样本 ${metric(liquidity.volume_sample_count, '只', 0)} · 较前5个完整交易日均量` : '收盘换手和成交量证据待核验') + '</div>';
+            tile(hasLiveLiquidity ? '换手中位 / 盘中量比中位' : '换手中位 / 收盘日量比', metric(liquidity?.turnover_median_pct, '%') + ' / ' + metric(ratio, '倍'),
+                liquidity ? `换手 ${metric(liquidity.turnover_sample_count, '只', 0)} · ${hasLiveLiquidity ? '量比' : '日量比同样本'} ${metric(liquidity.volume_sample_count, '只', 0)} · ` +
+                    (hasLiveLiquidity ? `${escape(liquidity.definition)} · 数据时间 ${escape(liquidity.as_of)}` : '较前5个完整交易日均量') : '换手和量比数据待核验') + '</div>';
     }
 
     function renderBreadth(market, snapshot) {
@@ -483,7 +487,8 @@
     function renderEvents(snapshot, requested) {
         const events = rows(snapshot?.events).filter(item => day(item.snapshot_at) === requested && requested);
         const heading = escape(requested || '日期待核验');
-        if (!events.length && !snapshot?.next_cursor) return panel('监控中心', heading, empty('所选交易日的异动事件证据待核验') + link('market-radar', '查看异动雷达'), 'mh-third');
+        if (!events.length && !snapshot?.next_cursor) return panel('监控中心', heading,
+            empty(snapshot?.requested_date === requested && Array.isArray(snapshot.events) ? '当日暂无已记录的监控事件' : '所选交易日的异动事件证据待核验') + link('market-radar', '查看异动雷达'), 'mh-third');
         const limitLabels = {TOUCH:'触及涨停', SEAL:'涨停封板', RESEAL:'涨停回封', BREAK:'涨停开板'};
         return panel('监控中心', heading, '<div class="mh-list mh-event-scroll" data-mh-events tabindex="0" role="region" aria-label="监控事件，向下滚动查看更早记录">' + events.map(item => {
             const detail = item.detail_json || {};
@@ -544,8 +549,8 @@
     }
 
     function render(state, requested, clock, modes = {}) {
-        const market = marketObservation(state.market, requested);
         const snapshot = snapshotObservation(state.snapshot, requested);
+        const market = marketObservation(state.market, requested, snapshot?.market_overview);
         const labels = {realtime: '盘中快照', close: '收盘观察', paused: '午间快照', stale: '行情已过期'};
         const boardPhase = {qmt_snapshot: '盘中快照', exchange_close: '收盘观察', public_index_snapshot: '盘中指数', public_stock_ranking: '盘中排名'}[snapshot?.as_of_basis] || '数据待核验';
         const phase = !market ? boardPhase : market.trade_date < requested ? '历史回退' : labels[market.freshness_status] || '已存行情';
@@ -555,7 +560,7 @@
             `<div class="mh-head-actions"><span class="mh-meta">请求 ${escape(requested || '日期待核验')} · 行情 ${escape(stamp || '待核验')}${observationLag(market, clock, requested)}</span>` +
             '<button type="button" class="mh-retry" data-mh-refresh>重载</button></div></header>';
         return renderHub(state, requested, clock, modes, market, snapshot) + markup +
-            renderIndexStrip(requested, market, state.trend, snapshot) + renderMetrics(market, snapshot) +
+            renderIndexStrip(requested, market, state.trend, snapshot) + renderMetrics(market, snapshot, state.liquidity, requested) +
             '<div class="mh-grid">' + renderBreadth(market, snapshot) + renderEmotion(market) + renderTrend(state.trend, market, snapshot, requested) +
             renderLadder(snapshot) + renderDrawdowns(snapshot) +
             renderSector('concept', '概念热度', state.heatmap, requested, modes.concept || 'change') +
@@ -587,6 +592,7 @@
             trend: '/api/hot-data/market-trend?date=' + query,
             snapshot: '/api/monitor/board?date=' + query,
             heatmap: '/api/monitor/sector-heatmap?date=' + query,
+            liquidity: '/api/monitor/liquidity?date=' + query,
             events: '/api/monitor/events?date=' + query,
             reviewDates: '/api/hot-data/daily-review-dates',
             delivery: '/api/scheduler/daily-delivery?trade_date=' + query + '&attempt_limit=12'};
@@ -633,7 +639,7 @@
             session.pending = Promise.all(keys.map(async key => {
                 let value = null;
                 try {
-                    value = await options.request(paths[key], key === 'heatmap' ? 30000 : 15000, {cache: 'no-store'});
+                    value = await options.request(paths[key], ['heatmap', 'liquidity'].includes(key) ? 30000 : 15000, {cache: 'no-store'});
                 } catch {
                     // Other data sources stay available when this request fails.
                 }
@@ -642,7 +648,7 @@
                     paint();
                 }
             })).then(() => {
-                if (current() && !marketObservation(session.state.market, requested)?.breadth) return {loadError: '市场广度暂不可用'};
+                if (current() && !marketObservation(session.state.market, requested, snapshotObservation(session.state.snapshot, requested)?.market_overview)?.breadth) return {loadError: '市场广度暂不可用'};
                 return {};
             }).finally(() => { session.pending = null; });
             return session.pending;
@@ -655,9 +661,9 @@
                 try {
                     if (document.hidden || options.isActive?.() === false) return;
                     const clock = options.refreshClock ? await options.refreshClock() : options.clock?.();
-                    if (current() && clock?.is_intraday === true && day(clock.active_trade_date) === requested) {
+                    if (current() && (clock?.is_intraday === true || ['midday_break', 'postmarket'].includes(clock?.phase)) && day(clock.active_trade_date) === requested) {
                         const readingHistory = (container.querySelector?.('[data-mh-events]')?.scrollTop || 0) > 0;
-                        await refresh(['market', 'snapshot', 'heatmap', ...(readingHistory ? [] : ['events'])]);
+                        await refresh(['market', 'snapshot', 'heatmap', 'liquidity', ...(readingHistory ? [] : ['events'])]);
                     }
                 } catch {
                     // A failed clock refresh must not relabel the previous observation.

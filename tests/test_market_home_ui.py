@@ -111,13 +111,13 @@ const request = (url, timeout, options) => new Promise(resolve => calls.push({ur
     try {
         const old = page.load('2026-11-05', container, {request});
         const current = page.load('2026-11-06', container, {request});
-        const paths = ['/api/monitor/data', '/api/hot-data/market-trend', '/api/monitor/board', '/api/monitor/sector-heatmap', '/api/monitor/events'];
+        const paths = ['/api/monitor/data', '/api/hot-data/market-trend', '/api/monitor/board', '/api/monitor/sector-heatmap', '/api/monitor/liquidity', '/api/monitor/events'];
         const expected = ['2026-11-05','2026-11-06'].flatMap(date => [
             ...paths.map(path => path + '?date=' + date), '/api/hot-data/daily-review-dates',
             '/api/scheduler/daily-delivery?trade_date=' + date + '&attempt_limit=12'
         ]);
         assert.deepEqual(calls.map(call => call.url), expected);
-        assert.ok(calls.every(call => call.timeout === (call.url.includes('sector-heatmap') ? 30000 : 15000) && call.options.cache === 'no-store'));
+        assert.ok(calls.every(call => call.timeout === (/sector-heatmap|liquidity/.test(call.url) ? 30000 : 15000) && call.options.cache === 'no-store'));
         assert.equal(container.listeners.size, 3);
         calls.slice(paths.length + 2).forEach(call => call.resolve({trade_date:'2026-11-06', data_source:'新日期来源'}));
         await current;
@@ -280,4 +280,42 @@ const html=page.render({snapshot},date);
 assert.ok(html.includes('东财盘中换手样本 · 2026-11-19T10:29:50+08:00 · eastmoney.push2.f8'));
 assert.ok(html.includes('华东重机'));
 assert.ok(html.includes('10.32%'));
+""")
+
+
+def test_intraday_metrics_use_verified_board_when_aggregate_fails():
+    run_node(r"""
+const date='2026-11-19';
+const overview={status:'available',trade_date:date,data_source:'sm_stock_current',scope_label:'已核验行情样本',
+    data_time:date+'T10:30:00+08:00',total_count:10,up_count:6,flat_count:1,down_count:3,total_amount:123000000,
+    freshness_status:'realtime'};
+const snapshot={status:'partial',trade_date:date,as_of:date+'T10:30:00+08:00',market_overview:overview};
+const liquidity={status:'available',trade_date:date,as_of:date+'T10:29:50+08:00',turnover_median_pct:2.35,
+    turnover_sample_count:9,volume_ratio_median:1.23,volume_sample_count:8,definition:'源端逐股量比中位数'};
+const html=page.render({snapshot,market:{status:'unavailable'},liquidity},date);
+for(const value of ['上涨占比 60.0%','1.23亿','2.35% / 1.23倍','盘中量比中位','已核验行情样本','10:29:50']) assert.ok(html.includes(value),value);
+assert.ok(!html.includes('市场情绪观察待核验'));
+assert.ok(!html.includes('涨跌家数待核验'));
+assert.ok(!page.render({snapshot,liquidity:{...liquidity,trade_date:'2026-11-18'}},date).includes('2.35% / 1.23倍'));
+""")
+
+
+def test_home_keeps_refreshing_through_lunch_and_after_close():
+    run_node(r"""
+global.document={activeElement:null,hidden:false};
+let tick;
+global.setTimeout=fn=>{tick=fn;return 1;};global.clearTimeout=()=>{};
+const calls=[];
+const container={innerHTML:'',contains:()=>false,addEventListener:()=>{},removeEventListener:()=>{}};
+const clock={phase:'midday_break',active_trade_date:'2026-11-19',is_intraday:false};
+const request=async url=>{calls.push(url);return {};};
+(async()=>{try {
+ await page.load('2026-11-19',container,{request,refreshClock:async()=>clock});
+ calls.length=0;await tick();
+ assert.ok(calls.some(url=>url.includes('/monitor/liquidity')));
+ assert.ok(calls.some(url=>url.includes('/monitor/board')));
+ calls.length=0;clock.phase='postmarket';await tick();
+ assert.ok(calls.some(url=>url.includes('/monitor/liquidity')));
+ assert.ok(calls.some(url=>url.includes('/monitor/board')));
+}finally{page.stop();}})().catch(e=>{console.error(e);process.exitCode=1;});
 """)

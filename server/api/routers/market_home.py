@@ -23,6 +23,7 @@ from server.common.current_data import get_current_engine
 from server.common.daily_delivery_control import load_completed_market_capture_receipt
 from server.common.kline_data import get_kline_engine
 from server.common.index_live import read_live_indices
+from server.common.liquidity_live import read_live_liquidity
 from server.common.turnover_live import read_live_turnover
 from server.common.limit_up_events import LIMIT_STATUS_BASIS
 from server.common.limit_up_event_schema import LIMIT_UP_EVENT_TABLE
@@ -771,6 +772,17 @@ def build_market_board(day: date, *, now: datetime) -> dict:
         "price_sample_size": len(stocks),
         "close_drawdowns": _close_drawdowns(stocks, quotes) if source == "sm_stock_kline" else None,
         "sample_sources": sorted({row["source"] for row in stocks}),
+        "market_overview": {
+            "status": "available", "trade_date": day_text, "requested_date": day_text,
+            "data_time": _timestamp(as_of), "data_source": source, "scope_label": "已核验行情样本",
+            "timezone": "Asia/Shanghai", "is_realtime": bool(live),
+            "freshness_status": "realtime" if live else "paused" if lunch else "close",
+            "total_count": len(return_stocks), "up_count": len(up), "down_count": len(down),
+            "flat_count": len(return_stocks)-len(up)-len(down),
+            "total_amount": sum(row["amount"] for row in return_stocks)
+                if all(row["amount"] is not None for row in return_stocks) else None,
+            "heat_percentile_method": "当前核验行情样本；历史比较暂不可用",
+        } if return_stocks else None,
         "distribution": _distribution(return_stocks) if return_stocks else [],
         "strong": {"up_3pct": sum(row["change_pct"] >= 3 for row in up) if return_stocks else None,
                    "down_3pct": sum(row["change_pct"] <= -3 for row in down) if return_stocks else None},
@@ -794,6 +806,24 @@ def build_market_board(day: date, *, now: datetime) -> dict:
         "indices": indices, "missing_index_codes": missing_indices,
         "events": events, "limit_ladder": limit_ladder, "unavailable_fields": unavailable,
     }
+
+
+@router.get("/monitor/liquidity")
+def market_liquidity(requested: str = Query(alias="date", pattern=r"^\d{4}-\d{2}-\d{2}$")) -> dict:
+    now = datetime.now(SHANGHAI).replace(tzinfo=None)
+    try:
+        selected = date.fromisoformat(requested)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="invalid liquidity date") from exc
+    if selected != now.date() or not (_live_session(now) or time(11, 30) < now.time() < time(13)):
+        return {"status": "not_intraday", "requested_date": requested}
+    deadline = monotonic()+22
+    try:
+        if not _trading_day(requested, deadline):
+            return {"status": "not_intraday", "requested_date": requested}
+        return read_live_liquidity(requested, now=now, deadline=deadline)
+    except (OSError, sqlite3.Error, RuntimeError, TimeoutError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail="intraday liquidity source unavailable; retry") from exc
 
 
 @router.get("/monitor/board")

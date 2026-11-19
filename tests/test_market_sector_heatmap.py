@@ -227,3 +227,22 @@ def test_live_source_failure_does_not_block_other_board_or_reuse_stale_rows(heat
     result = market_home.build_sector_heatmap(date.fromisoformat(DAY), now=now)
     assert result["concept"]["change"]["status"] == "unavailable"
     assert result["industry"]["change"]["status"] == "available"
+
+
+def test_bulk_source_fields_supply_the_intraday_five_day_return(heatmap_db, monkeypatch):
+    from tools import sync_eastmoney_concept_market as provider
+    now = datetime(2026, 11, 6, 10, 30)
+    with heatmap_db.begin() as c:
+        previous = 100
+        for day, close in zip(SESSIONS[:-1], [110, 112, 114, 108]):
+            _quote(c, "BK0120", day, previous, close)
+            previous = close
+    def request(url, params, **kwargs):
+        concept = params["fs"].endswith(":3")
+        row = _live_row("BK0120" if concept else "BK1201", "概念" if concept else "计算机", now)
+        returned = {key: value for key, value in row.items() if key in params["fields"].split(",")}
+        return {"rc": 0, "data": {"total": 1, "diff": [returned]}}
+    monkeypatch.setattr(provider, "_resolved_curl_json", request)
+    payload = market_home.build_sector_heatmap(date.fromisoformat(DAY), now=now)
+    assert payload["concept"]["five_day_return"]["status"] == "available"
+    assert payload["concept"]["five_day_return"]["rows"][0]["value"] == 20
