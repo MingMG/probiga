@@ -922,6 +922,70 @@ def _concept_flow_history_coverage(selected: str, now: datetime, codes: set[str]
     return None
 
 
+def _live_sector_metrics(result, changes, industry_changes, sessions, now):
+    from server.common.sector_live import read_live_boards
+    from tools.fetch_sector_heat_east_daily import _build_fixed_industry_rows, _source_timestamp
+    selected = sessions[-1]
+    try:
+        snapshots = read_live_boards(selected, now=now)
+    except (OSError, sqlite3.Error, RuntimeError, TimeoutError, ValueError) as exc:
+        snapshots = {"error_3": str(exc), "error_2": str(exc)}
+    anchor = now
+    if time(11, 30) < now.time() < time(13):
+        anchor = now.replace(hour=11, minute=30, second=0, microsecond=0)
+    elif now.time() > time(15):
+        anchor = now.replace(hour=15, minute=0, second=0, microsecond=0)
+    for kind, section, history, source in (
+        (3, "concept", changes, _HEATMAP_CONCEPT_SOURCE),
+        (2, "industry", industry_changes, _HEATMAP_INDUSTRY_SOURCE),
+    ):
+        rows = snapshots.get(kind, [])
+        stamps = [_source_timestamp(row["f124"]) for row in rows]
+        as_of = min(stamps) if stamps else None
+        # Do not carry a stale board into a current ranking. Lunch/close pauses
+        # measure age against the end of the preceding trading window.
+        fresh = as_of is not None and (anchor - as_of).total_seconds() <= 180
+        metrics = result[section]
+        if not fresh:
+            for metric in metrics.values():
+                metric.update(status="unavailable", rows=[], as_of=as_of.isoformat(sep=" ") if as_of else None,
+                              note="盘中板块数据已过期" if rows else "盘中板块源暂不可用，将自动重试")
+            continue
+        names = {row["f12"]: row["f14"] for row in rows}
+        current, flow = [], []
+        if kind == 3:
+            current = [{"code": row["f12"], "session": selected, "change_pct": row.get("f3"),
+                        "close": row.get("f2"), "change": row.get("f4")} for row in rows]
+            flow_names = names
+        else:
+            fixed, _ = _build_fixed_industry_rows([
+                {"concept_code": row["f12"], "concept_name": row["f14"],
+                 "change_pct": _number(row.get("f3")), "hot_value": _number(row.get("f6"))}
+                for row in rows
+            ])
+            current = [{"code": row["concept_name"], "session": selected, "change_pct": row["change_pct"]} for row in fixed]
+            names = {row["code"]: row["code"] for row in current}
+            flow_names = {row["concept_code"]: row["concept_name"] for row in fixed if row["hot_tag"] == "东财一级行业成交额"}
+        metrics["change"], metrics["five_day_return"] = _sector_changes(
+            [row for row in history if str(row["session"])[:10] != selected] + current,
+            names, sessions, source, native=(kind == 3),
+        )
+        flow_source = _HEATMAP_CONCEPT_FLOW_SOURCE if kind == 3 else _HEATMAP_INDUSTRY_FLOW_SOURCE
+        for row in rows:
+            main, largest, big = map(_number, (row.get("f62"), row.get("f66"), row.get("f72")))
+            if row["f12"] in flow_names and None not in (main, largest, big) and abs(main - largest - big) <= 0.03:
+                flow.append({"code": row["f12"], "name": flow_names[row["f12"]], "value": main, "source": flow_source})
+        metrics["net_inflow"] = _sector_rank(flow, flow_source)
+        for mode, metric in metrics.items():
+            metric["as_of"] = as_of.isoformat(sep=" ")
+            metric["note"] += " · 盘中快照，每分钟刷新" + (" · 前4日加当日盘中" if mode == "five_day_return" else "")
+            if mode == "five_day_return":
+                for row in metric["rows"]:
+                    row["series_label"] = "前4日及当日盘中"
+    result["observation_mode"] = "intraday"
+    return result
+
+
 def build_sector_heatmap(day: date, *, now: datetime) -> dict:
     selected = day.isoformat()
     concept = {"change": _sector_rank([], _HEATMAP_CONCEPT_SOURCE),
@@ -931,7 +995,7 @@ def build_sector_heatmap(day: date, *, now: datetime) -> dict:
                 "five_day_return": _sector_rank([], _HEATMAP_INDUSTRY_SOURCE),
                 "net_inflow": _sector_rank([], _HEATMAP_INDUSTRY_FLOW_SOURCE)}
     result = {"requested_date": selected, "trade_date": None, "concept": concept, "industry": industry}
-    if day > now.date() or (day == now.date() and now.time() < time(15)):
+    if day > now.date() or (day == now.date() and now.time() < time(9, 25)):
         return result
     deadline = monotonic() + 8
     sessions = _sector_read(get_engine, """
@@ -944,6 +1008,7 @@ def build_sector_heatmap(day: date, *, now: datetime) -> dict:
     if not sessions or sessions[-1] != selected or len(set(sessions)) != len(sessions):
         return result
     result["trade_date"] = selected
+    live = day == now.date() and now.time() < time(15, 10)
     bounds = {"selected": selected, "start": sessions[0], "now": now}
     changes = _sector_read(get_kline_engine, """
         SELECT /*+ MAX_EXECUTION_TIME(1800) */ index_code AS code, trade_date AS session, trade_time,
@@ -952,6 +1017,14 @@ def build_sector_heatmap(day: date, *, now: datetime) -> dict:
           AND etl_sync_at <= :now LIMIT :limit
     """, bounds, deadline=deadline, limit=len(sessions) * _HEATMAP_BOARD_LIMIT, stage="concept closes")
     changes = [row for row in changes if _clock(row["trade_time"]) == _clock(row["session"])]
+    industry_changes = _sector_read(get_engine, """
+        SELECT /*+ MAX_EXECUTION_TIME(1500) */ concept_name AS code, concept_code AS native_code,
+               snapshot_date AS session, change_pct, hot_tag
+        FROM st_hot_concept_ths_daily WHERE plate_type=3 AND snapshot_date BETWEEN :start AND :selected
+          AND hot_tag LIKE '东财一级行业%' AND etl_sync_at <= :now LIMIT :limit
+    """, bounds, deadline=deadline, limit=len(sessions) * 100, stage="industry closes")
+    if live:
+        return _live_sector_metrics(result, changes, industry_changes, sessions, now)
     flows = _sector_read(get_engine, """
         SELECT /*+ MAX_EXECUTION_TIME(1400) */ index_code AS code, MAX(index_name) AS name,
                MAX(main_net_inflow) AS main_net_inflow, MAX(max_net_inflow) AS max_net_inflow, MAX(lg_net_inflow) AS lg_net_inflow
@@ -970,12 +1043,6 @@ def build_sector_heatmap(day: date, *, now: datetime) -> dict:
             flow_rows.append({"code": code, "name": names.get(code, code), "value": main, "source": _HEATMAP_CONCEPT_FLOW_SOURCE})
     concept["net_inflow"] = _sector_rank(flow_rows, _HEATMAP_CONCEPT_FLOW_SOURCE)
 
-    industry_changes = _sector_read(get_engine, """
-        SELECT /*+ MAX_EXECUTION_TIME(1500) */ concept_name AS code, concept_code AS native_code,
-               snapshot_date AS session, change_pct, hot_tag
-        FROM st_hot_concept_ths_daily WHERE plate_type=3 AND snapshot_date BETWEEN :start AND :selected
-          AND hot_tag LIKE '东财一级行业%' AND etl_sync_at <= :now LIMIT :limit
-    """, bounds, deadline=deadline, limit=len(sessions) * 100, stage="industry closes")
     # The collector's fixed industry names identify the board. Its representative
     # vendor code may change when a primary industry aggregates several children.
     industry_names = {row["code"]: row["code"] for row in industry_changes if row["code"]}

@@ -454,7 +454,8 @@
             return `<li class="mh-heat-cell ${tone(value)}" style="--mh-heat-fill:${fill}%"><button type="button" class="mh-link mh-heat-name" data-mh-board="${kind}" data-mh-board-code="${escape(item.code)}">${escape(item.name)}</button>` +
                 `<strong>${heatValue(value, mode)}</strong>${heatSeries(item.series, item.series_label)}<small class="mh-heat-source">${source}</small></li>`;
         }).join('') + '</ul>' : empty(payload === undefined && requested ? '正在加载板块热力图…' : `所选交易日暂无可核验的${label}数据`);
-        const note = metricResult?.note ? `<p class="mh-meta mh-heat-note">${escape(metricResult.note)}</p>` : '';
+        const stamp = metricResult?.as_of ? ` · 数据时间 ${metricResult.as_of}` : '';
+        const note = metricResult?.note ? `<p class="mh-meta mh-heat-note">${escape(metricResult.note + stamp)}</p>` : '';
         return panel(title, escape(exact ? requested : '证据待核验'), controls +
             `<div id="mh-heatmap-${kind}">${plot}${note}</div>` +
             (kind === 'concept' ? link('concept', '查看概念详情', mode === 'five_day_return' ? 'c5' : 'c0') :
@@ -607,7 +608,7 @@
             session.pending = Promise.all(keys.map(async key => {
                 let value = null;
                 try {
-                    value = await options.request(paths[key], 15000, {cache: 'no-store'});
+                    value = await options.request(paths[key], key === 'heatmap' ? 30000 : 15000, {cache: 'no-store'});
                 } catch {
                     // Other data sources stay available when this request fails.
                 }

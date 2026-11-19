@@ -114,7 +114,7 @@ def test_heatmap_ranks_full_sources_and_binds_each_metric_to_the_selected_sessio
 
 
 def test_missing_or_nontrading_day_does_not_relabel_an_earlier_snapshot(heatmap_db):
-    for day, now in [(date(2026, 11, 7), NOW), (date(2026, 11, 6), datetime(2026, 11, 6, 13))]:
+    for day, now in [(date(2026, 11, 7), NOW), (date(2026, 11, 6), datetime(2026, 11, 6, 9))]:
         payload = market_home.build_sector_heatmap(day, now=now)
         assert payload["requested_date"] == day.isoformat()
         assert payload["trade_date"] is None
@@ -153,3 +153,77 @@ def test_private_flow_partition_is_idempotent_and_preserves_last_valid_publicati
         publish_industry_flow(DAY, [{**_flow("BK1201", "计算机", 4), "lg_net_inflow": 1}])
     assert float(read_industry_flow(DAY, now=NOW)[0]["main_net_inflow"]) == 0
     assert read_industry_flow("2026-11-05", now=NOW) == []
+
+
+def _live_row(code, name, stamp, pct=2):
+    from zoneinfo import ZoneInfo
+    return {"f12": code, "f14": name, "f124": int(stamp.replace(tzinfo=ZoneInfo("Asia/Shanghai")).timestamp()),
+            "f2": 120, "f3": pct, "f4": 12, "f6": 1000,
+            "f62": 120, "f66": 80, "f72": 40}
+
+
+def test_intraday_endpoint_uses_live_observations_and_previous_four_closes(heatmap_db, monkeypatch):
+    from server.common import sector_live
+    now = datetime(2026, 11, 6, 10, 30)
+    with heatmap_db.begin() as c:
+        previous = 100
+        for day, close in zip(SESSIONS[:-1], [110, 112, 114, 108]):
+            _quote(c, "BK0120", day, previous, close)
+            previous = close
+    calls = []
+    def capture(kind, selected, observed, deadline):
+        calls.append(kind)
+        return [_live_row("BK0120" if kind == 3 else "BK1201", "概念盘中" if kind == 3 else "计算机", now - timedelta(seconds=20))]
+    monkeypatch.setattr(sector_live, "_fetch", capture)
+    payload = market_home.build_sector_heatmap(date.fromisoformat(DAY), now=now)
+    assert payload["trade_date"] == DAY and payload["observation_mode"] == "intraday"
+    assert payload["concept"]["change"]["rows"][0]["name"] == "概念盘中"
+    assert payload["concept"]["change"]["as_of"] == f"{DAY} 10:29:40"
+    assert payload["concept"]["five_day_return"]["rows"][0]["value"] == 20
+    assert payload["concept"]["net_inflow"]["rows"][0]["value"] == 120
+    assert payload["industry"]["change"]["rows"][0]["name"] == "计算机"
+    assert payload["industry"]["net_inflow"]["rows"][0]["value"] == 120
+    again = market_home.build_sector_heatmap(date.fromisoformat(DAY), now=now + timedelta(seconds=10))
+    assert again["concept"] == payload["concept"]
+    assert sorted(calls) == [2, 3]  # Durable snapshot reused without new source capture.
+
+
+@pytest.mark.parametrize("clock,source,available", [("10:30", "10:20", False), ("12:30", "11:29", True)])
+def test_live_staleness_and_lunch_pause(heatmap_db, monkeypatch, clock, source, available):
+    from server.common import sector_live
+    now = datetime.fromisoformat(f"{DAY} {clock}")
+    stamp = datetime.fromisoformat(f"{DAY} {source}")
+    monkeypatch.setattr(sector_live, "_fetch", lambda kind, *args: [_live_row("BK1201", "计算机", stamp)])
+    payload = market_home.build_sector_heatmap(date.fromisoformat(DAY), now=now)
+    assert (payload["concept"]["change"]["status"] == "available") == available
+    if not available:
+        assert payload["concept"]["change"]["rows"] == []
+        assert "已过期" in payload["concept"]["change"]["note"]
+
+
+def test_live_pagination_rejects_duplicates_and_partial_inventory(monkeypatch):
+    from server.common import sector_live
+    from tools import sync_eastmoney_concept_market as provider
+    from time import monotonic
+    now = datetime(2026, 11, 6, 10, 30)
+    def request(url, params, **kwargs):
+        rows = [_live_row(f"BK{i:04d}", str(i), now) for i in range(100)]
+        if params["pn"] == 2:
+            rows = rows[:1]  # Duplicate identity in another page.
+        return {"rc": 0, "data": {"total": 101, "diff": rows}}
+    monkeypatch.setattr(provider, "_resolved_curl_json", request)
+    with pytest.raises(ValueError, match="identity"):
+        sector_live._fetch(3, DAY, now, monotonic() + 10)
+
+
+def test_live_source_failure_does_not_block_other_board_or_reuse_stale_rows(heatmap_db, monkeypatch):
+    from server.common import sector_live
+    now = datetime(2026, 11, 6, 10, 30)
+    def capture(kind, *args):
+        if kind == 3:
+            raise RuntimeError("sector_live: source timed out")
+        return [_live_row("BK1201", "计算机", now)]
+    monkeypatch.setattr(sector_live, "_fetch", capture)
+    result = market_home.build_sector_heatmap(date.fromisoformat(DAY), now=now)
+    assert result["concept"]["change"]["status"] == "unavailable"
+    assert result["industry"]["change"]["status"] == "available"
