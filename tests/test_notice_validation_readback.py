@@ -5,6 +5,7 @@ import zlib
 
 import pytest
 from sqlalchemy import create_engine, event, text
+from sqlalchemy.exc import OperationalError
 
 from biz.notice import sync_notice_em as notice
 from server.common import scheduler_validation as validation
@@ -203,6 +204,49 @@ def test_notice_readback_stops_at_total_deadline_after_one_real_batch(monkeypatc
     with pytest.raises(RuntimeError, match="notice_readback: total deadline exceeded"):
         validation._read_notice_validation_window(engine, codes=codes,
             window_start=date(2026, 9, 18), window_end=date(2026, 11, 3))
+    engine.dispose()
+
+
+@pytest.mark.parametrize("error_code", [1205, 1213, 2006, 2013, 3024])
+def test_notice_readback_recovers_transient_batch_without_changing_rows(monkeypatch, error_code):
+    engine, codes, _receipt = _fixture(code_count=55)
+    window = dict(codes=codes, window_start=date(2026, 9, 18), window_end=date(2026, 11, 3))
+    expected = validation._read_notice_validation_window(engine, **window)
+    failed = False
+
+    def transient(_conn, _cursor, sql, params, _context, _many):
+        nonlocal failed
+        if "FROM si_notice_eastmoney AS notice" in sql and not failed:
+            failed = True
+            raise OperationalError(sql, params, Exception(error_code, "transient read failure"))
+
+    event.listen(engine, "before_cursor_execute", transient)
+    monkeypatch.setattr(validation, "sleep", lambda _seconds: None)
+    actual = validation._read_notice_validation_window(engine, **window)
+    assert failed
+    assert actual == expected
+    assert notice._notice_row_hash(actual) == notice._notice_row_hash(expected)
+    engine.dispose()
+
+
+@pytest.mark.parametrize("error_code, expected_attempts", [(3024, 3), (1142, 1)])
+def test_notice_readback_bounds_failures_and_preserves_error(monkeypatch, error_code, expected_attempts):
+    engine, codes, _receipt = _fixture(code_count=1)
+    attempts = 0
+
+    def fail(_conn, _cursor, sql, params, _context, _many):
+        nonlocal attempts
+        if "FROM si_notice_eastmoney AS notice" in sql:
+            attempts += 1
+            raise OperationalError(sql, params, Exception(error_code, "read failed"))
+
+    event.listen(engine, "before_cursor_execute", fail)
+    monkeypatch.setattr(validation, "sleep", lambda _seconds: None)
+    with pytest.raises(OperationalError) as caught:
+        validation._read_notice_validation_window(engine, codes=codes,
+            window_start=date(2026, 9, 18), window_end=date(2026, 11, 3))
+    assert caught.value.orig.args[0] == error_code
+    assert attempts == expected_attempts
     engine.dispose()
 
 
