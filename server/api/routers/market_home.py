@@ -594,6 +594,10 @@ def build_market_board(day: date, *, now: datetime) -> dict:
         stocks = []
         as_of, source, stage = None, None, "live_quote_expired"
     unavailable = [] if limit_ladder is not None else ["limit_ladder"]
+    if limit_ladder is not None:
+        for field in ("limit_down_count", "opened_limit_up_count"):
+            if limit_ladder.get(field) is None:
+                unavailable.append("limit_ladder." + field)
     if not events:
         unavailable.append("events")
     amount_complete = bool(stocks) and all(row["amount"] is not None for row in stocks)

@@ -148,7 +148,8 @@ def test_complete_close_survives_slower_quote_read_and_caches_exact_date(market_
 
     monkeypatch.setattr(market_home, "monotonic", lambda: elapsed)
     monkeypatch.setattr(market_home, "_day_quotes", slow_quotes)
-    monkeypatch.setattr(market_home, "load_market_close_ladder", lambda *_, **__: {"count": 1})
+    monkeypatch.setattr(market_home, "load_market_close_ladder", lambda *_, **__:
+        {"count": 1, "limit_down_count": 0, "opened_limit_up_count": 0})
     monkeypatch.setattr(market_home, "_limit_up_events", lambda *_: [{"snapshot_at": "2026-11-06T10:00:00"}])
     monkeypatch.setattr(market_home, "_close_liquidity", lambda *_: {"volume_ratio5": 1})
 
@@ -207,6 +208,20 @@ def test_zero_reference_volume_is_unknown_instead_of_fabricated_zero(market_db):
     result = market_home._close_liquidity(DAY_TEXT, [{"stock_code": "000001", "turnover_rate": 1}],
         datetime(2026, 11, 7), float("inf"))
     assert result["volume_ratio5"] is None and result["volume_sample_count"] == 1
+
+
+@pytest.mark.parametrize("counts,missing", [
+    ({}, {"limit_ladder.limit_down_count", "limit_ladder.opened_limit_up_count"}),
+    ({"limit_down_count": 0, "opened_limit_up_count": 0}, set()),
+])
+def test_close_pool_partial_publication_keeps_completed_pool_and_names_missing_fields(market_db, monkeypatch, counts, missing):
+    with market_db.begin() as connection:
+        _stock(connection, "000001", 100)
+    retained = {"count": 1, "limit_up_count": 1, **counts}
+    monkeypatch.setattr(market_home, "load_market_close_ladder", lambda *_, **__: retained)
+    result = market_home.build_market_board(DAY, now=datetime(2026, 11, 7))
+    assert result["limit_ladder"] == retained
+    assert {key for key in result["unavailable_fields"] if key.startswith("limit_ladder.")} == missing
 
 
 def test_index_close_requires_exact_marker_and_post_close_ingestion(market_db):
