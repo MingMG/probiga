@@ -22,6 +22,8 @@ def source(monkeypatch):
             "CREATE TABLE st_hot_rank_fused(snapshot_date TEXT,fused_rank INTEGER,stock_code TEXT,short_name TEXT,change_pct REAL,industry_name TEXT,etl_sync_at TEXT)",
             "CREATE TABLE st_hot_rank_ths(snapshot_date TEXT,rank INTEGER,stock_code TEXT,short_name TEXT,change_pct REAL,pop_tag TEXT,concept_tag TEXT,etl_sync_at TEXT)",
             "CREATE TABLE sm_stock_kline(stock_code TEXT,short_name TEXT,trade_date TEXT,adjust_type INTEGER,k_type INTEGER,open REAL,close REAL,pre_close REAL,high REAL,low REAL,amount REAL,volume REAL,data_source TEXT,quality_status TEXT,received_at TEXT,etl_sync_at TEXT)",
+            "CREATE TABLE st_a_list_daily(trade_date TEXT,stock_code TEXT,reason TEXT,a_buy_amount REAL,a_sell_amount REAL,a_net_amount REAL,data_source TEXT,quality_status TEXT,permission_status TEXT,received_at TEXT,etl_sync_at TEXT)",
+            "CREATE TABLE st_a_list_info(trade_date TEXT,stock_code TEXT,reason TEXT,operate_code TEXT,operate_name TEXT,a_buy_amount REAL,a_sell_amount REAL,a_net_amount REAL,etl_sync_at TEXT)",
         ]:
             conn.execute(text(sql))
         for day in DAYS:
@@ -40,6 +42,62 @@ def source(monkeypatch):
                      {"d": DAY, "received": DAY + " 17:15:00"})
     statements.clear()
     return engine, statements
+
+
+def test_dragon_tiger_links_exact_stock_reason_and_receipt_without_double_counting(source):
+    engine, statements = source
+    with engine.begin() as conn:
+        for day, reason, net, stamp in [(DAY, "单日涨幅", 60, DAY + " 21:00:00"),
+                                        (DAY, "三日累计", -30, DAY + " 21:00:00"),
+                                        ("2026-10-29", "昨日", 999, DAY + " 21:00:00"),
+                                        (DAY, "未来入库", 888, "2026-11-02 21:00:00")]:
+            conn.execute(text("INSERT INTO st_a_list_daily VALUES(:day,'000001',:reason,100,:sell,:net,'eastmoney_datacenter','PROVIDER_COMPLETE','PUBLIC',:stamp,:stamp)"),
+                         {"day": day, "reason": reason, "sell": 100 - net, "net": net, "stamp": stamp})
+        for _ in range(2):
+            conn.execute(text("INSERT INTO st_a_list_info VALUES(:day,'000001','单日涨幅','seat','机构专用',100,40,60,:stamp)"),
+                         {"day": DAY, "stamp": DAY + " 21:05:00"})
+        conn.execute(text("INSERT INTO st_a_list_info VALUES(:day,'000001','不匹配原因','other','未知席位',999,0,999,:stamp)"),
+                     {"day": DAY, "stamp": DAY + " 21:05:00"})
+    statements.clear()
+    result = theme.collect_theme_evidence(engine, DAY, asof=ASOF)
+    stock = result["stocks"][0]
+    dragon = stock["dragon_tiger"]
+    assert dragon["status"] == "OBSERVED" and stock["sector_names"]
+    assert {row["reason"] for row in dragon["disclosures"]} == {"单日涨幅", "三日累计"}
+    daily = next(row for row in dragon["disclosures"] if row["reason"] == "单日涨幅")
+    assert len(daily["seats"]) == daily["seat_sample_count"] == 1
+    assert daily["seats"][0]["name"] == "机构专用"
+    assert "net_total" not in dragon
+    assert sum("FROM st_a_list_daily" in sql for sql in statements) == 1
+    assert sum("FROM st_a_list_info" in sql for sql in statements) == 1
+
+
+def test_missing_dragon_tiger_is_unknown_and_does_not_block_other_facts(source):
+    engine, _ = source
+    result = theme.collect_theme_evidence(engine, DAY, asof=ASOF)
+    assert result["status"] == "OBSERVED"
+    assert result["stocks"][0]["dragon_tiger"]["status"] == "UNKNOWN"
+    assert "不能" in result["stocks"][0]["dragon_tiger"]["limitation"]
+
+
+def test_linked_seat_detail_filters_the_same_disclosure_reason(monkeypatch):
+    from server.api.routers import hot_data
+    engine = create_engine("sqlite://")
+    with engine.begin() as conn:
+        conn.execute(text("CREATE TABLE st_a_list_daily(trade_date TEXT,stock_code TEXT,short_name TEXT,close REAL,change_cpt REAL,turnover_ratio REAL,a_net_amount REAL,a_buy_amount REAL,a_sell_amount REAL,a_amount REAL,amount REAL,net_amount_rate REAL,a_amount_rate REAL,reason TEXT)"))
+        conn.execute(text("CREATE TABLE st_a_list_info(id INTEGER,trade_date TEXT,stock_code TEXT,operate_name TEXT,a_net_amount REAL,a_buy_amount REAL,a_sell_amount REAL,a_buy_amount_rate REAL,a_sell_amount_rate REAL,reason TEXT)"))
+        for reason, net in (("单日", 100), ("三日", 500)):
+            conn.execute(text("INSERT INTO st_a_list_daily(trade_date,stock_code,reason,a_net_amount) VALUES(:d,'000001',:reason,:net)"), {"d": DAY, "reason": reason, "net": net})
+            conn.execute(text("INSERT INTO st_a_list_info(trade_date,stock_code,reason,a_net_amount) VALUES(:d,'000001',:reason,:net)"), {"d": DAY, "reason": reason, "net": net})
+    def read(sql, params):
+        with engine.connect() as conn:
+            return [dict(row) for row in conn.execute(text(sql), params).mappings()]
+    monkeypatch.setattr(hot_data, "_read_sql", read)
+    result = hot_data.a_list_info(DAY, "000001", reason="单日")
+    assert result["summary"]["reason"] == "单日"
+    assert result["summary"]["a_net_amount"] == 100
+    assert [row["reason"] for row in result["data"]] == ["单日"]
+    engine.dispose()
 
 
 def test_date_exact_bulk_sources_price_checks_and_source_semantics(source):
@@ -64,7 +122,7 @@ def test_date_exact_bulk_sources_price_checks_and_source_semantics(source):
     assert result["amount_quality"]["target"]["status"] == "OBSERVED"
     assert result["amount_quality"]["previous"]["trade_date"] == DAYS[-2]
     assert "not_whole_market" in result["amount_quality"]["target"]["coverage_scope"]
-    assert len(statements) == 5  # No N+1 lookups or retry paths.
+    assert len(statements) == 7  # Includes two bulk disclosure reads; no N+1 queries.
     assert all("MAX_EXECUTION_TIME(15000)" in statement for statement in statements)
     assert len([statement for statement in statements if "FROM sm_stock_kline" in statement]) == 1
 

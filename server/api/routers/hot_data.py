@@ -1906,7 +1906,7 @@ def a_list_daily(trade_date: str = Query(default_factory=lambda: date.today().is
 
 
 @router.get("/hot-data/a-list-info")
-def a_list_info(trade_date: str = Query(), stock_code: str = Query()):
+def a_list_info(trade_date: str = Query(), stock_code: str = Query(), reason: str = ""):
     try:
         summary_rows = _read_sql("""
             SELECT trade_date, stock_code, short_name, close, change_cpt, turnover_ratio,
@@ -1914,9 +1914,10 @@ def a_list_info(trade_date: str = Query(), stock_code: str = Query()):
                    net_amount_rate, a_amount_rate, reason
             FROM st_a_list_daily
             WHERE trade_date = :d AND stock_code = :c
+              AND (:reason='' OR reason=:reason)
             LIMIT 1
-        """, {"d": trade_date, "c": stock_code})
-        rows = _read_sql("SELECT id, trade_date, stock_code, operate_name, a_net_amount, a_buy_amount, a_sell_amount, a_buy_amount_rate, a_sell_amount_rate, reason FROM st_a_list_info WHERE trade_date = :d AND stock_code = :c ORDER BY a_net_amount DESC", {"d": trade_date, "c": stock_code})
+        """, {"d": trade_date, "c": stock_code, "reason": reason})
+        rows = _read_sql("SELECT id, trade_date, stock_code, operate_name, a_net_amount, a_buy_amount, a_sell_amount, a_buy_amount_rate, a_sell_amount_rate, reason FROM st_a_list_info WHERE trade_date = :d AND stock_code = :c AND (:reason='' OR reason=:reason) ORDER BY a_net_amount DESC", {"d": trade_date, "c": stock_code, "reason": reason})
         summary = summary_rows[0] if summary_rows else {}
         if not summary:
             buy_sum = sum(float(r.get("a_buy_amount") or 0) for r in rows)

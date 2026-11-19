@@ -205,6 +205,64 @@ def _stock_rows(fused: list[dict], tags: list[dict], sectors: list[dict], bars: 
     return result
 
 
+def _attach_dragon_tiger(stocks, daily, seats, *, target, cutoff):
+    daily = _available(daily, cutoff)
+    seats = _available(seats, cutoff)
+
+    def amounts(row):
+        values = {name: _number(row.get(name)) for name in ("a_buy_amount", "a_sell_amount", "a_net_amount")}
+        if any(value is None for value in values.values()):
+            return None
+        if min(values["a_buy_amount"], values["a_sell_amount"]) < 0 or abs(
+            values["a_buy_amount"] - values["a_sell_amount"] - values["a_net_amount"]
+        ) > 0.02:
+            return None
+        return values
+
+    for stock in stocks:
+        disclosures = []
+        seen = {}
+        for row in daily:
+            if (row.get("stock_code") != stock["stock_code"] or _date(row["trade_date"]) != target
+                    or row.get("quality_status") != "PROVIDER_COMPLETE" or row.get("permission_status") != "PUBLIC"):
+                continue
+            values = amounts(row)
+            reason = str(row.get("reason") or "").strip()
+            if values is None or not reason:
+                continue
+            if reason in seen:
+                if seen[reason] != values:
+                    disclosures = []
+                    break
+                continue
+            seen[reason] = values
+            matched = []
+            seen_seats = set()
+            for seat in seats:
+                if (seat.get("stock_code") != stock["stock_code"] or _date(seat["trade_date"]) != target
+                        or seat.get("reason") != reason or not seat.get("operate_name")):
+                    continue
+                seat_values = amounts(seat)
+                if seat_values is None:
+                    continue
+                identity = (seat.get("operate_code"), seat["operate_name"], *seat_values.values())
+                if identity in seen_seats:
+                    continue
+                seen_seats.add(identity)
+                matched.append({"name": str(seat["operate_name"]), **seat_values,
+                                "received_at": _receipt(seat, target)["received_at"]})
+            matched.sort(key=lambda item: abs(item["a_net_amount"]), reverse=True)
+            disclosures.append({"reason": reason, **values, "source": row.get("data_source"),
+                                "received_at": _receipt(row, target)["received_at"],
+                                "seats": matched[:3], "seat_sample_count": len(matched)})
+        stock["dragon_tiger"] = {
+            "status": "OBSERVED" if disclosures else "UNKNOWN", "trade_date": target,
+            "disclosures": disclosures,
+            "scope": "同交易日、同上榜原因的披露；单日与多日累计分开，不跨原因加总。席位仅列已存净额绝对值前三个样本，名称不证明实际资金身份。",
+            "limitation": "" if disclosures else "未取得可核验的同日披露，不能据此判断未上榜或资金为零。",
+        }
+
+
 def collect_theme_evidence(engine, trade_date, *, asof) -> dict:
     """Read exact-date stored facts once per bulk stage; never collect or write.
 
@@ -271,6 +329,15 @@ def collect_theme_evidence(engine, trade_date, *, asof) -> dict:
         receipt.update(coverage_scope="same_day_attention_candidate_sample_not_whole_market", candidate_count=len(codes))
         quality[key] = receipt
     stocks = _stock_rows(fused, tags, sectors, bars, target, dates)
+    daily = read("dragon_tiger_daily", "SELECT trade_date,stock_code,reason,a_buy_amount,a_sell_amount,a_net_amount,data_source,quality_status,permission_status,received_at,etl_sync_at FROM st_a_list_daily WHERE trade_date=:d AND stock_code IN :codes ORDER BY stock_code,reason LIMIT 129", {"d": target, "codes": codes}, ("codes",)) if codes else []
+    seats = read("dragon_tiger_seats", "SELECT trade_date,stock_code,reason,operate_code,operate_name,a_buy_amount,a_sell_amount,a_net_amount,etl_sync_at FROM st_a_list_info WHERE trade_date=:d AND stock_code IN :codes ORDER BY stock_code,reason,operate_code LIMIT 1025", {"d": target, "codes": codes}, ("codes",)) if codes else []
+    if len(daily) > 128:
+        errors.append("dragon_tiger_daily:row_limit_exceeded")
+        daily = []
+    if len(seats) > 1024:
+        errors.append("dragon_tiger_seats:row_limit_exceeded")
+        seats = []
+    _attach_dragon_tiger(stocks, daily, seats, target=target, cutoff=cutoff)
     coverage = [{"trade_date": day, "plate_type": kind, "observed_rows": sum(_date(row["snapshot_date"]) == day and int(row["plate_type"]) == kind for row in sectors_data)} for day in dates for kind in _SOURCES]
     return {
         "status": "OBSERVED" if sectors or stocks else "UNKNOWN", "trade_date": target, "asof": cutoff.isoformat(),

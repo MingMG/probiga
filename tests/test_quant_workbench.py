@@ -360,13 +360,46 @@ def test_strategy_pool_projection_requires_active_identity(monkeypatch):
         return [{"analysis_count": 5578}]
 
     monkeypatch.setattr(quant_workbench, "_rows", rows)
-    result = quant_workbench.load_strategy_pool_status(object())
+    result = quant_workbench.load_strategy_pool_status(object(), trade_date="2026-10-23")
 
     assert result["status"] == "ACTIVE"
     assert result["active_count"] == 80
     assert result["analysis_count"] == 5578
     assert result["run_uid"] == "e" * 32
     assert result["real_order_authority"] is False
+
+
+def test_old_pending_pool_does_not_select_an_old_session_or_block_research():
+    from sqlalchemy import create_engine, text
+    engine = create_engine("sqlite://")
+    with engine.begin() as conn:
+        conn.execute(text("CREATE TABLE st_recommended_stocks(pick_date TEXT,publication_status TEXT,publisher_run_uid TEXT)"))
+        conn.execute(text("INSERT INTO st_recommended_stocks VALUES('2026-11-11','PENDING','old-run')"))
+    pool = quant_workbench.load_strategy_pool_status(engine, trade_date="2026-11-19")
+    assert pool["status"] == "NOT_STARTED"
+    assert pool["trade_date"] == "2026-11-19"
+    gate = quant_workbench.load_decision_gate_status(engine, trade_date=pool["trade_date"], run_uid="")
+    assert gate["status"] == "WAITING" and gate["executable_count"] == 0
+    lifecycle = build_quant_workbench_lifecycle(trade_date="2026-11-19",
+        target={"ready": True}, outlook={"status": "READY"}, pool=pool,
+        decision_gate=gate, governance={}, simulation={}, review={"publish_status": "ready"})
+    stages = {row["code"]: row for row in lifecycle["stages"]}
+    assert lifecycle["overall_status"] == "PARTIAL"
+    assert stages["STRATEGY_POOL"]["state"] == "NOT_STARTED"
+    assert stages["REVIEW"]["state"] == "READY"
+    assert lifecycle["next_action"]["stage_code"] == "STRATEGY_POOL"
+    engine.dispose()
+
+
+def test_zero_executable_is_observation_and_keeps_individual_restrictions(monkeypatch):
+    monkeypatch.setattr(quant_workbench, "_rows", lambda *args: [{
+        "stock_code": "000001", "recommend_status": "BLOCK", "signal_status": "WATCH",
+        "recommend_reason": "等待确认", "ordinary_buy_eligible": 0, "chase_risk_status": "BLOCK"}])
+    gate = quant_workbench.load_decision_gate_status(object(), trade_date="2026-11-19", run_uid="a" * 32)
+    assert gate["status"] == "OBSERVE"
+    assert gate["candidate_count"] == gate["blocked_count"] == 1
+    assert gate["executable_count"] == 0 and gate["real_order_authority"] is False
+    assert gate["top_reasons"] == [{"reason": "等待确认", "count": 1}]
 
 
 def test_lifecycle_joins_data_pool_decision_simulation_and_review_truthfully():
@@ -421,14 +454,14 @@ def test_lifecycle_joins_data_pool_decision_simulation_and_review_truthfully():
     stages = {item["code"]: item for item in lifecycle["stages"]}
 
     assert lifecycle["schema"] == "probiga.quant-workbench-lifecycle.v1"
-    assert lifecycle["overall_status"] == "BLOCKED"
+    assert lifecycle["overall_status"] == "PARTIAL"
     assert lifecycle["first_blocking_stage"] == "CANONICAL_DECISION"
     assert lifecycle["next_action"]["entry_tab"] == "strategy-center"
     assert stages["DATA"]["state"] == "READY"
     assert stages["MARKET"]["state"] == "READY"
     assert stages["STRATEGY_POOL"]["state"] == "READY"
     assert stages["CANONICAL_DECISION"]["state"] == "STALE"
-    assert stages["EXECUTION_GATE"]["state"] == "BLOCKED"
+    assert stages["EXECUTION_GATE"]["state"] == "OBSERVE"
     assert stages["SIMULATION"]["state"] == "WAITING"
     assert stages["REVIEW"]["state"] == "BLOCKED"
     assert lifecycle["real_order_authority"] is False
@@ -527,7 +560,7 @@ def test_overview_exposes_one_integrated_lifecycle_and_next_action(monkeypatch):
     monkeypatch.setattr(
         quant_workbench,
         "load_strategy_pool_status",
-        lambda _engine: {
+        lambda _engine, **_kwargs: {
             "status": "ACTIVE",
             "trade_date": "2026-10-23",
             "active_count": 80,
@@ -602,7 +635,7 @@ def test_overview_exposes_one_integrated_lifecycle_and_next_action(monkeypatch):
     result = quant_workbench.quant_workbench_overview()
 
     assert result["lifecycle"]["schema"] == "probiga.quant-workbench-lifecycle.v1"
-    assert result["lifecycle"]["overall_status"] == "BLOCKED"
+    assert result["lifecycle"]["overall_status"] == "PARTIAL"
     assert result["summary"]["first_blocking_stage"] == "CANONICAL_DECISION"
     assert result["summary"]["next_action"]["entry_tab"] == "strategy-center"
     assert result["execution_policy"]["manual_run_available"] is True
@@ -914,7 +947,7 @@ function fetchRawJsonWithTimeout(url) {
     lifecycle: {
       schema: 'probiga.quant-workbench-lifecycle.v1',
       trade_date: '2026-10-23',
-      overall_status: 'BLOCKED',
+      overall_status: 'PARTIAL',
       ready_stage_count: 3,
       stage_count: 7,
       first_blocking_stage: 'CANONICAL_DECISION',
@@ -923,7 +956,7 @@ function fetchRawJsonWithTimeout(url) {
         {code:'MARKET',label:'市场状态与情景',state:'READY',summary:'恐慌修复',evidence:{market_mode_label:'恐慌修复'},operation_ids:[],entry_tab:'market-outlook'},
         {code:'STRATEGY_POOL',label:'策略候选池',state:'READY',summary:'80 只 ACTIVE',evidence:{active_count:80,trade_date:'2026-10-23'},operation_ids:['strategy_pool'],entry_tab:'recommended'},
         {code:'CANONICAL_DECISION',label:'规范治理决策',state:'STALE',summary:'规范运行日 2026-08-31',blocking_reason:'CANONICAL_DECISION_TRADE_DATE_STALE',evidence:{trade_date:'2026-08-31'},operation_ids:[],entry_tab:'strategy-center',entry_label:'打开策略治理'},
-        {code:'EXECUTION_GATE',label:'候选执行门禁',state:'BLOCKED',summary:'0 / 80 只通过全部执行门禁',evidence:{executable_count:0,candidate_count:80,top_reasons:[{reason:'关键数据缺失',count:80}]},operation_ids:[],entry_tab:'trading-v3-candidates'},
+        {code:'EXECUTION_GATE',label:'候选执行门禁',state:'OBSERVE',summary:'0 / 80 只通过全部执行门禁',evidence:{executable_count:0,candidate_count:80,top_reasons:[{reason:'关键数据缺失',count:80}]},operation_ids:[],entry_tab:'trading-v3-candidates'},
         {code:'SIMULATION',label:'QMT 策略模拟',state:'WAITING',summary:'尚无模拟输入',evidence:{reason:'尚无模拟输入'},operation_ids:[],entry_tab:'qmt-strategy-results'},
         {code:'REVIEW',label:'复盘与反馈',state:'BLOCKED',summary:'复盘阻断',evidence:{blocking_reason:'目标行情覆盖率不足'},operation_ids:[],entry_tab:'review'}
       ]
@@ -941,7 +974,7 @@ setTimeout(function() {
   assert.match(rendered, /查看策略票池/);
   assert.match(rendered, /当前有效票池/);
   assert.match(rendered, /量化生产闭环/);
-  assert.match(rendered, /当前第一断点/);
+  assert.match(rendered, /下一项待处理/);
   assert.match(rendered, /规范治理决策/);
   assert.match(rendered, /0 \/ 80 可执行/);
   assert.match(rendered, /打开策略治理/);
