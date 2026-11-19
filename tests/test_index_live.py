@@ -62,6 +62,7 @@ def test_bulk_transport_requests_all_explicit_index_markets(monkeypatch):
 
 
 def test_same_day_intraday_board_exposes_indices_even_without_stock_quotes(monkeypatch):
+    monkeypatch.setattr(market_home, "read_live_turnover", lambda *args, **kwargs: None)
     monkeypatch.setattr(market_home, "_trading_day", lambda *_: True)
     monkeypatch.setattr(market_home, "_live_quotes", lambda *_: ([], None))
     monkeypatch.setattr(market_home, "_limit_up_events", lambda *_: [])

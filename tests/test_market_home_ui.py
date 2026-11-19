@@ -268,3 +268,16 @@ assert.equal((html.match(/2026-11-19 10:29:59<\/span>/g)||[]).length,7);
 assert.ok(html.includes('盘中指数'));
 assert.ok(html.includes('1,006.00'));
 """)
+
+
+def test_turnover_ranking_keeps_its_own_intraday_source_and_timestamp():
+    run_node(r"""
+const date='2026-11-19';
+const snapshot={status:'partial',trade_date:date,as_of:date+'T10:30:00+08:00',as_of_basis:'qmt_snapshot',source:'sm_stock_current',
+    ranking_observations:{turnover:{trade_date:date,as_of:date+'T10:29:50+08:00',source:'eastmoney.push2.f8',scope:'东财盘中换手样本'}},
+    rankings:{turnover:[{stock_code:'002685',short_name:'华东重机',trade_date:date,turnover_rate:10.32,turnover_rate_source:'eastmoney.push2.f8'}]}};
+const html=page.render({snapshot},date);
+assert.ok(html.includes('东财盘中换手样本 · 2026-11-19T10:29:50+08:00 · eastmoney.push2.f8'));
+assert.ok(html.includes('华东重机'));
+assert.ok(html.includes('10.32%'));
+""")

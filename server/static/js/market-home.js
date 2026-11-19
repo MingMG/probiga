@@ -321,7 +321,7 @@
 
     function snapshotMeta(snapshot) {
         if (!snapshot) return '证据待核验';
-        const kind = {qmt_snapshot: '盘中样本', exchange_close: '收盘样本', public_index_snapshot: '盘中指数'}[snapshot.as_of_basis];
+        const kind = {qmt_snapshot: '盘中样本', exchange_close: '收盘样本', public_index_snapshot: '盘中指数', public_stock_ranking: '盘中排名'}[snapshot.as_of_basis];
         return `${kind ? kind + ' · ' : ''}${escape(snapshot.as_of || snapshot.trade_date)} · ${escape(snapshot.source || '来源待核验')}`;
     }
 
@@ -513,7 +513,10 @@
         } else if (key === 'amount' && Number.isInteger(snapshot?.price_sample_size)) {
             scope = ` · 价量样本 ${metric(snapshot.price_sample_size, '只', 0)}`;
         }
-        const meta = display.length ? `TOP ${display.length}${scope} · ${snapshotMeta(snapshot)}` : noMatches ? snapshotMeta(snapshot) : '排名待核验';
+        const observation = snapshot?.ranking_observations?.[key];
+        const origin = observation && observation.trade_date === snapshot?.trade_date
+            ? `${escape(observation.scope)} · ${escape(observation.as_of)} · ${escape(observation.source)}` : snapshotMeta(snapshot);
+        const meta = display.length ? `TOP ${display.length}${scope} · ${origin}` : noMatches ? origin : '排名待核验';
         return panel(title, meta, display.length ?
             '<div class="mh-list">' + display.map((item, i) => {
                 const source = key === 'turnover' ? item.turnover_rate_source || item.source : item.source;
@@ -544,7 +547,7 @@
         const market = marketObservation(state.market, requested);
         const snapshot = snapshotObservation(state.snapshot, requested);
         const labels = {realtime: '盘中快照', close: '收盘观察', paused: '午间快照', stale: '行情已过期'};
-        const boardPhase = {qmt_snapshot: '盘中快照', exchange_close: '收盘观察', public_index_snapshot: '盘中指数'}[snapshot?.as_of_basis] || '数据待核验';
+        const boardPhase = {qmt_snapshot: '盘中快照', exchange_close: '收盘观察', public_index_snapshot: '盘中指数', public_stock_ranking: '盘中排名'}[snapshot?.as_of_basis] || '数据待核验';
         const phase = !market ? boardPhase : market.trade_date < requested ? '历史回退' : labels[market.freshness_status] || '已存行情';
         const stamp = market?.data_time || market?.trade_date || snapshot?.as_of;
         const markup = '<section class="market-home" id="mh-market-observation" tabindex="-1" aria-label="行情概览"><header class="mh-head"><div>' +

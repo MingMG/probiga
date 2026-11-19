@@ -23,6 +23,7 @@ from server.common.current_data import get_current_engine
 from server.common.daily_delivery_control import load_completed_market_capture_receipt
 from server.common.kline_data import get_kline_engine
 from server.common.index_live import read_live_indices
+from server.common.turnover_live import read_live_turnover
 from server.common.limit_up_events import LIMIT_STATUS_BASIS
 from server.common.limit_up_event_schema import LIMIT_UP_EVENT_TABLE
 from server.common.market_close_ladder import load_market_close_ladder
@@ -308,9 +309,12 @@ def _live_quote_batch(engine, day: str, now: datetime, deadline: float) -> tuple
     generated = _clock(receipt.get("source_generated_at"))
     published = _clock(receipt.get("published_at"))
     expected, observed = _number(receipt.get("expected_count")), _number(receipt.get("observed_count"))
+    paused = time(11, 30) < now.time() < time(13)
+    pause_at = now.replace(hour=11, minute=30, second=0, microsecond=0)
+    fresh = (generated and generated >= pause_at - _LIVE_MAX_AGE) if paused else _fresh_live_stamp(generated, now)
     if (not isinstance(batch_id, str) or not batch_id or not generated or not published
             or not generated <= published <= now
-            or generated.date().isoformat() != day or not _fresh_live_stamp(generated, now)
+            or generated.date().isoformat() != day or not fresh
             or not expected or not observed or not 0.95 <= observed / expected <= 1):
         return [], None
     stocks = _read(engine, """
@@ -325,7 +329,10 @@ def _live_quote_batch(engine, day: str, now: datetime, deadline: float) -> tuple
           "now": now, "limit": _STOCK_LIMIT + 1}, deadline=deadline)
     if len(stocks) > _STOCK_LIMIT:
         raise ValueError("market board live rows exceed bound")
-    snapshot = validate_qmt_snapshot(receipt, stocks, now=now)
+    # Lunch pauses the market clock; the source/publication timestamps remain
+    # unchanged and must still be at or before the actual request time.
+    validation_at = max(pause_at, generated, published) if paused else now
+    snapshot = validate_qmt_snapshot(receipt, stocks, now=validation_at)
     if snapshot.warnings or len(stocks) != len({row.get("stock_code") for row in stocks}):
         return [], None
     return [dict(row, trade_date=day) for row in snapshot.rows], generated
@@ -642,6 +649,7 @@ def build_market_board(day: date, *, now: datetime) -> dict:
     as_of = None
     source = None
     turnover_evidence = None
+    live_turnover = None
     limit_ladder = None
     stocks, indices, events = [], [], []
     stage = "not_closed_or_not_trading"
@@ -659,17 +667,22 @@ def build_market_board(day: date, *, now: datetime) -> dict:
                     indices = read_live_indices(INDEX_NAMES, day_text, now=now, deadline=deadline)
                 except (OSError, sqlite3.Error, RuntimeError, TimeoutError, ValueError) as exc:
                     logger.warning("market board live indices unavailable: %s", type(exc).__name__)
-            if live or close_ready:
+            if live or lunch or close_ready:
                 try:
-                    quotes, observed_at = _live_quotes(day_text, now, deadline) if live else (
+                    quotes, observed_at = _live_quotes(day_text, now, deadline) if live or lunch else (
                         _day_quotes(day_text, now, deadline), close,
                     )
-                    stocks = _stock_rows(quotes, day_text, live=live)
+                    stocks = _stock_rows(quotes, day_text, live=live or lunch)
                     if stocks:
                         as_of = observed_at
-                        source = "sm_stock_current" if live else "sm_stock_kline"
+                        source = "sm_stock_current" if live or lunch else "sm_stock_kline"
                 except (SQLAlchemyError, RuntimeError, TimeoutError, ValueError, QualityGateError) as exc:
                     logger.warning("market board stock data unavailable: %s", type(exc).__name__)
+            if live or lunch:
+                try:
+                    live_turnover = read_live_turnover(day_text, now=now, deadline=deadline)
+                except (OSError, sqlite3.Error, RuntimeError, TimeoutError, ValueError) as exc:
+                    logger.warning("market board live turnover unavailable: %s", type(exc).__name__)
             # Shared current-table timestamps cannot attest index provenance.
             # Intraday observations above retain the direct provider identity.
             if close_ready:
@@ -710,6 +723,9 @@ def build_market_board(day: date, *, now: datetime) -> dict:
     turnover_rows = [row for row in stocks if row["turnover_rate"] is not None]
     if turnover_evidence is None and len(turnover_rows) != len(stocks):
         turnover_rows = []
+    if live_turnover:
+        turnover_rows = live_turnover["rows"]
+    turnover_expected = live_turnover["observed_count"] if live_turnover else len(stocks)
     liquidity = None
     if close_ready and stocks:
         try:
@@ -735,6 +751,8 @@ def build_market_board(day: date, *, now: datetime) -> dict:
     if not as_of and events:
         as_of = _clock(events[0]["snapshot_at"])
         source = LIMIT_UP_EVENT_TABLE if events[0].get("event_family") == "LIMIT_UP_LIFECYCLE" else "sm_market_radar_event"
+    if not as_of and live_turnover:
+        as_of, source = _clock(live_turnover["as_of"]), live_turnover["source"]
     up = [row for row in return_stocks if row["change_pct"] > 0]
     down = [row for row in return_stocks if row["change_pct"] < 0]
     status = "unavailable"
@@ -747,7 +765,8 @@ def build_market_board(day: date, *, now: datetime) -> dict:
         "as_of": _timestamp(as_of) if as_of else None, "source": source,
         "as_of_basis": {"sm_stock_current": "qmt_snapshot", "sm_stock_kline": "exchange_close",
                         "sm_index_kline": "exchange_close", "sm_market_radar_event": "radar_observation",
-                        LIMIT_UP_EVENT_TABLE: "qmt_limit_event", "eastmoney.push2.index": "public_index_snapshot"}.get(source),
+                        LIMIT_UP_EVENT_TABLE: "qmt_limit_event", "eastmoney.push2.index": "public_index_snapshot",
+                        "eastmoney.push2.f8": "public_stock_ranking"}.get(source),
         "sample_size": len(return_stocks), "sample_scope": "verified_quotes_with_price_and_change_pct",
         "price_sample_size": len(stocks),
         "close_drawdowns": _close_drawdowns(stocks, quotes) if source == "sm_stock_kline" else None,
@@ -762,12 +781,13 @@ def build_market_board(day: date, *, now: datetime) -> dict:
             "turnover": _rank(turnover_rows, "turnover_rate", descending=True),
         },
         "turnover_evidence": turnover_evidence,
+        "ranking_observations": {"turnover": {key: value for key, value in live_turnover.items() if key != "rows"}} if live_turnover else {},
         "liquidity": liquidity,
         "turnover_coverage": {
             "status": ("unavailable" if not turnover_rows else
-                       "complete" if len(turnover_rows) == len(stocks) else "partial"),
-            "verified_count": len(turnover_rows), "sample_size": len(stocks),
-            "excluded_count": len(stocks) - len(turnover_rows),
+                       "complete" if len(turnover_rows) == turnover_expected else "partial"),
+            "verified_count": len(turnover_rows), "sample_size": turnover_expected,
+            "excluded_count": live_turnover["excluded_count"] if live_turnover else len(stocks) - len(turnover_rows),
             "excluded_codes": (sorted(row["stock_code"] for row in stocks if row["turnover_rate"] is None)[:20]
                                if turnover_evidence else []),
         },
