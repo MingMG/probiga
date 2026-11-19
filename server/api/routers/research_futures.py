@@ -6,28 +6,19 @@ from urllib.parse import urlparse
 import threading
 import csv
 import json
-import math
 import re
 
 from fastapi import APIRouter
 import requests
 from urllib3.util import Timeout
 
-from server.api.routers.market_home import SHANGHAI
+from server.api.routers.market_home import SHANGHAI, _number
 from server.api.routers.research_tools import _serve
 
 router = APIRouter(tags=["research-futures"])
 SINA = {"NQ":"纳斯达克100期货CFD", "ES":"标普500期货CFD", "YM":"道指期货CFD",
         "NK":"日经225期货CFD", "HSI":"恒指期货CFD"}
 TAIFEX = "https://mis.taifex.com.tw/futures/api/"
-
-
-def _number(value):
-    try:
-        result = float(value)
-    except (ValueError, TypeError):
-        return None
-    return result if math.isfinite(result) else None
 
 
 def _request(url, deadline, *, body=None):
