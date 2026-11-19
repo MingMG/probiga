@@ -6176,7 +6176,7 @@ def _fetch_verified_external_index_kline(
 ) -> tuple[pd.DataFrame, str]:
     """Cross-check Eastmoney OHLCV against Tencent and retain Eastmoney amount."""
     code = str(index_code or "").strip().zfill(6)
-    if code.startswith(("970", "980")):
+    if code.startswith(("399", "970", "980")):
         try:
             official = _fetch_cnindex_index_kline(code, start_date, end_date)
         except Exception as exc:  # pylint: disable=broad-except
