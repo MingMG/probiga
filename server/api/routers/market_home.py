@@ -479,7 +479,8 @@ def _rank(rows: list[dict], key: str, *, descending: bool) -> list[dict]:
 
 def _close_liquidity(day: str, stocks: list[dict], now: datetime, deadline: float) -> dict:
     rates = [row["turnover_rate"] for row in stocks if row["turnover_rate"] is not None]
-    result = {"turnover_median_pct": median(rates) if rates else None,
+    result = {"trade_date": day, "known_at": _timestamp(now), "evidence_mode": "CURRENT_OBSERVATION",
+              "turnover_median_pct": median(rates) if rates else None,
               "turnover_sample_count": len(rates), "volume_ratio5": None,
               "volume_sample_count": 0, "volume_reference_dates": [],
               "volume_definition": "同样本当日成交股数 / 前5个完整交易日平均成交股数"}
