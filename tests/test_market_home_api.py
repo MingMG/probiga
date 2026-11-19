@@ -109,6 +109,7 @@ def market_db(monkeypatch):
         connection.execute(text("INSERT INTO si_trade_calendar VALUES (:day, 1)"), {"day": DAY_TEXT})
     for name in ("get_engine", "get_kline_engine", "get_current_engine"):
         monkeypatch.setattr(market_home, name, lambda: engine)
+    monkeypatch.setattr(market_home, "read_live_indices", lambda *args, **kwargs: [])
     market_home._cache.clear()
     yield engine
     market_home._cache.clear()
