@@ -2,12 +2,16 @@
     var API_BASE = '/api/hot-data';
 
     window.onerror = function (msg, src, line, col, err) {
+        // The browser defers these resize notifications to the next frame.
+        if (!err && (msg === 'ResizeObserver loop completed with undelivered notifications.' || msg === 'ResizeObserver loop limit exceeded')) {
+            console.warn('[布局通知]', msg);
+            return false;
+        }
         console.error('[全局错误]', msg, src, line, col, err);
-        var area = el('contentArea');
-        // Only replace a page that never finished loading; a later, unrelated
-        // error must not overwrite a rendered result.
+        var area = document.querySelector('.tab-content.active');
+        // Hidden tabs keep loading placeholders even after this tab is ready.
         if (area && area.innerHTML.indexOf('加载中') !== -1) {
-            showFatalError('⚠️ 页面加载异常：' + msg + '（第' + line + '行）。请刷新页面或检查控制台。');
+            showFatalError('⚠️ 页面加载异常：' + msg + '（第' + line + '行）。请刷新页面或检查控制台。', area);
         }
     };
 
@@ -17,12 +21,13 @@
     // reported beside that skeleton.  Writing it over the skeleton - which is
     // what the missing #mainContent lookup silently failed to do - would leave
     // the page with no tabs and no way back.
-    function showFatalError(message) {
-        var host = el('contentArea') || document.body;
-        var banner = el('globalErrorBanner');
+    function showFatalError(message, host) {
+        host = host || el('contentArea') || document.body;
+        var errorId = host.id && host.id !== 'contentArea' ? host.id + '-error' : 'globalErrorBanner';
+        var banner = el(errorId);
         if (!banner) {
             banner = document.createElement('div');
-            banner.id = 'globalErrorBanner';
+            banner.id = errorId;
             banner.className = 'loading';
             banner.setAttribute('role', 'alert');
             banner.style.color = '#e74c3c';
