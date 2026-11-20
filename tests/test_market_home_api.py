@@ -629,6 +629,43 @@ def test_live_snapshot_that_expires_during_reads_is_withheld(market_db, monkeypa
     assert result["reason"] == "live_quote_expired"
 
 
+def test_live_snapshot_uses_read_time_after_connection_setup(market_db, monkeypatch):
+    from contextlib import contextmanager
+    elapsed = 0
+    @contextmanager
+    def connection_budget(*args, **kwargs):
+        nonlocal elapsed
+        elapsed = 3
+        yield
+    with market_db.begin() as c:
+        c.execute(text("""INSERT INTO st_qmt_realtime_sync_receipt_v2 VALUES
+            ('id','gj_big_qmt_inner','token','2026-11-06 10:00:02',1,1,1,
+             '2026-11-06 10:00:03','LIVE_FORWARD','PASS',
+             '{"full_batch_id":"verified"}','2026-11-06 10:00:03')"""))
+        c.execute(text("""INSERT INTO sm_stock_current VALUES
+            ('000001','valid',12,3,100,'2026-11-06 10:00:02',
+             'verified','gj_big_qmt_inner','VALIDATED','SUPPORTED')"""))
+    monkeypatch.setattr(market_home, "monotonic", lambda: elapsed)
+    monkeypatch.setattr(market_home, "_live_announcement_reply_budget", connection_budget)
+    quotes, stamp = market_home._live_quotes(DAY_TEXT, datetime(2026,11,6,10), 14)
+    assert len(quotes) == 1
+    assert stamp == datetime(2026,11,6,10,0,2)
+
+
+def test_slow_index_source_cannot_prevent_healthy_stock_read(market_db, monkeypatch):
+    from threading import Event
+    stocks_read = Event()
+    def quotes(*args):
+        stocks_read.set()
+        return [], None
+    def indices(*args, **kwargs):
+        assert stocks_read.wait(1), 'an independent index request blocked the stock source'
+        return []
+    monkeypatch.setattr(market_home, "_live_quotes", quotes)
+    monkeypatch.setattr(market_home, "read_live_indices", indices)
+    market_home.build_market_board(DAY, now=datetime(2026,11,6,10))
+
+
 @pytest.mark.parametrize("now", [datetime(2026, 11, 6, 12), datetime(2026, 11, 7)])
 def test_board_event_projection_is_same_date_and_public_only(market_db, now):
     with market_db.begin() as connection:

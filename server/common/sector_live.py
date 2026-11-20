@@ -71,12 +71,14 @@ def _fetch(kind, selected, now, deadline):
 
 def read_live_boards(selected: str, *, now: datetime) -> dict:
     """Reuse a verified 15-second checkpoint; refresh each source independently."""
+    started = monotonic()
     now = now.astimezone(_ZONE).replace(tzinfo=None) if now.tzinfo else now
     if selected != now.date().isoformat():
         raise ValueError("sector_live: only the current session may be captured")
     if not _LOCK.acquire(timeout=12):
         raise TimeoutError("sector_live: capture owner deadline exceeded")
     try:
+        now += timedelta(seconds=monotonic()-started)
         with closing(sqlite3.connect(_path(create=True), timeout=2)) as db:
             db.execute("CREATE TABLE IF NOT EXISTS live_board_snapshot (kind TEXT PRIMARY KEY, day TEXT, captured_at TEXT, digest TEXT, payload TEXT)")
             result, missing = {}, []

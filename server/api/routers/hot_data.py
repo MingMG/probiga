@@ -12565,31 +12565,42 @@ def _recommended_run_history_reconcile_scheduler_terminal() -> None:
         )
 
 
+def _recommended_history_rows(run_uid: str = "", *, limit: int = 1) -> list[dict]:
+    where = "WHERE r.run_uid=:run_uid" if run_uid else ""
+    rows = _read_sql(f"""
+        SELECT r.id, r.run_uid, r.trade_date, r.status, r.min_score, r.top_n, r.strict_prev_trade_day,
+               r.execution_time, r.started_at, r.finished_at, r.duration_seconds,
+               r.progress_percent, r.done_count, r.total, r.passed,
+               r.flow_date, r.hot_date, r.market_mood_score, r.message, r.error,
+               r.trigger_source, r.scheduler_job_id, r.host_name, r.build_sha,
+               h.status AS scheduler_status, h.finished_at AS scheduler_finished_at,
+               h.duration AS scheduler_duration_seconds,
+               SUBSTR(h.output, -500) AS scheduler_output
+        FROM st_recommended_run_history r
+        LEFT JOIN st_scheduled_task_history h
+          ON h.run_uid=r.run_uid AND h.run_uid=r.scheduler_job_id AND h.build_sha=r.build_sha
+        {where} ORDER BY r.started_at DESC, r.id DESC LIMIT :limit
+    """, {"run_uid": run_uid, "limit": limit})
+    for row in rows:
+        status = row.pop("scheduler_status", None)
+        finished = row.pop("scheduler_finished_at", None)
+        duration = row.pop("scheduler_duration_seconds", None)
+        output = row.pop("scheduler_output", None)
+        if row.get("status") not in {"running", "submitted"} or not finished:
+            continue
+        if status in {"success", "failed", "timeout", "stopped", "blocked"}:
+            row.update(status="done" if status == "success" else "cancelled" if status == "stopped" else "error",
+                       finished_at=finished, duration_seconds=duration,
+                       message=f"生产调度任务终态：{status}", error="" if status == "success" else str(output or ""))
+            if status == "success":
+                row["progress_percent"] = 100
+    return rows
+
+
 def _recommended_history_progress(run_uid: str = "") -> dict | None:
     try:
         _ensure_recommended_run_history_table()
-        if run_uid:
-            rows = _read_sql("""
-                SELECT run_uid, trade_date, status, min_score, top_n, strict_prev_trade_day,
-                        execution_time, started_at, finished_at, duration_seconds,
-                        progress_percent, done_count, total, passed,
-                        flow_date, hot_date, market_mood_score, message, error,
-                        trigger_source, scheduler_job_id, host_name, build_sha
-                FROM st_recommended_run_history
-                WHERE run_uid = :run_uid
-                LIMIT 1
-            """, {"run_uid": run_uid})
-        else:
-            rows = _read_sql("""
-                SELECT run_uid, trade_date, status, min_score, top_n, strict_prev_trade_day,
-                        execution_time, started_at, finished_at, duration_seconds,
-                        progress_percent, done_count, total, passed,
-                        flow_date, hot_date, market_mood_score, message, error,
-                        trigger_source, scheduler_job_id, host_name, build_sha
-                FROM st_recommended_run_history
-                ORDER BY started_at DESC, id DESC
-                LIMIT 1
-            """, {})
+        rows = _recommended_history_rows(run_uid)
         if not rows:
             return None
         row = rows[0]
@@ -12649,7 +12660,6 @@ def _recommended_history_progress(run_uid: str = "") -> dict | None:
 @router.get("/hot-data/recommended-stocks/progress")
 def recommended_stocks_progress():
     """查询 AI 推荐筛选进度"""
-    _recommended_run_history_reconcile_scheduler_terminal()
     cached = _cache_get("rec_screen_progress", ttl_seconds=7200)
     if cached is not None:
         if isinstance(cached, dict) and str(cached.get("status") or "") == "protected":
@@ -12682,7 +12692,7 @@ def recommended_stocks_progress():
             ),
         }
     history = _recommended_history_progress()
-    if history and (history.get("is_running") or history.get("status") == "protected"):
+    if history:
         return history
     return {"status": "idle", "percent": 0, "step": "未启动", "is_running": False}
 
@@ -12691,17 +12701,8 @@ def recommended_stocks_progress():
 def recommended_stocks_run_history(limit: int = Query(default=10, ge=1, le=50)):
     """查询 AI 推荐筛选执行历史"""
     try:
-        _recommended_run_history_reconcile_scheduler_terminal()
         _ensure_recommended_run_history_table()
-        rows = _read_sql("""
-            SELECT id, run_uid, trade_date, status, min_score, top_n, strict_prev_trade_day,
-                   execution_time, started_at, finished_at, duration_seconds,
-                   total, passed, flow_date, hot_date, market_mood_score, message, error,
-                   trigger_source, scheduler_job_id, host_name, build_sha
-            FROM st_recommended_run_history
-            ORDER BY started_at DESC, id DESC
-            LIMIT :limit
-        """, {"limit": limit})
+        rows = _recommended_history_rows(limit=limit)
         return {"status": "READY", "data": rows, "total": len(rows)}
     except Exception as exc:
         _record_fallback("recommended_stocks_run_history", exc)

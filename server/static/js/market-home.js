@@ -559,10 +559,16 @@
         const boardPhase = {qmt_snapshot: '盘中快照', exchange_close: '收盘观察', public_index_snapshot: '盘中指数', public_stock_ranking: '盘中排名'}[snapshot?.as_of_basis] || '数据待核验';
         const phase = !market ? boardPhase : market.trade_date < requested ? '历史回退' : labels[market.freshness_status] || '已存行情';
         const stamp = market?.data_time || market?.trade_date || snapshot?.as_of;
+        const failed = Object.keys(state.refreshErrors || {});
+        const sourceNames = {market:'市场概览', snapshot:'行情与榜单', heatmap:'板块热度', liquidity:'换手与量比', events:'监控事件', reviewDates:'复盘日历', delivery:'交付记录'};
+        const refreshText = failed.length
+            ? `刷新失败：${failed.map(key => sourceNames[key] || key).join('、')}。保留上次已取得数据，时间见各卡片；将自动重试。`
+            : '当前交易日每20秒检查更新';
         const markup = '<section class="market-home" id="mh-market-observation" tabindex="-1" aria-label="行情概览"><header class="mh-head"><div>' +
             '<h2>行情概览</h2><span class="mh-badge">' + phase + '</span>' + link('market-context', '市场环境') + '</div>' +
             `<div class="mh-head-actions"><span class="mh-meta">请求 ${escape(requested || '日期待核验')} · 行情 ${escape(stamp || '待核验')}${observationLag(market, clock, requested)}</span>` +
-            '<button type="button" class="mh-retry" data-mh-refresh>重载</button></div></header>';
+            '<button type="button" class="mh-retry" data-mh-refresh>重载</button></div></header>' +
+            `<p class="mh-meta" role="status" data-mh-refresh-status>${escape(refreshText)}</p>`;
         return renderHub(state, requested, clock, modes, market, snapshot) + markup +
             renderIndexStrip(requested, market, state.trend, snapshot) + renderMetrics(market, snapshot, state.liquidity, requested) +
             '<div class="mh-grid">' + renderBreadth(market, snapshot) + renderEmotion(market) + renderTrend(state.trend, market, snapshot, requested) +
@@ -640,18 +646,27 @@
         function refresh(keys) {
             if (session.pending) return session.pending;
             if (!requested) return Promise.resolve({loadError: '交易日期待核验'});
+            const status = container.querySelector?.('[data-mh-refresh-status]');
+            if (status) status.textContent = '正在更新，现有内容保持显示…';
             session.pending = Promise.all(keys.map(async key => {
-                let value = null;
                 try {
-                    value = await options.request(paths[key], ['heatmap', 'liquidity'].includes(key) ? 30000 : 15000, {cache: 'no-store'});
+                    const value = await options.request(paths[key], ['heatmap', 'liquidity'].includes(key) ? 30000 : key === 'snapshot' ? 20000 : 15000, {cache: 'no-store'});
+                    return {key, value};
                 } catch {
-                    // Other data sources stay available when this request fails.
+                    return {key, failed:true};
                 }
-                if (current()) {
-                    session.state[key] = value;
-                    paint();
-                }
-            })).then(() => {
+            })).then(results => {
+                if (!current()) return {};
+                const errors = session.state.refreshErrors || {};
+                results.forEach(result => {
+                    if (result.failed) errors[result.key] = true;
+                    else {
+                        session.state[result.key] = result.value;
+                        delete errors[result.key];
+                    }
+                });
+                session.state.refreshErrors = errors;
+                paint();
                 if (current() && !marketObservation(session.state.market, requested, snapshotObservation(session.state.snapshot, requested)?.market_overview)?.breadth) return {loadError: '市场广度暂不可用'};
                 return {};
             }).finally(() => { session.pending = null; });

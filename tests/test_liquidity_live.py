@@ -53,6 +53,23 @@ def test_liquidity_retains_valid_lunch_observations():
     assert result["dated_quote_count"] == 20
 
 
+def test_liquidity_uses_time_after_waiting_for_capture_owner(tmp_path, monkeypatch):
+    elapsed = 0
+    class Owner:
+        def acquire(self, **kwargs):
+            nonlocal elapsed
+            elapsed = 10
+            return True
+        def release(self):
+            pass
+    monkeypatch.setenv("PROBIGA_JOB_LOG_ROOT", str(tmp_path))
+    monkeypatch.setattr(liquidity_live, "_LOCK", Owner())
+    monkeypatch.setattr(liquidity_live, "monotonic", lambda: elapsed)
+    monkeypatch.setattr(liquidity_live, "_fetch", lambda deadline: rows(NOW+timedelta(seconds=8)))
+    result = liquidity_live.read_live_liquidity(DAY, now=NOW, deadline=22)
+    assert result["dated_quote_count"] == 20
+
+
 def test_bulk_capture_requires_complete_unique_pagination(monkeypatch):
     calls = []
     def request(url, params, **kwargs):

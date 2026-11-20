@@ -87,10 +87,12 @@ def _normalize(rows, selected, now):
 
 
 def read_live_liquidity(selected, *, now, deadline):
+    started = monotonic()
     remaining = deadline-monotonic()
     if selected != now.date().isoformat() or remaining <= 0 or not _LOCK.acquire(timeout=min(18, remaining)):
         raise TimeoutError("liquidity_live: capture owner/date deadline exceeded")
     try:
+        now += timedelta(seconds=monotonic()-started)
         with closing(sqlite3.connect(_path(create=True), timeout=1)) as db:
             db.execute("CREATE TABLE IF NOT EXISTS live_liquidity_snapshot (slot INTEGER PRIMARY KEY CHECK(slot=1), day TEXT, captured_at TEXT, digest TEXT, payload TEXT)")
             stored = db.execute("SELECT day,captured_at,digest,payload FROM live_liquidity_snapshot WHERE slot=1").fetchone()

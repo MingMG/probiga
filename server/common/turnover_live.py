@@ -70,12 +70,14 @@ def _normalize(payload, selected, now):
 
 
 def read_live_turnover(selected, *, now, deadline):
+    started = monotonic()
     if selected != now.date().isoformat():
         return None
     remaining = deadline-monotonic()
     if remaining <= 0 or not _LOCK.acquire(timeout=min(4, remaining)):
         raise TimeoutError("turnover_live: capture owner deadline exceeded")
     try:
+        now += timedelta(seconds=monotonic()-started)
         with closing(sqlite3.connect(_path(create=True), timeout=1)) as db:
             db.execute("CREATE TABLE IF NOT EXISTS live_turnover_snapshot (slot INTEGER PRIMARY KEY CHECK(slot=1), day TEXT, captured_at TEXT, digest TEXT, payload TEXT)")
             stored = db.execute("SELECT day,captured_at,digest,payload FROM live_turnover_snapshot WHERE slot=1").fetchone()
