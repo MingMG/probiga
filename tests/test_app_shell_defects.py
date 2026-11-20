@@ -39,7 +39,7 @@ def _run_node(tmp_path, name, body, *argv):
 
 def test_fatal_error_banner_lands_beside_the_shell(tmp_path):
     source = APP_JS.read_text(encoding="utf-8")
-    start = source.index("    function showFatalError(message) {")
+    start = source.index("    function showFatalError(message, host) {")
     fragment = source[start:source.index("    function setStatus(msg, err) {")]
     assert "showFatalError" in fragment
 
@@ -74,6 +74,59 @@ assert.equal(banner.attributes.role, 'alert', 'a fatal banner must announce itse
 assert.equal(banner.attributes.id, 'globalErrorBanner');
 assert.ok(!('mainContent' in nodes));
 assert.ok(!fragment.includes('mainContent'), 'the fatal path still targets the absent #mainContent');
+""".replace("FRAGMENT", json.dumps(fragment)))
+
+
+def test_resize_observer_notifications_do_not_poison_every_tab(tmp_path):
+    source = APP_JS.read_text(encoding="utf-8")
+    fragment = source[source.index("    window.onerror ="):source.index("    function setStatus(msg, err)")]
+    _run_node(tmp_path, "resize-observer-errors.cjs", r"""
+const assert = require('assert'), vm = require('vm');
+const nodes = {}, errors = [], warnings = [];
+function host(html) {
+  return { innerHTML: html, children: [], firstChild: null,
+    insertBefore(child) { this.children.unshift(child); child.parentNode = this; },
+  };
+}
+const shell = host('<div class="tab-content">加载中...</div>');
+let active = host('<div class="loading">加载中...</div>');
+active.id = 'tab-workbench';
+nodes.contentArea = shell;
+const context = {
+  window: {}, console: { error: (...args) => errors.push(args), warn: (...args) => warnings.push(args) },
+  document: {
+    body: shell, getElementById: id => nodes[id] || null,
+    querySelector: selector => selector === '.tab-content.active' ? active : null,
+    createElement() {
+      const node = { style: {}, setAttribute() {} };
+      Object.defineProperty(node, 'id', {set(value) {nodes[value] = node;}});
+      return node;
+    },
+  },
+};
+vm.runInNewContext(FRAGMENT, context);
+for (const message of ['ResizeObserver loop completed with undelivered notifications.', 'ResizeObserver loop limit exceeded']) {
+  context.window.onerror(message, '', 0, 0, null);
+  assert.equal(active.children.length, 0, 'a deferred resize notification became a page failure');
+  assert.equal(shell.children.length, 0, 'the notification poisoned every tab');
+}
+assert.equal(warnings.length, 2, 'resize diagnostics must remain available');
+context.window.onerror('ResizeObserver is not defined', 'app.js', 42, 1, new ReferenceError());
+assert.equal(errors.length, 1, 'a real ResizeObserver exception was filtered');
+assert.equal(active.children.length, 1, 'real loading failures must remain visible');
+assert.match(active.children[0].textContent, /ResizeObserver is not defined.*42/);
+assert.equal(shell.children.length, 0, 'a tab error must not follow users into every other tab');
+const secondTab = host('<div class="loading">加载中...</div>');
+secondTab.id = 'tab-review';
+active = secondTab;
+context.window.onerror('Review render failed', 'app.js', 84, 1, new Error());
+assert.equal(secondTab.children.length, 1, 'each failing tab needs its own error');
+assert.equal(nodes['tab-workbench-error'].parentNode.id, 'tab-workbench');
+assert.equal(nodes['tab-review-error'].parentNode.id, 'tab-review');
+active = host('<section>已加载的行情</section>');
+context.window.onerror('Other runtime error', 'app.js', 99, 1, new Error());
+assert.equal(errors.length, 3);
+assert.equal(active.children.length, 0, 'hidden loading tabs made a rendered page look failed');
 """.replace("FRAGMENT", json.dumps(fragment)))
 
 
