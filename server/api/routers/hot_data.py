@@ -12422,12 +12422,24 @@ def _recommended_run_history_finish(
     *,
     status: str,
     payload: dict | None = None,
+    expected_build_sha: str | None = None,
 ) -> dict:
     run_uid = str(run_uid or "").strip().lower()
     if not re.fullmatch(r"[0-9a-f]{32}", run_uid):
         raise ValueError("recommendation terminal run_uid is invalid")
     if status not in {"done", "error", "cancelled"}:
         raise ValueError("recommendation terminal status is invalid")
+    production = str(os.environ.get("PROBIGA_DEPLOYMENT_MODE") or "").strip().lower() == "production"
+    scheduler_env_uid = str(os.environ.get("PROBIGA_SCHEDULER_HISTORY_RUN_UID") or "").strip().lower()
+    if scheduler_env_uid and (
+        not re.fullmatch(r"[0-9a-f]{32}", scheduler_env_uid) or scheduler_env_uid != run_uid
+    ):
+        raise RuntimeError("recommendation terminal scheduler environment identity differs")
+    build_sha = _recommendation_build_sha() if expected_build_sha is None else expected_build_sha
+    if expected_build_sha is not None and not re.fullmatch(r"[0-9a-f]{40}", expected_build_sha):
+        raise ValueError("recommendation terminal scheduler build identity invalid")
+    if production and not build_sha:
+        raise RuntimeError("recommendation terminal build identity unavailable")
     payload = payload or {}
     progress_percent = payload.get("progress_percent")
     if progress_percent is None and status == "done":
@@ -12440,28 +12452,33 @@ def _recommended_run_history_finish(
         UPDATE st_recommended_run_history
         SET status = :status,
             trade_date = COALESCE(:trade_date, trade_date),
-            finished_at = NOW(),
-            duration_seconds = TIMESTAMPDIFF(SECOND, started_at, NOW()),
-            progress_percent = :progress_percent,
-            done_count = :done_count,
-            total = :total,
-            passed = :passed,
-            flow_date = :flow_date,
-            hot_date = :hot_date,
-            market_mood_score = :market_mood_score,
+            finished_at = COALESCE(:finished_at, NOW()),
+            duration_seconds = TIMESTAMPDIFF(SECOND, started_at, COALESCE(:finished_at, NOW())),
+            progress_percent = COALESCE(:progress_percent, progress_percent),
+            done_count = COALESCE(:done_count, done_count),
+            total = COALESCE(:total, total),
+            passed = COALESCE(:passed, passed),
+            flow_date = COALESCE(:flow_date, flow_date),
+            hot_date = COALESCE(:hot_date, hot_date),
+            market_mood_score = COALESCE(:market_mood_score, market_mood_score),
             message = :message,
             error = :error
         WHERE run_uid = :uid
+          AND (:build_sha IS NULL OR build_sha = :build_sha)
+          AND (:require_scheduler = 0 OR scheduler_job_id = :uid)
     """, {
         "uid": run_uid,
         "status": status,
+        "build_sha": build_sha,
+        "require_scheduler": int(bool(production or scheduler_env_uid or expected_build_sha)),
+        "finished_at": payload.get("finished_at"),
         "trade_date": payload.get("trade_date"),
         "progress_percent": progress_percent,
         "done_count": done_count,
         "total": payload.get("total"),
         "passed": payload.get("passed"),
-        "flow_date": str(payload.get("flow_date") or "")[:20],
-        "hot_date": str(payload.get("hot_date") or "")[:20],
+        "flow_date": str(payload.get("flow_date") or "")[:20] if "flow_date" in payload else None,
+        "hot_date": str(payload.get("hot_date") or "")[:20] if "hot_date" in payload else None,
         "market_mood_score": payload.get("market_mood_score"),
         "message": str(payload.get("message") or "")[:500],
         "error": str(payload.get("error") or "")[:500],
@@ -12483,28 +12500,11 @@ def _recommended_run_history_finish(
         )
     row = rows[0]
     scheduler_job_id = str(row.get("scheduler_job_id") or "").strip().lower()
-    production = (
-        str(os.environ.get("PROBIGA_DEPLOYMENT_MODE") or "").strip().lower()
-        == "production"
-    )
-    scheduler_env_uid = str(
-        os.environ.get("PROBIGA_SCHEDULER_HISTORY_RUN_UID") or ""
-    ).strip().lower()
-    if scheduler_env_uid and (
-        not re.fullmatch(r"[0-9a-f]{32}", scheduler_env_uid)
-        or scheduler_env_uid != run_uid
-    ):
-        raise RuntimeError(
-            "recommendation terminal scheduler environment identity differs"
-        )
     if scheduler_job_id != run_uid and (production or scheduler_env_uid):
         raise RuntimeError(
             "recommendation terminal scheduler identity differs"
         )
-    build_sha = _recommendation_build_sha()
     row_build_sha = str(row.get("build_sha") or "").strip().lower()
-    if production and not build_sha:
-        raise RuntimeError("recommendation terminal build identity unavailable")
     if build_sha and row_build_sha != build_sha:
         raise RuntimeError("recommendation terminal build identity differs")
     if (
@@ -12522,6 +12522,7 @@ def _recommended_run_history_reconcile_scheduler_terminal() -> None:
         _ensure_recommended_run_history_table()
         rows = _read_sql("""
             SELECT r.run_uid, r.scheduler_job_id,
+                   h.build_sha AS scheduler_build_sha,
                    h.status AS scheduler_status,
                    h.finished_at AS scheduler_finished_at,
                    h.output AS scheduler_output
@@ -12558,7 +12559,8 @@ def _recommended_run_history_reconcile_scheduler_terminal() -> None:
         _recommended_run_history_finish(
             str(row.get("run_uid") or ""),
             status=status,
-            payload={"message": message, "error": error},
+            expected_build_sha=str(row.get("scheduler_build_sha") or ""),
+            payload={"message": message, "error": error, "finished_at": row.get("scheduler_finished_at")},
         )
 
 
