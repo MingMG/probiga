@@ -12435,6 +12435,7 @@ def _recommended_run_history_finish(
         not re.fullmatch(r"[0-9a-f]{32}", scheduler_env_uid) or scheduler_env_uid != run_uid
     ):
         raise RuntimeError("recommendation terminal scheduler environment identity differs")
+    # Historical reconciliation is bound to the producing scheduler receipt.
     build_sha = _recommendation_build_sha() if expected_build_sha is None else expected_build_sha
     if expected_build_sha is not None and not re.fullmatch(r"[0-9a-f]{40}", expected_build_sha):
         raise ValueError("recommendation terminal scheduler build identity invalid")

@@ -74,3 +74,11 @@ def test_old_scheduler_terminal_receipt_survives_a_new_api_release(monkeypatch):
     with pytest.raises(RuntimeError):
         hot_data._recommended_run_history_finish(uid, status="done")
     assert read("SELECT * FROM st_recommended_run_history")[0] == row
+
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE st_recommended_run_history SET status='running'"))
+        conn.execute(text("UPDATE st_scheduled_task_history SET build_sha=:build"), {"build": "d" * 40})
+    before = read("SELECT * FROM st_recommended_run_history")[0]
+    with pytest.raises(RuntimeError):
+        hot_data._recommended_run_history_reconcile_scheduler_terminal()
+    assert read("SELECT * FROM st_recommended_run_history")[0] == before
