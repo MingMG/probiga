@@ -7,6 +7,7 @@ import math
 import re
 import sqlite3
 from collections import OrderedDict, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from threading import Lock
@@ -281,13 +282,14 @@ def _verified_turnover(day: str, quotes: list[dict], stocks: list[dict], now: da
 
 
 def _live_quotes(day: str, now: datetime, deadline: float) -> tuple[list[dict], datetime | None]:
+    started = monotonic()
     engine = get_current_engine()
     with engine.connect() as connection:
         if connection.dialect.name == "mysql":
             connection = connection.execution_options(isolation_level="REPEATABLE READ")
         with (_live_announcement_reply_budget(connection, deadline=deadline, stage="market-board-live-snapshot"),
               bind_sql_connection(connection)):
-            return _live_quote_batch(engine, day, now, deadline)
+            return _live_quote_batch(engine, day, now + timedelta(seconds=monotonic() - started), deadline)
 
 
 def _live_quote_batch(engine, day: str, now: datetime, deadline: float) -> tuple[list[dict], datetime | None]:
@@ -638,6 +640,29 @@ def _close_volume_ratio(day: str, stocks: list[dict], now: datetime, deadline: f
     return {}
 
 
+def _live_board_inputs(day: str, now: datetime, deadline: float) -> dict:
+    started = monotonic()
+    def observed_now():
+        return now + timedelta(seconds=monotonic() - started)
+    sources = {
+        "quotes": (lambda: _live_quotes(day, observed_now(), deadline), ([], None)),
+        "indices": (lambda: read_live_indices(INDEX_NAMES, day, now=observed_now(), deadline=deadline), []),
+        "turnover": (lambda: read_live_turnover(day, now=observed_now(), deadline=deadline), None),
+        "limit_events": (lambda: _limit_up_events(date.fromisoformat(day), observed_now(), deadline), []),
+        "radar_events": (lambda: _market_events(date.fromisoformat(day), observed_now(), deadline), []),
+    }
+    result = {}
+    with ThreadPoolExecutor(max_workers=len(sources)) as pool:
+        pending = {key: pool.submit(load) for key, (load, _) in sources.items()}
+        for key, future in pending.items():
+            try:
+                result[key] = future.result()
+            except (OSError, sqlite3.Error, SQLAlchemyError, RuntimeError, TimeoutError, ValueError) as exc:
+                logger.warning("market board %s unavailable: %s", key, type(exc).__name__)
+                result[key] = sources[key][1]
+    return result
+
+
 def build_market_board(day: date, *, now: datetime) -> dict:
     """Keep exact dated reads and unavailable data boundaries independent."""
     started_at = monotonic()
@@ -646,7 +671,7 @@ def build_market_board(day: date, *, now: datetime) -> dict:
     live = same_day and _live_session(now)
     lunch = same_day and time(11, 30) < now.time() < time(13)
     close_ready = day < now.date() or (same_day and now.time() >= time(15))
-    deadline = started_at + (12 if close_ready else 8)
+    deadline = started_at + (12 if close_ready else 14)
     as_of = None
     source = None
     turnover_evidence = None
@@ -664,13 +689,13 @@ def build_market_board(day: date, *, now: datetime) -> dict:
             stage = "lunch_pause" if lunch else "market_data_unavailable"
             close = datetime.combine(day, time(15))
             if live or lunch:
-                try:
-                    indices = read_live_indices(INDEX_NAMES, day_text, now=now, deadline=deadline)
-                except (OSError, sqlite3.Error, RuntimeError, TimeoutError, ValueError) as exc:
-                    logger.warning("market board live indices unavailable: %s", type(exc).__name__)
+                inputs = _live_board_inputs(day_text, now + timedelta(seconds=monotonic() - started_at), deadline)
+                indices, live_turnover = inputs["indices"], inputs["turnover"]
+                events = sorted([*inputs["limit_events"], *inputs["radar_events"]],
+                                key=lambda row: _clock(row["snapshot_at"]), reverse=True)[:_EVENT_LIMIT]
             if live or lunch or close_ready:
                 try:
-                    quotes, observed_at = _live_quotes(day_text, now, deadline) if live or lunch else (
+                    quotes, observed_at = inputs["quotes"] if live or lunch else (
                         _day_quotes(day_text, now, deadline), close,
                     )
                     stocks = _stock_rows(quotes, day_text, live=live or lunch)
@@ -679,11 +704,6 @@ def build_market_board(day: date, *, now: datetime) -> dict:
                         source = "sm_stock_current" if live or lunch else "sm_stock_kline"
                 except (SQLAlchemyError, RuntimeError, TimeoutError, ValueError, QualityGateError) as exc:
                     logger.warning("market board stock data unavailable: %s", type(exc).__name__)
-            if live or lunch:
-                try:
-                    live_turnover = read_live_turnover(day_text, now=now, deadline=deadline)
-                except (OSError, sqlite3.Error, RuntimeError, TimeoutError, ValueError) as exc:
-                    logger.warning("market board live turnover unavailable: %s", type(exc).__name__)
             # Shared current-table timestamps cannot attest index provenance.
             # Intraday observations above retain the direct provider identity.
             if close_ready:
@@ -701,15 +721,16 @@ def build_market_board(day: date, *, now: datetime) -> dict:
                     turnover_evidence = _verified_turnover(day_text, quotes, stocks, now, deadline)
                 except (SQLAlchemyError, RuntimeError, TimeoutError, ValueError) as exc:
                     logger.warning("market board turnover evidence unavailable: %s", type(exc).__name__)
-            try:
-                events = _limit_up_events(day, now, deadline)
-            except (SQLAlchemyError, RuntimeError, TimeoutError, ValueError) as exc:
-                logger.warning("market board QMT limit events unavailable: %s", type(exc).__name__)
-            try:
-                radar = _market_events(day, now, deadline)
-                events = sorted([*events, *radar], key=lambda row: _clock(row["snapshot_at"]), reverse=True)[:_EVENT_LIMIT]
-            except (SQLAlchemyError, RuntimeError, TimeoutError, ValueError) as exc:
-                logger.warning("market board radar events unavailable: %s", type(exc).__name__)
+            if close_ready:
+                try:
+                    events = _limit_up_events(day, now, deadline)
+                except (SQLAlchemyError, RuntimeError, TimeoutError, ValueError) as exc:
+                    logger.warning("market board QMT limit events unavailable: %s", type(exc).__name__)
+                try:
+                    radar = _market_events(day, now, deadline)
+                    events = sorted([*events, *radar], key=lambda row: _clock(row["snapshot_at"]), reverse=True)[:_EVENT_LIMIT]
+                except (SQLAlchemyError, RuntimeError, TimeoutError, ValueError) as exc:
+                    logger.warning("market board radar events unavailable: %s", type(exc).__name__)
     if live and stocks and not _fresh_live_stamp(as_of, now + timedelta(seconds=monotonic() - started_at)):
         stocks = []
         as_of, source, stage = None, None, "live_quote_expired"
@@ -810,6 +831,7 @@ def build_market_board(day: date, *, now: datetime) -> dict:
 
 @router.get("/monitor/liquidity")
 def market_liquidity(requested: str = Query(alias="date", pattern=r"^\d{4}-\d{2}-\d{2}$")) -> dict:
+    started = monotonic()
     now = datetime.now(SHANGHAI).replace(tzinfo=None)
     try:
         selected = date.fromisoformat(requested)
@@ -821,7 +843,7 @@ def market_liquidity(requested: str = Query(alias="date", pattern=r"^\d{4}-\d{2}
     try:
         if not _trading_day(requested, deadline):
             return {"status": "not_intraday", "requested_date": requested}
-        return read_live_liquidity(requested, now=now, deadline=deadline)
+        return read_live_liquidity(requested, now=now + timedelta(seconds=monotonic() - started), deadline=deadline)
     except (OSError, sqlite3.Error, RuntimeError, TimeoutError, ValueError) as exc:
         raise HTTPException(status_code=503, detail="intraday liquidity source unavailable; retry") from exc
 
@@ -1099,6 +1121,7 @@ def _live_sector_metrics(result, changes, industry_changes, sessions, now):
 
 
 def build_sector_heatmap(day: date, *, now: datetime) -> dict:
+    started = monotonic()
     selected = day.isoformat()
     concept = {"change": _sector_rank([], _HEATMAP_CONCEPT_SOURCE),
                "five_day_return": _sector_rank([], _HEATMAP_CONCEPT_SOURCE),
@@ -1136,7 +1159,7 @@ def build_sector_heatmap(day: date, *, now: datetime) -> dict:
           AND hot_tag LIKE '东财一级行业%' AND etl_sync_at <= :now LIMIT :limit
     """, bounds, deadline=deadline, limit=len(sessions) * 100, stage="industry closes")
     if live:
-        return _live_sector_metrics(result, changes, industry_changes, sessions, now)
+        return _live_sector_metrics(result, changes, industry_changes, sessions, now + timedelta(seconds=monotonic() - started))
     flows = _sector_read(get_engine, """
         SELECT /*+ MAX_EXECUTION_TIME(1400) */ index_code AS code, MAX(index_name) AS name,
                MAX(main_net_inflow) AS main_net_inflow, MAX(max_net_inflow) AS max_net_inflow, MAX(lg_net_inflow) AS lg_net_inflow

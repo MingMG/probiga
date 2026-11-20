@@ -117,7 +117,7 @@ const request = (url, timeout, options) => new Promise(resolve => calls.push({ur
             '/api/scheduler/daily-delivery?trade_date=' + date + '&attempt_limit=12'
         ]);
         assert.deepEqual(calls.map(call => call.url), expected);
-        assert.ok(calls.every(call => call.timeout === (/sector-heatmap|liquidity/.test(call.url) ? 30000 : 15000) && call.options.cache === 'no-store'));
+        assert.ok(calls.every(call => call.timeout === (/sector-heatmap|liquidity/.test(call.url) ? 30000 : /monitor\/board/.test(call.url) ? 20000 : 15000) && call.options.cache === 'no-store'));
         assert.equal(container.listeners.size, 3);
         calls.slice(paths.length + 2).forEach(call => call.resolve({trade_date:'2026-11-06', data_source:'新日期来源'}));
         await current;
@@ -337,5 +337,38 @@ const request=async url=>{calls.push(url);if(hold && url.includes('/monitor/boar
  assert.equal(delay,0); // A slow batch finishes before the next cycle can start.
  calls.length=0;document.hidden=true;await tick();
  assert.equal(calls.length,0);assert.equal(delay,20000);
+}finally{page.stop();}})().catch(e=>{console.error(e);process.exitCode=1;});
+""")
+
+
+def test_refresh_keeps_observed_data_on_failure_and_paints_one_complete_cycle():
+    run_node(r"""
+global.document={activeElement:null,hidden:false};
+let tick, paints=0, html='', fail=false, version=1;
+global.setTimeout=fn=>{tick=fn;return 1;};global.clearTimeout=()=>{};
+const date='2026-11-20';
+const container={get innerHTML(){return html;},set innerHTML(value){html=value;paints++;},
+ contains:()=>false,addEventListener:()=>{},removeEventListener:()=>{}};
+const clock={is_intraday:true,active_trade_date:date,today:date};
+const request=async url=>{
+ if(url.includes('/monitor/board')){
+  if(fail)throw new Error('network timeout');
+  return {status:'available',trade_date:date,as_of:date+'T10:30:00+08:00',source:'verified source',
+   rankings:{gainers:[{stock_code:'600001',short_name:'已取得行情'+version,trade_date:date,change_pct:3}]}};
+ }
+ return {};
+};
+(async()=>{try{
+ await page.load(date,container,{request,clock:()=>clock});
+ assert.ok(html.includes('已取得行情1'));
+ const before=paints;fail=true;await tick();
+ assert.ok(html.includes('已取得行情1'),'a failed request erased the last observed data');
+ assert.ok(html.includes('刷新失败'),'retained observations must not masquerade as a successful refresh');
+ assert.ok(html.includes('10:30:00'),'the observation time must remain visible');
+ assert.equal(paints-before,1,'a refresh rebuilt the page for every source response');
+ fail=false;version=2;await tick();
+ assert.ok(html.includes('已取得行情2'));
+ assert.ok(!html.includes('已取得行情1'));
+ assert.ok(!html.includes('刷新失败'));
 }finally{page.stop();}})().catch(e=>{console.error(e);process.exitCode=1;});
 """)

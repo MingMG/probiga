@@ -12,7 +12,9 @@ def test_old_scheduler_terminal_receipt_survives_a_new_api_release(monkeypatch):
     with engine.begin() as conn:
         conn.execute(text("""
             CREATE TABLE st_recommended_run_history (
-                run_uid TEXT PRIMARY KEY, scheduler_job_id TEXT, build_sha TEXT,
+                id INTEGER DEFAULT 1, run_uid TEXT PRIMARY KEY, scheduler_job_id TEXT, build_sha TEXT,
+                min_score REAL DEFAULT 50, top_n INTEGER DEFAULT 80, strict_prev_trade_day INTEGER DEFAULT 1,
+                execution_time TEXT, host_name TEXT,
                 status TEXT, trade_date TEXT, started_at TEXT, finished_at TEXT,
                 duration_seconds INTEGER, progress_percent INTEGER, done_count INTEGER,
                 total INTEGER, passed INTEGER, flow_date TEXT, hot_date TEXT,
@@ -22,7 +24,7 @@ def test_old_scheduler_terminal_receipt_survives_a_new_api_release(monkeypatch):
         conn.execute(text("""
             CREATE TABLE st_scheduled_task_history (
                 run_uid TEXT PRIMARY KEY, build_sha TEXT, status TEXT,
-                finished_at TEXT, output TEXT
+                finished_at TEXT, output TEXT, duration INTEGER DEFAULT 1800
             )
         """))
         conn.execute(text("""
@@ -33,7 +35,7 @@ def test_old_scheduler_terminal_receipt_survives_a_new_api_release(monkeypatch):
                     75,4200,5573,0,'2026-11-19','2026-11-19',40)
         """), {"uid": uid, "build": old_build})
         conn.execute(text("""
-            INSERT INTO st_scheduled_task_history VALUES
+            INSERT INTO st_scheduled_task_history (run_uid,build_sha,status,finished_at,output) VALUES
             (:uid,:build,'timeout','2026-11-19 16:30:00','NO_PROGRESS')
         """), {"uid": uid, "build": old_build})
 
@@ -54,6 +56,15 @@ def test_old_scheduler_terminal_receipt_survives_a_new_api_release(monkeypatch):
     monkeypatch.setattr(hot_data, "_recommendation_build_sha", lambda: current_build)
     monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
     monkeypatch.delenv("PROBIGA_SCHEDULER_HISTORY_RUN_UID", raising=False)
+
+    monkeypatch.setattr(hot_data, "_cache_get", lambda *a, **k: None)
+    before_read = read("SELECT * FROM st_recommended_run_history")[0]
+    progress = hot_data.recommended_stocks_progress()
+    history = hot_data.recommended_stocks_run_history(limit=5)
+    assert progress["status"] == "error" and progress["is_running"] is False
+    assert progress["finished_at"] == "2026-11-19 16:30:00"
+    assert history["data"][0]["status"] == "error"
+    assert read("SELECT * FROM st_recommended_run_history")[0] == before_read
 
     hot_data._recommended_run_history_reconcile_scheduler_terminal()
     row = read("SELECT * FROM st_recommended_run_history")[0]

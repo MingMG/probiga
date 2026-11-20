@@ -1,4 +1,5 @@
 from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -248,3 +249,25 @@ def test_bulk_source_fields_supply_the_intraday_five_day_return(heatmap_db, monk
     payload = market_home.build_sector_heatmap(date.fromisoformat(DAY), now=now)
     assert payload["concept"]["five_day_return"]["status"] == "available"
     assert payload["concept"]["five_day_return"]["rows"][0]["value"] == 20
+def test_live_boards_are_validated_at_capture_time_after_history_reads(tmp_path, monkeypatch):
+    from datetime import timedelta
+    from server.common import sector_live
+    from tools import sync_eastmoney_concept_market as source
+    now = datetime(2026, 11, 6, 10)
+    elapsed = 0
+    def history(engine, sql, params, **kwargs):
+        nonlocal elapsed
+        if 'si_trade_calendar' in sql:
+            return [{"trade_date": f"2026-11-{day:02d}"} for day in range(6,1,-1)]
+        elapsed = 5
+        return []
+    stamp = int((now+timedelta(seconds=4)).replace(tzinfo=ZoneInfo('Asia/Shanghai')).timestamp())
+    row = {"f12":"BK1201","f14":"计算机","f2":10,"f3":2,"f4":0.2,"f6":100,
+           "f124":stamp,"f62":10,"f66":5,"f72":5}
+    monkeypatch.setenv('PROBIGA_JOB_LOG_ROOT', str(tmp_path))
+    monkeypatch.setattr(market_home, 'monotonic', lambda: elapsed)
+    monkeypatch.setattr(market_home, '_sector_read', history)
+    monkeypatch.setattr(source, '_resolved_curl_json', lambda *a, **k: {"rc":0,"data":{"total":1,"diff":[row]}})
+    result = market_home.build_sector_heatmap(now.date(), now=now)
+    assert result['concept']['change']['status'] == 'available'
+    assert result['concept']['change']['rows'][0]['name'] == '计算机'
