@@ -2359,6 +2359,9 @@ def main(argv: list[str] | None = None) -> int:
                 load_project_env(_validated_runtime_env_file(args.runtime_env_file))
             else:
                 load_project_env()
+            if os.name == "nt" and os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip().lower() == "production":
+                from tools.run_scheduler_daemon import bind_windows_code_identity
+                bind_windows_code_identity()
             engine = create_tool_engine()
         expected_env_sha = (
             os.environ.get("PROBIGA_BUILD_COMMIT_SHA", "").strip().lower()
