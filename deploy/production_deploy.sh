@@ -14474,7 +14474,7 @@ prepare_release() {
       PROBIGA_RELEASE_TREE_SHA256="$EXPECTED_RELEASE_TREE_SHA256" \
       "PYTHONPATH=$ADATA_SOURCE:$CODE_VALIDATION_ROOT" \
       "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P -c \
-      'from server.engine.strategy_execution_adapters import seal_strategy_execution_adapter_registry; print(seal_strategy_execution_adapter_registry())'
+      'from server.engine.strategy_execution_adapters import bootstrap_strategy_execution_adapter_registry, seal_strategy_execution_adapter_registry; bootstrap_strategy_execution_adapter_registry(registry_rows=()); print(seal_strategy_execution_adapter_registry())'
   )"
   test "$COMPUTED_ADAPTER_REGISTRY_SEAL_SHA256" = \
     "$EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256"
@@ -14513,7 +14513,7 @@ prepare_release() {
       PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256="$EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256" \
       "PYTHONPATH=$ADATA_SOURCE:$CODE_VALIDATION_ROOT" \
       "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P -c \
-      'from server.engine.strategy_execution_adapters import bootstrap_strategy_execution_adapter_registry; p=bootstrap_strategy_execution_adapter_registry(); assert p["registry_sealed"] is True'
+      'from server.engine.strategy_execution_adapters import bootstrap_strategy_execution_adapter_registry; p=bootstrap_strategy_execution_adapter_registry(registry_rows=()); assert p["registry_sealed"] is True'
   )
   assert_service_cannot_write_release_paths "$CODE_VALIDATION_ROOT"
   prepare_scheduler_task_release_plan
