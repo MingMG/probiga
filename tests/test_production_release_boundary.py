@@ -429,6 +429,44 @@ def _write_job_log(path: Path, mode: int = 0o600) -> None:
     path.chmod(mode)
 
 
+@pytest.mark.parametrize("phase", ["live", "quiescent"])
+@pytest.mark.parametrize("entry_kind", ["valid", "unknown", "directory", "symlink", "hardlink", "mode"])
+def test_external_market_checkpoint_namespace(tmp_path: Path, phase: str, entry_kind: str) -> None:
+    if os.name != "posix" or not hasattr(os, "O_DIRECTORY"):
+        pytest.skip("secure openat behavior requires POSIX")
+    deploy = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    function = "prepare_probiga_job_log_root" if phase == "live" else "migrate_probiga_job_log_legacy_modes"
+    body = deploy.split(function + "() {", 1)[1].split("\n}\n", 1)[0]
+    script = body.split("<<'PY' || return 2\n", 1)[1].split("\nPY", 1)[0]
+    root = tmp_path / "jobs"
+    root.mkdir(mode=0o700)
+    namespace = root / "external-market"
+    namespace.mkdir(mode=0o700)
+    root.chmod(0o700)
+    namespace.chmod(0o700)
+    database = namespace / "sector-heatmap-v1.sqlite3"
+    _write_job_log(database)
+    _write_job_log(namespace / "market-dashboard-owner.lock")
+    _write_job_log(namespace / "sector-heatmap-v1.sqlite3-journal")
+    if entry_kind == "unknown":
+        _write_job_log(namespace / "unknown.json")
+    elif entry_kind == "directory":
+        database.unlink()
+        database.mkdir(mode=0o700)
+    elif entry_kind == "symlink":
+        database.unlink()
+        database.symlink_to(tmp_path / "outside")
+    elif entry_kind == "hardlink":
+        os.link(database, tmp_path / "outside")
+    elif entry_kind == "mode":
+        database.chmod(0o644)
+    completed = subprocess.run(
+        [sys.executable, "-I", "-", str(root), str(os.geteuid()), str(os.getegid())], input=script,
+        text=True, capture_output=True, timeout=10, check=False,
+    )
+    assert (completed.returncode == 0) == (entry_kind == "valid"), completed.stderr
+
+
 def test_job_log_legacy_modes_are_migrated_only_for_exact_allowlist(
     tmp_path: Path,
 ) -> None:
