@@ -208,6 +208,8 @@ def _publish_board(day, value, token, *, closed):
         fields = ("as_of", "source", "as_of_basis", "sample_size", "price_sample_size", "sample_scope",
                   "sample_sources", "market_overview", "distribution", "strong", "close_drawdowns", "liquidity", "quote_identity")
         payload = {key: value.get(key) for key in fields}
+        payload["unavailable_fields"] = [field for field in value.get("unavailable_fields", [])
+            if field in ("distribution", "strong", "rankings.gainers", "rankings.losers", "rankings.amount", "liquidity.volume_ratio5")]
         payload["rankings"] = {key: value["rankings"][key] for key in ("gainers", "losers", "amount")}
         store.publish(day, "quotes", payload, source_at=value["as_of"], basis="close" if closed else "source", token=token)
         count += 1
