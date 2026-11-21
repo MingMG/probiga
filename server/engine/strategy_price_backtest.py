@@ -95,32 +95,109 @@ def _group_inputs(connection, sessions, cutoff):
             for i in range(0, len(sessions), 16)]
 
 
+def _prepare_native_scopes(connection, run, cutoff):
+    """Resolve the original signed universe, including its legal no-row pairs."""
+    from server.common.qmt_attestation_contract import validated_universe_manifest, validated_no_row_exception_contract
+    from server.common.qmt_daily_market_truth import _validate_bound_daily_entries
+    from server.common.qmt_daily_no_row import project_catalog_daily_codes
+    from server.common.qmt_stock_catalog import load_stock_catalog
+    from server.common.qmt_trade_calendar import load_trade_calendar_receipt
+    start, end = str(run["start_date"])[:10], str(run["end_date"])[:10]
+    if run["status"] != "COMPLETED" or str(run["finished_at"]) > cutoff:
+        raise ValueError("历史原生来源未在研究截止前完成")
+    manifest = validated_universe_manifest(run["tolerance_json"], start_date=start, end_date=end)
+    no_rows = validated_no_row_exception_contract(run["tolerance_json"], start_date=start, end_date=end)
+    first = next(iter(manifest.values()))
+    catalog = load_stock_catalog(connection, batch_id=first["catalog_batch_id"], decision_known_at=cutoff)
+    calendar = load_trade_calendar_receipt(connection, batch_id=first["calendar_batch_id"],
+        start_date=start, end_date=end, decision_known_at=cutoff)
+    total = _validate_bound_daily_entries(manifest, catalog=catalog, calendar=calendar,
+        run_start_date=start, run_end_date=end, no_row_exception_contract=no_rows)
+    if total != int(run["target_rows"]) or total != int(run["matched_rows"]):
+        raise ValueError("原生历史目录和已完成来源计数不一致")
+    projected = project_catalog_daily_codes(catalog=catalog, calendar=calendar, start_date=start,
+        end_date=end, contract=no_rows) if no_rows else {d: catalog.eligible_codes(d) for d in manifest}
+    return {d: {"catalog": catalog.batch_id, "catalog_manifest_hash": catalog.manifest_hash,
+        "excluded_codes": sorted(set(catalog.eligible_codes(d)) - set(projected[d])),
+        "stock_set_hash": entry["stock_set_hash"], "stock_count": int(entry["stock_count"]),
+        "native_receipt_id": str(run["run_id"]), "available_at": str(run["finished_at"])}
+        for d, entry in manifest.items()}
+
+
+def _source_scope(connection, truth, day, cutoff):
+    base = {"catalog": truth["catalog_batch_id"], "excluded_codes": [],
+            "stock_count": int(truth.get("attested_row_count", truth.get("row_count", 0))),
+            "stock_set_hash": truth.get("code_set_hash")}
+    if truth.get("provider") != "qmt_retained_history":
+        return base
+    from server.common.formal_analysis_store import FormalAnalysisStore
+    receipt = str(truth["receipt_id"])
+    generation = canonical_sha256({"schema": "probiga.price-native-source-scope.v1", "receipt": receipt})
+    store = FormalAnalysisStore(connection)
+    scope = store.get(generation, "price_native_scope", day)
+    if scope is None:
+        run = connection.execute(text("""SELECT /*+ MAX_EXECUTION_TIME(4000) */ *
+            FROM qmt_kline_attestation_run WHERE run_id=:uid AND provider='gj_big_qmt_inner'"""),
+            {"uid": receipt}).mappings().one_or_none()
+        if run is None:
+            if not receipt.startswith("retained-row-proof-"):
+                raise ValueError(day + " 的原生历史完成记录不存在")
+            return base
+        scopes = _prepare_native_scopes(connection, run, cutoff)
+        store.put_many(generation, "price_native_scope", scopes)
+        scope = scopes[day]
+    if (scope["stock_count"] != base["stock_count"] or scope["stock_set_hash"] != base["stock_set_hash"]
+            or scope["available_at"] > cutoff):
+        raise ValueError(day + " 的原始证券集合与来源证明不一致")
+    return scope
+
+
+def _scope_filters(scopes, days):
+    clauses, params, expanding = [], {}, []
+    for i, day in enumerate(days):
+        excluded = scopes[day]["excluded_codes"]
+        if excluded:
+            clauses.append(f"NOT (k.trade_date=:scope_day_{i} AND SUBSTR(k.stock_code,1,6) IN :scope_excluded_{i})")
+            params[f"scope_day_{i}"], params[f"scope_excluded_{i}"] = day, excluded
+            expanding.append(bindparam(f"scope_excluded_{i}", expanding=True))
+    return (" AND " + " AND ".join(clauses) if clauses else ""), params, expanding
+
+
+def _resolved_scopes(connection, inputs, days, cutoff):
+    proofs = {d: proof for part in inputs.values() for d, proof in part["proofs"].items()}
+    return {d: _source_scope(connection, proofs[d], d, cutoff) for d in days}
+
+
 def _validate_group(connection, group, cutoff):
     days = group["sessions"]
     from server.common.qmt_daily_market_truth import load_qmt_daily_market_truth
     from server.common.verified_daily_market_truth import load_retained_qmt_daily_market_truth, load_verified_daily_market_truth
-    bindings, proofs, expected = {}, {}, {}
+    bindings, proofs, expected, scopes = {}, {}, {}, {}
     for day in days:
         source = group["sources"][day]
         loader = {"QMT_MANIFEST": load_qmt_daily_market_truth, "QMT_RETAINED": load_retained_qmt_daily_market_truth,
                   "VERIFIED_PUBLIC": load_verified_daily_market_truth}[source]
         truth = loader(connection, start_date=day, end_date=day, decision_known_at=cutoff).as_dict()
-        bindings[day] = truth["catalog_batch_id"]
+        scopes[day] = _source_scope(connection, truth, day, cutoff)
+        bindings[day] = scopes[day]["catalog"]
         expected[day] = int(truth.get("attested_row_count", truth.get("row_count", 0)))
         proofs[day] = truth
     join, params = daily_input_catalog_join({"sessions": days, "catalog_batches_by_session": bindings})
+    predicate, scope_params, expanding = _scope_filters(scopes, days)
     force = " FORCE INDEX (idx_date_ktype) " if connection.dialect.name == "mysql" else " "
     counts = {str(r[0])[:10]: int(r[1]) for r in connection.execute(text("""SELECT /*+ MAX_EXECUTION_TIME(12000) */
         k.trade_date,COUNT(*) FROM sm_stock_kline k """ + force + join + """ WHERE k.k_type=1 AND k.adjust_type=0
-        AND k.trade_date BETWEEN :start AND :end AND k.received_at<=:cutoff GROUP BY k.trade_date"""),
-        {**params, "start": days[0], "end": days[-1], "cutoff": cutoff})}
+        AND k.trade_date BETWEEN :start AND :end AND k.received_at<=:cutoff """ + predicate + " GROUP BY k.trade_date").bindparams(*expanding),
+        {**params, **scope_params, "start": days[0], "end": days[-1], "cutoff": cutoff})}
     if counts != expected:
-        raise ValueError(days[0] + " 已验证来源与回测实际行情覆盖不一致")
+        delta = {d: {"expected": expected[d], "actual": counts.get(d, 0)} for d in days if counts.get(d, 0) != expected[d]}
+        raise ValueError("已验证来源与回测实际行情覆盖不一致：" + str(delta))
     return {"sessions": days, "catalogs": bindings, "proofs": proofs, "row_counts": counts}
 
 
 def _read_bars(connection, days, inputs, cutoff):
-    bindings = {day: batch for part in inputs.values() for day, batch in part["catalogs"].items()}
+    scopes = _resolved_scopes(connection, inputs, days, cutoff)
+    bindings = {d: scopes[d]["catalog"] for d in days}
     expected = {day: n for part in inputs.values() for day, n in part["row_counts"].items()}
     if sum(expected[d] for d in days) > 500000:
         raise ValueError("单步历史行情超过500000行的内存上限")
@@ -129,13 +206,13 @@ def _read_bars(connection, days, inputs, cutoff):
     rows = []
     for offset in range(0, len(days), width):
         chunk = days[offset:offset + width]
+        predicate, scope_params, expanding = _scope_filters(scopes, chunk)
         join, params = daily_input_catalog_join({"sessions": chunk, "catalog_batches_by_session": {d: bindings[d] for d in chunk}})
         rows.extend(dict(r) for r in connection.execute(text("""SELECT /*+ MAX_EXECUTION_TIME(12000) */
-            LEFT(k.stock_code,6) stock_code,k.trade_date,k.`open`,k.high,k.low,k.`close`,k.pre_close,k.volume,k.amount
+            SUBSTR(k.stock_code,1,6) stock_code,k.trade_date,k.`open`,k.high,k.low,k.`close`,k.pre_close,k.volume,k.amount
             FROM sm_stock_kline k """ + force + join + """ WHERE k.k_type=1 AND k.adjust_type=0
-            AND k.trade_date BETWEEN :start AND :end AND k.received_at<=:cutoff
-            ORDER BY k.stock_code,k.trade_date LIMIT 60001"""),
-            {**params, "start": chunk[0], "end": chunk[-1], "cutoff": cutoff}).mappings())
+            AND k.trade_date BETWEEN :start AND :end AND k.received_at<=:cutoff """ + predicate + " ORDER BY k.stock_code,k.trade_date LIMIT 60001").bindparams(*expanding),
+            {**params, **scope_params, "start": chunk[0], "end": chunk[-1], "cutoff": cutoff}).mappings())
     seen = {str(r["trade_date"])[:10] for r in rows}
     if seen != set(days):
         raise ValueError("历史行情读取缺少交易日：" + ",".join(sorted(set(days) - seen)))
@@ -143,6 +220,16 @@ def _read_bars(connection, days, inputs, cutoff):
     counts = Counter(str(r["trade_date"])[:10] for r in rows)
     if any(counts[day] != expected[day] for day in days):
         raise ValueError("已冻结的回测行情覆盖在读取时发生变化")
+    from server.common.qmt_attestation_contract import expected_stock_set_contract
+    by_day = {}
+    for r in rows:
+        by_day.setdefault(str(r["trade_date"])[:10], []).append(r["stock_code"])
+    for day, codes in by_day.items():
+        expected_hash = scopes[day]["stock_set_hash"]
+        actual_hash = (expected_stock_set_contract(day, codes)["stock_set_hash"]
+                       if scopes[day].get("native_receipt_id") else canonical_sha256(sorted(codes)))
+        if expected_hash is not None and actual_hash != expected_hash:
+            raise ValueError(day + " 的行情证券集合与冻结证明不一致")
     return rows
 
 
@@ -321,6 +408,7 @@ def advance_replay(connection, state, proposals, campaign, *, checkpoint=None):
         from server.engine.strategy_rule_replay import replay_rule
         bars = [bar for part in prices.values() for bar in part["bars"]]
         common_hash = canonical_sha256({"inputs": inputs, "contract": campaign["contract"], "sessions": campaign["sessions"],
+            "read_scopes": _resolved_scopes(connection, inputs, campaign["input_sessions"], campaign["knowledge_cutoff"]),
             "identity_proofs": {day: part["identity_proof"] for day, part in signals.items()}})
         identity_sessions = sum(part["identity_proof"]["status"] == "VERIFIED" for part in signals.values())
         for p in proposals:
