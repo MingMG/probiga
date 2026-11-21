@@ -1168,6 +1168,29 @@ def quant_workbench_strategies(trade_date: str = Query(default="")):
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+@router.get("/strategy-performance")
+def strategy_performance(trade_date: str = Query(default="")):
+    from server.api.strategy_performance import read_performance
+    try:
+        return read_performance(get_engine(), trade_date)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get("/strategy-performance/{result_id}")
+def strategy_performance_detail(result_id: str, offset: int = Query(default=0, ge=0, le=100000),
+                                limit: int = Query(default=50, ge=1, le=100)):
+    from server.api.strategy_performance import read_performance_detail
+    if len(result_id) > 160:
+        raise HTTPException(status_code=422, detail="invalid result identity")
+    try:
+        return read_performance_detail(get_engine(), result_id, offset=offset, limit=limit)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="strategy result not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="invalid result identity") from exc
+
+
 @router.post("/operations/{operation_id}/run")
 def run_quant_workbench_operation(
     operation_id: str,

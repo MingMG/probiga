@@ -5359,6 +5359,16 @@ button:focus-visible,a:focus-visible { outline:2px solid #1a73e8; outline-offset
 #tab-quant-workbench .qsw-operations {margin-top:18px}
 #tab-quant-workbench .qsw-research {margin:18px 0;padding:16px;background:#f4f8ff;border:1px solid #d8e4f5;border-radius:12px}
 #tab-quant-workbench .qsw-research h3 {margin:0 0 10px;color:#244876;font-size:16px}
+#tab-quant-workbench .qsw-performance {margin:18px 0;padding:16px;border:1px solid #d8e4f5;border-radius:12px;background:#fff}
+#tab-quant-workbench .qsw-performance p {font-size:12px;line-height:1.8;overflow-wrap:anywhere}
+#tab-quant-workbench .qsw-performance details {margin:12px 0}
+#tab-quant-workbench .qsw-performance summary {cursor:pointer;font-weight:600}
+#tab-quant-workbench .qsw-result-scroll {max-height:480px;overflow:auto;overscroll-behavior:contain}
+#tab-quant-workbench .qsw-result-scroll table {border-collapse:collapse;width:100%;font-size:12px}
+#tab-quant-workbench .qsw-result-scroll th {position:sticky;top:0;background:#eef4fc;z-index:1}
+#tab-quant-workbench .qsw-result-scroll th,#tab-quant-workbench .qsw-result-scroll td {padding:10px;text-align:left;border-bottom:1px solid #e2e8f0;min-width:85px}
+#tab-quant-workbench .qsw-result-scroll small {display:block;max-width:380px;overflow-wrap:anywhere;white-space:normal;color:#64748b;font-size:11px;margin-top:4px}
+#tab-quant-workbench .qsw-result-detail {padding:12px;background:#f4f8ff;border:1px solid #d8e4f5;border-radius:8px}
 #tab-quant-workbench .qsw-research p {font-size:12px;line-height:1.8;overflow-wrap:anywhere}
 #tab-quant-workbench .qsw-research-proposal {padding:12px;margin-top:10px;border:1px solid #dce5ef;border-radius:8px;background:#fff}
 #tab-quant-workbench .qsw-research-proposal>summary {cursor:pointer;font-weight:600;font-size:13px;color:#334155}
