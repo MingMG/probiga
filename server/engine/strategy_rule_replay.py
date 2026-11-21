@@ -14,10 +14,13 @@ ACCOUNT = {"minimum_commission_cny": 5, "commission_rate": 0.0003,
            "transfer_fee_rate": 0.00001, "sell_stamp_duty_rate": 0.0005, "default_slippage_rate": 0.001}
 
 
-def replay_rule(rule, signals, bars, sessions, *, initial_cash=250000.0):
+def replay_rule(rule, signals, bars, sessions, *, initial_cash=250000.0, evaluation_start=None):
     """Stops observed in a daily bar schedule the next executable open exit."""
     if sessions != sorted(set(sessions)) or not sessions:
         raise ValueError("研究回放交易日必须唯一且有序")
+    evaluation_start = evaluation_start or sessions[0]
+    if evaluation_start not in sessions:
+        raise ValueError("回测统计起点不在行情窗口内")
     prices = {}
     for row in bars:
         identity = (str(row["trade_date"])[:10], str(row["stock_code"]))
@@ -66,7 +69,7 @@ def replay_rule(rule, signals, bars, sessions, *, initial_cash=250000.0):
                 cash += value - fee
                 pnl = (value - fee - position["entry_value"] - position["entry_fee"]
                        if not position.get("cashflow_unknown") else None)
-                trades.append({"stock_code": code, "entry_at": position["entry_day"] + " 09:30:00", "exit_at": day + " 09:30:00",
+                trades.append({"stock_code": code, "stock_name": position["stock_name"], "entry_at": position["entry_day"] + " 09:30:00", "exit_at": day + " 09:30:00",
                     "signal_known_at": position["signal_known_at"], "entry_price": position["entry_price"], "exit_price": price,
                     "quantity": position["quantity"], "estimated_fee_cny": position["entry_fee"] + fee,
                     "estimated_impact_cny": position["entry_impact"] + impact, "net_pnl_cny": pnl,
@@ -119,7 +122,7 @@ def replay_rule(rule, signals, bars, sessions, *, initial_cash=250000.0):
                 continue
             cash -= value + fee
             opening_cash -= value + fee
-            positions[code] = {"quantity": quantity, "industry": signal["industry"], "entry_value": value,
+            positions[code] = {"quantity": quantity, "stock_name": signal["stock_name"], "industry": signal["industry"], "entry_value": value,
                 "entry_fee": fee, "entry_impact": impact, "entry_price": price, "entry_day": day,
                 "entry_index": index, "signal_known_at": signal["signal_known_at"],
                 "instrument_rule_version": instrument["rule_version"],
@@ -138,15 +141,20 @@ def replay_rule(rule, signals, bars, sessions, *, initial_cash=250000.0):
         equity = cash + marked
         if cash < -0.01:
             raise ValueError("研究模拟发生现金透支")
-        nav.append({"trade_date": day, "nav_cny": equity if not invalid_nav else None,
-                    "return_pct": (equity / previous_nav - 1) * 100 if not invalid_nav and previous_nav > 0 else None})
+        if day >= evaluation_start:
+            nav.append({"trade_date": day, "nav_cny": equity if not invalid_nav else None,
+                        "return_pct": (equity / previous_nav - 1) * 100 if not invalid_nav and previous_nav > 0 else None})
         previous_nav = equity
-    blocked = invalid_nav or any(d["status"] == "DATA_BLOCKED" for d in dispositions)
-    statistics = newey_west_nav_statistics(nav) if not blocked else None
-    return {"status": "BLOCKED" if blocked else "COMPLETE", "execution_mode": "MODELED_DAILY_BAR",
+    exclusions = [d for d in dispositions if d["status"] == "DATA_BLOCKED"]
+    partial = bool(exclusions) and not invalid_nav
+    statistics = newey_west_nav_statistics(nav) if not invalid_nav and not partial else None
+    return {"status": "BLOCKED" if invalid_nav else "PARTIAL" if partial else "COMPLETE", "execution_mode": "MODELED_DAILY_BAR",
             "initial_cash_cny": initial_cash, "trades": trades, "dispositions": dispositions, "nav": nav,
             "open_position_count": len(positions), "completed_trade_count": len(trades),
-            "net_return_pct": (previous_nav / initial_cash - 1) * 100 if not blocked else None,
+            "net_return_pct": (previous_nav / initial_cash - 1) * 100 if not invalid_nav and not partial else None,
+            "verified_input_subset_return_pct": (previous_nav / initial_cash - 1) * 100 if not invalid_nav else None,
+            "input_exclusion_count": len(exclusions),
+            "return_scope": "VERIFIED_INPUT_SUBSET" if partial else "FULL_REQUESTED_INPUTS" if not invalid_nav else "UNKNOWN",
             "statistical_evidence": statistics, "fees": {"kind": "ESTIMATE", **ACCOUNT},
             "out_of_sample_status": "RETROSPECTIVE_NOT_PRISTINE", "funding_eligible": False,
             "real_order_authority": False, "automatic_real_order_submission": False}

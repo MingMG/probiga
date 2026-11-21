@@ -354,11 +354,33 @@ def _step(connection, state, owner):
     elif state["stage"] == "VALIDATE":
         pending = next((p for p in state["proposals"] if p["validation"]["status"] in {"NOT_STARTED", "RUNNING"}), None)
         if pending is not None:
-            pending["validation"] = _validate_historical(connection, state, pending)
-            state["current_unit"] = pending["name"] + " · " + str(pending["validation"].get("current_unit") or "历史数据检查")
-            partition_events = pending["validation"].pop("_events", [])
-            if pending["validation"]["status"] not in {"NOT_STARTED", "RUNNING"}:
-                state["completed_units"] += 1
+            from server.engine.strategy_price_backtest import supports_price_rule, start_replay, advance_replay
+            if supports_price_rule(pending["rule"]):
+                proposals = [p for p in state["proposals"] if supports_price_rule(p["rule"])]
+                campaign = state.get("price_backtest")
+                if campaign is None:
+                    days, _ = _historical_inventory(connection, state)
+                    campaign = start_replay(connection, state, proposals, days)
+                    state["price_backtest"] = campaign
+                    state["current_unit"] = "历史回测已创建 · " + campaign["run_id"]
+                    _checkpoint(connection, state, owner)
+                before = sum(p["validation"]["status"] not in {"NOT_STARTED", "RUNNING"} for p in proposals)
+                def replay_checkpoint(current, events, *, completed=True):
+                    state.update(price_backtest=current, current_unit=current["current_unit"])
+                    if completed:
+                        state["last_progress_at"] = now_shanghai().isoformat(sep=" ")
+                    _checkpoint(connection, state, owner, partition_events=events)
+                campaign, partition_events = advance_replay(connection, state, proposals, campaign, checkpoint=replay_checkpoint)
+                state["price_backtest"] = campaign
+                after = sum(p["validation"]["status"] not in {"NOT_STARTED", "RUNNING"} for p in proposals)
+                state["completed_units"] += after - before
+                state["current_unit"] = campaign["current_unit"]
+            else:
+                pending["validation"] = _validate_historical(connection, state, pending)
+                state["current_unit"] = pending["name"] + " · " + str(pending["validation"].get("current_unit") or "历史数据检查")
+                partition_events = pending["validation"].pop("_events", [])
+                if pending["validation"]["status"] not in {"NOT_STARTED", "RUNNING"}:
+                    state["completed_units"] += 1
         if all(p["validation"]["status"] not in {"NOT_STARTED", "RUNNING"} for p in state["proposals"]):
             state["stage"] = "REGISTER"
     elif state["stage"] == "REGISTER":
@@ -391,7 +413,7 @@ def _step(connection, state, owner):
                                            "funding_eligible": False, "real_order_authority": False}
             state["completed_units"] += 1
         if all(p["registration"]["status"] == "COMPLETE" for p in state["proposals"]):
-            blocked = any(p["validation"]["status"] == "BLOCKED" for p in state["proposals"])
+            blocked = any(p["validation"]["status"] in {"BLOCKED", "PARTIAL", "FAILED"} for p in state["proposals"])
             state.update(stage="FINISHED", status="BLOCKED" if blocked else "COMPLETE",
                          reason="候选已生成并登记影子观察；历史验证存在数据缺口" if blocked else "候选生成与研究验证已处理；盈利与资金资格仍待前向证据")
     if time.monotonic() > deadline:
@@ -443,6 +465,20 @@ def research_tick(engine):
                         aliases = state.setdefault("equivalent_source_hashes", [])
                         state["equivalent_source_hashes"] = (aliases + [root])[-24:]
                         _checkpoint(connection, state, owner)
+            if state and state["stage"] == "FINISHED" and all(p["registration"]["status"] == "COMPLETE" for p in state["proposals"]):
+                from server.engine.strategy_price_backtest import replay_contract, supports_price_rule
+                price_proposals = [p for p in state["proposals"] if supports_price_rule(p["rule"])]
+                contract = replay_contract() if price_proposals else None
+                if any(p["validation"].get("backtest_contract") != contract for p in price_proposals):
+                    # Evaluation has its own identity and deadline; generation and registration stay immutable.
+                    state["generation_deadline_at"] = state.get("generation_deadline_at", state["deadline_at"])
+                    state.update(status="NOT_STARTED", stage="VALIDATE", step_status="NOT_STARTED", retryable=False,
+                        deadline_at=(now_shanghai() + timedelta(hours=24)).isoformat(sep=" "),
+                        completed_units=state["completed_units"] - len(price_proposals))
+                    state.pop("price_backtest", None)
+                    for p in price_proposals:
+                        p["validation"] = {"status": "NOT_STARTED"}
+                    _checkpoint(connection, state, owner)
             if state and state["status"] in {"COMPLETE", "FAILED", "BLOCKED"}:
                 if (state.get("retryable") is True and int(state.get("retry_count") or 0) <= 2
                         and str(state.get("retry_after") or "9999") <= now_shanghai().isoformat(sep=" ")):
@@ -477,8 +513,9 @@ def research_tick(engine):
             return {key: state.get(key) for key in ("status", "run_id", "stage", "completed_units", "total_units", "reason")}
         except Exception as exc:
             from biz.review.market_decision import ResearchError
-            reason = str(exc)[:600] if isinstance(exc, (ValueError, ResearchError, TimeoutError)) else type(exc).__name__
+            reason = str(exc)[:600] if isinstance(exc, (ValueError, ResearchError, TimeoutError, RuntimeError)) else type(exc).__name__
             if state is not None:
+                reason = str(state.get("current_unit") or state.get("stage")) + ": " + reason
                 state.update(status="FAILED", step_status="FAILED", reason=reason)
                 original = getattr(exc, "orig", exc)
                 error_args = getattr(original, "args", ())

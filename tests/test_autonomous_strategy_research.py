@@ -164,6 +164,55 @@ def test_unknown_corporate_action_does_not_create_fake_loss(rule, replay_data):
     assert report["nav"][22]["nav_cny"] is None
 
 
+def test_price_research_runs_shared_inputs_and_resumes_from_real_audit_partitions(ledger, rule, monkeypatch):
+    from server.engine import strategy_price_backtest as price
+    import pandas as pd
+    dates = [d.date().isoformat() for d in pd.bdate_range('2026-06-01', periods=32)]
+    raw = [{"stock_code": code, "trade_date": day, "open": 10 * rate ** (i - 1),
+            "pre_close": 10 * rate ** (i - 1), "close": 10 * rate ** i,
+            "high": 10.2 * rate ** i, "low": 9.8 * rate ** i, "amount": 1e8, "volume": 1e7}
+           for code, rate in [("000001", 1.01), ("000002", .99)] for i, day in enumerate(dates)]
+    with ledger.begin() as c:
+        c.execute(text("CREATE TABLE si_trade_calendar(trade_date TEXT,trade_status INT)"))
+        c.execute(text("INSERT INTO si_trade_calendar VALUES(:day,1)"), [{"day": d} for d in dates])
+    monkeypatch.setattr(research, '_historical_inventory', lambda *_: (dates[20:], {}))
+    calls = []
+    monkeypatch.setattr(price, '_group_inputs', lambda _c, days, _cutoff: [{"sessions": days, "source_key": "test", "native": True}])
+    def validate(_c, group, _cutoff):
+        calls.append(group['sessions'])
+        return {"sessions": group['sessions'], "catalogs": {d: "test" for d in group['sessions']}, "proofs": {"fixture": True}, "row_counts": {d: 2 for d in group['sessions']}}
+    monkeypatch.setattr(price, '_validate_group', validate)
+    monkeypatch.setattr(price, '_read_bars', lambda _c, days, _inputs, _cutoff: [r for r in raw if r['trade_date'] in days])
+    def identity(_c, day):
+        if day == dates[20]:
+            return {}, {"status": "UNAVAILABLE"}
+        return {code: {"short_name": "测试证券", "industry_name": "测试行业", "industry_snapshot_date": day,
+                       "industry_snapshot_source": "gj_big_qmt_inner", "membership_proof_sha256": "a" * 64}
+                for code in ['000001', '000002']}, {"status": "VERIFIED", "captured_at": day + ' 18:00:00'}
+    monkeypatch.setattr(price, '_identity_rows', identity)
+    proposals = [{"strategy_key": 'test' + str(i), "version": 'v1', "name": 'fixture', "rule": deepcopy(rule),
+                  "rule_hash": str(i) * 64, "validation": {"status": "NOT_STARTED"}, "registration": {"status": "COMPLETE"}}
+                 for i in (1, 2)]
+    proposals[1]['rule']['holding_days'] = 3
+    state = {"schema": research.SCHEMA, "run_id": 'a' * 64, "trade_date": dates[-1], "stage": "VALIDATE",
+             "analysis_run_uid": 'b' * 32, "analysis_payload_hash": 'c' * 64, "status": "NOT_STARTED",
+             "proposal_generated_at": '2026-11-21 20:00:00', "decision_known_at": '2026-11-21 20:00:00',
+             "completed_units": 3, "total_units": 5, "proposals": proposals}
+    with ledger.connect() as c:
+        owner = research._owner(c)
+        for _ in range(8):
+            research._step(c, state, owner)
+            state = research._read_states(c)[0]
+            if state['stage'] == 'FINISHED':
+                break
+        assert len(calls) == 1
+        assert state['stage'] == 'FINISHED' and state['completed_units'] == 5
+        assert all(p['validation']['report']['completed_trade_count'] > 0 for p in state['proposals'])
+        assert all(p['validation']['status'] == 'PARTIAL' for p in state['proposals'])
+        assert len({p['validation']['source_input_sha256'] for p in state['proposals']}) == 1
+        assert c.execute(text("SELECT COUNT(*) FROM st_strategy_governance_audit WHERE entity_type='AUTO_REPLAY_PART'")).scalar() == 45
+
+
 @pytest.fixture
 def ledger(monkeypatch):
     engine = create_engine("sqlite://")
@@ -222,6 +271,7 @@ def test_terminal_scheduler_owner_cannot_publish_research(ledger):
 
 def test_complete_feature_history_is_required_without_rebuilding_with_current_factors(ledger, rule):
     from server.engine.strategy_rule_backtest import run_rule_backtest
+    rule["entry_all"][0]["field"] = "technical_score"
     state = {"run_id": "a" * 64, "decision_known_at": "2026-11-21 20:00:00"}
     days = [(datetime(2026, 5, 1) + timedelta(days=i)).date().isoformat() for i in range(120)]
     proposal = {"rule": rule, "rule_hash": "b" * 64, "validation": {"status": "NOT_STARTED"}}
@@ -315,11 +365,12 @@ def test_model_result_reuses_one_durable_request_after_caller_restart(rule, raw_
         engine.dispose()
 
 
-def test_unfinished_validation_keeps_its_checkpoint_and_does_not_register(ledger, monkeypatch):
+def test_unfinished_validation_keeps_its_checkpoint_and_does_not_register(ledger, monkeypatch, rule):
+    rule["entry_all"][0]["field"] = "technical_score"
     state = {"schema": research.SCHEMA, "run_id": "a" * 64, "trade_date": "2026-11-20", "stage": "VALIDATE",
              "analysis_run_uid": "b" * 32, "analysis_payload_hash": "c" * 64, "status": "NOT_STARTED",
              "completed_units": 1, "total_units": 3,
-             "proposals": [{"name": "测试假设", "validation": {"status": "NOT_STARTED"}, "registration": {"status": "NOT_STARTED"}}]}
+             "proposals": [{"name": "测试假设", "rule": rule, "validation": {"status": "NOT_STARTED"}, "registration": {"status": "NOT_STARTED"}}]}
     monkeypatch.setattr(research, "_validate_historical", lambda *args: {
         "status": "RUNNING", "current_unit": "SIGNALS:2026-08-01", "cursor": 3, "completed_units": 3, "total_units": 260})
     with ledger.connect() as c:
@@ -334,6 +385,7 @@ def test_unfinished_validation_keeps_its_checkpoint_and_does_not_register(ledger
 
 def test_resume_reads_next_partitions_and_reuses_the_durable_cursor(ledger, rule, monkeypatch):
     from server.engine import strategy_rule_backtest as backtest
+    rule["entry_all"][0]["field"] = "technical_score"
     days = [(datetime(2026, 5, 1) + timedelta(days=i)).date().isoformat() for i in range(120)]
     with ledger.begin() as c:
         c.execute(text("CREATE TABLE si_trade_calendar (trade_date TEXT,trade_status INT)"))

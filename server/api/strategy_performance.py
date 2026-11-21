@@ -86,18 +86,28 @@ def _research(run, proposal):
     trades = report.get("trades") or []
     initial = _number(report.get("initial_cash_cny"))
     net_return = _number(report.get("net_return_pct")) if validation.get("status") == "COMPLETE" else None
+    subset_return = (_number(report.get("verified_input_subset_return_pct"))
+                     if validation.get("status") == "PARTIAL" else None)
+    return_scope = report.get("return_scope", "FULL_REQUESTED_INPUTS")
     cohort = {"start_date": (validation.get("sessions") or [None])[0],
         "end_date": (validation.get("sessions") or [None])[-1],
-        "dataset_sha256": validation.get("dataset_sha256"), "initial_cash_cny": initial,
-        "fees": report.get("fees"), "execution_mode": report.get("execution_mode")}
-    eligible = bool(net_return is not None and initial and cohort["dataset_sha256"]
-                    and cohort["fees"] and report.get("status") == "COMPLETE" and trades)
+        "dataset_sha256": validation.get("source_input_sha256") or validation.get("dataset_sha256"), "initial_cash_cny": initial,
+        "fees": report.get("fees"), "execution_mode": report.get("execution_mode"), "return_scope": return_scope}
+    comparable = net_return if net_return is not None else subset_return
+    eligible = bool(comparable is not None and initial and cohort["dataset_sha256"]
+                    and cohort["fees"] and report.get("status") in {"COMPLETE", "PARTIAL"} and trades)
     return {"result_id": "research:" + run["run_id"] + ":" + proposal["rule_hash"],
         "kind": "MODEL_RULE_RETROSPECTIVE", "strategy_key": proposal["strategy_key"],
         "strategy_version": proposal["version"], "strategy_name": proposal["name"],
         "status": validation.get("status", "NOT_STARTED"), **{k: cohort[k] for k in ("start_date", "end_date", "initial_cash_cny")},
         "net_return_pct": net_return, "net_profit_cny": initial * net_return / 100 if initial and net_return is not None else None,
+        "verified_input_subset_return_pct": subset_return,
+        "verified_input_subset_profit_cny": initial * subset_return / 100 if initial and subset_return is not None else None,
+        "return_scope": return_scope, "identity_covered_sessions": validation.get("identity_covered_sessions"),
+        "input_exclusion_count": report.get("input_exclusion_count"), "replay_run_id": validation.get("replay_run_id"),
         "completed_trades": report.get("completed_trade_count"), "max_drawdown_pct": _drawdown(nav) if eligible else None,
+        "closed_trade_net_pnl_cny": sum(_number(t["net_pnl_cny"]) for t in trades)
+            if trades and all(_number(t.get("net_pnl_cny")) is not None for t in trades) else None,
         "win_rate_pct": sum(_number(t["net_pnl_cny"]) > 0 for t in trades) / len(trades) * 100
             if eligible and trades and all(_number(t.get("net_pnl_cny")) is not None for t in trades) else None,
         "estimated_fees_cny": sum(float(t["estimated_fee_cny"]) for t in trades)
@@ -124,11 +134,13 @@ def rank_results(records):
         group.setdefault((row["strategy_key"], row["strategy_version"]), row)
     result = []
     for key, versions in groups.items():
-        ordered = sorted(versions.values(), key=lambda r: (-r["net_return_pct"], r["strategy_key"]))
+        def value(row):
+            return row.get("verified_input_subset_return_pct") if row.get("return_scope") == "VERIFIED_INPUT_SUBSET" else row["net_return_pct"]
+        ordered = sorted(versions.values(), key=lambda r: (-value(r), r["strategy_key"]))
         last, rank = None, 0
         for index, row in enumerate(ordered):
-            if row["net_return_pct"] != last:
-                rank, last = index + 1, row["net_return_pct"]
+            if value(row) != last:
+                rank, last = index + 1, value(row)
             row["rank"] = rank
         result.append({"cohort_id": key, "cohort": ordered[0]["cohort"], "rows": ordered})
     return result
@@ -162,7 +174,7 @@ def read_performance(engine, day):
     return {"trade_date": workspace["trade_date"], "strategies": strategies,
         "results": records, "leaderboards": rank_results(records), "sources": sources,
         "history_limit": 100, "history_limit_reached": len(formal) == 100,
-        "method": "历史回测按同区间、同数据、同初始资金及费用执行口径分组，以账户扣费累计收益率排名；前向观察单列。模型规则历史回放属于事后研究，未经样本外验证不构成盈利结论。",
+        "method": "历史回测按同区间、同数据、同初始资金及费用执行口径分组。可用输入子集单列研究排名，缺少历史身份的拟入场被排除，其收益不能代表完整策略表现。模型规则回放属于事后研究，未经样本外验证不构成盈利结论。",
         "real_order_authority": False}
 
 
@@ -180,6 +192,7 @@ def read_performance_detail(engine, result_id, *, offset=0, limit=50):
         return {"summary": row, "trades": trades[offset:offset + limit], "trade_count": len(trades),
                 "offset": offset, "limit": limit, "nav": report.get("nav") or [],
                 "dispositions": (report.get("dispositions") or [])[:100], "fees": report.get("fees"),
+                "disposition_count": len(report.get("dispositions") or []),
                 "missing_feature_dates": (proposal.get("validation") or {}).get("missing_feature_dates") or []}
     repository = TradingV2ReadRepository(engine)
     raw = repository.backtest(result_id)
