@@ -22,6 +22,8 @@ from starlette.concurrency import run_in_threadpool
 from server.api.admin_auth import validate_admin_request
 from server.api.qmt_live_runtime import start_qmt_live_runtime, stop_qmt_live_runtime
 from server.api.market_radar_runtime import start_market_radar_runtime, stop_market_radar_runtime
+from server.common.market_dashboard_worker import start_dashboard_producer, stop_dashboard_producer
+from server.api.market_dashboard_stream import router as dashboard_stream_router, hub as dashboard_stream_hub
 from server.api.routers._engine import (
     dispose_engine as dispose_api_engine,
     get_engine as get_api_engine,
@@ -207,9 +209,12 @@ async def lifespan(_: FastAPI):
         qmt_live_runtime_started = True
     if _desktop_runtimes_allowed() and start_market_radar_runtime() is not None:
         market_radar_runtime_started = True
+    start_dashboard_producer()
     try:
         yield
     finally:
+        await dashboard_stream_hub.stop()
+        await run_in_threadpool(stop_dashboard_producer)
         from server.api.data_monitor import stop_monitor
         await run_in_threadpool(stop_monitor)
         stop_embedded_scheduler()
@@ -266,6 +271,7 @@ app.include_router(commentary.router, prefix="/api")
 app.include_router(deploy.router, prefix="/api")
 app.include_router(project_workflow.router, prefix="/api")
 app.include_router(market_radar.router, prefix="/api")
+app.include_router(dashboard_stream_router, prefix="/api")
 app.include_router(market_outlook.router, prefix="/api")
 app.include_router(market_home.router, prefix="/api")
 app.include_router(research_tools.router, prefix="/api")

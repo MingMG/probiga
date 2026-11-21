@@ -29,6 +29,8 @@ from server.common.turnover_live import read_live_turnover
 from server.common.limit_up_events import LIMIT_STATUS_BASIS
 from server.common.limit_up_event_schema import LIMIT_UP_EVENT_TABLE
 from server.common.market_close_ladder import load_market_close_ladder
+from server.common import market_dashboard_store as dashboard_store
+from server.common.market_live_ladder import capture_live_ladder
 from server.common.qmt_attestation_contract import canonical_digest
 from server.common.sector_heatmap_store import read_concept_names, read_industry_flow
 from server.common.sql_reader import bind_sql_connection, read_sql_rows
@@ -339,7 +341,9 @@ def _live_quote_batch(engine, day: str, now: datetime, deadline: float) -> tuple
     snapshot = validate_qmt_snapshot(receipt, stocks, now=validation_at)
     if snapshot.warnings or len(stocks) != len({row.get("stock_code") for row in stocks}):
         return [], None
-    return [dict(row, trade_date=day) for row in snapshot.rows], generated
+    identity = {key: receipt.get(key) for key in ("receipt_id", "source_provider", "source_snapshot_token")}
+    identity["batch_id"] = batch_id
+    return [dict(row, trade_date=day, quote_identity=identity) for row in snapshot.rows], generated
 
 
 def _index_quotes(day: str, close_at: datetime, now: datetime, deadline: float) -> list[dict]:
@@ -539,9 +543,7 @@ def _limit_up_events(day: date, now: datetime, deadline: float, *, before=None, 
     return result
 
 
-@router.get("/monitor/events")
-def monitor_events(requested: str = Query(alias="date", pattern=r"^\d{4}-\d{2}-\d{2}$"),
-                   before: str | None = Query(default=None, max_length=100)) -> dict:
+def _read_event_page(requested: str, before: str | None = None) -> dict:
     now = datetime.now(SHANGHAI).replace(tzinfo=None)
     try:
         selected = date.fromisoformat(requested)
@@ -567,6 +569,27 @@ def monitor_events(requested: str = Query(alias="date", pattern=r"^\d{4}-\d{2}-\
     return {"requested_date": requested,
             "events": [{key: value for key, value in row.items() if key != "_cursor"}
                        for row in page if "event_type" in row], "next_cursor": cursor}
+
+
+@router.get("/monitor/events")
+def monitor_events(requested: str = Query(alias="date", pattern=r"^\d{4}-\d{2}-\d{2}$"),
+                   before: str | None = Query(default=None, max_length=100)) -> dict:
+    if before:
+        return _read_event_page(requested, before)
+    selected = _selected_day(requested)
+    stored = dashboard_store.component(requested, "events")
+    if stored is not None:
+        return stored
+    if selected < datetime.now(SHANGHAI).date():
+        return _read_event_page(requested)
+    raise HTTPException(status_code=503, detail="dashboard events snapshot not published")
+
+
+def _selected_day(requested):
+    try:
+        return date.fromisoformat(requested)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="date must be a valid exchange date") from exc
 
 
 def _distribution(rows: list[dict]) -> list[dict]:
@@ -683,27 +706,14 @@ def _source_failure(exc: Exception) -> dict:
 
 
 def _live_board_inputs(day: str, now: datetime, deadline: float) -> dict:
-    started = monotonic()
-    def observed_now():
-        return now + timedelta(seconds=monotonic() - started)
-    sources = {
-        "quotes": (lambda: _live_quotes(day, observed_now(), deadline), ([], None)),
-        "indices": (lambda: read_live_indices(INDEX_NAMES, day, now=observed_now(), deadline=deadline), []),
-        "turnover": (lambda: read_live_turnover(day, now=observed_now(), deadline=deadline), None),
-        "limit_events": (lambda: _limit_up_events(date.fromisoformat(day), observed_now(), deadline), []),
-        "radar_events": (lambda: _market_events(date.fromisoformat(day), observed_now(), deadline), []),
-        "breadth_history": (lambda: _breadth_history(day, deadline), []),
-    }
-    result = {"source_errors": {}}
-    with ThreadPoolExecutor(max_workers=len(sources)) as pool:
-        pending = {key: pool.submit(load) for key, (load, _) in sources.items()}
-        for key, future in pending.items():
-            try:
-                result[key] = future.result()
-            except (OSError, sqlite3.Error, SQLAlchemyError, RuntimeError, TimeoutError, ValueError) as exc:
-                result["source_errors"][key] = _source_failure(exc)
-                logger.warning("market board %s unavailable: %s", key, result["source_errors"][key])
-                result[key] = sources[key][1]
+    parts, _ = dashboard_store.read(day, now=now)
+    result = {"source_errors": {}, "indices": [], "turnover": None, "ladder": None,
+              "breadth_history": parts.get("breadth_history", ({"rows": []}, {}))[0]["rows"]}
+    try:
+        result["quotes"] = _live_quotes(day, now, deadline)
+    except (OSError, sqlite3.Error, SQLAlchemyError, RuntimeError, TimeoutError, ValueError) as exc:
+        result["quotes"] = ([], None)
+        result["source_errors"]["quotes"] = _source_failure(exc)
     return result
 
 
@@ -737,8 +747,7 @@ def build_market_board(day: date, *, now: datetime) -> dict:
                 inputs = _live_board_inputs(day_text, now + timedelta(seconds=monotonic() - started_at), deadline)
                 history, source_errors = inputs["breadth_history"], inputs["source_errors"]
                 indices, live_turnover = inputs["indices"], inputs["turnover"]
-                events = sorted([*inputs["limit_events"], *inputs["radar_events"]],
-                                key=lambda row: _clock(row["snapshot_at"]), reverse=True)[:_EVENT_LIMIT]
+                limit_ladder = inputs["ladder"]
             if live or lunch or close_ready:
                 try:
                     quotes, observed_at = inputs["quotes"] if live or lunch else (
@@ -787,7 +796,7 @@ def build_market_board(day: date, *, now: datetime) -> dict:
         as_of, source, stage = None, None, "live_quote_expired"
     unavailable = [] if limit_ladder is not None else ["limit_ladder"]
     if limit_ladder is not None:
-        for field in ("limit_down_count", "opened_limit_up_count"):
+        for field in ("limit_up_count", "max_streak", "limit_down_count", "opened_limit_up_count"):
             if limit_ladder.get(field) is None:
                 unavailable.append("limit_ladder." + field)
     if not events:
@@ -835,6 +844,7 @@ def build_market_board(day: date, *, now: datetime) -> dict:
     return {
         "status": status,
         "source_errors": source_errors,
+        "quote_identity": quotes[0].get("quote_identity") if stocks and source == "sm_stock_current" else None,
         "reason": None if as_of else stage,
         "requested_date": day_text, "trade_date": day_text if as_of else None,
         "as_of": _timestamp(as_of) if as_of else None, "source": source,
@@ -887,8 +897,7 @@ def build_market_board(day: date, *, now: datetime) -> dict:
     }
 
 
-@router.get("/monitor/liquidity")
-def market_liquidity(requested: str = Query(alias="date", pattern=r"^\d{4}-\d{2}-\d{2}$")) -> dict:
+def _capture_liquidity(requested: str) -> dict:
     started = monotonic()
     now = datetime.now(SHANGHAI).replace(tzinfo=None)
     try:
@@ -912,8 +921,21 @@ def market_liquidity(requested: str = Query(alias="date", pattern=r"^\d{4}-\d{2}
         raise HTTPException(status_code=503, detail={"error": "intraday_liquidity_unavailable", **failure}) from exc
 
 
-@router.get("/monitor/board")
-def market_board(requested: str = Query(alias="date", pattern=r"^\d{4}-\d{2}-\d{2}$")) -> dict:
+@router.get("/monitor/liquidity")
+def market_liquidity(requested: str = Query(alias="date", pattern=r"^\d{4}-\d{2}-\d{2}$")) -> dict:
+    selected = _selected_day(requested)
+    now = datetime.now(SHANGHAI).replace(tzinfo=None)
+    if selected != now.date() or now.time() >= time(15):
+        return {"status": "not_intraday", "requested_date": requested}
+    stored = dashboard_store.component(requested, "liquidity", now=now)
+    if stored is None:
+        raise HTTPException(status_code=503, detail="dashboard liquidity snapshot not published")
+    if stored["observation"]["state"] == "expired":
+        stored["status"] = "stale"
+    return stored
+
+
+def _historical_board(requested: str) -> dict:
     try:
         selected_day = date.fromisoformat(requested)
     except ValueError as exc:
@@ -953,6 +975,24 @@ def market_board(requested: str = Query(alias="date", pattern=r"^\d{4}-\d{2}-\d{
     finally:
         with _cache_lock:
             _board_inflight.pop(key, None)
+
+
+@router.get("/monitor/board")
+def market_board(requested: str = Query(alias="date", pattern=r"^\d{4}-\d{2}-\d{2}$")) -> dict:
+    selected = _selected_day(requested)
+    now = datetime.now(SHANGHAI).replace(tzinfo=None)
+    stored = dashboard_store.board(requested, now=now)
+    if stored is not None:
+        return stored
+    if selected < now.date():
+        return _historical_board(requested)
+    raise HTTPException(status_code=503, detail="dashboard market snapshot not published")
+
+
+@router.get("/monitor/runtime")
+def market_snapshot_runtime() -> dict:
+    state = dashboard_store.runtime()
+    return {key: value for key, value in state.items() if key != "token"}
 
 
 def _sector_rank(rows: list[dict], source: str) -> dict:
@@ -1197,7 +1237,7 @@ def _live_sector_metrics(result, changes, industry_changes, sessions, now):
         metrics["net_inflow"] = _sector_rank(flow, flow_source)
         for mode, metric in metrics.items():
             metric["as_of"] = as_of.isoformat(sep=" ")
-            metric["note"] += " · 盘中快照，每分钟刷新" + (" · 前4日加当日盘中" if mode == "five_day_return" else "")
+            metric["note"] += " · 盘中观测" + (" · 前4日加当日盘中" if mode == "five_day_return" else "")
             if mode == "five_day_return":
                 for row in metric["rows"]:
                     row["series_label"] = "前4日及当日盘中"
@@ -1304,8 +1344,11 @@ def build_sector_heatmap(day: date, *, now: datetime) -> dict:
 
 @router.get("/monitor/sector-heatmap")
 def sector_heatmap(requested: str = Query(alias="date", pattern=r"^\d{4}-\d{2}-\d{2}$")) -> dict:
-    try:
-        selected_day = date.fromisoformat(requested)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail="date must be a valid exchange date") from exc
-    return build_sector_heatmap(selected_day, now=datetime.now(SHANGHAI).replace(tzinfo=None))
+    selected_day = _selected_day(requested)
+    now = datetime.now(SHANGHAI).replace(tzinfo=None)
+    stored = dashboard_store.heatmap(requested, now=now)
+    if stored is not None:
+        return stored
+    if selected_day < now.date():
+        return build_sector_heatmap(selected_day, now=now)
+    raise HTTPException(status_code=503, detail="dashboard sector snapshot not published")

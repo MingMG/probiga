@@ -112,6 +112,7 @@ def market_db(monkeypatch):
         monkeypatch.setattr(market_home, name, lambda: engine)
     monkeypatch.setattr(market_home, "read_live_indices", lambda *args, **kwargs: [])
     monkeypatch.setattr(market_home, "read_live_turnover", lambda *args, **kwargs: None)
+    monkeypatch.setattr(market_home, "capture_live_ladder", lambda *args, **kwargs: None)
     market_home._cache.clear()
     yield engine
     market_home._cache.clear()
@@ -212,7 +213,7 @@ def test_complete_close_survives_slower_quote_read_and_caches_exact_date(market_
     monkeypatch.setattr(market_home, "monotonic", lambda: elapsed)
     monkeypatch.setattr(market_home, "_day_quotes", slow_quotes)
     monkeypatch.setattr(market_home, "load_market_close_ladder", lambda *_, **__:
-        {"count": 1, "limit_down_count": 0, "opened_limit_up_count": 0})
+        {"count": 1, "limit_up_count": 1, "max_streak": 1, "limit_down_count": 0, "opened_limit_up_count": 0})
     monkeypatch.setattr(market_home, "_limit_up_events", lambda *_: [{"snapshot_at": "2026-11-06T10:00:00"}])
     monkeypatch.setattr(market_home, "_close_liquidity", lambda *_: {"volume_ratio5": 1})
 
@@ -282,7 +283,7 @@ def test_zero_reference_volume_is_unknown_instead_of_fabricated_zero(market_db):
 def test_close_pool_partial_publication_keeps_completed_pool_and_names_missing_fields(market_db, monkeypatch, counts, missing):
     with market_db.begin() as connection:
         _stock(connection, "000001", 100)
-    retained = {"count": 1, "limit_up_count": 1, **counts}
+    retained = {"count": 1, "limit_up_count": 1, "max_streak": 1, **counts}
     monkeypatch.setattr(market_home, "load_market_close_ladder", lambda *_, **__: retained)
     result = market_home.build_market_board(DAY, now=datetime(2026, 11, 7))
     assert result["limit_ladder"] == retained
@@ -373,13 +374,8 @@ def test_all_stock_rankings_remain_available_intraday_and_at_lunch(market_db, mo
             (:code,:code,12,:change,:amount,:stamp,'verified','gj_big_qmt_inner','VALIDATED','SUPPORTED')
         """), [{"code": code, "change": change, "amount": amount, "stamp": f"{DAY_TEXT} {source_time}"}
                for code, change, amount in (("000001", 8, 100), ("000002", -6, 300), ("000003", 2, 200))])
-    monkeypatch.setattr(market_home, "read_live_turnover", lambda *args, **kwargs: {
-        "rows": [{"stock_code": "000003", "short_name": "stock", "trade_date": DAY_TEXT,
-                  "turnover_rate": 5, "source": "eastmoney.push2.f8", "turnover_rate_source": "eastmoney.push2.f8"}],
-        "as_of": DAY_TEXT+"T"+request_time+"+08:00", "source": "eastmoney.push2.f8", "trade_date": DAY_TEXT,
-        "scope": "vendor-ranked snapshot", "observed_count": 1, "excluded_count": 0})
     result = market_home.build_market_board(DAY, now=datetime.fromisoformat(f"{DAY_TEXT} {request_time}"))
-    assert [r["stock_code"] for r in result["rankings"]["turnover"]] == ["000003"]
+    assert result["rankings"]["turnover"] == []  # Independently published by the turnover owner.
     if available:
         assert result["rankings"]["gainers"][0]["stock_code"] == "000001"
         assert result["rankings"]["losers"][0]["stock_code"] == "000002"
@@ -584,46 +580,33 @@ def test_board_invalid_date_is_rejected_and_repeat_uses_bounded_cache(monkeypatc
         market_home._cache.clear()
 
 
-@pytest.mark.parametrize(("stamp", "before", "after"), [
-    ("10:00:00", "10:02:00", "10:02:01"),
-    ("11:29:50", "11:30:00", "11:30:01"),
-])
-def test_cache_never_serves_live_quotes_past_freshness_or_session(market_db, monkeypatch, stamp, before, after):
-    now = datetime.fromisoformat(f"{DAY_TEXT}T{before}")
-
+def test_current_request_does_not_use_legacy_cache_or_trigger_collection(market_db, monkeypatch):
     class Clock(datetime):
         @classmethod
         def now(cls, tz):
-            return now.replace(tzinfo=tz)
-
+            return cls(2026, 11, 6, 10, tzinfo=tz)
     monkeypatch.setattr(market_home, "datetime", Clock)
-    monkeypatch.setattr(market_home, "monotonic", lambda: 5.0)
-    cached = {"source": "sm_stock_current", "as_of": f"{DAY_TEXT}T{stamp}+08:00"}
-    market_home._cache[DAY_TEXT] = (4.0, cached)
-    calls = []
-    monkeypatch.setattr(market_home, "build_market_board", lambda _, **kw: calls.append(kw["now"]) or {})
-
-    assert market_home.market_board(DAY_TEXT) == cached
-    assert calls == []
-    now = datetime.fromisoformat(f"{DAY_TEXT}T{after}")
-    assert market_home.market_board(DAY_TEXT) == {}
-    assert calls == [now]
+    monkeypatch.setattr(market_home.dashboard_store, "board", lambda *_, **__: None)
+    market_home._cache[DAY_TEXT] = (4.0, {"source": "sm_stock_current"})
+    def forbidden(*args, **kwargs):
+        raise AssertionError("HTTP triggered source acquisition")
+    monkeypatch.setattr(market_home, "build_market_board", forbidden)
+    with pytest.raises(HTTPException) as error:
+        market_home.market_board(DAY_TEXT)
+    assert error.value.status_code == 503
 
 
 def test_live_snapshot_that_expires_during_reads_is_withheld(market_db, monkeypatch):
     elapsed = 0
 
-    def load_events(*_):
+    def load_quotes(*_, **__):
         nonlocal elapsed
         elapsed = 2
-        return []
+        return ([{"stock_code": "000001", "trade_date": DAY_TEXT, "price": 12, "change_pct": 3,
+                  "data_source": market_home.LIVE_SOURCE}], datetime(2026, 11, 6, 10))
 
     monkeypatch.setattr(market_home, "monotonic", lambda: elapsed)
-    monkeypatch.setattr(market_home, "_live_quotes", lambda *_: ([{
-        "stock_code": "000001", "trade_date": DAY_TEXT, "price": 12, "change_pct": 3,
-        "data_source": market_home.LIVE_SOURCE,
-    }], datetime(2026, 11, 6, 10)))
-    monkeypatch.setattr(market_home, "_market_events", load_events)
+    monkeypatch.setattr(market_home, "_live_quotes", load_quotes)
 
     result = market_home.build_market_board(DAY, now=datetime(2026, 11, 6, 10, 1, 59))
     assert result["sample_size"] == 0
@@ -653,15 +636,14 @@ def test_live_snapshot_uses_read_time_after_connection_setup(market_db, monkeypa
     assert stamp == datetime(2026,11,6,10,0,2)
 
 
-def test_slow_index_source_cannot_prevent_healthy_stock_read(market_db, monkeypatch):
+def test_quote_capture_does_not_fetch_other_live_domains(market_db, monkeypatch):
     from threading import Event
     stocks_read = Event()
     def quotes(*args):
         stocks_read.set()
         return [], None
     def indices(*args, **kwargs):
-        assert stocks_read.wait(1), 'an independent index request blocked the stock source'
-        return []
+        raise AssertionError("quote capture fetched an independent domain")
     monkeypatch.setattr(market_home, "_live_quotes", quotes)
     monkeypatch.setattr(market_home, "read_live_indices", indices)
     market_home.build_market_board(DAY, now=datetime(2026,11,6,10))
@@ -722,7 +704,7 @@ def test_board_reports_exact_quality_failure_without_hiding_healthy_sources(mark
     assert result["source_errors"]["quotes"] == {"type": "QualityGateError", "code": "snapshot_batch_mismatch"}
 
 
-@pytest.mark.parametrize("now", [datetime(2026, 11, 6, 12), datetime(2026, 11, 7)])
+@pytest.mark.parametrize("now", [datetime(2026, 11, 7)])
 def test_board_event_projection_is_same_date_and_public_only(market_db, now):
     with market_db.begin() as connection:
         connection.execute(text("""

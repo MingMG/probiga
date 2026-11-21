@@ -59,12 +59,14 @@ def _normalize(rows, names, selected, now):
 
 def read_live_indices(names, selected, *, now, deadline):
     """One bounded bulk request, or a 15-second verified durable checkpoint."""
+    started = monotonic()
     if selected != now.date().isoformat():
         return []
     remaining = deadline - monotonic()
     if remaining <= 0 or not _LOCK.acquire(timeout=min(5, remaining)):
         raise TimeoutError("index_live: capture owner deadline exceeded")
     try:
+        now += timedelta(seconds=monotonic()-started)
         with closing(sqlite3.connect(_path(create=True), timeout=1)) as db:
             db.execute("CREATE TABLE IF NOT EXISTS live_index_snapshot (slot INTEGER PRIMARY KEY CHECK(slot=1), day TEXT, captured_at TEXT, digest TEXT, payload TEXT)")
             stored = db.execute("SELECT day,captured_at,digest,payload FROM live_index_snapshot WHERE slot=1").fetchone()
