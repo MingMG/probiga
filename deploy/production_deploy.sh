@@ -845,6 +845,37 @@ def require_acquisition_shards(parent_fd, name, depth=0):
     finally:
         os.close(descriptor)
 
+def require_external_market(parent_fd, name):
+    observed = os.lstat(name, dir_fd=parent_fd)
+    if not (stat.S_ISDIR(observed.st_mode)
+            and observed.st_uid == expected_uid and observed.st_gid == expected_gid
+            and stat.S_IMODE(observed.st_mode) == 0o700):
+        raise SystemExit("unsafe external market root")
+    descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         dir_fd=parent_fd)
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (observed.st_dev, observed.st_ino):
+            raise SystemExit("external market directory changed")
+        transient = {"sector-heatmap-v1.sqlite3" + suffix for suffix in ("-journal", "-wal", "-shm")}
+        allowed = transient | {"sector-heatmap-v1.sqlite3", "market-dashboard-owner.lock"}
+        for child in os.listdir(descriptor):
+            if child not in allowed:
+                raise SystemExit("unknown external market file")
+            try:
+                metadata = os.lstat(child, dir_fd=descriptor)
+            except FileNotFoundError:
+                if child in transient:
+                    continue  # SQLite can remove a journal while this read-only check runs.
+                raise
+            if not (stat.S_ISREG(metadata.st_mode)
+                    and metadata.st_uid == expected_uid and metadata.st_gid == expected_gid
+                    and metadata.st_nlink == 1
+                    and stat.S_IMODE(metadata.st_mode) == 0o600):
+                raise SystemExit("unsafe external market file")
+    finally:
+        os.close(descriptor)
+
 def require_analysis_diagnostics(parent_fd, name):
     observed = os.lstat(name, dir_fd=parent_fd)
     if not (stat.S_ISDIR(observed.st_mode)
@@ -902,6 +933,10 @@ try:
                     and stat.S_IMODE(observed.st_mode) in {0o700, 0o750, 0o755}):
                 raise SystemExit("unsafe exposure risk checkpoint root")
             continue
+        if name == "external-market":
+            require_external_market(directory_fd, name)
+            continue
+
         if name == "analysis-execution-diagnostics":
             require_analysis_diagnostics(directory_fd, name)
             continue
@@ -1039,6 +1074,37 @@ def require_acquisition_shards(parent_fd, name, depth=0):
     finally:
         os.close(descriptor)
 
+def require_external_market(parent_fd, name):
+    observed = os.lstat(name, dir_fd=parent_fd)
+    if not (stat.S_ISDIR(observed.st_mode)
+            and observed.st_uid == expected_uid and observed.st_gid == expected_gid
+            and stat.S_IMODE(observed.st_mode) == 0o700):
+        raise SystemExit("unsafe external market root")
+    descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         dir_fd=parent_fd)
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (observed.st_dev, observed.st_ino):
+            raise SystemExit("external market directory changed")
+        transient = {"sector-heatmap-v1.sqlite3" + suffix for suffix in ("-journal", "-wal", "-shm")}
+        allowed = transient | {"sector-heatmap-v1.sqlite3", "market-dashboard-owner.lock"}
+        for child in os.listdir(descriptor):
+            if child not in allowed:
+                raise SystemExit("unknown external market file")
+            try:
+                metadata = os.lstat(child, dir_fd=descriptor)
+            except FileNotFoundError:
+                if child in transient:
+                    continue  # SQLite can remove a journal while this read-only check runs.
+                raise
+            if not (stat.S_ISREG(metadata.st_mode)
+                    and metadata.st_uid == expected_uid and metadata.st_gid == expected_gid
+                    and metadata.st_nlink == 1
+                    and stat.S_IMODE(metadata.st_mode) == 0o600):
+                raise SystemExit("unsafe external market file")
+    finally:
+        os.close(descriptor)
+
 def require_analysis_diagnostics(parent_fd, name):
     observed = os.lstat(name, dir_fd=parent_fd)
     if not (stat.S_ISDIR(observed.st_mode)
@@ -1102,6 +1168,10 @@ def require_file(metadata, *, modes, name):
                 and stat.S_IMODE(metadata.st_mode) in {0o700, 0o750, 0o755}):
             raise SystemExit("unsafe exposure risk checkpoint root")
         return
+    if name == "external-market":
+        require_external_market(directory_fd, name)
+        return
+
     if name == "analysis-execution-diagnostics":
         require_analysis_diagnostics(directory_fd, name)
         return
@@ -1187,7 +1257,7 @@ PY
   validate_scheduler_terminal_job_log_tree || return 2
   validate_exposure_risk_job_checkpoint_tree quiescent || return 2
   unsafe_entry="$(find -P "$PROBIGA_JOB_LOG_ROOT" -mindepth 1 -maxdepth 1 \
-    \( \( -name acquisition-shards -o -name scheduler-terminal -o -name exposure-event-risk-watch-v1 -o -name analysis-execution-diagnostics -o -name upper-limit-history \) -type d \) -prune -o \
+    \( \( -name acquisition-shards -o -name scheduler-terminal -o -name exposure-event-risk-watch-v1 -o -name analysis-execution-diagnostics -o -name upper-limit-history -o -name external-market \) -type d \) -prune -o \
     \( ! -type f -o ! -user "$SERVICE_USER" -o ! -group "$SERVICE_USER" \
        -o ! -links 1 -o ! -perm 0600 -o -perm /7177 \) \
     -print -quit)" || return 2
