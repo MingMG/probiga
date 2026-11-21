@@ -1189,6 +1189,25 @@ def test_qmt_stock_catalog_loader_hides_future_metadata():
     assert catalog.batch_id == "known-catalog"
     assert catalog.history_complete_from == "2026-08-01"
 
+    from types import SimpleNamespace
+    with engine.connect() as connection:
+        class CacheConnection:
+            dialect = SimpleNamespace(name="mysql")
+            info = {}
+            calls = 0
+            def execute(self, *args, **kwargs):
+                self.calls += 1
+                return connection.execute(*args, **kwargs)
+        cached = CacheConnection()
+        first = load_stock_catalog(cached, batch_id="known-catalog", decision_known_at="2026-08-24 12:00:00")
+        reads = cached.calls
+        first.members[0]["stock_code"] = "tampered"
+        reused = load_stock_catalog(cached, batch_id="known-catalog", decision_known_at="2026-08-24 12:00:00")
+        assert reused.members[0]["stock_code"] != "tampered"
+        assert cached.calls == reads
+        with pytest.raises(RuntimeError, match="no complete"):
+            load_stock_catalog(cached, batch_id="known-catalog", decision_known_at="2026-08-24 09:59:59")
+
 
 def test_historical_archive_imports_expired_instrument_and_rejects_tamper(
     tmp_path,

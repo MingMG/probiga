@@ -5856,19 +5856,26 @@ def _recover_interrupted_manual_claim(
                 return False
             newest_started = _coerce_datetime(history_rows[0].get("run_at"))
             if newest_started is not None and newest_started < started_at - timedelta(seconds=1):
-                # An older orphan can outlive a later, already finished run.
-                # Prove that the projected claim has its own terminal audit;
-                # missing history is not permission to release an unknown owner.
+                # Resolve the latest durable identity before releasing a
+                # summary whose timestamp differs from the running audit.
                 terminal = connection.execute(text(
-                    "SELECT task_type,run_at,finished_at,status FROM st_scheduled_task_history "
+                    "SELECT run_uid,task_type,run_at,finished_at,status FROM st_scheduled_task_history "
                     "WHERE task_id=:task_id ORDER BY id DESC LIMIT 1 FOR UPDATE"
                 ), {"task_id": task_id}).mappings().first()
+                # The latest audit identifies the claim. Older launchers wrote
+                # the task summary after inserting that audit, so its time can
+                # differ without there being another business run.
+                latest_is_running_claim = bool(
+                    terminal and terminal.get("run_uid") == history_rows[0].get("run_uid")
+                    and terminal.get("status") == "running"
+                    and terminal.get("task_type") == row.get("task_type")
+                )
                 terminal_finished = _coerce_datetime(terminal.get("finished_at")) if terminal else None
-                if (not terminal
+                if (not latest_is_running_claim and (not terminal
                         or terminal.get("task_type") != row.get("task_type")
                         or _coerce_datetime(terminal.get("run_at")) != started_at
                         or terminal.get("status") not in _PIPELINE_TERMINAL_STATUSES
-                        or terminal_finished is None or terminal_finished < started_at):
+                        or terminal_finished is None or terminal_finished < started_at)):
                     return False
             recovered = []
             boot_checked = False

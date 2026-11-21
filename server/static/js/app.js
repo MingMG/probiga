@@ -3918,7 +3918,9 @@
     }
 
     function loadQuantWorkbenchPage(d, c) {
-        c.innerHTML = '<div class="loading">正在读取任务注册、运行回执和策略票池...</div>';
+        c.innerHTML = '<section class="qsw-workspace"><div class="loading">正在读取策略与结果…</div></section><details class="qsw-maintenance"><summary>运行与维护 · 任务队列、回执和数据门禁</summary><div class="qsw-operations"><div class="loading">正在读取任务运行状态…</div></div></details>';
+        var workspaceMount=c.querySelector('.qsw-workspace'), operationsMount=c.querySelector('.qsw-operations');
+        window.QuantStrategyWorkspace.load(d,workspaceMount,fetchRawJsonWithTimeout,switchTab,window.openStockDetail,function(){return activeTabId()==='quant-workbench';});
         fetchRawJsonWithTimeout('/api/quant-workbench', 30000).then(function (res) {
             res = res || {};
             var capabilities = Array.isArray(res.capabilities) ? res.capabilities : [];
@@ -4004,6 +4006,7 @@
                 var latest = lab.latest_backtest || {};
                 var worker = lab.worker || {};
                 function metric(value, suffix, digits) {
+                    if (value == null || value === '') return '—';
                     var number = Number(value);
                     if (!isFinite(number)) return '—';
                     return number.toFixed(digits == null ? 2 : digits) + (suffix || '');
@@ -4214,7 +4217,7 @@
             var executableCount = Number(executionEvidence.executable_count || 0);
             var primaryHeadline = pool.status === 'ACTIVE'
                 ? (candidateCount + ' 只票池已出，' + executableCount + ' 只可执行')
-                : (pool.status === 'PENDING' ? '当日候选池待发布' : '当日候选池待生成');
+                : (pool.status === 'VERIFIED_EMPTY' ? '本轮分析已完成，符合条件 0 只' : pool.status === 'PENDING' ? '当日候选池待发布' : '当日候选池待生成');
             var primaryReason = nextAction.reason === 'CANONICAL_DECISION_TRADE_DATE_STALE'
                 ? ('规范治理结果仍停留在 ' + (governanceEvidence.trade_date || '更早交易日') + '，没有推进到 ' + (pool.trade_date || target.default_trade_date || '当前交易日'))
                 : (nextStage.summary || '研究与复盘继续运行；无可执行候选时保持观察');
@@ -4241,7 +4244,7 @@
 
             h += '<section class="qwb-operation-summary"><article><span>已接入任务</span><strong>' + escHtml(summary.operation_count || operations.length) + '</strong><small>全部绑定真实调度身份</small></article><article><span>当前运行</span><strong>' + escHtml(summary.running_count || 0) + '</strong><small>依据持久化运行回执</small></article><article><span>最近失败</span><strong>' + escHtml(summary.failed_count || 0) + '</strong><small>可打开任务结果定位</small></article><article class="' + (String(pool.status).toUpperCase() === 'ACTIVE' ? 'qwb-pool-ready' : '') + '"><span>当前有效票池</span><strong>' + escHtml(pool.active_count || 0) + '</strong><small>' + escHtml(pool.trade_date || '尚无') + ' · ' + escHtml(pool.run_uid ? pool.run_uid.slice(0, 12) : '无运行身份') + '</small></article></section>';
 
-            h += '<section class="qwb-pool-strip"><div><span>正式策略票池</span><h3>' + escHtml(pool.status === 'ACTIVE' ? '已激活，可直接进入结果页' : '当前没有可证明有效的票池') + '</h3><p>' + (pool.status === 'ACTIVE' ? ('交易日 ' + escHtml(pool.trade_date) + '，分析 ' + escHtml(pool.analysis_count || '—') + ' 只，入池 ' + escHtml(pool.active_count) + ' 只，模型 ' + escHtml(pool.model_version || '—') + '，运行身份 ' + escHtml(pool.run_uid) + '。') : escHtml(pool.reason || '运行策略任务后在这里读回票池。')) + '</p></div><button type="button" onclick="openQuantOperationResult(\'strategy_pool\')"' + (pool.status === 'ACTIVE' ? '' : ' disabled') + '>查看票池</button></section>';
+            h += '<section class="qwb-pool-strip"><div><span>正式策略票池</span><h3>' + escHtml(pool.status === 'ACTIVE' ? '已激活，可直接进入结果页' : pool.status === 'VERIFIED_EMPTY' ? '本轮已完成：符合条件 0 只' : '当前没有可证明有效的票池') + '</h3><p>' + (pool.status === 'ACTIVE' ? ('交易日 ' + escHtml(pool.trade_date) + '，分析 ' + escHtml(pool.analysis_count || '—') + ' 只，入池 ' + escHtml(pool.active_count) + ' 只，模型 ' + escHtml(pool.model_version || '—') + '，运行身份 ' + escHtml(pool.run_uid) + '。') : escHtml(pool.reason || '运行策略任务后在这里读回票池。')) + '</p></div><button type="button" onclick="openQuantOperationResult(\'strategy_pool\')"' + (pool.status === 'ACTIVE' ? '' : ' disabled') + '>查看票池</button></section>';
 
             h += '<section class="qwb-operations"><div class="qwb-section-head"><div><span>可直接操作</span><h3>量化任务队列</h3></div><small>运行、停止、查看回执与结果</small></div><div class="qwb-operation-grid">';
             operations.forEach(function (item) { h += renderOperationCard(item); });
@@ -4262,7 +4265,8 @@
             categoryOrder.forEach(function (category) { var items=capabilities.filter(function(item){return item.category===category;}); if(!items.length)return; h+='<section class="qwb-category"><div class="qwb-section-head"><div><span>'+escHtml(items[0].category_label||category)+'</span><h3>'+escHtml(category)+'</h3></div></div><div class="qwb-capability-grid">'; items.forEach(function(item){var available=String(item.availability||'UNAVAILABLE').toUpperCase();h+='<article><div class="qwb-capability-title"><strong>'+escHtml(item.code)+' · '+escHtml(item.label)+'</strong><b class="qwb-status '+statusClass(available)+'">'+escHtml(statusText[available]||available)+'</b></div><p>'+escHtml(item.scope||'')+'</p><small>'+escHtml(item.limitations||'')+'</small>'+(item.entry_tab?'<button type="button" onclick="openQuantWorkflow(\''+escAttr(item.code)+'\')">打开结果入口</button>':'<button type="button" disabled>缺少正式数据或引擎</button>')+'</article>';}); h+='</div></section>'; });
             h += '</div></details>';
             h += '<footer class="qwb-footer">能力合同 '+escHtml(res.schema||'-')+'。系统不解析个人 Skill 作为生产权限；accepted / delegated / 进程存活均不等于业务完成。</footer></div>';
-            c.innerHTML = h;
+            operationsMount.innerHTML = h;
+            window.QuantStrategyWorkspace.setMarket(workspaceMount,evidence.market,pool);
             fetchRawJsonWithTimeout('/api/quant-workbench/research-lab', 30000).then(function (lab) {
                 var mount = document.getElementById('qwb-research-lab');
                 if (mount) mount.innerHTML = renderResearchLab(lab);
@@ -4271,7 +4275,7 @@
                 if (mount) mount.innerHTML = '<div class="qwb-research-head"><div><span>RESEARCH LAB · 研究实验</span><h3>研究资产暂时不可读取</h3><p>' + escHtml(error && error.message ? error.message : '请求失败') + '</p></div><b class="qwb-status qwb-bad">阻断</b></div>';
             });
         }).catch(function (err) {
-            c.innerHTML = '<div class="loading" style="color:#b91c1c">量化工作台读取失败：'+escHtml(err&&err.message?err.message:err)+'</div>';
+            operationsMount.innerHTML = '<div class="loading" style="color:#b91c1c">任务状态读取失败：'+escHtml(err&&err.message?err.message:err)+'</div>';
         });
     }
 

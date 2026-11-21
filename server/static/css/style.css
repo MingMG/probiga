@@ -5329,3 +5329,32 @@ button:focus-visible,a:focus-visible { outline:2px solid #1a73e8; outline-offset
 @media(prefers-reduced-motion:reduce){.sidebar{transition:none}}
 
 .stock-context-actions { display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:10px 0 16px;font-size:11px; }.stock-context-actions a { color:#1a73e8;text-decoration:none;font-weight:600; }.stock-context-actions span { color:#888; }
+/* Strategy results stay visible while maintenance requests run independently. */
+#tab-quant-workbench .qsw-workspace {background:#fff;border:1px solid #dce5ef;border-radius:16px;padding:22px;color:#243246;margin-bottom:18px}
+#tab-quant-workbench .qsw-header {display:flex;justify-content:space-between;gap:16px;align-items:flex-start}
+#tab-quant-workbench .qsw-header h2 {font-size:24px;margin:6px 0}
+#tab-quant-workbench .qsw-header small {color:#2563eb;font-weight:700}
+#tab-quant-workbench .qsw-header p,.qsw-foot,.qsw-detail p {color:#64748b;font-size:12px;line-height:1.7}
+#tab-quant-workbench .qsw-workspace button {background:#f8fbff;color:#1d4ed8;border:1px solid #c8d9ef;border-radius:7px;padding:8px 12px;cursor:pointer}
+#tab-quant-workbench .qsw-links {display:flex;gap:8px;flex-wrap:wrap;margin:16px 0}
+#tab-quant-workbench .qsw-context {display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+#tab-quant-workbench .qsw-context>div {display:grid;gap:7px;background:#f3f7fc;padding:13px;border-radius:9px;font-size:12px}
+#tab-quant-workbench .qsw-context span {color:#64748b}
+#tab-quant-workbench .qsw-warning,.qsw-error {padding:12px;border-left:3px solid #d97706;background:#fffbeb;color:#92400e;font-size:12px;line-height:1.8}
+#tab-quant-workbench .qsw-toolbar {display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin:18px 0;font-size:12px}
+#tab-quant-workbench .qsw-toolbar select {border:1px solid #cbd5e1;border-radius:6px;padding:7px;background:white;color:#334155}
+#tab-quant-workbench .qsw-toolbar>span {flex:1;color:#64748b;min-width:240px}
+#tab-quant-workbench .qsw-table {overflow-x:auto;border:1px solid #e2e8f0;border-radius:9px}
+#tab-quant-workbench .qsw-columns {display:grid;grid-template-columns:minmax(210px,2.3fr) repeat(6,minmax(85px,1fr));align-items:center;gap:12px;min-width:880px;padding:13px;font-size:12px}
+#tab-quant-workbench div.qsw-columns {background:#f1f5f9;color:#64748b}
+#tab-quant-workbench .qsw-strategy {border-top:1px solid #e2e8f0}
+#tab-quant-workbench .qsw-strategy summary {cursor:pointer;list-style:none}
+#tab-quant-workbench .qsw-strategy summary:hover {background:#f8fbff}
+#tab-quant-workbench .qsw-strategy small {display:block;color:#7c8ba0;font-size:10px;margin-top:5px;overflow-wrap:anywhere}
+#tab-quant-workbench .qsw-detail {padding:3px 16px 16px;background:#f8fbff;min-width:700px}
+#tab-quant-workbench .qsw-detail h4 {margin:8px 0;font-size:12px}
+#tab-quant-workbench .qsw-detail li {font-size:12px;margin:7px 0;line-height:1.7}
+#tab-quant-workbench .qsw-maintenance {border:1px solid #dce5ef;border-radius:13px;background:#f8fafc;padding:16px}
+#tab-quant-workbench .qsw-maintenance>summary {cursor:pointer;font-weight:700;color:#475569}
+#tab-quant-workbench .qsw-operations {margin-top:18px}
+@media(max-width:700px){#tab-quant-workbench .qsw-workspace{padding:14px}#tab-quant-workbench .qsw-context{grid-template-columns:1fr}#tab-quant-workbench .qsw-header h2{font-size:20px}}

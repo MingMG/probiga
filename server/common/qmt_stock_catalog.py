@@ -7,6 +7,7 @@ details, and then reused by daily/history writers and the attestation process.
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 import re
 import socket
 import threading
@@ -973,6 +974,14 @@ def load_stock_catalog(
     batch_id: str | None = None,
 ) -> StockCatalogBatch:
     decision_time = _captured_at(decision_known_at)
+    # Explicit batches are protected by the append-only catalog contract.
+    # Reuse their verified content on this pooled connection, never a mutable
+    # "latest" lookup, and return a copy so callers cannot alter the proof.
+    cache = connection.info.setdefault("verified_qmt_catalogs", {}) if connection.dialect.name == "mysql" else {}
+    if batch_id is not None and str(batch_id) in cache:
+        cached = cache[str(batch_id)]
+        if cached.captured_at <= decision_time:
+            return deepcopy(cached)
     params: dict[str, Any] = {"decision_known_at": decision_time}
     where = "status='COMPLETE' AND captured_at<=:decision_known_at"
     order = "ORDER BY captured_at DESC, batch_id DESC LIMIT 1"
@@ -999,9 +1008,14 @@ def load_stock_catalog(
         WHERE batch_id=:batch_id
         ORDER BY qmt_code
     """), {"batch_id": str(batch["batch_id"])}).mappings().all()
-    return validate_catalog_manifest(
+    verified = validate_catalog_manifest(
         batch["manifest_json"], row=dict(batch), members=[dict(row) for row in rows]
     )
+    if batch_id is not None:
+        cache[str(batch_id)] = deepcopy(verified)
+        while len(cache) > 4:
+            cache.pop(next(iter(cache)))
+    return verified
 
 
 def load_target_stock_catalog(

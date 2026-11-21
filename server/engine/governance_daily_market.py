@@ -32,7 +32,9 @@ class NativeDatadirClose:
 
 def read_close_batches(batches, read, *, deadline):
     """Keep a bounded number of exact reads in flight on separate connections."""
-    parallelism = 4
+    # Four concurrent full-market reads exhaust the production database's
+    # response budget; isolated reads of the same partitions verify correctly.
+    parallelism = 2
     remaining = iter(batches)
     workers = ThreadPoolExecutor(max_workers=parallelism, thread_name_prefix="governance-close")
     try:
@@ -44,7 +46,13 @@ def read_close_batches(batches, read, *, deadline):
                 raise TimeoutError(f"QMT 收盘证据读取超时：{next(iter(pending.values()))}")
             for future in done:
                 batch = pending.pop(future)
-                result = future.result()
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    original = getattr(exc, "orig", exc)
+                    args = getattr(original, "args", ())
+                    errno = args[0] if args and type(args[0]) is int else None
+                    raise ValueError(f"QMT 收盘证据读取失败：{batch} ({type(exc).__name__}, errno={errno})") from exc
                 next_batch = next(remaining, None)
                 if next_batch is not None:
                     pending[workers.submit(read, next_batch)] = next_batch

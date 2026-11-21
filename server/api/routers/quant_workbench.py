@@ -287,6 +287,26 @@ def load_operation_status(engine: Any) -> list[dict[str, Any]]:
     return projected
 
 
+def _published_empty_pool(engine: Any, trade_date: str) -> dict | None:
+    from server.common.daily_delivery_control import DailyDeliveryControlError, load_published_analysis_receipt
+
+    try:
+        receipt = load_published_analysis_receipt(engine, trade_date)
+    except DailyDeliveryControlError as exc:
+        if str(exc) == "ANALYSIS_PUBLISHED_SNAPSHOT_UNAVAILABLE":
+            return None
+        raise
+    if receipt.get("recommendation_count") != 0:
+        raise ValueError("published recommendations are missing from the formal pool")
+    return {
+        "status": "VERIFIED_EMPTY", "reason": "本轮分析已完成，没有符合入池条件的股票",
+        "trade_date": trade_date, "active_count": 0, "row_count": 0,
+        "analysis_count": receipt["analysis_count"], "run_uid": receipt["run_uid"],
+        "model_version": receipt.get("model_version"), "result_entry_tab": "recommended",
+        "automatic_real_order_submission": False, "real_order_authority": False,
+    }
+
+
 def load_strategy_pool_status(engine: Any, *, trade_date: str) -> dict[str, Any]:
     try:
         latest = _rows(
@@ -318,6 +338,15 @@ def load_strategy_pool_status(engine: Any, *, trade_date: str) -> dict[str, Any]
             "real_order_authority": False,
         }
     if not latest:
+        try:
+            empty = _published_empty_pool(engine, trade_date)
+            if empty:
+                return empty
+        except Exception:
+            return {"status": "BLOCKED", "reason": "STRATEGY_POOL_PUBLICATION_READ_FAILED",
+                    "trade_date": trade_date, "active_count": 0, "run_uid": "",
+                    "result_entry_tab": "recommended", "automatic_real_order_submission": False,
+                    "real_order_authority": False}
         return {
             "status": "NOT_STARTED",
             "reason": "NO_STRATEGY_POOL",
@@ -1127,6 +1156,16 @@ def quant_workbench_operation_status(operation_id: str):
 @router.get("/research-lab")
 def quant_workbench_research_lab():
     return load_research_lab_status(get_engine())
+
+
+@router.get("/strategies")
+def quant_workbench_strategies(trade_date: str = Query(default="")):
+    from server.api.quant_strategy_workspace import read_strategy_workspace
+
+    try:
+        return read_strategy_workspace(get_engine(), trade_date)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.post("/operations/{operation_id}/run")

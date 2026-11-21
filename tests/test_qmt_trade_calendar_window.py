@@ -79,6 +79,28 @@ def _load(engine, target="2026-09-18", cutoff="2026-09-18 23:59:59"):
         )
 
 
+def test_explicit_verified_calendar_reuse_keeps_knowledge_cutoff(calendar_db):
+    from types import SimpleNamespace
+    _insert(calendar_db)
+    with calendar_db.connect() as connection:
+        class CacheConnection:
+            dialect = SimpleNamespace(name="mysql")
+            info = {}
+            calls = 0
+            def execute(self, *args, **kwargs):
+                self.calls += 1
+                return connection.execute(*args, **kwargs)
+        cached = CacheConnection()
+        kwargs = dict(batch_id="official-2026", start_date="2026-09-01", end_date="2026-09-18",
+                      decision_known_at="2026-09-18 23:59:59")
+        first = load_trade_calendar_receipt(cached, **kwargs)
+        reads = cached.calls
+        assert load_trade_calendar_receipt(cached, **kwargs) == first
+        assert cached.calls == reads
+        with pytest.raises(RuntimeError, match="no immutable"):
+            load_trade_calendar_receipt(cached, **{**kwargs, "decision_known_at": "2026-09-01 23:59:59"})
+
+
 def test_existing_year_receipt_proves_120_without_unneeded_previous_year(calendar_db):
     manifest, sessions = _insert(calendar_db)
     with calendar_db.connect() as connection:

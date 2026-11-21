@@ -12,6 +12,15 @@ COMPLETED = "2026-11-15T11:55:28"
 DECISION = datetime.fromisoformat("2026-11-16T01:11:14")
 
 
+def test_read_failure_names_partition_without_exposing_sql_or_credentials():
+    import time
+    def failed(day):
+        raise RuntimeError("private connection details")
+    with pytest.raises(ValueError, match=r"2026-11-13 \(RuntimeError, errno=None\)") as error:
+        list(market.read_close_batches([DAY], failed, deadline=time.monotonic() + 2))
+    assert "private" not in str(error.value)
+
+
 @pytest.fixture
 def close_partition(monkeypatch):
     engine = create_engine("sqlite://")

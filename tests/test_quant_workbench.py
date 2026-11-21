@@ -369,9 +369,10 @@ def test_strategy_pool_projection_requires_active_identity(monkeypatch):
     assert result["real_order_authority"] is False
 
 
-def test_old_pending_pool_does_not_select_an_old_session_or_block_research():
+def test_old_pending_pool_does_not_select_an_old_session_or_block_research(monkeypatch):
     from sqlalchemy import create_engine, text
     engine = create_engine("sqlite://")
+    monkeypatch.setattr(quant_workbench, "_published_empty_pool", lambda *a: None)
     with engine.begin() as conn:
         conn.execute(text("CREATE TABLE st_recommended_stocks(pick_date TEXT,publication_status TEXT,publisher_run_uid TEXT)"))
         conn.execute(text("INSERT INTO st_recommended_stocks VALUES('2026-11-11','PENDING','old-run')"))
@@ -389,6 +390,20 @@ def test_old_pending_pool_does_not_select_an_old_session_or_block_research():
     assert stages["REVIEW"]["state"] == "READY"
     assert lifecycle["next_action"]["stage_code"] == "STRATEGY_POOL"
     engine.dispose()
+
+
+def test_verified_empty_publication_is_completed_work_not_an_unstarted_pool(monkeypatch):
+    from server.common import daily_delivery_control
+    monkeypatch.setattr(quant_workbench, "_rows", lambda *a: [])
+    monkeypatch.setattr(daily_delivery_control, "load_published_analysis_receipt", lambda *a: {
+        "recommendation_count": 0, "analysis_count": 5572, "run_uid": "e" * 32,
+    })
+    pool = quant_workbench.load_strategy_pool_status(object(), trade_date="2026-11-20")
+    assert pool["status"] == "VERIFIED_EMPTY" and pool["analysis_count"] == 5572
+    lifecycle = build_quant_workbench_lifecycle(trade_date="2026-11-20", target={"ready": True},
+        outlook={"status": "READY"}, pool=pool, decision_gate={}, governance={}, simulation={}, review={})
+    stage = next(s for s in lifecycle["stages"] if s["code"] == "STRATEGY_POOL")
+    assert stage["state"] == "READY" and stage["blocking_reason"] == ""
 
 
 def test_zero_executable_is_observation_and_keeps_individual_restrictions(monkeypatch):
@@ -851,10 +866,12 @@ def test_quant_workbench_renders_real_task_actions_and_active_pool():
     harness = r"""
 const assert = require('assert');
 global.window = {};
+window.QuantStrategyWorkspace = {load:function(){},setMarket:function(){}};
 let rendered = '';
 const container = {
   get innerHTML() { return rendered; },
-  set innerHTML(value) { rendered = String(value); }
+  set innerHTML(value) { rendered = String(value); },
+  querySelector:function(){return {set innerHTML(value){rendered+=String(value);}};}
 };
 global.document = {
   getElementById: function(id) {

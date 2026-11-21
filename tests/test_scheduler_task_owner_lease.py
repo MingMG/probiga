@@ -70,6 +70,26 @@ def _history(engine):
         return dict(c.execute(text("SELECT * FROM st_scheduled_task_history WHERE id=79494")).mappings().one())
 
 
+@pytest.mark.parametrize("owner_absent", [True, False])
+def test_latest_audit_recovers_summary_written_two_seconds_later(case, monkeypatch, owner_absent):
+    engine, clock, original, _ = case
+    started = clock[0] + timedelta(seconds=2)
+    with engine.begin() as c:
+        c.execute(text("UPDATE st_scheduled_task_history SET output='',build_sha=:old,trigger_source='scheduled'"), {"old": "b" * 40})
+        c.execute(text("UPDATE st_scheduled_tasks SET last_run_at=:at,last_triggered_at=:at"), {"at": started})
+    clock[0] += timedelta(days=1)
+    monkeypatch.setattr(runtime, "gethostname", lambda: "windows-host")
+    monkeypatch.setattr(runtime, "_scheduler_build_commit_sha", lambda: "d" * 40)
+    monkeypatch.setattr(runtime, "_owner_pid_is_absent", lambda *a, **kw: owner_absent)
+    monkeypatch.setattr(runtime, "_now_shanghai_naive", lambda: clock[0])
+    assert runtime._recover_interrupted_manual_claim(engine,
+        {"id": 112, "task_type": original["task_type"]}, started) is owner_absent
+    assert _history(engine)["status"] == ("failed" if owner_absent else "running")
+    with engine.connect() as c:
+        status = c.execute(text("SELECT last_run_status FROM st_scheduled_tasks WHERE id=112")).scalar_one()
+    assert status == ("failed" if owner_absent else "running")
+
+
 def test_renew_updates_exact_running_audit_and_extends_expiry(case):
     engine, clock, original, marker = case
     owner = lease.TaskOwnerLease(engine, original, marker, clock=lambda: clock[0], on_lost=lambda: None)
