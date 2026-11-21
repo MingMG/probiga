@@ -13721,6 +13721,9 @@ prepare_trusted_wheelhouse() {
   local wheelhouse_build
   local wheel_file
   local wheel_sha
+  local download_lock="$RESOLVED_LOCK"
+  local previous_cache
+  local previous_manifest
   local artifact_root="$RELEASE_ARTIFACT_ROOT"
   [[ "$EXPECTED_INPUT_LOCK_SHA256" =~ ^[0-9a-f]{64}$ ]] || return 1
   [[ "$EXPECTED_WHEEL_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]] || return 1
@@ -13745,7 +13748,47 @@ prepare_trusted_wheelhouse() {
   TRUSTED_WHEELHOUSE="$wheelhouse_build"
   chown "$BUILD_USER:$BUILD_USER" "$TRUSTED_WHEELHOUSE" || return 1
   chmod 0700 "$TRUSTED_WHEELHOUSE" || return 1
-  sudo -u "$BUILD_USER" /usr/bin/env -i \
+  previous_manifest="${PREVIOUS_CODE_ROOT:-}/deploy/production_wheel_manifest.lock"
+  if [[ "${PREVIOUS_INPUT_LOCK_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] && test -f "$previous_manifest"; then
+    previous_cache="$artifact_root/wheelhouse-cache-static-$PREVIOUS_INPUT_LOCK_SHA256-$(sha256sum "$previous_manifest" | cut -d' ' -f1)"
+    if test -d "$previous_cache"; then
+      verify_sealed_wheelhouse "$previous_cache" "$previous_manifest" || return 1
+      download_lock="$("$BOOTSTRAP_PYTHON" -I - "$previous_cache" "$TRUSTED_WHEELHOUSE" "$TRUSTED_WHEEL_MANIFEST" "$RESOLVED_LOCK" <<'PY_REUSE_WHEELS'
+import hashlib
+from pathlib import Path
+import re
+import shutil
+import sys
+import tempfile
+
+source, target, manifest, lock = map(Path, sys.argv[1:])
+normalize = lambda value: re.sub(r"[-_.]+", "-", value).lower()
+reused = set()
+for line in manifest.read_text().splitlines():
+    if not re.fullmatch(r"[0-9a-f]{64}  [A-Za-z0-9_.+-]+\.whl", line):
+        continue
+    digest, filename = line.split()
+    candidate = source / filename
+    if candidate.is_file() and hashlib.sha256(candidate.read_bytes()).hexdigest() == digest:
+        shutil.copyfile(candidate, target / filename)
+        name, version = filename.split("-")[:2]
+        reused.add((normalize(name), version))
+missing = []
+for line in lock.read_text().splitlines():
+    pinned = re.match(r"([A-Za-z0-9_.-]+)==([^\s]+)", line)
+    if not pinned or (normalize(pinned[1]), pinned[2]) not in reused:
+        missing.append(line)
+with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False) as stream:
+    stream.write("\n".join(missing)+"\n")
+    output = Path(stream.name)
+output.chmod(0o444)
+print(f"Reused {len(reused)} verified dependency wheels; downloading only missing artifacts", file=sys.stderr)
+print(output)
+PY_REUSE_WHEELS
+)" || return 1
+    fi
+  fi
+  if ! sudo -u "$BUILD_USER" /usr/bin/env -i \
     PATH=/usr/sbin:/usr/bin:/sbin:/bin \
     HOME=/var/empty \
     LANG=C.UTF-8 LC_ALL=C.UTF-8 \
@@ -13758,7 +13801,11 @@ prepare_trusted_wheelhouse() {
       "$DEPENDENCY_DOWNLOAD_TIMEOUT" \
       "$BOOTSTRAP_PYTHON" -I -m pip download \
       --require-hashes --only-binary=:all: --no-deps \
-      --dest "$TRUSTED_WHEELHOUSE" -r "$RESOLVED_LOCK" || return 1
+      --dest "$TRUSTED_WHEELHOUSE" -r "$download_lock"; then
+    if test "$download_lock" != "$RESOLVED_LOCK"; then rm -f -- "$download_lock"; fi
+    return 1
+  fi
+  if test "$download_lock" != "$RESOLVED_LOCK"; then rm -f -- "$download_lock"; fi
   manifest_entries="$(mktemp)" || return 1
   expected_files="$(mktemp)" || { rm -f -- "$manifest_entries"; return 1; }
   actual_files="$(mktemp)" || {
