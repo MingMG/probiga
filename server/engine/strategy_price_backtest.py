@@ -11,7 +11,7 @@ from pathlib import Path
 import time
 
 import pandas as pd
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 
 from server.common.analysis_pool_receipt import canonical_sha256
 from server.common.authoritative_market_clock import PRODUCTION_TIMEZONE
@@ -79,13 +79,16 @@ def _group_inputs(connection, sessions, cutoff):
         FROM {MANIFEST_TABLE} WHERE schema_version=:schema AND dataset='stock_daily' AND provider=:provider
         AND status='EXACT' AND strategy_eligible=1 AND trade_date BETWEEN :start AND :end AND captured_at<=:cutoff"""),
         {"schema": SCHEMA, "provider": PROVIDER, "start": sessions[0], "end": sessions[-1], "cutoff": cutoff})}
-    runs = connection.execute(text("""SELECT /*+ MAX_EXECUTION_TIME(4000) */ run_id,start_date,end_date
-        FROM qmt_kline_attestation_run WHERE status='COMPLETED' AND provider='gj_big_qmt_inner' AND finished_at<=:cutoff
-        AND start_date<=:end AND end_date>=:start ORDER BY finished_at DESC,run_id DESC"""),
-        {"start": sessions[0], "end": sessions[-1], "cutoff": cutoff}).mappings().all()
-    sources = {day: "QMT_MANIFEST" if day in manifests else "QMT_RETAINED"
-        if any(str(r["start_date"])[:10] <= day <= str(r["end_date"])[:10] for r in runs)
-        else "VERIFIED_PUBLIC" for day in sessions}
+    from server.common.verified_daily_market_truth import FREE_DAILY_PROVIDERS
+    public = {str(r[0])[:10] for r in connection.execute(text("""SELECT DISTINCT target_date
+        FROM acquisition_partition_state WHERE dataset='stock_daily' AND partition_key='__daily_partition__'
+        AND status='complete' AND source IN :providers AND target_date BETWEEN :start AND :end
+    """).bindparams(bindparam("providers", expanding=True)),
+        {"providers": sorted(FREE_DAILY_PROVIDERS), "start": sessions[0], "end": sessions[-1]})}
+    # An archive day need not have the legacy attestation table populated;
+    # the existing retained reader also verifies original QMT rows directly.
+    sources = {day: "QMT_MANIFEST" if day in manifests else "VERIFIED_PUBLIC" if day in public
+               else "QMT_RETAINED" for day in sessions}
     # Retained archive validation accepts exact days; 16 measured calls stay
     # bounded without re-running the old whole-range finality verifier.
     return [{"sessions": sessions[i:i + 16], "sources": {d: sources[d] for d in sessions[i:i + 16]}}
@@ -187,21 +190,52 @@ def start_replay(connection, state, proposals, days):
         WHERE trade_status=1 AND trade_date<:day ORDER BY trade_date DESC LIMIT :n"""), {"day": days[0], "n": warmup_count}).scalars())
     if len(warmup) != warmup_count:
         raise ValueError("回测预热交易日不足")
+    input_sessions = warmup + days
+    prior = state.get("previous_price_backtest") or {}
+    archives = []
+    cutoff = clock
+    if prior.get("input_sessions") == input_sessions:
+        cutoff = prior["knowledge_cutoff"]
+        archives = list(prior.get("input_archives") or []) + [{"run_id": prior["run_id"], "rule_hash": prior["rule_hash"]}]
     identity = {"contract": contract, "sessions": days, "requested_at": clock,
         "versions": [(p["strategy_key"], p["version"], p["rule_hash"]) for p in proposals]}
-    return {"run_id": canonical_sha256(identity), "rule_hash": canonical_sha256(identity["versions"]),
+    campaign = {"run_id": canonical_sha256(identity), "rule_hash": canonical_sha256(identity["versions"]),
         "contract": contract, "phase": "INPUTS", "status": "RUNNING", "cursor": 0,
-        "sessions": days, "input_sessions": warmup + days, "warmup_count": warmup_count,
-        "knowledge_cutoff": clock, "requested_at": clock,
-        "groups": _group_inputs(connection, warmup + days, clock), "completed_units": 0,
-        "total_units": len(warmup + days) * 2 + len(days)}
+        "sessions": days, "input_sessions": input_sessions, "warmup_count": warmup_count,
+        "knowledge_cutoff": cutoff, "requested_at": clock, "input_archives": archives,
+        "groups": _group_inputs(connection, input_sessions, cutoff), "completed_units": 0,
+        "total_units": len(input_sessions) * 2 + len(days)}
+    inputs = _input_parts(connection, campaign)
+    for group in campaign["groups"]:
+        existing = inputs.get(group["sessions"][0])
+        if existing is None:
+            break
+        if existing["sessions"] != group["sessions"]:
+            raise ValueError("恢复的历史输入分区范围不一致")
+        campaign["cursor"] += 1
+        campaign["completed_units"] += len(group["sessions"])
+    if campaign["cursor"] == len(campaign["groups"]):
+        campaign.update(phase="SIGNALS", cursor=0)
+    campaign["reused_input_sessions"] = campaign["completed_units"]
+    return campaign
+
+
+def _input_parts(connection, campaign):
+    inputs = {}
+    for archive in [*(campaign.get("input_archives") or []), campaign]:
+        for day, part in _partitions(connection, archive, {"rule_hash": archive["rule_hash"]}, "D").items():
+            if day in inputs and inputs[day] != part:
+                raise ValueError("已验证历史输入的恢复引用发生冲突")
+            inputs[day] = part
+    return inputs
 
 
 def advance_replay(connection, state, proposals, campaign, *, checkpoint=None):
     """One scheduler-owned bounded step; caller atomically persists all events."""
     campaign = dict(campaign)
+    campaign["status"] = "RUNNING"
     key = {"rule_hash": campaign["rule_hash"]}
-    inputs = _partitions(connection, campaign, key, "D")
+    inputs = _input_parts(connection, campaign)
     signals = _partitions(connection, campaign, key, "S")
     prices = _partitions(connection, campaign, key, "P")
     events, deadline = [], time.monotonic() + 100
@@ -217,6 +251,7 @@ def advance_replay(connection, state, proposals, campaign, *, checkpoint=None):
             p["validation"] = {"status": "RUNNING", "phase": campaign["phase"], "replay_run_id": campaign["run_id"],
                 "backtest_contract": campaign["contract"], "completed_units": campaign["completed_units"],
                 "total_units": campaign["total_units"], "current_unit": campaign["current_unit"],
+                "reused_input_sessions": campaign.get("reused_input_sessions", 0),
                 "sessions": campaign["sessions"], "source_kind": "RECONSTRUCTED_TRAILING_PRICE_FEATURES",
                 "reason": "按各历史交易日重算量价特征，复用同批输入并实际回放", "net_return_pct": None}
     if phase == "INPUTS":
@@ -299,6 +334,7 @@ def advance_replay(connection, state, proposals, campaign, *, checkpoint=None):
                 "reason": "历史量价研究已实际回放；不是事前预测，样本外与前向盈利资格另行验证" if report["status"] == "COMPLETE" else "历史回放已计算；部分拟入场缺少当日身份或成交证据，详见排除明细",
                 "sessions": campaign["sessions"], "replay_run_id": campaign["run_id"],
                 "requested_at": campaign["requested_at"], "computed_at": _now(),
+                "reused_input_sessions": campaign.get("reused_input_sessions", 0),
                 "knowledge_cutoff": campaign["knowledge_cutoff"], "backtest_contract": campaign["contract"],
                 "source_kind": "RECONSTRUCTED_TRAILING_PRICE_FEATURES", "source_input_sha256": common_hash,
                 "dataset_sha256": canonical_sha256({"source": common_hash, "signals": selected, "prices": prices}),

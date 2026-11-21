@@ -105,6 +105,7 @@ def _research(run, proposal):
         "verified_input_subset_profit_cny": initial * subset_return / 100 if initial and subset_return is not None else None,
         "return_scope": return_scope, "identity_covered_sessions": validation.get("identity_covered_sessions"),
         "input_exclusion_count": report.get("input_exclusion_count"), "replay_run_id": validation.get("replay_run_id"),
+        "reused_input_sessions": validation.get("reused_input_sessions", 0),
         "completed_trades": report.get("completed_trade_count"), "max_drawdown_pct": _drawdown(nav) if eligible else None,
         "closed_trade_net_pnl_cny": sum(_number(t["net_pnl_cny"]) for t in trades)
             if trades and all(_number(t.get("net_pnl_cny")) is not None for t in trades) else None,
