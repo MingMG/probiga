@@ -117,10 +117,12 @@ def build_quant_workbench_lifecycle(
         _stage(
             "STRATEGY_POOL",
             "策略候选池",
-            {"ACTIVE": "READY", "PENDING": "WAITING", "NOT_STARTED": "NOT_STARTED"}.get(_status(pool.get("status")), "BLOCKED"),
+            {"ACTIVE": "READY", "VERIFIED_EMPTY": "READY", "PENDING": "WAITING", "NOT_STARTED": "NOT_STARTED"}.get(_status(pool.get("status")), "BLOCKED"),
             (
                 f"{pool.get('active_count', 0)} 只 ACTIVE · 分析 {pool.get('analysis_count', 0)} 只"
                 if _status(pool.get("status")) == "ACTIVE"
+                else f"本轮已分析 {pool.get('analysis_count', 0)} 只，符合条件 0 只；空池已验真"
+                if _status(pool.get("status")) == "VERIFIED_EMPTY"
                 else "当日候选池待生成；市场研究与复盘继续运行"
                 if _status(pool.get("status")) == "NOT_STARTED"
                 else "候选池待发布；执行资格单独核验"
@@ -137,7 +139,7 @@ def build_quant_workbench_lifecycle(
             },
             blocking_reason=(
                 ""
-                if _status(pool.get("status")) == "ACTIVE"
+                if _status(pool.get("status")) in {"ACTIVE", "VERIFIED_EMPTY"}
                 else str(pool.get("reason") or "STRATEGY_POOL_UNAVAILABLE")
             ),
             operation_ids=("strategy_pool",),

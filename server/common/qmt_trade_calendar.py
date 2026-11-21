@@ -660,6 +660,11 @@ def load_trade_calendar_receipt(
     start = _iso_date(start_date)
     end = _iso_date(end_date)
     decision_time = _known_at(decision_known_at)
+    cache = connection.info.setdefault("verified_qmt_calendars", {}) if connection.dialect.name == "mysql" else {}
+    if batch_id is not None and str(batch_id) in cache:
+        cached = cache[str(batch_id)]
+        if cached.known_at <= decision_time and cached.start_date <= start <= end <= cached.end_date:
+            return cached
     params: dict[str, Any] = {
         "start_date": start,
         "end_date": end,
@@ -690,11 +695,16 @@ def load_trade_calendar_receipt(
         WHERE batch_id=:batch_id
         ORDER BY trade_date
     """), {"batch_id": str(row["batch_id"])}).fetchall()
-    return validate_calendar_manifest(
+    verified = validate_calendar_manifest(
         row["manifest_json"],
         row=dict(row),
         sessions=[item[0] for item in session_rows],
     )
+    if batch_id is not None:
+        cache[str(batch_id)] = verified
+        while len(cache) > 4:
+            cache.pop(next(iter(cache)))
+    return verified
 
 
 def load_trade_calendar_window_receipt(
