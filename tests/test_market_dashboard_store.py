@@ -76,6 +76,16 @@ def test_missing_ladder_does_not_prevent_new_quote_publication(snapshots):
     assert "limit_ladder" in result["unavailable_fields"]
 
 
+def test_missing_amount_remains_explicit_in_published_quote(snapshots):
+    value = board_value()
+    value["unavailable_fields"] = ["rankings.amount", "indices", "limit_ladder"]
+    value["market_overview"]["total_amount"] = None
+    _publish_board(DAY, value, TOKEN, closed=False)
+    result = store.board(DAY)
+    assert "rankings.amount" in result["unavailable_fields"]
+    assert result["market_overview"]["total_amount"] is None
+
+
 def test_digest_corruption_and_expired_ownership_fail_closed(snapshots):
     _publish_board(DAY, board_value(), TOKEN, closed=False)
     with store.database(write=True) as db, db:

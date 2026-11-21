@@ -222,7 +222,7 @@ def board(day, *, now=None):
             result["turnover_coverage"] = payload["coverage"]
             result["turnover_evidence"] = payload.get("evidence")
     result["events"] = parts.get("events", ({"events": []}, {}))[0]["events"][:20]
-    missing = []
+    missing = list(quote.get("unavailable_fields", []))
     if not quote or observation.get("state") == "expired":
         missing += ["distribution", "strong", "rankings.gainers", "rankings.losers", "rankings.amount"]
     if len(result["indices"]) != 7 or any(row["observation"]["state"] == "expired" for row in result["indices"]):

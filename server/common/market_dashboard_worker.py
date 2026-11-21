@@ -208,6 +208,8 @@ def _publish_board(day, value, token, *, closed):
         fields = ("as_of", "source", "as_of_basis", "sample_size", "price_sample_size", "sample_scope",
                   "sample_sources", "market_overview", "distribution", "strong", "close_drawdowns", "liquidity", "quote_identity")
         payload = {key: value.get(key) for key in fields}
+        payload["unavailable_fields"] = [field for field in value.get("unavailable_fields", [])
+            if field in ("distribution", "strong", "rankings.gainers", "rankings.losers", "rankings.amount", "liquidity.volume_ratio5")]
         payload["rankings"] = {key: value["rankings"][key] for key in ("gainers", "losers", "amount")}
         store.publish(day, "quotes", payload, source_at=value["as_of"], basis="close" if closed else "source", token=token)
         count += 1
@@ -301,10 +303,10 @@ def capture_once(token):
         try:
             value = load()
             if name in ("board", "quotes"):
-                published = _publish_board(day, value, token, closed=closed)
                 if value.get("source_errors"):
                     error = json.dumps(value["source_errors"], ensure_ascii=True)[:1000]
-                elif name == "board" and any(field != "events" for field in value.get("unavailable_fields", [])):
+                published = _publish_board(day, value, token, closed=closed)
+                if not error and name == "board" and any(field != "events" for field in value.get("unavailable_fields", [])):
                     error = "partial_board_coverage"
             elif name == "indices":
                 published = _publish_board(day, {"indices": value}, token, closed=False)
@@ -318,9 +320,9 @@ def capture_once(token):
                     "turnover_coverage": {"verified_count": len(value["rows"]), "sample_size": value["observed_count"],
                         "excluded_count": value["excluded_count"]}}, token, closed=False)
             elif name == "ladder":
-                published = _publish_board(day, {"limit_ladder": value}, token, closed=False)
                 if value.get("source_errors"):
                     error = json.dumps(value["source_errors"], ensure_ascii=True)[:1000]
+                published = _publish_board(day, {"limit_ladder": value}, token, closed=False)
             elif name == "heatmap":
                 published = _publish_heatmap(day, value, token, closed=closed)
                 if published != 6:
@@ -333,7 +335,7 @@ def capture_once(token):
                     basis="close" if closed else "source" if name == "liquidity" else "received", token=token)
                 published = 1
         except Exception as exc:
-            error = getattr(exc, "reason_code", None) or getattr(exc, "code", None) or type(exc).__name__
+            error = error or getattr(exc, "reason_code", None) or getattr(exc, "code", None) or type(exc).__name__
             LOGGER.warning("dashboard %s failed: %s", name, error)
         store.finish_component(day, name, run_id, token, published=published, error=error)
     with ThreadPoolExecutor(max_workers=len(jobs) or 1) as pool:
