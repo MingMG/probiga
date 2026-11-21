@@ -97,8 +97,9 @@ def read_strategy_workspace(engine, trade_date: str = "") -> dict:
     for task in tasks:
         output = str(task.pop("last_run_output") or "")
         receipts = [_json(line, {}) for line in output.splitlines() if line.startswith("{")]
-        task["reason"] = next((r.get("reason") or r.get("reason_code") for r in reversed(receipts)
-                               if isinstance(r, dict) and (r.get("reason") or r.get("reason_code"))), "")
+        task["reason"] = next((r["reason"] for r in reversed(receipts)
+                               if isinstance(r, dict) and r.get("reason")), "") or next(
+            (r["reason_code"] for r in reversed(receipts) if isinstance(r, dict) and r.get("reason_code")), "")
     return {
         "trade_date": day, "registry_observed_at": datetime.now(PRODUCTION_TIMEZONE).isoformat(timespec="seconds"),
         "strategy_count": count, "strategies": strategies, "governance": run,

@@ -60,6 +60,16 @@ def test_no_completed_trades_do_not_report_zero_return_or_drawdown(workspace):
     assert all(m[field] is None for field in ("net_expectancy_pct", "profit_factor", "max_drawdown_pct", "win_rate_pct"))
 
 
+def test_task_reason_keeps_business_failure_before_retry_marker(workspace):
+    output = '\n'.join(json.dumps(row) for row in [
+        {"reason": "历史行情认证读取超时", "reason_code": "GOVERNANCE_EVIDENCE_NOT_READY"},
+        {"schema": "probiga.scheduler-transient-block.v1", "reason_code": "GOVERNANCE_EVIDENCE_NOT_READY"},
+    ])
+    with workspace.begin() as c:
+        c.execute(text("INSERT INTO st_scheduled_tasks VALUES(85,'strategy_governance_daily',1,'blocked','2026-11-21 18:00:00',:output)"), {"output": output})
+    assert read_strategy_workspace(workspace, "2026-11-20")["tasks"][0]["reason"] == "历史行情认证读取超时"
+
+
 def test_drawdown_comparison_places_smaller_losses_first(workspace, tmp_path):
     node = shutil.which("node")
     if not node:
