@@ -90,12 +90,13 @@ def test_native_receipt_uses_original_universe_and_reuses_immutable_scope(monkey
     privileged_migrate_formal_analysis_schema(engine)
     day = '2026-10-16'
     expected = expected_stock_set_contract(day, ['000001', '000002'])
-    truth = {'provider': 'qmt_retained_history', 'receipt_id': 'native-run', 'catalog_batch_id': 'later',
-             'row_count': 2, 'code_set_hash': expected['stock_set_hash']}
-    class Receipt:
-        def as_dict(self):
-            return dict(truth)
-    monkeypatch.setattr(source, 'load_retained_qmt_daily_market_truth', lambda *_a, **_k: Receipt())
+    receipt = source.VerifiedDailyMarketTruth(provider='qmt_retained_history', target_date=day,
+        receipt_id='native-run', captured_at='2026-10-16 18:00:00', decision_known_at='2026-11-22 05:59:24',
+        catalog_batch_id='later', catalog_manifest_hash='a' * 64, catalog_member_set_hash='b' * 64,
+        row_count=2, code_count=2, code_set_hash=expected['stock_set_hash'], row_hash='c' * 64,
+        coverage_ratio=1.0, truth_hash='d' * 64)
+    truth = receipt.as_dict()
+    monkeypatch.setattr(source, 'load_retained_qmt_daily_market_truth', lambda *_a, **_k: receipt)
     prepared = []
     def prepare(_c, run, _cutoff):
         prepared.append(run['run_id'])

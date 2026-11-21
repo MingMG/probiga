@@ -131,7 +131,7 @@ def _source_scope(connection, truth, day, cutoff):
     if truth.get("provider") != "qmt_retained_history":
         return base
     from server.common.formal_analysis_store import FormalAnalysisStore
-    receipt = str(truth["receipt_id"])
+    receipt = str(truth["run_id"])
     generation = canonical_sha256({"schema": "probiga.price-native-source-scope.v1", "receipt": receipt})
     store = FormalAnalysisStore(connection)
     scope = store.get(generation, "price_native_scope", day)
