@@ -52,6 +52,28 @@ def test_exact_version_reads_completed_returns_and_selection(workspace):
     assert d["governance_current"] is True
 
 
+def test_no_completed_trades_do_not_report_zero_return_or_drawdown(workspace):
+    with workspace.begin() as c:
+        c.execute(text("UPDATE st_strategy_health_snapshot SET strategy_version='v2',completed_trades=0,net_expectancy_pct=0,profit_factor=0,max_drawdown_pct=0,win_rate_pct=0"))
+    m = read_strategy_workspace(workspace, "2026-11-20")["strategies"][0]["windows"]["20"]
+    assert m["completed_trades"] == 0
+    assert all(m[field] is None for field in ("net_expectancy_pct", "profit_factor", "max_drawdown_pct", "win_rate_pct"))
+
+
+def test_drawdown_comparison_places_smaller_losses_first(workspace, tmp_path):
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node is required for the browser module")
+    d = read_strategy_workspace(workspace, "2026-11-20")
+    base = d["strategies"][0]
+    d["strategies"] = [{**base, "strategy_name": name, "windows": {"20": {"max_drawdown_pct": dd}}}
+                       for name, dd in [("large loss", 20), ("small loss", 2), ("unknown loss", None)]]
+    script = Path(__file__).resolve().parents[1] / "server/static/js/quant-strategy-workspace.js"
+    runner = tmp_path / "compare.cjs"
+    runner.write_text("global.window={};require(" + json.dumps(str(script)) + ");const d=" + json.dumps(d) + ";const h=window.QuantStrategyWorkspace.render({data:d,window:'20',order:'drawdown'});if(!(h.indexOf('small loss')<h.indexOf('large loss')&&h.indexOf('large loss')<h.indexOf('unknown loss')))process.exit(1);", encoding="utf-8")
+    subprocess.run([node, str(runner)], check=True, timeout=10)
+
+
 def test_workspace_renderer_preserves_unknowns_and_escapes_evidence(workspace, tmp_path):
     node = shutil.which("node")
     if not node:

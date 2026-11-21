@@ -14,7 +14,7 @@
             const field={net:'net_expectancy_pct',drawdown:'max_drawdown_pct',samples:'completed_trades'}[s.order];
             const av=field?number((a.windows[s.window]||{})[field]):null, bv=field?number((b.windows[s.window]||{})[field]):null;
             if(av===null&&bv!==null)return 1;if(bv===null&&av!==null)return -1;
-            return av!==null&&bv!==null&&av!==bv ? bv-av : a.strategy_name.localeCompare(b.strategy_name,'zh-CN');
+            return av!==null&&bv!==null&&av!==bv ? (s.order==='drawdown'?av-bv:bv-av) : a.strategy_name.localeCompare(b.strategy_name,'zh-CN');
         });
         let h='<header class="qsw-header"><div><small>策略清单 · 选股 · 收益证据</small><h2>策略池与竞技</h2><p>注册 '+esc(d.strategy_count)+' 个策略；QMT 当前模拟 '+esc((catalog.strategies||[]).length)+' 策略、'+esc((catalog.combinations||[]).length)+' 组合。下方任务数量另计。</p></div><button type="button" data-qsw-action="refresh">刷新结果</button></header>';
         h+='<div class="qsw-links">'+[['strategy-center','策略研究与竞技'],['qmt-strategy-results','QMT选股与后续表现'],['strategy-backtest','回测结果'],['recommended','正式股票池']].map(x=>'<button type="button" data-qsw-tab="'+x[0]+'">'+x[1]+'</button>').join('')+'</div>';
@@ -38,9 +38,18 @@
     function paint(s) {
         const opened=new Set(Array.from(s.mount.querySelectorAll('details[open]')).map(e=>e.dataset.qswKey));
         const table=s.mount.querySelector('.qsw-table'), left=table?table.scrollLeft:0;
+        const focused=s.mount.contains(document.activeElement)?document.activeElement:null;
+        const focusControl=focused&&focused.dataset.qswControl;
+        const focusKey=focused&&focused.closest('details')&&focused.closest('details').dataset.qswKey;
+        const focusRefresh=focused&&focused.hasAttribute('data-qsw-action');
         s.mount.innerHTML=render(s);
         s.mount.querySelectorAll('details').forEach(e=>e.open=opened.has(e.dataset.qswKey));
         s.mount.querySelector('.qsw-table').scrollLeft=left;
+        let restore;
+        if(focusControl)restore=Array.from(s.mount.querySelectorAll('[data-qsw-control]')).find(e=>e.dataset.qswControl===focusControl);
+        else if(focusKey){const detail=Array.from(s.mount.querySelectorAll('details')).find(e=>e.dataset.qswKey===focusKey);restore=detail&&detail.querySelector('summary');}
+        else if(focusRefresh)restore=s.mount.querySelector('[data-qsw-action]');
+        if(restore)restore.focus({preventScroll:true});
     }
     function load(day,mount,request,navigate,stock,isActive) {
         const s={mount,window:'20',order:'name',data:null,market:null,timer:null,busy:false};
