@@ -5357,4 +5357,9 @@ button:focus-visible,a:focus-visible { outline:2px solid #1a73e8; outline-offset
 #tab-quant-workbench .qsw-maintenance {border:1px solid #dce5ef;border-radius:13px;background:#f8fafc;padding:16px}
 #tab-quant-workbench .qsw-maintenance>summary {cursor:pointer;font-weight:700;color:#475569}
 #tab-quant-workbench .qsw-operations {margin-top:18px}
+#tab-quant-workbench .qsw-research {margin:18px 0;padding:16px;background:#f4f8ff;border:1px solid #d8e4f5;border-radius:12px}
+#tab-quant-workbench .qsw-research h3 {margin:0 0 10px;color:#244876;font-size:16px}
+#tab-quant-workbench .qsw-research p {font-size:12px;line-height:1.8;overflow-wrap:anywhere}
+#tab-quant-workbench .qsw-research-proposal {padding:12px;margin-top:10px;border:1px solid #dce5ef;border-radius:8px;background:#fff}
+#tab-quant-workbench .qsw-research-proposal>summary {cursor:pointer;font-weight:600;font-size:13px;color:#334155}
 @media(max-width:700px){#tab-quant-workbench .qsw-workspace{padding:14px}#tab-quant-workbench .qsw-context{grid-template-columns:1fr}#tab-quant-workbench .qsw-header h2{font-size:20px}}

@@ -5,6 +5,32 @@
     const metric = (v, suffix='') => number(v) === null ? '未知' : Number(v).toFixed(2)+suffix;
     const stages = {SHADOW:'影子观察',CANDIDATE:'待晋级',ACTIVE:'正式',PAUSED:'暂停',RETIRED:'已淘汰',FORMAL:'正式'};
     const stateNames = {strong_trend:'强趋势',low_range:'低位震荡',high_range:'高位震荡',extreme_event:'极端事件'};
+    const researchStates={NOT_STARTED:'待处理',RUNNING:'进行中',COMPLETE:'已处理',BLOCKED:'待补齐证据',FAILED:'失败',AWAITING_EVALUATION:'等待日评估与影子执行',OBSERVED:'已有验证交易样本'};
+    const featureNames={change_pct:'当日涨跌幅',previous_change_pct:'前一日涨跌幅',pct_5:'5日涨幅',pct_20:'20日涨幅',dist_ma20:'距20日均线',drawdown_60:'60日回撤',from_low_60:'距60日低点涨幅',amount_ratio_20:'成交额相对20日均值',amount_ratio_5:'成交额相对5日均值',close_location_value:'收盘位置',volatility_20:'20日波动',turnover_ratio:'换手率',capital_score:'资金分',technical_score:'技术分',sector_rotation_score:'板块轮动分',ultra_short_score:'超短分',short_term_score:'短线分',swing_score:'波段分',main_wave_score:'主升分',relative_change_pct:'相对市场当日强度',relative_20d_pct:'相对市场20日强度',sector_breadth_pct:'行业上涨宽度',sector_change_pct:'行业平均涨幅',sector_strength_percentile:'行业内强度百分位',sector_top3_amount_pct:'行业前三成交集中度',market_change_pct:'市场平均涨幅',market_breadth_pct:'市场上涨宽度',market_return_20d_pct:'市场20日平均涨幅'};
+    const conditionsText=list=>(list||[]).map(c=>(featureNames[c.field]||c.field)+' '+({gt:'>',gte:'≥',lt:'<',lte:'≤'}[c.op]||c.op)+' '+c.value).join('；')||'无附加条件';
+    function researchView(research) {
+        if(!research)return '';
+        const run=(research.runs||[])[0];
+        let h='<section class="qsw-research"><h3>自主策略研究</h3><p>每个新冻结收盘批次自动提出假设、验证规则、回放研究并登记影子观察。市场条件决定规则是否触发；正式晋级沿用已有证据审核。</p>';
+        if(!run)return h+'<p>'+esc(research.reason||'尚无自主研究批次，等待研究 Worker 处理有效收盘数据。')+'</p></section>';
+        h+='<p><strong>'+esc(researchStates[run.status]||run.status)+'</strong> · 来源交易日 '+esc(run.trade_date)+' · 已处理 '+esc(run.completed_units||0)+' / '+esc(run.total_units||0)+' 项 · 最近进展 '+esc(run.last_progress_at||run.updated_at||'未知')+'</p>';
+        h+='<p>'+esc(run.reason||run.summary||'正在生成或验证研究候选')+'</p>';
+        h+='<p class="qsw-foot">数据截止 '+esc(run.decision_known_at||'未知')+'；模型提出时间 '+esc(run.proposal_generated_at||'尚未完成')+'。</p>';
+        (run.proposals||[]).forEach(p=>{
+            const v=p.validation||{}, reg=p.registration||{}, report=v.report||{};
+            h+='<details class="qsw-research-proposal" data-qsw-key="research-'+esc(p.rule_hash)+'"><summary>'+esc(p.name)+' · '+esc(researchStates[v.status]||v.status)+' · '+esc(reg.status==='COMPLETE'?'已登记影子观察':'待登记')+'</summary>';
+            h+='<p>'+esc(p.thesis)+'</p><p>适用：'+esc(p.applicability)+'；失效：'+esc(p.invalidations)+'</p>';
+            h+='<p>市场条件（同时满足）：'+esc(conditionsText(p.rule.market_all))+'</p><p>入场条件（同时满足）：'+esc(conditionsText(p.rule.entry_all))+'；择一条件：'+esc(conditionsText(p.rule.entry_any))+'</p>';
+            h+='<p>持有上限 '+esc(p.rule.holding_days)+' 个交易日，保护止损 '+esc(p.rule.stop_loss_pct)+'%。具体成交仍受下一交易日、涨跌停、流动性及组合约束。</p>';
+            h+='<p>历史研究：'+esc(v.reason||((v.completed_units!=null)?'已校验 '+v.completed_units+' / '+v.total_units+' 个分区':'等待验证'))+'</p>';
+            if(v.available_feature_sessions!=null)h+='<p>冻结特征批次 '+esc(v.available_feature_sessions)+' / '+esc(v.required_sessions)+' 个交易日。</p>';
+            if(report.net_return_pct!=null)h+='<p>历史模型回放收益 '+metric(report.net_return_pct,'%')+' · 完成交易 '+esc(report.completed_trade_count)+' 笔 · 费用为估算。前向盈利资格仍待独立验证。</p>';
+            h+='<p>本批研究候选：'+esc((p.research_picks||[]).map(x=>x.stock_code+' '+x.stock_name).join('、')||'当前尚无候选结果')+'</p>';
+            h+='<p class="qsw-foot">'+esc(p.version)+' · '+esc(researchStates[(p.forward_evidence||{}).status]||'尚无成熟前向收益')+'</p></details>';
+        });
+        if((research.runs||[]).length>1)h+='<details data-qsw-key="research-history"><summary>历史研究批次</summary><ul>'+research.runs.slice(1).map(r=>'<li>'+esc(r.trade_date+' · '+(researchStates[r.status]||r.status)+' · '+(r.proposals||[]).map(p=>p.name).join('、'))+'</li>').join('')+'</ul></details>';
+        return h+'</section>';
+    }
     function render(s) {
         const d=s.data, g=d.governance||{}, tasks=d.tasks||[], e=d.external_observation||{}, catalog=d.simulation_catalog||{};
         const governanceTask=tasks.find(t=>t.task_type==='strategy_governance_daily')||{};
@@ -21,6 +47,7 @@
         h+='<section class="qsw-context"><div><strong>'+esc(s.market?s.market.market_mode_label:'市场状态')+'</strong><span>'+esc(s.market?s.market.tactical_style:'市场观察在任务状态读回后更新')+'</span></div><div><strong>外围最新观察</strong><span>'+esc(e.captured_at||'暂无批次')+'</span></div><div><strong>策略实际使用依据</strong><span>'+esc(g.trade_date?g.trade_date+' · '+(stateNames[g.market_state]||g.market_state):'尚无治理结果')+'</span></div></section>';
         if(!current)h+='<p class="qsw-warning" role="status">所选日 '+esc(d.trade_date)+' 尚无当前治理结果'+(g.trade_date?'，最近结果停在 '+esc(g.trade_date):'')+'。'+esc(governanceTask.reason||'等待本轮治理通过输入校验')+'。最新外围观察尚不能标记为已用于策略决策。</p>';
         if(s.pool)h+='<p class="qsw-foot">正式股票池：'+esc(s.pool.status==='VERIFIED_EMPTY'?'本轮已分析 '+s.pool.analysis_count+' 只，符合条件 0 只，空池已验真':s.pool.status==='ACTIVE'?s.pool.active_count+' 只入池':s.pool.reason||'等待生成')+'。</p>';
+        h+=researchView(d.autonomous_research);
         h+='<div class="qsw-toolbar"><label>观察窗口 <select data-qsw-control="window">'+[20,60,120].map(n=>'<option value="'+n+'"'+(s.window===String(n)?' selected':'')+'>'+n+' 个交易日</option>').join('')+'</select></label><label>比较 <select data-qsw-control="order">'+[['name','策略名称'],['net','扣费单笔均值'],['drawdown','最大回撤'],['samples','完成交易数']].map(x=>'<option value="'+x[0]+'"'+(s.order===x[0]?' selected':'')+'>'+x[1]+'</option>').join('')+'</select></label><span>'+esc(d.metric_basis)+'</span></div>';
         h+='<div class="qsw-table"><div class="qsw-columns"><span>策略 / 当前版本</span><span>阶段</span><span>完成交易</span><span>扣费单笔均值</span><span>胜率</span><span>最大回撤</span><span>市场适配分</span></div>';
         rows.forEach(row=>{
