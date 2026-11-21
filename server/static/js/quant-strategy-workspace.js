@@ -31,6 +31,36 @@
         if((research.runs||[]).length>1)h+='<details data-qsw-key="research-history"><summary>历史研究批次</summary><ul>'+research.runs.slice(1).map(r=>'<li>'+esc(r.trade_date+' · '+(researchStates[r.status]||r.status)+' · '+(r.proposals||[]).map(p=>p.name).join('、'))+'</li>').join('')+'</ul></details>';
         return h+'</section>';
     }
+    function resultTable(rows, ranked) {
+        return '<div class="qsw-result-scroll"><table><thead><tr>'+['排名 / 策略版本','回测区间','账户累计收益','账户净盈利','已平仓笔数','胜率','最大回撤','结果'].map(x=>'<th>'+x+'</th>').join('')+'</tr></thead><tbody>'+rows.map(r=>'<tr><td>'+esc(ranked?r.rank:'—')+' · '+esc(r.strategy_name||r.strategy_key||r.reported_strategy_key||'历史策略')+'<small>'+esc(r.strategy_version)+'</small></td><td>'+esc(r.start_date||'未知')+' 至 '+esc(r.end_date||'未知')+'</td><td>'+metric(r.net_return_pct,'%')+'</td><td>'+metric(r.net_profit_cny,'元')+'</td><td>'+esc(r.completed_trades==null?'未知':r.completed_trades)+'</td><td>'+metric(r.win_rate_pct,'%')+'</td><td>'+metric(r.max_drawdown_pct,'%')+'</td><td><button type="button" data-qsw-result="'+esc(r.result_id)+'">明细与证据</button><small>'+esc(r.reason)+'</small></td></tr>').join('')+'</tbody></table></div>';
+    }
+    function performanceView(s) {
+        const d=s.performance;
+        let h='<section class="qsw-performance"><h3>回测与赚钱排名</h3><p>历史回测、模型规则事后回放、前向模拟分别比较。累计收益包含持仓估值；已平仓交易盈利另列。</p>';
+        if(!d)return h+'<p role="status">'+esc(s.performanceError||'正在独立读取回测结果…')+'</p></section>';
+        if(s.performanceError)h+='<p class="qsw-error">'+esc(s.performanceError)+'；保留上次结果。</p>';
+        Object.values(d.sources||{}).filter(x=>x.status==='FAILED').forEach(x=>{h+='<p class="qsw-error">'+esc(x.reason)+'</p>';});
+        h+='<p>'+esc(d.method)+'</p><h4>累计收益排名</h4>';
+        if(!(d.leaderboards||[]).length)h+='<p class="qsw-warning">当前没有满足版本绑定及可比口径的完整回测结果，暂不能给出赚钱排名。历史报告及全部策略的进度在下方保留。</p>';
+        (d.leaderboards||[]).forEach(g=>{h+='<p>同组 '+esc(g.rows.length)+' 个版本 · '+esc(g.cohort.start_date)+' 至 '+esc(g.cohort.end_date)+' · 初始资金 '+metric(g.cohort.initial_cash_cny,'元')+(g.rows[0].kind==='MODEL_RULE_RETROSPECTIVE'?' · 模型规则事后研究，非独立样本外结果':' · 历史回测')+'</p>'+resultTable(g.rows,true);});
+        h+='<details data-qsw-key="backtest-coverage" open><summary>全部 '+esc(d.strategies.length)+' 个当前策略的回测进度</summary><div class="qsw-result-scroll"><table><thead><tr><th>策略 / 版本</th><th>回测状态与缺口</th><th>结果</th></tr></thead><tbody>'+d.strategies.map(r=>'<tr><td>'+esc(r.strategy_name)+'<small>'+esc(r.strategy_version)+'</small></td><td>'+esc(researchStates[r.backtest_status]||r.backtest_status)+'<small>'+esc(r.reason)+'</small></td><td>'+(r.result_id?'<button type="button" data-qsw-result="'+esc(r.result_id)+'">查看验证进度</button>':'等待当前版本回测')+'</td></tr>').join('')+'</tbody></table></div></details>';
+        h+='<details data-qsw-key="backtest-archive"><summary>全部历史报告与研究回放（'+esc(d.results.length)+' 份）</summary><p>旧版本和身份未完整绑定的存档均保留原标记，不计入当前策略收益。</p>'+resultTable(d.results,false)+(d.history_limit_reached?'<p>此处展示最近100份正式回测；更早结果请在回测结果页查询。</p>':'')+'</details>';
+        if(s.resultLoading)h+='<p role="status">正在读取交易明细…</p>';
+        if(s.resultError)h+='<p class="qsw-error">'+esc(s.resultError)+'</p>';
+        const x=s.resultDetail;
+        if(x){const r=x.summary;
+            h+='<article class="qsw-result-detail"><h4>'+esc(r.strategy_name||r.strategy_key||r.reported_strategy_key||'历史报告')+' · 交易明细与证据</h4><p>'+esc(r.strategy_version)+' · '+esc(r.reason)+'</p><p>账户累计收益 '+metric(r.net_return_pct,'%')+'；账户净盈利 '+metric(r.net_profit_cny,'元')+'；已平仓交易净盈利 '+metric(r.closed_trade_net_pnl_cny,'元')+'。费用属于原回测假设，真实成交另行验证。</p>';
+            if(r.available_feature_sessions!=null)h+='<p>历史冻结特征 '+esc(r.available_feature_sessions)+' / '+esc(r.required_sessions)+' 日。'+esc((x.missing_feature_dates||[]).length)+' 日缺失。</p><details data-qsw-key="missing-'+esc(r.result_id)+'"><summary>缺失交易日</summary><p>'+esc((x.missing_feature_dates||[]).join('、'))+'</p></details>';
+            if(r.total_units!=null)h+='<p>分区进度 '+esc(r.completed_units)+' / '+esc(r.total_units)+'</p>';
+            h+='<p>结果哈希 '+esc(r.result_hash||r.cohort?.dataset_sha256||'尚无完整结果')+'；'+esc(r.identity_verified?'策略身份已绑定':'策略身份未完整绑定')+'。'+(x.trade_coverage_matches===false?'交易明细数量与报告不一致，需核对。':'')+'</p>';
+            if(x.trades.length)h+='<div class="qsw-result-scroll"><table><thead><tr><th>股票</th><th>买入</th><th>卖出</th><th>数量</th><th>买卖金额</th><th>费用</th><th>扣费净盈亏</th></tr></thead><tbody>'+x.trades.map(t=>'<tr><td><button type="button" data-qsw-stock="'+esc(t.stock_code)+'">'+esc(t.stock_code)+'</button></td><td>'+esc(t.entry_date||t.entry_at)+'</td><td>'+esc(t.exit_date||t.exit_at||'未退出')+'</td><td>'+esc(t.quantity)+'</td><td>'+metric(t.buy_fill_amount??(number(t.entry_price)!==null?Number(t.entry_price)*Number(t.quantity):null))+' / '+metric(t.sell_fill_amount??(number(t.exit_price)!==null?Number(t.exit_price)*Number(t.quantity):null))+'</td><td>'+metric(t.estimated_fee_cny??(number(t.buy_fees)!==null&&number(t.sell_fees)!==null?Number(t.buy_fees)+Number(t.sell_fees):null),'元')+'</td><td>'+metric(t.trade_net_pnl??t.net_pnl_cny,'元')+'</td></tr>').join('')+'</tbody></table></div>';
+            else h+='<p>尚无可展示的已完成交易明细。</p>';
+            if(x.trade_count!=null)h+='<p>交易 '+esc(x.offset+(x.trades.length?1:0))+'—'+esc(x.offset+x.trades.length)+' / '+esc(x.trade_count)+' 笔 '+(x.offset>0?'<button type="button" data-qsw-result="'+esc(r.result_id)+'" data-qsw-offset="'+Math.max(0,x.offset-x.limit)+'">上一页</button>':'')+' '+(x.offset+x.limit<x.trade_count?'<button type="button" data-qsw-result="'+esc(r.result_id)+'" data-qsw-offset="'+(x.offset+x.limit)+'">下一页</button>':'')+'</p>';
+            if(x.dispositions?.length)h+='<details data-qsw-key="dispositions"><summary>未成交与证据缺口</summary><ul>'+x.dispositions.map(t=>'<li>'+esc([t.stock_code,t.trade_date,t.status,t.reason].filter(Boolean).join(' · '))+'</li>').join('')+'</ul></details>';
+            h+='</article>';
+        }
+        return h+'</section>';
+    }
     function render(s) {
         const d=s.data, g=d.governance||{}, tasks=d.tasks||[], e=d.external_observation||{}, catalog=d.simulation_catalog||{};
         const governanceTask=tasks.find(t=>t.task_type==='strategy_governance_daily')||{};
@@ -48,6 +78,8 @@
         if(!current)h+='<p class="qsw-warning" role="status">所选日 '+esc(d.trade_date)+' 尚无当前治理结果'+(g.trade_date?'，最近结果停在 '+esc(g.trade_date):'')+'。'+esc(governanceTask.reason||'等待本轮治理通过输入校验')+'。最新外围观察尚不能标记为已用于策略决策。</p>';
         if(s.pool)h+='<p class="qsw-foot">正式股票池：'+esc(s.pool.status==='VERIFIED_EMPTY'?'本轮已分析 '+s.pool.analysis_count+' 只，符合条件 0 只，空池已验真':s.pool.status==='ACTIVE'?s.pool.active_count+' 只入池':s.pool.reason||'等待生成')+'。</p>';
         h+=researchView(d.autonomous_research);
+        h+=performanceView(s);
+        h+='<h3>前向模拟观察 · 当前版本</h3><p>下面按已完成交易比较扣费单笔均值。尚无独立账户净值证据时，不能当作账户累计收益排名。</p>';
         h+='<div class="qsw-toolbar"><label>观察窗口 <select data-qsw-control="window">'+[20,60,120].map(n=>'<option value="'+n+'"'+(s.window===String(n)?' selected':'')+'>'+n+' 个交易日</option>').join('')+'</select></label><label>比较 <select data-qsw-control="order">'+[['name','策略名称'],['net','扣费单笔均值'],['drawdown','最大回撤'],['samples','完成交易数']].map(x=>'<option value="'+x[0]+'"'+(s.order===x[0]?' selected':'')+'>'+x[1]+'</option>').join('')+'</select></label><span>'+esc(d.metric_basis)+'</span></div>';
         h+='<div class="qsw-table"><div class="qsw-columns"><span>策略 / 当前版本</span><span>阶段</span><span>完成交易</span><span>扣费单笔均值</span><span>胜率</span><span>最大回撤</span><span>市场适配分</span></div>';
         rows.forEach(row=>{
@@ -63,15 +95,15 @@
         return h;
     }
     function paint(s) {
-        const opened=new Set(Array.from(s.mount.querySelectorAll('details[open]')).map(e=>e.dataset.qswKey));
-        const table=s.mount.querySelector('.qsw-table'), left=table?table.scrollLeft:0;
+        const opened=new Map(Array.from(s.mount.querySelectorAll('details')).map(e=>[e.dataset.qswKey,e.open]));
+        const scrolls=Array.from(s.mount.querySelectorAll('.qsw-table,.qsw-result-scroll')).map(e=>e.scrollLeft);
         const focused=s.mount.contains(document.activeElement)?document.activeElement:null;
         const focusControl=focused&&focused.dataset.qswControl;
         const focusKey=focused&&focused.closest('details')&&focused.closest('details').dataset.qswKey;
         const focusRefresh=focused&&focused.hasAttribute('data-qsw-action');
         s.mount.innerHTML=render(s);
-        s.mount.querySelectorAll('details').forEach(e=>e.open=opened.has(e.dataset.qswKey));
-        s.mount.querySelector('.qsw-table').scrollLeft=left;
+        s.mount.querySelectorAll('details').forEach(e=>{if(opened.has(e.dataset.qswKey))e.open=opened.get(e.dataset.qswKey);});
+        s.mount.querySelectorAll('.qsw-table,.qsw-result-scroll').forEach((e,i)=>e.scrollLeft=scrolls[i]||0);
         let restore;
         if(focusControl)restore=Array.from(s.mount.querySelectorAll('[data-qsw-control]')).find(e=>e.dataset.qswControl===focusControl);
         else if(focusKey){const detail=Array.from(s.mount.querySelectorAll('details')).find(e=>e.dataset.qswKey===focusKey);restore=detail&&detail.querySelector('summary');}
@@ -79,7 +111,7 @@
         if(restore)restore.focus({preventScroll:true});
     }
     function load(day,mount,request,navigate,stock,isActive) {
-        const s={mount,window:'20',order:'name',data:null,market:null,timer:null,busy:false};
+        const s={mount,window:'20',order:'name',data:null,market:null,timer:null,busy:false,performance:null};
         mount._strategyWorkspace=s;
         async function refresh() {
             if(s.busy||!mount.isConnected||(isActive&&!isActive()))return;
@@ -97,12 +129,30 @@
                 error.textContent='策略结果读取失败：'+(e.message||e)+'。已显示的结果保留原时间。';
             } finally {s.busy=false;if(mount.isConnected)s.timer=setTimeout(refresh,20000);}
         }
-        mount.onclick=e=>{
+        let performanceBusy=false;
+        async function refreshPerformance(){
+            if(performanceBusy||!mount.isConnected||(isActive&&!isActive()))return;
+            performanceBusy=true;
+            try{const d=await request('/api/quant-workbench/strategy-performance?trade_date='+encodeURIComponent(day),20000,{cache:'no-store'});
+                if(!mount.isConnected)return;
+                const version=JSON.stringify(d);if(version!==s.performanceVersion||s.performanceError){s.performance=d;s.performanceVersion=version;s.performanceError='';if(s.data)paint(s);}
+            }catch(e){s.performanceError='回测结果读取失败：'+(e.message||e);if(s.data&&mount.isConnected)paint(s);}
+            finally{performanceBusy=false;if(mount.isConnected)setTimeout(refreshPerformance,20000);}
+        }
+        mount.onclick=async e=>{
             const tab=e.target.closest('[data-qsw-tab]'), code=e.target.closest('[data-qsw-stock]');
-            if(tab)navigate(tab.dataset.qswTab);else if(code)stock(code.dataset.qswStock);else if(e.target.closest('[data-qsw-action]'))refresh();
+            const result=e.target.closest('[data-qsw-result]');
+            if(result){
+                if(s.resultLoading)return;
+                s.resultLoading=true;s.resultError='';paint(s);
+                try{const d=await request('/api/quant-workbench/strategy-performance/'+encodeURIComponent(result.dataset.qswResult)+'?offset='+(Number(result.dataset.qswOffset)||0),20000,{cache:'no-store'});if(mount.isConnected)s.resultDetail=d;}
+                catch(err){s.resultError='交易明细读取失败：'+(err.message||err);}
+                finally{s.resultLoading=false;if(mount.isConnected){paint(s);mount.querySelector('.qsw-result-detail')?.scrollIntoView({block:'nearest',behavior:'smooth'});}}
+            }else if(tab)navigate(tab.dataset.qswTab);else if(code)stock(code.dataset.qswStock);else if(e.target.closest('[data-qsw-action]')){refresh();refreshPerformance();}
         };
         mount.onchange=e=>{const field=e.target.dataset.qswControl;if(field&&s.data){s[field]=e.target.value;paint(s);}};
         refresh();
+        refreshPerformance();
     }
     window.QuantStrategyWorkspace={load,setMarket(mount,market,pool){const s=mount&&mount._strategyWorkspace;if(s){s.market=market;s.pool=pool;if(s.data)paint(s);}},render};
 })();
