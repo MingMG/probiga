@@ -64,3 +64,16 @@ def test_latest_observation_is_separate_from_history_and_reads_only_one_batch(mo
     assert historical['rows'][0]['price']==100
     assert historical['view_mode']=='history'
     engine.dispose()
+
+
+def test_latest_route_reads_the_newly_published_batch_without_waiting_for_cache(monkeypatch):
+    engine=create_engine('sqlite://')
+    with engine.begin() as conn:
+        conn.exec_driver_sql('CREATE TABLE st_external_market_context (id INT,context_date TEXT,snapshot_id TEXT,captured_at TEXT,symbol TEXT,display_name TEXT,price REAL,change_pct REAL,previous_close REAL,market_time TEXT,availability TEXT,source TEXT,payload_json TEXT)')
+        conn.exec_driver_sql("INSERT INTO st_external_market_context VALUES (1,'2026-11-17','first','2026-11-17 09:00:00','nasdaq','指数',100,1,99,'2026-11-17 08:59:00','available','native','{}')")
+    monkeypatch.setattr(context,'get_engine',lambda:engine)
+    assert context.global_context('2026-11-17',mode='latest')['snapshot_id']=='first'
+    with engine.begin() as conn:
+        conn.exec_driver_sql("INSERT INTO st_external_market_context VALUES (2,'2026-11-17','second','2026-11-17 09:02:00','nasdaq','指数',200,1,199,'2026-11-17 09:01:00','available','native','{}')")
+    assert context.global_context('2026-11-17',mode='latest')['snapshot_id']=='second'
+    engine.dispose()

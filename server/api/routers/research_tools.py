@@ -346,16 +346,16 @@ def build_industry_breadth(day, *, period=20):
             "reconstruction_basis": "视频明确提到20或30日均线宽度；原私有热度总分未给公式，此处展示可复算的均线宽度。"}
 
 
-def _serve(builder, *args, **kwargs):
+def _serve(builder, *args, cache_seconds=120, **kwargs):
     from server.api.routers.hot_data import _cache_get, _cache_set
 
     key = "research-tools:" + builder.__name__ + json.dumps([args, kwargs], sort_keys=True)
-    cached = _cache_get(key, ttl_seconds=120)
+    cached = _cache_get(key, ttl_seconds=cache_seconds) if cache_seconds > 0 else None
     if cached is not None:
         return cached
     try:
         result = builder(*args, **kwargs)
-        if result.get("status") == "available":
+        if result.get("status") == "available" and cache_seconds > 0:
             _cache_set(key, result)
         return result
     except ValueError as exc:
