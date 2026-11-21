@@ -221,3 +221,23 @@ def test_bounded_stream_queue_merges_unread_components():
     SnapshotHub.offer(queue, {"components": {"snapshot": {"version": "c"}}})
     assert queue.qsize() == 1
     assert queue.get_nowait()["components"] == {"snapshot": {"version": "c"}, "heatmap": {"version": "b"}}
+
+
+def test_external_observation_publishes_its_own_receipt_without_main_calendar(snapshots, monkeypatch):
+    from types import SimpleNamespace
+    from server.common import market_dashboard_worker as worker
+    from tools import env_config, refresh_external_market_context as capture
+    monkeypatch.setattr(env_config, "load_project_env", lambda: None)
+    monkeypatch.setattr(env_config, "create_tool_engine", lambda **kw: SimpleNamespace(dispose=lambda: None))
+    def forbidden():
+        raise AssertionError("external capture waited for the A-share calendar")
+    monkeypatch.setattr(worker, "_target", forbidden)
+    monkeypatch.setattr(capture, "capture_current_observation", lambda engine: {
+        "context_date": DAY, "snapshot_id": "verified-external-batch", "available_count": 41,
+        "expected_count": 41, "status": "COMPLETE", "persisted_sha256": "a"*64})
+    worker.capture_external(TOKEN)
+    worker._terminal(TOKEN)
+    assert store.runtime()["total_units"] == store.runtime()["completed_units"] == 1
+    assert store.runtime()["state"] == "COMPLETE"
+    assert store.component(DAY, "external")["snapshot_id"] == "verified-external-batch"
+    assert store.runtime()["current_units"][0]["published"] == 41

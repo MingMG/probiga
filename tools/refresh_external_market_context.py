@@ -16,6 +16,8 @@ if str(ROOT) not in sys.path:
 
 from biz.market_context.external_market import (
     PREMARKET_EXTERNAL_CAPTURE_TIME,
+    EXTERNAL_OBSERVATION_SCHEMA,
+    external_capture_owner,
     PREMARKET_EXTERNAL_SNAPSHOT_SCHEMA,
     _external_premarket_persisted_proof,
     fetch_external_market_snapshot,
@@ -91,6 +93,24 @@ def _capture_premarket_external_snapshot(engine) -> dict:
         return {**result, "reason_code": f"EXTERNAL_MARKET_{stage}_FAILED", "detail": type(exc).__name__}
 
 
+def capture_current_observation(engine) -> dict:
+    with external_capture_owner(engine):
+        snapshot = fetch_external_market_snapshot()
+        if int(snapshot.get("available_count") or 0) <= 0:
+            raise RuntimeError("EXTERNAL_MARKET_SOURCE_EMPTY")
+        observed_at = _now_shanghai().replace(microsecond=0)
+        snapshot = {**snapshot, "captured_at": observed_at, "context_date": observed_at.date().isoformat()}
+        report = store_external_market_snapshot(engine, snapshot)
+        digest, missing = _external_premarket_persisted_proof(
+            engine, snapshot_id=report["snapshot_id"], captured_at=observed_at)
+        if missing != report["missing_symbols"]:
+            raise ValueError("external observation durable coverage differs")
+        report.update(schema=EXTERNAL_OBSERVATION_SCHEMA, persisted_sha256=digest,
+                      status="COMPLETE" if not missing else "FAILED")
+        report["source_warnings"] = [str(item)[:300] for item in report["source_warnings"][:20]]
+        return report
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--attempts", type=int, default=3)
@@ -106,37 +126,31 @@ def main() -> int:
             connect_args={"connect_timeout": 8, "read_timeout": 10, "write_timeout": 10},
         )
         try:
-            receipt = _capture_premarket_external_snapshot(engine)
+            with external_capture_owner(engine):
+                receipt = _capture_premarket_external_snapshot(engine)
         finally:
             engine.dispose()
         print(json.dumps(receipt, ensure_ascii=False, default=str))
         return 0 if receipt["status"] == "COMPLETE" else 2
-    attempts = max(1, int(args.attempts))
-    snapshot = None
-    errors: list[str] = []
-    for attempt in range(1, attempts + 1):
-        try:
-            snapshot = fetch_external_market_snapshot()
-            if int(snapshot.get("available_count") or 0) > 0:
-                break
-            errors.append(f"attempt {attempt}: no available items")
-        except Exception as exc:  # noqa: BLE001
-            errors.append(f"attempt {attempt}: {type(exc).__name__}: {exc}")
-        if attempt < attempts:
-            time.sleep(max(0.0, float(args.retry_delay_seconds)))
-    if snapshot is None:
-        raise RuntimeError("; ".join(errors) or "external snapshot unavailable")
-    engine = create_tool_engine()
+    engine = create_tool_engine(connect_args={"connect_timeout": 8, "read_timeout": 10, "write_timeout": 10})
+    report, errors = None, []
     try:
-        report = store_external_market_snapshot(engine, snapshot)
+        for attempt in range(max(1, int(args.attempts))):
+            try:
+                report = capture_current_observation(engine)
+                if report["available_count"] > 0:
+                    break
+            except Exception as exc:
+                errors.append(type(exc).__name__+": "+str(exc)[:200])
+            if attempt+1 < args.attempts:
+                time.sleep(max(0, args.retry_delay_seconds))
     finally:
         engine.dispose()
+    if report is None:
+        raise RuntimeError("external observation failed: "+"; ".join(errors))
     report["fetch_errors"] = errors
-    if args.json:
-        print(json.dumps(report, ensure_ascii=False, default=str))
-    else:
-        print(report)
-    return 0 if int(report.get("available_count") or 0) > 0 else 3
+    print(json.dumps(report, ensure_ascii=False, default=str) if args.json else report)
+    return 0 if report["status"] == "COMPLETE" else 3
 
 
 if __name__ == "__main__":

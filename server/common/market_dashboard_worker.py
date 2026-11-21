@@ -8,6 +8,7 @@ import logging
 import os
 from pathlib import Path
 import signal
+import stat
 import sqlite3
 import subprocess
 import sys
@@ -24,6 +25,8 @@ LEASE_SECONDS = 30
 CYCLE_SECONDS = 20
 CAPTURE_DEADLINE_SECONDS = 45
 _thread = None
+_external_thread = None
+_external_role = False
 _stop = threading.Event()
 _start_lock = threading.Lock()
 
@@ -124,7 +127,10 @@ def _supervise():
                 _stop.wait(min(5, (store.stamp(due)-store.clock()).total_seconds()))
                 continue
             started = monotonic()
-            child = subprocess.Popen([sys.executable, "-m", __name__, "--capture", token],
+            command = [sys.executable, "-m", "server.common.market_dashboard_worker", "--capture", token]
+            if _external_role:
+                command.append("--external")
+            child = subprocess.Popen(command,
                 cwd=str(Path(__file__).resolve().parents[2]), stdin=subprocess.DEVNULL,
                 start_new_session=True)
             renew(token, child_pid=child.pid)
@@ -161,7 +167,7 @@ def _supervise():
 
 
 def start_dashboard_producer():
-    global _thread
+    global _thread, _external_thread
     if os.name != "posix" or os.environ.get("PROBIGA_DEPLOYMENT_MODE") != "production":
         return
     with _start_lock:
@@ -170,6 +176,8 @@ def start_dashboard_producer():
         _stop.clear()
         _thread = threading.Thread(target=_supervise, name="market-dashboard-producer", daemon=True)
         _thread.start()
+        _external_thread = threading.Thread(target=_supervise_external_process, name="external-market-producer", daemon=True)
+        _external_thread.start()
 
 
 def stop_dashboard_producer():
@@ -178,6 +186,74 @@ def stop_dashboard_producer():
         _thread.join(timeout=10)
         if _thread.is_alive():
             raise RuntimeError("dashboard producer shutdown deadline exceeded")
+    if _external_thread:
+        _external_thread.join(timeout=15)
+        if _external_thread.is_alive():
+            raise RuntimeError("external observation supervisor shutdown deadline exceeded")
+
+
+def _supervise_external_process():
+    from server.common.trading_day_store import journal_runtime_root
+    base = journal_runtime_root()
+    root = base / "external-market"
+    try:
+        base_info = base.lstat()
+        if (not base.is_absolute() or not stat.S_ISDIR(base_info.st_mode) or base_info.st_uid != os.geteuid()
+                or stat.S_IMODE(base_info.st_mode) != 0o700):
+            raise RuntimeError("external observation parent root is not private")
+        root.mkdir(mode=0o700, exist_ok=True)
+        info = root.lstat()
+        if (not root.is_absolute() or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) != 0o700):
+            raise RuntimeError("external observation runtime root is not private")
+        environment = {**os.environ, "PROBIGA_JOB_LOG_ROOT": str(root)}
+        for attempt in range(3):
+            child = subprocess.Popen([sys.executable, "-m", "server.common.market_dashboard_worker", "--external-supervisor"],
+                cwd=str(Path(__file__).resolve().parents[2]), env=environment,
+                stdin=subprocess.DEVNULL, start_new_session=True)
+            while child.poll() is None and not _stop.wait(2):
+                pass
+            if _stop.is_set():
+                if child.poll() is None:
+                    child.send_signal(signal.SIGTERM)
+                    try:
+                        child.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        _terminate(child)
+                return
+            LOGGER.error("external observation supervisor exited: attempt=%s exit=%s", attempt+1, child.returncode)
+            if _stop.wait(5*(attempt+1)):
+                return
+    except Exception as exc:
+        LOGGER.error("external observation supervisor FAILED: %s", type(exc).__name__)
+
+
+def capture_external(token):
+    from tools.env_config import create_tool_engine, load_project_env
+    from tools.refresh_external_market_context import capture_current_observation
+    now = store.clock()
+    day, run_id = now.date().isoformat(), uuid.uuid4().hex
+    with store.database(write=True) as db, db:
+        store._authorized(db, token, now)
+        db.execute("""UPDATE dashboard_owner SET run_id=?,state='RUNNING',total_units=1,completed_units=0,
+            last_progress_at=?,next_capture_at=? WHERE slot=1 AND token=?""",
+            (run_id, store.iso(now), store.iso(now+timedelta(seconds=120)), token))
+    store.start_component(day, "external", run_id, token)
+    load_project_env()
+    engine = create_tool_engine(connect_args={"connect_timeout": 8, "read_timeout": 10, "write_timeout": 10})
+    published, error = 0, None
+    try:
+        report = capture_current_observation(engine)
+        store.publish(report["context_date"], "external", report, source_at=None, basis="received", token=token)
+        published = report["available_count"]
+        if report["status"] != "COMPLETE":
+            error = "partial_external_instrument_coverage"
+    except Exception as exc:
+        error = getattr(exc, "reason_code", None) or getattr(exc, "code", None) or type(exc).__name__
+        LOGGER.warning("external observation acquisition FAILED: %s", error)
+    finally:
+        engine.dispose()
+    store.finish_component(day, "external", run_id, token, published=published, error=error)
 
 
 def _target():
@@ -358,6 +434,15 @@ def capture_once(token):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3 or sys.argv[1] != "--capture":
+    if sys.argv[1:] == ["--external-supervisor"]:
+        _external_role = True
+        CAPTURE_DEADLINE_SECONDS = 180
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(signum, lambda *_: _stop.set())
+        _supervise()
+    elif len(sys.argv) == 4 and sys.argv[1] == "--capture" and sys.argv[3] == "--external":
+        capture_external(sys.argv[2])
+    elif len(sys.argv) == 3 and sys.argv[1] == "--capture":
+        capture_once(sys.argv[2])
+    else:
         raise SystemExit("dashboard capture requires its supervisor identity")
-    capture_once(sys.argv[2])

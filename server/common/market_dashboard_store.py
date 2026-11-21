@@ -31,8 +31,8 @@ def iso(value):
 
 
 @contextmanager
-def database(*, write=False):
-    path = _path(create=write)
+def database(*, write=False, root=None):
+    path = _path(create=write, root=root)
     db = sqlite3.connect(path if write else path.as_uri()+"?mode=ro", uri=not write, timeout=1)
     db.row_factory = sqlite3.Row
     try:
@@ -61,9 +61,9 @@ def initialize():
             last_progress_at TEXT, next_capture_at TEXT)""")
 
 
-def runtime():
+def runtime(*, root=None):
     try:
-        with database() as db:
+        with database(root=root) as db:
             row = db.execute("SELECT * FROM dashboard_owner WHERE slot=1").fetchone()
             if not row:
                 return {}
@@ -159,11 +159,11 @@ def freshness(row, day, *, now):
             "fresh_seconds": FRESH_SECONDS, "expired_seconds": EXPIRED_SECONDS}
 
 
-def read(day, *, now=None):
+def read(day, *, now=None, root=None):
     """One bounded, read-only SQLite read, independent of all source clients."""
     now = clock(now)
     try:
-        with database() as db:
+        with database(root=root) as db:
             rows = db.execute("""SELECT * FROM dashboard_observation WHERE trade_date=?
                 AND length(CAST(payload AS BLOB))<=? LIMIT 32""", (day, MAX_BYTES)).fetchall()
             attempts = db.execute("SELECT * FROM dashboard_capture WHERE trade_date=? LIMIT 16", (day,)).fetchall()
@@ -258,8 +258,8 @@ def heatmap(day, *, now=None):
     return result
 
 
-def component(day, name, *, now=None):
-    parts, attempts = read(day, now=now)
+def component(day, name, *, now=None, root=None):
+    parts, attempts = read(day, now=now, root=root)
     if name not in parts:
         return None
     payload, meta = parts[name]
