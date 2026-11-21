@@ -465,17 +465,25 @@ def research_tick(engine):
                         aliases = state.setdefault("equivalent_source_hashes", [])
                         state["equivalent_source_hashes"] = (aliases + [root])[-24:]
                         _checkpoint(connection, state, owner)
-            if state and state["stage"] == "FINISHED" and all(p["registration"]["status"] == "COMPLETE" for p in state["proposals"]):
+            if (state and state["status"] in {"COMPLETE", "FAILED", "BLOCKED"}
+                    and state["stage"] in {"FINISHED", "VALIDATE"}
+                    and all(p["registration"]["status"] == "COMPLETE" for p in state["proposals"])):
                 from server.engine.strategy_price_backtest import replay_contract, supports_price_rule
                 price_proposals = [p for p in state["proposals"] if supports_price_rule(p["rule"])]
                 contract = replay_contract() if price_proposals else None
                 if any(p["validation"].get("backtest_contract") != contract for p in price_proposals):
                     # Evaluation has its own identity and deadline; generation and registration stay immutable.
                     state["generation_deadline_at"] = state.get("generation_deadline_at", state["deadline_at"])
+                    price_keys = {p["strategy_key"] for p in price_proposals}
+                    completed = 1 + sum(p["registration"]["status"] == "COMPLETE" for p in state["proposals"]) + sum(
+                        p["strategy_key"] not in price_keys and p["validation"]["status"] not in {"NOT_STARTED", "RUNNING"}
+                        for p in state["proposals"])
                     state.update(status="NOT_STARTED", stage="VALIDATE", step_status="NOT_STARTED", retryable=False,
+                        retry_count=0, error_type=None, error_errno=None,
                         deadline_at=(now_shanghai() + timedelta(hours=24)).isoformat(sep=" "),
-                        completed_units=state["completed_units"] - len(price_proposals))
-                    state.pop("price_backtest", None)
+                        completed_units=completed)
+                    if state.get("price_backtest"):
+                        state["previous_price_backtest"] = state.pop("price_backtest")
                     for p in price_proposals:
                         p["validation"] = {"status": "NOT_STARTED"}
                     _checkpoint(connection, state, owner)
@@ -526,6 +534,11 @@ def research_tick(engine):
                         and (state["stage"] != "GENERATE" or not state.get("provider_attempted"))):
                     state.update(status="BLOCKED", retryable=True, retry_count=retries,
                                  retry_after=(now_shanghai() + timedelta(minutes=5)).isoformat(sep=" "))
+                if state.get("price_backtest") and state["stage"] == "VALIDATE":
+                    state["price_backtest"].update(status=state["status"], reason=reason)
+                    for proposal in state["proposals"]:
+                        if proposal["validation"]["status"] == "RUNNING":
+                            proposal["validation"].update(status="NOT_STARTED" if state.get("retryable") else "FAILED", reason=reason)
                 if getattr(exc, "provider_failure_receipt", None):
                     state["provider_failure_receipt"] = exc.provider_failure_receipt
                 connection.rollback()

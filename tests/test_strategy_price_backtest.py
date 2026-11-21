@@ -60,13 +60,15 @@ def test_unrelated_ai_and_flow_scores_still_require_original_frozen_evidence():
 
 def test_archive_uses_retained_proof_and_recent_days_use_their_actual_manifest():
     from server.common.qmt_datadir_daily_coverage import MANIFEST_TABLE, SCHEMA, PROVIDER
+    from server.common.verified_daily_market_truth import FREE_DAILY_PROVIDERS
     engine = create_engine("sqlite://")
     with engine.begin() as c:
-        c.execute(text("CREATE TABLE qmt_kline_attestation_run(run_id TEXT,start_date TEXT,end_date TEXT,status TEXT,finished_at TEXT,provider TEXT)"))
-        c.execute(text("INSERT INTO qmt_kline_attestation_run VALUES('bulk','2026-01-01','2026-07-31','COMPLETED','2026-08-01','gj_big_qmt_inner')"))
+        c.execute(text("CREATE TABLE acquisition_partition_state(target_date TEXT,dataset TEXT,partition_key TEXT,status TEXT,source TEXT)"))
+        c.execute(text("INSERT INTO acquisition_partition_state VALUES('2026-08-03','stock_daily','__daily_partition__','complete',:source)"), {"source": sorted(FREE_DAILY_PROVIDERS)[0]})
         c.execute(text(f"CREATE TABLE {MANIFEST_TABLE}(trade_date TEXT,schema_version TEXT,dataset TEXT,provider TEXT,status TEXT,strategy_eligible INT,captured_at TEXT)"))
         c.execute(text(f"INSERT INTO {MANIFEST_TABLE} VALUES('2026-07-31',:schema,'stock_daily',:provider,'EXACT',1,'2026-08-02')"), {"schema": SCHEMA, "provider": PROVIDER})
         groups = _group_inputs(c, ["2026-07-29", "2026-07-30", "2026-07-31", "2026-08-03"], "2026-11-22")
+        assert _group_inputs(c, ["2026-09-28"], "2026-11-22")[0]["sources"]["2026-09-28"] == "QMT_RETAINED"
     assert groups[0]["sources"] == {"2026-07-29": "QMT_RETAINED", "2026-07-30": "QMT_RETAINED", "2026-07-31": "QMT_MANIFEST", "2026-08-03": "VERIFIED_PUBLIC"}
 
 

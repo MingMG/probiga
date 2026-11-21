@@ -213,6 +213,60 @@ def test_price_research_runs_shared_inputs_and_resumes_from_real_audit_partition
         assert c.execute(text("SELECT COUNT(*) FROM st_strategy_governance_audit WHERE entity_type='AUTO_REPLAY_PART'")).scalar() == 45
 
 
+def test_failed_price_source_is_terminal_and_new_contract_reuses_verified_prefix(ledger, rule, monkeypatch):
+    from server.engine import strategy_price_backtest as price
+    import pandas as pd
+    days = [d.date().isoformat() for d in pd.bdate_range('2026-06-01', periods=32)]
+    with ledger.begin() as c:
+        c.connection.driver_connection.create_function('GET_LOCK', 2, lambda *_: 1)
+        c.connection.driver_connection.create_function('RELEASE_LOCK', 1, lambda *_: 1)
+        c.execute(text('CREATE TABLE si_trade_calendar(trade_date TEXT,trade_status INT)'))
+        c.execute(text('INSERT INTO si_trade_calendar VALUES(:day,1)'), [{'day': d} for d in days])
+    groups = [{"sessions": days[:16]}, {"sessions": days[16:]}]
+    monkeypatch.setattr(price, '_group_inputs', lambda *_: groups)
+    monkeypatch.setattr(research, '_historical_inventory', lambda *_: (days[20:], {}))
+    monkeypatch.setattr(research, 'authoritative_closed_trade_date', lambda *_a, **_k: days[-1])
+    monkeypatch.setattr(research, 'load_published_analysis_receipt', lambda *_: {'run_uid': 'b' * 32, 'score_snapshot': {'payload_sha256': 'c' * 64}})
+    monkeypatch.setattr(research, 'generate_proposals', lambda *_a, **_k: pytest.fail('must not regenerate model proposals'))
+    calls, repaired = [], [False]
+    def validate(_c, group, _cutoff):
+        calls.append(group['sessions'][0])
+        if group['sessions'] == days[16:] and not repaired[0]:
+            raise ValueError('observed source classification failure')
+        return {"sessions": group['sessions'], "catalogs": {d: 'test' for d in group['sessions']},
+                "proofs": {'fixture': True}, "row_counts": {d: 2 for d in group['sessions']}}
+    monkeypatch.setattr(price, '_validate_group', validate)
+    proposal = {"strategy_key": 'fixture', "version": 'v1', "name": 'fixture', "rule": rule,
+                "rule_hash": 'd' * 64, "validation": {"status": "NOT_STARTED"}, "registration": {"status": "COMPLETE"}}
+    state = {"schema": research.SCHEMA, "run_id": 'a' * 64, "trade_date": days[-1], "stage": "VALIDATE",
+             "analysis_run_uid": 'b' * 32, "analysis_payload_hash": 'c' * 64, "status": "NOT_STARTED",
+             "proposal_generated_at": '2026-11-21 20:00:00', "decision_known_at": '2026-11-21 20:00:00',
+             "deadline_at": (research.now_shanghai() + timedelta(hours=24)).isoformat(sep=' '),
+             "created_at": research.now_shanghai().isoformat(sep=' '), "completed_units": 2, "total_units": 3,
+             "provider_request_id": 'original-model-request', "proposals": [proposal]}
+    with ledger.connect() as c:
+        research._checkpoint(c, state, research._owner(c))
+    result = research.research_tick(ledger)
+    assert result['status'] == 'FAILED'
+    with ledger.connect() as c:
+        failed = research._read_states(c)[0]
+    assert failed['proposals'][0]['validation']['status'] == 'FAILED'
+    assert failed['price_backtest']['completed_units'] == 16
+    old_run = failed['price_backtest']['run_id']
+    repaired[0] = True
+    monkeypatch.setattr(price, 'replay_contract', lambda: 'f' * 64)
+    research.research_tick(ledger)
+    with ledger.connect() as c:
+        resumed = research._read_states(c)[0]
+        campaign = resumed['price_backtest']
+        assert campaign['reused_input_sessions'] == 16
+        assert campaign['completed_units'] == 32 and campaign['phase'] == 'SIGNALS'
+        assert campaign['run_id'] != old_run
+        assert resumed['provider_request_id'] == 'original-model-request'
+        assert calls == [days[0], days[16], days[16]]
+        assert c.execute(text("SELECT COUNT(*) FROM st_strategy_governance_audit WHERE entity_type='AUTO_REPLAY_PART'")).scalar() == 2
+
+
 @pytest.fixture
 def ledger(monkeypatch):
     engine = create_engine("sqlite://")
