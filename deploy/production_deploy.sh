@@ -895,7 +895,12 @@ def require_analysis_diagnostics(parent_fd, name):
                 child,
             ) is None:
                 raise SystemExit("unsafe analysis diagnostics entry")
-            metadata = os.lstat(child, dir_fd=descriptor)
+            try:
+                metadata = os.lstat(child, dir_fd=descriptor)
+            except FileNotFoundError:
+                if allow_live_shard_writers and re.fullmatch(r"\.[0-9a-f]{32}\.progress\.json\.tmp", child):
+                    continue  # The active writer atomically published its progress file.
+                raise
             if not (stat.S_ISREG(metadata.st_mode)
                     and metadata.st_uid == expected_uid and metadata.st_gid == expected_gid
                     and metadata.st_nlink == 1
@@ -1124,7 +1129,12 @@ def require_analysis_diagnostics(parent_fd, name):
                 child,
             ) is None:
                 raise SystemExit("unsafe analysis diagnostics entry")
-            metadata = os.lstat(child, dir_fd=descriptor)
+            try:
+                metadata = os.lstat(child, dir_fd=descriptor)
+            except FileNotFoundError:
+                if allow_live_shard_writers and re.fullmatch(r"\.[0-9a-f]{32}\.progress\.json\.tmp", child):
+                    continue  # The active writer atomically published its progress file.
+                raise
             if not (stat.S_ISREG(metadata.st_mode)
                     and metadata.st_uid == expected_uid and metadata.st_gid == expected_gid
                     and metadata.st_nlink == 1

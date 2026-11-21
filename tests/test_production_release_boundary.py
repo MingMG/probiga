@@ -467,6 +467,35 @@ def test_external_market_checkpoint_namespace(tmp_path: Path, phase: str, entry_
     assert (completed.returncode == 0) == (entry_kind == "valid"), completed.stderr
 
 
+@pytest.mark.parametrize("phase", ["live", "quiescent"])
+@pytest.mark.parametrize("temporary", [True, False])
+def test_diagnostic_progress_atomic_publication_during_preflight(tmp_path: Path, phase: str, temporary: bool) -> None:
+    if os.name != "posix" or not hasattr(os, "O_DIRECTORY"):
+        pytest.skip("secure openat behavior requires POSIX")
+    deploy = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    function = "prepare_probiga_job_log_root" if phase == "live" else "migrate_probiga_job_log_legacy_modes"
+    body = deploy.split(function + "() {", 1)[1].split("\n}\n", 1)[0]
+    script = body.split("<<'PY' || return 2\n", 1)[1].split("\nPY", 1)[0]
+    root = tmp_path / "jobs"
+    root.mkdir(mode=0o700)
+    diagnostics = root / "analysis-execution-diagnostics"
+    diagnostics.mkdir(mode=0o700)
+    root.chmod(0o700)
+    diagnostics.chmod(0o700)
+    name = ("." if temporary else "") + "a" * 32 + ".progress.json" + (".tmp" if temporary else "")
+    _write_job_log(diagnostics / name)
+    # Reproduce the real writer's rename after listdir and before lstat.
+    race = "original_lstat=os.lstat\ndef publish_before_stat(name, *args, **kwargs):\n"
+    race += f" if name == {name!r}:\n  os.rename(name, 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.progress.json', src_dir_fd=kwargs['dir_fd'], dst_dir_fd=kwargs['dir_fd'])\n"
+    race += " return original_lstat(name, *args, **kwargs)\nos.lstat=publish_before_stat\n\n"
+    script = script.replace("directory_fd = os.open(", race + "directory_fd = os.open(", 1)
+    completed = subprocess.run(
+        [sys.executable, "-I", "-", str(root), str(os.geteuid()), str(os.getegid())], input=script,
+        text=True, capture_output=True, timeout=10, check=False,
+    )
+    assert (completed.returncode == 0) == (phase == "live" and temporary), completed.stderr
+
+
 def test_job_log_legacy_modes_are_migrated_only_for_exact_allowlist(
     tmp_path: Path,
 ) -> None:
