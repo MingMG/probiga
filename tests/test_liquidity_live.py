@@ -99,3 +99,22 @@ def test_liquidity_route_binds_intraday_requests_to_exact_session(monkeypatch):
     monkeypatch.setattr(market_home, "read_live_liquidity", lambda selected, **kwargs: {"trade_date": selected, "status": "available"})
     assert market_home.market_liquidity(DAY)["trade_date"] == DAY
     assert market_home.market_liquidity("2026-11-18")["status"] == "not_intraday"
+
+
+def test_liquidity_failure_preserves_the_failed_stage_and_safe_source_reason(monkeypatch):
+    from fastapi import HTTPException
+    from server.api.routers import market_home
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 11, 19, 10, 30, tzinfo=tz)
+    monkeypatch.setattr(market_home, "datetime", Clock)
+    monkeypatch.setattr(market_home, "_trading_day", lambda *_: True)
+    def failed(*args, **kwargs):
+        raise ValueError("liquidity_live: insufficient current-session source coverage")
+    monkeypatch.setattr(market_home, "read_live_liquidity", failed)
+    with pytest.raises(HTTPException) as error:
+        market_home.market_liquidity(DAY)
+    assert error.value.status_code == 503
+    assert error.value.detail["stage"] == "liquidity_snapshot"
+    assert error.value.detail["reason"] == "liquidity_live: insufficient current-session source coverage"
