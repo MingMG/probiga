@@ -53,6 +53,27 @@ def test_research_reuses_equal_features_after_unrelated_republication(raw_rows):
     assert research.research_input_identity(same_rows, same_market, "2026-11-20") != first
 
 
+def test_release_preflight_seals_the_actual_nonempty_startup_registry():
+    import subprocess
+    import sys
+    import re
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    script = (root / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    stage = script.split('  COMPUTED_ADAPTER_REGISTRY_SEAL_SHA256="$(', 1)[1].split('  )"', 1)[0]
+    code = re.findall(r"^\s*'([^']+)'\s*$", stage, flags=re.MULTILINE)[-1]
+    env = {**os.environ, "PROBIGA_DEPLOYMENT_MODE": "development", "PROBIGA_CODE_ROOT": str(root),
+           "PROBIGA_RELEASE_TREE_SHA256": "a" * 64, "PYTHONDONTWRITEBYTECODE": "1"}
+    observed = subprocess.check_output([sys.executable, "-c", code], cwd=root, env=env, text=True, timeout=30).strip()
+    expected_code = ('from server.engine.strategy_execution_adapters import _TRUSTED_STARTUP_ADAPTERS, _digest; '
+        'assert len(_TRUSTED_STARTUP_ADAPTERS)>0; '
+        'print(_digest({"schema":"probiga.strategy-adapter-registry-seal.v1","adapters":['
+        '{"adapter_key":a.adapter_key,"adapter_version":a.adapter_version,"artifact_sha256":a.artifact_sha256,'
+        '"evaluator_types":sorted(a.evaluator_types)} for a in _TRUSTED_STARTUP_ADAPTERS]}))')
+    expected = subprocess.check_output([sys.executable, "-c", expected_code], cwd=root, env=env, text=True, timeout=30).strip()
+    assert observed == expected
+
+
 @pytest.mark.parametrize("field", ["future_return", "net_pnl", "__import__", "stock_code"])
 def test_rule_rejects_future_outcomes_or_executable_content(rule, field):
     rule["entry_all"][0]["field"] = field
