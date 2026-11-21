@@ -76,6 +76,7 @@ def market_db(monkeypatch):
     with engine.begin() as connection:
         for sql in (
             "CREATE TABLE si_trade_calendar (trade_date TEXT, trade_status INTEGER)",
+            "CREATE TABLE sm_market_overview_daily (trade_date TEXT PRIMARY KEY, up_cnt INTEGER, total INTEGER)",
             "CREATE TABLE sm_stock_kline (id INTEGER PRIMARY KEY, stock_code TEXT, short_name TEXT, trade_date TEXT, close REAL, "
             "pre_close REAL, amount REAL, turnover_ratio REAL, data_source TEXT, quality_status TEXT, "
             "permission_status TEXT, k_type INTEGER, adjust_type INTEGER, etl_sync_at TEXT, "
@@ -664,6 +665,61 @@ def test_slow_index_source_cannot_prevent_healthy_stock_read(market_db, monkeypa
     monkeypatch.setattr(market_home, "_live_quotes", quotes)
     monkeypatch.setattr(market_home, "read_live_indices", indices)
     market_home.build_market_board(DAY, now=datetime(2026,11,6,10))
+
+
+def test_board_breadth_history_excludes_current_and_future_sessions(market_db):
+    from time import monotonic
+    with market_db.begin() as connection:
+        connection.execute(text("""INSERT INTO sm_market_overview_daily VALUES
+            ('2026-11-04',1000,4000),('2026-11-05',3000,4000),
+            ('2026-11-06',4000,4000),('2026-11-09',0,4000),('2026-11-03',1,10)"""))
+    history = market_home._breadth_history(DAY_TEXT, monotonic()+5)
+    result = market_home._breadth_comparison(history, 20, 40)
+    assert result["heat_percentile"] == 50
+    assert result["heat_percentile_sample_count"] == 2
+    assert result["breadth_change_pp"] == -25
+    assert result["comparison_trade_date"] == "2026-11-05"
+    assert market_home._breadth_comparison([], 0, 40)["heat_percentile"] is None
+    assert market_home._breadth_comparison(history+history, 20, 40) == {}
+
+
+def test_concurrent_board_requests_share_one_real_capture(market_db, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier, Event
+    from time import sleep
+    with market_db.begin() as connection:
+        _stock(connection, "000001", 101)
+    original = market_home.build_market_board
+    entered, release, start = Event(), Event(), Barrier(8)
+    captures = []
+    def build(day, *, now):
+        captures.append(day)
+        entered.set()
+        assert release.wait(2)
+        return original(day, now=now)
+    monkeypatch.setattr(market_home, "build_market_board", build)
+    def request():
+        start.wait(timeout=2)
+        return market_home.market_board(DAY_TEXT)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        pending = [pool.submit(request) for _ in range(8)]
+        assert entered.wait(2)
+        sleep(0.05)
+        release.set()
+        results = [future.result(timeout=5) for future in pending]
+    assert captures == [DAY]
+    assert all(result == results[0] for result in results)
+    assert results[0]["sample_size"] == 1
+    assert DAY_TEXT not in market_home._board_inflight
+
+
+def test_board_reports_exact_quality_failure_without_hiding_healthy_sources(market_db, monkeypatch):
+    def reject(*args):
+        raise market_home.QualityGateError("snapshot_batch_mismatch", "batch differs")
+    monkeypatch.setattr(market_home, "_live_quotes", reject)
+    result = market_home.build_market_board(DAY, now=datetime(2026,11,6,10))
+    assert result["sample_size"] == 0
+    assert result["source_errors"]["quotes"] == {"type": "QualityGateError", "code": "snapshot_batch_mismatch"}
 
 
 @pytest.mark.parametrize("now", [datetime(2026, 11, 6, 12), datetime(2026, 11, 7)])

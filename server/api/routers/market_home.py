@@ -7,7 +7,7 @@ import math
 import re
 import sqlite3
 from collections import OrderedDict, defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from threading import Lock
@@ -90,6 +90,7 @@ _HEATMAP_CONCEPT_FLOW_SOURCE = "东财概念主力净流入"
 _HEATMAP_INDUSTRY_FLOW_SOURCE = "东财一级行业主力净流入"
 _cache: OrderedDict[str, tuple[float, dict]] = OrderedDict()
 _cache_lock = Lock()
+_board_inflight: dict[str, Future] = {}
 
 
 def _number(value):
@@ -640,6 +641,47 @@ def _close_volume_ratio(day: str, stocks: list[dict], now: datetime, deadline: f
     return {}
 
 
+def _breadth_history(day: str, deadline: float) -> list[dict]:
+    return _read(get_engine(), """
+        SELECT /*+ MAX_EXECUTION_TIME(1000) */ trade_date, up_cnt, total
+        FROM sm_market_overview_daily
+        WHERE trade_date < :day AND total >= 3000
+        ORDER BY trade_date DESC LIMIT 19
+    """, {"day": day}, deadline=deadline)
+
+
+def _breadth_comparison(history: list[dict], up: int, total: int) -> dict:
+    valid = []
+    seen = set()
+    for row in history:
+        count, size = _number(row.get("up_cnt")), _number(row.get("total"))
+        day = str(row.get("trade_date"))[:10]
+        if day in seen:
+            return {}
+        seen.add(day)
+        if (count is not None and size is not None and count.is_integer() and size.is_integer()
+                and 0 <= count <= size and size >= 3000):
+            valid.append((day, round(count / size * 1000)))
+    valid.sort(reverse=True)
+    current = round(up / total * 1000)
+    prior = [value for _, value in valid[:19]]
+    return {
+        "heat_status": "上涨少于四成" if current < 400 else "上涨多于六成" if current > 600 else "涨跌相对均衡",
+        "heat_percentile": round((sum(value < current for value in prior)
+                                  + sum(value == current for value in prior) / 2) / len(prior) * 100)
+                           if prior else None,
+        "heat_percentile_sample_count": len(prior),
+        "breadth_change_pp": round((current - prior[0]) / 10, 2) if prior else None,
+        "comparison_trade_date": valid[0][0] if valid else None,
+        "heat_percentile_method": "此前最多19个已存交易日的广度中位秩；不含当日 · sm_market_overview_daily",
+    }
+
+
+def _source_failure(exc: Exception) -> dict:
+    return {"type": type(exc).__name__,
+            "code": getattr(exc, "reason_code", None) or getattr(exc, "code", None) or type(exc).__name__}
+
+
 def _live_board_inputs(day: str, now: datetime, deadline: float) -> dict:
     started = monotonic()
     def observed_now():
@@ -650,15 +692,17 @@ def _live_board_inputs(day: str, now: datetime, deadline: float) -> dict:
         "turnover": (lambda: read_live_turnover(day, now=observed_now(), deadline=deadline), None),
         "limit_events": (lambda: _limit_up_events(date.fromisoformat(day), observed_now(), deadline), []),
         "radar_events": (lambda: _market_events(date.fromisoformat(day), observed_now(), deadline), []),
+        "breadth_history": (lambda: _breadth_history(day, deadline), []),
     }
-    result = {}
+    result = {"source_errors": {}}
     with ThreadPoolExecutor(max_workers=len(sources)) as pool:
         pending = {key: pool.submit(load) for key, (load, _) in sources.items()}
         for key, future in pending.items():
             try:
                 result[key] = future.result()
             except (OSError, sqlite3.Error, SQLAlchemyError, RuntimeError, TimeoutError, ValueError) as exc:
-                logger.warning("market board %s unavailable: %s", key, type(exc).__name__)
+                result["source_errors"][key] = _source_failure(exc)
+                logger.warning("market board %s unavailable: %s", key, result["source_errors"][key])
                 result[key] = sources[key][1]
     return result
 
@@ -678,6 +722,7 @@ def build_market_board(day: date, *, now: datetime) -> dict:
     live_turnover = None
     limit_ladder = None
     stocks, indices, events = [], [], []
+    history, source_errors = [], {}
     stage = "not_closed_or_not_trading"
     if close_ready or live or lunch:
         try:
@@ -690,6 +735,7 @@ def build_market_board(day: date, *, now: datetime) -> dict:
             close = datetime.combine(day, time(15))
             if live or lunch:
                 inputs = _live_board_inputs(day_text, now + timedelta(seconds=monotonic() - started_at), deadline)
+                history, source_errors = inputs["breadth_history"], inputs["source_errors"]
                 indices, live_turnover = inputs["indices"], inputs["turnover"]
                 events = sorted([*inputs["limit_events"], *inputs["radar_events"]],
                                 key=lambda row: _clock(row["snapshot_at"]), reverse=True)[:_EVENT_LIMIT]
@@ -704,6 +750,11 @@ def build_market_board(day: date, *, now: datetime) -> dict:
                         source = "sm_stock_current" if live or lunch else "sm_stock_kline"
                 except (SQLAlchemyError, RuntimeError, TimeoutError, ValueError, QualityGateError) as exc:
                     logger.warning("market board stock data unavailable: %s", type(exc).__name__)
+            if close_ready and stocks:
+                try:
+                    history = _breadth_history(day_text, deadline)
+                except (SQLAlchemyError, RuntimeError, TimeoutError, ValueError) as exc:
+                    source_errors["breadth_history"] = _source_failure(exc)
             # Shared current-table timestamps cannot attest index provenance.
             # Intraday observations above retain the direct provider identity.
             if close_ready:
@@ -777,11 +828,13 @@ def build_market_board(day: date, *, now: datetime) -> dict:
         as_of, source = _clock(live_turnover["as_of"]), live_turnover["source"]
     up = [row for row in return_stocks if row["change_pct"] > 0]
     down = [row for row in return_stocks if row["change_pct"] < 0]
+    small = [row for row in return_stocks if row["stock_code"].startswith(("002", "300", "301"))]
     status = "unavailable"
     if as_of:
         status = "partial" if unavailable or len(turnover_rows) != len(stocks) else "available"
     return {
         "status": status,
+        "source_errors": source_errors,
         "reason": None if as_of else stage,
         "requested_date": day_text, "trade_date": day_text if as_of else None,
         "as_of": _timestamp(as_of) if as_of else None, "source": source,
@@ -802,7 +855,12 @@ def build_market_board(day: date, *, now: datetime) -> dict:
             "flat_count": len(return_stocks)-len(up)-len(down),
             "total_amount": sum(row["amount"] for row in return_stocks)
                 if all(row["amount"] is not None for row in return_stocks) else None,
-            "heat_percentile_method": "当前核验行情样本；历史比较暂不可用",
+            **_breadth_comparison(history, len(up), len(return_stocks)),
+            "board_sample": {
+                "scope": "002 / 300 / 301 代码样本，不是中证1000成分股",
+                "count": len(small),
+                "change": sum(row["change_pct"] for row in small) / len(small) if small else None,
+            },
         } if return_stocks else None,
         "distribution": _distribution(return_stocks) if return_stocks else [],
         "strong": {"up_3pct": sum(row["change_pct"] >= 3 for row in up) if return_stocks else None,
@@ -840,12 +898,18 @@ def market_liquidity(requested: str = Query(alias="date", pattern=r"^\d{4}-\d{2}
     if selected != now.date() or not (_live_session(now) or time(11, 30) < now.time() < time(13)):
         return {"status": "not_intraday", "requested_date": requested}
     deadline = monotonic()+22
+    stage = "trading_calendar"
     try:
         if not _trading_day(requested, deadline):
             return {"status": "not_intraday", "requested_date": requested}
+        stage = "liquidity_snapshot"
         return read_live_liquidity(requested, now=now + timedelta(seconds=monotonic() - started), deadline=deadline)
-    except (OSError, sqlite3.Error, RuntimeError, TimeoutError, ValueError) as exc:
-        raise HTTPException(status_code=503, detail="intraday liquidity source unavailable; retry") from exc
+    except (OSError, sqlite3.Error, SQLAlchemyError, RuntimeError, TimeoutError, ValueError) as exc:
+        failure = {"stage": stage, **_source_failure(exc)}
+        if str(exc).startswith(("liquidity_live:", "DATA_BLOCKED:")):
+            failure["reason"] = str(exc)[:200]
+        logger.warning("intraday liquidity unavailable: %s", failure)
+        raise HTTPException(status_code=503, detail={"error": "intraday_liquidity_unavailable", **failure}) from exc
 
 
 @router.get("/monitor/board")
@@ -865,13 +929,30 @@ def market_board(requested: str = Query(alias="date", pattern=r"^\d{4}-\d{2}-\d{
             ttl = _CLOSED_CACHE_TTL if is_complete_close else _CACHE_TTL
             if monotonic() - captured < ttl and (not is_live or _fresh_live_stamp(_clock(board.get("as_of")), now)):
                 return board
-    result = build_market_board(selected_day, now=now)
-    with _cache_lock:
-        _cache[key] = (monotonic(), result)
-        _cache.move_to_end(key)
-        while len(_cache) > _CACHE_SIZE:
-            _cache.popitem(last=False)
-    return result
+        pending = _board_inflight.get(key)
+        owner = pending is None
+        if owner:
+            pending = _board_inflight[key] = Future()
+    if not owner:
+        try:
+            return pending.result(timeout=18)
+        except TimeoutError as exc:
+            raise HTTPException(status_code=503, detail="market board capture owner deadline exceeded") from exc
+    try:
+        result = build_market_board(selected_day, now=now)
+        with _cache_lock:
+            _cache[key] = (monotonic(), result)
+            _cache.move_to_end(key)
+            while len(_cache) > _CACHE_SIZE:
+                _cache.popitem(last=False)
+        pending.set_result(result)
+        return result
+    except BaseException as exc:
+        pending.set_exception(exc)
+        raise
+    finally:
+        with _cache_lock:
+            _board_inflight.pop(key, None)
 
 
 def _sector_rank(rows: list[dict], source: str) -> dict:
@@ -1063,7 +1144,11 @@ def _live_sector_metrics(result, changes, industry_changes, sessions, now):
     try:
         snapshots = read_live_boards(selected, now=now)
     except (OSError, sqlite3.Error, RuntimeError, TimeoutError, ValueError) as exc:
+        logger.warning("sector live capture unavailable: %s", exc)
         snapshots = {"error_3": str(exc), "error_2": str(exc)}
+    for kind in (3, 2):
+        if snapshots.get(f"error_{kind}"):
+            logger.warning("sector live kind=%s unavailable: %s", kind, snapshots[f"error_{kind}"])
     anchor = now
     if time(11, 30) < now.time() < time(13):
         anchor = now.replace(hour=11, minute=30, second=0, microsecond=0)

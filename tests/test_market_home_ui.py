@@ -111,15 +111,15 @@ const request = (url, timeout, options) => new Promise(resolve => calls.push({ur
     try {
         const old = page.load('2026-11-05', container, {request});
         const current = page.load('2026-11-06', container, {request});
-        const paths = ['/api/monitor/data', '/api/hot-data/market-trend', '/api/monitor/board', '/api/monitor/sector-heatmap', '/api/monitor/liquidity', '/api/monitor/events'];
+        const paths = ['/api/monitor/board', '/api/monitor/sector-heatmap', '/api/monitor/liquidity', '/api/monitor/events', '/api/hot-data/market-trend'];
         const expected = ['2026-11-05','2026-11-06'].flatMap(date => [
             ...paths.map(path => path + '?date=' + date), '/api/hot-data/daily-review-dates',
             '/api/scheduler/daily-delivery?trade_date=' + date + '&attempt_limit=12'
         ]);
         assert.deepEqual(calls.map(call => call.url), expected);
-        assert.ok(calls.every(call => call.timeout === (/sector-heatmap|liquidity/.test(call.url) ? 30000 : /monitor\/board/.test(call.url) ? 20000 : 15000) && call.options.cache === 'no-store'));
+        assert.ok(calls.every(call => call.timeout === (/market-trend|sector-heatmap|liquidity/.test(call.url) ? 30000 : /monitor\/board/.test(call.url) ? 20000 : 15000) && call.options.cache === 'no-store'));
         assert.equal(container.listeners.size, 3);
-        calls.slice(paths.length + 2).forEach(call => call.resolve({trade_date:'2026-11-06', data_source:'新日期来源'}));
+        calls.slice(paths.length + 2).forEach(call => call.resolve({status:'partial',trade_date:'2026-11-06',source:'新日期来源',as_of:'2026-11-06T10:30:00+08:00'}));
         await current;
         const listener = container.listeners.get('click');
         container.contains = target => Boolean(target);
@@ -127,7 +127,7 @@ const request = (url, timeout, options) => new Promise(resolve => calls.push({ur
         assert.match(container.innerHTML, /aria-pressed="true"[^>]*data-mh-heat-mode="concept:net_inflow"/);
         assert.match(container.innerHTML, /aria-pressed="true"[^>]*data-mh-heat-mode="industry:change"/);
         assert.equal(calls.length, expected.length);
-        calls.slice(0,paths.length + 2).forEach(call => call.resolve({trade_date:'2026-11-05', data_source:'旧日期来源'}));
+        calls.slice(0,paths.length + 2).forEach(call => call.resolve({status:'partial',trade_date:'2026-11-05',source:'旧日期来源',as_of:'2026-11-05T10:30:00+08:00'}));
         await old;
         assert.match(container.innerHTML, /新日期来源/);
         assert.doesNotMatch(container.innerHTML, /旧日期来源/);
@@ -370,5 +370,89 @@ const request=async url=>{
  assert.ok(html.includes('已取得行情2'));
  assert.ok(!html.includes('已取得行情1'));
  assert.ok(!html.includes('刷新失败'));
+}finally{page.stop();}})().catch(e=>{console.error(e);process.exitCode=1;});
+""")
+
+
+def test_live_cards_render_before_slow_reference_and_never_poll_full_plate_aggregate():
+    run_node(r"""
+global.document={activeElement:null,hidden:false};
+let tick;
+global.setTimeout=fn=>{tick=fn;return 1;};global.clearTimeout=()=>{};
+const date='2026-11-20', calls=[];
+const container={innerHTML:'',contains:()=>false,addEventListener:()=>{},removeEventListener:()=>{}};
+const clock={is_intraday:true,active_trade_date:date,today:date};
+const request=url=>new Promise(resolve=>calls.push({url,resolve}));
+(async()=>{try{
+ const loading=page.load(date,container,{request,clock:()=>clock});
+ const value={status:'available',trade_date:date,as_of:date+'T10:30:00+08:00',source:'当前核验行情',
+  market_overview:{trade_date:date,up_count:6,flat_count:1,down_count:3,total_count:10,data_source:'当前核验行情'}};
+ calls.slice(0,4).forEach(call=>call.resolve(value));
+ await new Promise(resolve=>setImmediate(resolve));
+ assert.ok(container.innerHTML.includes('当前核验行情'));
+ assert.ok(container.innerHTML.includes('上涨占比 60.0%'),'slow history hid the current stock snapshot');
+ assert.ok(!calls.some(call=>call.url.includes('/monitor/data')));
+ calls.slice(4).forEach(call=>call.resolve({}));await loading;
+ calls.length=0;
+ const refreshing=tick();await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(calls.length,4);
+ assert.ok(!calls.some(call=>/market-trend|daily-review|daily-delivery|monitor\/data/.test(call.url)));
+ calls.forEach(call=>call.resolve(value));await refreshing;
+}finally{page.stop();}})().catch(e=>{console.error(e);process.exitCode=1;});
+""")
+
+
+def test_partial_http_200_cannot_erase_observed_rankings_or_relabel_old_timestamp():
+    run_node(r"""
+global.document={activeElement:null,hidden:false};let tick, partial=false;
+global.setTimeout=fn=>{tick=fn;return 1;};global.clearTimeout=()=>{};
+const date='2026-11-20';
+const container={innerHTML:'',contains:()=>false,addEventListener:()=>{},removeEventListener:()=>{}};
+const request=async url=>url.includes('/monitor/board') ? partial ?
+ {status:'partial',trade_date:date,as_of:date+'T10:30:20+08:00',unavailable_fields:['rankings.gainers'],rankings:{gainers:[]}} :
+ {status:'partial',trade_date:date,as_of:date+'T10:30:00+08:00',unavailable_fields:[],
+  rankings:{gainers:[{stock_code:'600001',short_name:'已核验股票',trade_date:date,change_pct:3}]}} : {};
+(async()=>{try{
+ await page.load(date,container,{request,clock:()=>({is_intraday:true,active_trade_date:date})});
+ partial=true;await tick();
+ assert.ok(container.innerHTML.includes('已核验股票'));
+ assert.ok(container.innerHTML.includes('刷新失败'));
+ assert.ok(container.innerHTML.includes('上次观测'));
+ assert.ok(container.innerHTML.includes('10:30:00'));
+ const ranking=container.innerHTML.split('<h3>涨幅榜</h3>')[1].split('</section>')[0];
+ assert.ok(ranking.includes('10:30:00'));
+ assert.ok(!ranking.includes('10:30:20'),'old rows were relabelled with the failed new observation time');
+}finally{page.stop();}})().catch(e=>{console.error(e);process.exitCode=1;});
+""")
+
+
+def test_failed_index_and_industry_do_not_block_new_stock_and_concept_observations():
+    run_node(r"""
+global.document={activeElement:null,hidden:false};let tick, version=1;
+global.setTimeout=fn=>{tick=fn;return 1;};global.clearTimeout=()=>{};
+const date='2026-11-20';
+const container={innerHTML:'',contains:()=>false,addEventListener:()=>{},removeEventListener:()=>{}};
+const metric=(name,stamp)=>({status:'available',note:name,as_of:date+' '+stamp,rows:[{code:'BK0001',name,value:1,source:name}]});
+const request=async url=>{
+ if(url.includes('/monitor/board'))return {status:'partial',trade_date:date,as_of:date+'T10:30:0'+version+'+08:00',
+  unavailable_fields:version===1?[]:['indices'],rankings:{gainers:[{stock_code:'600001',short_name:'当前股票'+version,trade_date:date,change_pct:version}]},
+  indices:version===1?[{index_code:'000001',trade_date:date,price:3999,as_of:date+'T10:30:01+08:00',source:'公开指数'}]:[]};
+ if(url.includes('/monitor/sector-heatmap'))return {requested_date:date,trade_date:date,
+  concept:{change:metric('当前概念'+version,'10:30:0'+version)},
+  industry:{change:version===1?metric('原行业观测','10:30:01'):{status:'unavailable',rows:[]}}};
+ return {};
+};
+(async()=>{try{
+ await page.load(date,container,{request,clock:()=>({is_intraday:true,active_trade_date:date})});
+ version=2;await tick();
+ assert.ok(container.innerHTML.includes('当前股票2'));
+ assert.ok(!container.innerHTML.includes('当前股票1'));
+ assert.ok(container.innerHTML.includes('当前概念2'));
+ assert.ok(container.innerHTML.includes('原行业观测'));
+ assert.ok(container.innerHTML.includes('3,999.00'));
+ const industry=container.innerHTML.split('<h3>行业热度</h3>')[1].split('</section>')[0];
+ assert.ok(industry.includes('上次观测'));
+ assert.ok(industry.includes('10:30:01'));
+ assert.ok(!industry.includes('10:30:02'));
 }finally{page.stop();}})().catch(e=>{console.error(e);process.exitCode=1;});
 """)
