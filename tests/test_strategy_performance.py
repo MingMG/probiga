@@ -78,6 +78,27 @@ def test_blocked_research_preserves_missing_dates_and_unknown_pnl():
     assert not r["rank_eligible"]
 
 
+def test_subset_research_has_its_own_rank_and_never_claims_full_strategy_return():
+    p = {"rule_hash": "abc", "strategy_key": "new", "version": "v1", "name": "新策略",
+         "validation": {"status": "PARTIAL", "source_input_sha256": "common", "dataset_sha256": "per-rule",
+             "sessions": ["2026-07-01", "2026-07-02"], "report": {"status": "PARTIAL",
+                 "initial_cash_cny": 1000, "return_scope": "VERIFIED_INPUT_SUBSET", "net_return_pct": None,
+                 "verified_input_subset_return_pct": 5, "fees": {"kind": "ESTIMATE"},
+                 "completed_trade_count": 1, "trades": [{"net_pnl_cny": 50, "estimated_fee_cny": 5}],
+                 "nav": [{"nav_cny": 1000}, {"nav_cny": 1050}], "execution_mode": "MODELED_DAILY_BAR"}}}
+    r = _research({"run_id": "run"}, p)
+    assert r["net_return_pct"] is None and r["net_profit_cny"] is None
+    assert r["verified_input_subset_return_pct"] == 5 and r["verified_input_subset_profit_cny"] == 50
+    other = copy.deepcopy(p)
+    other["strategy_key"] = "other"
+    other["validation"]["dataset_sha256"] = "different-rule-signals"
+    other["validation"]["report"]["verified_input_subset_return_pct"] = -1
+    groups = rank_results([r, _research({"run_id": "run"}, other)])
+    assert len(groups) == 1 and len(groups[0]["rows"]) == 2
+    assert groups[0]["cohort"]["return_scope"] == "VERIFIED_INPUT_SUBSET"
+    assert groups[0]["rows"][0]["strategy_key"] == "new"
+
+
 def test_actual_sql_trade_pagination_and_coverage():
     engine = create_engine("sqlite://")
     raw = formal_row()

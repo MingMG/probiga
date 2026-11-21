@@ -29,7 +29,7 @@ def _partitions(connection, state, proposal, kind):
     rows = connection.execute(text("""
         SELECT /*+ MAX_EXECUTION_TIME(4000) */ payload_json,audit_hash,after_json
         FROM st_strategy_governance_audit WHERE entity_type=:entity AND entity_key LIKE :prefix
-        ORDER BY entity_key LIMIT 150
+        ORDER BY entity_key LIMIT 256
     """), {"entity": PART_ENTITY, "prefix": prefix}).mappings().all()
     parts = {}
     for row in rows:
@@ -122,7 +122,7 @@ def run_rule_backtest(connection, state, proposal, *, inventory):
             from server.engine.strategy_rule_replay import replay_rule
             signals = [signal for part in selected.values() for signal in part["signals"]]
             bars = [bar for part in priced.values() for bar in part["bars"]]
-            report = replay_rule(proposal["rule"], signals, bars, result["price_sessions"])
+            report = replay_rule(proposal["rule"], signals, bars, result["price_sessions"], evaluation_start=result["sessions"][0])
             result.update(status=report["status"], phase="FINISHED", report=report,
                           reason="历史诊断已完成，前向证据待积累" if report["status"] == "COMPLETE" else "历史诊断的成交或估值证据存在缺口",
                           dataset_sha256=canonical_sha256({"features": selected, "prices": priced}))

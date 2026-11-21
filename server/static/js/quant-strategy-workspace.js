@@ -5,7 +5,7 @@
     const metric = (v, suffix='') => number(v) === null ? '未知' : Number(v).toFixed(2)+suffix;
     const stages = {SHADOW:'影子观察',CANDIDATE:'待晋级',ACTIVE:'正式',PAUSED:'暂停',RETIRED:'已淘汰',FORMAL:'正式'};
     const stateNames = {strong_trend:'强趋势',low_range:'低位震荡',high_range:'高位震荡',extreme_event:'极端事件'};
-    const researchStates={NOT_STARTED:'待处理',RUNNING:'进行中',COMPLETE:'已处理',BLOCKED:'待补齐证据',FAILED:'失败',AWAITING_EVALUATION:'等待日评估与影子执行',OBSERVED:'已有验证交易样本'};
+    const researchStates={NOT_STARTED:'待处理',RUNNING:'进行中',COMPLETE:'已处理',BLOCKED:'待补齐证据',PARTIAL:'已回放 · 输入部分可用',FAILED:'失败',AWAITING_EVALUATION:'等待日评估与影子执行',OBSERVED:'已有验证交易样本'};
     const featureNames={change_pct:'当日涨跌幅',previous_change_pct:'前一日涨跌幅',pct_5:'5日涨幅',pct_20:'20日涨幅',dist_ma20:'距20日均线',drawdown_60:'60日回撤',from_low_60:'距60日低点涨幅',amount_ratio_20:'成交额相对20日均值',amount_ratio_5:'成交额相对5日均值',close_location_value:'收盘位置',volatility_20:'20日波动',turnover_ratio:'换手率',capital_score:'资金分',technical_score:'技术分',sector_rotation_score:'板块轮动分',ultra_short_score:'超短分',short_term_score:'短线分',swing_score:'波段分',main_wave_score:'主升分',relative_change_pct:'相对市场当日强度',relative_20d_pct:'相对市场20日强度',sector_breadth_pct:'行业上涨宽度',sector_change_pct:'行业平均涨幅',sector_strength_percentile:'行业内强度百分位',sector_top3_amount_pct:'行业前三成交集中度',market_change_pct:'市场平均涨幅',market_breadth_pct:'市场上涨宽度',market_return_20d_pct:'市场20日平均涨幅'};
     const conditionsText=list=>(list||[]).map(c=>(featureNames[c.field]||c.field)+' '+({gt:'>',gte:'≥',lt:'<',lte:'≤'}[c.op]||c.op)+' '+c.value).join('；')||'无附加条件';
     function researchView(research) {
@@ -31,8 +31,10 @@
         if((research.runs||[]).length>1)h+='<details data-qsw-key="research-history"><summary>历史研究批次</summary><ul>'+research.runs.slice(1).map(r=>'<li>'+esc(r.trade_date+' · '+(researchStates[r.status]||r.status)+' · '+(r.proposals||[]).map(p=>p.name).join('、'))+'</li>').join('')+'</ul></details>';
         return h+'</section>';
     }
+    const resultReturn = r => r.return_scope==='VERIFIED_INPUT_SUBSET'?r.verified_input_subset_return_pct:r.net_return_pct;
+    const resultProfit = r => r.return_scope==='VERIFIED_INPUT_SUBSET'?r.verified_input_subset_profit_cny:r.net_profit_cny;
     function resultTable(rows, ranked) {
-        return '<div class="qsw-result-scroll"><table><thead><tr>'+['排名 / 策略版本','回测区间','账户累计收益','账户净盈利','已平仓笔数','胜率','最大回撤','结果'].map(x=>'<th>'+x+'</th>').join('')+'</tr></thead><tbody>'+rows.map(r=>'<tr><td>'+esc(ranked?r.rank:'—')+' · '+esc(r.strategy_name||r.strategy_key||r.reported_strategy_key||'历史策略')+'<small>'+esc(r.strategy_version)+'</small></td><td>'+esc(r.start_date||'未知')+' 至 '+esc(r.end_date||'未知')+'</td><td>'+metric(r.net_return_pct,'%')+'</td><td>'+metric(r.net_profit_cny,'元')+'</td><td>'+esc(r.completed_trades==null?'未知':r.completed_trades)+'</td><td>'+metric(r.win_rate_pct,'%')+'</td><td>'+metric(r.max_drawdown_pct,'%')+'</td><td><button type="button" data-qsw-result="'+esc(r.result_id)+'">明细与证据</button><small>'+esc(r.reason)+'</small></td></tr>').join('')+'</tbody></table></div>';
+        return '<div class="qsw-result-scroll"><table><thead><tr>'+['排名 / 策略版本','回测区间','账户累计收益','账户净盈利','已平仓笔数','胜率','最大回撤','结果'].map(x=>'<th>'+x+'</th>').join('')+'</tr></thead><tbody>'+rows.map(r=>'<tr><td>'+esc(ranked?r.rank:'—')+' · '+esc(r.strategy_name||r.strategy_key||r.reported_strategy_key||'历史策略')+'<small>'+esc(r.strategy_version)+'</small>'+(r.return_scope==='VERIFIED_INPUT_SUBSET'?'<small>可用输入子集 · 非完整策略收益</small>':'')+'</td><td>'+esc(r.start_date||'未知')+' 至 '+esc(r.end_date||'未知')+'</td><td>'+metric(resultReturn(r),'%')+'</td><td>'+metric(resultProfit(r),'元')+'</td><td>'+esc(r.completed_trades==null?'未知':r.completed_trades)+'</td><td>'+metric(r.win_rate_pct,'%')+'</td><td>'+metric(r.max_drawdown_pct,'%')+'</td><td><button type="button" data-qsw-result="'+esc(r.result_id)+'">明细与证据</button><small>'+esc(r.reason)+'</small></td></tr>').join('')+'</tbody></table></div>';
     }
     function performanceView(s) {
         const d=s.performance;
@@ -42,21 +44,23 @@
         Object.values(d.sources||{}).filter(x=>x.status==='FAILED').forEach(x=>{h+='<p class="qsw-error">'+esc(x.reason)+'</p>';});
         h+='<p>'+esc(d.method)+'</p><h4>累计收益排名</h4>';
         if(!(d.leaderboards||[]).length)h+='<p class="qsw-warning">当前没有满足版本绑定及可比口径的完整回测结果，暂不能给出赚钱排名。历史报告及全部策略的进度在下方保留。</p>';
-        (d.leaderboards||[]).forEach(g=>{h+='<p>同组 '+esc(g.rows.length)+' 个版本 · '+esc(g.cohort.start_date)+' 至 '+esc(g.cohort.end_date)+' · 初始资金 '+metric(g.cohort.initial_cash_cny,'元')+(g.rows[0].kind==='MODEL_RULE_RETROSPECTIVE'?' · 模型规则事后研究，非独立样本外结果':' · 历史回测')+'</p>'+resultTable(g.rows,true);});
+        (d.leaderboards||[]).forEach(g=>{h+='<p>'+esc(g.cohort.return_scope==='VERIFIED_INPUT_SUBSET'?'可用输入子集研究排名':'完整输入回测排名')+' · 同组 '+esc(g.rows.length)+' 个版本 · '+esc(g.cohort.start_date)+' 至 '+esc(g.cohort.end_date)+' · 初始资金 '+metric(g.cohort.initial_cash_cny,'元')+(g.rows[0].kind==='MODEL_RULE_RETROSPECTIVE'?' · 模型规则事后研究，非独立样本外结果':' · 历史回测')+'</p>'+resultTable(g.rows,true);});
         h+='<details data-qsw-key="backtest-coverage" open><summary>全部 '+esc(d.strategies.length)+' 个当前策略的回测进度</summary><div class="qsw-result-scroll"><table><thead><tr><th>策略 / 版本</th><th>回测状态与缺口</th><th>结果</th></tr></thead><tbody>'+d.strategies.map(r=>'<tr><td>'+esc(r.strategy_name)+'<small>'+esc(r.strategy_version)+'</small></td><td>'+esc(researchStates[r.backtest_status]||r.backtest_status)+'<small>'+esc(r.reason)+'</small></td><td>'+(r.result_id?'<button type="button" data-qsw-result="'+esc(r.result_id)+'">查看验证进度</button>':'等待当前版本回测')+'</td></tr>').join('')+'</tbody></table></div></details>';
         h+='<details data-qsw-key="backtest-archive"><summary>全部历史报告与研究回放（'+esc(d.results.length)+' 份）</summary><p>旧版本和身份未完整绑定的存档均保留原标记，不计入当前策略收益。</p>'+resultTable(d.results,false)+(d.history_limit_reached?'<p>此处展示最近100份正式回测；更早结果请在回测结果页查询。</p>':'')+'</details>';
         if(s.resultLoading)h+='<p role="status">正在读取交易明细…</p>';
         if(s.resultError)h+='<p class="qsw-error">'+esc(s.resultError)+'</p>';
         const x=s.resultDetail;
         if(x){const r=x.summary;
-            h+='<article class="qsw-result-detail"><h4>'+esc(r.strategy_name||r.strategy_key||r.reported_strategy_key||'历史报告')+' · 交易明细与证据</h4><p>'+esc(r.strategy_version)+' · '+esc(r.reason)+'</p><p>账户累计收益 '+metric(r.net_return_pct,'%')+'；账户净盈利 '+metric(r.net_profit_cny,'元')+'；已平仓交易净盈利 '+metric(r.closed_trade_net_pnl_cny,'元')+'。费用属于原回测假设，真实成交另行验证。</p>';
+            h+='<article class="qsw-result-detail"><h4>'+esc(r.strategy_name||r.strategy_key||r.reported_strategy_key||'历史报告')+' · 交易明细与证据</h4><p>'+esc(r.strategy_version)+' · '+esc(r.reason)+'</p><p>账户累计收益 '+metric(resultReturn(r),'%')+'；账户净盈利 '+metric(resultProfit(r),'元')+'；已平仓交易净盈利 '+metric(r.closed_trade_net_pnl_cny,'元')+'。费用属于原回测假设，真实成交另行验证。</p>';
             if(r.available_feature_sessions!=null)h+='<p>历史冻结特征 '+esc(r.available_feature_sessions)+' / '+esc(r.required_sessions)+' 日。'+esc((x.missing_feature_dates||[]).length)+' 日缺失。</p><details data-qsw-key="missing-'+esc(r.result_id)+'"><summary>缺失交易日</summary><p>'+esc((x.missing_feature_dates||[]).join('、'))+'</p></details>';
+            if(r.return_scope==='VERIFIED_INPUT_SUBSET')h+='<p class="qsw-warning">上面的收益仅为可用输入子集回放；精确日期身份覆盖 '+esc(r.identity_covered_sessions)+' 个交易日，排除 '+esc(r.input_exclusion_count)+' 次证据不足的拟入场，不能代表完整策略收益。</p>';
+            if(r.replay_run_id)h+='<p>实际回测身份 '+esc(r.replay_run_id)+'</p>';
             if(r.total_units!=null)h+='<p>分区进度 '+esc(r.completed_units)+' / '+esc(r.total_units)+'</p>';
             h+='<p>结果哈希 '+esc(r.result_hash||r.cohort?.dataset_sha256||'尚无完整结果')+'；'+esc(r.identity_verified?'策略身份已绑定':'策略身份未完整绑定')+'。'+(x.trade_coverage_matches===false?'交易明细数量与报告不一致，需核对。':'')+'</p>';
             if(x.trades.length)h+='<div class="qsw-result-scroll"><table><thead><tr><th>股票</th><th>买入</th><th>卖出</th><th>数量</th><th>买卖金额</th><th>费用</th><th>扣费净盈亏</th></tr></thead><tbody>'+x.trades.map(t=>'<tr><td><button type="button" data-qsw-stock="'+esc(t.stock_code)+'">'+esc(t.stock_code)+'</button></td><td>'+esc(t.entry_date||t.entry_at)+'</td><td>'+esc(t.exit_date||t.exit_at||'未退出')+'</td><td>'+esc(t.quantity)+'</td><td>'+metric(t.buy_fill_amount??(number(t.entry_price)!==null?Number(t.entry_price)*Number(t.quantity):null))+' / '+metric(t.sell_fill_amount??(number(t.exit_price)!==null?Number(t.exit_price)*Number(t.quantity):null))+'</td><td>'+metric(t.estimated_fee_cny??(number(t.buy_fees)!==null&&number(t.sell_fees)!==null?Number(t.buy_fees)+Number(t.sell_fees):null),'元')+'</td><td>'+metric(t.trade_net_pnl??t.net_pnl_cny,'元')+'</td></tr>').join('')+'</tbody></table></div>';
             else h+='<p>尚无可展示的已完成交易明细。</p>';
             if(x.trade_count!=null)h+='<p>交易 '+esc(x.offset+(x.trades.length?1:0))+'—'+esc(x.offset+x.trades.length)+' / '+esc(x.trade_count)+' 笔 '+(x.offset>0?'<button type="button" data-qsw-result="'+esc(r.result_id)+'" data-qsw-offset="'+Math.max(0,x.offset-x.limit)+'">上一页</button>':'')+' '+(x.offset+x.limit<x.trade_count?'<button type="button" data-qsw-result="'+esc(r.result_id)+'" data-qsw-offset="'+(x.offset+x.limit)+'">下一页</button>':'')+'</p>';
-            if(x.dispositions?.length)h+='<details data-qsw-key="dispositions"><summary>未成交与证据缺口</summary><ul>'+x.dispositions.map(t=>'<li>'+esc([t.stock_code,t.trade_date,t.status,t.reason].filter(Boolean).join(' · '))+'</li>').join('')+'</ul></details>';
+            if(x.dispositions?.length)h+='<details data-qsw-key="dispositions"><summary>未成交与证据缺口（最多展示前100项）</summary><ul>'+x.dispositions.map(t=>'<li>'+esc([t.stock_code,t.trade_date,t.status,t.reason].filter(Boolean).join(' · '))+'</li>').join('')+'</ul></details>';
             h+='</article>';
         }
         return h+'</section>';
@@ -135,7 +139,17 @@
             performanceBusy=true;
             try{const d=await request('/api/quant-workbench/strategy-performance?trade_date='+encodeURIComponent(day),20000,{cache:'no-store'});
                 if(!mount.isConnected)return;
+                const activeId=s.resultDetail?.summary?.result_id;
+                const before=(s.performance?.results||[]).find(r=>r.result_id===activeId);
+                const after=(d.results||[]).find(r=>r.result_id===activeId);
                 const version=JSON.stringify(d);if(version!==s.performanceVersion||s.performanceError){s.performance=d;s.performanceVersion=version;s.performanceError='';if(s.data)paint(s);}
+                if(activeId&&after&&JSON.stringify(before)!==JSON.stringify(after)&&!s.resultLoading){
+                    s.resultLoading=true;
+                    try{const detail=await request('/api/quant-workbench/strategy-performance/'+encodeURIComponent(activeId)+'?offset='+(s.resultDetail.offset||0),20000,{cache:'no-store'});
+                        if(mount.isConnected&&s.resultDetail?.summary?.result_id===activeId){s.resultDetail=detail;s.resultError='';}}
+                    catch(e){s.resultError='交易明细更新失败：'+(e.message||e);}
+                    finally{s.resultLoading=false;if(mount.isConnected&&s.data)paint(s);}
+                }
             }catch(e){s.performanceError='回测结果读取失败：'+(e.message||e);if(s.data&&mount.isConnected)paint(s);}
             finally{performanceBusy=false;if(mount.isConnected)setTimeout(refreshPerformance,20000);}
         }
