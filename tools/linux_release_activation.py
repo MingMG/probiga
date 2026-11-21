@@ -34,6 +34,7 @@ FILES = (
     "/etc/systemd/system/probiga-ai-recommendation-worker.service.d/release-runtime.conf",
 )
 LINK = "/opt/ProBigA-current"
+NGINX_CONFIG = "/etc/nginx/conf.d/probiga.conf"
 JOURNAL = "/var/lib/probiga/linux-activation/transaction.json"
 
 
@@ -49,6 +50,31 @@ def checked_sha(value):
     if not isinstance(value, str) or not SHA.fullmatch(value) or value == "0" * 40:
         raise ActivationError("invalid_build_identity")
     return value
+
+
+def websocket_proxy_config(data):
+    """Clone the existing API location's policies for the one stream endpoint."""
+    value = data.decode("utf-8")
+    marker = r"(?ms)^[ \t]*# BEGIN PROBIGA MARKET STREAM\n.*?^[ \t]*# END PROBIGA MARKET STREAM\n"
+    value, removed = re.subn(marker, "", value)
+    if removed > 1 or re.search(r"location\s+=?\s*/api/monitor/stream\b", value):
+        raise ActivationError("unmanaged_market_stream_proxy")
+    locations = list(re.finditer(r"(?ms)^(?P<i>[ \t]*)location /api/\s*\{(?P<body>.*?)^(?P=i)\}", value))
+    if len(locations) != 1:
+        raise ActivationError("api_proxy_location_identity_differs")
+    match = locations[0]
+    body, indent = match["body"], match["i"]
+    if not re.search(r"proxy_pass\s+http://127\.0\.0\.1:8000\s*;", body):
+        raise ActivationError("api_proxy_upstream_identity_differs")
+    body = re.sub(r"(?m)^[ \t]*(?:proxy_http_version|proxy_read_timeout|proxy_send_timeout|proxy_buffering)\b[^;]*;[^\n]*\n", "", body)
+    body = re.sub(r"(?mi)^[ \t]*proxy_set_header\s+(?:Upgrade|Connection)\b[^;]*;[^\n]*\n", "", body)
+    additions = "\n".join(indent+"    "+line for line in (
+        "proxy_http_version 1.1;", "proxy_set_header Upgrade $http_upgrade;",
+        'proxy_set_header Connection "upgrade";', "proxy_read_timeout 75s;",
+        "proxy_send_timeout 15s;", "proxy_buffering off;"))
+    block = (indent+"# BEGIN PROBIGA MARKET STREAM\n"+indent+"location = /api/monitor/stream {"
+             +body.rstrip()+"\n"+additions+"\n"+indent+"}\n"+indent+"# END PROBIGA MARKET STREAM\n")
+    return (value[:match.start()]+block+value[match.start():]).encode("utf-8")
 
 
 class Filesystem:
@@ -426,7 +452,7 @@ class Activation:
             raise ActivationError("invalid_activation_seal")
         for key in ("previous_sha", "target_sha"):
             checked_sha(value[key])
-        expected_paths = {*FILES, LINK, self.receipt(value["target_sha"])}
+        expected_paths = {*FILES, NGINX_CONFIG, LINK, self.receipt(value["target_sha"])}
         if set(value["old_files"]) != expected_paths or set(value["new_files"]) != expected_paths:
             raise ActivationError("invalid_activation_paths")
         if not set(UNITS) <= set(value["units"]) <= set((*UNITS, *AI_UNITS)):
@@ -510,7 +536,7 @@ class Activation:
                 or any(target[key] != previous[key] for key in
                        ("windows_build_sha", "contract_build_sha"))):
             raise ActivationError("linux_contract_differs")
-        old_files = {name: self.fs.snapshot(name) for name in (*FILES, LINK, self.receipt(target_sha))}
+        old_files = {name: self.fs.snapshot(name) for name in (*FILES, NGINX_CONFIG, LINK, self.receipt(target_sha))}
         if old_files[LINK] != {"kind": "link", "target": f"/opt/ProBigA-releases/{previous_sha}"}:
             raise ActivationError("previous_current_link_differs")
         new_files = {}
@@ -531,6 +557,10 @@ class Activation:
                 if marker not in data or f"PROBIGA_EXPECTED_GIT_SHA={target_sha}".encode() not in data:
                     raise ActivationError("prepared_unit_identity_differs")
             new_files[name] = {"kind": "file", "mode": 0o644, "data": base64.b64encode(data).decode()}
+        if old_files[NGINX_CONFIG]["kind"] != "file":
+            raise ActivationError("api_proxy_configuration_missing")
+        new_files[NGINX_CONFIG] = {**old_files[NGINX_CONFIG], "data": base64.b64encode(
+            websocket_proxy_config(self.fs.read(NGINX_CONFIG))).decode()}
         new_files[LINK] = {"kind": "link", "target": f"/opt/ProBigA-releases/{target_sha}"}
         receipt = {
             "schema": SCHEMA,
@@ -563,7 +593,7 @@ class Activation:
         try:
             self.save(value, "ACTIVATING")
             self.services.stop(units)
-            for name in (*FILES, LINK):
+            for name in (*FILES, NGINX_CONFIG, LINK):
                 self.fs.restore(name, new_files[name])
             self.services.reload_static()
             self.services.start(units, original=False)

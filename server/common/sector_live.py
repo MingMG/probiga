@@ -1,6 +1,6 @@
-"""Bounded, demand-driven Eastmoney board observations for the Linux dashboard.
+"""Bounded, background-owned Eastmoney board observations for the Linux dashboard.
 
-The visible dashboard renews these complete bulk snapshots every 20 seconds. They
+The supervised dashboard producer renews these complete bulk snapshots every 20 seconds. They
 are private observations, never published as completed daily acquisition rows.
 """
 from __future__ import annotations

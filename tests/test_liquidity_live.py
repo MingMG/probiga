@@ -19,7 +19,7 @@ def rows(stamp=NOW, count=20):
 def test_liquidity_full_source_capture_is_durable_and_reused(tmp_path, monkeypatch):
     monkeypatch.setenv("PROBIGA_JOB_LOG_ROOT", str(tmp_path))
     calls = []
-    def fetch(deadline):
+    def fetch(deadline, **kwargs):
         calls.append(deadline)
         return rows()
     monkeypatch.setattr(liquidity_live, "_fetch", fetch)
@@ -65,12 +65,13 @@ def test_liquidity_uses_time_after_waiting_for_capture_owner(tmp_path, monkeypat
     monkeypatch.setenv("PROBIGA_JOB_LOG_ROOT", str(tmp_path))
     monkeypatch.setattr(liquidity_live, "_LOCK", Owner())
     monkeypatch.setattr(liquidity_live, "monotonic", lambda: elapsed)
-    monkeypatch.setattr(liquidity_live, "_fetch", lambda deadline: rows(NOW+timedelta(seconds=8)))
+    monkeypatch.setattr(liquidity_live, "_fetch", lambda deadline, **kwargs: rows(NOW+timedelta(seconds=8)))
     result = liquidity_live.read_live_liquidity(DAY, now=NOW, deadline=22)
     assert result["dated_quote_count"] == 20
 
 
-def test_bulk_capture_requires_complete_unique_pagination(monkeypatch):
+def test_bulk_capture_requires_complete_unique_pagination(tmp_path, monkeypatch):
+    monkeypatch.setenv("PROBIGA_JOB_LOG_ROOT", str(tmp_path))
     calls = []
     def request(url, params, **kwargs):
         calls.append(params["pn"])
@@ -78,14 +79,35 @@ def test_bulk_capture_requires_complete_unique_pagination(monkeypatch):
         data = [{"f12": f"{i:06d}"} for i in range(start, start+100)]
         return {"rc": 0, "data": {"total": 3000, "diff": data}}
     monkeypatch.setattr(liquidity_live, "_resolved_curl_json", request)
-    assert len(liquidity_live._fetch(monotonic()+22)) == 3000
+    assert len(liquidity_live._fetch(monotonic()+22, selected=DAY, now=NOW)) == 3000
     assert sorted(calls) == list(range(1, 31))
 
     def duplicate(url, params, **kwargs):
         return {"rc": 0, "data": {"total": 3000, "diff": [{"f12": f"{i:06d}"} for i in range(100)]}}
     monkeypatch.setattr(liquidity_live, "_resolved_curl_json", duplicate)
     with pytest.raises(ValueError, match="duplicate"):
-        liquidity_live._fetch(monotonic()+22)
+        liquidity_live._fetch(monotonic()+22, selected=DAY, now=NOW)
+
+
+def test_bulk_failure_resumes_only_missing_pages(tmp_path, monkeypatch):
+    monkeypatch.setenv("PROBIGA_JOB_LOG_ROOT", str(tmp_path))
+    calls, fail = [], True
+    def request(url, params, **kwargs):
+        number = params["pn"]
+        calls.append(number)
+        if number == 9 and fail:
+            raise TimeoutError("source page deadline")
+        start = (number-1)*100
+        return {"rc": 0, "data": {"total": 3000, "diff": [{"f12": f"{i:06d}"} for i in range(start, start+100)]}}
+    monkeypatch.setattr(liquidity_live, "_resolved_curl_json", request)
+    with pytest.raises(RuntimeError, match="missing pages.*9"):
+        liquidity_live._fetch(monotonic()+22, selected=DAY, now=NOW)
+    assert calls.count(9) == 2
+    fail = False
+    calls.clear()
+    result = liquidity_live._fetch(monotonic()+22, selected=DAY, now=NOW+timedelta(seconds=2))
+    assert sorted(calls) == [1, 9]
+    assert len(result) == 3000
 
 
 def test_liquidity_route_binds_intraday_requests_to_exact_session(monkeypatch):
@@ -97,8 +119,8 @@ def test_liquidity_route_binds_intraday_requests_to_exact_session(monkeypatch):
     monkeypatch.setattr(market_home, "datetime", Clock)
     monkeypatch.setattr(market_home, "_trading_day", lambda *_: True)
     monkeypatch.setattr(market_home, "read_live_liquidity", lambda selected, **kwargs: {"trade_date": selected, "status": "available"})
-    assert market_home.market_liquidity(DAY)["trade_date"] == DAY
-    assert market_home.market_liquidity("2026-11-18")["status"] == "not_intraday"
+    assert market_home._capture_liquidity(DAY)["trade_date"] == DAY
+    assert market_home._capture_liquidity("2026-11-18")["status"] == "not_intraday"
 
 
 def test_liquidity_failure_preserves_the_failed_stage_and_safe_source_reason(monkeypatch):
@@ -114,7 +136,7 @@ def test_liquidity_failure_preserves_the_failed_stage_and_safe_source_reason(mon
         raise ValueError("liquidity_live: insufficient current-session source coverage")
     monkeypatch.setattr(market_home, "read_live_liquidity", failed)
     with pytest.raises(HTTPException) as error:
-        market_home.market_liquidity(DAY)
+        market_home._capture_liquidity(DAY)
     assert error.value.status_code == 503
     assert error.value.detail["stage"] == "liquidity_snapshot"
     assert error.value.detail["reason"] == "liquidity_live: insufficient current-session source coverage"

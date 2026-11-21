@@ -1,0 +1,7 @@
+{
+  "private": true,
+  "description": "DOM regression checks for the market dashboard",
+  "devDependencies": {
+    "linkedom": "0.18.12"
+  }
+}

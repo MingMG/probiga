@@ -49,3 +49,4 @@ a86dd39d14bb45f85a3d18525215a9ef0cfd1f192ac793220e72598c90335f0c  starlette-1.6.
 65b8397ba37ccbce054456aaccddfc91e6e3083c92824df348d96ca832f3f147  typing_inspection-0.4.4-py3-none-any.whl
 9fb4c81ebbb1ce9531cce37674bbc6f1360472bc18ca9a553ede278ef7276897  urllib3-2.7.0-py3-none-any.whl
 116af2710dbf47c80f463cd20ee4884b6662f4c9f227d797ddc7279d2fcc2c7c  uvicorn-0.52.3-py3-none-any.whl
+781caf5e8eee67f663126490c2f96f40906594cb86b408a703630f95550a8c3e  websockets-16.0-cp314-cp314-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl

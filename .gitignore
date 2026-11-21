@@ -74,3 +74,4 @@ data/**
 adata/
 .release_venvs/
 .release_sources/
+node_modules/

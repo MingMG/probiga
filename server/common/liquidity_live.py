@@ -1,5 +1,5 @@
 """Complete bounded bulk capture of source-specific intraday liquidity samples."""
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import closing
 from datetime import datetime, time, timedelta
 import json
@@ -19,31 +19,69 @@ _LOCK = Lock()
 _ZONE = ZoneInfo("Asia/Shanghai")
 
 
-def _fetch(deadline):
+def _fetch(deadline, *, selected, now):
+    started = monotonic()
     def page(number):
-        remaining = deadline-monotonic()
-        if remaining < 1:
-            raise TimeoutError("liquidity_live: bulk capture deadline exceeded")
-        payload = _resolved_curl_json("https://push2delay.eastmoney.com/api/qt/clist/get", {
-            "fs": EASTMONEY_MARKETS, "fields": "f12,f2,f8,f10,f124",
-            "fid": "f12", "po": 1, "pz": 100, "pn": number, "np": 1, "fltt": 2, "invt": 2,
-        }, host="push2delay.eastmoney.com", timeout=min(2, int(remaining)))
-        if payload.get("rc") != 0:
-            raise ValueError("liquidity_live: source rejected request")
-        return _page_items(payload, page=number)
-    total, rows = page(1)
-    if not 3000 <= total <= 7000 or len(rows) != 100:
+        failure = None
+        for attempt in range(2):
+            remaining = deadline-monotonic()
+            if remaining < 1:
+                raise TimeoutError(f"liquidity_live: page {number} deadline exceeded")
+            try:
+                payload = _resolved_curl_json("https://push2delay.eastmoney.com/api/qt/clist/get", {
+                    "fs": EASTMONEY_MARKETS, "fields": "f12,f2,f8,f10,f124",
+                    "fid": "f12", "po": 1, "pz": 100, "pn": number, "np": 1, "fltt": 2, "invt": 2,
+                }, host="push2delay.eastmoney.com", timeout=min(2, int(remaining)))
+                if payload.get("rc") != 0:
+                    raise ValueError("source rejected request")
+                return _page_items(payload, page=number)
+            except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
+                failure = exc
+        raise RuntimeError(f"liquidity_live: page {number} failed after two attempts") from failure
+    total, first = page(1)
+    if not 3000 <= total <= 7000 or len(first) != 100:
         raise ValueError("liquidity_live: A-share source inventory differs")
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = [(number, pool.submit(page, number)) for number in range(2, (total+99)//100+1)]
-        for number, future in futures:
-            count, items = future.result()
-            if count != total or len(items) != min(100, total-(number-1)*100):
-                raise ValueError("liquidity_live: incomplete pagination")
-            rows.extend(items)
-    codes = [row.get("f12") for row in rows]
-    if len(rows) != total or len(set(codes)) != total:
-        raise ValueError("liquidity_live: duplicate or missing source identities")
+    with closing(sqlite3.connect(_path(create=True), timeout=1)) as db:
+        db.execute("""CREATE TABLE IF NOT EXISTS live_liquidity_page (
+            page INTEGER PRIMARY KEY, day TEXT, inventory INTEGER, captured_at TEXT, digest TEXT, payload TEXT)""")
+        pages = {1: first}
+        with db:
+            db.execute("DELETE FROM live_liquidity_page WHERE day<>? OR inventory<>? OR captured_at<?",
+                       (selected, total, (now-timedelta(seconds=30)).isoformat()))
+        for number, captured, digest, encoded in db.execute(
+                "SELECT page,captured_at,digest,payload FROM live_liquidity_page WHERE day=? AND inventory=?",
+                (selected, total)).fetchall():
+            if 1 < number <= (total+99)//100 and 0 <= (now-datetime.fromisoformat(captured)).total_seconds() <= 30:
+                items = json.loads(encoded)
+                if canonical_digest(items) != digest:
+                    raise ValueError("liquidity_live: partial page digest differs")
+                if len(items) == min(100, total-(number-1)*100):
+                    pages[number] = items
+        failures = []
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {pool.submit(page, number): number for number in range(2, (total+99)//100+1) if number not in pages}
+            for future in as_completed(futures):
+                number = futures[future]
+                try:
+                    count, items = future.result()
+                    if count != total or len(items) != min(100, total-(number-1)*100):
+                        raise ValueError("pagination coverage differs")
+                    encoded, digest = json.dumps(items, allow_nan=False), canonical_digest(items)
+                    with db:
+                        db.execute("INSERT OR REPLACE INTO live_liquidity_page VALUES (?,?,?,?,?,?)",
+                                   (number, selected, total, (now+timedelta(seconds=monotonic()-started)).isoformat(), digest, encoded))
+                    pages[number] = items
+                except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
+                    failures.append(number)
+        if failures:
+            raise RuntimeError(f"liquidity_live: missing pages {sorted(failures)}; completed pages checkpointed")
+        rows = [row for number in sorted(pages) for row in pages[number]]
+        codes = [row.get("f12") for row in rows]
+        if len(rows) != total or len(set(codes)) != total:
+            raise ValueError("liquidity_live: duplicate or missing source identities")
+        # Successful captures start a new observation; only failed runs resume pages.
+        with db:
+            db.execute("DELETE FROM live_liquidity_page")
     return rows
 
 
@@ -102,7 +140,7 @@ def read_live_liquidity(selected, *, now, deadline):
                     raise ValueError("liquidity_live: persisted digest differs")
                 return _normalize(rows, selected, now)
             started = monotonic()
-            rows = _fetch(deadline)
+            rows = _fetch(deadline, selected=selected, now=now)
             observed = now+timedelta(seconds=monotonic()-started)
             result = _normalize(rows, selected, observed)
             encoded, digest = json.dumps(rows, allow_nan=False), canonical_digest(rows)

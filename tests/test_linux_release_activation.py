@@ -130,6 +130,7 @@ def fixture(tmp_path):
         fs.write(f"/var/lib/probiga/release-artifacts/{sha}/component-release.json", activation.encoded(value), 0o644)
     for index, name in enumerate(activation.FILES):
         fs.write(name, f"old-unit-{index}".encode(), 0o644)
+    fs.write(activation.NGINX_CONFIG, b"server {\n    location /api/ {\n        limit_req zone=probiga_api burst=60 nodelay;\n        proxy_pass http://127.0.0.1:8000;\n        proxy_set_header Host $host;\n    }\n}\n", 0o644)
     fs.restore(activation.LINK, {"kind": "link", "target": f"/opt/ProBigA-releases/{OLD}"})
     sources = []
     for index in range(4):
@@ -142,7 +143,7 @@ def fixture(tmp_path):
 
 
 def capture(fs, sha=NEW):
-    return {name: fs.snapshot(name) for name in (*activation.FILES, activation.LINK, activation.Activation.receipt(sha))}
+    return {name: fs.snapshot(name) for name in (*activation.FILES, activation.NGINX_CONFIG, activation.LINK, activation.Activation.receipt(sha))}
 
 
 def test_success_preserves_windows_contract_and_ai_states(fixture):
@@ -165,6 +166,11 @@ def test_success_preserves_windows_contract_and_ai_states(fixture):
     assert services.calls.count("stop") == 1
     assert services.calls.count("verify_new") == 1
     assert ctl.recover() == "NO_TRANSACTION"
+    proxy = fs.read(activation.NGINX_CONFIG)
+    assert b"location = /api/monitor/stream" in proxy
+    assert b"proxy_http_version 1.1;" in proxy
+    assert proxy.count(b"limit_req zone=probiga_api burst=60 nodelay;") == 2
+    assert activation.websocket_proxy_config(proxy) == proxy
 
 
 def test_forced_fast_receipt_preserves_classified_coordinated_scope(fixture):

@@ -4,3 +4,4 @@
 -r ../requirements-platform.txt
 pip==26.2.1
 setuptools==84.0.0
+websockets==16.0

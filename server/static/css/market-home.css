@@ -188,6 +188,11 @@ body.market-home-active .main-content > .content {
 .mh-hub button:disabled { opacity: .44; cursor: default; }
 .mh-hub :is(button:not(:disabled), a):hover { background: #302a21; }
 #mh-market-observation { scroll-margin-top: 76px; }
+.mh-observation { display: block; margin-top: 4px; font-size: 11px; font-weight: 400; line-height: 1.5; }
+.mh-observation-fresh { color: var(--success, #36c991); }
+.mh-observation-delayed, .mh-observation-paused { color: #cfab62; }
+.mh-observation-expired { color: #e5ad79; }
+.mh-panel-stale, .mh-tile-stale { border-style: dashed; }
 
 @media (max-width: 1050px) {
     .mh-hub-cards { grid-template-columns: repeat(3, minmax(0, 1fr)); }

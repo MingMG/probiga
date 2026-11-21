@@ -156,13 +156,13 @@
     }
 
     function panel(title, meta, body, span = 'mh-quarter') {
-        return `<section class="mh-panel ${span}"><header class="mh-panel-head"><h3>${title}</h3><span class="mh-meta">${meta}</span></header>${body}</section>`;
+        return `<section class="mh-panel ${span}${String(meta).includes('mh-observation-expired') ? ' mh-panel-stale' : ''}" data-mh-key="panel:${escape(title)}"><header class="mh-panel-head"><h3>${title}</h3><span class="mh-meta">${meta}</span></header>${body}</section>`;
     }
 
     function empty(text) { return `<p class="mh-empty">${escape(text)}</p>`; }
 
     function tile(name, value, foot, extra = '') {
-        return `<article class="mh-tile ${extra}"><span class="mh-tile-name">${name}</span><strong class="mh-tile-value">${value}</strong><small class="mh-meta">${foot}</small></article>`;
+        return `<article class="mh-tile ${extra}${String(foot).includes('mh-observation-expired') ? ' mh-tile-stale' : ''}" data-mh-key="tile:${escape(name)}"><span class="mh-tile-name">${name}</span><strong class="mh-tile-value">${value}</strong><small class="mh-meta">${foot}</small></article>`;
     }
 
     function marketObservation(payload, requested, fallback) {
@@ -180,23 +180,67 @@
     }
 
     function snapshotObservation(payload, requested) {
-        return requested && day(payload?.trade_date) === requested && ['available', 'partial'].includes(payload.status) ? payload : null;
+        return requested && day(payload?.trade_date) === requested && ['available', 'partial', 'stale'].includes(payload.status) ? payload : null;
     }
 
-    function rememberSnapshot(state, value, requested) {
-        const snapshot = snapshotObservation(value, requested);
-        if (!snapshot) return false;
-        const saved = state.observations ||= {};
-        const missing = snapshot.unavailable_fields || [];
-        const quoteFields = ['distribution', 'strong', 'rankings.gainers', 'rankings.losers', 'rankings.amount'];
-        if (!quoteFields.some(field => missing.includes(field))) saved.quotes = snapshot;
-        for (const key of ['turnover', 'limit_ladder']) {
-            const field = key === 'turnover' ? 'rankings.turnover' : key;
-            if (!missing.includes(field) && (key === 'turnover' ? rows(snapshot.rankings?.turnover).length : snapshot.limit_ladder)) saved[key] = snapshot;
+    function observationState(meta, clock) {
+        if (!meta) return {};
+        const source = meta.source_at || meta.received_at;
+        const parsed = Date.parse(source || '');
+        const current = Date.parse(clock?.server_time || '');
+        const age = Number.isFinite(parsed) && Number.isFinite(current)
+            ? Math.max(0, Math.floor((current-parsed)/1000)) : meta.age_seconds;
+        const local = new Date(current+8*3600000);
+        const minute = local.getUTCHours()*60+local.getUTCMinutes();
+        const lunch = Number.isFinite(current) && source?.slice(0,10) === local.toISOString().slice(0,10) && minute > 690 && minute < 780;
+        const fixed = ['closed', 'reference'].includes(meta.state) || meta.state === 'paused' && lunch;
+        const state = fixed ? meta.state : age > meta.expired_seconds ? 'expired' : age > meta.fresh_seconds ? 'delayed' : meta.last_error ? 'retained' : meta.state;
+        return {state,age,source,fixed};
+    }
+
+    function observationBadge(meta, clock) {
+        if (!meta) return '';
+        const {state,age,source,fixed} = observationState(meta,clock);
+        const names = {fresh:'新近观测',delayed:'数据延迟',expired:'已过期，保留参考',retained:'上次观测',paused:'午间暂停',closed:'收盘观测',reference:'历史参照'};
+        const basis = meta.age_basis === 'received' ? '接收时间' : '数据时间';
+        const text = (names[state] || '观测状态待核验') + (source ? ` · ${basis} ${source.replace('T',' ').slice(0,19)}` : '') +
+            (!fixed && Number.isFinite(age) ? ` · ${age}秒前` : '') + (meta.age_basis === 'received' ? ' · 源端更新时间未提供' : '') +
+            (meta.last_error ? ' · 本次采集失败' : '');
+        return `<small class="mh-observation mh-observation-${escape(state)}">${escape(text)}</small>`;
+    }
+
+    function nodeKey(node) {
+        return node.nodeType === 1 ? node.getAttribute('data-mh-key') || node.id || null : null;
+    }
+
+    function patchNode(current, next) {
+        if (current === next || current.isEqualNode(next)) return;
+        if (current.nodeType !== next.nodeType || current.nodeName !== next.nodeName) {
+            current.replaceWith(next);
+            return;
         }
-        const indices = saved.indices ||= {};
-        rows(snapshot.indices).forEach(row => { if (day(row.trade_date) === requested && number(row.price) > 0) indices[row.index_code] = row; });
-        return !quoteFields.some(field => missing.includes(field)) && !missing.includes('indices');
+        if (current.nodeType !== 1 && current.nodeType !== 11) {
+            current.nodeValue = next.nodeValue;
+            return;
+        }
+        if (current === document.activeElement && current.nodeName === 'SELECT') return;
+        if (current.nodeType === 1) {
+            for (const name of current.getAttributeNames()) if (!next.hasAttribute(name)) current.removeAttribute(name);
+            for (const name of next.getAttributeNames()) if (current.getAttribute(name) !== next.getAttribute(name)) current.setAttribute(name,next.getAttribute(name));
+        }
+        const keyed = new Map(Array.from(current.childNodes).filter(nodeKey).map(node => [nodeKey(node),node]));
+        let cursor = current.firstChild;
+        for (const child of Array.from(next.childNodes)) {
+            const key = nodeKey(child);
+            let match = key ? keyed.get(key) : cursor && !nodeKey(cursor) && cursor.nodeName === child.nodeName ? cursor : null;
+            if (!match) {
+                match = child.cloneNode(true);
+                current.insertBefore(match,cursor);
+            } else if (match !== cursor) current.insertBefore(match,cursor);
+            patchNode(match,child);
+            cursor = match.nextSibling;
+        }
+        while (cursor) { const following = cursor.nextSibling; cursor.remove(); cursor = following; }
     }
 
     function monthShift(month, offset) {
@@ -326,51 +370,51 @@
 
     function indexStamp(row) { return String(row.as_of || row.data_time || row.trade_date).replace('T', ' '); }
 
-    function renderIndexStrip(requested, market, trend, snapshot) {
+    function renderIndexStrip(requested, market, trend, snapshot, clock) {
         return '<div class="mh-tape">' + indices.map(([code, name]) => {
             const row = freshestIndex(code, requested, market, trend, snapshot);
             const foot = row
                 ? `<span>${code}</span><span title="${escape(indexStamp(row) + ' · ' + (row.source || '来源待核验'))}">${escape(day(row.trade_date))}${row.evidence_mode === 'LIVE_OBSERVATION' ? ' ' + escape(indexStamp(row).slice(11, 19)) : ''}${row.retained_observation ? ' · 上次观测' : day(row.trade_date) < requested ? ' · 历史' : ''}</span>`
                 : `<span>${code}</span><span>行情待核验</span>`;
-            return tile(name, `<span class="mh-tile-change">${signed(row?.change_pct)}</span><span class="${tone(row?.change_pct)}">${metric(row?.price)}</span>`, foot, 'mh-index-tile');
+            return tile(name, `<span class="mh-tile-change">${signed(row?.change_pct)}</span><span class="${tone(row?.change_pct)}">${metric(row?.price)}</span>`, foot+observationBadge(row?.observation,clock), 'mh-index-tile');
         }).join('') + '</div>';
     }
 
-    function observationMeta(market) {
-        return market ? `${escape(market.trade_date)} · ${escape(market.data_source || '来源待核验')}${market.scope_label ? ' · ' + escape(market.scope_label) : ''}` : '证据待核验';
+    function observationMeta(market, clock) {
+        return market ? `${escape(market.trade_date)} · ${escape(market.data_source || '来源待核验')}${market.scope_label ? ' · ' + escape(market.scope_label) : ''}${observationBadge(market.observation,clock)}` : '证据待核验';
     }
 
-    function snapshotMeta(snapshot) {
+    function snapshotMeta(snapshot, clock) {
         if (!snapshot) return '证据待核验';
         const kind = {qmt_snapshot: '盘中样本', exchange_close: '收盘样本', public_index_snapshot: '盘中指数', public_stock_ranking: '盘中排名'}[snapshot.as_of_basis];
-        return `${kind ? kind + ' · ' : ''}${escape(snapshot.as_of || snapshot.trade_date)} · ${escape(snapshot.source || '来源待核验')}`;
+        return `${kind ? kind + ' · ' : ''}${escape(snapshot.as_of || snapshot.trade_date)} · ${escape(snapshot.source || '来源待核验')}${observationBadge(snapshot.observation,clock)}`;
     }
 
     function pair(a, b, af = '', bf = '', digits = 0) {
         return `<span class="mh-up">${metric(a, af, digits)}</span><span class="mh-muted"> / </span><span class="mh-down">${metric(b, bf, digits)}</span>`;
     }
 
-    function renderMetrics(market, snapshot, liveLiquidity, requested) {
+    function renderMetrics(market, snapshot, liveLiquidity, requested, clock) {
         const breadth = market?.breadth;
         const strong = snapshot?.strong || {};
         const limits = snapshot?.limit_ladder;
-        const hasLiveLiquidity = liveLiquidity?.status === 'available' && liveLiquidity.trade_date === requested;
+        const hasLiveLiquidity = snapshot?.as_of_basis !== 'exchange_close' && ['available','stale'].includes(liveLiquidity?.status) && liveLiquidity.trade_date === requested;
         const liquidity = hasLiveLiquidity ? liveLiquidity : snapshot?.liquidity;
         const ratio = hasLiveLiquidity ? liquidity.volume_ratio_median : liquidity?.volume_ratio5;
-        const limitMeta = limits ? [limits.scope, limits.source].filter(Boolean).map(escape).join(' · ') : '涨跌停证据待核验';
+        const limitMeta = limits ? [limits.scope, limits.source].filter(Boolean).map(escape).join(' · ')+observationBadge(limits.observation,clock) : '涨跌停证据待核验';
         const count = breadth ? `<span class="mh-up">${metric(breadth.up, '', 0)}</span><span class="mh-muted"> / ${metric(breadth.flat, '', 0)} / </span><span class="mh-down">${metric(breadth.down, '', 0)}</span>` : '—';
         return '<div class="mh-metrics">' +
-            tile('个股涨 / 平 / 跌', count, breadth ? `上涨占比 ${metric(100 * breadth.up / breadth.total, '%', 1)} · ${observationMeta(market)}` : '涨跌家数待核验') +
-            tile('强势 / 弱势', pair(strong.up_3pct, strong.down_3pct), number(strong.up_3pct) !== null || number(strong.down_3pct) !== null ? `涨跌幅达到 ±3% · ${snapshotMeta(snapshot)}` : '涨跌幅分布待核验') +
+            tile('个股涨 / 平 / 跌', count, breadth ? `上涨占比 ${metric(100 * breadth.up / breadth.total, '%', 1)} · ${observationMeta(market,clock)}` : '涨跌家数待核验') +
+            tile('强势 / 弱势', pair(strong.up_3pct, strong.down_3pct), number(strong.up_3pct) !== null || number(strong.down_3pct) !== null ? `涨跌幅达到 ±3% · ${snapshotMeta(snapshot,clock)}` : '涨跌幅分布待核验') +
             tile('涨停 / 跌停', pair(limits?.limit_up_count, limits?.limit_down_count), limitMeta) +
             tile('最高连板', metric(limits?.max_streak, '板', 0), limits ? limitMeta : '连板证据待核验') +
-            tile('成交额', amount(market?.total_amount), observationMeta(market)) +
+            tile('成交额', amount(market?.total_amount), observationMeta(market,clock)) +
             tile(hasLiveLiquidity ? '换手中位 / 盘中量比中位' : '换手中位 / 收盘日量比', metric(liquidity?.turnover_median_pct, '%') + ' / ' + metric(ratio, '倍'),
                 liquidity ? `换手 ${metric(liquidity.turnover_sample_count, '只', 0)} · ${hasLiveLiquidity ? '量比' : '日量比同样本'} ${metric(liquidity.volume_sample_count, '只', 0)} · ` +
-                    (hasLiveLiquidity ? `${escape(liquidity.definition)} · 数据时间 ${escape(liquidity.as_of)}` : '较前5个完整交易日均量') : '换手和量比数据待核验') + '</div>';
+                    (hasLiveLiquidity ? `${escape(liquidity.definition)} · 数据时间 ${escape(liquidity.as_of)}${observationBadge(liquidity.observation,clock)}` : '较前5个完整交易日均量') : '换手和量比数据待核验') + '</div>';
     }
 
-    function renderBreadth(market, snapshot) {
+    function renderBreadth(market, snapshot, clock) {
         const b = market?.breadth;
         const observed = rows(snapshot?.distribution).filter(item => Number.isInteger(item.count) && item.count >= 0 && typeof item.label === 'string').map(item => ({
             ...item, direction: item.key === 'flat' ? '' : typeof item.upper === 'number' && item.upper <= 0 ? 'down' : typeof item.lower === 'number' && item.lower >= 0 ? 'up' : ''
@@ -381,8 +425,8 @@
         const color = {up: 'mh-up', down: 'mh-down'};
         const plot = '<div class="mh-spark" aria-label="涨跌样本分布">' + bins.map(item =>
             `<div><strong>${metric(item.count, '', 0)}</strong><i class="${color[item.direction] || 'mh-neutral'}" style="--mh-height:${100 * item.count / max}%"></i><span>${escape(item.label)}</span></div>`).join('') + '</div>';
-        const marketMeta = b ? `${metric(b.total, '只', 0)} · ${observationMeta(market)}` : '';
-        const sampleMeta = observed.length ? `分布样本 ${metric(snapshot.sample_size, '只', 0)} · ${snapshotMeta(snapshot)}` : '';
+        const marketMeta = b ? `${metric(b.total, '只', 0)} · ${observationMeta(market,clock)}` : '';
+        const sampleMeta = observed.length ? `分布样本 ${metric(snapshot.sample_size, '只', 0)} · ${snapshotMeta(snapshot,clock)}` : '';
         const bar = b ? '<div class="mh-breadth-bar" aria-hidden="true">' + [[b.down, 'mh-down'], [b.flat, 'mh-neutral'], [b.up, 'mh-up']].map(([count, cls]) =>
             `<span class="mh-breadth-part ${cls}" style="width:${100 * count / b.total}%"></span>`).join('') + '</div>' +
             `<div class="mh-meta">跌 ${metric(b.down, '', 0)} · 平 ${metric(b.flat, '', 0)} · 涨 ${metric(b.up, '', 0)}${sampleMeta ? ' · ' + marketMeta : ''}</div>` : '';
@@ -391,11 +435,11 @@
 
     function stat(label, value) { return `<div><span class="mh-meta">${label}</span><strong>${value}</strong></div>`; }
 
-    function renderEmotion(market) {
+    function renderEmotion(market, clock) {
         const b = market?.breadth;
         const percentile = number(market?.heat_percentile);
         if (!b) return panel('情绪观察', '广度证据', empty('市场情绪观察待核验'));
-        return panel('情绪观察', observationMeta(market),
+        return panel('情绪观察', observationMeta(market,clock),
             `<div class="mh-section-label">${escape(market.heat_status || '涨跌广度')}</div><div class="mh-stat-grid">` +
             stat('上涨占比', metric(100 * b.up / b.total, '%', 1)) +
             stat('历史广度分位', percentile !== null ? 'P' + metric(percentile, '', 0) : '—') +
@@ -403,7 +447,7 @@
             `<p class="mh-meta">${escape(market.heat_percentile_method || '分位使用已发布的可比历史样本')} · ${metric(market.heat_percentile_sample_count, '日', 0)}</p>`);
     }
 
-    function renderTrend(trend, market, snapshot, requested) {
+    function renderTrend(trend, market, snapshot, requested, clock) {
         const index = rows(trend?.indices).find(item => item.index_code === '000300' && day(item.data_cutoff) && day(item.data_cutoff) <= requested);
         const measures = index?.periods?.daily?.metrics;
         const title = index ? `沪深300 · ${escape(index.data_cutoff)}` : '指数证据待核验';
@@ -411,20 +455,20 @@
             panel('趋势强度', title, measures ? '<div class="mh-stat-grid">' +
                 stat('指数点位', metric(measures.close)) + stat('SMA20', metric(measures.sma20)) + stat('SMA60', metric(measures.sma60)) +
                 stat('SMA20近5根斜率', signed(measures.sma20_slope_5_pct)) + '</div>' : empty('暂无可核验的指数日线趋势')) +
-            panel('实用监控', observationMeta(market), '<div class="mh-stat-grid">' +
+            panel('实用监控', observationMeta(market,clock), '<div class="mh-stat-grid">' +
                 stat('涨停开板样本', metric(snapshot?.limit_ladder?.opened_limit_up_count, '只', 0)) +
                 stat('小盘代码样本', metric(market?.board_sample?.count, '只', 0)) +
                 stat('小盘样本平均涨跌', signed(market?.board_sample?.change)) + '</div>') + '</div>';
     }
 
-    function renderLadder(snapshot) {
+    function renderLadder(snapshot, clock) {
         const notes = snapshot?.limit_ladder || {};
         const exact = day(notes.trade_date) && day(notes.trade_date) === day(snapshot?.trade_date) && notes.source;
         const ladder = exact
             ? rows(notes.rows).filter(item => Number.isInteger(item.streak) && item.streak > 0 && Number.isInteger(item.count) && item.count > 0)
             : [];
         const max = Math.max(1, ...ladder.map(item => item.count));
-        const meta = exact ? [notes.trade_date, notes.scope, notes.source].filter(Boolean).map(escape).join(' · ') : snapshotMeta(snapshot);
+        const meta = exact ? [notes.trade_date, notes.scope, notes.source].filter(Boolean).map(escape).join(' · ')+observationBadge(notes.observation,clock) : snapshotMeta(snapshot,clock);
         const captured = exact && notes.available_at ? `证据可用 ${escape(notes.available_at)} · ` : '';
         return panel('涨停梯队', meta, (ladder.length ? '<div class="mh-list">' + ladder.slice(0, 8).map(item =>
             `<div class="mh-row"><b>${item.streak}板</b><span class="mh-breadth-bar" aria-hidden="true"><span class="mh-breadth-part mh-up" style="width:${100 * item.count / max}%"></span></span><span>${item.count}只</span></div>`).join('') + '</div>' :
@@ -455,7 +499,7 @@
         return `<div class="mh-heat-trend">${caption}<svg class="mh-heat-series" viewBox="0 0 100 20" preserveAspectRatio="none" aria-hidden="true" focusable="false"><polyline points="${points}"></polyline></svg></div>`;
     }
 
-    function renderSector(kind, title, payload, requested, mode) {
+    function renderSector(kind, title, payload, requested, mode, clock) {
         const label = heatModes.find(([key]) => key === mode)[1];
         const exact = requested && payload?.requested_date === requested && payload.trade_date === requested;
         const metricResult = exact ? payload[kind]?.[mode] : null;
@@ -476,7 +520,7 @@
         const stamp = metricResult?.as_of ? ` · 数据时间 ${metricResult.as_of}` : '';
         const noteText = (metricResult?.retained_observation ? '上次观测 · ' : '') + (metricResult?.note || '');
         const note = noteText || stamp ? `<p class="mh-meta mh-heat-note">${escape(noteText + stamp)}</p>` : '';
-        return panel(title, escape(exact ? requested : '证据待核验'), controls +
+        return panel(title, escape(exact ? requested : '证据待核验')+observationBadge(metricResult?.observation,clock), controls +
             `<div id="mh-heatmap-${kind}">${plot}${note}</div>` +
             (kind === 'concept' ? link('concept', '查看概念详情', mode === 'five_day_return' ? 'c5' : 'c0') :
                 link('sector', '查看行业热度矩阵', 'heat')), 'mh-third');
@@ -506,27 +550,31 @@
         return dialog;
     }
 
-    function renderEvents(snapshot, requested) {
+    function eventIdentity(item) {
+        return JSON.stringify([item.event_family,item.event_type,item.stock_code,item.sector_name,item.snapshot_at,item.available_at,item.detail_json]);
+    }
+
+    function renderEvents(snapshot, requested, clock, waiting) {
         const events = rows(snapshot?.events).filter(item => day(item.snapshot_at) === requested && requested);
-        const heading = escape(requested || '日期待核验');
+        const heading = escape(requested || '日期待核验')+observationBadge(snapshot?.observation,clock);
         if (!events.length && !snapshot?.next_cursor) return panel('监控中心', heading,
             empty(snapshot?.requested_date === requested && Array.isArray(snapshot.events) ? '当日暂无已记录的监控事件' : '所选交易日的异动事件证据待核验') + link('market-radar', '查看异动雷达'), 'mh-third');
         const limitLabels = {TOUCH:'触及涨停', SEAL:'涨停封板', RESEAL:'涨停回封', BREAK:'涨停开板'};
-        return panel('监控中心', heading, '<div class="mh-list mh-event-scroll" data-mh-events tabindex="0" role="region" aria-label="监控事件，向下滚动查看更早记录">' + events.map(item => {
+        return panel('监控中心', heading, (waiting ? '<button type="button" class="mh-retry" data-mh-events-latest data-mh-key="events-latest">有新事件 · 回到最新</button>' : '') + '<div class="mh-list mh-event-scroll" data-mh-key="events-list" data-mh-events tabindex="0" role="region" aria-label="监控事件，向下滚动查看更早记录">' + events.map(item => {
             const detail = item.detail_json || {};
             const name = item.stock_code ? stock(item.stock_code, detail.short_name) : escape(item.sector_name || '板块异动');
             const limitEvent = item.event_family === 'LIMIT_UP_LIFECYCLE' && Object.hasOwn(limitLabels, item.event_type);
             const label = limitEvent ? limitLabels[item.event_type] : item.direction === 'UP' ? '上涨异动' : item.direction === 'DOWN' ? '下跌异动' : '市场异动';
             const tone = limitEvent ? (item.event_type === 'BREAK' ? 'mh-down' : 'mh-up') : item.direction === 'UP' ? 'mh-up' : item.direction === 'DOWN' ? 'mh-down' : 'mh-neutral';
             const provider = limitEvent ? '国金 QMT 涨停生命周期' : item.data_source || '来源待核验';
-            return `<div class="mh-row"><span>${name}<small class="mh-meta">${escape(provider)}</small></span>` +
+            return `<div class="mh-row" data-mh-key="event:${escape(eventIdentity(item))}"><span>${name}<small class="mh-meta">${escape(provider)}</small></span>` +
                 `<span class="mh-badge ${tone}">${label}</span>` +
                 `<span class="mh-meta">${escape(item.snapshot_at)}${item.available_at ? `<small class="mh-meta">记录 ${escape(item.available_at)}</small>` : ''}</span></div>`;
         }).join('') + (snapshot?.next_cursor ? '<button type="button" class="mh-retry" data-mh-events-more' +
             (snapshot.loading ? ' disabled' : '') + '>' + (snapshot.loading ? '正在加载…' : snapshot.error ? '加载失败，点击重试' : '加载更早事件') + '</button>' : '<p class="mh-meta">已显示当天全部事件</p>') + '</div>', 'mh-third');
     }
 
-    function renderRanking(snapshot, key, title, field, unit, retained = false) {
+    function renderRanking(snapshot, key, title, field, unit, clock) {
         const sourceRows = rows(snapshot?.rankings?.[key]);
         const data = sourceRows.filter(item => day(item.trade_date) === day(snapshot.trade_date) &&
             /^\d{6}$/.test(item.stock_code || '') && number(item[field]) !== null);
@@ -542,13 +590,14 @@
         }
         const observation = snapshot?.ranking_observations?.[key];
         const origin = observation && observation.trade_date === snapshot?.trade_date
-            ? `${escape(observation.scope)} · ${escape(observation.as_of)} · ${escape(observation.source)}` : snapshotMeta(snapshot);
-        const meta = display.length ? `${retained ? '上次观测 · ' : ''}TOP ${display.length}${scope} · ${origin}` : noMatches ? origin : '排名待核验';
+            ? `${escape(observation.scope)} · ${escape(observation.as_of)} · ${escape(observation.source)}` : `${escape(snapshot?.as_of || snapshot?.trade_date || '')} · ${escape(snapshot?.source || '来源待核验')}`;
+        const meta = (display.length ? `TOP ${display.length}${scope} · ${origin}` : noMatches ? origin : '排名待核验') +
+            observationBadge(observation?.observation || snapshot?.observation,clock);
         return panel(title, meta, display.length ?
             '<div class="mh-list">' + display.map((item, i) => {
                 const source = key === 'turnover' ? item.turnover_rate_source || item.source : item.source;
                 const value = field === 'change_pct' ? signed(item[field]) : unit === '亿' ? amount(item[field]) : metric(item[field], unit);
-                return `<div class="mh-row"><span class="mh-muted">${i + 1}</span>` +
+                return `<div class="mh-row" data-mh-key="stock:${escape(item.stock_code)}"><span class="mh-muted">${i + 1}</span>` +
                     `<span>${stock(item.stock_code, item.short_name)}<small class="mh-meta">${escape(item.stock_code)}${source ? ' · ' + escape(source) : ''}</small></span>` +
                     `<span>${value}</span></div>`;
             }).join('') + '</div>' :
@@ -572,235 +621,261 @@
 
     function render(state, requested, clock, modes = {}) {
         const snapshot = snapshotObservation(state.snapshot, requested);
-        const saved = state.observations || {};
-        const quotes = snapshotObservation(saved.quotes, requested) || snapshot;
-        const ladder = snapshot?.limit_ladder ? snapshot : snapshotObservation(saved.limit_ladder, requested) || snapshot;
-        const measured = quotes ? {...quotes, limit_ladder:ladder?.limit_ladder} : ladder;
-        const market = marketObservation(state.market, requested, quotes?.market_overview);
-        const currentCodes = new Set(rows(snapshot?.indices).map(row => row.index_code));
-        const indexSnapshot = {indices:[...rows(snapshot?.indices), ...Object.values(saved.indices || {})
-            .filter(row => day(row.trade_date) === requested && !currentCodes.has(row.index_code))
-            .map(row => ({...row,retained_observation:true}))]};
+        const market = marketObservation(state.market, requested, snapshot?.market_overview);
         const failed = Object.keys(state.refreshErrors || {});
         const labels = {realtime: '盘中快照', close: '收盘观察', paused: '午间快照', stale: '行情已过期'};
         const boardPhase = {qmt_snapshot: '盘中快照', exchange_close: '收盘观察', public_index_snapshot: '盘中指数', public_stock_ranking: '盘中排名'}[snapshot?.as_of_basis] || '数据待核验';
-        const phase = quotes && quotes !== snapshot ? '上次观测' : !market ? boardPhase : market.trade_date < requested ? '历史回退' : labels[market.freshness_status] || '已存行情';
-        const stamp = market?.data_time || market?.trade_date || quotes?.as_of || snapshot?.as_of;
-        const sourceNames = {trend:'指数历史趋势', snapshot:'行情与榜单', heatmap:'板块热度', liquidity:'换手与量比', events:'监控事件', reviewDates:'复盘日历', delivery:'交付记录'};
-        const refreshText = failed.length
-            ? `刷新失败：${failed.map(key => sourceNames[key] || key).join('、')}。保留上次已取得数据，时间见各卡片；将自动重试。`
-            : '当前交易日每20秒检查更新';
+        const phase = observationState(snapshot?.observation,clock).state === 'expired' ? '上次观测（已过期）' : !market ? boardPhase : market.trade_date < requested ? '历史回退' : labels[market.freshness_status] || '已存行情';
+        const stamp = market?.data_time || market?.trade_date || snapshot?.as_of;
+        const sourceNames = {stream:'快照读取', trend:'指数历史趋势', snapshot:'行情与榜单', heatmap:'板块热度', liquidity:'换手与量比', events:'监控事件', reviewDates:'复盘日历', delivery:'交付记录'};
+        const transports = {connecting:'正在连接实时推送…',connected:'实时推送已连接 · 后台约每20秒更新，数据时间见各卡片',
+            disconnected:'推送已断开，正在自动重连；保留已显示的观测',paused:'页面在后台，推送已暂停；后台采集继续运行',historical:'历史日期 · 显示已保存观测'};
+        const refreshText = (transports[state.transport] || '正在同步市场观测…') + (failed.length
+            ? ` · 更新失败：${failed.map(key => sourceNames[key] || key).join('、')}，保留原观测时间。` : '');
         const markup = '<section class="market-home" id="mh-market-observation" tabindex="-1" aria-label="行情概览"><header class="mh-head"><div>' +
             '<h2>行情概览</h2><span class="mh-badge">' + phase + '</span>' + link('market-context', '市场环境') + '</div>' +
             `<div class="mh-head-actions"><span class="mh-meta">请求 ${escape(requested || '日期待核验')} · 行情 ${escape(stamp || '待核验')}${observationLag(market, clock, requested)}</span>` +
             '<button type="button" class="mh-retry" data-mh-refresh>重载</button></div></header>' +
             `<p class="mh-meta" role="status" data-mh-refresh-status>${escape(refreshText)}</p>`;
-        return renderHub(state, requested, clock, modes, market, quotes) + markup +
-            renderIndexStrip(requested, market, state.trend, indexSnapshot) + renderMetrics(market, measured, state.liquidity, requested) +
-            '<div class="mh-grid">' + renderBreadth(market, quotes) + renderEmotion(market) + renderTrend(state.trend, market, measured, requested) +
-            renderLadder(ladder) + renderDrawdowns(quotes) +
-            renderSector('concept', '概念热度', state.heatmap, requested, modes.concept || 'change') +
-            renderSector('industry', '行业热度', state.heatmap, requested, modes.industry || 'change') +
-            renderEvents(state.events, requested) + rankings.map(([key, title, field, unit]) => {
-                const observation = key === 'turnover' ? snapshotObservation(saved.turnover, requested) || snapshot : quotes;
-                return renderRanking(observation, key, title, field, unit, observation !== snapshot);
-            }).join('') +
+        return renderHub(state, requested, clock, modes, market, snapshot) + markup +
+            renderIndexStrip(requested, market, state.trend, snapshot,clock) + renderMetrics(market, snapshot, state.liquidity, requested,clock) +
+            '<div class="mh-grid">' + renderBreadth(market, snapshot,clock) + renderEmotion(market,clock) + renderTrend(state.trend, market, snapshot, requested,clock) +
+            renderLadder(snapshot,clock) + renderDrawdowns(snapshot) +
+            renderSector('concept', '概念热度', state.heatmap, requested, modes.concept || 'change',clock) +
+            renderSector('industry', '行业热度', state.heatmap, requested, modes.industry || 'change',clock) +
+            renderEvents(state.events, requested,clock,state.pendingEvents) + rankings.map(([key, title, field, unit]) =>
+                renderRanking(snapshot,key,title,field,unit,clock)).join('') +
             '</div></section>';
     }
 
     function stop() {
         if (!active) return;
-        clearTimeout(active.timer);
-        active.container.removeEventListener('click', active.click);
-        active.container.removeEventListener('change', active.change);
-        active.container.removeEventListener('scroll', active.scroll, true);
+        active.cleanup?.();
         active.detail?.remove();
         active = null;
     }
 
     function load(date, container, options = {}) {
         const requested = day(date) || day(options.clock?.()?.ui_trade_date);
+        if (!requested) return Promise.resolve({loadError:'交易日期待核验'});
         const retained = active?.container === container && active.requested === requested ? active.state : {};
         const modes = active?.container === container && active.requested === requested ? active.modes :
-            {concept: 'change', industry: 'change', month: requested.slice(0, 7), feed: '全部'};
+            {concept:'change',industry:'change',month:requested.slice(0,7),feed:'全部'};
         stop();
-        const session = {container, requested, state: retained, modes, timer: null, pending: null, click: null, change: null};
+        const session = {container,requested,state:retained,modes,socket:null,failures:0,timers:{},pointer:false};
         active = session;
-        const query = encodeURIComponent(requested);
-        const paths = {trend: '/api/hot-data/market-trend?date=' + query,
-            snapshot: '/api/monitor/board?date=' + query,
-            heatmap: '/api/monitor/sector-heatmap?date=' + query,
-            liquidity: '/api/monitor/liquidity?date=' + query,
-            events: '/api/monitor/events?date=' + query,
-            reviewDates: '/api/hot-data/daily-review-dates',
-            delivery: '/api/scheduler/daily-delivery?trade_date=' + query + '&attempt_limit=12'};
-        const liveKeys = ['snapshot', 'heatmap', 'liquidity', 'events'];
-        const referenceKeys = ['trend', 'reviewDates', 'delivery'];
         const current = () => active === session;
-
+        const liveKeys = ['snapshot','heatmap','liquidity','events'];
+        const referenceKeys = ['trend','reviewDates','delivery'];
+        const activeDay = day(options.clock?.()?.active_trade_date);
+        const streaming = !activeDay || requested >= activeDay;
+        const query = encodeURIComponent(requested);
+        const paths = {snapshot:'/api/monitor/board?date='+query,heatmap:'/api/monitor/sector-heatmap?date='+query,
+            liquidity:'/api/monitor/liquidity?date='+query,events:'/api/monitor/events?date='+query,
+            trend:'/api/hot-data/market-trend?date='+query,reviewDates:'/api/hot-data/daily-review-dates',
+            delivery:'/api/scheduler/daily-delivery?trade_date='+query+'&attempt_limit=12'};
+        let firstResolve;
+        const firstState = new Promise(resolve => {firstResolve=resolve;});
+        function finishInitial(outcome={}) {
+            if (!firstResolve) return;
+            clearTimeout(session.timers.initial);
+            firstResolve(outcome);firstResolve=null;
+        }
+        function renderClock() {
+            const value = {...options.clock?.()};
+            if (session.serverTime) value.server_time = new Date(session.serverTime.value+performance.now()-session.serverTime.at).toISOString();
+            return value;
+        }
         function paint() {
             if (!current()) return;
+            if (session.pointer) {session.needsPaint=true;return;}
             const focused = document.activeElement;
-            const attributes = ['data-mh-refresh', 'data-mh-stock', 'data-mh-tab', 'data-mh-heat-mode', 'data-mh-feed', 'data-mh-month', 'data-mh-date', 'data-mh-observation', 'data-mh-events'];
-            const action = container.contains(focused) ? attributes.find(name => focused.hasAttribute(name)) : null;
-            const value = action && focused.getAttribute(action);
-            const eventScroll = container.querySelector?.('[data-mh-events]')?.scrollTop || 0;
-            container.innerHTML = render(session.state, requested, options.clock?.(), session.modes);
-            const eventList = container.querySelector?.('[data-mh-events]');
-            if (eventList) eventList.scrollTop = eventScroll;
-            if (action) Array.from(container.querySelectorAll(`[${action}]`))
-                .find(button => button.getAttribute(action) === value)?.focus({preventScroll: true});
+            const next = container.cloneNode(false);
+            next.innerHTML = render(session.state,requested,renderClock(),session.modes);
+            patchNode(container,next);
+            if (focused?.isConnected && document.activeElement !== focused) focused.focus?.({preventScroll:true});
+            session.needsPaint=false;
         }
-
-        async function olderEvents() {
-            const feed = session.state.events;
-            if (!current() || !feed?.next_cursor || feed.loading) return;
-            feed.loading = true;
-            feed.error = false;
-            paint();
+        function accept(key,value) {
+            const errors = session.state.refreshErrors ||= {};
+            if (value === null) return;
+            if (['snapshot','heatmap','liquidity','events'].includes(key) &&
+                day(value?.requested_date || value?.trade_date) !== requested) {errors[key]=true;return;}
+            if (key === 'events') {
+                if (!Array.isArray(value.events)) {errors.events=true;return;}
+                const list = container.querySelector('[data-mh-events]');
+                if (list?.scrollTop > 0 && session.state.events) {
+                    const known = new Set(rows(session.state.events.events).map(eventIdentity));
+                    if (value.events.some(item => !known.has(eventIdentity(item)))) session.state.pendingEvents=value;
+                    delete errors.events;
+                    return;
+                }
+                session.state.pendingEvents=null;
+            }
+            session.state[key]=value;
+            delete errors[key];
+        }
+        async function requestPart(key) {
             try {
-                const page = await options.request(paths.events + '&before=' + encodeURIComponent(feed.next_cursor), 15000, {cache: 'no-store'});
-                if (current() && session.state.events === feed) {
-                    if (page?.requested_date !== requested || !Array.isArray(page.events)) throw new Error('invalid event page');
-                    feed.events.push(...page.events);
-                    feed.next_cursor = page.next_cursor;
-                }
-            } catch {
-                feed.error = true;
-            } finally {
-                feed.loading = false;
-                paint();
-            }
-        }
-
-        function refresh(keys, pendingKey = 'pending') {
-            if (session[pendingKey]) return session[pendingKey];
-            if (!requested) return Promise.resolve({loadError: '交易日期待核验'});
-            const status = container.querySelector?.('[data-mh-refresh-status]');
-            if (status) status.textContent = '正在更新，现有内容保持显示…';
-            session[pendingKey] = Promise.all(keys.map(async key => {
-                try {
-                    const value = await options.request(paths[key], ['trend', 'heatmap', 'liquidity'].includes(key) ? 30000 : key === 'snapshot' ? 20000 : 15000, {cache: 'no-store'});
-                    return {key, value};
-                } catch {
-                    return {key, failed:true};
-                }
-            })).then(results => {
-                if (!current()) return {};
-                const errors = session.state.refreshErrors || {};
-                results.forEach(result => {
-                    const previous = session.state[result.key];
-                    if (result.key === 'snapshot' && !result.failed) {
-                        if (rememberSnapshot(session.state, result.value, requested)) delete errors.snapshot;
-                        else errors.snapshot = true;
-                        session.state.snapshot = result.value;
-                        return;
-                    }
-                    const incomplete = result.key === 'heatmap' && ['concept', 'industry'].some(kind => heatModes.some(([mode]) =>
-                            previous?.[kind]?.[mode]?.status === 'available' && result.value?.[kind]?.[mode]?.status !== 'available'));
-                    if (result.failed) errors[result.key] = true;
-                    else {
-                        if (incomplete) {
-                            const value = result.value?.trade_date === requested && result.value?.requested_date === requested
-                                ? {...result.value} : {requested_date:requested,trade_date:requested};
-                            for (const kind of ['concept', 'industry']) {
-                                value[kind] = {...value[kind]};
-                                for (const [mode] of heatModes) {
-                                    if (previous?.[kind]?.[mode]?.status === 'available' && value[kind][mode]?.status !== 'available')
-                                        value[kind][mode] = {...previous[kind][mode],retained_observation:true};
-                                }
-                            }
-                            result.value = value;
-                        }
-                        session.state[result.key] = result.value;
-                        if (incomplete) errors[result.key] = true;
-                        else delete errors[result.key];
-                    }
-                });
-                session.state.refreshErrors = errors;
-                paint();
-                if (current() && !marketObservation(session.state.market, requested, snapshotObservation(session.state.snapshot, requested)?.market_overview)?.breadth) return {loadError: '市场广度暂不可用'};
-                return {};
-            }).finally(() => { session[pendingKey] = null; });
-            return session[pendingKey];
-        }
-
-        function reload() {
-            const live = refresh(liveKeys);
-            return Promise.all([live, refresh(referenceKeys, 'referencesPending')]).then(([outcome]) => outcome);
-        }
-
-        function schedule(started = performance.now()) {
-            if (!current()) return;
-            session.timer = setTimeout(async () => {
+                const value = await options.request(paths[key],key === 'trend' ? 30000 : 15000,{cache:'no-store'});
                 if (!current()) return;
-                const started = performance.now();
-                try {
-                    if (document.hidden || options.isActive?.() === false) return;
-                    const clock = options.refreshClock ? await options.refreshClock() : options.clock?.();
-                    if (current() && (clock?.is_intraday === true || ['midday_break', 'postmarket'].includes(clock?.phase)) && day(clock.active_trade_date) === requested) {
-                        const readingHistory = (container.querySelector?.('[data-mh-events]')?.scrollTop || 0) > 0;
-                        await refresh(readingHistory ? liveKeys.filter(key => key !== 'events') : liveKeys);
-                    }
-                } catch {
-                    // A failed clock refresh must not relabel the previous observation.
-                } finally { schedule(started); }
-            }, Math.max(0, 20000 - (performance.now() - started)));
+                accept(key,value);paint();
+                if (liveKeys.includes(key)) finishInitial();
+            } catch {
+                if (!current()) return;
+                (session.state.refreshErrors ||= {})[key]=true;paint();
+            }
         }
-
-        session.click = event => {
-            const button = event.target.closest('button');
-            if (!button || !container.contains(button)) return;
-            if (button.dataset.mhEventsMore !== undefined) olderEvents();
-            else if (button.dataset.mhTab) options.navigate?.(button.dataset.mhTab, button.dataset.mhView);
-            else if (button.dataset.mhBoard) {
-                const kind = button.dataset.mhBoard;
-                session.detail?.remove();
-                session.detail = openBoardDetail(document.body, session.state.heatmap, requested, kind, session.modes[kind], button.dataset.mhBoardCode);
-            }
-            else if (button.dataset.mhStock) options.stock?.(button.dataset.mhStock);
-            else if (button.dataset.mhDate) options.selectDate?.(button.dataset.mhDate);
-            else if (button.dataset.mhMonth && requested) {
-                const shift = Number(button.dataset.mhMonth);
-                if (shift !== -1 && shift !== 1) return;
-                const month = monthShift(session.modes.month, shift);
-                if (month >= '1900-01' && month <= (day(options.clock?.()?.today) || requested).slice(0, 7)) {
-                    session.modes.month = month;
-                    paint();
+        function references() {referenceKeys.forEach(key => {void requestPart(key);});}
+        function disconnect() {
+            clearTimeout(session.timers.connection);
+            if (!session.socket) return;
+            const socket=session.socket;session.socket=null;
+            socket.onopen=socket.onmessage=socket.onclose=socket.onerror=null;
+            socket.close(1000,'view changed');
+        }
+        function reconnectLater() {
+            if (!current() || document.hidden) return;
+            session.state.transport='disconnected';paint();
+            finishInitial({loadError:'推送暂不可用，正在自动重连'});
+            const wait=[1000,2000,5000,10000,20000][Math.min(session.failures++,4)];
+            clearTimeout(session.timers.reconnect);
+            session.timers.reconnect=setTimeout(connect,wait);
+        }
+        function connect() {
+            if (!current() || document.hidden) return;
+            disconnect();clearTimeout(session.timers.reconnect);
+            session.state.transport='connecting';paint();
+            try {
+                const address=new URL('/api/monitor/stream?date='+query,root.location.href);
+                address.protocol=address.protocol === 'https:' ? 'wss:' : 'ws:';
+                const socket=options.streamFactory ? options.streamFactory(address.href) : new root.WebSocket(address.href);
+                session.socket=socket;
+                const valid=()=>current() && session.socket===socket;
+                session.timers.connection=setTimeout(()=>{if(valid()){disconnect();reconnectLater();}},8000);
+                socket.onopen=()=>{
+                    if(!valid())return;
+                    clearTimeout(session.timers.connection);session.failures=0;
+                    session.lastMessage=performance.now();session.state.transport='connected';paint();
+                };
+                socket.onmessage=event=>{
+                    if(!valid())return;
+                    try {
+                        if(typeof event.data!=='string'||event.data.length>2500000)throw new Error('invalid frame');
+                        const message=JSON.parse(event.data);
+                        if(message.trade_date!==requested)throw new Error('wrong session');
+                        const at=Date.parse(message.server_time);
+                        if(Number.isFinite(at))session.serverTime={value:at,at:performance.now()};
+                        session.lastMessage=performance.now();
+                        if(message.type==='closing'){disconnect();reconnectLater();return;}
+                        if(message.type==='error'){
+                            (session.state.refreshErrors ||= {}).stream=true;
+                            finishInitial({loadError:'后台快照暂不可读，保留已显示观测'});
+                        } else {
+                            delete (session.state.refreshErrors ||= {}).stream;
+                            for(const key of liveKeys)if(Object.hasOwn(message.components||{},key))accept(key,message.components[key]);
+                            if(message.type==='update')finishInitial();
+                        }
+                        paint();
+                    } catch {disconnect();reconnectLater();}
+                };
+                socket.onclose=()=>{if(valid()){session.socket=null;reconnectLater();}};
+                socket.onerror=()=>{if(valid()){disconnect();reconnectLater();}};
+            } catch {reconnectLater();}
+        }
+        async function olderEvents() {
+            const feed=session.state.events;
+            if(!current()||!feed?.next_cursor||feed.loading)return;
+            feed.loading=true;feed.error=false;paint();
+            try {
+                const page=await options.request(paths.events+'&before='+encodeURIComponent(feed.next_cursor),15000,{cache:'no-store'});
+                if(current()&&session.state.events===feed){
+                    if(page?.requested_date!==requested||!Array.isArray(page.events))throw new Error('invalid event page');
+                    const known=new Set(feed.events.map(eventIdentity));
+                    feed.events.push(...page.events.filter(item=>!known.has(eventIdentity(item))));
+                    feed.next_cursor=page.next_cursor;
                 }
-            }
-            else if (button.dataset.mhHeatMode) {
-                const [kind, mode] = button.dataset.mhHeatMode.split(':');
-                if (Object.hasOwn(session.modes, kind) && heatModes.some(([key]) => mode === key)) {
-                    session.modes[kind] = mode;
-                    paint();
-                }
-            } else if (button.hasAttribute('data-mh-refresh') && !session.pending) {
-                options.status?.('正在重载市场看板…');
-                reload().then(outcome => {
-                    if (current()) options.status?.(outcome.loadError || '市场看板已重载', Boolean(outcome.loadError));
-                });
-            } else if (button.hasAttribute('data-mh-observation')) {
-                const observation = container.querySelector('#mh-market-observation');
-                observation?.focus({preventScroll: true});
-                observation?.scrollIntoView({block: 'start'});
+            } catch {feed.error=true;}
+            finally {feed.loading=false;paint();}
+        }
+        session.click=event=>{
+            const button=event.target.closest('button');
+            if(!button||!container.contains(button))return;
+            if(button.hasAttribute('data-mh-events-latest')){
+                if(session.state.pendingEvents)session.state.events=session.state.pendingEvents;
+                session.state.pendingEvents=null;
+                const list=container.querySelector('[data-mh-events]');if(list)list.scrollTop=0;
+                paint();
+            } else if(button.hasAttribute('data-mh-events-more'))void olderEvents();
+            else if(button.dataset.mhTab)options.navigate?.(button.dataset.mhTab,button.dataset.mhView);
+            else if(button.dataset.mhBoard){
+                const kind=button.dataset.mhBoard;session.detail?.remove();
+                session.detail=openBoardDetail(document.body,session.state.heatmap,requested,kind,session.modes[kind],button.dataset.mhBoardCode);
+            } else if(button.dataset.mhStock)options.stock?.(button.dataset.mhStock);
+            else if(button.dataset.mhDate)options.selectDate?.(button.dataset.mhDate);
+            else if(button.dataset.mhMonth){
+                const shift=Number(button.dataset.mhMonth);
+                if(shift!==-1&&shift!==1)return;
+                const month=monthShift(session.modes.month,shift);
+                if(month>='1900-01'&&month<=(day(options.clock?.()?.today)||requested).slice(0,7)){session.modes.month=month;paint();}
+            } else if(button.dataset.mhHeatMode){
+                const [kind,mode]=button.dataset.mhHeatMode.split(':');
+                if(Object.hasOwn(session.modes,kind)&&heatModes.some(([key])=>key===mode)){session.modes[kind]=mode;paint();}
+            } else if(button.hasAttribute('data-mh-refresh')){
+                if(streaming)connect();else liveKeys.forEach(key=>{void requestPart(key);});
+                references();
+            } else if(button.hasAttribute('data-mh-observation')){
+                const observation=container.querySelector('#mh-market-observation');
+                observation?.focus({preventScroll:true});observation?.scrollIntoView({block:'start'});
             }
         };
-        session.change = event => {
-            if (event.target.hasAttribute('data-mh-feed') && ['全部', '行情', '复盘', '交付'].includes(event.target.value)) {
-                session.modes.feed = event.target.value;
+        session.change=event=>{
+            if(event.target.hasAttribute('data-mh-feed')&&['全部','行情','复盘','交付'].includes(event.target.value)){
+                session.modes.feed=event.target.value;paint();
+            }
+        };
+        session.scroll=event=>{
+            const list=event.target;
+            if(list.hasAttribute?.('data-mh-events')&&list.scrollTop+list.clientHeight>=list.scrollHeight-80&&!session.state.events?.error)void olderEvents();
+        };
+        session.pointerDown=()=>{session.pointer=true;};
+        session.pointerUp=()=>{
+            clearTimeout(session.timers.pointer);
+            session.timers.pointer=setTimeout(()=>{session.pointer=false;if(session.needsPaint)paint();},0);
+        };
+        session.blur=()=>{clearTimeout(session.timers.blur);session.timers.blur=setTimeout(paint,0);};
+        session.visibility=()=>{
+            if(!streaming)return;
+            if(document.hidden){disconnect();clearTimeout(session.timers.reconnect);session.state.transport='paused';paint();}
+            else connect();
+        };
+        const listeners=[['click',session.click],['change',session.change],['scroll',session.scroll,true],
+            ['pointerdown',session.pointerDown,true],['focusout',session.blur]];
+        listeners.forEach(args=>container.addEventListener(...args));
+        document.addEventListener('pointerup',session.pointerUp,true);
+        document.addEventListener('pointercancel',session.pointerUp,true);
+        document.addEventListener('visibilitychange',session.visibility);
+        session.cleanup=()=>{
+            disconnect();Object.values(session.timers).forEach(clearTimeout);
+            listeners.forEach(args=>container.removeEventListener(...args));
+            document.removeEventListener('pointerup',session.pointerUp,true);
+            document.removeEventListener('pointercancel',session.pointerUp,true);
+            document.removeEventListener('visibilitychange',session.visibility);
+            finishInitial({loadError:'页面已切换'});
+        };
+        function tick(){
+            if(!current())return;
+            if(!document.hidden){
+                if(streaming&&session.socket&&session.lastMessage&&performance.now()-session.lastMessage>25000){disconnect();reconnectLater();}
                 paint();
             }
-        };
-        container.addEventListener('click', session.click);
-        container.addEventListener('change', session.change);
-        session.scroll = event => {
-            const list = event.target;
-            if (list.hasAttribute?.('data-mh-events') && list.scrollTop + list.clientHeight >= list.scrollHeight - 80 && !session.state.events?.error) olderEvents();
-        };
-        container.addEventListener('scroll', session.scroll, true);
-        paint();
-        return reload().finally(schedule);
+            session.timers.freshness=setTimeout(tick,5000);
+        }
+        session.state.transport=streaming?'connecting':'historical';paint();references();
+        session.timers.initial=setTimeout(()=>finishInitial({loadError:streaming?'推送暂不可用，正在自动重连':'历史观测暂未返回'}),10000);
+        if(streaming)connect();else liveKeys.forEach(key=>{void requestPart(key);});
+        tick();
+        return firstState;
     }
 
     const api = {load, stop, render};
