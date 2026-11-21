@@ -221,7 +221,7 @@ def test_generated_rule_has_a_real_deployed_candidate_receipt(rule, raw_rows, mo
     proposal = {"name": "弱市相对强势", "rule": rule, "rule_hash": "b" * 64, "strategy_key": "auto_" + "b" * 24,
                 "version": "research-rule-v1:b", "thesis": "研究假设", "applicability": "弱市", "invalidations": "强势失效",
                 "validation": {"status": "BLOCKED"}}
-    state = {"run_id": "a" * 64, "proposal_generated_at": "2026-11-21 20:00:00", "analysis_run_uid": "c" * 32}
+    state = {"run_id": "a" * 64, "proposal_generated_at": "2026-11-19 20:00:00", "analysis_run_uid": "c" * 32}
     from server.engine.strategy_challenger_factory import _normalized_registration_payload
     from server.engine.strategy_governance import _strategy_content_digest
     payload, version_hash = _normalized_registration_payload(research._registration_payload(proposal, state), operator="test")
@@ -230,11 +230,21 @@ def test_generated_rule_has_a_real_deployed_candidate_receipt(rule, raw_rows, mo
     strategy = {"strategy_key": payload["strategy_key"], "current_version": payload["version"], "version_hash": version_hash, "content_hash": content_hash,
                 "source_kind": "runtime_registry", "evaluator_type": payload["evaluator_type"], "enabled": True, "version_integrity_valid": True,
                 "current_status": "SHADOW", "parameters": payload["parameters"], "evaluator_config": payload["evaluator_config"]}
-    batch = adapters.execute_dynamic_adapter_candidate_batch(strategy, {"trade_date": "2026-11-20",
-        "recommendation_rows": raw_rows, "market": {}, "configs": {}, "metrics": {}})
+    from server.engine.strategy_center import _research_execution_context
+    snapshot = {"trade_date": "2026-11-20", "run_uid": "c" * 32, "stock_count": len(raw_rows),
+                "decision_at": "2026-11-20 15:35:00", "scored_rows": raw_rows}
+    receipt = {"trade_date": "2026-11-20", "run_uid": "c" * 32,
+               "score_snapshot": {"payload_sha256": "d" * 64}}
+    context = _research_execution_context(None, {"trade_date": "2026-11-20",
+        "recommendation_rows": [], "market": {}, "configs": {}, "metrics": {}}, source=(receipt, snapshot))
+    assert len(context["recommendation_rows"]) == 3  # The formal pool is empty, not the market universe.
+    batch = adapters.execute_dynamic_adapter_candidate_batch(strategy, context)
     assert batch["receipt"]["candidate_count"] == 1
     assert batch["signals"][0]["stock_code"] == "000001"
     assert batch["signals"][0]["real_order_authority"] is False
+    strategy["evaluator_config"]["autonomous_research"]["proposed_at"] = "2026-11-21 20:00:00"
+    with pytest.raises(ValueError, match="禁止回填"):
+        adapters.execute_dynamic_adapter_candidate_batch(strategy, context)
 
 
 def test_model_result_reuses_one_durable_request_after_caller_restart(rule, raw_rows, tmp_path, monkeypatch):

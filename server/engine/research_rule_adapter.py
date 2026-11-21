@@ -15,6 +15,12 @@ def validate_research_strategy(strategy):
 
 
 def research_candidate_rows(strategy, context):
+    research = strategy["evaluator_config"]["autonomous_research"]
+    if context["trade_date"] <= research["proposed_at"][:10]:
+        raise ValueError("研究规则只能在实际提出日期之后产生前向候选，禁止回填事前结果")
+    source = context["market"].get("research_input")
+    if not source or len(context["recommendation_rows"]) != source["stock_count"]:
+        raise ValueError("研究规则缺少完整冻结评分样本及来源身份")
     rule = strategy["parameters"]["rule_spec"]
     rows, market = feature_frame(context["recommendation_rows"], context["trade_date"])
     selected = select_rule_rows(rule, rows, market)
