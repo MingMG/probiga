@@ -154,7 +154,7 @@ def freshness(row, day, *, now):
         state = "paused"
     else:
         state = "expired" if age > EXPIRED_SECONDS else "delayed" if age > FRESH_SECONDS else "fresh"
-    return {"version": row["version"], "source_at": row["source_at"], "received_at": row["captured_at"],
+    return {"version": row["version"], "capture_run_id": row["run_id"], "source_at": row["source_at"], "received_at": row["captured_at"],
             "age_seconds": age, "age_basis": "source" if source else "received", "state": state,
             "fresh_seconds": FRESH_SECONDS, "expired_seconds": EXPIRED_SECONDS}
 

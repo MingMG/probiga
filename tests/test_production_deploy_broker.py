@@ -3,12 +3,40 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_changed_dependency_lock_reuses_only_identical_verified_wheels(tmp_path):
+    engine = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    script = engine.split("<<'PY_REUSE_WHEELS'\n", 1)[1].split("\nPY_REUSE_WHEELS", 1)[0]
+    source, target = tmp_path / "verified", tmp_path / "build"
+    source.mkdir()
+    target.mkdir()
+    reused = "same_pkg-1.0-py3-none-any.whl"
+    changed = "changed_pkg-2.0-py3-none-any.whl"
+    (source / reused).write_bytes(b"verified same content")
+    (source / changed).write_bytes(b"wrong content")
+    manifest, lock = tmp_path / "manifest", tmp_path / "lock"
+    manifest.write_text(hashlib.sha256((source / reused).read_bytes()).hexdigest()+"  "+reused+"\n"+
+                        hashlib.sha256(b"new content").hexdigest()+"  "+changed+"\n", encoding="utf-8")
+    lock.write_text("--only-binary=:all:\nsame-pkg==1.0 --hash=sha256:abc\nchanged-pkg==2.0 --hash=sha256:def\n", encoding="utf-8")
+    result = subprocess.run([sys.executable, "-I", "-", *map(str, (source, target, manifest, lock))],
+                            input=script, capture_output=True, text=True, timeout=5)
+    assert result.returncode == 0, result.stderr
+    missing = Path(result.stdout.strip())
+    try:
+        assert (target / reused).read_bytes() == b"verified same content"
+        assert not (target / changed).exists()
+        assert missing.read_text() == "--only-binary=:all:\nchanged-pkg==2.0 --hash=sha256:def\n"
+    finally:
+        missing.chmod(0o600)
+        missing.unlink()
 
 
 def _bash() -> str | None:
