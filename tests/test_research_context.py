@@ -77,3 +77,22 @@ def test_latest_route_reads_the_newly_published_batch_without_waiting_for_cache(
         conn.exec_driver_sql("INSERT INTO st_external_market_context VALUES (2,'2026-11-17','second','2026-11-17 09:02:00','nasdaq','指数',200,1,199,'2026-11-17 09:01:00','available','native','{}')")
     assert context.global_context('2026-11-17',mode='latest')['snapshot_id']=='second'
     engine.dispose()
+
+
+def test_latest_batch_remains_consistent_when_a_new_date_publishes_between_reads(monkeypatch):
+    engine=create_engine('sqlite://')
+    with engine.begin() as conn:
+        conn.exec_driver_sql('CREATE TABLE st_external_market_context (id INT,context_date TEXT,snapshot_id TEXT,captured_at TEXT,symbol TEXT,display_name TEXT,price REAL,change_pct REAL,previous_close REAL,market_time TEXT,availability TEXT,source TEXT,payload_json TEXT)')
+        conn.exec_driver_sql("INSERT INTO st_external_market_context VALUES (1,'2026-11-16','first','2026-11-16 09:00:00','nasdaq','指数',100,1,99,'2026-11-16 08:59:00','available','native','{}')")
+    monkeypatch.setattr(context,'get_engine',lambda:engine)
+    original=context._read
+    def concurrent_publish(*args,**kwargs):
+        rows=original(*args,**kwargs)
+        if kwargs['stage']=='global-market-batch':
+            with engine.begin() as conn:
+                conn.exec_driver_sql("INSERT INTO st_external_market_context VALUES (2,'2026-11-17','second','2026-11-17 09:00:00','nasdaq','指数',200,1,199,'2026-11-17 08:59:00','available','native','{}')")
+        return rows
+    monkeypatch.setattr(context,'_read',concurrent_publish)
+    value=context.build_global_context('2026-11-16','latest')
+    assert value['snapshot_id']=='first' and value['rows'][0]['price']==100
+    engine.dispose()
