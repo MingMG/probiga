@@ -150,6 +150,24 @@ def _bind_windows_qmt_python() -> str:
     return value
 
 
+def bind_windows_code_identity() -> None:
+    """Bind the registered Windows checkout before importing engine validators."""
+    from tools.classify_release_scope import _git_executable
+    root = ROOT.resolve(strict=True)
+    if root != ROOT:
+        raise RuntimeError("Windows code root cannot be a reparse point")
+    tree = subprocess.run(
+        [_git_executable(), "-C", str(root), "rev-parse", "HEAD^{tree}"],
+        check=True, capture_output=True, text=True, timeout=10,
+    ).stdout.strip()
+    if re.fullmatch(r"[0-9a-f]{40,64}", tree) is None:
+        raise RuntimeError("Windows source tree identity is unavailable")
+    os.environ["PROBIGA_CODE_ROOT"] = str(root)
+    os.environ["PROBIGA_RELEASE_TREE_SHA256"] = hashlib.sha256(json.dumps(
+        {"kind": "git-tree", "tree": tree}, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+
+
 def _load_windows_runtime_env() -> int:
     """Load the Windows owner's local environment before runtime imports."""
 
@@ -171,7 +189,7 @@ def _load_windows_runtime_env() -> int:
             os.environ.pop(name, None)
     _bind_windows_qmt_python()
     _bind_windows_state_roots()
-    os.environ["PROBIGA_CODE_ROOT"] = str(ROOT.resolve(strict=True))
+    bind_windows_code_identity()
     # Force the one capability identity accepted by the shared
     # scheduler/health contract.
     os.environ["PROBIGA_DEPLOYMENT_MODE"] = "production"

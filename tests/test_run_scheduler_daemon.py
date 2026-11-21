@@ -232,6 +232,7 @@ def test_windows_env_loader_overrides_runtime_and_removes_launcher_controls(
     monkeypatch.setenv("SCHEDULER_INTRADAY_START", "stale")
     monkeypatch.setenv("QMT_PYTHON", r"E:\stale\python.exe")
     monkeypatch.setenv("PROBIGA_CODE_ROOT", r"E:\stale\code")
+    monkeypatch.setenv("PROBIGA_RELEASE_TREE_SHA256", "stale")
     monkeypatch.setenv("PROBIGA_SCHEDULER_STDOUT", "must-not-leak")
     # Track every variable mutated directly by the loader so this test cannot
     # leak the Windows executor identity into later in-process test modules.
