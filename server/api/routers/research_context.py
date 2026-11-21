@@ -121,7 +121,7 @@ def build_global_context(day, mode="latest"):
     rows = _read(get_engine, f"""
         SELECT /*+ MAX_EXECUTION_TIME(3000) */ snapshot_id,captured_at,symbol,display_name,
                price,change_pct,previous_close,market_time,availability,source,payload_json
-        FROM st_external_market_context WHERE {date_filter} captured_at<=:cutoff AND snapshot_id=:snapshot
+        FROM st_external_market_context WHERE captured_at<=:cutoff AND snapshot_id=:snapshot
         ORDER BY id DESC LIMIT 42
     """, {**params,"snapshot":latest[0]["snapshot_id"] if latest else ""},deadline=deadline,limit=41,stage="global-market-observation")
     selected = [r for r in rows if r["snapshot_id"]==rows[0]["snapshot_id"]] if rows else []
