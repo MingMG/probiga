@@ -180,7 +180,9 @@ def test_price_research_runs_shared_inputs_and_resumes_from_real_audit_partition
     monkeypatch.setattr(price, '_group_inputs', lambda _c, days, _cutoff: [{"sessions": days, "source_key": "test", "native": True}])
     def validate(_c, group, _cutoff):
         calls.append(group['sessions'])
-        return {"sessions": group['sessions'], "catalogs": {d: "test" for d in group['sessions']}, "proofs": {"fixture": True}, "row_counts": {d: 2 for d in group['sessions']}}
+        return {"sessions": group['sessions'], "catalogs": {d: "test" for d in group['sessions']},
+                "proofs": {d: {"provider": "fixture", "catalog_batch_id": "test", "row_count": 2} for d in group['sessions']},
+                "row_counts": {d: 2 for d in group['sessions']}}
     monkeypatch.setattr(price, '_validate_group', validate)
     monkeypatch.setattr(price, '_read_bars', lambda _c, days, _inputs, _cutoff: [r for r in raw if r['trade_date'] in days])
     def identity(_c, day):

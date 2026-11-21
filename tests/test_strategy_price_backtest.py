@@ -81,6 +81,50 @@ def test_old_day_never_borrows_present_day_name_or_industry():
     assert rows == {} and proof["status"] == "UNAVAILABLE"
 
 
+def test_native_receipt_uses_original_universe_and_reuses_immutable_scope(monkeypatch):
+    from server.engine import strategy_price_backtest as price
+    from server.common import verified_daily_market_truth as source
+    from server.common.qmt_attestation_contract import expected_stock_set_contract
+    from server.db.formal_analysis_schema import privileged_migrate_formal_analysis_schema
+    engine = create_engine('sqlite://')
+    privileged_migrate_formal_analysis_schema(engine)
+    day = '2026-10-16'
+    expected = expected_stock_set_contract(day, ['000001', '000002'])
+    truth = {'provider': 'qmt_retained_history', 'receipt_id': 'native-run', 'catalog_batch_id': 'later',
+             'row_count': 2, 'code_set_hash': expected['stock_set_hash']}
+    class Receipt:
+        def as_dict(self):
+            return dict(truth)
+    monkeypatch.setattr(source, 'load_retained_qmt_daily_market_truth', lambda *_a, **_k: Receipt())
+    prepared = []
+    def prepare(_c, run, _cutoff):
+        prepared.append(run['run_id'])
+        return {day: {'catalog': 'original', 'excluded_codes': ['000003'], 'stock_count': 2,
+                      'stock_set_hash': expected['stock_set_hash'], 'native_receipt_id': 'native-run',
+                      'available_at': '2026-10-16 18:00:00'}}
+    monkeypatch.setattr(price, '_prepare_native_scopes', prepare)
+    with engine.begin() as c:
+        c.execute(text('CREATE TABLE qmt_kline_attestation_run(run_id TEXT,provider TEXT)'))
+        c.execute(text("INSERT INTO qmt_kline_attestation_run VALUES('native-run','gj_big_qmt_inner')"))
+        c.execute(text('CREATE TABLE qmt_stock_catalog_member(batch_id TEXT,stock_code TEXT,instrument_type TEXT,list_date TEXT,expire_date TEXT)'))
+        for batch, codes in [('original', ['000001', '000002', '000003']), ('later', ['000001', '000002', '000003', '000004'])]:
+            c.execute(text("INSERT INTO qmt_stock_catalog_member VALUES(:batch,:code,'STOCK','2020-01-01',NULL)"), [{'batch': batch, 'code': code} for code in codes])
+        c.execute(text('CREATE TABLE sm_stock_kline(stock_code TEXT,trade_date TEXT,k_type INT,adjust_type INT,received_at TEXT,open REAL,high REAL,low REAL,close REAL,pre_close REAL,volume REAL,amount REAL)'))
+        c.execute(text("INSERT INTO sm_stock_kline VALUES(:code,:day,1,0,'2026-10-16 18:00:00',10,11,9,10,10,1000,10000)"), [{'code': f'00000{i}', 'day': day} for i in range(1, 5)])
+    group = {'sessions': [day], 'sources': {day: 'QMT_RETAINED'}}
+    for _ in range(2):
+        with engine.begin() as c:
+            part = price._validate_group(c, group, '2026-11-22 05:59:24')
+            assert part['catalogs'][day] == 'original' and part['row_counts'][day] == 2
+            rows = price._read_bars(c, [day], {day: part}, '2026-11-22 05:59:24')
+            assert [r['stock_code'] for r in rows] == ['000001', '000002']
+            assert c.execute(text('SELECT COUNT(*) FROM sm_stock_kline')).scalar() == 4
+    assert prepared == ['native-run']
+    truth['code_set_hash'] = 'f' * 64
+    with engine.connect() as c, pytest.raises(ValueError, match='原始证券集合'):
+        price._source_scope(c, truth, day, '2026-11-22 05:59:24')
+
+
 def test_missing_entry_identity_excludes_that_entry_but_preserves_known_cash_outcome():
     raw = bars_fixture(30)
     days = sorted(set(r["trade_date"] for r in raw))
