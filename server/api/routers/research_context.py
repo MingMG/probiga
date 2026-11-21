@@ -109,19 +109,21 @@ def build_global_context(day, mode="latest"):
     cutoff, deadline = _cutoff(day), monotonic()+18
     if mode == "latest":
         cutoff = datetime.now(SHANGHAI).replace(tzinfo=None)
-    date_filter = "context_date=:day AND" if mode == "history" else ""
+    date_filter = ("context_date=:day AND" if mode == "history" else
+        "context_date=(SELECT MAX(context_date) FROM st_external_market_context WHERE context_date<=:today) AND")
+    params = {"day":day,"cutoff":cutoff,"today":cutoff.date()}
     # Reuse the collector's batch identity; never combine different capture times.
     latest = _read(get_engine, f"""
         SELECT /*+ MAX_EXECUTION_TIME(2000) */ snapshot_id
         FROM st_external_market_context WHERE {date_filter} captured_at<=:cutoff
         ORDER BY captured_at DESC,id DESC LIMIT 1
-    """, {"day":day,"cutoff":cutoff},deadline=deadline,limit=1,stage="global-market-batch")
+    """, params,deadline=deadline,limit=1,stage="global-market-batch")
     rows = _read(get_engine, f"""
         SELECT /*+ MAX_EXECUTION_TIME(3000) */ snapshot_id,captured_at,symbol,display_name,
                price,change_pct,previous_close,market_time,availability,source,payload_json
         FROM st_external_market_context WHERE {date_filter} captured_at<=:cutoff AND snapshot_id=:snapshot
         ORDER BY id DESC LIMIT 42
-    """, {"day":day,"cutoff":cutoff,"snapshot":latest[0]["snapshot_id"] if latest else ""},deadline=deadline,limit=41,stage="global-market-observation")
+    """, {**params,"snapshot":latest[0]["snapshot_id"] if latest else ""},deadline=deadline,limit=41,stage="global-market-observation")
     selected = [r for r in rows if r["snapshot_id"]==rows[0]["snapshot_id"]] if rows else []
     symbols = [r["symbol"] for r in selected]
     if len(symbols)!=len(set(symbols)):
@@ -184,4 +186,4 @@ def macro_release(day: str = Query(alias="date",pattern=r"^\d{4}-\d{2}-\d{2}$"))
 @router.get("/research/global-context")
 def global_context(day: str = Query(alias="date",pattern=r"^\d{4}-\d{2}-\d{2}$"),
                    mode: str = Query(default="latest", pattern="^(latest|history)$")):
-    return _serve(build_global_context,day,mode=mode)
+    return _serve(build_global_context,day,mode=mode,cache_seconds=0 if mode == "latest" else 120)
