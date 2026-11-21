@@ -371,13 +371,14 @@ def test_native_quote_rejects_wrong_identity_stale_clock_and_unusable_prices(cha
 def test_native_provider_retries_transient_failure_and_keeps_partial_evidence(monkeypatch):
     responses = iter([ConnectionResetError("connection closed"), {"rc": 0, "data": {"diff": [_quote("sp500"), _quote("dow", f2="-")]}}])
     calls = []
-    def get(request, **kwargs):
-        calls.append(request.full_url)
+    def get(url, params, **kwargs):
+        from urllib.parse import urlencode
+        calls.append(url+"?"+urlencode(params))
         result = next(responses)
         if isinstance(result, Exception):
             raise result
         return result
-    monkeypatch.setattr(external, "_public_json", get)
+    monkeypatch.setattr(external, "_resolved_curl_json", get)
     monkeypatch.setattr(external.time, "sleep", lambda _: None)
     items, errors = external._load_eastmoney_quote_items(captured_at=AS_OF)
     assert set(items) == {"sp500"}
@@ -389,7 +390,7 @@ def test_native_provider_retries_transient_failure_and_keeps_partial_evidence(mo
 
 
 def test_unsuccessful_native_payload_cannot_supply_quotes(monkeypatch):
-    monkeypatch.setattr(external, "_public_json", lambda *_a, **_kw: {"rc": 1, "data": {"diff": [_quote("sp500")]}})
+    monkeypatch.setattr(external, "_resolved_curl_json", lambda *_a, **_kw: {"rc": 1, "data": {"diff": [_quote("sp500")]}})
     monkeypatch.setattr(external.time, "sleep", lambda _: None)
     items, errors = external._load_eastmoney_quote_items(captured_at=AS_OF)
     assert not items
@@ -471,3 +472,20 @@ def test_us_cash_close_normalizes_new_york_timestamp_and_rejects_old_quote(monke
     assert [(row["symbol"], row["market_time"], row["change_pct"]) for row in result] == [
         ("nasdaq", "2026-11-06T06:15:59+08:00", -5.52),
     ]
+
+
+def test_fifteen_available_quotes_do_not_disable_missing_instrument_recovery(monkeypatch):
+    ready = {symbol: _item(symbol, 1) for symbol, _ in EXTERNAL_MARKET_SYMBOLS[:15]}
+    monkeypatch.setattr(external, "_load_eastmoney_quote_items", lambda **kw: (ready, []))
+    monkeypatch.setattr(external, "_load_twse_quote_item", lambda **kw: (None, []))
+    monkeypatch.setattr(external, "_load_tencent_fallback_items", lambda *a, **kw: ({}, []))
+    monkeypatch.setattr(external, "_load_sina_fallback_items", lambda *a, **kw: ({}, []))
+    monkeypatch.setattr(external, "_load_us10y_item", lambda **kw: (None, []))
+    calls = []
+    def recover(symbols, **kw):
+        calls.extend(symbols)
+        return {symbol: _item(symbol, 2) for symbol in symbols}, []
+    monkeypatch.setattr(external, "_load_yahoo_fallback_items", recover)
+    snapshot = external.fetch_external_market_snapshot(AS_OF)
+    assert len(calls) == 26
+    assert snapshot["available_count"] == 41 and snapshot["acquisition_status"] == "COMPLETE"

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import csv
 from collections.abc import Mapping
-from contextlib import nullcontext
+from contextlib import nullcontext, contextmanager
 import json
 import logging
 import math
@@ -30,6 +30,7 @@ from sqlalchemy.engine import Engine
 
 from server.common.authoritative_market_clock import STRATEGY_POOL_PREMARKET_REVISION_TIME
 from server.common.sql_reader import read_sql_rows
+from tools.sync_eastmoney_concept_market import _resolved_curl_json
 from server.common.runtime_table_schema import (
     RuntimeColumn,
     RuntimeIndex,
@@ -44,16 +45,36 @@ MAX_QUOTE_AGE_SECONDS = 96 * 60 * 60
 PREMARKET_EXTERNAL_TASK_TYPE = "strategy_external_market_snapshot"
 PREMARKET_EXTERNAL_CAPTURE_TIME = datetime_time(8, 15)
 PREMARKET_EXTERNAL_SNAPSHOT_SCHEMA = "probiga.external-market-premarket-snapshot.v1"
+EXTERNAL_OBSERVATION_SCHEMA = "probiga.external-market-observation.v1"
+
+
+@contextmanager
+def external_capture_owner(engine):
+    with engine.connect() as connection:
+        mysql = connection.dialect.name == "mysql"
+        if mysql and connection.execute(text("SELECT GET_LOCK('external_market_capture_v1',5)")).scalar() != 1:
+            raise RuntimeError("EXTERNAL_MARKET_CAPTURE_BUSY")
+        try:
+            yield
+        finally:
+            if mysql:
+                connection.execute(text("SELECT RELEASE_LOCK('external_market_capture_v1')"))
 
 
 def _public_json(request: Request, *, timeout: int) -> dict[str, Any]:
     with build_opener(ProxyHandler({})).open(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
+        body = response.read(2_000_001)
+        if len(body) > 2_000_000:
+            raise ValueError("external source response exceeds byte bound")
+        return json.loads(body.decode("utf-8"))
 
 
 def _public_text(request: Request, *, timeout: int, encoding: str) -> str:
     with build_opener(ProxyHandler({})).open(request, timeout=timeout) as response:
-        return response.read().decode(encoding, errors="replace")
+        body = response.read(2_000_001)
+        if len(body) > 2_000_000:
+            raise ValueError("external source response exceeds byte bound")
+        return body.decode(encoding, errors="replace")
 
 EXTERNAL_MARKET_SYMBOLS: tuple[tuple[str, str], ...] = (
     ("nasdaq", "美股纳斯达克"),
@@ -224,15 +245,14 @@ def _parse_eastmoney_quote(symbol: str, row: dict[str, Any], *, captured_at: dat
 
 
 def _load_eastmoney_quote_items(*, captured_at: datetime) -> tuple[dict[str, dict[str, Any]], list[str]]:
-    query = urlencode({"secids": ",".join(_EASTMONEY_QUOTE_IDS.values()), "fltt": 2,
-                       "invt": 2, "fields": "f12,f13,f2,f3,f18,f124"})
-    request = Request("https://push2delay.eastmoney.com/api/qt/ulist.np/get?" + query,
-                      headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"})
+    params = {"secids": ",".join(_EASTMONEY_QUOTE_IDS.values()), "fltt": 2,
+              "invt": 2, "fields": "f12,f13,f2,f3,f18,f124"}
     payload = None
     errors = []
     for attempt in range(3):
         try:
-            payload = _public_json(request, timeout=10)
+            payload = _resolved_curl_json("https://push2delay.eastmoney.com/api/qt/ulist.np/get", params,
+                host="push2delay.eastmoney.com", timeout=10)
             if not isinstance(payload, dict) or payload.get("rc") != 0:
                 raise ValueError("Eastmoney quote service returned an unsuccessful response")
             break
@@ -969,7 +989,7 @@ def fetch_external_market_snapshot(as_of: datetime | None = None) -> dict[str, A
         if treasury is not None:
             available["us10y"] = treasury
     missing = [symbol for symbol, _name in EXTERNAL_MARKET_SYMBOLS if symbol not in available]
-    if len(available) < 8:
+    if missing:
         yahoo, yahoo_errors = _load_yahoo_fallback_items(
             missing,
             captured_at=captured_at,

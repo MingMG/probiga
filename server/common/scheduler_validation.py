@@ -4591,6 +4591,19 @@ def validate_scheduler_task_result(
     output: str | None = None,
 ) -> SchedulerValidationResult:
     task_type = str(task.get("task_type") or "").strip()
+    if task_type == "external_market_observation":
+        from biz.market_context.external_market import EXTERNAL_OBSERVATION_SCHEMA, _external_premarket_persisted_proof
+        try:
+            receipt = _single_nested_machine_payload(output, schema=EXTERNAL_OBSERVATION_SCHEMA)
+            if not receipt or receipt.get("status") != "COMPLETE" or task.get("script_path") != "tools/refresh_external_market_context.py":
+                raise ValueError("external observation completion missing")
+            captured = datetime.fromisoformat(receipt["captured_at"])
+            digest, missing = _external_premarket_persisted_proof(engine, snapshot_id=receipt["snapshot_id"], captured_at=captured)
+            if missing or digest != receipt["persisted_sha256"]:
+                raise ValueError("external observation durable evidence differs")
+            return SchedulerValidationResult(checked=True, ok=True, message="external observation verified: "+receipt["snapshot_id"])
+        except Exception as exc:
+            return SchedulerValidationResult(checked=True, ok=False, message="external observation verification failed: "+type(exc).__name__)
     if task_type == "strategy_external_overlay":
         from server.common.frozen_strategy_pool_work import PREMARKET_POOL_WORK_REF_SCHEMA
 

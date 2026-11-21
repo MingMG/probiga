@@ -26,8 +26,8 @@
             ])))+'</section><p class="rt-note">'+escape(data.method)+'</p>';
         if (kind==='global') return '<div class="rt-kpis">'+metric('有效观察',format(data.available_count,'项',0))+metric('批次标的',format(data.expected_count,'项',0))+
             metric('批次状态',data.acquisition_status==='COMPLETE'?'完整':data.acquisition_status==='PARTIAL'?'部分可用':'不可用')+metric('采集时间',escape(data.known_at))+'</div>'+
-            '<section class="rt-panel"><h3>同批次跨市场观察</h3>'+table(['标的','观察价格','较前收变化','市场时间','数据来源'],(data.rows||[]).map(x=>row([
-                escape(x.display_name),x.availability==='available'?format(x.price):'未取得数据',pct(x.change_pct),escape(x.market_time),escape(x.source)
+            '<section class="rt-panel"><h3>同批次跨市场观察</h3>'+table(['标的','观察价格','较前收变化','市场时间','数据来源 / 缺失原因'],(data.rows||[]).map(x=>row([
+                escape(x.display_name),x.availability==='available'?format(x.price):'未取得数据',pct(x.change_pct),escape(x.market_time),x.availability==='available'?escape(x.source):escape(x.missing_reason || '该批次未取得可核验报价')
             ])))+'</section><p class="rt-note">'+escape(data.method)+'<br>'+escape(data.horizon_note)+'<br>批次 '+escape(data.snapshot_id)+'</p>';
         if (kind === 'seats') {
             const charts = data.distribution || [], maximum = Math.max(1,...charts.map(x=>x.count));
@@ -58,7 +58,8 @@
     }
 
     function controls(kind, state, data) {
-        if (kind==='macro' || kind==='global' || kind==='futures') return '';
+        if (kind==='global') return '<label>观察方式<select data-rt-control="mode"><option value="latest"'+(state.mode==='latest'?' selected':'')+'>最新观察</option><option value="history"'+(state.mode==='history'?' selected':'')+'>所选日期历史批次</option></select></label>';
+        if (kind==='macro' || kind==='futures') return '';
         const select = (key,label,options) => `<label>${label}<select data-rt-control="${key}">${options.map(([value,text])=>`<option value="${escape(value)}"${String(state[key])===String(value)?' selected':''}>${escape(text)}</option>`).join('')}</select></label>`;
         if (kind==='seats') return select('seat','公开营业部',(data?.seats||[]).map(x=>[x.seat,x.seat]))+
             select('sessions','观察窗口',[[5,'近5个交易日'],[10,'近10个交易日']])+select('horizon','披露后观察',[[1,'1个交易日'],[3,'3个交易日'],[5,'5个交易日'],[10,'10个交易日']]);
@@ -68,13 +69,13 @@
     }
 
     function load(kind,date,container,options) {
-        const state = {date,seat:'',sessions:5,horizon:1,period:20,tmt:'false',start:date.slice(0,4)+(date.slice(5,7)>='07'?'-07-01':'-01-01')};
+        const state = {date,mode:kind==='global'&&container.dataset.rtGlobalMode==='history'?'history':'latest',seat:'',sessions:5,horizon:1,period:20,tmt:'false',start:date.slice(0,4)+(date.slice(5,7)>='07'?'-07-01':'-01-01')};
         const generation = String(Date.now())+Math.random();
         container.dataset.rtGeneration = generation;
         let latest = null, sequence = 0, timer = null;
         function current() {return container.dataset.rtGeneration===generation && (!options.isActive || options.isActive());}
         function shell(body, busy=false) {
-            container.innerHTML='<div class="research-tools"><header><div><h2>'+titles[kind]+'</h2><p>'+(kind==='futures'?'当前监测 · 不按全局历史日期回放':'观察日期 '+escape(date)+' · 公开数据研究')+'</p></div><button type="button" data-rt-refresh'+(busy?' disabled':'')+'>刷新</button></header>'+
+            container.innerHTML='<div class="research-tools"><header><div><h2>'+titles[kind]+'</h2><p>'+(kind==='futures'||kind==='global'&&state.mode==='latest'?'当前观察 · 不按全局历史日期回放':'观察日期 '+escape(date)+' · 公开数据研究')+'</p></div><button type="button" data-rt-refresh'+(busy?' disabled':'')+'>刷新</button></header>'+
                 '<form class="rt-controls">'+controls(kind,state,latest)+'</form>'+body+'</div>';
         }
         async function refresh() {
@@ -82,9 +83,9 @@
             const request = ++sequence;
             const query = new URLSearchParams(kind==='futures'?{}:{date});
             const path = {seats:'seat-observation',drawdowns:'period-drawdowns',breadth:'industry-breadth',macro:'macro-release',global:'global-context',futures:'global-futures'}[kind];
-            const keys = {seats:['seat','sessions','horizon'],drawdowns:['start','tmt'],breadth:['period'],macro:[],global:[],futures:[]}[kind];
+            const keys = {seats:['seat','sessions','horizon'],drawdowns:['start','tmt'],breadth:['period'],macro:[],global:['mode'],futures:[]}[kind];
             keys.forEach(key=>query.set(key,state[key]));
-            shell('<p class="rt-loading" role="status">正在读取所选日期的正式数据…</p>',true);
+            shell(latest ? render(kind,latest) : '<p class="rt-loading" role="status">正在读取已保存的观察批次…</p>',true);
             try {
                 const data = await options.request('/api/research/'+path+'?'+query,kind==='drawdowns'?115000:kind==='breadth'?35000:30000,{cache:'no-store'});
                 if (!current() || request!==sequence) return;
@@ -92,16 +93,16 @@
                 if (data.status==='unavailable') throw new Error('所选范围尚未取得可核验的公开记录');
                 latest=data;
                 if (kind==='seats') state.seat=data.selected_seat;
-                shell(render(kind,data)+'<footer>数据可用时间 '+escape(data.known_at)+(kind==='futures'?' · 当前行情观察':' · 历史研究按当前取得的证据展示')+'</footer>');
+                shell(render(kind,data)+'<footer>数据可用时间 '+escape(data.known_at)+(kind==='futures'||kind==='global'&&state.mode==='latest'?' · 最新批次，保留真实市场时间':' · 历史研究按当前取得的证据展示')+'</footer>');
             } catch (error) {
-                if (current() && request===sequence) shell('<p class="rt-error" role="alert">'+escape(error.message || '数据读取失败')+'</p>');
+                if (current() && request===sequence) shell((latest?render(kind,latest):'')+'<p class="rt-error" role="alert">'+escape(error.message || '数据读取失败')+'；已显示的数据保留原采集时间。</p>');
             } finally {
-                if (kind==='futures' && current() && request===sequence) timer=setTimeout(()=>{if(current())refresh();},120000);
+                if ((kind==='futures'||kind==='global'&&state.mode==='latest') && current() && request===sequence) timer=setTimeout(()=>{if(current())refresh();},120000);
             }
         }
         container.onchange = event => {
             const field=event.target.closest('[data-rt-control]');
-            if (field) {state[field.dataset.rtControl]=field.value; if(field.dataset.rtControl==='sessions')state.seat=''; refresh();}
+            if (field) {if(field.dataset.rtControl==='mode'){latest=null;container.dataset.rtGlobalMode=field.value;} state[field.dataset.rtControl]=field.value; if(field.dataset.rtControl==='sessions')state.seat=''; refresh();}
         };
         container.onsubmit = event => event.preventDefault();
         container.onclick = event => {

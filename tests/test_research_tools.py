@@ -171,3 +171,33 @@ assert.ok(!html.includes('NaN'));
 """.replace("PATH",json.dumps(str(path)))
     result = subprocess.run([node,"-e",body],capture_output=True,text=True,encoding="utf-8",timeout=10)
     assert result.returncode == 0,result.stdout+result.stderr
+
+
+def test_global_defaults_latest_and_preserves_history_mode_on_date_change():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node unavailable")
+    path = Path(__file__).resolve().parents[1]/"server/static/js/research-tools.js"
+    body = r'''
+const assert=require('node:assert/strict');
+global.setTimeout=()=>1;global.clearTimeout=()=>{};
+const tools=require(PATH), calls=[], container={dataset:{},innerHTML:''};
+const request=async url=>{
+ calls.push(url);const q=new URL('http://unit.test'+url).searchParams;
+ return {trade_date:q.get('date'),view_mode:q.get('mode'),status:'available',available_count:1,expected_count:41,
+  known_at:'2026-11-21 16:00:00',rows:[{display_name:'test',availability:'missing',missing_reason:'<source failed>'}]};
+};
+(async()=>{
+ await tools.load('global','2026-11-20',container,{request});
+ assert.match(calls[0],/mode=latest/);assert.match(container.innerHTML,/当前观察/);
+ assert.match(container.innerHTML,/&lt;source failed&gt;/);
+ container.onchange({target:{closest:()=>({dataset:{rtControl:'mode'},value:'history'})}});
+ await new Promise(resolve=>setImmediate(resolve));
+ assert.match(calls.at(-1),/mode=history/);
+ await tools.load('global','2026-11-19',container,{request});
+ assert.match(calls.at(-1),/date=2026-11-19.*mode=history/);
+ assert.match(container.innerHTML,/观察日期 2026-11-19/);
+})().catch(error=>{console.error(error);process.exitCode=1;});
+'''.replace("PATH",json.dumps(str(path)))
+    result=subprocess.run([node,"-e",body],capture_output=True,text=True,encoding="utf-8",timeout=10)
+    assert result.returncode == 0,result.stdout+result.stderr
