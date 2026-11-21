@@ -24,8 +24,8 @@ _MAX_PAYLOAD_BYTES = 1_000_000
 _FLOW_FIELDS = ("main_net_inflow", "max_net_inflow", "lg_net_inflow", "mid_net_inflow", "sm_net_inflow")
 
 
-def _path(*, create: bool = False) -> Path:
-    root = journal_runtime_root()
+def _path(*, create: bool = False, root: Path | None = None) -> Path:
+    root = root if root is not None else journal_runtime_root()
     if not root.is_absolute() or root.is_symlink() or not root.is_dir():
         raise OSError("sector observation runtime root unavailable")
     if os.name != "nt":

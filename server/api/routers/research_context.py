@@ -2,6 +2,7 @@
 from datetime import date, datetime, time
 from time import monotonic
 import json
+import sqlite3
 from urllib.parse import urljoin, urlparse
 import re
 
@@ -149,7 +150,23 @@ def build_global_context(day, mode="latest"):
     from biz.market_context.external_market import EXTERNAL_MARKET_SYMBOLS
     order = {symbol: i for i, (symbol, _) in enumerate(EXTERNAL_MARKET_SYMBOLS)}
     selected.sort(key=lambda item: order.get(item["symbol"], len(order)))
-    return {"trade_date":day,"view_mode":mode,"status":"available" if valid else "unavailable",
+    producer = None
+    if mode == "latest":
+        from server.common import market_dashboard_store
+        from server.common.trading_day_store import journal_runtime_root
+        root = journal_runtime_root() / "external-market"
+        try:
+            producer = {key: value for key, value in market_dashboard_store.runtime(root=root).items() if key != "token"}
+            if selected:
+                receipt = market_dashboard_store.component(str(selected[0]["captured_at"])[:10], "external", root=root)
+                producer["publication"] = {key: value for key, value in (receipt or {}).items()
+                    if key in ("snapshot_id", "persisted_sha256", "status", "captured_at", "context_date", "available_count", "expected_count", "missing_symbols")}
+            if (producer.get("lease_until") and producer.get("state") in ("RUNNING", "COMPLETE")
+                    and market_dashboard_store.stamp(producer["lease_until"]) < cutoff):
+                producer.update(state="FAILED", error="publisher_owner_lease_expired")
+        except (OSError, sqlite3.Error, RuntimeError, ValueError):
+            producer = {"state": "FAILED", "error": "runtime_metadata_unavailable"}
+    return {"trade_date":day,"view_mode":mode,"producer":producer,"status":"available" if valid else "unavailable",
             "snapshot_id":selected[0]["snapshot_id"] if selected else None,
             "known_at":str(selected[0]["captured_at"]) if selected else None,
             "available_count":valid,"expected_count":len(EXTERNAL_MARKET_SYMBOLS),"rows":selected,

@@ -28,7 +28,7 @@
             metric('批次状态',data.acquisition_status==='COMPLETE'?'完整':data.acquisition_status==='PARTIAL'?'部分可用':'不可用')+metric('采集时间',escape(data.known_at))+'</div>'+
             '<section class="rt-panel"><h3>同批次跨市场观察</h3>'+table(['标的','观察价格','较前收变化','市场时间','数据来源 / 缺失原因'],(data.rows||[]).map(x=>row([
                 escape(x.display_name),x.availability==='available'?format(x.price):'未取得数据',pct(x.change_pct),escape(x.market_time),x.availability==='available'?escape(x.source):escape(x.missing_reason || '该批次未取得可核验报价')
-            ])))+'</section><p class="rt-note">'+escape(data.method)+'<br>'+escape(data.horizon_note)+'<br>批次 '+escape(data.snapshot_id)+'</p>';
+            ])))+'</section><p class="rt-note">'+escape(data.method)+(data.producer?.state==='FAILED'?' 后台本轮采集未完成；可用记录继续展示，并保留实际采集时间。':'')+'<br>'+escape(data.horizon_note)+'<br>批次 '+escape(data.snapshot_id)+'</p>';
         if (kind === 'seats') {
             const charts = data.distribution || [], maximum = Math.max(1,...charts.map(x=>x.count));
             return '<div class="rt-kpis">' + metric('涉及股票',format(data.security_count,'只',0)) + metric('披露买入额',money(data.buy_amount)) +

@@ -565,7 +565,6 @@ _fast_lane_running_task_ids: set[int] = set()
 _bulk_history_running_task_ids: set[int] = set()
 _provider_maintenance_running_task_ids: set[int] = set()
 _quote_lane_running_task_ids: set[int] = set()
-_external_lane_running_task_ids: set[int] = set()
 _alert_lane_running_task_ids: set[int] = set()
 _delivery_lane_running_task_ids: set[int] = set()
 _exclusive_running_task_ids: set[int] = set()
@@ -586,7 +585,6 @@ _fast_lane_semaphore: threading.Semaphore | None = None
 _bulk_history_semaphore: threading.Semaphore | None = None
 _provider_maintenance_semaphore: threading.Semaphore | None = None
 _quote_lane_semaphore: threading.Semaphore | None = None
-_external_lane_semaphore: threading.Semaphore | None = None
 _alert_lane_semaphore: threading.Semaphore | None = None
 _delivery_lane_semaphore: threading.Semaphore | None = None
 _scheduler_thread: threading.Thread | None = None
@@ -4934,8 +4932,6 @@ def _task_timeout_minutes(
     now: datetime | None = None,
 ) -> int | None:
     task_type = str(row.get("task_type") or "").strip()
-    if task_type == "external_market_observation":
-        return 2
     if task_type in _FROZEN_SCHEDULED_TASK_TYPES:
         current = now or _now_shanghai_naive()
         if current.tzinfo is not None:
@@ -5420,7 +5416,6 @@ def _cleanup_stale_running_tasks(engine) -> int:
                     _bulk_history_running_task_ids.discard(task_id)
                     _provider_maintenance_running_task_ids.discard(task_id)
                     _quote_lane_running_task_ids.discard(task_id)
-                    _external_lane_running_task_ids.discard(task_id)
                     _alert_lane_running_task_ids.discard(task_id)
                     _delivery_lane_running_task_ids.discard(task_id)
                     _exclusive_running_task_ids.discard(task_id)
@@ -5436,7 +5431,6 @@ def _cleanup_stale_running_tasks(engine) -> int:
                     _bulk_history_running_task_ids.discard(task_id)
                     _provider_maintenance_running_task_ids.discard(task_id)
                     _quote_lane_running_task_ids.discard(task_id)
-                    _external_lane_running_task_ids.discard(task_id)
                     _alert_lane_running_task_ids.discard(task_id)
                     _delivery_lane_running_task_ids.discard(task_id)
                     _exclusive_running_task_ids.discard(task_id)
@@ -6665,10 +6659,6 @@ def _uses_fast_lane(row: dict) -> bool:
     return str(row.get("task_type") or "").strip() in FAST_LANE_TASK_TYPES
 
 
-def _uses_external_lane(row: dict) -> bool:
-    return str(row.get("task_type") or "").strip() == "external_market_observation"
-
-
 def _uses_quote_lane(row: dict) -> bool:
     return str(row.get("task_type") or "").strip() in QUOTE_LANE_TASK_TYPES
 
@@ -6726,13 +6716,6 @@ def _get_quote_lane_semaphore() -> threading.Semaphore:
     return _quote_lane_semaphore
 
 
-def _get_external_lane_semaphore() -> threading.Semaphore:
-    global _external_lane_semaphore
-    if _external_lane_semaphore is None:
-        _external_lane_semaphore = threading.Semaphore(1)
-    return _external_lane_semaphore
-
-
 def _get_alert_lane_semaphore() -> threading.Semaphore:
     global _alert_lane_semaphore
     if _alert_lane_semaphore is None:
@@ -6752,8 +6735,6 @@ def _task_lane_semaphore(row: dict) -> threading.Semaphore:
         return _get_bulk_history_semaphore()
     if _uses_provider_maintenance_lane(row):
         return _get_provider_maintenance_semaphore()
-    if _uses_external_lane(row):
-        return _get_external_lane_semaphore()
     if _uses_quote_lane(row):
         return _get_quote_lane_semaphore()
     if _uses_alert_lane(row):
@@ -6767,12 +6748,10 @@ def _task_lane_semaphore(row: dict) -> threading.Semaphore:
 
 def _scheduler_lane_has_capacity(row: dict, *, max_general_tasks: int) -> bool:
     """Return lane capacity while ``_running_lock`` is held by the caller."""
-    if _exclusive_running_task_ids and not (_uses_alert_lane(row) or _uses_external_lane(row)):
+    if _exclusive_running_task_ids and not _uses_alert_lane(row):
         return False
     if _uses_exclusive_lane(row):
-        return not (_running_task_ids - _alert_lane_running_task_ids - _external_lane_running_task_ids)
-    if _uses_external_lane(row):
-        return len(_external_lane_running_task_ids) < 1
+        return not (_running_task_ids - _alert_lane_running_task_ids)
     if _uses_quote_lane(row):
         return len(_quote_lane_running_task_ids) < 1
     if _uses_alert_lane(row):
@@ -6791,7 +6770,6 @@ def _scheduler_lane_has_capacity(row: dict, *, max_general_tasks: int) -> bool:
         - _bulk_history_running_task_ids
         - _provider_maintenance_running_task_ids
         - _quote_lane_running_task_ids
-        - _external_lane_running_task_ids
         - _delivery_lane_running_task_ids
         - _alert_lane_running_task_ids
     )
@@ -11472,7 +11450,7 @@ def _release_task_registry(task_id, history_run_uid):
             _timeout_requested_task_ids, _running_task_ids, _core_running_task_ids,
             _fast_lane_running_task_ids, _bulk_history_running_task_ids,
             _provider_maintenance_running_task_ids,
-            _quote_lane_running_task_ids, _external_lane_running_task_ids, _alert_lane_running_task_ids,
+            _quote_lane_running_task_ids, _alert_lane_running_task_ids,
             _delivery_lane_running_task_ids, _exclusive_running_task_ids):
         values.discard(task_id)
     _running_skip_logged_at.pop(task_id, None)
@@ -11655,8 +11633,6 @@ def launch_scheduler_task(
             _bulk_history_running_task_ids.add(task_id)
         if _uses_provider_maintenance_lane(row):
             _provider_maintenance_running_task_ids.add(task_id)
-        if _uses_external_lane(row):
-            _external_lane_running_task_ids.add(task_id)
         if _uses_quote_lane(row):
             _quote_lane_running_task_ids.add(task_id)
         if _uses_alert_lane(row):
@@ -11685,7 +11661,6 @@ def launch_scheduler_task(
             _bulk_history_running_task_ids.discard(task_id)
             _provider_maintenance_running_task_ids.discard(task_id)
             _quote_lane_running_task_ids.discard(task_id)
-            _external_lane_running_task_ids.discard(task_id)
             _alert_lane_running_task_ids.discard(task_id)
             _delivery_lane_running_task_ids.discard(task_id)
             _exclusive_running_task_ids.discard(task_id)
@@ -11700,7 +11675,6 @@ def launch_scheduler_task(
             _bulk_history_running_task_ids.discard(task_id)
             _provider_maintenance_running_task_ids.discard(task_id)
             _quote_lane_running_task_ids.discard(task_id)
-            _external_lane_running_task_ids.discard(task_id)
             _alert_lane_running_task_ids.discard(task_id)
             _delivery_lane_running_task_ids.discard(task_id)
             _exclusive_running_task_ids.discard(task_id)
@@ -11722,7 +11696,6 @@ def launch_scheduler_task(
             _bulk_history_running_task_ids.discard(task_id)
             _provider_maintenance_running_task_ids.discard(task_id)
             _quote_lane_running_task_ids.discard(task_id)
-            _external_lane_running_task_ids.discard(task_id)
             _alert_lane_running_task_ids.discard(task_id)
             _delivery_lane_running_task_ids.discard(task_id)
             _exclusive_running_task_ids.discard(task_id)
@@ -11752,7 +11725,6 @@ def launch_scheduler_task(
             _bulk_history_running_task_ids.discard(task_id)
             _provider_maintenance_running_task_ids.discard(task_id)
             _quote_lane_running_task_ids.discard(task_id)
-            _external_lane_running_task_ids.discard(task_id)
             _alert_lane_running_task_ids.discard(task_id)
             _delivery_lane_running_task_ids.discard(task_id)
             _exclusive_running_task_ids.discard(task_id)
@@ -11790,7 +11762,6 @@ def launch_scheduler_task(
             _bulk_history_running_task_ids.discard(task_id)
             _provider_maintenance_running_task_ids.discard(task_id)
             _quote_lane_running_task_ids.discard(task_id)
-            _external_lane_running_task_ids.discard(task_id)
             _alert_lane_running_task_ids.discard(task_id)
             _delivery_lane_running_task_ids.discard(task_id)
             _exclusive_running_task_ids.discard(task_id)
@@ -12245,7 +12216,6 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                     uses_delivery_lane = _uses_delivery_lane(row)
                     uses_fast_lane = _uses_fast_lane(row)
                     uses_provider_lane = _uses_provider_maintenance_lane(row)
-                    uses_external_lane = _uses_external_lane(row)
                     uses_quote_lane = _uses_quote_lane(row)
                     uses_alert_lane = _uses_alert_lane(row)
                     uses_exclusive_lane = _uses_exclusive_lane(row)
@@ -12322,8 +12292,6 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                         _bulk_history_running_task_ids.add(int(task_id))
                     if uses_provider_lane:
                         _provider_maintenance_running_task_ids.add(int(task_id))
-                    if uses_external_lane:
-                        _external_lane_running_task_ids.add(int(task_id))
                     if uses_quote_lane:
                         _quote_lane_running_task_ids.add(int(task_id))
                     if uses_alert_lane:
@@ -12346,7 +12314,6 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                         _bulk_history_running_task_ids.discard(int(task_id))
                         _provider_maintenance_running_task_ids.discard(int(task_id))
                         _quote_lane_running_task_ids.discard(int(task_id))
-                        _external_lane_running_task_ids.discard(int(task_id))
                         _alert_lane_running_task_ids.discard(int(task_id))
                         _delivery_lane_running_task_ids.discard(int(task_id))
                         _exclusive_running_task_ids.discard(int(task_id))
@@ -12363,7 +12330,6 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                         _bulk_history_running_task_ids.discard(int(task_id))
                         _provider_maintenance_running_task_ids.discard(int(task_id))
                         _quote_lane_running_task_ids.discard(int(task_id))
-                        _external_lane_running_task_ids.discard(int(task_id))
                         _alert_lane_running_task_ids.discard(int(task_id))
                         _delivery_lane_running_task_ids.discard(int(task_id))
                         _exclusive_running_task_ids.discard(int(task_id))
@@ -12384,7 +12350,6 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                         _bulk_history_running_task_ids.discard(int(task_id))
                         _provider_maintenance_running_task_ids.discard(int(task_id))
                         _quote_lane_running_task_ids.discard(int(task_id))
-                        _external_lane_running_task_ids.discard(int(task_id))
                         _alert_lane_running_task_ids.discard(int(task_id))
                         _delivery_lane_running_task_ids.discard(int(task_id))
                         _exclusive_running_task_ids.discard(int(task_id))
@@ -12423,7 +12388,6 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                         _bulk_history_running_task_ids.discard(int(task_id))
                         _provider_maintenance_running_task_ids.discard(int(task_id))
                         _quote_lane_running_task_ids.discard(int(task_id))
-                        _external_lane_running_task_ids.discard(int(task_id))
                         _alert_lane_running_task_ids.discard(int(task_id))
                         _delivery_lane_running_task_ids.discard(int(task_id))
                         _exclusive_running_task_ids.discard(int(task_id))
