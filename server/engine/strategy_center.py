@@ -4196,6 +4196,36 @@ def _dynamic_shadow_trade_session_ordinal(
     return ordinal
 
 
+def _research_execution_context(connection, context, *, source=None, analysis_run_uid=None,
+                                decision_known_at=None):
+    """Research rules consume the verified full score universe, including an empty formal pool."""
+    from server.engine.strategy_rule_language import STOCK_FIELDS
+    from server.common.daily_delivery_control import load_published_analysis_receipt
+    day = context["trade_date"]
+    if source is None:
+        snapshots = []
+        receipt = load_published_analysis_receipt(
+            connection, day, run_uid=analysis_run_uid, capture_score=snapshots.append,
+            decision_at=decision_known_at or datetime.now(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None),
+        )
+        snapshot = snapshots[0]
+    else:
+        receipt, snapshot = source
+    if (snapshot["trade_date"] != day or receipt["trade_date"] != day
+            or snapshot["run_uid"] != receipt["run_uid"]
+            or len(snapshot["scored_rows"]) != int(snapshot["stock_count"])):
+        raise ValueError("RESEARCH_FULL_SCORE_UNIVERSE_IDENTITY_INVALID")
+    fields = (*STOCK_FIELDS, "stock_code", "short_name", "stock_name", "close", "amount",
+              "industry_name", "industry_snapshot_source", "industry_snapshot_date",
+              "membership_proof_sha256", "flow_trade_date", "turnover_evidence_validated")
+    return {**context,
+        "recommendation_rows": tuple({key: row.get(key) for key in fields} for row in snapshot["scored_rows"]),
+        "market": {**context["market"], "research_input": {
+            "run_uid": receipt["run_uid"], "payload_sha256": receipt["score_snapshot"]["payload_sha256"],
+            "decision_at": snapshot["decision_at"], "stock_count": snapshot["stock_count"],
+        }}}
+
+
 def _dynamic_execution_signals(
     *,
     trade_date: str,
@@ -4234,6 +4264,7 @@ def _dynamic_execution_signals(
     statuses: list[dict[str, Any]] = []
     shadow_plan_groups: list[dict[str, Any]] = []
     native_source_cache: dict[tuple, Any] = {}
+    research_context = None
     native_context = context
     if decision_known_at is not None:
         native_context = {
@@ -4307,8 +4338,21 @@ def _dynamic_execution_signals(
             continue
         try:
             if source_kind == "runtime_registry":
+                runtime_context = context
+                if str(strategy.get("evaluator_type")) == "declarative_daily_research":
+                    if research_context is None:
+                        if governance_connection is not None:
+                            research_context = _research_execution_context(
+                                governance_connection, context, source=native_analysis_source,
+                                analysis_run_uid=analysis_run_uid, decision_known_at=decision_known_at)
+                        else:
+                            with get_engine().connect() as research_connection:
+                                research_context = _research_execution_context(
+                                    research_connection, context, analysis_run_uid=analysis_run_uid,
+                                    decision_known_at=decision_known_at)
+                    runtime_context = research_context
                 execution = execute_dynamic_adapter_candidate_batch(
-                    strategy, context, adapter_status=adapter,
+                    strategy, runtime_context, adapter_status=adapter,
                 )
             else:
                 from server.engine.strategy_shadow_trials import native_trial_candidate_batch
