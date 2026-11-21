@@ -159,7 +159,8 @@ def test_exact_market_ladder_claim_inserts_renews_and_recovers_its_audit(case, m
 @pytest.fixture(params=[
     (140, "intraday alert", "intraday_market_alert", "manual"),
     (37, "formal analysis", "analysis_fast", "release_catchup"),
-], ids=["intraday-alert", "formal-analysis"])
+    (70, "research worker", "trading_v2_job_worker", "manual"),
+], ids=["intraday-alert", "formal-analysis", "research-worker"])
 def atomic_claim(case, monkeypatch, request):
     engine, clock, _, _ = case
     task_id, task_name, task_type, explicit_trigger = request.param

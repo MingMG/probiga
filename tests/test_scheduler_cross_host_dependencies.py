@@ -237,9 +237,8 @@ def test_blocked_peer_dependency_does_not_abort_owned_gap_dispatch(windows_depen
         return original_due(row, **kwargs)
 
     monkeypatch.setattr(scheduler, "_release_build_catchup_allowed", owned_due)
-    claims = MagicMock(return_value=True)
-    monkeypatch.setattr(scheduler, "_claim_task_run", claims)
-    monkeypatch.setattr(scheduler, "_task_history_start", MagicMock(return_value="f" * 32))
+    claims = MagicMock(return_value=(True, "f" * 32))
+    monkeypatch.setattr(scheduler, "_claim_task_run_with_audit", claims)
     threads = MagicMock()
     monkeypatch.setattr(scheduler.threading, "Thread", threads)
     sets = ("_running_task_ids", "_core_running_task_ids", "_fast_lane_running_task_ids", "_bulk_history_running_task_ids", "_provider_maintenance_running_task_ids", "_quote_lane_running_task_ids", "_alert_lane_running_task_ids", "_delivery_lane_running_task_ids", "_exclusive_running_task_ids")

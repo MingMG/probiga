@@ -6083,15 +6083,10 @@ def _claim_task_run(row: dict, engine) -> bool:
 
 
 def _claim_task_run_with_audit(row: dict, engine, *, run_uid: str) -> tuple[bool, str | None]:
-    task_type = str(row.get("task_type") or "").strip()
-    if task_type == "intraday_market_alert" or (
-        task_type == "analysis_fast" and row.get("_release_analysis_research_mode") is not True
-    ):
-        history_uid = _task_history_start(engine, row, run_uid=run_uid, claim_first=True)
-        return history_uid is not None, history_uid
-    if not _claim_task_run(row, engine):
-        return False, None
-    return True, _task_history_start(engine, row, run_uid=run_uid)
+    # A crash or failed audit must roll back the claim as well. Every owner
+    # uses the existing atomic path; no unaudited RUNNING summary may escape.
+    history_uid = _task_history_start(engine, row, run_uid=run_uid, claim_first=True)
+    return history_uid is not None, history_uid
 
 
 def _build_task_args(row: dict, script_path: str, today: str) -> list[str]:
