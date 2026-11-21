@@ -84,6 +84,9 @@ def read_strategy_workspace(engine, trade_date: str = "") -> dict:
         window = str(item["window_days"])
         if window in row["windows"]:
             raise ValueError("duplicate strategy health window")
+        if not item["completed_trades"]:
+            for field in ("net_expectancy_pct", "profit_factor", "max_drawdown_pct", "win_rate_pct"):
+                item[field] = None
         row["windows"][window] = item
     for pick in picks:
         row = by_key.get(pick["dominant_strategy"])
