@@ -157,13 +157,16 @@ def register_new_strategy(
         _lock_challenger_namespace(connection)
         existing = connection.execute(text(
             "SELECT current_version FROM st_strategy_registry "
-            "WHERE strategy_key=:strategy_key FOR UPDATE"
+            "WHERE strategy_key=:strategy_key"
         ), {"strategy_key": key}).mappings().first()
         if existing is not None:
             raise StrategyAlreadyRegisteredError(
                 "该策略代码已存在；所有新版本必须先登记挑战者、"
                 "提交可重算证据并经复核后晋级"
             )
+        # The namespace lock serializes every registrar. Do not additionally
+        # gap-lock an absent strategy key: the registrar inserts on another
+        # connection and would wait on this transaction's own InnoDB gap lock.
         # The global database row lock remains held while the existing
         # append-only registrar commits, so concurrent /registry requests
         # cannot both observe an absent key.

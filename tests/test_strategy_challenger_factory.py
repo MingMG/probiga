@@ -488,7 +488,7 @@ def test_existing_key_registry_bypass_is_blocked_under_database_lock(
         )
     assert called == []
     assert "FOR UPDATE" in connection.sql[0]
-    assert "FOR UPDATE" in connection.sql[1]
+    assert "FOR UPDATE" not in connection.sql[1]
 
 
 def test_brand_new_key_registry_path_still_registers(monkeypatch):
