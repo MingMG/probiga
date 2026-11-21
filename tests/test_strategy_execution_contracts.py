@@ -1782,6 +1782,23 @@ def test_adapter_artifact_binds_exact_runtime_helper_symbol(monkeypatch):
     assert first != second
 
 
+def test_adapter_identity_ignores_unrelated_release_and_checkout_location(monkeypatch):
+    def fingerprint():
+        return compute_strategy_execution_adapter_artifact_sha256(
+            adapter_key="dynamic.helper", adapter_version="1.0.0",
+            evaluator_types={"dynamic_score"},
+            candidate_builder=adapter_with_rebindable_helper,
+        )
+
+    monkeypatch.setenv("PROBIGA_RELEASE_TREE_SHA256", "a" * 64)
+    first = fingerprint()
+    monkeypatch.setenv("PROBIGA_RELEASE_TREE_SHA256", "b" * 64)
+    original = adapter_with_rebindable_helper.__code__
+    monkeypatch.setattr(adapter_with_rebindable_helper, "__code__",
+                        original.replace(co_filename="/another/immutable/release/adapter.py"))
+    assert fingerprint() == first
+
+
 def test_adapter_artifact_rejects_transitive_helper_mutable_global():
     with pytest.raises(ValueError, match="helper拒绝可变或不透明全局"):
         compute_strategy_execution_adapter_artifact_sha256(

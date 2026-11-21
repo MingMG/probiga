@@ -5,6 +5,7 @@ import json
 from datetime import datetime
 
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
 from server.common.authoritative_market_clock import PRODUCTION_TIMEZONE, authoritative_closed_trade_date
 
@@ -74,6 +75,11 @@ def read_strategy_workspace(engine, trade_date: str = "") -> dict:
             WHERE context_date=(SELECT MAX(context_date) FROM st_external_market_context)
             ORDER BY captured_at DESC,snapshot_id DESC LIMIT 1
         """)
+        from server.engine.autonomous_strategy_research import read_research_workspace
+        try:
+            research = read_research_workspace(connection, health_rows=health)
+        except (SQLAlchemyError, ValueError, RuntimeError) as exc:
+            research = {"status": "FAILED", "reason": "自主研究审计读取失败：" + type(exc).__name__, "runs": []}
     by_key = {row["strategy_key"]: row for row in strategies}
     for row in strategies:
         row.update(enabled=bool(row["enabled"]), windows={}, picks=[])
@@ -105,6 +111,7 @@ def read_strategy_workspace(engine, trade_date: str = "") -> dict:
         "strategy_count": count, "strategies": strategies, "governance": run,
         "governance_current": bool(run and str(run["trade_date"])[:10] == day and run["input_ready"]),
         "tasks": tasks, "external_observation": external[0] if external else None,
+        "autonomous_research": research,
         "simulation_catalog": strategy_catalog(),
         "metric_basis": "扣费后单笔收益均值与已完成交易样本；不是账户累计收益。缺少当前版本证据时保留未知。",
         "automatic_real_order_submission": False, "real_order_authority": False,

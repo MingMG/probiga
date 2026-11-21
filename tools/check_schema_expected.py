@@ -56,6 +56,9 @@ def collect_schema_guard(
                 "error_type": type(exc).__name__,
                 "read_only": True,
             }
+            args = getattr(getattr(exc, "orig", exc), "args", ())
+            if args and type(args[0]) is int:
+                checks[name]["database_errno"] = args[0]
         else:
             checks[name] = {
                 "status": "READY",

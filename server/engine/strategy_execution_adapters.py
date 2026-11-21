@@ -247,6 +247,23 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _location_independent_code_bytes(code: CodeType) -> bytes:
+    """Bind executable content without the immutable checkout's absolute path."""
+    constants = tuple(
+        _normalized_code_object(item) if isinstance(item, CodeType) else item
+        for item in code.co_consts
+    )
+    return marshal.dumps(code.replace(co_filename="<strategy-artifact>", co_consts=constants))
+
+
+def _normalized_code_object(code: CodeType) -> CodeType:
+    return code.replace(
+        co_filename="<strategy-artifact>",
+        co_consts=tuple(_normalized_code_object(item) if isinstance(item, CodeType) else item
+                       for item in code.co_consts),
+    )
+
+
 def _release_tree_sha256(root: Path) -> str:
     declared = str(
         os.environ.get("PROBIGA_RELEASE_TREE_SHA256") or ""
@@ -306,6 +323,7 @@ def _module_dependency_contract(
         # Third-party and stdlib code are frozen by the dependency lock and ABI.
         return None
     trusted = _trusted_regular_file(path, root, label="项目依赖模块")
+    _release_tree_sha256(root)  # Validate the deployment seal independently of artifact identity.
     return {
         "module": str(module.__name__),
         "relative_path": trusted.relative_to(root).as_posix(),
@@ -448,7 +466,7 @@ def _function_runtime_dependency_contract(
                     "module": __name__,
                     "name": nested.__name__,
                     "code_marshaled_sha256": hashlib.sha256(
-                        marshal.dumps(nested.__code__)
+                        _location_independent_code_bytes(nested.__code__)
                     ).hexdigest(),
                     "module_file": _module_dependency_contract(
                         sys.modules[__name__], root,
@@ -494,7 +512,7 @@ def _function_runtime_dependency_contract(
         "name": name,
         "qualname": qualname,
         "code_marshaled_sha256": hashlib.sha256(
-            marshal.dumps(dependency.__code__)
+            _location_independent_code_bytes(dependency.__code__)
         ).hexdigest(),
         "defaults": _immutable_runtime_value_contract(
             tuple(dependency.__defaults__ or ())
@@ -706,7 +724,7 @@ def _callable_code_contract(
                     "module": __name__,
                     "name": dependency.__name__,
                     "code_marshaled_sha256": hashlib.sha256(
-                        marshal.dumps(dependency.__code__)
+                        _location_independent_code_bytes(dependency.__code__)
                     ).hexdigest(),
                     "module_file": _module_dependency_contract(
                         sys.modules[__name__], root,
@@ -735,13 +753,14 @@ def _callable_code_contract(
         root,
         label="生产依赖锁",
     )
+    _release_tree_sha256(root)  # Validate the deployment seal independently of artifact identity.
     return {
         "module": str(module.__name__),
         "qualname": qualname,
         "module_relative_path": module_path.relative_to(root).as_posix(),
         "module_file_sha256": _file_sha256(module_path),
         "code_marshaled_sha256": hashlib.sha256(
-            marshal.dumps(value.__code__)
+            _location_independent_code_bytes(value.__code__)
         ).hexdigest(),
         "project_dependencies": [
             dependencies[key] for key in sorted(dependencies)
@@ -750,7 +769,6 @@ def _callable_code_contract(
             _DEPENDENCY_LOCK_RELATIVE_PATH.as_posix()
         ),
         "dependency_lock_sha256": _file_sha256(lock_path),
-        "release_tree_sha256": _release_tree_sha256(root),
         "python_abi": _python_abi_contract(),
     }
 
@@ -770,7 +788,7 @@ def compute_strategy_execution_adapter_artifact_sha256(
     """Recompute the immutable artifact identity from deployed code."""
 
     return _digest({
-        "schema": "probiga.strategy-adapter-code-artifact.v2",
+        "schema": "probiga.strategy-adapter-code-artifact.v3",
         "adapter_key": str(adapter_key),
         "adapter_version": str(adapter_version),
         "evaluator_types": sorted(str(item) for item in evaluator_types),
@@ -1024,7 +1042,24 @@ _REGISTRY_SEAL_HASH = ""
 # Code-owned startup manifest. New dynamic strategies are added by deploying a
 # new immutable adapter here; database registration alone never grants code
 # execution or funding eligibility. The tuple has no fixed cardinality.
-_TRUSTED_STARTUP_ADAPTERS: tuple[StrategyExecutionAdapter, ...] = ()
+from server.engine.research_rule_adapter import (
+    ADAPTER_KEY as RESEARCH_ADAPTER_KEY, ADAPTER_VERSION as RESEARCH_ADAPTER_VERSION,
+    EVALUATOR_TYPES as RESEARCH_EVALUATOR_TYPES, research_candidate_rows, validate_research_strategy,
+)
+
+
+def research_candidate_builder(strategy, context):
+    return create_candidate_batch(strategy, context, research_candidate_rows(strategy, context))
+
+
+_TRUSTED_STARTUP_ADAPTERS: tuple[StrategyExecutionAdapter, ...] = (StrategyExecutionAdapter(
+    RESEARCH_ADAPTER_KEY, RESEARCH_ADAPTER_VERSION,
+    compute_strategy_execution_adapter_artifact_sha256(
+        adapter_key=RESEARCH_ADAPTER_KEY, adapter_version=RESEARCH_ADAPTER_VERSION,
+        evaluator_types=RESEARCH_EVALUATOR_TYPES, candidate_builder=research_candidate_builder,
+        validator=validate_research_strategy,
+    ), RESEARCH_EVALUATOR_TYPES, research_candidate_builder, validate_research_strategy,
+),)
 
 
 def seal_strategy_execution_adapter_registry() -> str:
@@ -1063,7 +1098,9 @@ def seal_strategy_execution_adapter_registry() -> str:
         return seal_hash
 
 
-def bootstrap_strategy_execution_adapter_registry() -> dict[str, Any]:
+def bootstrap_strategy_execution_adapter_registry(
+    *, registry_rows: Iterable[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Register the code manifest and explicitly seal every production process."""
 
     declared = {
@@ -1080,7 +1117,7 @@ def bootstrap_strategy_execution_adapter_registry() -> dict[str, Any]:
         register_strategy_execution_adapter(adapter)
     if _deployment_mode() == "production":
         seal_strategy_execution_adapter_registry()
-    return strategy_execution_adapter_capabilities()
+    return strategy_execution_adapter_capabilities(registry_rows=registry_rows)
 
 
 def _seal_production_registry() -> None:
