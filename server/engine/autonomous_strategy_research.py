@@ -365,6 +365,7 @@ def _step(connection, state, owner):
         from server.engine.strategy_challenger_factory import register_new_strategy
         pending = next((p for p in state["proposals"] if p["registration"]["status"] == "NOT_STARTED"), None)
         if pending is not None:
+            state["current_unit"] = "登记规则 · " + pending["name"]
             payload = _registration_payload(pending, state)
             existing = connection.execute(text("""SELECT r.current_version,r.current_status,v.parameters_json
                 FROM st_strategy_registry r JOIN st_strategy_version v
@@ -378,6 +379,7 @@ def _step(connection, state, owner):
                     raise ValueError("已注册的研究规则身份冲突，禁止覆盖")
                 registered = {"current_status": existing["current_status"], "strategy_key": pending["strategy_key"],
                               "current_version": existing["current_version"]}
+            state["current_unit"] = "核对研究候选 · " + pending["name"]
             rows, market, _snapshot = _source(connection, state)
             picks = select_rule_rows(pending["rule"], rows, market)
             pending["registration"] = {"status": "COMPLETE", "lifecycle": registered["current_status"],
