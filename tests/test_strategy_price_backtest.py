@@ -141,3 +141,55 @@ def test_missing_entry_identity_excludes_that_entry_but_preserves_known_cash_out
     assert r["completed_trade_count"] == 1
     assert len(r["nav"]) == 10 and r["nav"][0]["trade_date"] == days[20]
     assert r["funding_eligible"] is False
+
+
+def test_historical_bar_batches_fit_query_budget_without_losing_daily_scope(monkeypatch):
+    from sqlalchemy import event
+    from sqlalchemy.exc import OperationalError
+    from server.engine import strategy_price_backtest as price
+    from server.common.analysis_pool_receipt import canonical_sha256
+    from server.common.strategy_daily_input_window import daily_input_catalog_join
+
+    engine = create_engine('sqlite://')
+    days = [d.date().isoformat() for d in pd.bdate_range('2026-08-27', periods=8)]
+    codes = [f'{i:06d}' for i in range(5500)]
+    with engine.begin() as c:
+        c.execute(text('CREATE TABLE qmt_stock_catalog_member(batch_id TEXT,stock_code TEXT,instrument_type TEXT,list_date TEXT,expire_date TEXT,PRIMARY KEY(batch_id,stock_code))'))
+        c.execute(text('CREATE TABLE sm_stock_kline(stock_code TEXT,trade_date TEXT,k_type INT,adjust_type INT,received_at TEXT,open REAL,high REAL,low REAL,close REAL,pre_close REAL,volume REAL,amount REAL)'))
+        c.execute(text('CREATE INDEX idx_date_ktype ON sm_stock_kline(trade_date,k_type,adjust_type)'))
+        members = [{'code': code, 'kind': 'STOCK', 'listed': '2020-01-01', 'expired': None} for code in codes]
+        members += [{'code': '990001', 'kind': 'ETF', 'listed': '2020-01-01', 'expired': None},
+                    {'code': '990002', 'kind': 'STOCK', 'listed': '2026-10-01', 'expired': None},
+                    {'code': '990003', 'kind': 'STOCK', 'listed': '2020-01-01', 'expired': '2026-08-01'},
+                    {'code': '990004', 'kind': 'STOCK', 'listed': '2020-01-01', 'expired': None}]
+        c.execute(text("INSERT INTO qmt_stock_catalog_member VALUES('frozen',:code,:kind,:listed,:expired)"), members)
+        c.execute(text("INSERT INTO sm_stock_kline VALUES(:code,:day,1,0,'2026-09-10',10,11,9,10,10,1000,10000)"),
+                  [{'code': member['code'], 'day': day} for day in days for member in members])
+        c.execute(text("INSERT INTO sm_stock_kline VALUES('000001',:day,1,0,'2026-11-23',99,99,99,99,99,1000,10000)"), [{'day': day} for day in days])
+    scopes = {day: {'catalog': 'frozen', 'excluded_codes': ['990004'], 'stock_count': len(codes),
+                    'stock_set_hash': canonical_sha256(codes)} for day in days}
+    monkeypatch.setattr(price, '_resolved_scopes', lambda *_args: scopes)
+    inputs = {'part': {'row_counts': {day: len(codes) for day in days}}}
+    with engine.connect() as c:
+        driver = c.connection.driver_connection
+        def budget(conn, cursor, statement, parameters, context, executemany):
+            if 'SUBSTR(k.stock_code,1,6) stock_code' in statement:
+                used = 0
+                def progress():
+                    nonlocal used
+                    used += 1000
+                    return int(used > 1500000)
+                driver.set_progress_handler(progress, 1000)
+        event.listen(c, 'before_cursor_execute', budget)
+        join, params = daily_input_catalog_join({'sessions': days, 'catalog_batches_by_session': {day: 'frozen' for day in days}})
+        old_query = text('SELECT SUBSTR(k.stock_code,1,6) stock_code,k.trade_date,k.open,k.high,k.low,k.close,k.pre_close,k.volume,k.amount FROM sm_stock_kline k ' + join + " WHERE k.k_type=1 AND k.adjust_type=0 AND k.trade_date BETWEEN :start AND :end AND k.received_at<=:cutoff ORDER BY k.stock_code,k.trade_date LIMIT 60001")
+        try:
+            with pytest.raises(OperationalError, match='interrupted'):
+                c.execute(old_query, {**params, 'start': days[0], 'end': days[-1], 'cutoff': '2026-11-22'}).all()
+            rows = price._read_bars(c, days, inputs, '2026-11-22')
+        finally:
+            driver.set_progress_handler(None, 0)
+            event.remove(c, 'before_cursor_execute', budget)
+    assert len(rows) == len(days) * len(codes)
+    assert {row['close'] for row in rows} == {10}
+    assert {row['stock_code'] for row in rows} == set(codes)

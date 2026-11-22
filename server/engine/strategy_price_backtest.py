@@ -201,7 +201,8 @@ def _read_bars(connection, days, inputs, cutoff):
     expected = {day: n for part in inputs.values() for day, n in part["row_counts"].items()}
     if sum(expected[d] for d in days) > 500000:
         raise ValueError("单步历史行情超过500000行的内存上限")
-    width = max(1, min(8, 60000 // max(expected[d] for d in days)))
+    # A six-day join exceeded 12s in production; two A-share days read in 2.6s.
+    width = max(1, min(8, 16000 // max(expected[d] for d in days)))
     force = " FORCE INDEX (idx_date_ktype) " if connection.dialect.name == "mysql" else " "
     rows = []
     for offset in range(0, len(days), width):
