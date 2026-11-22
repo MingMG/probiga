@@ -23,6 +23,38 @@ def _formal_store(tmp_path):
     return FormalAnalysisStore(engine)
 
 
+@pytest.mark.parametrize("observed", [datetime(2026, 8, 30, 1, 45), datetime(2026, 11, 22, 18, 5)])
+def test_historical_nonfiling_proof_is_validated_on_the_fact_date(observed):
+    engine = _engine()
+    _install_finance_test_catalog(engine)
+    _install_prior_finance_coverage(engine)
+    target = date(2026, 8, 30)
+    cutoff = datetime(2026, 8, 30, 1, 30)
+    seal = pit.append_finance_atomic_batch_seal(engine, as_of_date=target, completed_known_at=cutoff)
+    verified = pit.load_finance_atomic_batch_seal(
+        engine, codes=["000001", "002731"], decision_at=cutoff,
+        as_of_date=target, seal_coverage_id=seal["seal_coverage_id"],
+    )
+    selection = pit.SealedFinanceInputs(
+        engine=engine, decision_at=observed, fact_cutoff_at=cutoff, as_of_date=target,
+        seal_id=verified["seal_coverage_id"], batch_root_sha256=verified["batch_root_sha256"],
+        members=verified["members"], exclusions={},
+    )
+    result = load_sealed_finance_facts(
+        engine, selection=selection, codes=["002731"], decision_at=observed,
+        fact_cutoff_at=cutoff, as_of_date=target,
+    )
+    assert result.reason_for("002731") == "PIT_FINANCE_EXPECTED_UNAVAILABLE"
+    assert "002731" not in result.facts
+    assert result.coverage_by_code["002731"]["valid_until"] == "2026-09-01"
+    expired = date(2026, 9, 2)
+    with pytest.raises(ValueError, match="NONFILING_EXPIRED:002731"):
+        load_sealed_finance_facts(
+            engine, selection=replace(selection, as_of_date=expired), codes=["002731"],
+            decision_at=observed, fact_cutoff_at=cutoff, as_of_date=expired,
+        )
+
+
 @pytest.mark.parametrize("exclude,masked_date", [(True, False), (False, False), (True, True)])
 def test_exact_finance_features_reuse_seal_and_skip_unbound_payloads(tmp_path, exclude, masked_date):
     engine = _engine()
