@@ -2,6 +2,7 @@
 from datetime import date,datetime,timedelta
 import json
 from time import monotonic
+from types import MappingProxyType
 
 from sqlalchemy import text
 
@@ -109,6 +110,68 @@ def _read_reconstruction(engine, candidate, *, codes, decision, start, end, dead
     return dict(selected.batch)
 
 
+def _bind_dated_live_selection(engine, proof, bound_members, *, codes, decision, start, end, deadline,
+        coverage_store=None, coverage_progress=None, event_progress=None):
+    from hashlib import sha256
+    from pathlib import Path
+    from server.common import pit_facts as pit
+    from server.common.qmt_announcement_pit import (
+        VALIDATION_INVENTORY_CODE_LIMIT, _assert_pit_fact_schema_prepared,
+        _live_announcement_reply_budget,
+    )
+
+    _assert_pit_fact_schema_prepared(engine)
+    if set(bound_members)!=set(codes):
+        raise ValueError('dated announcement validated member scope differs')
+    received=normalize_decision_at(proof['received_at'])
+    source=proof['source'];batch=proof['batch_id']
+    generation=pit.canonical_hash({'schema':'probiga.dated-live-event-selection.v1',
+        'batch':proof,'codes':codes,'decision':decision,'start':start,'end':end,
+        'reader':sha256(Path(__file__).read_bytes()).hexdigest(),
+        'rules':sha256(Path(pit.__file__).read_bytes()).hexdigest()})
+    members={}
+    with engine.connect() as c:
+        with _live_announcement_reply_budget(c,deadline=deadline,stage='signed-historical-isolation'):
+            if c.dialect.name=='mysql' and c.get_isolation_level().upper() not in {'REPEATABLE READ','SERIALIZABLE'}:
+                raise ValueError('dated announcement requires a repeatable-read snapshot')
+        with c.begin():
+            for offset in range(0,len(codes),VALIDATION_INVENTORY_CODE_LIMIT):
+                group=codes[offset:offset+VALIDATION_INVENTORY_CODE_LIMIT]
+                key=pit.canonical_hash({'codes':group})
+                expected={code:pit._json_safe(bound_members[code][0]) for code in group}
+                retained=coverage_store.get(generation,'dated_live_event_coverage',key) if coverage_store else None
+                fresh=retained is None
+                if fresh:
+                    # The complete batch already verified these bodies and its global root.
+                    # Check ancestry at its receipt; later observations only determine heads.
+                    links=pit._read_signed_historical_coverage_links(c,
+                        exact_ids={code:row['coverage_id'] for code,row in expected.items()},received=received,
+                        head_frontier=decision,deadline=deadline,offset=offset,source=source)
+                    retained={}
+                    for code,row in expected.items():
+                        parent,head=links[row['coverage_id']]
+                        if (row['revision_no']!=(parent['revision_no']+1 if parent else 1)
+                                or (row['supersedes_coverage_id'] or None)!=(parent['coverage_id'] if parent else None)
+                                or (parent and normalize_decision_at(row['known_at'])<pit._row_datetime(parent['known_at']))):
+                            raise ValueError('dated announcement selected predecessor differs')
+                        retained[code]=[row,head]
+                if set(retained)!=set(group):
+                    raise ValueError('dated announcement cached member scope differs')
+                for code,(row,head) in retained.items():
+                    if (type(head) is not bool or row!=expected[code] or row['stock_code']!=code
+                            or row['source']!=source or row['batch_id']!=batch or row['watermark_kind']!='QUERY_CUTOFF'
+                            or row['scope_hash']!=pit._source_coverage_scope_hash('event',code,source)
+                            or not normalize_decision_at(row['received_at'])<=normalize_decision_at(row['known_at'])<=received<=decision):
+                        raise ValueError('dated announcement cached member identity differs')
+                    members[code]=(MappingProxyType(row),head)
+                if fresh and coverage_store:
+                    coverage_store.put(generation,'dated_live_event_coverage',key,retained)
+                done=offset+len(group)
+                if coverage_progress:coverage_progress(done,len(codes),generation,fresh and coverage_store is not None)
+                if event_progress:event_progress(done,len(codes))
+    return pit._LiveEventSelection(engine,decision,start,end,MappingProxyType(dict(proof)),MappingProxyType(members))
+
+
 def validate_dated_announcement_batch(engine,*,codes,decision_at,window_start,window_end,expected_trade_date,
         capture_historical_selection=None,capture_live_reuse=None,event_progress=None,
         coverage_store=None,coverage_progress=None):
@@ -122,11 +185,13 @@ def validate_dated_announcement_batch(engine,*,codes,decision_at,window_start,wi
         invalid=[]
         for candidate in candidates:
             if candidate['watermark_kind']!='QUERY_CUTOFF':continue
+            bound=[]
             try:
                 proof=validate_complete_qmt_announcement_batch(engine,codes=requested,decision_at=decision,
                     window_start=start,window_end=end,source=source,
                     fact_cutoff_at=candidate['covered_through_at'],_required_batch_id=candidate['batch_id'],
-                    _deadline_monotonic=deadline)
+                    _deadline_monotonic=deadline,
+                    _capture_bound_members=bound.append if capture_historical_selection is not None else None)
             except QMTAnnouncementBlocked as error:
                 if error.reason_code=='QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND':
                     if error.detail!='no-common-batch':invalid.append(error)
@@ -135,6 +200,11 @@ def validate_dated_announcement_batch(engine,*,codes,decision_at,window_start,wi
                 raise
             if normalize_decision_at(proof['fact_cutoff_at']).date()!=target:
                 raise ValueError('historical announcement validated cutoff differs from target')
+            if capture_historical_selection is not None:
+                if len(bound)!=1:raise ValueError('dated announcement validated capture differs')
+                capture_historical_selection(_bind_dated_live_selection(engine,proof,bound[0],codes=requested,
+                    decision=decision,start=start,end=end,deadline=deadline,coverage_store=coverage_store,
+                    coverage_progress=coverage_progress,event_progress=event_progress))
             if capture_live_reuse is not None:capture_live_reuse()
             return proof
         if invalid:raise invalid[-1]

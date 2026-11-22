@@ -11,9 +11,9 @@ from sqlalchemy.exc import OperationalError
 from server.common import pit_facts as pit
 
 
-def test_historical_chain_filters_future_revisions_before_row_reads(monkeypatch):
+@pytest.mark.parametrize('source',['cninfo.announcement','qmt.announcement','eastmoney.notice'])
+def test_historical_chain_filters_future_revisions_before_row_reads(monkeypatch,source):
     engine = create_engine('sqlite://')
-    source = 'cninfo.announcement'
     codes = ['000001', '000002']
     scopes = {code: pit._source_coverage_scope_hash('event', code, source) for code in codes}
     selected, parents, rows = {}, {}, []
@@ -25,7 +25,7 @@ def test_historical_chain_filters_future_revisions_before_row_reads(monkeypatch)
             identifier = pit.canonical_hash({'schema': 'probiga.pit-source-coverage-id.v1',
                 'scope_hash': scopes[code], 'coverage_fingerprint_hash': fingerprint})
             rows.append({'id': identifier, 'scope': scopes[code], 'code': code, 'rev': revision,
-                         'parent': previous, 'known': clock.isoformat(sep=' '), 'fingerprint': fingerprint})
+                         'parent': previous, 'known': clock.isoformat(sep=' '), 'fingerprint': fingerprint,'source':source})
             if revision == 6:
                 selected[code], parents[code] = identifier, previous
             previous = identifier
@@ -35,7 +35,7 @@ def test_historical_chain_filters_future_revisions_before_row_reads(monkeypatch)
             covered_through_at TEXT,coverage_status TEXT,coverage_fingerprint_hash TEXT,fact_kind TEXT,source TEXT)'''))
         c.execute(text('CREATE UNIQUE INDEX uk_pit_coverage_scope_revision ON st_pit_source_coverage(scope_hash,revision_no)'))
         c.execute(text('CREATE INDEX idx_pit_coverage_decision ON st_pit_source_coverage(fact_kind,stock_code,known_at)'))
-        c.execute(text("INSERT INTO st_pit_source_coverage VALUES(:id,:scope,:code,:rev,:parent,:known,:known,:known,'COMPLETE',:fingerprint,'event','cninfo.announcement')"), rows)
+        c.execute(text("INSERT INTO st_pit_source_coverage VALUES(:id,:scope,:code,:rev,:parent,:known,:known,:known,'COMPLETE',:fingerprint,'event',:source)"), rows)
     with engine.connect() as c:
         driver = c.connection.driver_connection
         def bounded_access(_c, _cursor, statement, parameters, _context, _many):
@@ -52,13 +52,13 @@ def test_historical_chain_filters_future_revisions_before_row_reads(monkeypatch)
             old = text('''SELECT coverage_id,scope_hash,stock_code,revision_no,supersedes_coverage_id,
                 known_at,received_at,covered_through_at,coverage_status,coverage_fingerprint_hash
                 FROM st_pit_source_coverage INDEXED BY uk_pit_coverage_scope_revision
-                WHERE scope_hash IN :scopes AND fact_kind='event' AND source='cninfo.announcement'
+                WHERE scope_hash IN :scopes AND fact_kind='event' AND source=:source
                 AND known_at<=:received AND received_at<=:received ORDER BY scope_hash,revision_no''').bindparams(bindparam('scopes', expanding=True))
             with pytest.raises(OperationalError, match='interrupted'):
-                c.execute(old, {'scopes': list(scopes.values()), 'received': received}).all()
+                c.execute(old, {'scopes': list(scopes.values()), 'received': received,'source':source}).all()
             monkeypatch.setattr(engine.dialect, 'name', 'mysql')
             links = pit._read_signed_historical_coverage_links(c, exact_ids=selected, received=received,
-                head_frontier=received, deadline=monotonic() + 10, offset=0)
+                head_frontier=received, deadline=monotonic() + 10, offset=0,source=source)
             assert set(links) == set(selected.values())
             assert all(links[selected[code]][0]['coverage_id'] == parents[code] for code in codes)
             assert all(head for _, head in links.values())
@@ -68,9 +68,9 @@ def test_historical_chain_filters_future_revisions_before_row_reads(monkeypatch)
         with monkeypatch.context() as sqlite:
             sqlite.setattr(engine.dialect, 'name', 'sqlite')
             future = pit._read_signed_historical_coverage_links(c, exact_ids=selected, received=received,
-                head_frontier=datetime(2026, 9, 4), deadline=monotonic() + 10, offset=0)
+                head_frontier=datetime(2026, 9, 4), deadline=monotonic() + 10, offset=0,source=source)
             assert all(not head for _, head in future.values())
             c.execute(text("UPDATE st_pit_source_coverage SET stock_code='999999' WHERE scope_hash=:scope AND revision_no=3"), {'scope': scopes['000001']})
             with pytest.raises(ValueError, match='chain differs'):
                 pit._read_signed_historical_coverage_links(c, exact_ids=selected, received=received,
-                    deadline=monotonic() + 10, offset=0)
+                    deadline=monotonic() + 10, offset=0,source=source)

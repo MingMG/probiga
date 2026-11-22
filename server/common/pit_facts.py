@@ -41,7 +41,6 @@ from server.common.finance_nonfiling_evidence import (
     EVIDENCE_SCHEMA as FINANCE_NONFILING_BODY_SCHEMA,
     validate_document_body_evidence,
 )
-from server.common.pit_event_coverage_checkpoint import EventCoverageCheckpoint
 
 if TYPE_CHECKING:
     from server.common.daily_delivery_control import FrozenInitialAnnouncement, FrozenPremarketAnnouncement
@@ -5043,7 +5042,7 @@ def _coverage_payload_row(
 
 def _read_indexed_event_coverage_inventory(
     connection: Connection, *, codes: list[str], source: str, decision_at: datetime,
-    deadline: float, stage: str, include_metadata: bool = False,
+    deadline: float, stage: str,
 ) -> dict[str, dict[str, Any]]:
     from server.common.qmt_announcement_pit import (
         _live_announcement_read_hint,
@@ -5053,10 +5052,7 @@ def _read_indexed_event_coverage_inventory(
     code_by_scope = {_source_coverage_scope_hash("event", code, source): code for code in codes}
     inventory_stage = f"{stage}:inventory"
     hint = _live_announcement_read_hint(mysql=True, deadline=deadline, stage=inventory_stage)
-    columns = (
-        ",".join(sorted(_REQUIRED_COLUMNS[SOURCE_COVERAGE_TABLE] - {"payload_json"}))
-        if include_metadata else "coverage_id, stock_code, scope_hash, revision_no"
-    )
+    columns = "coverage_id, stock_code, scope_hash, revision_no"
     inventory = text(
         f"SELECT {hint}{columns} "
         f"FROM {SOURCE_COVERAGE_TABLE} FORCE INDEX (uk_pit_coverage_scope_revision) "
@@ -5137,60 +5133,6 @@ def _read_indexed_event_coverage_rows(
     yield from _read_indexed_event_coverage_payloads(
         connection, expected=expected, source=source, deadline=deadline, stage=stage,
     )
-
-
-def _read_verified_event_coverage_chunk(
-    connection: Connection, *, codes: list[str], source: str, decision_at: datetime,
-    deadline: float, stage: str, checkpoint: EventCoverageCheckpoint,
-) -> tuple[dict[str, list[dict[str, Any]]], set[str]]:
-    """Validate only the suffix after a matching, previously verified prefix."""
-    inventory = _read_indexed_event_coverage_inventory(
-        connection, codes=codes, source=source, decision_at=decision_at, deadline=deadline,
-        stage=stage, include_metadata=True,
-    )
-    scopes: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for row in inventory.values():
-        scopes[row["scope_hash"]].append(row)
-    prior = checkpoint.load(list(scopes))
-    prefixes, pending = {}, {}
-    for scope, rows in scopes.items():
-        count, digest = prior.get(scope, (0, ""))
-        if type(count) is not int or not 0 < count <= len(rows) or canonical_hash(rows[:count]) != digest:
-            count = 0
-        prefixes[scope] = count
-        pending.update((row["coverage_id"], row) for row in rows[count:])
-
-    packed = {
-        row["coverage_id"]: row
-        for row in _read_indexed_event_coverage_payloads(
-            connection, expected=pending, source=source, deadline=deadline, stage=stage,
-        )
-    }
-    valid, invalid, verified = {}, set(), []
-    for scope, rows in scopes.items():
-        count = prefixes[scope]
-        head = rows[count - 1] if count else None
-        suffix = rows[count:]
-        try:
-            _validate_coverage_chain(
-                (
-                    _coverage_payload_row(
-                        packed.pop(row["coverage_id"]), mysql=True, stage="common_cutoff_event_coverage",
-                    )
-                    for row in suffix
-                ),
-                first_revision=count + 1,
-                previous_id=head["coverage_id"] if head else None,
-                previous_known=_row_datetime(head["known_at"]) if head else None,
-            )
-        except ValueError:
-            invalid.add(rows[0]["stock_code"])
-            continue
-        valid[scope] = rows
-        if suffix:
-            verified.append((scope, len(rows), canonical_hash(rows)))
-    checkpoint.save(verified)
-    return valid, invalid
 
 
 def _load_latest_finance_atomic_seal_evidence(
@@ -5807,6 +5749,7 @@ def _load_certified_initial_event_selection(
 def _read_signed_historical_coverage_links(
     connection: Connection, *, exact_ids: Mapping[str, str], received: datetime,
     deadline: float, offset: int, head_frontier: datetime | None = None,
+    source: str = CNINFO_EVENT_SOURCE,
 ) -> dict[str, tuple[Mapping[str, Any] | None, bool]]:
     """Verify coverage links and the original frontier without reading other batches' payloads."""
     from server.common.qmt_announcement_pit import _live_announcement_read_hint, _live_announcement_reply_budget
@@ -5816,7 +5759,7 @@ def _read_signed_historical_coverage_links(
     hint = _live_announcement_read_hint(mysql=mysql, deadline=deadline, stage=stage)
     # Filter the observation time in the index before fetching later revisions' rows.
     index = " FORCE INDEX (idx_pit_coverage_decision)" if mysql else ""
-    code_by_scope = {_source_coverage_scope_hash("event", code, CNINFO_EVENT_SOURCE): code for code in exact_ids}
+    code_by_scope = {_source_coverage_scope_hash("event", code, source): code for code in exact_ids}
     statement = text(
         f"SELECT {hint}coverage_id,scope_hash,stock_code,revision_no,supersedes_coverage_id,"
         "known_at,received_at,covered_through_at,coverage_status,coverage_fingerprint_hash "
@@ -5828,7 +5771,7 @@ def _read_signed_historical_coverage_links(
     selected_revisions = {}
     with _live_announcement_reply_budget(connection, deadline=deadline, stage=stage):
         with connection.execute(statement, {
-            "scopes": sorted(code_by_scope), "codes": sorted(exact_ids), "source": CNINFO_EVENT_SOURCE, "received": received,
+            "scopes": sorted(code_by_scope), "codes": sorted(exact_ids), "source": source, "received": received,
         }) as result:
             for scope, chain in groupby(result.mappings(), key=lambda row: row["scope_hash"]):
                 code = code_by_scope[scope]
@@ -5866,7 +5809,7 @@ def _read_signed_historical_coverage_links(
         stage = f"signed-historical-heads:{offset}"
         hint = _live_announcement_read_hint(mysql=mysql, deadline=deadline, stage=stage)
         head_index = " FORCE INDEX (uk_pit_coverage_scope_revision)" if mysql else ""
-        required, head_params = [], {"source":CNINFO_EVENT_SOURCE, "frontier":head_frontier}
+        required, head_params = [], {"source":source, "frontier":head_frontier}
         for number, (scope, revision) in enumerate(sorted(selected_revisions.items())):
             required.append(f"SELECT :head_scope_{number} AS scope_hash,:head_revision_{number} AS revision_no")
             head_params[f"head_scope_{number}"] = scope
@@ -6244,7 +6187,6 @@ def resolve_common_fact_cutoff(
     include_event_facts: bool = True,
     capture_historical_selection: Callable[[HistoricalEventRead], None] | None = None,
     capture_finance_selection: Callable[[SealedFinanceInputs], None] | None = None,
-    event_checkpoint_path: Path | None = None,
     event_progress: Callable[[int, int], None] | None = None,
     event_trade_date: date | str | None = None,
     event_coverage_store=None, event_coverage_progress=None,
@@ -6319,7 +6261,7 @@ def resolve_common_fact_cutoff(
     if finance_observation_at is not None and not finance_batch:
         return {**blocked, "reason":"PIT_HISTORICAL_FINANCE_BATCH_NOT_FOUND"}
     event_batch: dict[str, Any] = {}
-    historical_selections: list[HistoricalAnnouncementSelection] = []
+    historical_selections: list[HistoricalAnnouncementSelection | _LiveEventSelection] = []
     reusable_live_batch: list[bool] = []
     signed_selection = signed_historical_bindings = None
     if signed_source is not None:
@@ -6359,7 +6301,7 @@ def resolve_common_fact_cutoff(
                 **({'expected_trade_date':event_trade_date, 'event_progress':event_progress,
                     'coverage_store':event_coverage_store, 'coverage_progress':event_coverage_progress} if event_trade_date is not None else {}),
                 capture_historical_selection=(
-                    historical_selections.append if capture_historical_selection else None
+                    historical_selections.append if capture_historical_selection or event_trade_date is not None else None
                 ),
                 capture_live_reuse=(
                     (lambda: reusable_live_batch.append(True)) if capture_historical_selection else None
@@ -6457,28 +6399,6 @@ def resolve_common_fact_cutoff(
                     }:
                         raise ValueError("common cutoff requires a repeatable-read snapshot")
                 with connection.begin():
-                    checkpoint = None
-                    if compressed and event_checkpoint_path is not None:
-                        from server.engine.strategy_governance import validate_privileged_trigger_migration_seal
-
-                        # A checkpoint stands in only for payloads protected by
-                        # the attested append-only schema on this database.
-                        with _live_announcement_reply_budget(
-                            connection, deadline=deadline, stage="common-cutoff-checkpoint-identity",
-                        ):
-                            try:
-                                seal = validate_privileged_trigger_migration_seal(connection)
-                            except RuntimeError:
-                                logger.warning("Event coverage checkpoint identity is unavailable; verifying the full input")
-                            else:
-                                identity = {
-                                    "version": EventCoverageCheckpoint.VERSION,
-                                    "server": seal["trigger_inventory_server_uuid"],
-                                    "database": seal["trigger_inventory_seal_database"],
-                                    "contract": seal["pit_fact_schema_contract_hash"],
-                                    "seal": seal["trigger_inventory_table_comment"],
-                                }
-                                checkpoint = EventCoverageCheckpoint(event_checkpoint_path, canonical_hash(identity))
                     if coverage_progress is not None:
                         coverage_progress(0, len(normalized_codes))
                     for offset in range(0, len(normalized_codes), batch_size):
@@ -6487,23 +6407,6 @@ def resolve_common_fact_cutoff(
                             "codes": normalized_codes[offset:offset + batch_size],
                         }
                         stage = f"common-cutoff-coverage:{offset}"
-                        if checkpoint is not None:
-                            prior_revisions = checkpoint.committed_revisions
-                            verified, invalid = _read_verified_event_coverage_chunk(
-                                connection, codes=parameters["codes"], source=parameters["event_source"],
-                                decision_at=decision, deadline=deadline, stage=stage, checkpoint=checkpoint,
-                            )
-                            if event_coverage_progress is not None:
-                                event_coverage_progress(
-                                    offset + len(parameters["codes"]), len(normalized_codes), checkpoint.namespace,
-                                    checkpoint.committed_revisions > prior_revisions,
-                                )
-                            bad.update(("event", code) for code in invalid)
-                            for scope, chain in verified.items():
-                                yield ("event", chain[0]["stock_code"], scope), chain, False, True
-                            if coverage_progress is not None:
-                                coverage_progress(offset + len(parameters["codes"]), len(normalized_codes))
-                            continue
                         chains: dict[
                             tuple[str, str, str], list[dict[str, Any]]
                         ] = defaultdict(list)

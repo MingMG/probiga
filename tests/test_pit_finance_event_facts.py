@@ -2984,7 +2984,7 @@ def test_common_cutoff_reports_only_fixed_announcement_reply_stages(monkeypatch,
     engine.dispose()
 
 
-@pytest.mark.parametrize("fault", [None, "predecessor", "later-timeout", "missing-payload", "checkpoint-resume"])
+@pytest.mark.parametrize("fault", [None, "predecessor", "later-timeout", "missing-payload", "dated-snapshot"])
 def test_live_common_cutoff_preserves_full_event_chains_with_bounded_mysql_transport(
     monkeypatch, tmp_path, fault,
 ):
@@ -3090,11 +3090,87 @@ def test_live_common_cutoff_preserves_full_event_chains_with_bounded_mysql_trans
             f"SELECT coverage_id, LENGTH(CAST(payload_json AS BLOB)) FROM {SOURCE_COVERAGE_TABLE}"
         )).tuples().all())
     mysql_reader = _mysql_seal_transport(engine)
+    if fault == 'dated-snapshot':
+        import re
+        from server.common.formal_analysis_store import FormalAnalysisStore
+        from server.db.formal_analysis_schema import privileged_migrate_formal_analysis_schema
+        from server.common import qmt_announcement_pit as announcement_module
+        privileged_migrate_formal_analysis_schema(engine)
+        store=FormalAnalysisStore(engine)
+        check_sink=announcement_module._assert_pit_fact_schema_prepared
+        monkeypatch.setattr(announcement_module,'_assert_pit_fact_schema_prepared',
+            lambda target:check_sink(engine if target is mysql_reader else target))
+        def mysql_indexes(_c,_cursor,sql,parameters,_context,_many):
+            return re.sub(r' FORCE INDEX \([A-Za-z0-9_]+\)','',sql),parameters
+        event.listen(engine,'before_cursor_execute',mysql_indexes,retval=True)
+        dated={**kwargs,'event_trade_date':cutoff.date(),'event_coverage_store':store}
+        selected=[]
+        assert resolve_common_fact_cutoff(engine,**dated,capture_historical_selection=selected.append)==expected
+        assert selected[0].selection.members[codes[-1]][1] is False
+        assert all('payload_json' not in row for row,_head in selected[0].selection.members.values())
+        event_kwargs=dict(codes=codes,decision_at=kwargs['decision_at'],fact_cutoff_at=expected['fact_cutoff_at'],
+            start_date=start,end_date=cutoff.date(),require_qmt_complete_batch=True)
+        original_events=load_event_facts(engine,**event_kwargs)
+
+        # A later observation's body cannot belong to this historical snapshot.
+        with engine.begin() as c:
+            future=c.execute(text("SELECT coverage_id FROM st_pit_source_coverage WHERE batch_id='event-coverage-successor'")).scalar_one()
+            columns=[r[1] for r in c.exec_driver_sql('PRAGMA table_info(st_pit_source_coverage)')]
+            attempted=[]
+            def selected_payload_only(coverage_id,payload):
+                if coverage_id==future:
+                    attempted.append(coverage_id)
+                    raise ValueError('later observation payload must not be read')
+                return payload
+            c.connection.driver_connection.create_function('selected_payload_only',2,selected_payload_only)
+        def guard_payload(_c,_cursor,sql,parameters,_context,_many):
+            if 'FROM st_pit_source_coverage' in sql:
+                if sql.startswith('SELECT * FROM st_pit_source_coverage'):
+                    projection=[('selected_payload_only(coverage_id,payload_json) AS payload_json' if x=='payload_json' else x) for x in columns]
+                    sql=sql.replace('SELECT *','SELECT '+','.join(projection),1)
+                else:
+                    sql=sql.replace('COMPRESS(payload_json)','COMPRESS(selected_payload_only(coverage_id,payload_json))')
+            return sql,parameters
+        event.listen(engine,'before_cursor_execute',guard_payload,retval=True)
+        assert resolve_common_fact_cutoff(engine,**kwargs)['status']==PIT_DATA_BLOCKED
+        assert attempted==[future]
+        attempted.clear()
+        dated_selected=[]
+        assert resolve_common_fact_cutoff(mysql_reader,**dated,capture_historical_selection=dated_selected.append)==expected
+        assert load_event_facts(mysql_reader,**event_kwargs,historical_selection=dated_selected[0])==original_events
+        assert not attempted
+
+        # New grouping exercises a real partial commit, then skips its chain read.
+        monkeypatch.setattr('server.common.qmt_announcement_pit.VALIDATION_INVENTORY_CODE_LIMIT',20)
+        later={**dated,'decision_at':'2026-08-30 18:31:01'}
+        class CoverageDeadline(BaseException):pass
+        committed=[]
+        def interrupt(done,total,scope,fresh):
+            if fresh:
+                committed.append((done,total,scope))
+                raise CoverageDeadline()
+        with pytest.raises(CoverageDeadline):
+            resolve_common_fact_cutoff(mysql_reader,**later,event_coverage_progress=interrupt)
+        assert committed[0][:2]==(20,45)
+        assert len(store.list_members(committed[0][2],'dated_live_event_coverage'))==1
+        read_links=pit_module._read_signed_historical_coverage_links
+        offsets=[]
+        def record_links(*args,**options):
+            offsets.append(options['offset'])
+            return read_links(*args,**options)
+        monkeypatch.setattr(pit_module,'_read_signed_historical_coverage_links',record_links)
+        progress=[]
+        resumed=resolve_common_fact_cutoff(mysql_reader,**later,event_coverage_progress=lambda *v:progress.append(v))
+        assert resumed['status']==PIT_AVAILABLE and offsets==[20,40]
+        assert [v[3] for v in progress]==[False,True,True]
+        assert resumed['receipts']==expected['receipts']
+        event.remove(engine,'before_cursor_execute',guard_payload)
+        event.remove(engine,'before_cursor_execute',mysql_indexes)
+        engine.dispose()
+        return
     inventories, size_reads, payloads = [], [], []
-    checkpoint_interrupted = False
 
     def record(connection, _cursor, sql, parameters, context, _many):
-        nonlocal checkpoint_interrupted
         if "FORCE INDEX (uk_pit_coverage_scope_revision)" in sql:
             bindings = context.compiled_parameters[0]
             scopes = [value for key, value in bindings.items() if key.startswith("scope_hashes_")]
@@ -3110,9 +3186,6 @@ def test_live_common_cutoff_preserves_full_event_chains_with_bounded_mysql_trans
             ids = [value for key, value in bindings.items() if key.startswith("coverage_ids_")]
             payloads.append((connection.get_transaction(), ids, sql, context.execution_options))
             if fault == "later-timeout" and len(inventories) == 2:
-                raise OperationalError(sql, parameters, Exception(3024, "execution deadline"))
-            if fault == "checkpoint-resume" and len(inventories) == 2 and not checkpoint_interrupted:
-                checkpoint_interrupted = True
                 raise OperationalError(sql, parameters, Exception(3024, "execution deadline"))
             if fault == "missing-payload" and len(inventories) == 2:
                 sql += f" AND coverage_id<>'{ids[0]}'"
@@ -3144,81 +3217,6 @@ def test_live_common_cutoff_preserves_full_event_chains_with_bounded_mysql_trans
     event.listen(engine, "before_cursor_execute", record, retval=True)
     selections = []
     try:
-        if fault == "checkpoint-resume":
-            monkeypatch.setattr(
-                "server.engine.strategy_governance.validate_privileged_trigger_migration_seal",
-                lambda _connection: {
-                    "trigger_inventory_server_uuid": "isolated-database",
-                    "trigger_inventory_seal_database": "isolated-schema",
-                    "pit_fact_schema_contract_hash": "contract",
-                    "trigger_inventory_table_comment": "attested-schema",
-                },
-            )
-            checkpoint_args = {"event_checkpoint_path": tmp_path / "analysis-state" / "event.sqlite"}
-            progress = []
-            durable = []
-            checkpoint_args['event_coverage_progress'] = lambda *values: durable.append(values)
-            interrupted = resolve_common_fact_cutoff(
-                mysql_reader, **kwargs, **checkpoint_args,
-                event_progress=lambda done, total: progress.append((done, total)),
-            )
-            assert interrupted["status"] == PIT_DATA_BLOCKED
-            assert interrupted["receipt_root_hash"] == "" and interrupted["receipts"] == []
-            assert progress == [(0, 45), (40, 45)]
-            assert len(durable) == 1 and durable[0][:2] == (40, 45) and durable[0][3] is True
-            namespace = durable[0][2]
-            first_chunk_ids = {key for _, keys, *_ in payloads[:-1] for key in keys}
-            assert first_chunk_ids
-            inventories.clear()
-            size_reads.clear()
-            payloads.clear()
-
-            resumed = resolve_common_fact_cutoff(
-                mysql_reader, **kwargs, **checkpoint_args, capture_historical_selection=selections.append,
-            )
-            assert resumed == expected
-            assert len(inventories) == 2
-            assert payloads and not any(first_chunk_ids.intersection(keys) for _, keys, *_ in payloads)
-            assert durable[-2:] == [(40, 45, namespace, False), (45, 45, namespace, True)]
-
-            damaged_checkpoint = tmp_path / "analysis-state" / "damaged.sqlite"
-            damaged_checkpoint.write_text("invalid local state", encoding="utf-8")
-            damaged_checkpoint.chmod(0o600)
-            assert resolve_common_fact_cutoff(
-                mysql_reader, **kwargs, event_checkpoint_path=damaged_checkpoint,
-            ) == expected
-
-            late = append_source_coverage(
-                engine, fact_kind="event", stock_code=codes[0], window_start=start,
-                window_end=cutoff.date(), known_at="2026-08-30 18:32:00",
-                covered_through_at="2026-08-30 18:32:00", watermark_kind="CAPTURED_AT",
-                watermark_evidence={"source_call": "success"}, source_rows=[], fact_bindings=[],
-                source=CNINFO_ANNOUNCEMENT_SOURCE, batch_id="event-coverage-late",
-            )
-            inventories.clear()
-            size_reads.clear()
-            payloads.clear()
-            assert resolve_common_fact_cutoff(mysql_reader, **kwargs, **checkpoint_args) == expected
-            assert not payloads and not size_reads
-            assert durable[-2:] == [(40, 45, namespace, False), (45, 45, namespace, False)]
-
-            later = {**kwargs, "decision_at": "2026-08-30 18:33:00"}
-            assert resolve_common_fact_cutoff(mysql_reader, **later, **checkpoint_args) == (
-                resolve_common_fact_cutoff(engine, **later)
-            )
-            assert [key for _, keys, *_ in payloads for key in keys] == [late.coverage_id]
-
-            with engine.begin() as connection:
-                connection.execute(text("DROP TRIGGER trg_pit_source_coverage_immutable_bu"))
-                connection.execute(text(
-                    f"UPDATE {SOURCE_COVERAGE_TABLE} SET watermark_hash='broken' "
-                    "WHERE batch_id='event-coverage-prior' AND stock_code=:code"
-                ), {"code": codes[-1]})
-            corrupted = resolve_common_fact_cutoff(mysql_reader, **later, **checkpoint_args)
-            assert corrupted["status"] == PIT_DATA_BLOCKED
-            assert corrupted["reason"] == f"PIT_COMMON_CUTOFF_INCOMPLETE:event:{codes[-1]}:BAD_CHAIN"
-            engine.dispose()
-            return
         actual = resolve_common_fact_cutoff(mysql_reader, **kwargs, capture_historical_selection=selections.append)
         assert_bounded_reads()
         if fault is None:
