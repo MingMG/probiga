@@ -5866,17 +5866,7 @@ def _bind_signed_historical_event_selection(
     window_start: date, window_end: date,
     event_progress: Callable[[int, int], None] | None = None, binding_units: int = 0,
 ) -> HistoricalAnnouncementSelection:
-    from server.common.pit_source_coverage_index import PIT_SOURCE_COVERAGE_BATCH_INDEX_NAME
-    from server.common.qmt_announcement_pit import (
-        LIVE_ANNOUNCEMENT_BATCH_VALIDATION_BUDGET_SECONDS, VALIDATION_READ_BATCH_SIZE,
-        AnnouncementCatalog, HistoricalAnnouncementSelection,
-        QMT_ANNOUNCEMENT_RECONSTRUCTION_BATCH_SCHEMA, QMT_ANNOUNCEMENT_TASK_SCHEMA,
-        _batch_root_from_entries, _bounded_announcement_payload_keys, _fallback_receipt_valid,
-        _live_announcement_read_hint, _live_announcement_reply_budget, _qmt_time,
-        _read_live_announcement_payload_rows, _read_live_announcement_payload_sizes,
-        _reconstruction_authority_matches, _source_publication_within_window, validate_task_result,
-    )
-    from server.common.qmt_stock_catalog import load_stock_catalog
+    from server.common.qmt_announcement_pit import QMT_ANNOUNCEMENT_TASK_SCHEMA, validate_task_result
 
     if (
         receipt.get("schema") != QMT_ANNOUNCEMENT_TASK_SCHEMA
@@ -5888,6 +5878,37 @@ def _bind_signed_historical_event_selection(
         or validate_task_result(dict(receipt), 0) != "complete"
     ):
         raise ValueError("signed historical announcement stage identity differs")
+    selected = _bind_historical_event_snapshot(
+        engine, receipt, codes=codes, decision=decision, received=received,
+        frontier=received, window_start=window_start, window_end=window_end,
+        event_progress=event_progress, binding_units=binding_units,
+    )
+    return replace(selected, batch=MappingProxyType({**selected.batch, "initial_stage": {
+        "attempt_uid": receipt["stage_attempt_uid"],
+        "evidence_sha256": receipt["stage_evidence_sha256"],
+        "completed_at": _dt_text(completion),
+    }}))
+
+
+def _bind_historical_event_snapshot(
+    engine: Engine, receipt: Mapping[str, Any], *, codes: list[str],
+    decision: datetime, received: datetime, frontier: datetime,
+    window_start: date, window_end: date,
+    event_progress: Callable[[int, int], None] | None = None, binding_units: int = 0,
+    deadline: float | None = None,
+) -> HistoricalAnnouncementSelection:
+    from server.common.pit_source_coverage_index import PIT_SOURCE_COVERAGE_BATCH_INDEX_NAME
+    from server.common.qmt_announcement_pit import (
+        LIVE_ANNOUNCEMENT_BATCH_VALIDATION_BUDGET_SECONDS, VALIDATION_READ_BATCH_SIZE,
+        AnnouncementCatalog, HistoricalAnnouncementSelection,
+        QMT_ANNOUNCEMENT_RECONSTRUCTION_BATCH_SCHEMA,
+        _batch_root_from_entries, _bounded_announcement_payload_keys, _fallback_receipt_valid,
+        _live_announcement_read_hint, _live_announcement_reply_budget, _qmt_time,
+        _read_live_announcement_payload_rows, _read_live_announcement_payload_sizes,
+        _reconstruction_authority_matches, _source_publication_within_window,
+    )
+    from server.common.qmt_stock_catalog import load_stock_catalog
+
     source = CNINFO_EVENT_SOURCE
     batch_id = receipt["batch_id"]
     root = receipt["batch_root_hash"]
@@ -5895,6 +5916,28 @@ def _bind_signed_historical_event_selection(
     cutoff = _row_datetime(receipt["source_query_cutoff_at"])
     provenance = receipt["reconstruction_provenance"]
     authority = provenance["authority"]
+    from server.common.qmt_announcement_pit import (
+        QMT_ANNOUNCEMENT_RECONSTRUCTION_SCHEMA, _persisted_reconstruction_execution_origin_matches,
+    )
+    if (
+        provenance.get("schema") != QMT_ANNOUNCEMENT_RECONSTRUCTION_SCHEMA
+        or provenance.get("mode") != "HISTORICAL_RECONSTRUCTION"
+        or canonical_hash({k: v for k, v in provenance.items() if k != "reconstruction_sha256"})
+        != provenance.get("reconstruction_sha256")
+        or receipt["reconstruction_sha256"] != provenance.get("reconstruction_sha256")
+        or provenance.get("target_trade_date") != window_end.isoformat()
+        or _row_datetime(provenance.get("reconstructed_at")) != received
+        or _row_datetime(provenance.get("known_at")) != received or received > decision
+        or cutoff != datetime.combine(window_end, datetime.max.time())
+        or provenance.get("provider") != CNINFO_EVENT_SOURCE or provenance.get("source") != CNINFO_EVENT_SOURCE
+        or re.fullmatch(r"[0-9a-f]{32}", str(provenance.get("scheduler_run_uid") or "")) is None
+        or re.fullmatch(r"[0-9a-f]{40}", str(provenance.get("build_sha") or "")) is None
+        or provenance.get("build_sha") == "0" * 40
+        or provenance.get("automatic_real_order_submission") is not False
+        or provenance.get("real_order_authority") is not False
+        or not _persisted_reconstruction_execution_origin_matches(provenance, authority)
+    ):
+        raise ValueError("historical announcement reconstruction provenance differs")
     if (
         not codes or not start <= window_start <= window_end
         or receipt["window_end"] != window_end.isoformat()
@@ -5906,7 +5949,8 @@ def _bind_signed_historical_event_selection(
     ):
         raise ValueError("historical announcement durable batch differs from its signed stage receipt")
 
-    deadline = monotonic() + LIVE_ANNOUNCEMENT_BATCH_VALIDATION_BUDGET_SECONDS
+    if deadline is None:
+        deadline = monotonic() + LIVE_ANNOUNCEMENT_BATCH_VALIDATION_BUDGET_SECONDS
     entries = []
     members = {}
     requested = set(codes)
@@ -5914,6 +5958,8 @@ def _bind_signed_historical_event_selection(
     master = provenance["security_master"]
     master_started = _row_datetime(master["started_at"])
     master_ended = _row_datetime(master["ended_at"])
+    if not _row_datetime(provenance["reconstruction_started_at"]) <= master_started <= master_ended <= received:
+        raise ValueError("historical announcement security master timing differs")
     requested_start = _qmt_time(datetime.combine(start, datetime.min.time()))
     requested_end = _qmt_time(cutoff)
     with engine.connect() as connection:
@@ -5929,6 +5975,9 @@ def _bind_signed_historical_event_selection(
             catalog.manifest_hash != receipt["catalog_manifest_hash"]
             or catalog.member_set_hash != receipt["catalog_member_set_hash"]
             or len(catalog_codes) != receipt["stock_count"]
+            or provenance.get("catalog_member_count") != len(catalog_codes)
+            or any(provenance.get(field) != receipt[field] for field in (
+                "catalog_batch_id", "catalog_manifest_hash", "catalog_member_set_hash"))
             or canonical_hash(catalog_codes) != provenance.get("catalog_codes_sha256")
             or not requested.issubset(catalog_codes)
             or not _reconstruction_authority_matches(
@@ -5973,7 +6022,7 @@ def _bind_signed_historical_event_selection(
         for offset in range(0, len(inventory), VALIDATION_READ_BATCH_SIZE):
             stock_batch = dict(inventory[offset:offset + VALIDATION_READ_BATCH_SIZE])
             links = _read_signed_historical_coverage_links(
-                connection, exact_ids=stock_batch, received=received, deadline=deadline, offset=offset,
+                connection, exact_ids=stock_batch, received=frontier, deadline=deadline, offset=offset,
             )
             sizes = _read_live_announcement_payload_sizes(
                 connection, source=source, batch_id=batch_id, coverage_ids=list(stock_batch.values()),
@@ -6073,11 +6122,6 @@ def _bind_signed_historical_event_selection(
             "incremental_chain_root_hash": next(iter(incremental_hashes)),
             "fact_cutoff_at": _dt_text(cutoff), "source_query_cutoff_at": _dt_text(cutoff),
             "decision_at": _dt_text(received), "received_at": _dt_text(received), "reconstructed_at": _dt_text(received),
-            "initial_stage": {
-                "attempt_uid": receipt["stage_attempt_uid"],
-                "evidence_sha256": receipt["stage_evidence_sha256"],
-                "completed_at": _dt_text(completion),
-            },
         }),
         members=MappingProxyType(members),
     )
@@ -6235,7 +6279,7 @@ def resolve_common_fact_cutoff(
                 decision_at=decision,
                 window_start=windows["event"][0],
                 window_end=windows["event"][1],
-                **({'expected_trade_date':event_trade_date} if event_trade_date is not None else {}),
+                **({'expected_trade_date':event_trade_date, 'event_progress':event_progress} if event_trade_date is not None else {}),
                 capture_historical_selection=(
                     historical_selections.append if capture_historical_selection else None
                 ),
