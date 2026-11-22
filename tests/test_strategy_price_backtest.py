@@ -173,7 +173,7 @@ def test_historical_bar_batches_fit_query_budget_without_losing_daily_scope(monk
     with engine.connect() as c:
         driver = c.connection.driver_connection
         def budget(conn, cursor, statement, parameters, context, executemany):
-            if 'SUBSTR(k.stock_code,1,6) stock_code' in statement:
+            if statement.lstrip().startswith('SELECT'):
                 used = 0
                 def progress():
                     nonlocal used
