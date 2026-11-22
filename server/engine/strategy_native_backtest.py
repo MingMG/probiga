@@ -146,7 +146,7 @@ def _window(c,state,days,inputs):
 
 def _v3_day(c,state,day,owner):
     from server.common.strategy_daily_input_window import V3_DAILY_INPUT_SESSIONS
-    from server.common.pit_facts import resolve_common_fact_cutoff,PIT_AVAILABLE
+    from server.common.pit_facts import resolve_strategy_fact_cutoffs,PIT_AVAILABLE
     from server.common.historical_announcement_read import has_dated_announcement_candidate
     from server.trading_v3.daily_features import normalize_daily_bars,build_daily_feature_universe,DailyFactInputs
     from server.trading_v3.regime import classify_regime_probabilities
@@ -199,7 +199,7 @@ def _v3_day(c,state,day,owner):
             proposal['validation'].update(status='RUNNING',reason=f'公告来源核对 {day}：已保存 {done}/{total} 个成员')
         state['last_progress_at']=str(now_shanghai());_save(c,state,owner)
     if fact_inputs is None:
-        cutoff=resolve_common_fact_cutoff(c.engine,codes=eligible,decision_at=known,finance_start_date='1900-01-01',
+        cutoff=resolve_strategy_fact_cutoffs(c.engine,codes=eligible,decision_at=known,finance_start_date='1900-01-01',
             finance_end_date=day,event_start_date=target-timedelta(days=20),event_end_date=day,require_qmt_event_batch=True,
             event_trade_date=day,capture_finance_selection=finances.append,capture_historical_selection=events.append,
             finance_observation_at=finance_observation,
@@ -212,19 +212,24 @@ def _v3_day(c,state,day,owner):
         reason=cutoff['reason']
         _assert_read_succeeded(reason)
         return {'status':'BLOCKED','reason':reason,'identity':identity_proof,'signals':{}}
-    fact_clock=datetime.fromisoformat(cutoff['fact_cutoff_at'])
-    if fact_clock.date()!=target or fact_clock<datetime.fromisoformat(day+' 15:35:00'):
-        return {'status':'BLOCKED','reason':'历史共同事实截止时间不能覆盖当日收盘','fact_cutoff':cutoff['fact_cutoff_at'],'signals':{}}
+    source_clocks={kind:datetime.fromisoformat(value) for kind,value in cutoff['source_cutoff_at'].items()}
+    fact_clock=max(source_clocks.values())
+    if (any(clock.date()!=target for clock in source_clocks.values())
+            or source_clocks['event']<datetime.fromisoformat(day+' 15:35:00')):
+        return {'status':'BLOCKED','reason':'历史公告截止时间不能覆盖当日收盘或财务批次日期错误',
+            'source_cutoff_at':cutoff['source_cutoff_at'],'signals':{}}
     if len(finances)!=1 or len(events)!=1:raise ValueError('历史事实快照未完整移交')
+    signal_clock=max(fact_clock,datetime.fromisoformat(str(identity_proof['captured_at'])),
+        datetime.fromisoformat(str(events[0].selection.batch.get('received_at') or fact_clock)))
     if fact_inputs is None:
         fact_inputs=DailyFactInputs(cutoff,finances[0],events[0])
         save_snapshot(c.engine,generation,fact_inputs)
     if (fact_inputs.finance.decision_at!=known or fact_inputs.finance.as_of_date!=target
-            or fact_inputs.finance.fact_cutoff_at!=fact_clock or set(events[0].selection.members)!=eligible):
+            or fact_inputs.finance.fact_cutoff_at!=source_clocks['finance'] or set(events[0].selection.members)!=eligible):
         raise ValueError('native cached historical fact scope differs')
     from server.common.pit_sealed_finance_read import load_sealed_finance_facts
     financial=load_sealed_finance_facts(c.engine,selection=finances[0],codes=eligible,decision_at=known,
-        fact_cutoff_at=fact_clock,as_of_date=target,formal_store=FormalAnalysisStore(c.engine),
+        fact_cutoff_at=source_clocks['finance'],as_of_date=target,formal_store=FormalAnalysisStore(c.engine),
         formal_generation_sha256=generation,read_progress=lambda done,total:progress(done,total,'finance'))
     from server.common.pit_sealed_event_read import load_sealed_event_facts
     def event_progress(done,total,scope,fresh):
@@ -279,7 +284,7 @@ def _v3_day(c,state,day,owner):
             multiplier=sum(market.probabilities[k]*weights[k] for k in weights)
             if candidate is None or multiplier<=0 or market.risk_asset_cap<=0:continue
             selected[key].append({**candidate,'industry':stock.get('industry_name'),
-                'signal_known_at':max(str(fact_clock),str(identity_proof['captured_at'])),
+                'signal_known_at':str(signal_clock),
                 'source_snapshot_hash':dataset['data_snapshot_hash'],'historical_production_decision':False})
     for key,rows in selected.items():
         rows.sort(key=lambda r:(-r['effective_score'],r['stock_code']))
@@ -287,7 +292,8 @@ def _v3_day(c,state,day,owner):
     return {'status':'COMPLETE','signals':selected,'scored_stocks':scored,'missing_feature_stocks':missing,
         'finance_scope_exclusions':excluded,'finance_seal_coverage_id':baseline['seal_coverage_id'],
         'universe_identity_exclusion_count':max(0,frame.attrs['qmt_daily_input_window']['latest_daily_truth']['attested_row_count']-len(identity)),
-        'data_snapshot_hash':dataset['data_snapshot_hash'],'fact_cutoff':str(fact_clock),'identity':identity_proof,
+        'data_snapshot_hash':dataset['data_snapshot_hash'],'fact_cutoff':str(fact_clock),
+        'source_cutoff_at':cutoff['source_cutoff_at'],'identity':identity_proof,
         'interpretation':'CURRENT_FROZEN_RULES_WITHOUT_FUTURE_CALIBRATIONS'}
 
 
