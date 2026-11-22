@@ -27,6 +27,8 @@ def main() -> int:
             result["autonomous_research"] = research_tick(engine)
             if result["autonomous_research"]["status"] in {"COMPLETE", "BLOCKED", "FAILED"}:
                 from server.engine.strategy_native_backtest import native_tick
+                from server.engine.strategy_native_control import consume_retries
+                result["native_retry_control"] = consume_retries(engine)
                 result["native_backtest"] = native_tick(engine)
     finally:
         engine.dispose()

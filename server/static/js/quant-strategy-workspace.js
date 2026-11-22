@@ -49,8 +49,10 @@
         h+='<details data-qsw-key="backtest-archive"><summary>全部历史报告与研究回放（'+esc(d.results.length)+' 份）</summary><p>旧版本和身份未完整绑定的存档均保留原标记，不计入当前策略收益。</p>'+resultTable(d.results,false)+(d.history_limit_reached?'<p>此处展示最近100份正式回测；更早结果请在回测结果页查询。</p>':'')+'</details>';
         if(s.resultLoading)h+='<p role="status">正在读取交易明细…</p>';
         if(s.resultError)h+='<p class="qsw-error">'+esc(s.resultError)+'</p>';
+        if(s.resultNotice)h+='<p role="status">'+esc(s.resultNotice)+'</p>';
         const x=s.resultDetail;
         if(x){const r=x.summary;
+            if(r.kind==='NATIVE_SHADOW_RETROSPECTIVE'&&r.status==='FAILED')h+='<button type="button" data-qsw-retry="'+esc(r.result_id)+'"'+(s.resultLoading?' disabled':'')+'>从断点重试</button>';
             h+='<article class="qsw-result-detail"><h4>'+esc(r.strategy_name||r.strategy_key||r.reported_strategy_key||'历史报告')+' · 交易明细与证据</h4><p>'+esc(r.strategy_version)+' · '+esc(r.reason)+'</p><p>账户累计收益 '+metric(resultReturn(r),'%')+'；账户净盈利 '+metric(resultProfit(r),'元')+'；已平仓交易净盈利 '+metric(r.closed_trade_net_pnl_cny,'元')+'。费用属于原回测假设，真实成交另行验证。</p>';
             if(r.available_feature_sessions!=null)h+='<p>历史冻结特征 '+esc(r.available_feature_sessions)+' / '+esc(r.required_sessions)+' 日。'+esc((x.missing_feature_dates||[]).length)+' 日缺失。</p><details data-qsw-key="missing-'+esc(r.result_id)+'"><summary>缺失交易日</summary><p>'+esc((x.missing_feature_dates||[]).join('、'))+'</p></details>';
             if(r.return_scope==='VERIFIED_INPUT_SUBSET')h+='<p class="qsw-warning">上面的收益仅为可用输入子集回放；精确日期身份覆盖 '+esc(r.identity_covered_sessions)+' 个交易日，排除 '+esc(r.input_exclusion_count)+' 次证据不足的拟入场，不能代表完整策略收益。</p>';
@@ -157,7 +159,14 @@
         mount.onclick=async e=>{
             const tab=e.target.closest('[data-qsw-tab]'), code=e.target.closest('[data-qsw-stock]');
             const result=e.target.closest('[data-qsw-result]');
-            if(result){
+            const retry=e.target.closest('[data-qsw-retry]');
+            if(retry){
+                if(s.resultLoading)return;
+                s.resultLoading=true;s.resultError='';s.resultNotice='';paint(s);
+                try{await request('/api/quant-workbench/strategy-performance/'+encodeURIComponent(retry.dataset.qswRetry)+'/retry?request_uid='+crypto.randomUUID().replace(/-/g,''),20000,{method:'POST'});s.resultNotice='恢复请求已登记，等待后台从原断点接续。';refreshPerformance();}
+                catch(err){s.resultError='恢复请求失败：'+(err.message||err);}
+                finally{s.resultLoading=false;if(mount.isConnected)paint(s);}
+            }else if(result){
                 if(s.resultLoading)return;
                 s.resultLoading=true;s.resultError='';paint(s);
                 try{const d=await request('/api/quant-workbench/strategy-performance/'+encodeURIComponent(result.dataset.qswResult)+'?offset='+(Number(result.dataset.qswOffset)||0),20000,{cache:'no-store'});if(mount.isConnected)s.resultDetail=d;}
