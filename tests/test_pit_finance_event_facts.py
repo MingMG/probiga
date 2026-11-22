@@ -3156,6 +3156,8 @@ def test_live_common_cutoff_preserves_full_event_chains_with_bounded_mysql_trans
             )
             checkpoint_args = {"event_checkpoint_path": tmp_path / "analysis-state" / "event.sqlite"}
             progress = []
+            durable = []
+            checkpoint_args['event_coverage_progress'] = lambda *values: durable.append(values)
             interrupted = resolve_common_fact_cutoff(
                 mysql_reader, **kwargs, **checkpoint_args,
                 event_progress=lambda done, total: progress.append((done, total)),
@@ -3163,6 +3165,8 @@ def test_live_common_cutoff_preserves_full_event_chains_with_bounded_mysql_trans
             assert interrupted["status"] == PIT_DATA_BLOCKED
             assert interrupted["receipt_root_hash"] == "" and interrupted["receipts"] == []
             assert progress == [(0, 45), (40, 45)]
+            assert len(durable) == 1 and durable[0][:2] == (40, 45) and durable[0][3] is True
+            namespace = durable[0][2]
             first_chunk_ids = {key for _, keys, *_ in payloads[:-1] for key in keys}
             assert first_chunk_ids
             inventories.clear()
@@ -3175,6 +3179,7 @@ def test_live_common_cutoff_preserves_full_event_chains_with_bounded_mysql_trans
             assert resumed == expected
             assert len(inventories) == 2
             assert payloads and not any(first_chunk_ids.intersection(keys) for _, keys, *_ in payloads)
+            assert durable[-2:] == [(40, 45, namespace, False), (45, 45, namespace, True)]
 
             damaged_checkpoint = tmp_path / "analysis-state" / "damaged.sqlite"
             damaged_checkpoint.write_text("invalid local state", encoding="utf-8")
@@ -3195,6 +3200,7 @@ def test_live_common_cutoff_preserves_full_event_chains_with_bounded_mysql_trans
             payloads.clear()
             assert resolve_common_fact_cutoff(mysql_reader, **kwargs, **checkpoint_args) == expected
             assert not payloads and not size_reads
+            assert durable[-2:] == [(40, 45, namespace, False), (45, 45, namespace, False)]
 
             later = {**kwargs, "decision_at": "2026-08-30 18:33:00"}
             assert resolve_common_fact_cutoff(mysql_reader, **later, **checkpoint_args) == (

@@ -21,6 +21,7 @@ class EventCoverageCheckpoint:
         self.path = path
         self.namespace = namespace
         self.available = True
+        self.committed_revisions = 0
         try:
             self._prepare_private_path()
             with closing(self._connect()) as connection, connection:
@@ -112,6 +113,14 @@ class EventCoverageCheckpoint:
             return
         try:
             with closing(self._connect()) as connection, connection:
+                connection.execute("BEGIN IMMEDIATE")
+                advanced = 0
+                for scope, count, _digest in verified:
+                    prior = connection.execute(
+                        "SELECT revision_count FROM verified_event_prefix WHERE namespace=? AND scope_hash=?",
+                        (self.namespace, scope),
+                    ).fetchone()
+                    advanced += max(0, count - (prior[0] if prior else 0))
                 connection.executemany("""
                     INSERT INTO verified_event_prefix
                         (namespace,scope_hash,revision_count,inventory_sha256)
@@ -121,5 +130,6 @@ class EventCoverageCheckpoint:
                         inventory_sha256=excluded.inventory_sha256
                     WHERE excluded.revision_count>=verified_event_prefix.revision_count
                 """, ((self.namespace, *row) for row in verified))
+            self.committed_revisions += advanced
         except (OSError, sqlite3.Error) as exc:
             self._disable(exc)
