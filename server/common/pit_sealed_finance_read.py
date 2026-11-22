@@ -238,7 +238,8 @@ def load_sealed_finance_facts(
                 evidence = payload["official_evidence"]
                 if (
                     payload["expected_report_date"] != pit.finance_disclosure_gate(target).minimum_report_date.isoformat()
-                    or not date.fromisoformat(evidence["valid_from"]) <= decision.date() <= date.fromisoformat(evidence["valid_until"])
+                    # Historical evidence expires on its fact date, not when research is run.
+                    or not date.fromisoformat(evidence["valid_from"]) <= target <= date.fromisoformat(evidence["valid_until"])
                 ):
                     raise ValueError(f"PIT_SEALED_FINANCE_NONFILING_EXPIRED:{code}")
                 coverage[code] = {
