@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 import hashlib
@@ -5679,6 +5679,16 @@ class HistoricalEventRead:
     signed_historical_bindings: Mapping[str, tuple[Mapping[str, str], ...]] | None = None
 
 
+def subset_historical_event_read(read: HistoricalEventRead, codes: Iterable[str]) -> HistoricalEventRead:
+    requested={str(code).zfill(6) for code in codes}
+    if not requested<=read.selection.members.keys():
+        raise ValueError('PIT_EVENT_VALIDATED_SUBSET_DIFFERS')
+    selected=replace(read.selection,members=MappingProxyType({code:read.selection.members[code] for code in sorted(requested)}))
+    bindings=read.signed_historical_bindings
+    return replace(read,selection=selected,signed_historical_bindings=(
+        MappingProxyType({code:bindings[code] for code in sorted(requested)}) if bindings is not None else None))
+
+
 def _announcement_batch_read_reason(error: Exception) -> str:
     from server.common.qmt_announcement_pit import (
         LIVE_ANNOUNCEMENT_BATCH_REPLY_DEADLINE,
@@ -6122,6 +6132,7 @@ def resolve_common_fact_cutoff(
     capture_finance_selection: Callable[[SealedFinanceInputs], None] | None = None,
     event_checkpoint_path: Path | None = None,
     event_progress: Callable[[int, int], None] | None = None,
+    event_trade_date: date | str | None = None,
     required_premarket_announcement: FrozenPremarketAnnouncement | None = None,
     required_initial_announcement: FrozenInitialAnnouncement | None = None,
     _dataset_cutoffs: bool = False,
@@ -6221,6 +6232,7 @@ def resolve_common_fact_cutoff(
                 decision_at=decision,
                 window_start=windows["event"][0],
                 window_end=windows["event"][1],
+                **({'expected_trade_date':event_trade_date} if event_trade_date is not None else {}),
                 capture_historical_selection=(
                     historical_selections.append if capture_historical_selection else None
                 ),
@@ -6631,12 +6643,12 @@ def resolve_common_fact_cutoff(
                 "data_excluded_codes", "data_excluded_reasons", "data_exclusions",
             )
         })
-        if capture_finance_selection is not None and _dataset_cutoffs:
+        if capture_finance_selection is not None:
             exclusions = _finance_data_exclusions_from_baseline(
                 finance_batch, codes=normalized_codes, target=windows["finance"][1],
             )
             capture_finance_selection(SealedFinanceInputs(
-                engine=engine, decision_at=decision, fact_cutoff_at=source_cutoffs["finance"],
+                engine=engine, decision_at=decision, fact_cutoff_at=cutoff_for({'fact_kind':'finance'}),
                 as_of_date=windows["finance"][1], seal_id=finance_batch["seal_coverage_id"],
                 batch_root_sha256=finance_batch["batch_root_sha256"],
                 members=MappingProxyType({code: MappingProxyType(member) for code, member in finance_batch["members"].items()}),

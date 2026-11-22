@@ -2600,6 +2600,7 @@ def _mysql_seal_transport(engine, *, corrupt=None):
 
         def __init__(self):
             self.connection = engine.connect()
+            self.info = self.connection.info
 
         def __enter__(self):
             return self

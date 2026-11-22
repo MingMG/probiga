@@ -2471,6 +2471,22 @@ def _load_live_announcement_batch_rows(
             payload_offset += len(payload_keys)
 
 
+def has_dated_announcement_candidate(engine: Engine, *, code: str, decision_at: datetime,
+        target: date, window_start: date) -> bool:
+    """A missing required member proves there is no complete dated batch."""
+    with engine.connect() as c:
+        return c.execute(text("""SELECT /*+ MAX_EXECUTION_TIME(4000) */ 1 FROM st_pit_source_coverage
+            WHERE fact_kind='event' AND stock_code=:code AND source IN
+                ('qmt.announcement','cninfo.announcement','eastmoney.notice')
+            AND coverage_status='COMPLETE' AND known_at<=:decision AND received_at<=:decision
+            AND window_start<=:start AND window_end>=:target
+            AND ((watermark_kind='QUERY_CUTOFF' AND covered_through_at>=:opening AND covered_through_at<:ending)
+                 OR (watermark_kind='HISTORICAL_RECONSTRUCTION' AND window_end=:target)) LIMIT 1"""),
+            {'code':code,'decision':decision_at,'start':window_start,'target':target,
+             'opening':datetime.combine(target,datetime.min.time()),
+             'ending':datetime.combine(target+timedelta(days=1),datetime.min.time())}).scalar() is not None
+
+
 def validate_complete_qmt_announcement_batch(
     engine: Engine,
     *,
@@ -2479,6 +2495,7 @@ def validate_complete_qmt_announcement_batch(
     window_start: date | str,
     window_end: date | str,
     fact_cutoff_at: datetime | str | None = None,
+    expected_trade_date: date | str | None = None,
     source: str = QMT_ANNOUNCEMENT_SOURCE,
     _baseline_capture: _IncrementalBaselineCapture | None = None,
     _deadline_monotonic: float | None = None,
@@ -2523,6 +2540,7 @@ def validate_complete_qmt_announcement_batch(
     required_batch = _required_batch_id or (_baseline_capture.batch_id if _baseline_capture else "")
     start = date.fromisoformat(str(window_start)[:10])
     end = date.fromisoformat(str(window_end)[:10])
+    target = date.fromisoformat(str(expected_trade_date)[:10]) if expected_trade_date is not None else None
     if start > end:
         raise ValueError("QMT announcement validation window is invalid")
     deadline = monotonic() + LIVE_ANNOUNCEMENT_BATCH_VALIDATION_BUDGET_SECONDS
@@ -2537,6 +2555,19 @@ def validate_complete_qmt_announcement_batch(
                         connection = connection.execution_options(isolation_level="REPEATABLE READ")
             by_batch: dict[str, dict[str, datetime]] = {}
             candidate_filter = " AND batch_id=:required_batch_id" if required_batch else ""
+            dated_filter = " AND covered_through_at>=:target_start AND covered_through_at<:target_end" if target else ""
+            dated_params = ({'target_start':datetime.combine(target,datetime.min.time()),
+                'target_end':datetime.combine(target+timedelta(days=1),datetime.min.time())} if target else {})
+            if target:
+                with _live_announcement_reply_budget(connection,deadline=deadline,stage='dated-anchor'):
+                    anchor=connection.execute(text("SELECT "+_live_announcement_read_hint(mysql=mysql,deadline=deadline,stage='dated-anchor')+
+                        "1 FROM st_pit_source_coverage WHERE fact_kind='event' AND source=:source AND stock_code=:code "
+                        "AND watermark_kind='QUERY_CUTOFF' AND coverage_status='COMPLETE' AND known_at<=:decision_at "
+                        "AND received_at<=:decision_at AND window_start<=:window_start AND window_end>=:window_end"+
+                        dated_filter+" LIMIT 1"),{'source':source_name,'code':requested_codes[0],'decision_at':decision,
+                            'window_start':start,'window_end':end,**dated_params}).scalar()
+                if anchor is None:
+                    raise QMTAnnouncementBlocked('QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND','no-common-batch')
             code_limit = VALIDATION_INVENTORY_CODE_LIMIT if mysql else len(requested_codes)
             for offset in range(0, len(requested_codes), code_limit):
                 stage = f"candidate-discovery:{offset}" if mysql else "candidate-discovery"
@@ -2550,7 +2581,7 @@ def validate_complete_qmt_announcement_batch(
                     "AND stock_code IN :codes AND known_at<=:decision_at "
                     "AND received_at<=:decision_at AND coverage_status='COMPLETE' "
                     "AND window_start<=:window_start AND window_end>=:window_end"
-                    f"{candidate_filter}"
+                    f"{candidate_filter}{dated_filter}"
                 ).bindparams(bindparam("codes", expanding=True)).execution_options(stream_results=True)
                 parameters = {
                     "source": source_name,
@@ -2558,6 +2589,7 @@ def validate_complete_qmt_announcement_batch(
                     "decision_at": decision,
                     "window_start": start,
                     "window_end": end,
+                    **dated_params,
                 }
                 if required_batch:
                     parameters["required_batch_id"] = required_batch
@@ -2639,6 +2671,7 @@ def validate_complete_qmt_announcement_batch(
                             and event_cutoff < requested_cutoff
                         )
                         or (_required_batch_id and event_cutoff != requested_cutoff)
+                        or (target is not None and event_cutoff.date()!=target)
                     ):
                         raise ValueError("batch cutoff/receipt knowledge differs")
                     catalog_batch_id = str(
