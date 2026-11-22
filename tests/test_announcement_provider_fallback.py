@@ -2072,6 +2072,58 @@ def test_historical_reconstruction_uses_target_cutoff_and_actual_known_time(
         expected_trade_date=target,
     )
     assert reused["batch_id"] == result["batch_id"]
+    from server.common.historical_announcement_read import validate_dated_announcement_batch
+    from server.common import pit_facts
+
+    original_parse = pit_facts._parse_payload
+    parsed_batches = []
+    def record_payload(row):
+        parsed_batches.append(row["batch_id"])
+        return original_parse(row)
+
+    progress = []
+    selected = []
+    with monkeypatch.context() as bounded_reader:
+        bounded_reader.setattr(pit_facts, "_parse_payload", record_payload)
+        fast = validate_dated_announcement_batch(
+            engine, codes=catalog.codes, decision_at=live_received + timedelta(seconds=1),
+            window_start=target - timedelta(days=30), window_end=target, expected_trade_date=target,
+            capture_historical_selection=selected.append, event_progress=lambda done,total: progress.append((done,total)),
+        )
+    assert fast == reused
+    assert set(parsed_batches) == {result["batch_id"]}
+    assert len(parsed_batches) == len(catalog.codes)
+    assert progress[-1] == (2,2)
+    assert len(selected) == 1 and all(not head for _,head in selected[0].members.values())
+
+    # A metadata-only chain must remain complete even though old payloads are not reread.
+    with engine.begin() as connection:
+        connection.execute(text("DROP TRIGGER trg_pit_source_coverage_immutable_bu"))
+    with pytest.raises(QMTAnnouncementBlocked, match="SCHEMA"):
+        validate_dated_announcement_batch(
+            engine, codes=catalog.codes, decision_at=live_received + timedelta(seconds=1),
+            window_start=target - timedelta(days=30), window_end=target, expected_trade_date=target,
+        )
+    ensure_pit_fact_schema(engine)
+    with engine.connect() as connection:
+        original = connection.execute(text(
+            "SELECT coverage_id,payload_json FROM st_pit_source_coverage WHERE batch_id=:batch LIMIT 1"
+        ), {"batch":result["batch_id"]}).mappings().one()
+    with engine.begin() as connection:
+        connection.execute(text("DROP TRIGGER trg_pit_source_coverage_immutable_bu"))
+        connection.execute(text("UPDATE st_pit_source_coverage SET payload_json=:payload WHERE coverage_id=:id"),
+            {"payload":original["payload_json"]+" ","id":original["coverage_id"]})
+    ensure_pit_fact_schema(engine)
+    with pytest.raises(ValueError, match="canonical"):
+        validate_dated_announcement_batch(
+            engine, codes=catalog.codes, decision_at=live_received + timedelta(seconds=1),
+            window_start=target - timedelta(days=30), window_end=target, expected_trade_date=target,
+        )
+    with engine.begin() as connection:
+        connection.execute(text("DROP TRIGGER trg_pit_source_coverage_immutable_bu"))
+        connection.execute(text("UPDATE st_pit_source_coverage SET payload_json=:payload WHERE coverage_id=:id"),
+            {"payload":original["payload_json"],"id":original["coverage_id"]})
+    ensure_pit_fact_schema(engine)
     fact_cutoff = datetime.combine(target, datetime.max.time())
     for code in catalog.codes:
         append_source_coverage(

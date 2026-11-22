@@ -1,5 +1,6 @@
 """Date-bound research reads through the existing audited announcement validators."""
 from datetime import date,datetime,timedelta
+import json
 from time import monotonic
 
 from sqlalchemy import text
@@ -7,7 +8,6 @@ from sqlalchemy import text
 from server.common.pit_facts import normalize_decision_at
 from server.common.qmt_announcement_pit import (
     QMTAnnouncementBlocked,validate_complete_qmt_announcement_batch,
-    validate_complete_historical_reconstruction_batch,
     QMT_ANNOUNCEMENT_SOURCE,CNINFO_ANNOUNCEMENT_SOURCE,EASTMONEY_ANNOUNCEMENT_SOURCE,
     LIVE_ANNOUNCEMENT_BATCH_VALIDATION_BUDGET_SECONDS,
 )
@@ -16,7 +16,7 @@ from server.common.qmt_announcement_pit import (
 def _inventory(engine,*,code,decision_at,target,window_start,source=None):
     with engine.connect() as c:
         rows=c.execute(text("""SELECT /*+ MAX_EXECUTION_TIME(4000) */ source,batch_id,
-                covered_through_at,watermark_kind,known_at
+                covered_through_at,watermark_kind,known_at,coverage_id
             FROM st_pit_source_coverage WHERE fact_kind='event' AND stock_code=:code
             AND source IN ('qmt.announcement','cninfo.announcement','eastmoney.notice')
             AND (:source IS NULL OR source=:source) AND coverage_status='COMPLETE'
@@ -36,8 +36,57 @@ def has_dated_announcement_candidate(engine,*,code,decision_at,target,window_sta
     return bool(_inventory(engine,code=code,decision_at=decision_at,target=target,window_start=window_start))
 
 
+def _read_reconstruction(engine, candidate, *, codes, decision, start, end, deadline,
+        capture_historical_selection, event_progress):
+    from server.common.pit_facts import _bind_historical_event_snapshot
+    from server.common.qmt_announcement_pit import (
+        _assert_pit_fact_schema_prepared, _read_live_announcement_payload_rows,
+        _read_live_announcement_payload_sizes, _bounded_announcement_payload_keys,
+        _live_announcement_read_hint, _live_announcement_reply_budget,
+    )
+    from server.common.pit_source_coverage_index import PIT_SOURCE_COVERAGE_BATCH_INDEX_NAME
+
+    # Immutable rows permit metadata chain checks without decompressing unrelated batches.
+    _assert_pit_fact_schema_prepared(engine)
+    source=CNINFO_ANNOUNCEMENT_SOURCE;batch_id=candidate['batch_id']
+    with engine.connect() as c:
+        keys=[candidate['coverage_id']]
+        sizes=_read_live_announcement_payload_sizes(c,source=source,batch_id=batch_id,
+            coverage_ids=keys,deadline=deadline,stage='historical-header-size')
+        list(_bounded_announcement_payload_keys(list(sizes.items())))
+        row,=_read_live_announcement_payload_rows(c,source=source,batch_id=batch_id,
+            coverage_ids=keys,deadline=deadline,stage='historical-header-payload')
+        evidence=json.loads(row['payload_json'])['watermark']['evidence']
+        provenance=evidence['reconstruction_provenance']
+        stage='historical-header-inventory'
+        hint=_live_announcement_read_hint(mysql=c.dialect.name=='mysql',deadline=deadline,stage=stage)
+        index=f' FORCE INDEX ({PIT_SOURCE_COVERAGE_BATCH_INDEX_NAME})' if c.dialect.name=='mysql' else ''
+        with _live_announcement_reply_budget(c,deadline=deadline,stage=stage):
+            counts=c.execute(text(f'SELECT {hint}result_count FROM st_pit_source_coverage{index} '
+                "WHERE fact_kind='event' AND source=:source AND batch_id=:batch LIMIT 10001"),
+                {'source':source,'batch':batch_id}).scalars().all()
+        if not counts or len(counts)>10000:raise ValueError('historical reconstruction inventory is out of bounds')
+    material={
+        'status':'COMPLETE','source':source,'primary_source':QMT_ANNOUNCEMENT_SOURCE,
+        'fallback_reason':'QMT_ANNOUNCEMENT_HISTORICAL_RECONSTRUCTION_REQUIRED',
+        'batch_id':batch_id,'batch_root_hash':evidence['global_batch_root_hash'],
+        'window_start':provenance['query_window_start'],'window_end':provenance['query_window_end'],
+        'source_query_cutoff_at':provenance['source_query_cutoff_at'],
+        'reconstructed_at':provenance['reconstructed_at'],
+        'reconstruction_provenance':provenance,'reconstruction_sha256':provenance['reconstruction_sha256'],
+        **{field:provenance[field] for field in ('catalog_batch_id','catalog_manifest_hash','catalog_member_set_hash')},
+        'stock_count':len(counts),'coverage_count':len(counts),
+        'event_count':sum(counts),'empty_stock_count':sum(count==0 for count in counts),
+    }
+    selected=_bind_historical_event_snapshot(engine,material,codes=codes,decision=decision,
+        received=normalize_decision_at(material['reconstructed_at']),frontier=decision,
+        window_start=start,window_end=end,event_progress=event_progress,deadline=deadline)
+    if capture_historical_selection is not None:capture_historical_selection(selected)
+    return dict(selected.batch)
+
+
 def validate_dated_announcement_batch(engine,*,codes,decision_at,window_start,window_end,expected_trade_date,
-        capture_historical_selection=None,capture_live_reuse=None):
+        capture_historical_selection=None,capture_live_reuse=None,event_progress=None):
     requested=sorted({str(code).zfill(6) for code in codes})
     target=date.fromisoformat(str(expected_trade_date)[:10]);start=date.fromisoformat(str(window_start)[:10])
     end=date.fromisoformat(str(window_end)[:10]);decision=normalize_decision_at(decision_at)
@@ -64,11 +113,9 @@ def validate_dated_announcement_batch(engine,*,codes,decision_at,window_start,wi
             if capture_live_reuse is not None:capture_live_reuse()
             return proof
         if invalid:raise invalid[-1]
-        if source==CNINFO_ANNOUNCEMENT_SOURCE and any(c['watermark_kind']=='HISTORICAL_RECONSTRUCTION' for c in candidates):
-            try:
-                return validate_complete_historical_reconstruction_batch(engine,codes=requested,decision_at=decision,
-                    window_start=start,window_end=end,expected_trade_date=target,
-                    capture_historical_selection=capture_historical_selection)
-            except QMTAnnouncementBlocked as error:
-                if error.reason_code!='QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND' or error.detail!='no-common-batch':raise
+        if source==CNINFO_ANNOUNCEMENT_SOURCE:
+            for candidate in candidates:
+                if candidate['watermark_kind']=='HISTORICAL_RECONSTRUCTION':
+                    return _read_reconstruction(engine,candidate,codes=requested,decision=decision,start=start,end=end,
+                        deadline=deadline,capture_historical_selection=capture_historical_selection,event_progress=event_progress)
     raise QMTAnnouncementBlocked('QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND','no-common-batch')
