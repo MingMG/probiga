@@ -5707,7 +5707,7 @@ def _announcement_batch_read_reason(error: Exception) -> str:
         r"stock-catalog|batch-verified|batch-inventory(?::[0-9]{1,8})?|"
         r"batch-payload(?:-size)?:[0-9]{1,8}|"
         r"incremental-parent|candidate-read|signed-historical-(?:isolation|catalog|native|inventory|"
-        r"(?:chain|size|payload|bindings):[0-9]{1,8}(?::inventory)?)",
+        r"(?:chain|heads|size|payload|bindings):[0-9]{1,8}(?::inventory)?)",
         detail,
     ):
         return f"{reason}:{detail}"
@@ -5806,7 +5806,7 @@ def _load_certified_initial_event_selection(
 
 def _read_signed_historical_coverage_links(
     connection: Connection, *, exact_ids: Mapping[str, str], received: datetime,
-    deadline: float, offset: int,
+    deadline: float, offset: int, head_frontier: datetime | None = None,
 ) -> dict[str, tuple[Mapping[str, Any] | None, bool]]:
     """Verify coverage links and the original frontier without reading other batches' payloads."""
     from server.common.qmt_announcement_pit import _live_announcement_read_hint, _live_announcement_reply_budget
@@ -5824,6 +5824,7 @@ def _read_signed_historical_coverage_links(
         "ORDER BY scope_hash,revision_no"
     ).bindparams(bindparam("scopes", expanding=True)).execution_options(stream_results=True)
     links = {}
+    selected_revisions = {}
     with _live_announcement_reply_budget(connection, deadline=deadline, stage=stage):
         with connection.execute(statement, {
             "scopes": sorted(code_by_scope), "source": CNINFO_EVENT_SOURCE, "received": received,
@@ -5852,11 +5853,31 @@ def _read_signed_historical_coverage_links(
                     if row["coverage_id"] == selected_id:
                         predecessor = previous
                         links[selected_id] = (predecessor, False)
+                        selected_revisions[scope] = row["revision_no"]
                     previous = row
                 if selected_id in links and previous is not None and previous["coverage_id"] == selected_id:
                     links[selected_id] = (predecessor, True)
     if links.keys() != set(exact_ids.values()):
         raise ValueError("historical announcement selected coverage is unavailable at its original frontier")
+    if head_frontier is not None and head_frontier > received:
+        # Later revisions only determine whether an old empty result is still the head.
+        # Their payloads and chains are outside the selected historical observation.
+        stage = f"signed-historical-heads:{offset}"
+        hint = _live_announcement_read_hint(mysql=mysql, deadline=deadline, stage=stage)
+        latest_statement = text(
+            f"SELECT {hint}scope_hash,MAX(revision_no) AS revision_no FROM {SOURCE_COVERAGE_TABLE}{index} "
+            "WHERE scope_hash IN :scopes AND fact_kind='event' AND source=:source "
+            "AND known_at<=:frontier AND received_at<=:frontier GROUP BY scope_hash"
+        ).bindparams(bindparam("scopes", expanding=True))
+        with _live_announcement_reply_budget(connection, deadline=deadline, stage=stage):
+            latest = dict(connection.execute(latest_statement, {
+                "scopes":sorted(code_by_scope), "source":CNINFO_EVENT_SOURCE, "frontier":head_frontier,
+            }).tuples().all())
+        if latest.keys() != selected_revisions.keys():
+            raise ValueError("historical announcement current coverage frontier is unavailable")
+        for scope, revision in latest.items():
+            selected_id = exact_ids[code_by_scope[scope]]
+            links[selected_id] = (links[selected_id][0], revision == selected_revisions[scope])
     return links
 
 
@@ -5899,7 +5920,7 @@ def _bind_historical_event_snapshot(
 ) -> HistoricalAnnouncementSelection:
     from server.common.pit_source_coverage_index import PIT_SOURCE_COVERAGE_BATCH_INDEX_NAME
     from server.common.qmt_announcement_pit import (
-        LIVE_ANNOUNCEMENT_BATCH_VALIDATION_BUDGET_SECONDS, VALIDATION_READ_BATCH_SIZE,
+        LIVE_ANNOUNCEMENT_BATCH_VALIDATION_BUDGET_SECONDS, VALIDATION_INVENTORY_CODE_LIMIT,
         AnnouncementCatalog, HistoricalAnnouncementSelection,
         QMT_ANNOUNCEMENT_RECONSTRUCTION_BATCH_SCHEMA,
         _batch_root_from_entries, _bounded_announcement_payload_keys, _fallback_receipt_valid,
@@ -6019,10 +6040,11 @@ def _bind_historical_event_snapshot(
         total = len(inventory) + binding_units
         if event_progress is not None:
             event_progress(0, total)
-        for offset in range(0, len(inventory), VALIDATION_READ_BATCH_SIZE):
-            stock_batch = dict(inventory[offset:offset + VALIDATION_READ_BATCH_SIZE])
+        for offset in range(0, len(inventory), VALIDATION_INVENTORY_CODE_LIMIT):
+            stock_batch = dict(inventory[offset:offset + VALIDATION_INVENTORY_CODE_LIMIT])
             links = _read_signed_historical_coverage_links(
-                connection, exact_ids=stock_batch, received=frontier, deadline=deadline, offset=offset,
+                connection, exact_ids=stock_batch, received=received, deadline=deadline, offset=offset,
+                head_frontier=frontier,
             )
             sizes = _read_live_announcement_payload_sizes(
                 connection, source=source, batch_id=batch_id, coverage_ids=list(stock_batch.values()),

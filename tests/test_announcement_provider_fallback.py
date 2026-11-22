@@ -2095,6 +2095,29 @@ def test_historical_reconstruction_uses_target_cutoff_and_actual_known_time(
     assert len(parsed_batches) == len(catalog.codes)
     assert progress[-1] == (2,2)
     assert len(selected) == 1 and all(not head for _,head in selected[0].members.values())
+    with engine.begin() as connection:
+        connection.execute(text("DROP TRIGGER trg_pit_source_coverage_immutable_bu"))
+        connection.execute(text("UPDATE st_pit_source_coverage SET coverage_fingerprint_hash=:hash WHERE batch_id=:batch"),
+            {"hash":"f"*64,"batch":live_batch_id})
+    ensure_pit_fact_schema(engine)
+    # A later observation cannot change the contents of this already-published historical batch.
+    assert validate_dated_announcement_batch(
+        engine, codes=catalog.codes, decision_at=live_received + timedelta(seconds=1),
+        window_start=target - timedelta(days=30), window_end=target, expected_trade_date=target,
+    ) == reused
+    with engine.begin() as connection:
+        connection.execute(text("DROP TRIGGER trg_pit_source_coverage_immutable_bu"))
+        for row in connection.execute(text("SELECT coverage_id,scope_hash FROM st_pit_source_coverage WHERE batch_id=:batch"),
+                {"batch":live_batch_id}).mappings().all():
+            # Restore the genuine fingerprint from the content-addressed publication's original rows below.
+            payload = connection.execute(text("SELECT payload_json,supersedes_coverage_id FROM st_pit_source_coverage WHERE coverage_id=:id"),
+                {"id":row["coverage_id"]}).mappings().one()
+            fingerprint = pit_canonical_hash({"schema":"probiga.pit-source-coverage-fingerprint.v1",
+                "scope_hash":row["scope_hash"],"payload":json.loads(payload["payload_json"]),
+                "supersedes_coverage_id":payload["supersedes_coverage_id"]})
+            connection.execute(text("UPDATE st_pit_source_coverage SET coverage_fingerprint_hash=:hash WHERE coverage_id=:id"),
+                {"hash":fingerprint,"id":row["coverage_id"]})
+    ensure_pit_fact_schema(engine)
 
     # A metadata-only chain must remain complete even though old payloads are not reread.
     with engine.begin() as connection:
