@@ -49,7 +49,8 @@ def read_runs(connection, run_id=None):
 def _contract():
     from server.trading_v3 import daily_features,sleeves,engine,regime,config
     from server.engine import strategy_native_replay,shadow_trial_policy
-    paths=[Path(__file__),*(Path(m.__file__) for m in (daily_features,sleeves,engine,regime,strategy_native_replay,shadow_trial_policy))]
+    from server.common import historical_announcement_read
+    paths=[Path(__file__),*(Path(m.__file__) for m in (daily_features,sleeves,engine,regime,strategy_native_replay,shadow_trial_policy,historical_announcement_read))]
     root=Path(__file__).resolve().parents[2]
     paths.extend(root/p for p in ('server/engine/strategy_shadow_trials.py','server/engine/strategy_center.py',
         'server/common/pit_facts.py','server/common/versioned_strategy_config.py',
@@ -139,7 +140,7 @@ def _window(c,state,days,inputs):
 def _v3_day(c,state,day,owner):
     from server.common.strategy_daily_input_window import V3_DAILY_INPUT_SESSIONS
     from server.common.pit_facts import resolve_common_fact_cutoff,PIT_AVAILABLE
-    from server.common.qmt_announcement_pit import has_dated_announcement_candidate
+    from server.common.historical_announcement_read import has_dated_announcement_candidate
     from server.trading_v3.daily_features import normalize_daily_bars,build_daily_feature_universe,DailyFactInputs
     from server.trading_v3.regime import classify_regime_probabilities
     from server.trading_v3.engine import TradingV3Engine

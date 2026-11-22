@@ -100,11 +100,11 @@ def test_driver_replays_partial_sources_without_fabricating_zero_profit(monkeypa
 def test_historical_uncovered_finance_members_do_not_block_other_securities(monkeypatch):
     from types import SimpleNamespace
     from server.common import pit_facts
-    from server.common import qmt_announcement_pit
+    from server.common import historical_announcement_read
     identity={str(i).zfill(6):{} for i in range(4755)}
     covered=set(sorted(identity)[4:])
     monkeypatch.setattr(native,'_identity_rows',lambda *_:(identity,{'status':'VERIFIED'}))
-    monkeypatch.setattr(qmt_announcement_pit,'has_dated_announcement_candidate',lambda *_a,**_k:True)
+    monkeypatch.setattr(historical_announcement_read,'has_dated_announcement_candidate',lambda *_a,**_k:True)
     def cutoff(_engine,*,codes,**_kwargs):
         if not set(codes)<=covered:raise ValueError('finance atomic batch seal code scope differs')
         assert len(codes)==4751

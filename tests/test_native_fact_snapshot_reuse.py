@@ -1,9 +1,11 @@
 from datetime import date,datetime,timedelta
 
 import pytest
+from sqlalchemy import text
 
 from server.common import pit_facts as pit
 from server.common import qmt_announcement_pit as announcements
+from server.common import historical_announcement_read as history
 from server.trading_v3 import daily_features
 from tests.test_qmt_announcement_pit import _engine,_catalog,_install_catalog,_frame
 
@@ -27,8 +29,8 @@ def test_historical_batch_selection_does_not_load_a_later_window():
     future=publish(engine,catalog,datetime(2026,8,26,18,20))
     options={'codes':catalog.codes,'decision_at':datetime(2026,8,27),'window_start':date(2026,8,5),'window_end':date(2026,8,25)}
     assert announcements.validate_complete_qmt_announcement_batch(engine,**options)['batch_id']==future
-    assert announcements.validate_complete_qmt_announcement_batch(engine,**options,expected_trade_date='2026-08-25')['batch_id']==old
-    assert not announcements.has_dated_announcement_candidate(engine,code='000001',decision_at=datetime(2026,8,27),
+    assert history.validate_dated_announcement_batch(engine,**options,expected_trade_date='2026-08-25')['batch_id']==old
+    assert not history.has_dated_announcement_candidate(engine,code='000001',decision_at=datetime(2026,8,27),
         target=date(2026,8,24),window_start=date(2026,8,4))
 
 
@@ -62,3 +64,25 @@ def test_verified_finance_and_event_inputs_are_reused_by_feature_readers(monkeyp
     assert len(notices['000001'])==1 and evidence['status_by_code']['000001']==pit.PIT_AVAILABLE
     assert len(events[0].selection.members)==2
     with pytest.raises(ValueError,match='SUBSET_DIFFERS'):pit.subset_historical_event_read(events[0],['999999'])
+
+
+def test_dated_reader_keeps_tampered_primary_batch_visible():
+    engine=_engine();catalog=_install_catalog(engine,_catalog(('000001','000001.SZ')))
+    publish(engine,catalog,datetime(2026,8,25,18,20))
+    with engine.begin() as c:
+        c.execute(text('DROP TRIGGER trg_pit_source_coverage_immutable_bu'))
+        c.execute(text("UPDATE st_pit_source_coverage SET payload_json='{}'"))
+    with pytest.raises(announcements.QMTAnnouncementBlocked,match='ValueError'):
+        history.validate_dated_announcement_batch(engine,codes=catalog.codes,decision_at=datetime(2026,8,27),
+            window_start=date(2026,8,5),window_end=date(2026,8,25),expected_trade_date=date(2026,8,25))
+
+
+def test_job_deadline_survives_real_source_validation_wrappers(monkeypatch):
+    from server.engine.strategy_native_backtest import NativeStepDeadline
+    engine=_engine();catalog=_install_catalog(engine,_catalog(('000001','000001.SZ')))
+    publish(engine,catalog,datetime(2026,8,25,18,20))
+    def interrupted(*_a,**_k):raise NativeStepDeadline('source read exceeded the job budget')
+    monkeypatch.setattr(announcements,'_load_live_announcement_batch_rows',interrupted)
+    with pytest.raises(NativeStepDeadline):
+        history.validate_dated_announcement_batch(engine,codes=catalog.codes,decision_at=datetime(2026,8,27),
+            window_start=date(2026,8,5),window_end=date(2026,8,25),expected_trade_date=date(2026,8,25))

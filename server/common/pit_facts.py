@@ -6225,6 +6225,9 @@ def resolve_common_fact_cutoff(
             from server.common.qmt_announcement_pit import (
                 validate_complete_announcement_batch,
             )
+            if event_trade_date is not None:
+                from server.common.historical_announcement_read import validate_dated_announcement_batch
+                validate_complete_announcement_batch=validate_dated_announcement_batch
 
             event_batch = validate_complete_announcement_batch(
                 engine,
