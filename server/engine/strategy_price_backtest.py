@@ -204,16 +204,38 @@ def _read_bars(connection, days, inputs, cutoff):
     # A six-day join exceeded 12s in production; two A-share days read in 2.6s.
     width = max(1, min(8, 16000 // max(expected[d] for d in days)))
     force = " FORCE INDEX (idx_date_ktype) " if connection.dialect.name == "mysql" else " "
+    catalogs = {}
+    missing = sorted(set(bindings.values()))
+    for offset in range(0, len(missing), 4):
+        batch_ids = missing[offset:offset + 4]
+        members = connection.execute(text("""SELECT /*+ MAX_EXECUTION_TIME(12000) */
+            batch_id,stock_code,list_date,expire_date FROM qmt_stock_catalog_member
+            WHERE batch_id IN :batches AND instrument_type='STOCK' LIMIT 40001""").bindparams(bindparam('batches', expanding=True)),
+            {'batches': batch_ids}).mappings().all()
+        if len(members) > 40000:
+            raise ValueError('历史行情证券目录批次超过40000行')
+        for batch in batch_ids:
+            selected = [r for r in members if r['batch_id'] == batch]
+            if not selected or len(selected) != len({r['stock_code'] for r in selected}):
+                raise ValueError('历史行情证券目录缺失或包含重复代码')
+            catalogs[batch] = selected
+    allowed = {day: {r['stock_code'] for r in catalogs[bindings[day]]
+                    if r['list_date'] is not None and str(r['list_date'])[:10] <= day
+                    and (r['expire_date'] is None or str(r['expire_date'])[:10] >= day)}
+                    - set(scopes[day]['excluded_codes']) for day in days}
     rows = []
     for offset in range(0, len(days), width):
         chunk = days[offset:offset + width]
-        predicate, scope_params, expanding = _scope_filters(scopes, chunk)
-        join, params = daily_input_catalog_join({"sessions": chunk, "catalog_batches_by_session": {d: bindings[d] for d in chunk}})
-        rows.extend(dict(r) for r in connection.execute(text("""SELECT /*+ MAX_EXECUTION_TIME(12000) */
+        # Apply the same dated catalog in memory; the per-row SQL join timed out on two days.
+        batch = connection.execute(text("""SELECT /*+ MAX_EXECUTION_TIME(12000) */
             SUBSTR(k.stock_code,1,6) stock_code,k.trade_date,k.`open`,k.high,k.low,k.`close`,k.pre_close,k.volume,k.amount
-            FROM sm_stock_kline k """ + force + join + """ WHERE k.k_type=1 AND k.adjust_type=0
-            AND k.trade_date BETWEEN :start AND :end AND k.received_at<=:cutoff """ + predicate + " ORDER BY k.stock_code,k.trade_date LIMIT 60001").bindparams(*expanding),
-            {**params, **scope_params, "start": chunk[0], "end": chunk[-1], "cutoff": cutoff}).mappings())
+            FROM sm_stock_kline k """ + force + """ WHERE k.k_type=1 AND k.adjust_type=0
+            AND k.trade_date IN :days AND k.received_at<=:cutoff LIMIT 60001""").bindparams(bindparam('days', expanding=True)),
+            {'days': chunk, 'cutoff': cutoff}).mappings().all()
+        if len(batch) > 60000:
+            raise ValueError('历史行情候选批次超过60000行')
+        rows.extend(dict(r) for r in batch if r['stock_code'] in allowed[str(r['trade_date'])[:10]])
+    rows.sort(key=lambda r: (r['stock_code'], str(r['trade_date'])[:10]))
     seen = {str(r["trade_date"])[:10] for r in rows}
     if seen != set(days):
         raise ValueError("历史行情读取缺少交易日：" + ",".join(sorted(set(days) - seen)))
