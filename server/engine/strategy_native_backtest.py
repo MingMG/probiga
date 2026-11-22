@@ -305,15 +305,22 @@ def _start(c,strategies,days,published,source_hash,contract):
     from server.engine.autonomous_strategy_research import _read_states
     prior=next((r.get('price_backtest') for r in _read_states(c) if (r.get('price_backtest') or {}).get('sessions')==days),None)
     warmup=sorted(str(d)[:10] for d in c.execute(text('SELECT DISTINCT trade_date FROM si_trade_calendar WHERE trade_status=1 AND trade_date<:d ORDER BY trade_date DESC LIMIT 20'),{'d':days[0]}).scalars())
-    requested=str(now_shanghai());versions=[(s['strategy_key'],s['current_version'],s['version_hash']) for s in strategies]
+    clock=str(now_shanghai());versions=[(s['strategy_key'],s['current_version'],s['version_hash']) for s in strategies]
+    frozen=next((r for r in read_runs(c) if r['source_hash']==source_hash and r['sessions']==days
+        and [(s['strategy_key'],s['current_version'],s['version_hash']) for s in r['strategies']]==versions),None)
+    # Re-evaluating the same frozen inputs retains their availability clock and checkpoints.
+    requested=frozen['requested_at'] if frozen else clock
+    archives=(list(frozen['input_archives'])+[{'run_id':frozen['run_id'],'rule_hash':frozen['rule_hash']}]
+        if frozen else list(prior.get('input_archives',[]))+[{'run_id':prior['run_id'],'rule_hash':prior['rule_hash']}] if prior else [])
     uid=canonical_sha256({'versions':versions,'days':days,'source_hash':source_hash,'contract':contract})
     state={'schema':SCHEMA,'run_id':uid,'trade_date':days[-1],'strategies':strategies,'published':published,
-        'sessions':days,'input_sessions':warmup+days,'price_cutoff':prior['knowledge_cutoff'] if prior else requested,
-        'requested_at':requested,'deadline_at':str(now_shanghai()+timedelta(hours=24)),
-        'input_archives':list(prior.get('input_archives',[]))+[{'run_id':prior['run_id'],'rule_hash':prior['rule_hash']}] if prior else [],
+        'sessions':days,'input_sessions':warmup+days,'price_cutoff':frozen['price_cutoff'] if frozen else prior['knowledge_cutoff'] if prior else requested,
+        'requested_at':requested,'deadline_at':frozen['deadline_at'] if frozen else str(now_shanghai()+timedelta(hours=24)),
+        'input_archives':archives,
         'contract':contract,'source_hash':source_hash,'rule_hash':canonical_sha256(versions),'phase':'INPUTS','status':'NOT_STARTED',
         'cursor':0,'completed_units':0,'total_units':(len(warmup)+len(days))*2+len(days)+len(strategies),
-        'last_progress_at':requested,'reason':'','proposals':[]}
+        'last_progress_at':clock,'reason':'','proposals':[],
+        'fact_read_checkpoint':dict(frozen.get('fact_read_checkpoint') or {}) if frozen else {}}
     inputs=_input_parts(c,state)
     present={d for p in inputs.values() for d in p['sessions']}
     state['completed_units']=sum(d in present for d in state['input_sessions'])
