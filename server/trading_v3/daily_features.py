@@ -1833,10 +1833,13 @@ def build_daily_feature_universe(
         if common_cutoff.get("status") == PIT_AVAILABLE
         else None
     )
-    pit_fact_cutoff_at = common_cutoff.get("fact_cutoff_at") or None
+    source_cutoffs = common_cutoff.get("source_cutoff_at") or {}
+    finance_cutoff_at = source_cutoffs.get("finance") or common_cutoff.get("fact_cutoff_at") or None
+    event_cutoff_at = source_cutoffs.get("event") or common_cutoff.get("fact_cutoff_at") or None
     market["pit_common_cutoff_status"] = common_cutoff.get("status")
     market["pit_common_cutoff_reason"] = common_cutoff.get("reason") or ""
     market["pit_fact_cutoff_at"] = common_cutoff.get("fact_cutoff_at") or ""
+    market["pit_source_cutoff_at"] = dict(source_cutoffs)
     market["pit_decision_at"] = common_cutoff.get("decision_at") or ""
     market["pit_common_receipt_root_hash"] = (
         common_cutoff.get("receipt_root_hash") or ""
@@ -1860,7 +1863,7 @@ def build_daily_feature_universe(
         as_of=as_of,
         codes=list(base),
         decision_at=pit_reader_decision_at,
-        fact_cutoff_at=pit_fact_cutoff_at,
+        fact_cutoff_at=finance_cutoff_at,
         **({'sealed_finance_inputs':fact_inputs.finance,'prepared_batch':fact_inputs.finance_facts} if fact_inputs is not None else {}),
     )
     quality_raw = {}
@@ -1995,7 +1998,7 @@ def build_daily_feature_universe(
         as_of=as_of,
         codes=ranked_codes,
         decision_at=pit_reader_decision_at,
-        fact_cutoff_at=pit_fact_cutoff_at,
+        fact_cutoff_at=event_cutoff_at,
         include_evidence=True,
         **({'historical_selection':subset_historical_event_read(fact_inputs.events,ranked_codes)} if fact_inputs is not None else {}),
         **({'prepared_batch':fact_inputs.event_facts} if fact_inputs is not None and fact_inputs.event_facts is not None else {}),

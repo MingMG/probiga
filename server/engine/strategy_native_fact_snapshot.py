@@ -17,7 +17,7 @@ def snapshot_identity(*, day, decision, identity_hash, finance_seal, codes):
         'decision':str(decision), 'identity':identity_hash, 'finance_seal':finance_seal,
         'codes':sorted(codes), 'readers':{Path(m.__file__).name:hashlib.sha256(Path(m.__file__).read_bytes()).hexdigest()
             for m in (pit,historical_announcement_read,pit_sealed_finance_read)},
-        'codec':WIRE_FORMAT_ID})
+        'codec':WIRE_FORMAT_ID,'cutoff_policy':'INDEPENDENT_VERIFIED_FRONTIERS_V1'})
 
 
 def save_snapshot(engine, generation, inputs):
@@ -26,7 +26,9 @@ def save_snapshot(engine, generation, inputs):
     if (finance.engine is not engine or selected.engine is not engine
             or inputs.cutoff.get('status')!=pit.PIT_AVAILABLE or not selected.members
             or not selected.members.keys()<=finance.members.keys()
-            or finance.decision_at!=selected.decision_at or finance.fact_cutoff_at!=events.fact_cutoff_at
+            or finance.decision_at!=selected.decision_at
+            or finance.fact_cutoff_at!=pit.normalize_decision_at(inputs.cutoff['source_cutoff_at']['finance'])
+            or events.fact_cutoff_at!=pit.normalize_decision_at(inputs.cutoff['source_cutoff_at']['event'])
             or finance.as_of_date!=selected.window_end):
         raise ValueError('native historical selection scope differs')
     if type(selected) not in (HistoricalAnnouncementSelection, pit._LiveEventSelection) or events.signed_historical_bindings is not None:

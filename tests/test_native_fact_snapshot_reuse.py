@@ -49,7 +49,8 @@ def test_full_market_snapshot_reads_fourteen_chunks_with_bounded_artifact_batche
         MappingProxyType({'coverage_count':len(codes)}),MappingProxyType(members))
     sealed=pit.SealedFinanceInputs(engine,decision,cutoff,cutoff.date(),'a'*64,'b'*64,
         MappingProxyType(financial),MappingProxyType({}))
-    inputs=daily_features.DailyFactInputs({'status':pit.PIT_AVAILABLE},sealed,pit.HistoricalEventRead(selection,cutoff))
+    inputs=daily_features.DailyFactInputs({'status':pit.PIT_AVAILABLE,
+        'source_cutoff_at':{'finance':str(cutoff),'event':str(cutoff)}},sealed,pit.HistoricalEventRead(selection,cutoff))
     save_snapshot(engine,'c'*64,inputs)
     from server.common.formal_analysis_store import FormalAnalysisStore
     store=FormalAnalysisStore(engine)
@@ -63,33 +64,40 @@ def test_full_market_snapshot_reads_fourteen_chunks_with_bounded_artifact_batche
     assert restored.events.selection.members[codes[-1]][0]['coverage_id']==pit.canonical_hash(codes[-1])
 
 
-def test_verified_finance_and_event_inputs_are_reused_by_feature_readers(monkeypatch):
-    engine=_engine();catalog=_install_catalog(engine,_catalog(('000001','000001.SZ'),('000002','000002.SZ')))
+@pytest.mark.parametrize('event_hour',[18,20])
+def test_verified_finance_and_event_inputs_are_reused_by_feature_readers(monkeypatch,event_hour):
+    engine=_engine();catalog=_install_catalog(engine,_catalog(('000001','000001.SZ'),('000002','000002.SZ')),captured_at='2026-08-25 14:00:00')
     for code in catalog.codes:
         row={'stock_code':code,'report_date':'2026-03-31','report_type':'Q1','notice_date':'2026-04-25','roe_wtd':14.5}
-        revision=pit.append_finance_revision(engine,row,known_at='2026-08-25 18:01:00')
+        revision=pit.append_finance_revision(engine,row,known_at='2026-08-25 15:01:00')
         pit.append_source_coverage(engine,fact_kind='finance',stock_code=code,window_start='1900-01-01',window_end='2026-08-25',
-            known_at='2026-08-25 18:01:00',covered_through_at='2026-08-25 18:01:00',watermark_kind='CAPTURED_AT',
+            known_at='2026-08-25 15:01:00',covered_through_at='2026-08-25 15:01:00',watermark_kind='CAPTURED_AT',
             watermark_evidence={'source_call':'success'},source_rows=[row],
             fact_bindings=[{'revision_id':revision.revision_id,'content_hash':revision.content_hash}],
             source='adata.finance.core_index',batch_id='finance-native')
-    pit.append_finance_atomic_batch_seal(engine,as_of_date='2026-08-25',completed_known_at='2026-08-25 18:22:00')
-    publish(engine,catalog,datetime(2026,8,25,18,20))
-    finances,events=[],[];decision=datetime(2026,8,25,19)
-    result=pit.resolve_common_fact_cutoff(engine,codes=catalog.codes,decision_at=decision,
+    pit.append_finance_atomic_batch_seal(engine,as_of_date='2026-08-25',completed_known_at='2026-08-25 15:11:00')
+    publish(engine,catalog,datetime(2026,8,25,event_hour,20))
+    finances,events=[],[];decision=datetime(2026,8,25,23)
+    result=pit.resolve_strategy_fact_cutoffs(engine,codes=catalog.codes,decision_at=decision,
         finance_start_date='1900-01-01',finance_end_date='2026-08-25',event_start_date='2026-08-05',event_end_date='2026-08-25',
         require_qmt_event_batch=True,event_trade_date='2026-08-25',
         capture_finance_selection=finances.append,capture_historical_selection=events.append)
     assert result['status']==pit.PIT_AVAILABLE and len(finances)==len(events)==1
-    assert finances[0].fact_cutoff_at==datetime.fromisoformat(result['fact_cutoff_at'])
+    assert finances[0].fact_cutoff_at==datetime.fromisoformat(result['source_cutoff_at']['finance'])
+    assert events[0].fact_cutoff_at==datetime.fromisoformat(result['source_cutoff_at']['event'])
+    blocked=pit.resolve_common_fact_cutoff(engine,codes=catalog.codes,decision_at=decision,
+        finance_start_date='1900-01-01',finance_end_date='2026-08-25',
+        event_start_date='2026-08-05',event_end_date='2026-08-25',
+        require_qmt_event_batch=True,event_trade_date='2026-08-25')
+    assert blocked['reason']=='PIT_COMMON_CUTOFF_STALE_OR_BACKFILL'
     monkeypatch.setattr(pit,'load_finance_atomic_batch_seal',lambda *_a,**_k:pytest.fail('verified finance was scanned again'))
     monkeypatch.setattr(announcements,'validate_complete_announcement_batch',lambda *_a,**_k:pytest.fail('verified event batch was scanned again'))
     financial=daily_features._load_finance(engine,as_of=date(2026,8,25),codes=['000001'],decision_at=decision,
-        fact_cutoff_at=result['fact_cutoff_at'],sealed_finance_inputs=finances[0])
+        fact_cutoff_at=result['source_cutoff_at']['finance'],sealed_finance_inputs=finances[0])
     assert financial['000001']['finance_pit_status']==pit.PIT_AVAILABLE
     subset=pit.subset_historical_event_read(events[0],['000001'])
     notices,evidence=daily_features._load_recent_notices(engine,as_of=date(2026,8,25),codes=['000001'],decision_at=decision,
-        fact_cutoff_at=result['fact_cutoff_at'],include_evidence=True,historical_selection=subset)
+        fact_cutoff_at=result['source_cutoff_at']['event'],include_evidence=True,historical_selection=subset)
     assert len(notices['000001'])==1 and evidence['status_by_code']['000001']==pit.PIT_AVAILABLE
     assert len(events[0].selection.members)==2
     with pytest.raises(ValueError,match='SUBSET_DIFFERS'):pit.subset_historical_event_read(events[0],['999999'])
@@ -105,18 +113,18 @@ def test_verified_finance_and_event_inputs_are_reused_by_feature_readers(monkeyp
     assert restored.cutoff==inputs.cutoff and restored.finance.members==inputs.finance.members
     assert restored.events.selection.batch==inputs.events.selection.batch
     financial=load_sealed_finance_facts(engine,selection=restored.finance,codes=catalog.codes,
-        decision_at=decision,fact_cutoff_at=result['fact_cutoff_at'],as_of_date=date(2026,8,25),
+        decision_at=decision,fact_cutoff_at=result['source_cutoff_at']['finance'],as_of_date=date(2026,8,25),
         formal_store=FormalAnalysisStore(engine),formal_generation_sha256=generation)
     monkeypatch.setattr(daily_features,'load_finance_facts',lambda *_a,**_k:pytest.fail('prepared issuer facts were read again'))
     values=daily_features._load_finance(engine,as_of=date(2026,8,25),codes=['000001'],decision_at=decision,
-        fact_cutoff_at=result['fact_cutoff_at'],sealed_finance_inputs=restored.finance,prepared_batch=financial)
+        fact_cutoff_at=result['source_cutoff_at']['finance'],sealed_finance_inputs=restored.finance,prepared_batch=financial)
     assert values['000001']['roe_wtd']==14.5
     with pytest.raises(ValueError,match='FINANCE_SNAPSHOT_DIFFERS'):
         daily_features._load_finance(engine,as_of=date(2026,8,26),codes=['000001'],decision_at=decision,
-            fact_cutoff_at=result['fact_cutoff_at'],sealed_finance_inputs=restored.finance,prepared_batch=financial)
+            fact_cutoff_at=result['source_cutoff_at']['finance'],sealed_finance_inputs=restored.finance,prepared_batch=financial)
     frozen=pit.subset_historical_event_read(restored.events,['000001'])
     restored_notices,restored_evidence=daily_features._load_recent_notices(engine,as_of=date(2026,8,25),
-        codes=['000001'],decision_at=decision,fact_cutoff_at=result['fact_cutoff_at'],
+        codes=['000001'],decision_at=decision,fact_cutoff_at=result['source_cutoff_at']['event'],
         include_evidence=True,historical_selection=frozen)
     assert restored_notices==notices and restored_evidence==evidence
     assert load_snapshot(engine,'e'*64) is None
@@ -129,6 +137,22 @@ def test_verified_finance_and_event_inputs_are_reused_by_feature_readers(monkeyp
         with pytest.raises(RuntimeError,match='complete snapshot receipt'):
             save_snapshot(engine,'f'*64,inputs)
     assert load_snapshot(engine,'f'*64) is None
+
+    # Real source readers must reach price/features even when finance was sealed before close.
+    from types import SimpleNamespace
+    from server.engine import strategy_native_backtest as native
+    with engine.begin() as c:
+        c.execute(text('CREATE TABLE si_trade_calendar(trade_date TEXT,trade_status INT)'))
+        c.execute(text("INSERT INTO si_trade_calendar VALUES('2026-08-25',1)"))
+    monkeypatch.undo()
+    monkeypatch.setattr(native,'_identity_rows',lambda *_:({code:{} for code in catalog.codes},
+        {'status':'VERIFIED','sha256':'a'*64,'captured_at':'2026-08-25 21:47:00'}))
+    monkeypatch.setattr(native,'_save',lambda *_:None)
+    class SourceFactsReady(Exception):pass
+    def prices_after_verified_sources(*_args):raise SourceFactsReady()
+    monkeypatch.setattr(native,'_ensure_inputs',prices_after_verified_sources)
+    with engine.connect() as c,pytest.raises(SourceFactsReady):
+        native._v3_day(c,{'requested_at':str(decision),'proposals':[]},'2026-08-25',None)
 
 
 def test_dated_reader_keeps_tampered_primary_batch_visible():
