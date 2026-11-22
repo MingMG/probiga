@@ -203,7 +203,7 @@ def _v3_day(c,state,day,owner):
             finance_end_date=day,event_start_date=target-timedelta(days=20),event_end_date=day,require_qmt_event_batch=True,
             event_trade_date=day,capture_finance_selection=finances.append,capture_historical_selection=events.append,
             finance_observation_at=finance_observation,
-            event_checkpoint_path=Path.home()/'.local/state/probiga/native-event-prefix/coverage.sqlite',event_progress=progress,
+            event_progress=progress,
             event_coverage_store=FormalAnalysisStore(c.engine),event_coverage_progress=coverage_progress)
     else:
         cutoff=fact_inputs.cutoff
