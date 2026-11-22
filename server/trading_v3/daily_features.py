@@ -1363,6 +1363,7 @@ def build_daily_feature_universe(
     primary_engine: Engine, *, as_of: date, dates: list[date], frame: pd.DataFrame,
     context_cutoff_at: datetime | None = None, limit: int = 5000,
     required_codes: Iterable[str] = (), allow_research_industry_last_known: bool = False,
+    entry_scope_codes: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Evaluate the same native features from an already verified price window."""
     required_code_set = {str(code).zfill(6) for code in required_codes if str(code)}
@@ -1379,6 +1380,9 @@ def build_daily_feature_universe(
         expected_trade_date=expected_trade_date,
         required_codes=required_code_set,
     )
+    if entry_scope_codes is not None:
+        scope = {str(code).zfill(6) for code in entry_scope_codes}
+        codes = [code for code in codes if code in scope or code in required_code_set]
     code_set = set(codes)
     industries, industry_evidence = _load_industries(
         primary_engine,

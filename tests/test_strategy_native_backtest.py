@@ -95,3 +95,34 @@ def test_driver_replays_partial_sources_without_fabricating_zero_profit(monkeypa
     assert state['phase']=='FINISHED' and state['status']=='BLOCKED' and state['completed_units']==61
     assert v['available_feature_sessions']==0 and len(v['source_gaps'])==10
     assert v['report']['net_return_pct'] is None and v['report']['nav']==[]
+
+
+def test_historical_uncovered_finance_members_do_not_block_other_securities(monkeypatch):
+    from types import SimpleNamespace
+    from server.common import pit_facts
+    identity={str(i).zfill(6):{} for i in range(4755)}
+    covered=set(sorted(identity)[4:])
+    monkeypatch.setattr(native,'_identity_rows',lambda *_:(identity,{'status':'VERIFIED'}))
+    monkeypatch.setattr(pit_facts,'load_latest_finance_atomic_batch_baseline',lambda *_a,**_k:
+        {'seal_coverage_id':'verified-seal','members':dict.fromkeys(covered,{})})
+    def cutoff(_engine,*,codes,**_kwargs):
+        if not set(codes)<=covered:raise ValueError('finance atomic batch seal code scope differs')
+        assert len(codes)==4751
+        return {'status':'DATA_BLOCKED','reason':'公告窗口尚无完成记录'}
+    monkeypatch.setattr(pit_facts,'resolve_common_fact_cutoff',cutoff)
+    result=native._v3_day(SimpleNamespace(engine=None),{'requested_at':'2026-11-22 09:00:00'},'2026-08-03',None)
+    assert result['reason']=='公告窗口尚无完成记录'
+
+
+def test_entry_scope_filters_stock_features_without_removing_market_bars(monkeypatch):
+    from server.trading_v3 import daily_features
+    days=[d.date() for d in pd.bdate_range('2026-04-01',periods=70)]
+    frame=pd.DataFrame([{'stock_code':code,'trade_date':d} for code in ['000001','000002'] for d in days])
+    frame.attrs['qmt_daily_input_window']={'sessions':[str(d) for d in days]}
+    class ReachedScope(Exception):pass
+    def industries(_engine,codes,**_kwargs):
+        assert codes==['000001'] and len(frame)==140
+        raise ReachedScope()
+    monkeypatch.setattr(daily_features,'_load_industries',industries)
+    with pytest.raises(ReachedScope):
+        daily_features.build_daily_feature_universe(None,as_of=days[-1],dates=days,frame=frame,entry_scope_codes=['000001'])

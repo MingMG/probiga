@@ -73,3 +73,25 @@ def test_retry_refuses_changed_computation_contract(ledger,monkeypatch):
     monkeypatch.setattr(native,'_contract',lambda:'different-code')
     with pytest.raises(ValueError,match='变化'):
         control.request_retry(ledger,'native:'+('a'*64)+':'+('c'*64),'1'*32)
+
+
+def test_new_compute_contract_never_runs_under_an_old_checkpoint(ledger,monkeypatch):
+    from server.common import authoritative_market_clock
+    with ledger.connect() as c:
+        state=native.read_runs(c)[0]
+        state['status']='NOT_STARTED'
+        _append_audit_connection(c,entity_type=native.ENTITY,entity_key=state['run_id'],action='CHECKPOINT_00000004',
+            operator='test',reason='pending',before=None,after=state,evidence={})
+        c.commit()
+    saved=[]
+    monkeypatch.setattr(native,'_contract',lambda:'new-code')
+    monkeypatch.setattr(native,'_owner',lambda _c:{'scheduler_run_uid':'new'})
+    monkeypatch.setattr(native,'_resume_allowed',lambda *_:True)
+    monkeypatch.setattr(native,'_save',lambda _c,state,*_:saved.append(dict(state)))
+    monkeypatch.setattr(native,'_strategies',lambda _c:[])
+    monkeypatch.setattr(native,'_inventory',lambda *_:([],{},'source'))
+    monkeypatch.setattr(native,'_step',lambda *_:pytest.fail('old contract must not execute new calculations'))
+    monkeypatch.setattr(authoritative_market_clock,'authoritative_closed_trade_date',lambda *_a,**_k:'2026-11-20')
+    native.native_tick(ledger)
+    assert len(saved)==1 and saved[0]['status']=='BLOCKED'
+    assert saved[0]['contract']=='code' and saved[0]['cursor']==1 and saved[0]['completed_units']==141
