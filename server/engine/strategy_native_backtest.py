@@ -237,7 +237,7 @@ def _v3_day(c,state,day,owner):
         rows.sort(key=lambda r:(-r['effective_score'],r['stock_code']))
         for rank,row in enumerate(rows):row['rank']=rank+1
     return {'status':'COMPLETE','signals':selected,'scored_stocks':scored,'missing_feature_stocks':missing,
-        'finance_scope_exclusions':excluded,'finance_seal_coverage_id':state['finance_seal_id'],
+        'finance_scope_exclusions':excluded,'finance_seal_coverage_id':baseline['seal_coverage_id'],
         'universe_identity_exclusion_count':max(0,frame.attrs['qmt_daily_input_window']['latest_daily_truth']['attested_row_count']-len(identity)),
         'data_snapshot_hash':dataset['data_snapshot_hash'],'fact_cutoff':str(fact_clock),'identity':identity_proof,
         'interpretation':'CURRENT_FROZEN_RULES_WITHOUT_FUTURE_CALIBRATIONS'}
