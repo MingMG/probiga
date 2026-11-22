@@ -106,7 +106,7 @@ def test_retry_request_works_without_secure_context_random_uuid(tmp_path):
 global.window={};global.document={activeElement:null};
 Object.defineProperty(global,'crypto',{value:{getRandomValues:a=>require('node:crypto').webcrypto.getRandomValues(a)}});
 require('''+json.dumps(str(script))+''');
-const mount={isConnected:false,querySelectorAll:()=>[],contains:()=>false};let sent;
+const mount=Object.assign(new EventTarget(),{isConnected:false,querySelectorAll:()=>[],contains:()=>false});let sent;
 QuantStrategyWorkspace=window.QuantStrategyWorkspace;
 QuantStrategyWorkspace.load('2026-11-20',mount,async(u,t,o)=>{sent={u,o};return {};},()=>{},()=>{},()=>false);
 mount._strategyWorkspace.data={};
