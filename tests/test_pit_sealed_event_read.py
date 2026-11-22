@@ -2,7 +2,7 @@ from dataclasses import replace
 from datetime import datetime,timedelta
 
 import pytest
-from sqlalchemy import event
+from sqlalchemy import event,text
 
 from server.common import pit_facts as pit
 from server.common import qmt_announcement_pit as announcements
@@ -96,3 +96,44 @@ def test_failed_event_read_is_not_published_as_a_completed_issuer(monkeypatch):
         materialize.load_sealed_event_facts(engine,selection=selection,codes=codes,formal_store=store,
             read_progress=lambda *values:progress.append(values))
     assert progress==[]
+
+
+def test_canonical_publication_date_survives_an_empty_metadata_projection():
+    engine=_engine()
+    payload={'stock_code':'000001','event_key':'cninfo:1234567890','event_date':'2026-08-25',
+        'published_at':None,'source_published_text':'2026-08-25','title':'Date-only source'}
+    source_name=announcements.CNINFO_ANNOUNCEMENT_SOURCE
+    identity=pit.canonical_hash({'schema':'probiga.pit-event-identity.v1','source':source_name,
+        'event_key':payload['event_key'],'stock_code':'000001'})
+    # Reproduce the immutable archived writer format observed in production.
+    values,_=pit._plan_revision(fact_kind='event',identity_hash=identity,latest=None,
+        row_columns={key:payload[key] for key in ('stock_code','event_key','event_date')},payload=payload,
+        published_value=None,known_at='2026-08-25 18:01:00',received_at=None,
+        source=source_name,batch_id='date-only-source')
+    with engine.begin() as c:pit._insert_pit_rows(c,pit.EVENT_REVISION_TABLE,[values])
+    with engine.connect() as c:
+        original=dict(c.execute(text("SELECT source_published_text,payload_json,known_at FROM st_pit_event_revision")).mappings().one())
+    import json
+    assert original['source_published_text']==''
+    assert json.loads(original['payload_json'])['source_published_text']=='2026-08-25'
+    actual=pit.load_event_facts(engine,codes=['000001'],decision_at='2026-08-25 19:00:00',
+        fact_cutoff_at='2026-08-25 18:20:00',start_date='2026-08-05',end_date='2026-08-25')
+    assert actual.status_for('000001')==pit.PIT_AVAILABLE,actual.reason_for('000001')
+    fact,=actual.facts['000001']
+    assert fact['event_published_at']=='2026-08-25'
+    assert fact['event_publication_precision']=='DATE_ONLY' and not fact['event_publication_time_verified']
+    assert pit.normalize_decision_at(fact['event_known_at'])==pit.normalize_decision_at(original['known_at'])
+
+
+def test_exact_batch_excludes_unbound_unknown_dates_but_generic_reader_stays_blocked():
+    engine,codes,selection=source()
+    pit.append_event_revision(engine,{'stock_code':'000001','event_key':'unbound-date-missing','title':'Other batch'},
+        known_at='2026-08-25 18:40:00',source=announcements.QMT_ANNOUNCEMENT_SOURCE,batch_id='other-batch')
+    kwargs=dict(codes=codes,decision_at=selection.selection.decision_at,
+        fact_cutoff_at=selection.fact_cutoff_at,start_date=selection.selection.window_start,end_date=selection.selection.window_end)
+    generic=pit.load_event_facts(engine,**kwargs)
+    assert generic.reason_for('000001')=='PIT_EVENT_PUBLICATION_DATE_MISSING'
+    exact=pit.load_event_facts(engine,**kwargs,require_qmt_complete_batch=True,historical_selection=selection)
+    assert exact.status_for('000001')==pit.PIT_AVAILABLE,exact.reason_for('000001')
+    assert len(exact.facts['000001'])==1
+    assert exact.reason_for('000002')=='PIT_EVENT_AUTHORITATIVE_EMPTY'
