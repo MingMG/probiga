@@ -64,6 +64,42 @@ def test_verified_finance_and_event_inputs_are_reused_by_feature_readers(monkeyp
     assert len(notices['000001'])==1 and evidence['status_by_code']['000001']==pit.PIT_AVAILABLE
     assert len(events[0].selection.members)==2
     with pytest.raises(ValueError,match='SUBSET_DIFFERS'):pit.subset_historical_event_read(events[0],['999999'])
+    from server.engine.strategy_native_fact_snapshot import save_snapshot,load_snapshot
+    from server.common.formal_analysis_store import FormalAnalysisStore
+    from server.common.pit_sealed_finance_read import load_sealed_finance_facts
+    from server.db.formal_analysis_schema import privileged_migrate_formal_analysis_schema
+    privileged_migrate_formal_analysis_schema(engine)
+    inputs=daily_features.DailyFactInputs(result,finances[0],events[0]);generation='d'*64
+    save_snapshot(engine,generation,inputs)
+    restored=load_snapshot(engine,generation)
+    assert restored.finance is not inputs.finance and restored.finance.engine is engine
+    assert restored.cutoff==inputs.cutoff and restored.finance.members==inputs.finance.members
+    assert restored.events.selection.batch==inputs.events.selection.batch
+    financial=load_sealed_finance_facts(engine,selection=restored.finance,codes=catalog.codes,
+        decision_at=decision,fact_cutoff_at=result['fact_cutoff_at'],as_of_date=date(2026,8,25),
+        formal_store=FormalAnalysisStore(engine),formal_generation_sha256=generation)
+    monkeypatch.setattr(daily_features,'load_finance_facts',lambda *_a,**_k:pytest.fail('prepared issuer facts were read again'))
+    values=daily_features._load_finance(engine,as_of=date(2026,8,25),codes=['000001'],decision_at=decision,
+        fact_cutoff_at=result['fact_cutoff_at'],sealed_finance_inputs=restored.finance,prepared_batch=financial)
+    assert values['000001']['roe_wtd']==14.5
+    with pytest.raises(ValueError,match='FINANCE_SNAPSHOT_DIFFERS'):
+        daily_features._load_finance(engine,as_of=date(2026,8,26),codes=['000001'],decision_at=decision,
+            fact_cutoff_at=result['fact_cutoff_at'],sealed_finance_inputs=restored.finance,prepared_batch=financial)
+    frozen=pit.subset_historical_event_read(restored.events,['000001'])
+    restored_notices,restored_evidence=daily_features._load_recent_notices(engine,as_of=date(2026,8,25),
+        codes=['000001'],decision_at=decision,fact_cutoff_at=result['fact_cutoff_at'],
+        include_evidence=True,historical_selection=frozen)
+    assert restored_notices==notices and restored_evidence==evidence
+    assert load_snapshot(engine,'e'*64) is None
+    original=FormalAnalysisStore.put
+    def interrupted(store,generation,stage,key,payload):
+        if stage=='native_fact_snapshot':raise RuntimeError('interrupted before complete snapshot receipt')
+        return original(store,generation,stage,key,payload)
+    with monkeypatch.context() as partial:
+        partial.setattr(FormalAnalysisStore,'put',interrupted)
+        with pytest.raises(RuntimeError,match='complete snapshot receipt'):
+            save_snapshot(engine,'f'*64,inputs)
+    assert load_snapshot(engine,'f'*64) is None
 
 
 def test_dated_reader_keeps_tampered_primary_batch_visible():

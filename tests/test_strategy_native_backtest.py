@@ -103,8 +103,10 @@ def test_historical_uncovered_finance_members_do_not_block_other_securities(monk
     from server.common import historical_announcement_read
     identity={str(i).zfill(6):{} for i in range(4755)}
     covered=set(sorted(identity)[4:])
-    monkeypatch.setattr(native,'_identity_rows',lambda *_:(identity,{'status':'VERIFIED'}))
-    monkeypatch.setattr(pit_facts,'load_latest_finance_atomic_batch_baseline',lambda *_a,**_k:{'as_of_date':'2026-08-03','members':dict.fromkeys(covered)})
+    from server.db.formal_analysis_schema import privileged_migrate_formal_analysis_schema
+    engine=create_engine('sqlite://');privileged_migrate_formal_analysis_schema(engine)
+    monkeypatch.setattr(native,'_identity_rows',lambda *_:(identity,{'status':'VERIFIED','sha256':'a'*64}))
+    monkeypatch.setattr(pit_facts,'load_latest_finance_atomic_batch_baseline',lambda *_a,**_k:{'as_of_date':'2026-08-03','members':dict.fromkeys(covered),'seal_coverage_id':'b'*64})
     monkeypatch.setattr(historical_announcement_read,'has_dated_announcement_candidate',lambda *_a,**_k:True)
     def cutoff(_engine,*,codes,**_kwargs):
         if not set(codes)<=covered:raise ValueError('finance atomic batch seal code scope differs')
@@ -112,7 +114,7 @@ def test_historical_uncovered_finance_members_do_not_block_other_securities(monk
         return {'status':'DATA_BLOCKED','reason':'公告窗口尚无完成记录'}
     monkeypatch.setattr(pit_facts,'resolve_common_fact_cutoff',cutoff)
     codes=sorted(covered)
-    result=native._v3_day(SimpleNamespace(engine=None),{'requested_at':'2026-11-22 09:00:00',
+    result=native._v3_day(SimpleNamespace(engine=engine),{'requested_at':'2026-11-22 09:00:00',
         'finance_scope_codes':codes,'finance_scope_sha256':native.canonical_sha256(codes)},'2026-08-03',None)
     assert result['reason']=='公告窗口尚无完成记录'
 
