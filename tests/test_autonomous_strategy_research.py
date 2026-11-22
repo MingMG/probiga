@@ -215,7 +215,8 @@ def test_price_research_runs_shared_inputs_and_resumes_from_real_audit_partition
         assert c.execute(text("SELECT COUNT(*) FROM st_strategy_governance_audit WHERE entity_type='AUTO_REPLAY_PART'")).scalar() == 45
 
 
-def test_failed_price_source_is_terminal_and_new_contract_reuses_verified_prefix(ledger, rule, monkeypatch):
+@pytest.mark.parametrize('failure', ['source', 'timeout_once', 'timeout_repeated', 'saved_timeout'])
+def test_price_source_recovery_preserves_verified_prefix_and_bounds_timeouts(ledger, rule, monkeypatch, failure):
     from server.engine import strategy_price_backtest as price
     import pandas as pd
     days = [d.date().isoformat() for d in pd.bdate_range('2026-06-01', periods=32)]
@@ -234,6 +235,10 @@ def test_failed_price_source_is_terminal_and_new_contract_reuses_verified_prefix
     def validate(_c, group, _cutoff):
         calls.append(group['sessions'][0])
         if group['sessions'] == days[16:] and not repaired[0]:
+            if failure != 'source':
+                from sqlalchemy.exc import OperationalError
+                from pymysql.err import OperationalError as DriverError
+                raise OperationalError('SELECT historical source', {}, DriverError(3024, 'maximum statement execution time exceeded'))
             raise ValueError('observed source classification failure')
         return {"sessions": group['sessions'], "catalogs": {d: 'test' for d in group['sessions']},
                 "proofs": {'fixture': True}, "row_counts": {d: 2 for d in group['sessions']}}
@@ -249,21 +254,41 @@ def test_failed_price_source_is_terminal_and_new_contract_reuses_verified_prefix
     with ledger.connect() as c:
         research._checkpoint(c, state, research._owner(c))
     result = research.research_tick(ledger)
-    assert result['status'] == 'FAILED'
+    assert result['status'] == ('FAILED' if failure == 'source' else 'BLOCKED')
     with ledger.connect() as c:
         failed = research._read_states(c)[0]
-    assert failed['proposals'][0]['validation']['status'] == 'FAILED'
+    assert failed['proposals'][0]['validation']['status'] == ('FAILED' if failure == 'source' else 'NOT_STARTED')
     assert failed['price_backtest']['completed_units'] == 16
     old_run = failed['price_backtest']['run_id']
-    repaired[0] = True
-    monkeypatch.setattr(price, 'replay_contract', lambda: 'f' * 64)
+    if failure == 'source':
+        monkeypatch.setattr(price, 'replay_contract', lambda: 'f' * 64)
+    else:
+        if failure == 'saved_timeout':
+            failed.update(status='FAILED', retryable=False, retry_count=0)
+            failed['proposals'][0]['validation']['status'] = 'FAILED'
+            with ledger.connect() as c:
+                research._checkpoint(c, failed, research._owner(c))
+        research.research_tick(ledger)
+        assert calls == [days[0], days[16]]
+        clock = research.now_shanghai() + timedelta(minutes=6)
+        monkeypatch.setattr(research, 'now_shanghai', lambda: clock)
+    repaired[0] = failure != 'timeout_repeated'
     research.research_tick(ledger)
+    if failure == 'timeout_repeated':
+        with ledger.connect() as c:
+            stopped = research._read_states(c)[0]
+        assert stopped['status'] == 'FAILED' and stopped['retry_count'] == 1
+        assert stopped['price_backtest']['run_id'] == old_run
+        assert stopped['price_backtest']['completed_units'] == 16
+        assert research.research_tick(ledger)['status'] == 'FAILED'
+        assert calls == [days[0], days[16], days[16]]
+        return
     with ledger.connect() as c:
         resumed = research._read_states(c)[0]
         campaign = resumed['price_backtest']
-        assert campaign['reused_input_sessions'] == 16
+        assert campaign['reused_input_sessions'] == (16 if failure == 'source' else 0)
         assert campaign['completed_units'] == 32 and campaign['phase'] == 'SIGNALS'
-        assert campaign['run_id'] != old_run
+        assert (campaign['run_id'] != old_run) == (failure == 'source')
         assert resumed['provider_request_id'] == 'original-model-request'
         assert calls == [days[0], days[16], days[16]]
         assert c.execute(text("SELECT COUNT(*) FROM st_strategy_governance_audit WHERE entity_type='AUTO_REPLAY_PART'")).scalar() == 2

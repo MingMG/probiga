@@ -435,6 +435,24 @@ def _step(connection, state, owner):
     return state
 
 
+def _arm_database_retry(state, *, failed_at):
+    code = state.get("error_errno")
+    limit = (1 if code == 3024 and state.get("stage") == "VALIDATE" and state.get("price_backtest")
+             else 2 if code in {2003, 2006, 2013, 1205, 1213} else 0)
+    attempt = int(state.get("retry_count") or 0) + 1
+    if (attempt > limit or (state.get("stage") == "GENERATE" and state.get("provider_attempted"))):
+        return False
+    state.update(status="BLOCKED", retryable=True, retry_count=attempt,
+                 retry_after=(datetime.fromisoformat(failed_at) + timedelta(minutes=5)).isoformat(sep=" "))
+    if state.get("price_backtest") and state.get("stage") == "VALIDATE":
+        state["price_backtest"]["status"] = "BLOCKED"
+        for proposal in state["proposals"]:
+            if (proposal["validation"].get("replay_run_id") == state["price_backtest"]["run_id"]
+                    and proposal["validation"]["status"] in {"FAILED", "RUNNING"}):
+                proposal["validation"]["status"] = "NOT_STARTED"
+    return True
+
+
 def research_tick(engine):
     """Do one bounded resumable step when the existing V2 queue has no job."""
     with engine.connect() as connection:
@@ -497,6 +515,9 @@ def research_tick(engine):
                     for p in price_proposals:
                         p["validation"] = {"status": "NOT_STARTED"}
                     _checkpoint(connection, state, owner)
+            if (state and state["status"] == "FAILED" and not state.get("retryable")
+                    and _arm_database_retry(state, failed_at=state["updated_at"])):
+                _checkpoint(connection, state, owner)
             if state and state["status"] in {"COMPLETE", "FAILED", "BLOCKED"}:
                 if (state.get("retryable") is True and int(state.get("retry_count") or 0) <= 2
                         and str(state.get("retry_after") or "9999") <= now_shanghai().isoformat(sep=" ")):
@@ -539,11 +560,7 @@ def research_tick(engine):
                 error_args = getattr(original, "args", ())
                 state["error_type"] = type(exc).__name__
                 state["error_errno"] = error_args[0] if error_args and type(error_args[0]) is int else None
-                retries = int(state.get("retry_count") or 0) + 1
-                if (state["error_errno"] in {2003, 2006, 2013, 1205, 1213} and retries <= 2
-                        and (state["stage"] != "GENERATE" or not state.get("provider_attempted"))):
-                    state.update(status="BLOCKED", retryable=True, retry_count=retries,
-                                 retry_after=(now_shanghai() + timedelta(minutes=5)).isoformat(sep=" "))
+                _arm_database_retry(state, failed_at=now_shanghai().isoformat(sep=" "))
                 if state.get("price_backtest") and state["stage"] == "VALIDATE":
                     state["price_backtest"].update(status=state["status"], reason=reason)
                     for proposal in state["proposals"]:
