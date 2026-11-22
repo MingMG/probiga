@@ -110,6 +110,13 @@ def _save(c,state,owner,events=()):
     c.commit()
 
 
+def _restore_failure_lock(connection):
+    # Interrupted driver reads can invalidate the connection and release its session lock.
+    if connection.execute(text('SELECT IS_USED_LOCK(:name)=CONNECTION_ID()'),{'name':LOCK}).scalar()!=1:
+        if connection.execute(text('SELECT GET_LOCK(:name,0)'),{'name':LOCK}).scalar()!=1:
+            raise RuntimeError('原生回测失败回执无法恢复互斥锁')
+
+
 def _part(state,kind,day,value):
     return {'entity_type':PART_ENTITY,'entity_key':partition_key(state,state,kind,day),
         'action':'PARTITION_COMPLETE','after':{'day':day,**value}}
@@ -411,9 +418,12 @@ def native_tick(engine):
             return {k:state.get(k) for k in ('status','run_id','phase','completed_units','total_units','reason')}
         except (Exception,NativeStepDeadline) as ex:
             if state is not None:
-                c.rollback();state.update(status='FAILED',step_status='FAILED',reason=f"{state.get('current_unit',state['phase'])}: {type(ex).__name__}: {ex}")
+                if previous_handler is not None:signal.setitimer(signal.ITIMER_REAL,0)
+                c.rollback()
+                _restore_failure_lock(c)
+                state.update(status='FAILED',step_status='FAILED',reason=f"{state.get('current_unit',state['phase'])}: {type(ex).__name__}: {ex}")
                 original=getattr(ex,'orig',ex);args=getattr(original,'args',())
-                transient=(args and args[0] in (1205,1213,2003,2006,2013)) or any(t in str(ex) for t in ('errno=2013','errno=1205','errno=2006'))
+                transient=(args and args[0] in (1205,1213,2003,2006,2013,3024)) or any(t in str(ex) for t in ('errno=2013','errno=1205','errno=2006'))
                 if transient and state.get('retry_count',0)<1:
                     state.update(status='NOT_STARTED',retry_count=1,retry_after=str(now_shanghai()+timedelta(minutes=5)))
                 for p in state['proposals']:

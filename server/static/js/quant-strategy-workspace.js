@@ -36,6 +36,35 @@
     function resultTable(rows, ranked) {
         return '<div class="qsw-result-scroll"><table><thead><tr>'+['排名 / 策略版本','回测区间','账户累计收益','账户净盈利','已平仓笔数','胜率','最大回撤','结果'].map(x=>'<th>'+x+'</th>').join('')+'</tr></thead><tbody>'+rows.map(r=>'<tr><td>'+esc(ranked?r.rank:'—')+' · '+esc(r.strategy_name||r.strategy_key||r.reported_strategy_key||'历史策略')+'<small>'+esc(r.strategy_version)+'</small>'+(r.return_scope==='VERIFIED_INPUT_SUBSET'?'<small>可用输入子集 · 非完整策略收益</small>':'')+'</td><td>'+esc(r.start_date||'未知')+' 至 '+esc(r.end_date||'未知')+'</td><td>'+metric(resultReturn(r),'%')+'</td><td>'+metric(resultProfit(r),'元')+'</td><td>'+esc(r.completed_trades==null?'未知':r.completed_trades)+'</td><td>'+metric(r.win_rate_pct,'%')+'</td><td>'+metric(r.max_drawdown_pct,'%')+'</td><td><button type="button" data-qsw-result="'+esc(r.result_id)+'">明细与证据</button><small>'+esc(r.reason)+'</small></td></tr>').join('')+'</tbody></table></div>';
     }
+    function winRateChart(s) {
+        const d=s.performance, byId=new Map(d.results.map(r=>[r.result_id,r]));
+        const colors=['#2563eb','#c2410c','#15803d','#a21caf','#0e7490','#be123c','#6d28d9','#854d0e','#475569','#047857','#4338ca','#b45309','#9f1239','#0f766e'];
+        const hidden=new Set(s.chartHidden||[]);
+        const series=d.strategies.map((strategy,i)=>({strategy,row:byId.get(strategy.result_id),color:colors[i%colors.length],index:i}));
+        const visible=series.filter(x=>!hidden.has(x.strategy.strategy_key)&&x.row?.win_rate_history?.length);
+        const dates=series.flatMap(x=>[x.row?.start_date,x.row?.end_date]).filter(x=>/^\d{4}-\d{2}-\d{2}$/.test(x||''));
+        const stamp=day=>Date.parse(day+'T00:00:00Z');
+        const first=Math.min(...dates.map(stamp)),last=Math.max(...dates.map(stamp));
+        let h='<section class="qsw-win-rates"><h4>各策略累计胜率</h4><p>横轴为平仓日期，纵轴为截至该日扣费盈利笔数 ÷ 已平仓笔数；持仓不计入，平手计入分母。图例可切换曲线，悬停或聚焦圆点查看样本数。样本少时胜率波动很大。</p>';
+        if(visible.length&&Number.isFinite(first)&&Number.isFinite(last)) {
+            const x=day=>60+880*(stamp(day)-first)/Math.max(86400000,last-first),y=value=>270-2.5*value;
+            h+='<div class="qsw-win-plot"><svg viewBox="0 0 960 320" role="img" aria-label="各策略累计胜率折线图，百分比范围零至一百">';
+            [0,25,50,75,100].forEach(v=>{h+='<line x1="60" x2="940" y1="'+y(v)+'" y2="'+y(v)+'" class="qsw-win-grid"/><text x="48" y="'+(y(v)+4)+'" text-anchor="end">'+v+'%</text>';});
+            for(let i=0;i<5;i++){const t=first+(last-first)*i/4;h+='<text x="'+(60+880*i/4)+'" y="300" text-anchor="'+(i===0?'start':i===4?'end':'middle')+'">'+new Date(t).toISOString().slice(0,10)+'</text>';}
+            visible.forEach(({strategy,row,color,index})=>{
+                const points=row.win_rate_history.filter(p=>Number.isFinite(stamp(p.date))&&number(p.win_rate_pct)!==null&&p.win_rate_pct>=0&&p.win_rate_pct<=100);
+                h+='<polyline fill="none" stroke="'+color+'" stroke-width="2.5"'+(index>=7?' stroke-dasharray="6 4"':'')+' points="'+points.map(p=>x(p.date)+','+y(p.win_rate_pct)).join(' ')+'"/>';
+                points.forEach(p=>{const label=strategy.strategy_name+' · '+p.date+' · 胜率 '+metric(p.win_rate_pct,'%')+' · 盈利 '+p.winning_trades+' / 已平仓 '+p.completed_trades+' 笔';h+='<circle cx="'+x(p.date)+'" cy="'+y(p.win_rate_pct)+'" r="4" fill="'+color+'" tabindex="0" data-qsw-point="'+esc(strategy.strategy_key+':'+p.date)+'" aria-label="'+esc(label)+'"><title>'+esc(label)+'</title></circle>';});
+            });
+            h+='</svg></div><p class="qsw-win-readout" role="status">悬停或聚焦圆点，查看该日胜率与已平仓笔数。</p>';
+        } else h+='<p class="qsw-warning">'+(series.some(x=>x.row?.win_rate_history?.length)?'当前曲线均已隐藏，请在图例中选择策略。':'暂无日期、盈亏和笔数均可核对的已平仓样本，完成回测后自动显示曲线。')+'</p>';
+        h+='<div class="qsw-win-legend">'+series.map(({strategy,row,color,index})=>{
+            const history=row?.win_rate_history||[],point=history[history.length-1];
+            const basis=row?.kind==='NATIVE_SHADOW_RETROSPECTIVE'?'原生规则回放':row?.kind==='MODEL_RULE_RETROSPECTIVE'?'模型规则回放':'历史回测';
+            return '<label title="'+esc(strategy.strategy_version)+'"><input type="checkbox" data-qsw-series="'+esc(strategy.strategy_key)+'"'+(!hidden.has(strategy.strategy_key)?' checked':'')+(!point?' disabled':'')+'><span class="qsw-win-swatch" style="border-color:'+color+';border-top-style:'+(index>=7?'dashed':'solid')+'"></span><span>'+esc(strategy.strategy_name)+'<small>'+esc(point?metric(point.win_rate_pct,'%')+' · 已平仓 '+point.completed_trades+' 笔':'暂无有效样本 · '+(researchStates[strategy.backtest_status]||strategy.backtest_status))+'</small><small>'+esc(basis+(row?.return_scope==='VERIFIED_INPUT_SUBSET'?' · 仅可用输入子集':''))+'</small></span></label>';
+        }).join('')+'</div><p class="qsw-foot">仅展示当前策略版本；曲线按各自输入和费用口径计算。胜率不代表收益，赚钱排名、盈亏和回撤仍需一起查看；此处历史回放不代表前向模拟或实盘表现。</p></section>';
+        return h;
+    }
     function performanceView(s) {
         const d=s.performance;
         let h='<section class="qsw-performance"><h3>回测与赚钱排名</h3><p>历史回测、模型规则事后回放、前向模拟分别比较。累计收益包含持仓估值；已平仓交易盈利另列。</p>';
@@ -45,6 +74,7 @@
         h+='<p>'+esc(d.method)+'</p><h4>累计收益排名</h4>';
         if(!(d.leaderboards||[]).length)h+='<p class="qsw-warning">当前没有满足版本绑定及可比口径的完整回测结果，暂不能给出赚钱排名。历史报告及全部策略的进度在下方保留。</p>';
         (d.leaderboards||[]).forEach(g=>{h+='<p>'+esc(g.cohort.return_scope==='VERIFIED_INPUT_SUBSET'?'可用输入子集研究排名':'完整输入回测排名')+' · 同组 '+esc(g.rows.length)+' 个版本 · '+esc(g.cohort.start_date)+' 至 '+esc(g.cohort.end_date)+' · 初始资金 '+metric(g.cohort.initial_cash_cny,'元')+(g.rows[0].kind==='NATIVE_SHADOW_RETROSPECTIVE'?' · 原生冻结影子规则事后研究，非独立样本外结果':g.rows[0].kind==='MODEL_RULE_RETROSPECTIVE'?' · 模型规则事后研究，非独立样本外结果':' · 历史回测')+'</p>'+resultTable(g.rows,true);});
+        h+=winRateChart(s);
         h+='<details data-qsw-key="backtest-coverage" open><summary>全部 '+esc(d.strategies.length)+' 个当前策略的回测进度</summary><div class="qsw-result-scroll"><table><thead><tr><th>策略 / 版本</th><th>回测状态与缺口</th><th>结果</th></tr></thead><tbody>'+d.strategies.map(r=>'<tr><td>'+esc(r.strategy_name)+'<small>'+esc(r.strategy_version)+'</small></td><td>'+esc(researchStates[r.backtest_status]||r.backtest_status)+'<small>'+esc(r.reason)+'</small></td><td>'+(r.result_id?'<button type="button" data-qsw-result="'+esc(r.result_id)+'">查看验证进度</button>':'等待当前版本回测')+'</td></tr>').join('')+'</tbody></table></div></details>';
         h+='<details data-qsw-key="backtest-archive"><summary>全部历史报告与研究回放（'+esc(d.results.length)+' 份）</summary><p>旧版本和身份未完整绑定的存档均保留原标记，不计入当前策略收益。</p>'+resultTable(d.results,false)+(d.history_limit_reached?'<p>此处展示最近100份正式回测；更早结果请在回测结果页查询。</p>':'')+'</details>';
         if(s.resultLoading)h+='<p role="status">正在读取交易明细…</p>';
@@ -103,22 +133,26 @@
     }
     function paint(s) {
         const opened=new Map(Array.from(s.mount.querySelectorAll('details')).map(e=>[e.dataset.qswKey,e.open]));
-        const scrolls=Array.from(s.mount.querySelectorAll('.qsw-table,.qsw-result-scroll')).map(e=>e.scrollLeft);
+        const scrolls=Array.from(s.mount.querySelectorAll('.qsw-table,.qsw-result-scroll,.qsw-win-plot')).map(e=>e.scrollLeft);
         const focused=s.mount.contains(document.activeElement)?document.activeElement:null;
         const focusControl=focused&&focused.dataset.qswControl;
+        const focusSeries=focused&&focused.dataset.qswSeries;
+        const focusPoint=focused&&focused.dataset.qswPoint;
         const focusKey=focused&&focused.closest('details')&&focused.closest('details').dataset.qswKey;
         const focusRefresh=focused&&focused.hasAttribute('data-qsw-action');
         s.mount.innerHTML=render(s);
         s.mount.querySelectorAll('details').forEach(e=>{if(opened.has(e.dataset.qswKey))e.open=opened.get(e.dataset.qswKey);});
-        s.mount.querySelectorAll('.qsw-table,.qsw-result-scroll').forEach((e,i)=>e.scrollLeft=scrolls[i]||0);
+        s.mount.querySelectorAll('.qsw-table,.qsw-result-scroll,.qsw-win-plot').forEach((e,i)=>e.scrollLeft=scrolls[i]||0);
         let restore;
         if(focusControl)restore=Array.from(s.mount.querySelectorAll('[data-qsw-control]')).find(e=>e.dataset.qswControl===focusControl);
+        else if(focusSeries)restore=Array.from(s.mount.querySelectorAll('[data-qsw-series]')).find(e=>e.dataset.qswSeries===focusSeries);
+        else if(focusPoint)restore=Array.from(s.mount.querySelectorAll('[data-qsw-point]')).find(e=>e.dataset.qswPoint===focusPoint);
         else if(focusKey){const detail=Array.from(s.mount.querySelectorAll('details')).find(e=>e.dataset.qswKey===focusKey);restore=detail&&detail.querySelector('summary');}
         else if(focusRefresh)restore=s.mount.querySelector('[data-qsw-action]');
         if(restore)restore.focus({preventScroll:true});
     }
     function load(day,mount,request,navigate,stock,isActive) {
-        const s={mount,window:'20',order:'name',data:null,market:null,timer:null,busy:false,performance:null};
+        const s={mount,window:'20',order:'name',data:null,market:null,timer:null,busy:false,performance:null,chartHidden:[]};
         mount._strategyWorkspace=s;
         async function refresh() {
             if(s.busy||!mount.isConnected||(isActive&&!isActive()))return;
@@ -174,7 +208,15 @@
                 finally{s.resultLoading=false;if(mount.isConnected){paint(s);mount.querySelector('.qsw-result-detail')?.scrollIntoView({block:'nearest',behavior:'smooth'});}}
             }else if(tab)navigate(tab.dataset.qswTab);else if(code)stock(code.dataset.qswStock);else if(e.target.closest('[data-qsw-action]')){refresh();refreshPerformance();}
         };
-        mount.onchange=e=>{const field=e.target.dataset.qswControl;if(field&&s.data){s[field]=e.target.value;paint(s);}};
+        mount.onchange=e=>{
+            const series=e.target.dataset.qswSeries;
+            if(series){const hidden=new Set(s.chartHidden);if(e.target.checked)hidden.delete(series);else hidden.add(series);s.chartHidden=Array.from(hidden);paint(s);return;}
+            const field=e.target.dataset.qswControl;if(field&&s.data){s[field]=e.target.value;paint(s);}
+        };
+        mount.onpointerover=mount.onfocusin=e=>{
+            const point=e.target.closest('[data-qsw-point]'),readout=mount.querySelector('.qsw-win-readout');
+            if(point&&readout)readout.textContent=point.getAttribute('aria-label');
+        };
         refresh();
         refreshPerformance();
     }

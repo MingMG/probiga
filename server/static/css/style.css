@@ -5363,6 +5363,17 @@ button:focus-visible,a:focus-visible { outline:2px solid #1a73e8; outline-offset
 #tab-quant-workbench .qsw-performance p {font-size:12px;line-height:1.8;overflow-wrap:anywhere}
 #tab-quant-workbench .qsw-performance details {margin:12px 0}
 #tab-quant-workbench .qsw-performance summary {cursor:pointer;font-weight:600}
+#tab-quant-workbench .qsw-win-rates {margin:18px 0;padding:16px;border:1px solid #d8e4f5;border-radius:10px;background:#f8fbff}
+#tab-quant-workbench .qsw-win-plot {overflow-x:auto}
+#tab-quant-workbench .qsw-win-plot svg {display:block;width:100%;min-width:600px;max-height:380px}
+#tab-quant-workbench .qsw-win-plot text {font-size:12px;fill:#475569}
+#tab-quant-workbench .qsw-win-grid {stroke:#dce5ef;stroke-width:1}
+#tab-quant-workbench .qsw-win-plot circle:hover,#tab-quant-workbench .qsw-win-plot circle:focus {r:6;stroke:#0f172a;stroke-width:2;outline:none}
+#tab-quant-workbench .qsw-win-legend {display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px;margin-top:12px}
+#tab-quant-workbench .qsw-win-legend label {display:flex;align-items:flex-start;gap:7px;font-size:12px;cursor:pointer}
+#tab-quant-workbench .qsw-win-legend input {margin-top:3px}
+#tab-quant-workbench .qsw-win-legend small {display:block;color:#64748b;font-size:11px;line-height:1.7}
+#tab-quant-workbench .qsw-win-swatch {width:22px;flex-shrink:0;border-top-width:3px;margin-top:8px}
 #tab-quant-workbench .qsw-result-scroll {max-height:480px;overflow:auto;overscroll-behavior:contain}
 #tab-quant-workbench .qsw-result-scroll table {border-collapse:collapse;width:100%;font-size:12px}
 #tab-quant-workbench .qsw-result-scroll th {position:sticky;top:0;background:#eef4fc;z-index:1}

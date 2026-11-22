@@ -143,3 +143,36 @@ def test_job_deadline_cannot_be_swallowed_by_source_exception_handlers():
     with pytest.raises(native.NativeStepDeadline):
         try:raise native.NativeStepDeadline('bounded job deadline')
         except Exception:pytest.fail('source error wrapper swallowed the deadline')
+
+
+def test_failure_lock_recovers_after_connection_invalidation_without_stealing():
+    from itertools import count
+    from sqlalchemy import event
+    from sqlalchemy.pool import QueuePool
+    engine=create_engine('sqlite://',poolclass=QueuePool)
+    sessions,owners={},{}
+    sequence=count(1)
+    @event.listens_for(engine,'connect')
+    def functions(dbapi,_record):
+        session=next(sequence);sessions[id(dbapi)]=session
+        def acquire(name,_timeout):
+            if name in owners and owners[name]!=session:return 0
+            owners[name]=session;return 1
+        dbapi.create_function('CONNECTION_ID',0,lambda:session)
+        dbapi.create_function('IS_USED_LOCK',1,lambda name:owners.get(name))
+        dbapi.create_function('GET_LOCK',2,acquire)
+    @event.listens_for(engine,'close')
+    def release(dbapi,_record):
+        session=sessions.pop(id(dbapi))
+        for name in list(owners):
+            if owners[name]==session:del owners[name]
+    try:
+        with engine.connect() as first,engine.connect() as second:
+            native._restore_failure_lock(first)
+            old=first.execute(text('SELECT CONNECTION_ID()')).scalar()
+            first.invalidate();first.rollback()
+            native._restore_failure_lock(first)
+            assert first.execute(text('SELECT CONNECTION_ID()')).scalar()!=old
+            with pytest.raises(RuntimeError,match='互斥锁'):native._restore_failure_lock(second)
+            assert first.execute(text('SELECT IS_USED_LOCK(:name)=CONNECTION_ID()'),{'name':native.LOCK}).scalar()==1
+    finally:engine.dispose()

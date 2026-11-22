@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import math
+from collections import defaultdict
+from datetime import date
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from server.trading_v2.config import canonical_json_hash
@@ -32,6 +34,61 @@ def _drawdown(nav):
         peak = max(peak, value)
         worst = max(worst, (1 - value / peak) * 100)
     return worst if nav else None
+
+
+def _win_rate_history(daily, expected, start, end):
+    """Cumulative closed-trade wins; flat trades count as completed, not wins."""
+    if not daily or sum(item[1] for item in daily) != expected:
+        return []
+    points = []
+    completed = wins = 0
+    try:
+        for day, count, winning, unknown in sorted(daily):
+            day = date.fromisoformat(str(day)[:10]).isoformat()
+            if unknown or not start <= day <= end or not 0 <= winning <= count:
+                return []
+            completed += count
+            wins += winning
+            points.append({"date": day, "completed_trades": completed,
+                           "winning_trades": wins, "win_rate_pct": wins / completed * 100})
+    except (TypeError, ValueError, ZeroDivisionError):
+        return []
+    return points
+
+
+def _research_win_rate_history(trades, report, sessions):
+    daily = defaultdict(lambda: [0, 0, 0])
+    for trade in trades:
+        day = str(trade.get("exit_date") or trade.get("exit_at") or "")[:10]
+        pnl = _number(trade.get("net_pnl_cny"))
+        row = daily[day]
+        row[0] += 1
+        row[1] += pnl is not None and pnl > 0
+        row[2] += pnl is None
+    return _win_rate_history([(day, *counts) for day, counts in daily.items()],
+        report.get("completed_trade_count"), sessions[0], sessions[-1]) if sessions else []
+
+
+def _attach_formal_win_rate_history(engine, records):
+    current = {r["result_id"]: r for r in records if r["kind"] == "HISTORICAL_BACKTEST"
+               and r["integrity_verified"] and r["identity_verified"] and r["status"] == "COMPLETE"}
+    if not current:
+        return
+    statement = text("""SELECT /*+ MAX_EXECUTION_TIME(4000) */ backtest_uid,exit_date,
+        COUNT(*) AS completed,SUM(CASE WHEN trade_net_pnl>0 THEN 1 ELSE 0 END) AS wins,
+        SUM(CASE WHEN trade_net_pnl IS NULL THEN 1 ELSE 0 END) AS unknown
+        FROM st_backtest_trade_v2 WHERE backtest_uid IN :ids GROUP BY backtest_uid,exit_date
+        ORDER BY backtest_uid,exit_date""").bindparams(bindparam("ids", expanding=True))
+    groups = defaultdict(list)
+    with engine.connect() as connection:
+        for uid, day, count, wins, unknown in connection.execute(statement, {"ids": list(current)}):
+            groups[uid].append((day, int(count), int(wins), int(unknown)))
+    for uid, record in current.items():
+        points = _win_rate_history(groups[uid], record["completed_trades"],
+            record["start_date"], record["end_date"])
+        if points and record["win_rate_pct"] is not None and abs(points[-1]["win_rate_pct"]-record["win_rate_pct"]) > 0.01:
+            points = []
+        record["win_rate_history"] = points
 
 
 def _formal(row):
@@ -68,6 +125,7 @@ def _formal(row):
         "max_drawdown_pct": abs(_percent(performance.get("max_drawdown")))
             if integrity and _percent(performance.get("max_drawdown")) is not None else None,
         "win_rate_pct": _percent(metrics.get("win_rate")) if integrity else None,
+        "win_rate_history": [],
         "integrity_verified": integrity, "identity_verified": identity,
         "rank_eligible": eligible, "cohort_id": canonical_json_hash(cohort) if eligible else None,
         "cohort": cohort, "reason": ("可按相同回测区间、数据、资金与费用口径比较" if eligible else
@@ -123,6 +181,8 @@ def _research(run, proposal, *, native=False):
         "required_sessions": validation.get("required_sessions"),
         "missing_feature_dates": validation.get("missing_feature_dates") or [],
         "out_of_sample_status": report.get("out_of_sample_status", "UNKNOWN"),
+        "win_rate_history": _research_win_rate_history(trades, report, validation.get("sessions") or [])
+            if validation.get("status") in {"COMPLETE", "PARTIAL"} else [],
         "funding_eligible": False}
 
 
@@ -184,6 +244,12 @@ def read_performance(engine, day):
             "backtest_status": latest["status"] if latest else "FAILED" if native_error else "NOT_STARTED",
             "reason": latest["reason"] if latest else native_error or "当前精确版本尚无已保存回测；不可复用旧版本或其他策略的收益",
             "forward_windows": row["windows"]})
+    current_ids = {s["result_id"] for s in strategies}
+    try:
+        _attach_formal_win_rate_history(engine, [r for r in records if r["result_id"] in current_ids])
+        sources["win_rate_history"] = {"status": "COMPLETE", "reason": ""}
+    except (SQLAlchemyError, ValueError) as exc:
+        sources["win_rate_history"] = {"status": "FAILED", "reason": "胜率曲线读取失败：" + type(exc).__name__}
     return {"trade_date": workspace["trade_date"], "strategies": strategies,
         "results": records, "leaderboards": rank_results(records), "sources": sources,
         "history_limit": 100, "history_limit_reached": len(formal) == 100,

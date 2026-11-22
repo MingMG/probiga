@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from sqlalchemy import create_engine, text
 
-from server.api.strategy_performance import _formal, _research, rank_results, read_performance_detail
+from server.api.strategy_performance import _formal, _research, _research_win_rate_history, _attach_formal_win_rate_history, rank_results, read_performance_detail
 from server.trading_v2.config import canonical_json_hash
 
 
@@ -99,6 +99,23 @@ def test_subset_research_has_its_own_rank_and_never_claims_full_strategy_return(
     assert groups[0]["rows"][0]["strategy_key"] == "new"
 
 
+def test_win_rate_curve_uses_all_closed_trades_and_aggregates_the_exit_day():
+    trades = [{"exit_at":"2026-07-01 09:30:00", "net_pnl_cny":10} for _ in range(51)]
+    trades += [{"exit_date":"2026-07-02", "net_pnl_cny":-10},
+               {"exit_date":"2026-07-02", "net_pnl_cny":0}]
+    report = {"completed_trade_count":53}
+    points = _research_win_rate_history(trades, report, ["2026-07-01","2026-07-31"])
+    assert len(points) == 2 and points[0]["completed_trades"] == 51
+    assert points[-1] == {"date":"2026-07-02", "completed_trades":53,
+                          "winning_trades":51, "win_rate_pct":51/53*100}
+    for invalid in ({"net_pnl_cny":None}, {"exit_date":""}, {"exit_date":"2026-08-01"}):
+        broken = copy.deepcopy(trades)
+        broken[-1].update(invalid)
+        assert _research_win_rate_history(broken, report, ["2026-07-01","2026-07-31"]) == []
+    assert _research_win_rate_history(trades, {"completed_trade_count":54}, ["2026-07-01","2026-07-31"]) == []
+    assert _research_win_rate_history([], {"completed_trade_count":0}, ["2026-07-01","2026-07-31"]) == []
+
+
 def test_actual_sql_trade_pagination_and_coverage():
     engine = create_engine("sqlite://")
     raw = formal_row()
@@ -119,6 +136,14 @@ def test_actual_sql_trade_pagination_and_coverage():
     assert d["summary"]["identity_verified"] is True
     assert d["trade_coverage_matches"] is True
     assert d["trade_count"] == 3 and [r["trade_id"] for r in d["trades"]] == ["1"]
+    record = d["summary"]
+    _attach_formal_win_rate_history(engine, [record])
+    assert record["win_rate_history"] == []  # The report says 2 wins, while all 3 SQL rows win.
+    with engine.begin() as c:
+        c.execute(text("UPDATE st_backtest_trade_v2 SET trade_net_pnl=-20 WHERE trade_id='2'"))
+    _attach_formal_win_rate_history(engine, [record])
+    assert record["win_rate_history"] == [{"date":"2026-07-03", "completed_trades":3,
+        "winning_trades":2, "win_rate_pct":2/3*100}]
     with pytest.raises(KeyError):
         read_performance_detail(engine, "missing")
     engine.dispose()
@@ -138,3 +163,20 @@ def test_browser_shows_backtest_status_legacy_report_and_complete_money_metrics(
     runner = tmp_path / "performance.cjs"
     runner.write_text("global.window={};require("+json.dumps(str(script))+");const h=window.QuantStrategyWorkspace.render("+json.dumps({"data": data, "performance": performance, "resultDetail": detail, "window": "20", "order": "net"})+");for(const v of ['回测与赚钱排名','账户累计收益','20000.00元','25000.00元','10.00%','缺特征','前向模拟观察'])if(!h.includes(v))throw new Error(v);if(h.includes('<img'))throw new Error('unescaped evidence');", encoding="utf-8")
     subprocess.run([node, str(runner)], timeout=10, check=True)
+
+
+def test_browser_win_rate_lines_keep_current_versions_unknown_samples_and_toggles(tmp_path):
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node unavailable")
+    record = _formal(formal_row())
+    record["win_rate_history"] = [{"date":"2026-07-03", "win_rate_pct":50,
+        "winning_trades":1, "completed_trades":2}]
+    strategies = [{"strategy_key":"trend","strategy_name":"趋势","strategy_version":"v1","result_id":"report01"},
+        {"strategy_key":"new","strategy_name":"<img onerror=bad>","strategy_version":"v2","backtest_status":"BLOCKED"}]
+    performance = {"strategies":strategies,"results":[record],"leaderboards":[],"method":"证据"}
+    state = {"data":{"strategies":[],"strategy_count":0},"performance":performance,"window":"20","order":"name"}
+    script = Path(__file__).resolve().parents[1]/"server/static/js/quant-strategy-workspace.js"
+    runner = tmp_path/"win-rate.cjs"
+    runner.write_text("global.window={};require("+json.dumps(str(script))+");const s="+json.dumps(state)+";const render=window.QuantStrategyWorkspace.render;let h=render(s);for(const t of ['各策略累计胜率','50.00%','盈利 1 / 已平仓 2 笔','暂无有效样本'])if(!h.includes(t))throw Error(t);if((h.match(/<polyline/g)||[]).length!==1||h.includes('<img'))throw Error('invalid series');s.chartHidden=['trend'];h=render(s);if(h.includes('<polyline')||!h.includes('当前曲线均已隐藏'))throw Error('toggle');",encoding="utf-8")
+    subprocess.run([node,str(runner)],timeout=10,check=True)
