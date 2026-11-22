@@ -28,7 +28,7 @@ from server.common.pit_facts import (
     load_finance_facts,
     normalize_decision_at,
     resolve_common_fact_cutoff,
-    SealedFinanceInputs, HistoricalEventRead, subset_historical_event_read, PITFactBatch, FINANCE_REVISION_TABLE,
+    SealedFinanceInputs, HistoricalEventRead, subset_historical_event_read, PITFactBatch, FINANCE_REVISION_TABLE, EVENT_REVISION_TABLE,
 )
 from server.common.strategy_daily_input_window import (
     V3_DAILY_INPUT_SESSIONS,
@@ -37,6 +37,7 @@ from server.common.strategy_daily_input_window import (
     resolve_daily_input_sessions,
     validate_daily_input_sessions,
 )
+from server.common.pit_sealed_event_read import event_fact_manifest
 
 from .context import load_asof_context, theme_context_score
 
@@ -66,6 +67,7 @@ class DailyFactInputs:
     finance: SealedFinanceInputs
     events: HistoricalEventRead
     finance_facts: PITFactBatch | None = None
+    event_facts: PITFactBatch | None = None
 
 DERIVED_CHANGE_PCT_PROTOCOL = (
     "NATIVE_CLOSE_DIV_NATIVE_PRE_CLOSE_MINUS_ONE_X100_V1"
@@ -1085,6 +1087,7 @@ def _load_recent_notices(
     fact_cutoff_at: datetime | str | None = None,
     include_evidence: bool = False,
     historical_selection: HistoricalEventRead | None = None,
+    prepared_batch: PITFactBatch | None = None,
 ) -> (
     dict[str, list[dict[str, Any]]]
     | tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]
@@ -1112,7 +1115,20 @@ def _load_recent_notices(
         }
         result: dict[str, list[dict[str, Any]]] = {}
         return (result, evidence) if include_evidence else result
-    batch = load_event_facts(
+    if prepared_batch is not None and (
+        historical_selection is None or historical_selection.selection.engine is not engine
+        or historical_selection.selection.window_end!=as_of or prepared_batch.table_name!=EVENT_REVISION_TABLE
+        or historical_selection.selection.window_start!=as_of-timedelta(days=20)
+        or historical_selection.selection.decision_at!=normalize_decision_at(decision_at)
+        or historical_selection.fact_cutoff_at!=normalize_decision_at(fact_cutoff_at)
+        or prepared_batch.global_status!=PIT_AVAILABLE
+        or normalize_decision_at(prepared_batch.decision_at)!=normalize_decision_at(decision_at)
+        or normalize_decision_at(prepared_batch.fact_cutoff_at)!=normalize_decision_at(fact_cutoff_at)
+        or not set(codes)<=prepared_batch.status_by_code.keys()
+        or prepared_batch.manifest_hash!=event_fact_manifest(prepared_batch,historical_selection)
+    ):
+        raise ValueError('PIT_EVENT_PREPARED_SNAPSHOT_DIFFERS')
+    batch = prepared_batch if prepared_batch is not None else load_event_facts(
         engine,
         codes=codes,
         decision_at=decision_at,
@@ -1982,6 +1998,7 @@ def build_daily_feature_universe(
         fact_cutoff_at=pit_fact_cutoff_at,
         include_evidence=True,
         **({'historical_selection':subset_historical_event_read(fact_inputs.events,ranked_codes)} if fact_inputs is not None else {}),
+        **({'prepared_batch':fact_inputs.event_facts} if fact_inputs is not None and fact_inputs.event_facts is not None else {}),
     )
     selected = []
     for code in ranked_codes:
