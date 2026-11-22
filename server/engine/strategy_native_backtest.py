@@ -128,7 +128,7 @@ def _window(c,state,days,inputs):
 
 def _v3_day(c,state,day,owner):
     from server.common.strategy_daily_input_window import V3_DAILY_INPUT_SESSIONS
-    from server.common.pit_facts import resolve_common_fact_cutoff,PIT_AVAILABLE
+    from server.common.pit_facts import resolve_common_fact_cutoff,PIT_AVAILABLE,load_latest_finance_atomic_batch_baseline
     from server.trading_v3.daily_features import normalize_daily_bars,build_daily_feature_universe
     from server.trading_v3.regime import classify_regime_probabilities
     from server.trading_v3.engine import TradingV3Engine
@@ -139,7 +139,12 @@ def _v3_day(c,state,day,owner):
         return {'status':'BLOCKED','reason':'缺少精确日期证券身份和行业快照','identity':identity_proof,'signals':{}}
     known=datetime.fromisoformat(state['requested_at'])
     target=date.fromisoformat(day)
-    cutoff=resolve_common_fact_cutoff(c.engine,codes=identity,decision_at=known,finance_start_date='1900-01-01',
+    baseline=load_latest_finance_atomic_batch_baseline(c.engine,decision_at=known)
+    eligible=set(identity)&set(baseline.get('members',{}))
+    excluded=sorted(set(identity)-eligible)
+    if not eligible:
+        return {'status':'BLOCKED','reason':'历史证券集合没有可验证的财务封存覆盖','identity':identity_proof,'signals':{}}
+    cutoff=resolve_common_fact_cutoff(c.engine,codes=eligible,decision_at=known,finance_start_date='1900-01-01',
         finance_end_date=day,event_start_date=target-timedelta(days=20),event_end_date=day,require_qmt_event_batch=True)
     if cutoff['status']!=PIT_AVAILABLE:
         reason=cutoff['reason']
@@ -158,7 +163,7 @@ def _v3_day(c,state,day,owner):
     frame.attrs['qmt_daily_input_window']=_window(c,state,days,inputs)
     frame=normalize_daily_bars(frame)
     dataset=build_daily_feature_universe(c.engine,as_of=target,dates=[date.fromisoformat(d) for d in days],frame=frame,
-        context_cutoff_at=known,limit=len(identity),allow_research_industry_last_known=False)
+        context_cutoff_at=known,limit=len(eligible),allow_research_industry_last_known=False,entry_scope_codes=eligible)
     market=classify_regime_probabilities(dataset['market_features'])
     if market.quality_status!='PASS':
         return {'status':'BLOCKED','reason':'市场状态输入不足：'+';'.join(market.evidence),'signals':{},'data_snapshot_hash':dataset['data_snapshot_hash']}
@@ -191,6 +196,7 @@ def _v3_day(c,state,day,owner):
         rows.sort(key=lambda r:(-r['effective_score'],r['stock_code']))
         for rank,row in enumerate(rows):row['rank']=rank+1
     return {'status':'COMPLETE','signals':selected,'scored_stocks':scored,'missing_feature_stocks':missing,
+        'finance_scope_exclusions':excluded,'finance_seal_coverage_id':baseline['seal_coverage_id'],
         'universe_identity_exclusion_count':max(0,frame.attrs['qmt_daily_input_window']['latest_daily_truth']['attested_row_count']-len(identity)),
         'data_snapshot_hash':dataset['data_snapshot_hash'],'fact_cutoff':str(fact_clock),'identity':identity_proof,
         'interpretation':'CURRENT_FROZEN_RULES_WITHOUT_FUTURE_CALIBRATIONS'}
@@ -290,8 +296,8 @@ def _step(c,state,owner):
         for strategy,proposal in zip(state['strategies'],state['proposals']):
             family=strategy['source_kind'];key=strategy['strategy_key']
             gaps=[{'trade_date':d,'reason':parts[d]['reason']} for d in days if parts[d]['status']=='BLOCKED']
-            gaps.extend({'trade_date':d,'reason':f"部分证券历史身份或策略特征不足：身份 {parts[d].get('universe_identity_exclusion_count',0)}，特征 {parts[d].get('missing_feature_stocks',{}).get(key,0)}"}
-                for d in days if parts[d]['status']=='COMPLETE' and (parts[d].get('universe_identity_exclusion_count',0) or parts[d].get('missing_feature_stocks',{}).get(key,0)))
+            gaps.extend({'trade_date':d,'reason':f"部分证券历史身份或策略特征不足：身份 {parts[d].get('universe_identity_exclusion_count',0)}，财务覆盖 {len(parts[d].get('finance_scope_exclusions',[]))}，特征 {parts[d].get('missing_feature_stocks',{}).get(key,0)}"}
+                for d in days if parts[d]['status']=='COMPLETE' and (parts[d].get('universe_identity_exclusion_count',0) or parts[d].get('finance_scope_exclusions') or parts[d].get('missing_feature_stocks',{}).get(key,0)))
             selected=[s for p in parts.values() for s in p['signals'].get(key,[])]
             report=replay_native(strategy,selected,bars,state['input_sessions'],evaluation_start=days[0],source_gaps=gaps)
             available=sum(parts[d]['status']=='COMPLETE' for d in days)
@@ -325,6 +331,16 @@ def native_tick(engine):
         try:
             owner=_owner(c);runs=read_runs(c)
             pending=[r for r in reversed(runs) if r['status'] in ('RUNNING','NOT_STARTED')]
+            contract=_contract()
+            for previous in list(pending):
+                if previous['contract']==contract:continue
+                if not _resume_allowed(c,previous,owner):
+                    return {'status':'BLOCKED','reason':'计算规则已更新，等待旧运行所有者退出','run_id':previous['run_id']}
+                previous.update(status='BLOCKED',step_status='BLOCKED',reason='计算契约已变化，原检查点保留；使用同源行情建立当前契约研究')
+                for p in previous['proposals']:
+                    p['validation'].update(status='BLOCKED',reason=previous['reason'])
+                _save(c,previous,owner)
+                pending.remove(previous)
             state=next((r for r in pending if r.get('retry_after','')<=str(now_shanghai())),None)
             if pending and state is None:return {'status':'BLOCKED','reason':'等待有界数据库重试时间','run_id':pending[0]['run_id']}
             if state is None:
