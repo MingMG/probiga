@@ -2886,8 +2886,8 @@ def test_sealed_common_cutoff_avoids_finance_rescan_with_identical_receipts():
     ]
     assert len(final_scans) == 1
     assert "WHERE fact_kind='event' AND stock_code IN" in final_scans[0]
-    # Finance member queries remain part of the real seal validation.
-    assert any("WHERE fact_kind='finance' AND stock_code IN" in sql for sql in statements)
+    assert any("WHERE selected.coverage_id IN" in sql for sql in statements)
+    assert not any("GROUP BY scope_hash) AS heads" in sql for sql in statements)
     assert {row["fact_kind"] for row in resolved["receipts"]} == {"finance", "event"}
 
     def restore_legacy_scan(_connection, _cursor, statement, parameters, _context, _many):
@@ -2902,6 +2902,39 @@ def test_sealed_common_cutoff_avoids_finance_rescan_with_identical_receipts():
     legacy = resolve_common_fact_cutoff(engine, **kwargs)
     event.remove(engine, "before_cursor_execute", restore_legacy_scan)
     assert resolved == legacy
+    engine.dispose()
+
+
+def test_sealed_finance_cutoff_and_facts_survive_unbounded_history_timeout():
+    from server.common.pit_sealed_finance_read import load_sealed_finance_facts
+
+    engine, kwargs = _sealed_common_cutoff_case()
+    selections = []
+    expected = resolve_common_fact_cutoff(engine, **kwargs, capture_finance_selection=selections.append)
+
+    def facts(selection):
+        return load_sealed_finance_facts(
+            engine, selection=selection, codes=kwargs["codes"],
+            decision_at=kwargs["decision_at"], fact_cutoff_at=expected["fact_cutoff_at"],
+            as_of_date=kwargs["finance_end_date"],
+        )
+
+    expected_facts = facts(selections[0])
+
+    def history_deadline(_connection, _cursor, statement, parameters, _context, _many):
+        if "GROUP BY scope_hash) AS heads" in statement:
+            raise OperationalError(statement, parameters, Exception(3024, "historical source query deadline"))
+
+    event.listen(engine, "before_cursor_execute", history_deadline)
+    current = []
+    assert resolve_common_fact_cutoff(engine, **kwargs, capture_finance_selection=current.append) == expected
+    actual = facts(current[0])
+    assert actual.facts == expected_facts.facts
+    assert actual.status_by_code == expected_facts.status_by_code
+    assert actual.reason_by_code == expected_facts.reason_by_code
+    assert actual.manifest_hash == expected_facts.manifest_hash
+    assert actual.status_for("000001") == PIT_AVAILABLE
+    event.remove(engine, "before_cursor_execute", history_deadline)
     engine.dispose()
 
 
