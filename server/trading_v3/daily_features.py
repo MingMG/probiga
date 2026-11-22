@@ -28,7 +28,7 @@ from server.common.pit_facts import (
     load_finance_facts,
     normalize_decision_at,
     resolve_common_fact_cutoff,
-    SealedFinanceInputs, HistoricalEventRead, subset_historical_event_read,
+    SealedFinanceInputs, HistoricalEventRead, subset_historical_event_read, PITFactBatch, FINANCE_REVISION_TABLE,
 )
 from server.common.strategy_daily_input_window import (
     V3_DAILY_INPUT_SESSIONS,
@@ -65,6 +65,7 @@ class DailyFactInputs:
     cutoff: dict[str, Any]
     finance: SealedFinanceInputs
     events: HistoricalEventRead
+    finance_facts: PITFactBatch | None = None
 
 DERIVED_CHANGE_PCT_PROTOCOL = (
     "NATIVE_CLOSE_DIV_NATIVE_PRE_CLOSE_MINUS_ONE_X100_V1"
@@ -998,6 +999,7 @@ def _load_finance(
     decision_at: datetime | None,
     fact_cutoff_at: datetime | str | None = None,
     sealed_finance_inputs: SealedFinanceInputs | None = None,
+    prepared_batch: PITFactBatch | None = None,
 ) -> dict[str, dict[str, Any]]:
     if not codes:
         return {}
@@ -1012,7 +1014,16 @@ def _load_finance(
             }
             for code in codes
         }
-    batch = load_finance_facts(
+    if prepared_batch is not None and (
+        sealed_finance_inputs is None or sealed_finance_inputs.engine is not engine
+        or sealed_finance_inputs.as_of_date!=as_of or prepared_batch.table_name!=FINANCE_REVISION_TABLE
+        or prepared_batch.global_status!=PIT_AVAILABLE
+        or normalize_decision_at(prepared_batch.decision_at)!=normalize_decision_at(decision_at)
+        or normalize_decision_at(prepared_batch.fact_cutoff_at)!=normalize_decision_at(fact_cutoff_at)
+        or not set(codes)<=prepared_batch.status_by_code.keys()
+    ):
+        raise ValueError('PIT_DAILY_FINANCE_SNAPSHOT_DIFFERS')
+    batch = prepared_batch if prepared_batch is not None else load_finance_facts(
         engine,
         codes=codes,
         decision_at=decision_at,
@@ -1834,7 +1845,7 @@ def build_daily_feature_universe(
         codes=list(base),
         decision_at=pit_reader_decision_at,
         fact_cutoff_at=pit_fact_cutoff_at,
-        **({'sealed_finance_inputs':fact_inputs.finance} if fact_inputs is not None else {}),
+        **({'sealed_finance_inputs':fact_inputs.finance,'prepared_batch':fact_inputs.finance_facts} if fact_inputs is not None else {}),
     )
     quality_raw = {}
     growth_raw = {}
