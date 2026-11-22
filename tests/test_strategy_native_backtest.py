@@ -100,17 +100,19 @@ def test_driver_replays_partial_sources_without_fabricating_zero_profit(monkeypa
 def test_historical_uncovered_finance_members_do_not_block_other_securities(monkeypatch):
     from types import SimpleNamespace
     from server.common import pit_facts
+    from server.common import historical_announcement_read
     identity={str(i).zfill(6):{} for i in range(4755)}
     covered=set(sorted(identity)[4:])
     monkeypatch.setattr(native,'_identity_rows',lambda *_:(identity,{'status':'VERIFIED'}))
-    monkeypatch.setattr(pit_facts,'load_latest_finance_atomic_batch_baseline',lambda *_a,**_k:
-        {'seal_coverage_id':'verified-seal','members':dict.fromkeys(covered,{})})
+    monkeypatch.setattr(historical_announcement_read,'has_dated_announcement_candidate',lambda *_a,**_k:True)
     def cutoff(_engine,*,codes,**_kwargs):
         if not set(codes)<=covered:raise ValueError('finance atomic batch seal code scope differs')
         assert len(codes)==4751
         return {'status':'DATA_BLOCKED','reason':'公告窗口尚无完成记录'}
     monkeypatch.setattr(pit_facts,'resolve_common_fact_cutoff',cutoff)
-    result=native._v3_day(SimpleNamespace(engine=None),{'requested_at':'2026-11-22 09:00:00'},'2026-08-03',None)
+    codes=sorted(covered)
+    result=native._v3_day(SimpleNamespace(engine=None),{'requested_at':'2026-11-22 09:00:00',
+        'finance_scope_codes':codes,'finance_scope_sha256':native.canonical_sha256(codes)},'2026-08-03',None)
     assert result['reason']=='公告窗口尚无完成记录'
 
 
@@ -126,3 +128,18 @@ def test_entry_scope_filters_stock_features_without_removing_market_bars(monkeyp
     monkeypatch.setattr(daily_features,'_load_industries',industries)
     with pytest.raises(ReachedScope):
         daily_features.build_daily_feature_universe(None,as_of=days[-1],dates=days,frame=frame,entry_scope_codes=['000001'])
+
+
+@pytest.mark.parametrize('reason',[
+    'QMT_ANNOUNCEMENT_LIVE_BATCH_REPLY_FAILED:batch-payload:3000',
+    'PIT_COMMON_CUTOFF_SCHEMA_UNAVAILABLE:QMT_ANNOUNCEMENT_LIVE_BATCH_REPLY_FAILED:common-cutoff-coverage:80:size:400',
+])
+def test_observed_reply_failures_are_not_completed_no_data_dates(reason):
+    with pytest.raises(RuntimeError,match='历史事实读取失败'):native._assert_read_succeeded(reason)
+    native._assert_read_succeeded('QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND')
+
+
+def test_job_deadline_cannot_be_swallowed_by_source_exception_handlers():
+    with pytest.raises(native.NativeStepDeadline):
+        try:raise native.NativeStepDeadline('bounded job deadline')
+        except Exception:pytest.fail('source error wrapper swallowed the deadline')

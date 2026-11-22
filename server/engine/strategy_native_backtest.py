@@ -19,6 +19,16 @@ SCHEMA = 'probiga.native-strategy-research.v1'
 LOCK = 'probiga:native-strategy-research'
 
 
+class NativeStepDeadline(BaseException):
+    """Source adapters must not convert the job deadline into a data gap."""
+
+
+def _assert_read_succeeded(reason):
+    if any(token in reason for token in ('OperationalError','Timeout','SQLAlchemyError',
+            'REPLY_FAILED','REPLY_DEADLINE','VALIDATION_DEADLINE','SCHEMA_UNAVAILABLE')):
+        raise RuntimeError('历史事实读取失败：'+reason)
+
+
 def read_runs(connection, run_id=None):
     from server.engine.strategy_governance import _digest
     records = connection.execute(text("""SELECT /*+ MAX_EXECUTION_TIME(4000) */ a.payload_json,a.audit_hash,a.after_json
@@ -39,7 +49,8 @@ def read_runs(connection, run_id=None):
 def _contract():
     from server.trading_v3 import daily_features,sleeves,engine,regime,config
     from server.engine import strategy_native_replay,shadow_trial_policy
-    paths=[Path(__file__),*(Path(m.__file__) for m in (daily_features,sleeves,engine,regime,strategy_native_replay,shadow_trial_policy))]
+    from server.common import historical_announcement_read
+    paths=[Path(__file__),*(Path(m.__file__) for m in (daily_features,sleeves,engine,regime,strategy_native_replay,shadow_trial_policy,historical_announcement_read))]
     root=Path(__file__).resolve().parents[2]
     paths.extend(root/p for p in ('server/engine/strategy_shadow_trials.py','server/engine/strategy_center.py',
         'server/common/pit_facts.py','server/common/versioned_strategy_config.py',
@@ -128,8 +139,9 @@ def _window(c,state,days,inputs):
 
 def _v3_day(c,state,day,owner):
     from server.common.strategy_daily_input_window import V3_DAILY_INPUT_SESSIONS
-    from server.common.pit_facts import resolve_common_fact_cutoff,PIT_AVAILABLE,load_latest_finance_atomic_batch_baseline
-    from server.trading_v3.daily_features import normalize_daily_bars,build_daily_feature_universe
+    from server.common.pit_facts import resolve_common_fact_cutoff,PIT_AVAILABLE
+    from server.common.historical_announcement_read import has_dated_announcement_candidate
+    from server.trading_v3.daily_features import normalize_daily_bars,build_daily_feature_universe,DailyFactInputs
     from server.trading_v3.regime import classify_regime_probabilities
     from server.trading_v3.engine import TradingV3Engine
     from server.trading_v3.config import load_v3_config
@@ -139,21 +151,33 @@ def _v3_day(c,state,day,owner):
         return {'status':'BLOCKED','reason':'缺少精确日期证券身份和行业快照','identity':identity_proof,'signals':{}}
     known=datetime.fromisoformat(state['requested_at'])
     target=date.fromisoformat(day)
-    baseline=load_latest_finance_atomic_batch_baseline(c.engine,decision_at=known)
-    eligible=set(identity)&set(baseline.get('members',{}))
+    if canonical_sha256(state['finance_scope_codes'])!=state['finance_scope_sha256']:
+        raise ValueError('历史财务证券范围哈希不一致')
+    eligible=set(identity)&set(state['finance_scope_codes'])
     excluded=sorted(set(identity)-eligible)
     if not eligible:
         return {'status':'BLOCKED','reason':'历史证券集合没有可验证的财务封存覆盖','identity':identity_proof,'signals':{}}
+    if not has_dated_announcement_candidate(c.engine,code=min(eligible),decision_at=known,target=target,window_start=target-timedelta(days=20)):
+        return {'status':'BLOCKED','reason':'QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND','identity':identity_proof,'signals':{}}
+    finances,events=[],[]
+    progress_at=time.monotonic()
+    def progress(done,total):
+        nonlocal progress_at
+        if done and (time.monotonic()-progress_at>=5 or done==total):
+            state['source_progress']={'trade_date':day,'completed':done,'total':total,'last_progress_at':str(now_shanghai())}
+            state['last_progress_at']=str(now_shanghai());_save(c,state,owner);progress_at=time.monotonic()
     cutoff=resolve_common_fact_cutoff(c.engine,codes=eligible,decision_at=known,finance_start_date='1900-01-01',
-        finance_end_date=day,event_start_date=target-timedelta(days=20),event_end_date=day,require_qmt_event_batch=True)
+        finance_end_date=day,event_start_date=target-timedelta(days=20),event_end_date=day,require_qmt_event_batch=True,
+        event_trade_date=day,capture_finance_selection=finances.append,capture_historical_selection=events.append,
+        event_checkpoint_path=Path.home()/'.local/state/probiga/native-event-prefix/coverage.sqlite',event_progress=progress)
     if cutoff['status']!=PIT_AVAILABLE:
         reason=cutoff['reason']
-        if any(x in reason for x in ('OperationalError','Timeout','SQLAlchemyError')):
-            raise RuntimeError('历史事实读取失败：'+reason)
+        _assert_read_succeeded(reason)
         return {'status':'BLOCKED','reason':reason,'identity':identity_proof,'signals':{}}
     fact_clock=datetime.fromisoformat(cutoff['fact_cutoff_at'])
     if fact_clock.date()!=target or fact_clock<datetime.fromisoformat(day+' 15:35:00'):
         return {'status':'BLOCKED','reason':'历史共同事实截止时间不能覆盖当日收盘','fact_cutoff':cutoff['fact_cutoff_at'],'signals':{}}
+    if len(finances)!=1 or len(events)!=1:raise ValueError('历史事实快照未完整移交')
     days=sorted(str(d)[:10] for d in c.execute(text('SELECT DISTINCT trade_date FROM si_trade_calendar WHERE trade_status=1 AND trade_date<=:d ORDER BY trade_date DESC LIMIT :n'),{'d':day,'n':V3_DAILY_INPUT_SESSIONS}).scalars())
     inputs=_ensure_inputs(c,state,days,owner)
     raw=_read_bars(c,days,inputs,state['price_cutoff'])
@@ -163,7 +187,11 @@ def _v3_day(c,state,day,owner):
     frame.attrs['qmt_daily_input_window']=_window(c,state,days,inputs)
     frame=normalize_daily_bars(frame)
     dataset=build_daily_feature_universe(c.engine,as_of=target,dates=[date.fromisoformat(d) for d in days],frame=frame,
-        context_cutoff_at=known,limit=len(eligible),allow_research_industry_last_known=False,entry_scope_codes=eligible)
+        context_cutoff_at=known,limit=len(eligible),allow_research_industry_last_known=False,entry_scope_codes=eligible,
+        fact_inputs=DailyFactInputs(cutoff,finances[0],events[0]))
+    _assert_read_succeeded(str(dataset['market_features'].get('pit_common_cutoff_reason') or ''))
+    for stock in dataset['stocks']:
+        _assert_read_succeeded(str(stock.get('finance_pit_reason') or '')+';'+str(stock.get('event_pit_reason') or ''))
     market=classify_regime_probabilities(dataset['market_features'])
     if market.quality_status!='PASS':
         return {'status':'BLOCKED','reason':'市场状态输入不足：'+';'.join(market.evidence),'signals':{},'data_snapshot_hash':dataset['data_snapshot_hash']}
@@ -196,7 +224,7 @@ def _v3_day(c,state,day,owner):
         rows.sort(key=lambda r:(-r['effective_score'],r['stock_code']))
         for rank,row in enumerate(rows):row['rank']=rank+1
     return {'status':'COMPLETE','signals':selected,'scored_stocks':scored,'missing_feature_stocks':missing,
-        'finance_scope_exclusions':excluded,'finance_seal_coverage_id':baseline['seal_coverage_id'],
+        'finance_scope_exclusions':excluded,'finance_seal_coverage_id':state['finance_seal_id'],
         'universe_identity_exclusion_count':max(0,frame.attrs['qmt_daily_input_window']['latest_daily_truth']['attested_row_count']-len(identity)),
         'data_snapshot_hash':dataset['data_snapshot_hash'],'fact_cutoff':str(fact_clock),'identity':identity_proof,
         'interpretation':'CURRENT_FROZEN_RULES_WITHOUT_FUTURE_CALIBRATIONS'}
@@ -242,14 +270,22 @@ def _start(c,strategies,days,published,source_hash,contract):
     prior=next((r.get('price_backtest') for r in _read_states(c) if (r.get('price_backtest') or {}).get('sessions')==days),None)
     warmup=sorted(str(d)[:10] for d in c.execute(text('SELECT DISTINCT trade_date FROM si_trade_calendar WHERE trade_status=1 AND trade_date<:d ORDER BY trade_date DESC LIMIT 20'),{'d':days[0]}).scalars())
     requested=str(now_shanghai());versions=[(s['strategy_key'],s['current_version'],s['version_hash']) for s in strategies]
-    uid=canonical_sha256({'versions':versions,'days':days,'source_hash':source_hash,'contract':contract})
+    finance_scope={}
+    if strategies[0]['source_kind']=='immutable_v3_sleeve':
+        from server.common.pit_facts import load_latest_finance_atomic_batch_baseline
+        baseline=load_latest_finance_atomic_batch_baseline(c.engine,decision_at=requested)
+        codes=sorted(baseline.get('members',{}))
+        finance_scope={'finance_scope_codes':codes,'finance_scope_sha256':canonical_sha256(codes),
+            'finance_seal_id':baseline.get('seal_coverage_id','')}
+    uid=canonical_sha256({'versions':versions,'days':days,'source_hash':source_hash,'contract':contract,
+        'finance_seal_id':finance_scope.get('finance_seal_id')})
     state={'schema':SCHEMA,'run_id':uid,'trade_date':days[-1],'strategies':strategies,'published':published,
         'sessions':days,'input_sessions':warmup+days,'price_cutoff':prior['knowledge_cutoff'] if prior else requested,
         'requested_at':requested,'deadline_at':str(now_shanghai()+timedelta(hours=24)),
         'input_archives':list(prior.get('input_archives',[]))+[{'run_id':prior['run_id'],'rule_hash':prior['rule_hash']}] if prior else [],
         'contract':contract,'source_hash':source_hash,'rule_hash':canonical_sha256(versions),'phase':'INPUTS','status':'NOT_STARTED',
         'cursor':0,'completed_units':0,'total_units':(len(warmup)+len(days))*2+len(days)+len(strategies),
-        'last_progress_at':requested,'reason':'','proposals':[]}
+        'last_progress_at':requested,'reason':'','proposals':[],**finance_scope}
     inputs=_input_parts(c,state)
     present={d for p in inputs.values() for d in p['sessions']}
     state['completed_units']=sum(d in present for d in state['input_sessions'])
@@ -272,7 +308,7 @@ def _step(c,state,owner):
         if len(missing)<=16:state.update(phase='SIGNALS',cursor=0)
     elif state['phase']=='SIGNALS':
         deadline=time.monotonic()+75
-        for _ in range(8):
+        for _ in range(32):
             if state['cursor']>=len(days) or time.monotonic()>deadline:break
             day=days[state['cursor']];state['current_unit']='原生历史选股 '+day;_save(c,state,owner)
             value=(_v2_day(c,state,day) if state['strategies'][0]['source_kind']=='immutable_manifest'
@@ -350,6 +386,12 @@ def native_tick(engine):
                 for family in ('immutable_manifest','immutable_v3_sleeve'):
                     group=[s for s in strategies if s['source_kind']==family]
                     if not group:continue
+                    existing=next((r for r in runs if r['contract']==contract and r['source_hash']==source_hash
+                        and r['sessions']==days and [(s['strategy_key'],s['version_hash']) for s in r['strategies']]
+                        ==[(s['strategy_key'],s['version_hash']) for s in group]),None)
+                    if existing is not None:
+                        latest.append(existing)
+                        continue
                     candidate=_start(c,group,days,published,source_hash,contract)
                     existing=next((r for r in runs if r['run_id']==candidate['run_id']),None)
                     if existing is None:
@@ -363,11 +405,11 @@ def native_tick(engine):
             if state.get('retry_after','')>str(now_shanghai()):
                 return {'status':'BLOCKED','run_id':state['run_id'],'reason':state['reason'],'retry_after':state['retry_after']}
             if str(now_shanghai())>state['deadline_at']:raise TimeoutError('原生回测超过24小时总时限')
-            def timeout(_signum,_frame):raise TimeoutError('原生回测单步超过180秒')
-            previous_handler=signal.signal(signal.SIGALRM,timeout);signal.setitimer(signal.ITIMER_REAL,180)
+            def timeout(_signum,_frame):raise NativeStepDeadline('原生回测单步超过600秒')
+            previous_handler=signal.signal(signal.SIGALRM,timeout);signal.setitimer(signal.ITIMER_REAL,600)
             _step(c,state,owner)
             return {k:state.get(k) for k in ('status','run_id','phase','completed_units','total_units','reason')}
-        except Exception as ex:
+        except (Exception,NativeStepDeadline) as ex:
             if state is not None:
                 c.rollback();state.update(status='FAILED',step_status='FAILED',reason=f"{state.get('current_unit',state['phase'])}: {type(ex).__name__}: {ex}")
                 original=getattr(ex,'orig',ex);args=getattr(original,'args',())

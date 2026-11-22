@@ -5,6 +5,7 @@ import json
 import logging
 import math
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any, Iterable
 
@@ -27,6 +28,7 @@ from server.common.pit_facts import (
     load_finance_facts,
     normalize_decision_at,
     resolve_common_fact_cutoff,
+    SealedFinanceInputs, HistoricalEventRead, subset_historical_event_read,
 )
 from server.common.strategy_daily_input_window import (
     V3_DAILY_INPUT_SESSIONS,
@@ -37,6 +39,8 @@ from server.common.strategy_daily_input_window import (
 )
 
 from .context import load_asof_context, theme_context_score
+
+
 from .theme_history import (
     EvidenceStatus,
     MARKET_TIMEZONE,
@@ -54,6 +58,13 @@ from .theme_features import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class DailyFactInputs:
+    cutoff: dict[str, Any]
+    finance: SealedFinanceInputs
+    events: HistoricalEventRead
 
 DERIVED_CHANGE_PCT_PROTOCOL = (
     "NATIVE_CLOSE_DIV_NATIVE_PRE_CLOSE_MINUS_ONE_X100_V1"
@@ -986,6 +997,7 @@ def _load_finance(
     codes: list[str],
     decision_at: datetime | None,
     fact_cutoff_at: datetime | str | None = None,
+    sealed_finance_inputs: SealedFinanceInputs | None = None,
 ) -> dict[str, dict[str, Any]]:
     if not codes:
         return {}
@@ -1006,6 +1018,7 @@ def _load_finance(
         decision_at=decision_at,
         fact_cutoff_at=fact_cutoff_at,
         as_of_date=as_of,
+        **({'sealed_finance_inputs':sealed_finance_inputs} if sealed_finance_inputs is not None else {}),
     )
     result: dict[str, dict[str, Any]] = {}
     for code in codes:
@@ -1060,6 +1073,7 @@ def _load_recent_notices(
     decision_at: datetime | None,
     fact_cutoff_at: datetime | str | None = None,
     include_evidence: bool = False,
+    historical_selection: HistoricalEventRead | None = None,
 ) -> (
     dict[str, list[dict[str, Any]]]
     | tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]
@@ -1095,6 +1109,7 @@ def _load_recent_notices(
         start_date=as_of - timedelta(days=20),
         end_date=as_of,
         require_qmt_complete_batch=True,
+        **({'historical_selection':historical_selection} if historical_selection is not None else {}),
     )
     result: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for code in codes:
@@ -1364,6 +1379,7 @@ def build_daily_feature_universe(
     context_cutoff_at: datetime | None = None, limit: int = 5000,
     required_codes: Iterable[str] = (), allow_research_industry_last_known: bool = False,
     entry_scope_codes: Iterable[str] | None = None,
+    fact_inputs: DailyFactInputs | None = None,
 ) -> dict[str, Any]:
     """Evaluate the same native features from an already verified price window."""
     required_code_set = {str(code).zfill(6) for code in required_codes if str(code)}
@@ -1763,7 +1779,14 @@ def build_daily_feature_universe(
         "fact_cutoff_at": "",
         "receipt_root_hash": "",
     }
-    if context_cutoff_at is not None:
+    if fact_inputs is not None:
+        if (fact_inputs.finance.engine is not primary_engine or fact_inputs.finance.as_of_date!=as_of
+                or fact_inputs.finance.decision_at!=normalize_decision_at(context_cutoff_at)
+                or fact_inputs.cutoff.get('status')!=PIT_AVAILABLE):
+            raise ValueError('PIT_DAILY_FEATURE_SNAPSHOT_DIFFERS')
+        common_cutoff=dict(fact_inputs.cutoff)
+    elif context_cutoff_at is not None:
+        finances,events=[],[]
         common_cutoff = resolve_common_fact_cutoff(
             primary_engine,
             codes=list(base),
@@ -1773,7 +1796,11 @@ def build_daily_feature_universe(
             event_start_date=as_of - timedelta(days=20),
             event_end_date=as_of,
             require_qmt_event_batch=True,
+            capture_finance_selection=finances.append,capture_historical_selection=events.append,
         )
+        if common_cutoff.get('status')==PIT_AVAILABLE:
+            if len(finances)!=1 or len(events)!=1:raise ValueError('PIT_DAILY_FEATURE_SNAPSHOT_INCOMPLETE')
+            fact_inputs=DailyFactInputs(common_cutoff,finances[0],events[0])
     pit_reader_decision_at = (
         context_cutoff_at
         if common_cutoff.get("status") == PIT_AVAILABLE
@@ -1807,6 +1834,7 @@ def build_daily_feature_universe(
         codes=list(base),
         decision_at=pit_reader_decision_at,
         fact_cutoff_at=pit_fact_cutoff_at,
+        **({'sealed_finance_inputs':fact_inputs.finance} if fact_inputs is not None else {}),
     )
     quality_raw = {}
     growth_raw = {}
@@ -1942,6 +1970,7 @@ def build_daily_feature_universe(
         decision_at=pit_reader_decision_at,
         fact_cutoff_at=pit_fact_cutoff_at,
         include_evidence=True,
+        **({'historical_selection':subset_historical_event_read(fact_inputs.events,ranked_codes)} if fact_inputs is not None else {}),
     )
     selected = []
     for code in ranked_codes:
