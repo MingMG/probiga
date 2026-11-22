@@ -17,17 +17,20 @@ def test_runtime_repair_keeps_same_input_clock_archives_and_total_deadline(ledge
         original={'schema':native.SCHEMA,'run_id':'d'*64,'rule_hash':'e'*64,'phase':'SIGNALS',
             'status':'FAILED','source_hash':'a'*64,'strategies':[strategy],'sessions':days,
             'requested_at':str(now-timedelta(hours=1)),'deadline_at':str(now+timedelta(hours=23)),
-            'price_cutoff':str(now-timedelta(hours=2)),'input_archives':[]}
+            'price_cutoff':str(now-timedelta(hours=2)),'input_archives':[],
+            'fact_read_checkpoint':{'trade_date':days[0],'completed':800,'total':4755}}
         native._save(c,original,native._owner(c))
         revised=native._start(c,[strategy],days,{},'a'*64,'different-runtime')
         assert revised['requested_at']==original['requested_at']
         assert revised['price_cutoff']==original['price_cutoff']
         assert revised['deadline_at']==original['deadline_at']
+        assert revised['fact_read_checkpoint']==original['fact_read_checkpoint']
         assert revised['run_id']!=original['run_id']
         assert revised['input_archives']==[{'run_id':original['run_id'],'rule_hash':original['rule_hash']}]
         fresh=native._start(c,[strategy],days,{},'b'*64,'different-runtime')
         assert fresh['requested_at']!=original['requested_at']
         assert fresh['input_archives']==[]
+        assert fresh['fact_read_checkpoint']=={}
 
 
 def test_step_deadline_resumes_only_after_new_durable_finance_progress(ledger,monkeypatch):

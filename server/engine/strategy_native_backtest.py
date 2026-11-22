@@ -319,7 +319,8 @@ def _start(c,strategies,days,published,source_hash,contract):
         'input_archives':archives,
         'contract':contract,'source_hash':source_hash,'rule_hash':canonical_sha256(versions),'phase':'INPUTS','status':'NOT_STARTED',
         'cursor':0,'completed_units':0,'total_units':(len(warmup)+len(days))*2+len(days)+len(strategies),
-        'last_progress_at':clock,'reason':'','proposals':[]}
+        'last_progress_at':clock,'reason':'','proposals':[],
+        'fact_read_checkpoint':dict(frozen.get('fact_read_checkpoint') or {}) if frozen else {}}
     inputs=_input_parts(c,state)
     present={d for p in inputs.values() for d in p['sessions']}
     state['completed_units']=sum(d in present for d in state['input_sessions'])
