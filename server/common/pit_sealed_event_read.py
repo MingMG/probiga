@@ -7,7 +7,7 @@ from time import monotonic
 
 from server.common import pit_facts as pit
 
-ISSUER_BATCH_SIZE = 40
+ISSUER_BATCH_SIZE = 400
 
 
 def event_fact_manifest(batch, selection):

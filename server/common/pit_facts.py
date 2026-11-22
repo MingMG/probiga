@@ -1094,6 +1094,8 @@ def _date_value(value: Any, *, required: bool) -> date | None:
 
 def _source_publication_date(row: Mapping[str, Any]) -> date | None:
     value = row.get("source_published_text")
+    if not value:
+        value = _parse_payload(row).get("source_published_text")
     return _date_value(value, required=False)
 
 
@@ -6278,7 +6280,7 @@ def resolve_common_fact_cutoff(
             )
             event_batch = dict(signed_selection.batch)
             if capture_historical_selection is not None and not isinstance(signed_selection, _SignedLiveEventSelection):
-                signed_historical_bindings = _read_signed_historical_event_bindings(
+                signed_historical_bindings = _read_validated_event_bindings(
                     engine, signed_selection, event_progress=event_progress,
                 )
         except Exception as exc:
@@ -6771,7 +6773,7 @@ def _finance_feature_fact(
     published_text = (
         _dt_text(_row_datetime(selected["published_at"]))
         if exact_publication
-        else str(selected.get("source_published_text") or "")
+        else str(selected.get("source_published_text") or payload.get("source_published_text") or "")
     )
     known_text = _dt_text(_row_datetime(selected["known_at"]))
     payload.update(
@@ -7307,7 +7309,7 @@ def load_finance_history_facts(
             published_text = (
                 _dt_text(_row_datetime(selected["published_at"]))
                 if exact_publication
-                else str(selected.get("source_published_text") or "")
+                else str(selected.get("source_published_text") or payload.get("source_published_text") or "")
             )
             known_text = _dt_text(_row_datetime(selected["known_at"]))
             payload.update(
@@ -7370,8 +7372,8 @@ def load_finance_history_facts(
     )
 
 
-def _read_signed_historical_event_bindings(
-    engine: Engine, selection: HistoricalAnnouncementSelection,
+def _read_validated_event_bindings(
+    engine: Engine, selection: HistoricalAnnouncementSelection | _LiveEventSelection,
     *, event_progress: Callable[[int, int], None] | None = None,
 ) -> Mapping[str, tuple[Mapping[str, str], ...]]:
     from server.common.qmt_announcement_pit import (
@@ -7384,7 +7386,7 @@ def _read_signed_historical_event_bindings(
         raise ValueError("historical announcement bound coverage identity is duplicated")
     deadline = monotonic() + LIVE_ANNOUNCEMENT_BATCH_VALIDATION_BUDGET_SECONDS
     result = {}
-    coverage_count = selection.batch["coverage_count"]
+    coverage_count = selection.batch["catalog_member_count"]
     with engine.connect() as connection:
         mysql = connection.dialect.name == "mysql"
         ids = sorted(by_id)
@@ -7419,11 +7421,11 @@ def _read_signed_historical_event_bindings(
     return MappingProxyType(result)
 
 
-def _query_signed_bound_event_revisions(
-    engine: Engine, selection: _SignedLiveEventSelection | HistoricalAnnouncementSelection,
+def _query_bound_event_revisions(
+    engine: Engine, selection: _LiveEventSelection | HistoricalAnnouncementSelection,
     bindings_by_code: Mapping[str, tuple[Mapping[str, str], ...]],
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
-    """Resolve only identities committed to the exact signed coverage receipt."""
+    """Resolve only identities committed to the exact validated coverage receipt."""
     from server.common.qmt_announcement_pit import (
         LIVE_ANNOUNCEMENT_BATCH_VALIDATION_BUDGET_SECONDS, _live_announcement_reply_budget,
     )
@@ -7583,13 +7585,15 @@ def load_event_facts(
                 status=PIT_DATA_BLOCKED,
             )
     bound_ids = {}
-    signed_bindings = historical_selection.signed_historical_bindings if selection is not None else None
+    bound_bindings = historical_selection.signed_historical_bindings if selection is not None else None
     if isinstance(selection, _SignedLiveEventSelection):
-        signed_bindings = selection.bindings
+        bound_bindings = selection.bindings
     signed_event_received_at = None
     try:
-        if signed_bindings is not None:
-            if set(signed_bindings) != set(normalized_codes):
+        if selection is not None and bound_bindings is None:
+            bound_bindings = _read_validated_event_bindings(engine, selection)
+        if bound_bindings is not None:
+            if set(bound_bindings) != set(normalized_codes):
                 raise ValueError("signed announcement bound stock scope differs")
             if (
                 not isinstance(selection, _SignedLiveEventSelection)
@@ -7597,11 +7601,13 @@ def load_event_facts(
                 and event_batch.get("source") == CNINFO_EVENT_SOURCE
             ):
                 received = _row_datetime(event_batch.get("received_at"))
-                completed = _row_datetime(event_batch["initial_stage"]["completed_at"])
-                if not fact_cutoff <= received <= completed <= decision:
-                    raise ValueError("signed historical announcement knowledge frontier differs")
+                if not fact_cutoff <= received <= decision:
+                    raise ValueError("historical announcement knowledge frontier differs")
+                stage = event_batch.get("initial_stage")
+                if stage is not None and not received <= _row_datetime(stage["completed_at"]) <= decision:
+                    raise ValueError("signed historical announcement completion frontier differs")
                 signed_event_received_at = received
-            rows, bound_ids = _query_signed_bound_event_revisions(engine, selection, signed_bindings)
+            rows, bound_ids = _query_bound_event_revisions(engine, selection, bound_bindings)
         else:
             rows = _query_revisions(
                 engine, table_name=EVENT_REVISION_TABLE, codes=normalized_codes,
@@ -7663,7 +7669,7 @@ def load_event_facts(
                 )
                 for code, (row, is_scope_head) in selection.members.items()
                 if is_scope_head and (
-                    (not by_code_identity.get(code) if signed_bindings is not None
+                    (not by_code_identity.get(code) if bound_bindings is not None
                      else int(row["result_count"]) == 0)
                 )
             }
@@ -7704,7 +7710,7 @@ def load_event_facts(
                     decision_at=decision,
                     signed_event_received_at=signed_event_received_at,
                 )
-                if signed_bindings is not None and (
+                if bound_bindings is not None and (
                     selected is None or selected["revision_id"] != bound_ids.get(identity)
                 ):
                     blocked_reasons.append("PIT_EVENT_BOUND_REVISION_NOT_ELIGIBLE")
@@ -7721,7 +7727,7 @@ def load_event_facts(
                 published_text = (
                     _dt_text(_row_datetime(selected["published_at"]))
                     if exact_publication
-                    else str(selected.get("source_published_text") or "")
+                    else str(selected.get("source_published_text") or payload.get("source_published_text") or "")
                 )
                 known_text = _dt_text(_row_datetime(selected["known_at"]))
                 payload.update(
