@@ -1191,6 +1191,17 @@ def strategy_performance_detail(result_id: str, offset: int = Query(default=0, g
         raise HTTPException(status_code=422, detail="invalid result identity") from exc
 
 
+@router.post("/strategy-performance/{result_id}/retry",status_code=202)
+def retry_native_backtest(result_id: str,request_uid: str=Query(pattern=r"^[0-9a-f]{32}$")):
+    from server.engine.strategy_native_control import request_retry
+    try:
+        return request_retry(get_engine(),result_id,request_uid)
+    except KeyError as exc:
+        raise HTTPException(404,'回测记录不存在') from exc
+    except ValueError as exc:
+        raise HTTPException(409,str(exc)) from exc
+
+
 @router.post("/operations/{operation_id}/run")
 def run_quant_workbench_operation(
     operation_id: str,
