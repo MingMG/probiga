@@ -6773,7 +6773,7 @@ def _finance_feature_fact(
     published_text = (
         _dt_text(_row_datetime(selected["published_at"]))
         if exact_publication
-        else str(selected.get("source_published_text") or payload.get("source_published_text") or "")
+        else str(selected.get("source_published_text") or "")
     )
     known_text = _dt_text(_row_datetime(selected["known_at"]))
     payload.update(
@@ -7309,7 +7309,7 @@ def load_finance_history_facts(
             published_text = (
                 _dt_text(_row_datetime(selected["published_at"]))
                 if exact_publication
-                else str(selected.get("source_published_text") or payload.get("source_published_text") or "")
+                else str(selected.get("source_published_text") or "")
             )
             known_text = _dt_text(_row_datetime(selected["known_at"]))
             payload.update(
