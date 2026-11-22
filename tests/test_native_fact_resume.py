@@ -38,6 +38,7 @@ def test_runtime_repair_keeps_same_input_clock_archives_and_total_deadline(ledge
     ('fact_read_checkpoint','finance',{},False),
     ('event_read_checkpoint','event_facts',{},False),
     ('event_read_checkpoint','event_facts',{},True),
+    ('coverage_read_checkpoint','event_coverage',{},True),
     ('event_read_checkpoint','event_facts',{'trade_date':'2026-09-07','scope':'c'*64,'completed':100},False),
 ])
 def test_step_deadline_resumes_only_after_new_durable_source_progress(ledger,monkeypatch,field,dataset,prior,later_calculation):

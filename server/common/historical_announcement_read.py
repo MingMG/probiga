@@ -69,7 +69,7 @@ def _reconstruction_counts(connection, *, source, batch_id, deadline):
 
 
 def _read_reconstruction(engine, candidate, *, codes, decision, start, end, deadline,
-        capture_historical_selection, event_progress):
+        capture_historical_selection, event_progress, coverage_store=None, coverage_progress=None):
     from server.common.pit_facts import _bind_historical_event_snapshot
     from server.common.qmt_announcement_pit import (
         _assert_pit_fact_schema_prepared, _read_live_announcement_payload_rows,
@@ -103,13 +103,15 @@ def _read_reconstruction(engine, candidate, *, codes, decision, start, end, dead
     }
     selected=_bind_historical_event_snapshot(engine,material,codes=codes,decision=decision,
         received=normalize_decision_at(material['reconstructed_at']),frontier=decision,
-        window_start=start,window_end=end,event_progress=event_progress,deadline=deadline)
+        window_start=start,window_end=end,event_progress=event_progress,deadline=deadline,
+        coverage_store=coverage_store,coverage_progress=coverage_progress)
     if capture_historical_selection is not None:capture_historical_selection(selected)
     return dict(selected.batch)
 
 
 def validate_dated_announcement_batch(engine,*,codes,decision_at,window_start,window_end,expected_trade_date,
-        capture_historical_selection=None,capture_live_reuse=None,event_progress=None):
+        capture_historical_selection=None,capture_live_reuse=None,event_progress=None,
+        coverage_store=None,coverage_progress=None):
     requested=sorted({str(code).zfill(6) for code in codes})
     target=date.fromisoformat(str(expected_trade_date)[:10]);start=date.fromisoformat(str(window_start)[:10])
     end=date.fromisoformat(str(window_end)[:10]);decision=normalize_decision_at(decision_at)
@@ -140,5 +142,6 @@ def validate_dated_announcement_batch(engine,*,codes,decision_at,window_start,wi
             for candidate in candidates:
                 if candidate['watermark_kind']=='HISTORICAL_RECONSTRUCTION':
                     return _read_reconstruction(engine,candidate,codes=requested,decision=decision,start=start,end=end,
-                        deadline=deadline,capture_historical_selection=capture_historical_selection,event_progress=event_progress)
+                        deadline=deadline,capture_historical_selection=capture_historical_selection,event_progress=event_progress,
+                        coverage_store=coverage_store,coverage_progress=coverage_progress)
     raise QMTAnnouncementBlocked('QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND','no-common-batch')

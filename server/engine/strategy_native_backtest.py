@@ -175,6 +175,7 @@ def _v3_day(c,state,day,owner):
     generation=snapshot_identity(day=day,decision=known,identity_hash=identity_proof['sha256'],
         finance_seal=baseline['seal_coverage_id'],codes=eligible)
     fact_inputs=load_snapshot(c.engine,generation)
+    from server.common.formal_analysis_store import FormalAnalysisStore
     finances,events=[],[]
     progress_at=time.monotonic()
     def progress(done,total,kind='event'):
@@ -189,12 +190,21 @@ def _v3_day(c,state,day,owner):
             for proposal in state['proposals']:
                 proposal['validation'].update(status='RUNNING',reason=f'{label} {day}：已处理 {done}/{total} 只')
             state['last_progress_at']=str(now_shanghai());_save(c,state,owner);progress_at=time.monotonic()
+    def coverage_progress(done,total,scope,fresh):
+        if not fresh:return
+        state['coverage_read_checkpoint']={'trade_date':day,'dataset':'event_coverage','completed':done,
+            'total':total,'scope':scope,'last_progress_at':str(now_shanghai())}
+        state['source_progress']=dict(state['coverage_read_checkpoint'])
+        for proposal in state['proposals']:
+            proposal['validation'].update(status='RUNNING',reason=f'公告来源核对 {day}：已保存 {done}/{total} 个成员')
+        state['last_progress_at']=str(now_shanghai());_save(c,state,owner)
     if fact_inputs is None:
         cutoff=resolve_common_fact_cutoff(c.engine,codes=eligible,decision_at=known,finance_start_date='1900-01-01',
             finance_end_date=day,event_start_date=target-timedelta(days=20),event_end_date=day,require_qmt_event_batch=True,
             event_trade_date=day,capture_finance_selection=finances.append,capture_historical_selection=events.append,
             finance_observation_at=finance_observation,
-            event_checkpoint_path=Path.home()/'.local/state/probiga/native-event-prefix/coverage.sqlite',event_progress=progress)
+            event_checkpoint_path=Path.home()/'.local/state/probiga/native-event-prefix/coverage.sqlite',event_progress=progress,
+            event_coverage_store=FormalAnalysisStore(c.engine),event_coverage_progress=coverage_progress)
     else:
         cutoff=fact_inputs.cutoff
         finances,events=[fact_inputs.finance],[fact_inputs.events]
@@ -213,7 +223,6 @@ def _v3_day(c,state,day,owner):
             or fact_inputs.finance.fact_cutoff_at!=fact_clock or set(events[0].selection.members)!=eligible):
         raise ValueError('native cached historical fact scope differs')
     from server.common.pit_sealed_finance_read import load_sealed_finance_facts
-    from server.common.formal_analysis_store import FormalAnalysisStore
     financial=load_sealed_finance_facts(c.engine,selection=finances[0],codes=eligible,decision_at=known,
         fact_cutoff_at=fact_clock,as_of_date=target,formal_store=FormalAnalysisStore(c.engine),
         formal_generation_sha256=generation,read_progress=lambda done,total:progress(done,total,'finance'))
@@ -337,6 +346,7 @@ def _start(c,strategies,days,published,source_hash,contract):
         'cursor':0,'completed_units':0,'total_units':(len(warmup)+len(days))*2+len(days)+len(strategies),
         'last_progress_at':clock,'reason':'','proposals':[],
         'fact_read_checkpoint':dict(frozen.get('fact_read_checkpoint') or {}) if frozen else {},
+        'coverage_read_checkpoint':dict(frozen.get('coverage_read_checkpoint') or {}) if frozen else {},
         'event_read_checkpoint':dict(frozen.get('event_read_checkpoint') or {}) if frozen else {}}
     inputs=_input_parts(c,state)
     present={d for p in inputs.values() for d in p['sessions']}
@@ -412,7 +422,7 @@ def _step(c,state,owner):
 def native_tick(engine):
     """One bounded step on the existing Linux worker, fenced by its renewable lease."""
     from server.common.authoritative_market_clock import authoritative_closed_trade_date
-    state=None;checkpoint_before={};event_before={}
+    state=None;checkpoint_before={};event_before={};coverage_before={}
     with engine.connect() as c:
         if c.execute(text('SELECT GET_LOCK(:name,0)'),{'name':LOCK}).scalar()!=1:return {'status':'RUNNING','reason':'已有原生回测持有互斥锁'}
         previous_handler=None
@@ -459,6 +469,7 @@ def native_tick(engine):
             if str(now_shanghai())>state['deadline_at']:raise TimeoutError('原生回测超过24小时总时限')
             checkpoint_before=dict(state.get('fact_read_checkpoint') or {})
             event_before=dict(state.get('event_read_checkpoint') or {})
+            coverage_before=dict(state.get('coverage_read_checkpoint') or {})
             def timeout(_signum,_frame):raise NativeStepDeadline('原生回测单步超过600秒')
             previous_handler=signal.signal(signal.SIGALRM,timeout);signal.setitimer(signal.ITIMER_REAL,600)
             _step(c,state,owner)
@@ -477,7 +488,10 @@ def native_tick(engine):
                     and (now_shanghai()-datetime.fromisoformat(saved['last_progress_at'])).total_seconds()<=120)
                 # New event chunks remain usable when later feature calculation exhausts the step.
                 event_advanced=event_saved.get('completed',0)>event_earlier
-                if isinstance(ex,NativeStepDeadline) and (finance_advanced or event_advanced):
+                coverage_saved=state.get('coverage_read_checkpoint') or {}
+                coverage_earlier=coverage_before.get('completed',0) if (coverage_before.get('trade_date'),coverage_before.get('scope'))==(coverage_saved.get('trade_date'),coverage_saved.get('scope')) else 0
+                coverage_advanced=coverage_saved.get('completed',0)>coverage_earlier
+                if isinstance(ex,NativeStepDeadline) and (finance_advanced or event_advanced or coverage_advanced):
                     state.update(status='NOT_STARTED',step_status='COMPLETE',
                         reason='来源事实分块断点已保存；下一步继续',retry_after=str(now_shanghai()+timedelta(minutes=1)))
                 original=getattr(ex,'orig',ex);args=getattr(original,'args',())
