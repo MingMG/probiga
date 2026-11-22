@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import faulthandler
+import os
+import re
 import sys
 from pathlib import Path
 
@@ -13,6 +16,27 @@ if str(ROOT) not in sys.path:
 from server.common.batch_db import create_batch_engine
 from server.trading_v2.job_worker import run_one_job
 from tools.env_config import load_project_env
+
+
+def run_native_backtest(engine):
+    from server.engine.strategy_native_backtest import native_tick
+    from tools import run_ai_recommendation_premarket as diagnostics
+    uid=os.environ.get('PROBIGA_SCHEDULER_HISTORY_RUN_UID','')
+    path=None
+    if re.fullmatch(r'[0-9a-f]{32}',uid):
+        if not os.environ.get('PROBIGA_ANALYSIS_DIAGNOSTICS_ROOT','').strip():
+            os.environ['PROBIGA_ANALYSIS_DIAGNOSTICS_ROOT']=str(
+                Path(os.environ.get('PROBIGA_JOB_LOG_ROOT') or '/var/lib/probiga/jobs')/'analysis-execution-diagnostics')
+        diagnostics._start_analysis_stack_diagnostics(uid)
+        path=diagnostics._analysis_diagnostics_root()/f'{uid}.stack.log'
+    try:
+        return native_tick(engine)
+    finally:
+        if path is not None:
+            faulthandler.cancel_dump_traceback_later()
+            if diagnostics._DIAGNOSTIC_STREAM is not None:
+                diagnostics._DIAGNOSTIC_STREAM.close();diagnostics._DIAGNOSTIC_STREAM=None
+            if path.exists() and path.stat().st_size==0:path.unlink()
 
 
 def main() -> int:
@@ -26,10 +50,9 @@ def main() -> int:
             bootstrap_strategy_execution_adapter_registry(registry_rows=())
             result["autonomous_research"] = research_tick(engine)
             if result["autonomous_research"]["status"] in {"COMPLETE", "BLOCKED", "FAILED"}:
-                from server.engine.strategy_native_backtest import native_tick
                 from server.engine.strategy_native_control import consume_retries
                 result["native_retry_control"] = consume_retries(engine)
-                result["native_backtest"] = native_tick(engine)
+                result["native_backtest"] = run_native_backtest(engine)
     finally:
         engine.dispose()
     print(json.dumps(result, ensure_ascii=False, default=str))

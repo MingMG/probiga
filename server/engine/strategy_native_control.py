@@ -53,7 +53,7 @@ def request_retry(engine,result_id,request_uid):
                 raise ValueError('该批次已有待处理的恢复请求')
             value={'request_uid':request_uid,'run_id':run_id,'version_hash':version_hash,'status':'NOT_STARTED',
                 'expected_sequence':state['checkpoint_sequence'],'source_contract':state['contract'],
-                'requested_at':str(now_shanghai()),'reason':'操作员请求修复故障后从原断点恢复'}
+                'requested_at':str(now_shanghai()),'reason':'操作员请求从原断点恢复'}
             _append_audit_connection(c,entity_type=ENTITY,entity_key=request_uid,action='RETRY_00000001',
                 reason=value['reason'],operator='native-research-control',before=None,after=value,evidence={'run_id':run_id})
             c.commit()
