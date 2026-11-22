@@ -25,6 +25,9 @@ def main() -> int:
             from server.engine.autonomous_strategy_research import research_tick
             bootstrap_strategy_execution_adapter_registry(registry_rows=())
             result["autonomous_research"] = research_tick(engine)
+            if result["autonomous_research"]["status"] in {"COMPLETE", "BLOCKED", "FAILED"}:
+                from server.engine.strategy_native_backtest import native_tick
+                result["native_backtest"] = native_tick(engine)
     finally:
         engine.dispose()
     print(json.dumps(result, ensure_ascii=False, default=str))

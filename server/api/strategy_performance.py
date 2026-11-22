@@ -79,7 +79,7 @@ def _formal(row):
     }
 
 
-def _research(run, proposal):
+def _research(run, proposal, *, native=False):
     validation = proposal.get("validation") or {}
     report = validation.get("report") or {}
     nav = report.get("nav") or []
@@ -93,11 +93,13 @@ def _research(run, proposal):
         "end_date": (validation.get("sessions") or [None])[-1],
         "dataset_sha256": validation.get("source_input_sha256") or validation.get("dataset_sha256"), "initial_cash_cny": initial,
         "fees": report.get("fees"), "execution_mode": report.get("execution_mode"), "return_scope": return_scope}
+    if native:
+        cohort['native_execution_policy'] = report.get('execution_policy')
     comparable = net_return if net_return is not None else subset_return
     eligible = bool(comparable is not None and initial and cohort["dataset_sha256"]
                     and cohort["fees"] and report.get("status") in {"COMPLETE", "PARTIAL"} and trades)
-    return {"result_id": "research:" + run["run_id"] + ":" + proposal["rule_hash"],
-        "kind": "MODEL_RULE_RETROSPECTIVE", "strategy_key": proposal["strategy_key"],
+    return {"result_id": ("native:" if native else "research:") + run["run_id"] + ":" + proposal["rule_hash"],
+        "kind": "NATIVE_SHADOW_RETROSPECTIVE" if native else "MODEL_RULE_RETROSPECTIVE", "strategy_key": proposal["strategy_key"],
         "strategy_version": proposal["version"], "strategy_name": proposal["name"],
         "status": validation.get("status", "NOT_STARTED"), **{k: cohort[k] for k in ("start_date", "end_date", "initial_cash_cny")},
         "net_return_pct": net_return, "net_profit_cny": initial * net_return / 100 if initial and net_return is not None else None,
@@ -152,9 +154,19 @@ def read_performance(engine, day):
     workspace = read_strategy_workspace(engine, day)
     records = [_research(run, p) for run in workspace["autonomous_research"].get("runs", [])
                for p in run.get("proposals", [])]
+    from server.engine.strategy_native_backtest import read_runs
+    native_error = ''
+    try:
+        with engine.connect() as connection:
+            native_runs = read_runs(connection)
+    except (SQLAlchemyError,ValueError) as exc:
+        native_runs = []
+        native_error = '原生回测审计读取失败：'+type(exc).__name__
+    records.extend(_research(run,p,native=True) for run in native_runs for p in run["proposals"])
     repository = TradingV2ReadRepository(engine)
     sources = {"autonomous_research": {"status": workspace["autonomous_research"].get("status", "COMPLETE"),
                                       "reason": workspace["autonomous_research"].get("reason", "")}}
+    sources['native_backtests'] = {'status':'FAILED' if native_error else 'COMPLETE','reason':native_error}
     try:
         formal = [_formal(row) for row in repository.backtests(100)]
         sources["historical_backtests"] = {"status": "COMPLETE", "reason": ""}
@@ -169,8 +181,8 @@ def read_performance(engine, day):
         latest = matching[0] if matching else None
         strategies.append({"strategy_key": row["strategy_key"], "strategy_name": row["strategy_name"],
             "strategy_version": row["current_version"], "result_id": latest["result_id"] if latest else None,
-            "backtest_status": latest["status"] if latest else "NOT_STARTED",
-            "reason": latest["reason"] if latest else "当前精确版本尚无已保存回测；不可复用旧版本或其他策略的收益",
+            "backtest_status": latest["status"] if latest else "FAILED" if native_error else "NOT_STARTED",
+            "reason": latest["reason"] if latest else native_error or "当前精确版本尚无已保存回测；不可复用旧版本或其他策略的收益",
             "forward_windows": row["windows"]})
     return {"trade_date": workspace["trade_date"], "strategies": strategies,
         "results": records, "leaderboards": rank_results(records), "sources": sources,
@@ -180,20 +192,22 @@ def read_performance(engine, day):
 
 
 def read_performance_detail(engine, result_id, *, offset=0, limit=50):
-    if result_id.startswith("research:"):
+    if result_id.startswith(("research:","native:")):
         from server.engine.autonomous_strategy_research import _read_states
+        from server.engine.strategy_native_backtest import read_runs
         _, run_id, rule_hash = result_id.split(":")
         with engine.connect() as connection:
-            runs = _read_states(connection, run_id=run_id, limit=1)
+            runs = read_runs(connection,run_id=run_id) if result_id.startswith("native:") else _read_states(connection, run_id=run_id, limit=1)
         proposal = next((p for r in runs for p in r.get("proposals", []) if p["rule_hash"] == rule_hash), None)
         if proposal is None:
             raise KeyError(result_id)
-        row, report = _research(runs[0], proposal), (proposal.get("validation") or {}).get("report") or {}
+        row, report = _research(runs[0], proposal,native=result_id.startswith("native:")), (proposal.get("validation") or {}).get("report") or {}
         trades = report.get("trades") or []
         return {"summary": row, "trades": trades[offset:offset + limit], "trade_count": len(trades),
                 "offset": offset, "limit": limit, "nav": report.get("nav") or [],
                 "dispositions": (report.get("dispositions") or [])[:100], "fees": report.get("fees"),
                 "disposition_count": len(report.get("dispositions") or []),
+                "source_gaps": (proposal.get("validation") or {}).get("source_gaps") or [],
                 "missing_feature_dates": (proposal.get("validation") or {}).get("missing_feature_dates") or []}
     repository = TradingV2ReadRepository(engine)
     raw = repository.backtest(result_id)

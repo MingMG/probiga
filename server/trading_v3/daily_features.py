@@ -408,6 +408,12 @@ def _load_bars(
     frame.attrs["qmt_daily_input_window"] = window
     if frame.empty:
         return frame
+    return normalize_daily_bars(frame)
+
+
+def normalize_daily_bars(frame: pd.DataFrame) -> pd.DataFrame:
+    """One causal price transform for live loading and verified historical windows."""
+    frame = frame.sort_values(["stock_code", "trade_date"]).copy()
     numeric = (
         "open",
         "close",
@@ -1345,7 +1351,27 @@ def load_daily_feature_universe(
             f"应到 {expected_trade_date.isoformat()}，实际仅到 {actual}"
         )
     frame = _load_bars(kline_engine, dates=dates, decision_known_at=daily_cutoff)
+    return build_daily_feature_universe(
+        primary_engine, as_of=as_of, dates=dates, frame=frame,
+        context_cutoff_at=context_cutoff_at, limit=limit,
+        required_codes=required_code_set,
+        allow_research_industry_last_known=allow_research_industry_last_known,
+    )
+
+
+def build_daily_feature_universe(
+    primary_engine: Engine, *, as_of: date, dates: list[date], frame: pd.DataFrame,
+    context_cutoff_at: datetime | None = None, limit: int = 5000,
+    required_codes: Iterable[str] = (), allow_research_industry_last_known: bool = False,
+) -> dict[str, Any]:
+    """Evaluate the same native features from an already verified price window."""
+    required_code_set = {str(code).zfill(6) for code in required_codes if str(code)}
+    if not dates or dates != sorted(set(dates)):
+        raise ValueError("native feature sessions must be ordered and unique")
+    expected_trade_date = dates[-1]
     daily_input_window = frame.attrs["qmt_daily_input_window"]
+    if daily_input_window["sessions"] != [d.isoformat() for d in dates]:
+        raise ValueError("native feature price window differs from its proof")
     if frame.empty or len(dates) < 65:
         raise RuntimeError("至少需要 65 个已收盘交易日的日 K 数据")
     codes = _eligible_daily_history_codes(

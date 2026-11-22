@@ -44,7 +44,7 @@
         Object.values(d.sources||{}).filter(x=>x.status==='FAILED').forEach(x=>{h+='<p class="qsw-error">'+esc(x.reason)+'</p>';});
         h+='<p>'+esc(d.method)+'</p><h4>累计收益排名</h4>';
         if(!(d.leaderboards||[]).length)h+='<p class="qsw-warning">当前没有满足版本绑定及可比口径的完整回测结果，暂不能给出赚钱排名。历史报告及全部策略的进度在下方保留。</p>';
-        (d.leaderboards||[]).forEach(g=>{h+='<p>'+esc(g.cohort.return_scope==='VERIFIED_INPUT_SUBSET'?'可用输入子集研究排名':'完整输入回测排名')+' · 同组 '+esc(g.rows.length)+' 个版本 · '+esc(g.cohort.start_date)+' 至 '+esc(g.cohort.end_date)+' · 初始资金 '+metric(g.cohort.initial_cash_cny,'元')+(g.rows[0].kind==='MODEL_RULE_RETROSPECTIVE'?' · 模型规则事后研究，非独立样本外结果':' · 历史回测')+'</p>'+resultTable(g.rows,true);});
+        (d.leaderboards||[]).forEach(g=>{h+='<p>'+esc(g.cohort.return_scope==='VERIFIED_INPUT_SUBSET'?'可用输入子集研究排名':'完整输入回测排名')+' · 同组 '+esc(g.rows.length)+' 个版本 · '+esc(g.cohort.start_date)+' 至 '+esc(g.cohort.end_date)+' · 初始资金 '+metric(g.cohort.initial_cash_cny,'元')+(g.rows[0].kind==='NATIVE_SHADOW_RETROSPECTIVE'?' · 原生冻结影子规则事后研究，非独立样本外结果':g.rows[0].kind==='MODEL_RULE_RETROSPECTIVE'?' · 模型规则事后研究，非独立样本外结果':' · 历史回测')+'</p>'+resultTable(g.rows,true);});
         h+='<details data-qsw-key="backtest-coverage" open><summary>全部 '+esc(d.strategies.length)+' 个当前策略的回测进度</summary><div class="qsw-result-scroll"><table><thead><tr><th>策略 / 版本</th><th>回测状态与缺口</th><th>结果</th></tr></thead><tbody>'+d.strategies.map(r=>'<tr><td>'+esc(r.strategy_name)+'<small>'+esc(r.strategy_version)+'</small></td><td>'+esc(researchStates[r.backtest_status]||r.backtest_status)+'<small>'+esc(r.reason)+'</small></td><td>'+(r.result_id?'<button type="button" data-qsw-result="'+esc(r.result_id)+'">查看验证进度</button>':'等待当前版本回测')+'</td></tr>').join('')+'</tbody></table></div></details>';
         h+='<details data-qsw-key="backtest-archive"><summary>全部历史报告与研究回放（'+esc(d.results.length)+' 份）</summary><p>旧版本和身份未完整绑定的存档均保留原标记，不计入当前策略收益。</p>'+resultTable(d.results,false)+(d.history_limit_reached?'<p>此处展示最近100份正式回测；更早结果请在回测结果页查询。</p>':'')+'</details>';
         if(s.resultLoading)h+='<p role="status">正在读取交易明细…</p>';
@@ -61,6 +61,7 @@
             else h+='<p>尚无可展示的已完成交易明细。</p>';
             if(x.trade_count!=null)h+='<p>交易 '+esc(x.offset+(x.trades.length?1:0))+'—'+esc(x.offset+x.trades.length)+' / '+esc(x.trade_count)+' 笔 '+(x.offset>0?'<button type="button" data-qsw-result="'+esc(r.result_id)+'" data-qsw-offset="'+Math.max(0,x.offset-x.limit)+'">上一页</button>':'')+' '+(x.offset+x.limit<x.trade_count?'<button type="button" data-qsw-result="'+esc(r.result_id)+'" data-qsw-offset="'+(x.offset+x.limit)+'">下一页</button>':'')+'</p>';
             if(x.dispositions?.length)h+='<details data-qsw-key="dispositions"><summary>未成交与证据缺口（最多展示前100项）</summary><ul>'+x.dispositions.map(t=>'<li>'+esc([t.stock_code,t.trade_date,t.status,t.reason].filter(Boolean).join(' · '))+'</li>').join('')+'</ul></details>';
+            if(x.source_gaps?.length)h+='<details data-qsw-key="native-source-gaps"><summary>历史来源缺口（'+esc(x.source_gaps.length)+'项）</summary><ul>'+x.source_gaps.map(g=>'<li>'+esc(g.trade_date+' · '+g.reason)+'</li>').join('')+'</ul></details>';
             h+='</article>';
         }
         return h+'</section>';
