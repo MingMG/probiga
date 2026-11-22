@@ -94,3 +94,24 @@ def test_workspace_renderer_preserves_unknowns_and_escapes_evidence(workspace, t
     runner = tmp_path / "render.cjs"
     runner.write_text("global.window={};require(" + json.dumps(str(script)) + ");const d=" + json.dumps(d) + ";const h=window.QuantStrategyWorkspace.render({data:d,window:'20',order:'net'});if(h.includes('<img')||h.includes('0.00%')||!h.includes('未知')||!h.includes('QMT选股'))process.exit(1);", encoding="utf-8")
     subprocess.run([node, str(runner)], check=True, timeout=10)
+
+
+def test_retry_request_works_without_secure_context_random_uuid(tmp_path):
+    node = shutil.which('node')
+    if not node:
+        pytest.skip('Node is required for the browser module')
+    script = Path(__file__).resolve().parents[1] / 'server/static/js/quant-strategy-workspace.js'
+    runner = tmp_path / 'retry.cjs'
+    runner.write_text('''
+global.window={};global.document={activeElement:null};
+Object.defineProperty(global,'crypto',{value:{getRandomValues:a=>require('node:crypto').webcrypto.getRandomValues(a)}});
+require('''+json.dumps(str(script))+''');
+const mount={isConnected:false,querySelectorAll:()=>[],contains:()=>false};let sent;
+QuantStrategyWorkspace=window.QuantStrategyWorkspace;
+QuantStrategyWorkspace.load('2026-11-20',mount,async(u,t,o)=>{sent={u,o};return {};},()=>{},()=>{},()=>false);
+mount._strategyWorkspace.data={};
+(async()=>{await mount.onclick({target:{closest:s=>s==='[data-qsw-retry]'?{dataset:{qswRetry:'native:run:version'}}:null}});
+if(!sent||sent.o.method!=='POST'||!/^.*request_uid=[0-9a-f]{32}$/.test(sent.u)||mount._strategyWorkspace.resultError)process.exit(1);
+})();
+''',encoding='utf-8')
+    subprocess.run([node,str(runner)],check=True,timeout=10)
