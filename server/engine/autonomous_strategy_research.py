@@ -77,10 +77,20 @@ def _owner(connection, *, locking=False):
         SELECT * FROM st_scheduled_task_history
         WHERE task_id=:task_id AND task_type='trading_v2_job_worker'
           AND status='running' AND host_name=:host ORDER BY id DESC LIMIT 2
-    """ + (" FOR UPDATE" if locking and connection.dialect.name == "mysql" else "")), {"task_id": int(task_id), "host": socket.gethostname()}).mappings().all()
+    """), {"task_id": int(task_id), "host": socket.gethostname()}).mappings().all()
     if len(owners) != 1:
         raise ValueError("自主研究缺少唯一有效的调度运行身份")
     row = dict(owners[0])
+    if locking:
+        # Match lease renewal's unique-key lock; a reverse history scan also
+        # locks unrelated scheduler rows and can deadlock their heartbeats.
+        locked = connection.execute(text("SELECT * FROM st_scheduled_task_history WHERE run_uid=:uid" +
+            (" FOR UPDATE" if connection.dialect.name == "mysql" else "")), {'uid':row['run_uid']}).mappings().one_or_none()
+        if (locked is None or locked['status']!='running' or locked.get('finished_at') is not None
+                or int(locked['task_id'])!=int(task_id) or locked['host_name']!=socket.gethostname()
+                or locked['task_type']!='trading_v2_job_worker'):
+            raise ValueError("自主研究调度运行身份在加锁前已失效")
+        row = dict(locked)
     lease = read_lease(row)
     current = now_shanghai()
     if lease is None or not lease["renewed_at"] <= current <= lease["lease_until"]:

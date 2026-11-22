@@ -325,6 +325,20 @@ def test_terminal_scheduler_owner_cannot_publish_research(ledger):
         assert c.execute(text("SELECT COUNT(*) FROM st_strategy_governance_audit")).scalar() == 0
 
 
+def test_owner_lock_rereads_exact_run_and_rejects_terminal_transition(ledger):
+    changed=[]
+    def terminate(connection,cursor,statement,parameters,context,many):
+        if 'WHERE run_uid=' in statement and not changed:
+            changed.append(True)
+            connection.execute(text("UPDATE st_scheduled_task_history SET status='failed' WHERE id=1"))
+    event.listen(ledger,'before_cursor_execute',terminate)
+    try:
+        with ledger.connect() as c, pytest.raises(ValueError,match='身份.*失效'):
+            research._owner(c,locking=True)
+    finally:
+        event.remove(ledger,'before_cursor_execute',terminate)
+
+
 def test_complete_feature_history_is_required_without_rebuilding_with_current_factors(ledger, rule):
     from server.engine.strategy_rule_backtest import run_rule_backtest
     rule["entry_all"][0]["field"] = "technical_score"
