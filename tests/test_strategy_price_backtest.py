@@ -193,3 +193,38 @@ def test_historical_bar_batches_fit_query_budget_without_losing_daily_scope(monk
     assert len(rows) == len(days) * len(codes)
     assert {row['close'] for row in rows} == {10}
     assert {row['stock_code'] for row in rows} == set(codes)
+
+
+def test_frozen_native_values_survive_later_recapture_without_looking_ahead(monkeypatch):
+    import json
+    from server.engine import strategy_price_backtest as price
+    from server.common import qmt_datadir_daily_coverage as coverage
+    from server.common.analysis_pool_receipt import canonical_sha256
+    from tests.test_qmt_datadir_daily_coverage import database, manifest, DAY, CUTOFF, TRADED, authorities, bar, snapshot, listing
+    engine = database(monkeypatch)
+    original = manifest()
+    catalog, calendar = authorities()
+    later = coverage.build_manifest(catalog=catalog, calendar=calendar, day=DAY,
+        rows=[{**bar(), 'close':12, 'high':12, 'amount':1200}], run_id='qdd-later',
+        captured_at=CUTOFF + timedelta(hours=3), snapshot=snapshot(), listings=listing())
+    with engine.begin() as c:
+        c.execute(text('ALTER TABLE sm_stock_kline ADD COLUMN received_at TEXT'))
+        c.execute(text("UPDATE sm_stock_kline SET close=12,high=12,amount=1200,received_at='2026-11-03 01:00:00'"))
+        coverage.insert_manifest(c, later)
+    proof = {'provider':'qmt_datadir', 'truth_hash':original['manifest_hash'], 'run_id':original['run_id'],
+             'run_finished_at':original['captured_at'], **{k:original[k] for k in
+                 ['catalog_batch_id','catalog_manifest_hash','calendar_batch_id','calendar_manifest_hash']}}
+    inputs = {'part': {'row_counts':{DAY:1}, 'proofs':{DAY:proof}}}
+    monkeypatch.setattr(price, '_resolved_scopes', lambda *_a: {DAY:{'catalog':'catalog',
+        'excluded_codes':[], 'stock_count':1, 'stock_set_hash':canonical_sha256([TRADED])}})
+    with engine.connect() as c:
+        rows = price._read_bars(c, [DAY], inputs, CUTOFF.isoformat(sep=' '))
+        assert len(rows) == 1 and rows[0]['close'] == 11 and rows[0]['amount'] == 1100
+        with pytest.raises(ValueError, match='可用时间'):
+            price._read_bars(c, [DAY], inputs, (CUTOFF - timedelta(seconds=1)).isoformat(sep=' '))
+        changed = deepcopy(original)
+        next(r for r in changed['entities'] if r['classification']=='TRADED')['evidence']['close'] = '99.000000'
+        c.execute(text('UPDATE qmt_history_coverage_manifest SET manifest_json=:json WHERE manifest_hash=:hash'),
+                  {'json':json.dumps(changed), 'hash':original['manifest_hash']})
+        with pytest.raises(ValueError, match='冻结日线内容'):
+            price._read_bars(c, [DAY], inputs, CUTOFF.isoformat(sep=' '))

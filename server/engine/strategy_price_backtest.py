@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 import hashlib
+import json
 from pathlib import Path
 import time
 
@@ -195,17 +196,75 @@ def _validate_group(connection, group, cutoff):
     return {"sessions": days, "catalogs": bindings, "proofs": proofs, "row_counts": counts}
 
 
+def _frozen_native_bars(connection, proofs, cutoff):
+    from server.common.qmt_attestation_contract import canonical_digest
+    from server.common.qmt_datadir_daily_coverage import MANIFEST_TABLE, PROVIDER, SCHEMA, _stamp
+    rows = []
+    hashes = {proof['truth_hash']: day for day, proof in proofs.items()}
+    if len(hashes) != len(proofs):
+        raise ValueError('冻结日线清单身份重复')
+    identities = sorted(hashes)
+    seen = set()
+    for offset in range(0, len(identities), 2):
+        sizes = dict(connection.execute(text(f"""SELECT /*+ MAX_EXECUTION_TIME(12000) */
+            manifest_hash,LENGTH(manifest_json) FROM {MANIFEST_TABLE}
+            WHERE manifest_hash IN :hashes LIMIT 3""").bindparams(bindparam('hashes', expanding=True)),
+            {'hashes': identities[offset:offset + 2]}).tuples().all())
+        if set(sizes) != set(identities[offset:offset + 2]) or any(size > 8 * 1024 * 1024 for size in sizes.values()):
+            raise ValueError('冻结日线清单缺失或超过8MiB读取上限')
+        records = connection.execute(text(f"""SELECT /*+ MAX_EXECUTION_TIME(12000) */
+            manifest_hash,manifest_json,schema_version,dataset,provider,trade_date,status,
+            strategy_eligible,run_id,captured_at,catalog_batch_id,catalog_manifest_hash,
+            calendar_batch_id,calendar_manifest_hash FROM {MANIFEST_TABLE}
+            WHERE manifest_hash IN :hashes LIMIT 3""").bindparams(bindparam('hashes', expanding=True)),
+            {'hashes': identities[offset:offset + 2]}).mappings().all()
+        for record in records:
+            manifest = json.loads(record['manifest_json'])
+            identity = manifest.pop('manifest_hash', None)
+            day = hashes[record['manifest_hash']]
+            proof = proofs[day]
+            if (identity != record['manifest_hash'] or canonical_digest(manifest) != identity
+                    or manifest.get('schema') != SCHEMA or record['schema_version'] != SCHEMA
+                    or manifest.get('provider') != PROVIDER or record['provider'] != PROVIDER
+                    or manifest.get('dataset') != 'stock_daily' or record['dataset'] != 'stock_daily'
+                    or manifest.get('status') != 'EXACT' or record['status'] != 'EXACT'
+                    or manifest.get('strategy_eligible') is not True or int(record['strategy_eligible'] or 0) != 1
+                    or manifest.get('trade_date') != day or str(record['trade_date'])[:10] != day
+                    or manifest.get('run_id') != proof['run_id'] or record['run_id'] != proof['run_id']
+                    or _stamp(manifest['captured_at']) != _stamp(record['captured_at'])
+                    or _stamp(manifest['captured_at']) > _stamp(cutoff)
+                    or _stamp(proof['run_finished_at']) > _stamp(cutoff)
+                    or any(manifest.get(key) != proof[key] or record[key] != proof[key] for key in (
+                        'catalog_batch_id','catalog_manifest_hash','calendar_batch_id','calendar_manifest_hash'))):
+                raise ValueError(day + ' 的冻结日线内容、来源或可用时间与已验证输入不一致')
+            if day in seen:
+                raise ValueError('冻结日线清单重复')
+            seen.add(day)
+            for entity in manifest['entities']:
+                if entity['classification'] == 'TRADED':
+                    bar = entity['evidence']
+                    rows.append({'stock_code': bar['stock_code'], 'trade_date': day,
+                                 **{key: float(bar[key]) for key in BAR_COLUMNS[2:]}})
+    if seen != set(proofs):
+        raise ValueError('已验证的冻结日线清单不存在')
+    return rows
+
+
 def _read_bars(connection, days, inputs, cutoff):
     scopes = _resolved_scopes(connection, inputs, days, cutoff)
     bindings = {d: scopes[d]["catalog"] for d in days}
     expected = {day: n for part in inputs.values() for day, n in part["row_counts"].items()}
     if sum(expected[d] for d in days) > 500000:
         raise ValueError("单步历史行情超过500000行的内存上限")
+    proofs = {day: proof for part in inputs.values() for day, proof in part.get('proofs', {}).items()}
+    frozen = {day: proofs[day] for day in days if proofs.get(day, {}).get('provider') == 'qmt_datadir'}
+    rows = _frozen_native_bars(connection, frozen, cutoff)
+    mutable_days = [day for day in days if day not in frozen]
     # A six-day join exceeded 12s in production; two A-share days read in 2.6s.
     width = max(1, min(8, 16000 // max(expected[d] for d in days)))
     force = " FORCE INDEX (idx_date_ktype) " if connection.dialect.name == "mysql" else " "
     catalogs = {}
-    missing = sorted(set(bindings.values()))
+    missing = sorted({bindings[day] for day in mutable_days})
     for offset in range(0, len(missing), 4):
         batch_ids = missing[offset:offset + 4]
         members = connection.execute(text("""SELECT /*+ MAX_EXECUTION_TIME(12000) */
@@ -222,10 +281,9 @@ def _read_bars(connection, days, inputs, cutoff):
     allowed = {day: {r['stock_code'] for r in catalogs[bindings[day]]
                     if r['list_date'] is not None and str(r['list_date'])[:10] <= day
                     and (r['expire_date'] is None or str(r['expire_date'])[:10] >= day)}
-                    - set(scopes[day]['excluded_codes']) for day in days}
-    rows = []
-    for offset in range(0, len(days), width):
-        chunk = days[offset:offset + width]
+                    - set(scopes[day]['excluded_codes']) for day in mutable_days}
+    for offset in range(0, len(mutable_days), width):
+        chunk = mutable_days[offset:offset + width]
         # Apply the same dated catalog in memory; the per-row SQL join timed out on two days.
         batch = connection.execute(text("""SELECT /*+ MAX_EXECUTION_TIME(12000) */
             SUBSTR(k.stock_code,1,6) stock_code,k.trade_date,k.`open`,k.high,k.low,k.`close`,k.pre_close,k.volume,k.amount

@@ -5814,20 +5814,21 @@ def _read_signed_historical_coverage_links(
     mysql = connection.dialect.name == "mysql"
     stage = f"signed-historical-chain:{offset}"
     hint = _live_announcement_read_hint(mysql=mysql, deadline=deadline, stage=stage)
-    index = " FORCE INDEX (uk_pit_coverage_scope_revision)" if mysql else ""
+    # Filter the observation time in the index before fetching later revisions' rows.
+    index = " FORCE INDEX (idx_pit_coverage_decision)" if mysql else ""
     code_by_scope = {_source_coverage_scope_hash("event", code, CNINFO_EVENT_SOURCE): code for code in exact_ids}
     statement = text(
         f"SELECT {hint}coverage_id,scope_hash,stock_code,revision_no,supersedes_coverage_id,"
         "known_at,received_at,covered_through_at,coverage_status,coverage_fingerprint_hash "
-        f"FROM {SOURCE_COVERAGE_TABLE}{index} WHERE scope_hash IN :scopes "
+        f"FROM {SOURCE_COVERAGE_TABLE}{index} WHERE scope_hash IN :scopes AND stock_code IN :codes "
         "AND fact_kind='event' AND source=:source AND known_at<=:received AND received_at<=:received "
         "ORDER BY scope_hash,revision_no"
-    ).bindparams(bindparam("scopes", expanding=True)).execution_options(stream_results=True)
+    ).bindparams(bindparam("scopes", expanding=True), bindparam("codes", expanding=True)).execution_options(stream_results=True)
     links = {}
     selected_revisions = {}
     with _live_announcement_reply_budget(connection, deadline=deadline, stage=stage):
         with connection.execute(statement, {
-            "scopes": sorted(code_by_scope), "source": CNINFO_EVENT_SOURCE, "received": received,
+            "scopes": sorted(code_by_scope), "codes": sorted(exact_ids), "source": CNINFO_EVENT_SOURCE, "received": received,
         }) as result:
             for scope, chain in groupby(result.mappings(), key=lambda row: row["scope_hash"]):
                 code = code_by_scope[scope]
@@ -5864,20 +5865,26 @@ def _read_signed_historical_coverage_links(
         # Their payloads and chains are outside the selected historical observation.
         stage = f"signed-historical-heads:{offset}"
         hint = _live_announcement_read_hint(mysql=mysql, deadline=deadline, stage=stage)
+        head_index = " FORCE INDEX (uk_pit_coverage_scope_revision)" if mysql else ""
+        required, head_params = [], {"source":CNINFO_EVENT_SOURCE, "frontier":head_frontier}
+        for number, (scope, revision) in enumerate(sorted(selected_revisions.items())):
+            required.append(f"SELECT :head_scope_{number} AS scope_hash,:head_revision_{number} AS revision_no")
+            head_params[f"head_scope_{number}"] = scope
+            head_params[f"head_revision_{number}"] = revision
+        # Only the existence of a later observation is needed, not its maximum revision.
         latest_statement = text(
-            f"SELECT {hint}scope_hash,MAX(revision_no) AS revision_no FROM {SOURCE_COVERAGE_TABLE}{index} "
-            "WHERE scope_hash IN :scopes AND fact_kind='event' AND source=:source "
-            "AND known_at<=:frontier AND received_at<=:frontier GROUP BY scope_hash"
-        ).bindparams(bindparam("scopes", expanding=True))
+            f"SELECT {hint}required_scope.scope_hash,EXISTS(SELECT 1 FROM {SOURCE_COVERAGE_TABLE}{head_index} "
+            "WHERE scope_hash=required_scope.scope_hash AND revision_no>required_scope.revision_no "
+            "AND fact_kind='event' AND source=:source AND known_at<=:frontier AND received_at<=:frontier LIMIT 1) AS has_later "
+            "FROM (" + " UNION ALL ".join(required) + ") AS required_scope"
+        )
         with _live_announcement_reply_budget(connection, deadline=deadline, stage=stage):
-            latest = dict(connection.execute(latest_statement, {
-                "scopes":sorted(code_by_scope), "source":CNINFO_EVENT_SOURCE, "frontier":head_frontier,
-            }).tuples().all())
+            latest = dict(connection.execute(latest_statement, head_params).tuples().all())
         if latest.keys() != selected_revisions.keys():
             raise ValueError("historical announcement current coverage frontier is unavailable")
-        for scope, revision in latest.items():
+        for scope, has_later in latest.items():
             selected_id = exact_ids[code_by_scope[scope]]
-            links[selected_id] = (links[selected_id][0], revision == selected_revisions[scope])
+            links[selected_id] = (links[selected_id][0], not bool(has_later))
     return links
 
 
