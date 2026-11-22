@@ -6,6 +6,30 @@ from server.db.formal_analysis_schema import privileged_migrate_formal_analysis_
 from tests.test_autonomous_strategy_research import ledger
 
 
+def test_runtime_repair_keeps_same_input_clock_archives_and_total_deadline(ledger):
+    now=native.now_shanghai()
+    strategy={'strategy_key':'native','strategy_name':'native','current_version':'v1','version_hash':'a'*64}
+    days=['2026-09-07','2026-09-08']
+    with ledger.begin() as c:
+        from sqlalchemy import text
+        c.execute(text('CREATE TABLE si_trade_calendar(trade_date TEXT,trade_status INT)'))
+    with ledger.connect() as c:
+        original={'schema':native.SCHEMA,'run_id':'d'*64,'rule_hash':'e'*64,'phase':'SIGNALS',
+            'status':'FAILED','source_hash':'a'*64,'strategies':[strategy],'sessions':days,
+            'requested_at':str(now-timedelta(hours=1)),'deadline_at':str(now+timedelta(hours=23)),
+            'price_cutoff':str(now-timedelta(hours=2)),'input_archives':[]}
+        native._save(c,original,native._owner(c))
+        revised=native._start(c,[strategy],days,{},'a'*64,'different-runtime')
+        assert revised['requested_at']==original['requested_at']
+        assert revised['price_cutoff']==original['price_cutoff']
+        assert revised['deadline_at']==original['deadline_at']
+        assert revised['run_id']!=original['run_id']
+        assert revised['input_archives']==[{'run_id':original['run_id'],'rule_hash':original['rule_hash']}]
+        fresh=native._start(c,[strategy],days,{},'b'*64,'different-runtime')
+        assert fresh['requested_at']!=original['requested_at']
+        assert fresh['input_archives']==[]
+
+
 def test_step_deadline_resumes_only_after_new_durable_finance_progress(ledger,monkeypatch):
     privileged_migrate_formal_analysis_schema(ledger)
     with ledger.connect() as c:

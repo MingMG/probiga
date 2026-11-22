@@ -34,6 +34,35 @@ def test_historical_batch_selection_does_not_load_a_later_window():
         target=date(2026,8,24),window_start=date(2026,8,4))
 
 
+def test_full_market_snapshot_reads_fourteen_chunks_with_bounded_artifact_batches():
+    # Synthetic identifiers exercise the transport limit; no prices or profits are generated.
+    from types import MappingProxyType
+    from server.engine.strategy_native_fact_snapshot import save_snapshot,load_snapshot
+    from server.db.formal_analysis_schema import privileged_migrate_formal_analysis_schema
+    engine=_engine();privileged_migrate_formal_analysis_schema(engine)
+    decision=datetime(2026,9,8);cutoff=datetime(2026,9,7,16)
+    codes=[str(i).zfill(6) for i in range(5600)]
+    financial={code:{'coverage_id':pit.canonical_hash(code)} for code in codes}
+    members={code:(MappingProxyType({'stock_code':code,'coverage_id':pit.canonical_hash(code),
+        'known_at':cutoff,'window_end':cutoff.date()}),True) for code in codes}
+    selection=pit._LiveEventSelection(engine,decision,date(2026,8,18),cutoff.date(),
+        MappingProxyType({'coverage_count':len(codes)}),MappingProxyType(members))
+    sealed=pit.SealedFinanceInputs(engine,decision,cutoff,cutoff.date(),'a'*64,'b'*64,
+        MappingProxyType(financial),MappingProxyType({}))
+    inputs=daily_features.DailyFactInputs({'status':pit.PIT_AVAILABLE},sealed,pit.HistoricalEventRead(selection,cutoff))
+    save_snapshot(engine,'c'*64,inputs)
+    from server.common.formal_analysis_store import FormalAnalysisStore
+    store=FormalAnalysisStore(engine)
+    header=store.get('c'*64,'native_fact_snapshot','complete')
+    assert len(header['chunks'])==14
+    with pytest.raises(ValueError,match='artifact read count limit'):
+        store.load_artifacts(list(header['chunks'].values()))
+    restored=load_snapshot(engine,'c'*64)
+    assert len(restored.finance.members)==len(restored.events.selection.members)==5600
+    assert restored.finance.members==inputs.finance.members
+    assert restored.events.selection.members[codes[-1]][0]['coverage_id']==pit.canonical_hash(codes[-1])
+
+
 def test_verified_finance_and_event_inputs_are_reused_by_feature_readers(monkeypatch):
     engine=_engine();catalog=_install_catalog(engine,_catalog(('000001','000001.SZ'),('000002','000002.SZ')))
     for code in catalog.codes:

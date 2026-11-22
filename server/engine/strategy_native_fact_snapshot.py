@@ -7,6 +7,9 @@ from server.common import pit_facts as pit
 from server.common.formal_analysis_store import FormalAnalysisStore
 from server.common.qmt_announcement_pit import HistoricalAnnouncementSelection, _assert_pit_fact_schema_prepared
 
+# Identity of the original v1 wire format; transport batching does not change it.
+WIRE_FORMAT_ID = 'ec5cda3eba9614e7959dec4033673eb6b3a5b661c2f28827869f06873be3f7ab'
+
 
 def snapshot_identity(*, day, decision, identity_hash, finance_seal, codes):
     from server.common import historical_announcement_read, pit_sealed_finance_read
@@ -14,7 +17,7 @@ def snapshot_identity(*, day, decision, identity_hash, finance_seal, codes):
         'decision':str(decision), 'identity':identity_hash, 'finance_seal':finance_seal,
         'codes':sorted(codes), 'readers':{Path(m.__file__).name:hashlib.sha256(Path(m.__file__).read_bytes()).hexdigest()
             for m in (pit,historical_announcement_read,pit_sealed_finance_read)},
-        'codec':hashlib.sha256(Path(__file__).read_bytes()).hexdigest()})
+        'codec':WIRE_FORMAT_ID})
 
 
 def save_snapshot(engine, generation, inputs):
@@ -51,7 +54,10 @@ def load_snapshot(engine, generation):
     if header is None:return None
     _assert_pit_fact_schema_prepared(engine)
     if not 1<=len(header['chunks'])<=25:raise ValueError('native fact snapshot chunk count differs')
-    artifacts=store.load_artifacts(list(header['chunks'].values()))
+    identities=list(header['chunks'].values())
+    artifacts={}
+    for offset in range(0,len(identities),8):
+        artifacts.update(store.load_artifacts(identities[offset:offset+8]))
     finance,events={},{}
     for key in sorted(header['chunks'],key=int):
         part=artifacts[header['chunks'][key]]
