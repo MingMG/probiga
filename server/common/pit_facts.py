@@ -4147,19 +4147,23 @@ def _select_finance_atomic_batch_members(
     as_of_date: date,
     incremental_discovery: Mapping[str, Any] | None = None,
     catalog_binding: Mapping[str, Any] | None = None,
+    sealed_members: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], datetime]:
     """Select one strict finance disposition per catalog member.
 
     Each immutable coverage already contains a complete provider snapshot.
-    Load the latest visible record per source scope and its predecessor anchor,
-    in bounded code chunks inside one repeatable-read snapshot. Historical
-    payload replay belongs to the full audit reader, not daily batch assembly.
+    Sealing selects visible heads; reading verifies the exact frozen members.
+    Both validate source contents and predecessor anchors in bounded chunks.
     """
 
     gate = finance_disclosure_gate(as_of_date)
     selected: list[dict[str, Any]] = []
     source_cutoff: datetime | None = None
     batch_size = max(1, int(FINANCE_ATOMIC_BATCH_QUERY_CODE_LIMIT))
+    if sealed_members is not None:
+        ids = [str(sealed_members[code].get("coverage_id") or "") for code in codes]
+        if len(set(ids)) != len(codes) or any(not _HASH_RE.fullmatch(value) for value in ids):
+            raise ValueError("finance sealed source member identities differ")
     with engine.connect() as connection:
         dialect = str(
             getattr(getattr(connection, "dialect", None), "name", "") or ""
@@ -4171,28 +4175,41 @@ def _select_finance_atomic_batch_members(
                 raise ValueError(
                     "finance atomic batch requires a repeatable-read snapshot"
                 )
+        head_join = (
+            f"JOIN (SELECT scope_hash,MAX(revision_no) AS revision_no FROM {SOURCE_COVERAGE_TABLE} "
+            "WHERE fact_kind='finance' AND stock_code IN :codes "
+            "AND known_at<=:completed_known_at AND received_at<=:completed_known_at "
+            "GROUP BY scope_hash) AS heads "
+            "ON selected.scope_hash=heads.scope_hash AND selected.revision_no=heads.revision_no "
+        ) if sealed_members is None else ""
+        bound_scope = (
+            "WHERE selected.coverage_id IN :coverage_ids AND selected.fact_kind='finance' "
+            "AND selected.stock_code IN :codes AND selected.known_at<=:completed_known_at "
+            "AND selected.received_at<=:completed_known_at "
+        ) if sealed_members is not None else ""
         statement = text(
             f"SELECT {_coverage_payload_columns(mysql, table_alias='selected')},"
             "parent.coverage_id AS _parent_id,parent.scope_hash AS _parent_scope,"
             "parent.revision_no AS _parent_revision,parent.known_at AS _parent_known,"
             "parent.received_at AS _parent_received,parent.covered_through_at AS _parent_covered,"
             "parent.coverage_status AS _parent_status,parent.coverage_fingerprint_hash AS _parent_fingerprint "
-            f"FROM {SOURCE_COVERAGE_TABLE} AS selected JOIN ("
-            f"SELECT scope_hash,MAX(revision_no) AS revision_no FROM {SOURCE_COVERAGE_TABLE} "
-            "WHERE fact_kind='finance' AND stock_code IN :codes "
-            "AND known_at<=:completed_known_at AND received_at<=:completed_known_at "
-            "GROUP BY scope_hash) AS heads "
-            "ON selected.scope_hash=heads.scope_hash AND selected.revision_no=heads.revision_no "
+            f"FROM {SOURCE_COVERAGE_TABLE} AS selected {head_join}"
             f"LEFT JOIN {SOURCE_COVERAGE_TABLE} AS parent ON parent.coverage_id=selected.supersedes_coverage_id "
+            f"{bound_scope}"
             "ORDER BY selected.stock_code,selected.scope_hash"
         ).bindparams(bindparam("codes", expanding=True))
+        if sealed_members is not None:
+            statement = statement.bindparams(bindparam("coverage_ids", expanding=True))
         with connection.begin():
             for offset in range(0, len(codes), batch_size):
                 code_batch = codes[offset : offset + batch_size]
+                parameters = {"codes": code_batch, "completed_known_at": completed_known_at}
+                if sealed_members is not None:
+                    parameters["coverage_ids"] = [sealed_members[code]["coverage_id"] for code in code_batch]
                 raw_rows, predecessors = [], {}
                 for raw in connection.execute(
                     statement,
-                    {"codes": code_batch, "completed_known_at": completed_known_at},
+                    parameters,
                 ).mappings():
                     row = _coverage_payload_row(raw, mysql=mysql)
                     parent = {key: row.pop("_parent_" + key) for key in (
@@ -5538,6 +5555,7 @@ def load_finance_atomic_batch_seal(
                 as_of_date=sealed_as_of,
                 incremental_discovery=incremental_discovery,
                 catalog_binding=catalog_binding,
+                sealed_members={code: member_map[code] for code in source_validation_codes},
             )
         selected_map = {
             str(item.get("stock_code") or "").zfill(6): item
