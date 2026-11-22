@@ -1,4 +1,5 @@
 from datetime import timedelta
+import pytest
 
 from server.engine import strategy_native_backtest as native
 from server.common.formal_analysis_store import FormalAnalysisStore
@@ -33,7 +34,13 @@ def test_runtime_repair_keeps_same_input_clock_archives_and_total_deadline(ledge
         assert fresh['fact_read_checkpoint']=={}
 
 
-def test_step_deadline_resumes_only_after_new_durable_finance_progress(ledger,monkeypatch):
+@pytest.mark.parametrize('field,dataset,prior,later_calculation',[
+    ('fact_read_checkpoint','finance',{},False),
+    ('event_read_checkpoint','event_facts',{},False),
+    ('event_read_checkpoint','event_facts',{},True),
+    ('event_read_checkpoint','event_facts',{'trade_date':'2026-09-07','scope':'c'*64,'completed':100},False),
+])
+def test_step_deadline_resumes_only_after_new_durable_source_progress(ledger,monkeypatch,field,dataset,prior,later_calculation):
     privileged_migrate_formal_analysis_schema(ledger)
     with ledger.connect() as c:
         c.connection.driver_connection.create_function('GET_LOCK',2,lambda *_:1)
@@ -44,6 +51,7 @@ def test_step_deadline_resumes_only_after_new_durable_finance_progress(ledger,mo
             'sessions':['2026-09-07'],'current_unit':'historical selection 2026-09-07',
             'deadline_at':str(native.now_shanghai()+timedelta(hours=24)),
             'proposals':[{'validation':{'status':'RUNNING'}}]}
+        state[field]=prior
         native._save(c,state,owner)
     monkeypatch.setattr(native,'_contract',lambda:'code')
     monkeypatch.setattr(native.signal,'SIGALRM',14,raising=False)
@@ -52,18 +60,21 @@ def test_step_deadline_resumes_only_after_new_durable_finance_progress(ledger,mo
     monkeypatch.setattr(native.signal,'setitimer',lambda *_:None,raising=False)
     def partial(c,state,owner):
         store=FormalAnalysisStore(ledger)
-        store.put('b'*64,'finance_issuer_facts','verified-chunk',{'codes':['000001'],'status':'VERIFIED_TEST_METADATA'})
-        state['fact_read_checkpoint']={'trade_date':'2026-09-07','dataset':'finance',
+        store.put('b'*64,dataset+'_issuer_facts','verified-chunk',{'codes':['000001'],'status':'VERIFIED_TEST_METADATA'})
+        state[field]={'trade_date':'2026-09-07','dataset':dataset,'scope':'b'*64,
             'completed':1,'total':2,'last_progress_at':str(native.now_shanghai())}
         native._save(c,state,owner)
+        if later_calculation:
+            after_source=native.now_shanghai()+timedelta(minutes=3)
+            monkeypatch.setattr(native,'now_shanghai',lambda:after_source)
         raise native.NativeStepDeadline('controlled business step deadline')
     monkeypatch.setattr(native,'_step',partial)
     result=native.native_tick(ledger)
     assert result['status']=='NOT_STARTED'
     with ledger.connect() as c:
         saved=native.read_runs(c)[0]
-    assert saved['step_status']=='COMPLETE' and saved['fact_read_checkpoint']['completed']==1
-    assert FormalAnalysisStore(ledger).get('b'*64,'finance_issuer_facts','verified-chunk')['codes']==['000001']
+    assert saved['step_status']=='COMPLETE' and saved[field]['completed']==1
+    assert FormalAnalysisStore(ledger).get('b'*64,dataset+'_issuer_facts','verified-chunk')['codes']==['000001']
     later=native.now_shanghai()+timedelta(minutes=2)
     monkeypatch.setattr(native,'now_shanghai',lambda:later)
     stopped=native.native_tick(ledger)

@@ -49,8 +49,8 @@ def read_runs(connection, run_id=None):
 def _contract():
     from server.trading_v3 import daily_features,sleeves,engine,regime,config
     from server.engine import strategy_native_replay,shadow_trial_policy,strategy_native_fact_snapshot
-    from server.common import historical_announcement_read
-    paths=[Path(__file__),*(Path(m.__file__) for m in (daily_features,sleeves,engine,regime,strategy_native_replay,shadow_trial_policy,historical_announcement_read,strategy_native_fact_snapshot))]
+    from server.common import historical_announcement_read,pit_sealed_event_read
+    paths=[Path(__file__),*(Path(m.__file__) for m in (daily_features,sleeves,engine,regime,strategy_native_replay,shadow_trial_policy,historical_announcement_read,strategy_native_fact_snapshot,pit_sealed_event_read))]
     root=Path(__file__).resolve().parents[2]
     paths.extend(root/p for p in ('server/engine/strategy_shadow_trials.py','server/engine/strategy_center.py',
         'server/common/pit_facts.py','server/common/versioned_strategy_config.py',
@@ -185,6 +185,9 @@ def _v3_day(c,state,day,owner):
                 prior=state.get('fact_read_checkpoint') or {}
                 if prior.get('trade_date')!=day or done>prior.get('completed',0):
                     state['fact_read_checkpoint']=dict(state['source_progress'])
+            label='财务核对' if kind=='finance' else '公告批次核对'
+            for proposal in state['proposals']:
+                proposal['validation'].update(status='RUNNING',reason=f'{label} {day}：已处理 {done}/{total} 只')
             state['last_progress_at']=str(now_shanghai());_save(c,state,owner);progress_at=time.monotonic()
     if fact_inputs is None:
         cutoff=resolve_common_fact_cutoff(c.engine,codes=eligible,decision_at=known,finance_start_date='1900-01-01',
@@ -214,6 +217,19 @@ def _v3_day(c,state,day,owner):
     financial=load_sealed_finance_facts(c.engine,selection=finances[0],codes=eligible,decision_at=known,
         fact_cutoff_at=fact_clock,as_of_date=target,formal_store=FormalAnalysisStore(c.engine),
         formal_generation_sha256=generation,read_progress=lambda done,total:progress(done,total,'finance'))
+    from server.common.pit_sealed_event_read import load_sealed_event_facts
+    def event_progress(done,total,scope,fresh):
+        nonlocal progress_at
+        if fresh or time.monotonic()-progress_at>=5 or done==total:
+            observation={'trade_date':day,'dataset':'event_facts','completed':done,'total':total,
+                'scope':scope,'last_progress_at':str(now_shanghai())}
+            state['source_progress']=observation
+            if fresh:state['event_read_checkpoint']=dict(observation)
+            for proposal in state['proposals']:
+                proposal['validation'].update(status='RUNNING',reason=f'公告事实核对 {day}：已处理 {done}/{total} 只')
+            state['last_progress_at']=str(now_shanghai());_save(c,state,owner);progress_at=time.monotonic()
+    event_facts=load_sealed_event_facts(c.engine,selection=events[0],codes=eligible,
+        formal_store=FormalAnalysisStore(c.engine),read_progress=event_progress)
     days=sorted(str(d)[:10] for d in c.execute(text('SELECT DISTINCT trade_date FROM si_trade_calendar WHERE trade_status=1 AND trade_date<=:d ORDER BY trade_date DESC LIMIT :n'),{'d':day,'n':V3_DAILY_INPUT_SESSIONS}).scalars())
     inputs=_ensure_inputs(c,state,days,owner)
     raw=_read_bars(c,days,inputs,state['price_cutoff'])
@@ -224,7 +240,7 @@ def _v3_day(c,state,day,owner):
     frame=normalize_daily_bars(frame)
     dataset=build_daily_feature_universe(c.engine,as_of=target,dates=[date.fromisoformat(d) for d in days],frame=frame,
         context_cutoff_at=known,limit=len(eligible),allow_research_industry_last_known=False,entry_scope_codes=eligible,
-        fact_inputs=DailyFactInputs(cutoff,finances[0],events[0],financial))
+        fact_inputs=DailyFactInputs(cutoff,finances[0],events[0],financial,event_facts))
     _assert_read_succeeded(str(dataset['market_features'].get('pit_common_cutoff_reason') or ''))
     for stock in dataset['stocks']:
         _assert_read_succeeded(str(stock.get('finance_pit_reason') or '')+';'+str(stock.get('event_pit_reason') or ''))
@@ -320,7 +336,8 @@ def _start(c,strategies,days,published,source_hash,contract):
         'contract':contract,'source_hash':source_hash,'rule_hash':canonical_sha256(versions),'phase':'INPUTS','status':'NOT_STARTED',
         'cursor':0,'completed_units':0,'total_units':(len(warmup)+len(days))*2+len(days)+len(strategies),
         'last_progress_at':clock,'reason':'','proposals':[],
-        'fact_read_checkpoint':dict(frozen.get('fact_read_checkpoint') or {}) if frozen else {}}
+        'fact_read_checkpoint':dict(frozen.get('fact_read_checkpoint') or {}) if frozen else {},
+        'event_read_checkpoint':dict(frozen.get('event_read_checkpoint') or {}) if frozen else {}}
     inputs=_input_parts(c,state)
     present={d for p in inputs.values() for d in p['sessions']}
     state['completed_units']=sum(d in present for d in state['input_sessions'])
@@ -395,7 +412,7 @@ def _step(c,state,owner):
 def native_tick(engine):
     """One bounded step on the existing Linux worker, fenced by its renewable lease."""
     from server.common.authoritative_market_clock import authoritative_closed_trade_date
-    state=None;checkpoint_before={}
+    state=None;checkpoint_before={};event_before={}
     with engine.connect() as c:
         if c.execute(text('SELECT GET_LOCK(:name,0)'),{'name':LOCK}).scalar()!=1:return {'status':'RUNNING','reason':'已有原生回测持有互斥锁'}
         previous_handler=None
@@ -441,6 +458,7 @@ def native_tick(engine):
                 return {'status':'BLOCKED','run_id':state['run_id'],'reason':state['reason'],'retry_after':state['retry_after']}
             if str(now_shanghai())>state['deadline_at']:raise TimeoutError('原生回测超过24小时总时限')
             checkpoint_before=dict(state.get('fact_read_checkpoint') or {})
+            event_before=dict(state.get('event_read_checkpoint') or {})
             def timeout(_signum,_frame):raise NativeStepDeadline('原生回测单步超过600秒')
             previous_handler=signal.signal(signal.SIGALRM,timeout);signal.setitimer(signal.ITIMER_REAL,600)
             _step(c,state,owner)
@@ -453,10 +471,15 @@ def native_tick(engine):
                 state.update(status='FAILED',step_status='FAILED',reason=f"{state.get('current_unit',state['phase'])}: {type(ex).__name__}: {ex}")
                 saved=state.get('fact_read_checkpoint') or {}
                 earlier=checkpoint_before.get('completed',0) if checkpoint_before.get('trade_date')==saved.get('trade_date') else 0
-                if (isinstance(ex,NativeStepDeadline) and saved.get('completed',0)>earlier
-                        and (now_shanghai()-datetime.fromisoformat(saved['last_progress_at'])).total_seconds()<=120):
+                event_saved=state.get('event_read_checkpoint') or {}
+                event_earlier=event_before.get('completed',0) if (event_before.get('trade_date'),event_before.get('scope'))==(event_saved.get('trade_date'),event_saved.get('scope')) else 0
+                finance_advanced=(saved.get('completed',0)>earlier
+                    and (now_shanghai()-datetime.fromisoformat(saved['last_progress_at'])).total_seconds()<=120)
+                # New event chunks remain usable when later feature calculation exhausts the step.
+                event_advanced=event_saved.get('completed',0)>event_earlier
+                if isinstance(ex,NativeStepDeadline) and (finance_advanced or event_advanced):
                     state.update(status='NOT_STARTED',step_status='COMPLETE',
-                        reason='财务事实分块断点已保存；下一步继续',retry_after=str(now_shanghai()+timedelta(minutes=1)))
+                        reason='来源事实分块断点已保存；下一步继续',retry_after=str(now_shanghai()+timedelta(minutes=1)))
                 original=getattr(ex,'orig',ex);args=getattr(original,'args',())
                 transient=(args and args[0] in (1205,1213,2003,2006,2013,3024)) or any(t in str(ex) for t in ('errno=2013','errno=1205','errno=2006'))
                 if transient and state.get('retry_count',0)<1:

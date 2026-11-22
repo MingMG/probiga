@@ -132,6 +132,7 @@ Use precise states: `NOT_STARTED`, `RUNNING`, `BLOCKED`, `FAILED`, and `COMPLETE
 5. Mocked or source-text tests are not sufficient for external UI control. Before
    declaring the fix complete, run one controlled live acceptance test with exact
    before/after evidence and rollback safety.
+6. 重回测和 `trading_v2_job_worker` 必须由现有独立调度器执行；手动操作只登记既有业务队列或断点恢复请求，不能通过通用任务立即运行 API 直接启动 Worker。2026-11-22 已实测该入口使重任务继承 `probiga.service` 的 900 MiB 内存软限，造成持续内存限速、行情排序超时和网页无响应；独立调度器已有 1792 MiB 软预算。验收须核对任务进程实际属于 `probiga-scheduler.service`、任务租约及业务断点，并验证网页仍响应；没有新的现场证据不得重新使用被否定的启动路径。
 
 # Release and architecture decoupling
 
