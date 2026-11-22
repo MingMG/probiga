@@ -213,10 +213,13 @@
             if(series){const hidden=new Set(s.chartHidden);if(e.target.checked)hidden.delete(series);else hidden.add(series);s.chartHidden=Array.from(hidden);paint(s);return;}
             const field=e.target.dataset.qswControl;if(field&&s.data){s[field]=e.target.value;paint(s);}
         };
-        mount.onpointerover=mount.onfocusin=e=>{
+        const showWinPoint=e=>{
             const point=e.target.closest('[data-qsw-point]'),readout=mount.querySelector('.qsw-win-readout');
             if(point&&readout)readout.textContent=point.getAttribute('aria-label');
         };
+        mount.onpointerover=showWinPoint;
+        if(mount._qswPointFocus)mount.removeEventListener('focusin',mount._qswPointFocus);
+        mount._qswPointFocus=showWinPoint;mount.addEventListener('focusin',showWinPoint);
         refresh();
         refreshPerformance();
     }

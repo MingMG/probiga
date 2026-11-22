@@ -6199,6 +6199,7 @@ def resolve_common_fact_cutoff(
     event_checkpoint_path: Path | None = None,
     event_progress: Callable[[int, int], None] | None = None,
     event_trade_date: date | str | None = None,
+    finance_observation_at: datetime | str | None = None,
     required_premarket_announcement: FrozenPremarketAnnouncement | None = None,
     required_initial_announcement: FrozenInitialAnnouncement | None = None,
     _dataset_cutoffs: bool = False,
@@ -6209,6 +6210,9 @@ def resolve_common_fact_cutoff(
         {str(code).strip().zfill(6) for code in codes if str(code).strip()}
     )
     decision = normalize_decision_at(decision_at)
+    finance_observation = normalize_decision_at(finance_observation_at) if finance_observation_at is not None else decision
+    if finance_observation > decision:
+        raise ValueError("finance observation cannot postdate the research decision")
     windows = {
         "finance": (
             _date_value(finance_start_date, required=True),
@@ -6246,7 +6250,7 @@ def resolve_common_fact_cutoff(
         finance_batch = load_finance_atomic_batch_seal(
             engine,
             codes=normalized_codes,
-            decision_at=decision,
+            decision_at=finance_observation,
             as_of_date=windows["finance"][1],
         )
     except Exception as exc:
@@ -6263,6 +6267,8 @@ def resolve_common_fact_cutoff(
             "reason": "PIT_FINANCE_ATOMIC_BATCH_INVALID:"
             f"{diagnostic}",
         }
+    if finance_observation_at is not None and not finance_batch:
+        return {**blocked, "reason":"PIT_HISTORICAL_FINANCE_BATCH_NOT_FOUND"}
     event_batch: dict[str, Any] = {}
     historical_selections: list[HistoricalAnnouncementSelection] = []
     reusable_live_batch: list[bool] = []
@@ -6314,6 +6320,19 @@ def resolve_common_fact_cutoff(
                 **blocked,
                 "reason": _announcement_batch_read_reason(exc),
             }
+    if finance_observation_at is not None and event_batch:
+        event_frontier = normalize_decision_at(event_batch["fact_cutoff_at"])
+        finance_observation = min(finance_observation, event_frontier)
+        if normalize_decision_at(finance_batch["completed_known_at"]) > finance_observation:
+            try:
+                finance_batch = load_finance_atomic_batch_seal(
+                    engine, codes=normalized_codes, decision_at=finance_observation,
+                    as_of_date=windows["finance"][1],
+                )
+            except Exception as exc:
+                return {**blocked,"reason":"PIT_FINANCE_ATOMIC_BATCH_INVALID:"+type(exc).__name__}
+            if not finance_batch:
+                return {**blocked,"reason":"PIT_HISTORICAL_FINANCE_BATCH_NOT_FOUND"}
     historical_selection = next(iter(historical_selections), None)
     exact_event_selection = signed_selection or historical_selection
     signed_live_selection = signed_selection if isinstance(signed_selection, _SignedLiveEventSelection) else None
@@ -6697,6 +6716,8 @@ def resolve_common_fact_cutoff(
     }
     if _dataset_cutoffs:
         result["source_cutoff_at"] = root_payload["source_cutoff_at"]
+    if finance_observation_at is not None:
+        result["finance_observation_at"] = _dt_text(finance_observation)
     if event_batch:
         result["qmt_event_batch"] = event_batch
     if finance_batch:

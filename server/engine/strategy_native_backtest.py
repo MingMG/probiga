@@ -158,9 +158,14 @@ def _v3_day(c,state,day,owner):
         return {'status':'BLOCKED','reason':'缺少精确日期证券身份和行业快照','identity':identity_proof,'signals':{}}
     known=datetime.fromisoformat(state['requested_at'])
     target=date.fromisoformat(day)
-    if canonical_sha256(state['finance_scope_codes'])!=state['finance_scope_sha256']:
-        raise ValueError('历史财务证券范围哈希不一致')
-    eligible=set(identity)&set(state['finance_scope_codes'])
+    from server.common.pit_facts import load_latest_finance_atomic_batch_baseline
+    finance_observation=min(known,datetime.combine(target,datetime.max.time()))
+    baseline=load_latest_finance_atomic_batch_baseline(c.engine,decision_at=finance_observation)
+    if baseline.get('as_of_date')!=day:
+        return {'status':'BLOCKED','reason':'PIT_HISTORICAL_FINANCE_BATCH_NOT_FOUND',
+            'identity':identity_proof,'finance_observation_at':str(finance_observation),
+            'latest_finance_date':baseline.get('as_of_date'),'signals':{}}
+    eligible=(set(identity)&set(baseline.get('members',{})))-set(baseline.get('data_excluded_codes',[]))
     excluded=sorted(set(identity)-eligible)
     if not eligible:
         return {'status':'BLOCKED','reason':'历史证券集合没有可验证的财务封存覆盖','identity':identity_proof,'signals':{}}
@@ -176,6 +181,7 @@ def _v3_day(c,state,day,owner):
     cutoff=resolve_common_fact_cutoff(c.engine,codes=eligible,decision_at=known,finance_start_date='1900-01-01',
         finance_end_date=day,event_start_date=target-timedelta(days=20),event_end_date=day,require_qmt_event_batch=True,
         event_trade_date=day,capture_finance_selection=finances.append,capture_historical_selection=events.append,
+        finance_observation_at=finance_observation,
         event_checkpoint_path=Path.home()/'.local/state/probiga/native-event-prefix/coverage.sqlite',event_progress=progress)
     if cutoff['status']!=PIT_AVAILABLE:
         reason=cutoff['reason']
@@ -277,22 +283,14 @@ def _start(c,strategies,days,published,source_hash,contract):
     prior=next((r.get('price_backtest') for r in _read_states(c) if (r.get('price_backtest') or {}).get('sessions')==days),None)
     warmup=sorted(str(d)[:10] for d in c.execute(text('SELECT DISTINCT trade_date FROM si_trade_calendar WHERE trade_status=1 AND trade_date<:d ORDER BY trade_date DESC LIMIT 20'),{'d':days[0]}).scalars())
     requested=str(now_shanghai());versions=[(s['strategy_key'],s['current_version'],s['version_hash']) for s in strategies]
-    finance_scope={}
-    if strategies[0]['source_kind']=='immutable_v3_sleeve':
-        from server.common.pit_facts import load_latest_finance_atomic_batch_baseline
-        baseline=load_latest_finance_atomic_batch_baseline(c.engine,decision_at=requested)
-        codes=sorted(baseline.get('members',{}))
-        finance_scope={'finance_scope_codes':codes,'finance_scope_sha256':canonical_sha256(codes),
-            'finance_seal_id':baseline.get('seal_coverage_id','')}
-    uid=canonical_sha256({'versions':versions,'days':days,'source_hash':source_hash,'contract':contract,
-        'finance_seal_id':finance_scope.get('finance_seal_id')})
+    uid=canonical_sha256({'versions':versions,'days':days,'source_hash':source_hash,'contract':contract})
     state={'schema':SCHEMA,'run_id':uid,'trade_date':days[-1],'strategies':strategies,'published':published,
         'sessions':days,'input_sessions':warmup+days,'price_cutoff':prior['knowledge_cutoff'] if prior else requested,
         'requested_at':requested,'deadline_at':str(now_shanghai()+timedelta(hours=24)),
         'input_archives':list(prior.get('input_archives',[]))+[{'run_id':prior['run_id'],'rule_hash':prior['rule_hash']}] if prior else [],
         'contract':contract,'source_hash':source_hash,'rule_hash':canonical_sha256(versions),'phase':'INPUTS','status':'NOT_STARTED',
         'cursor':0,'completed_units':0,'total_units':(len(warmup)+len(days))*2+len(days)+len(strategies),
-        'last_progress_at':requested,'reason':'','proposals':[],**finance_scope}
+        'last_progress_at':requested,'reason':'','proposals':[]}
     inputs=_input_parts(c,state)
     present={d for p in inputs.values() for d in p['sessions']}
     state['completed_units']=sum(d in present for d in state['input_sessions'])
