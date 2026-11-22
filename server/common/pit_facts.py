@@ -6488,10 +6488,16 @@ def resolve_common_fact_cutoff(
                         }
                         stage = f"common-cutoff-coverage:{offset}"
                         if checkpoint is not None:
+                            prior_revisions = checkpoint.committed_revisions
                             verified, invalid = _read_verified_event_coverage_chunk(
                                 connection, codes=parameters["codes"], source=parameters["event_source"],
                                 decision_at=decision, deadline=deadline, stage=stage, checkpoint=checkpoint,
                             )
+                            if event_coverage_progress is not None:
+                                event_coverage_progress(
+                                    offset + len(parameters["codes"]), len(normalized_codes), checkpoint.namespace,
+                                    checkpoint.committed_revisions > prior_revisions,
+                                )
                             bad.update(("event", code) for code in invalid)
                             for scope, chain in verified.items():
                                 yield ("event", chain[0]["stock_code"], scope), chain, False, True
