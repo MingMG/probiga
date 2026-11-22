@@ -2095,6 +2095,50 @@ def test_historical_reconstruction_uses_target_cutoff_and_actual_known_time(
     assert len(parsed_batches) == len(catalog.codes)
     assert progress[-1] == (2,2)
     assert len(selected) == 1 and all(not head for _,head in selected[0].members.values())
+
+    # A deadline after a verified block must not re-read that block on resume.
+    from server.common.formal_analysis_store import FormalAnalysisStore
+    from server.db.formal_analysis_schema import privileged_migrate_formal_analysis_schema
+    privileged_migrate_formal_analysis_schema(engine)
+    store = FormalAnalysisStore(engine)
+    class CoverageDeadline(BaseException):
+        pass
+    durable = []
+    def interrupt_after_commit(done, total, scope, fresh):
+        if fresh:
+            durable.append((done,total,scope))
+            raise CoverageDeadline()
+    options = dict(codes=catalog.codes, decision_at=live_received + timedelta(seconds=1),
+        window_start=target-timedelta(days=30), window_end=target, expected_trade_date=target,
+        coverage_store=store)
+    with monkeypatch.context() as checkpointed:
+        import server.common.qmt_announcement_pit as announcement_module
+        checkpointed.setattr(announcement_module,'VALIDATION_INVENTORY_CODE_LIMIT',1)
+        with pytest.raises(CoverageDeadline):
+            validate_dated_announcement_batch(engine,**options,coverage_progress=interrupt_after_commit)
+        assert durable[0][:2] == (1,2)
+        assert len(store.list_members(durable[0][2],'historical_event_coverage')) == 1
+        original_read = announcement_module._read_live_announcement_payload_rows
+        read_blocks = []
+        def record_read(*args,**kwargs):
+            if kwargs['stage'].startswith('signed-historical-payload:'):
+                read_blocks.append(kwargs['coverage_ids'])
+            return original_read(*args,**kwargs)
+        checkpointed.setattr(announcement_module,'_read_live_announcement_payload_rows',record_read)
+        resumed = []
+        reused_blocks = []
+        actual = validate_dated_announcement_batch(engine,**options,
+            capture_historical_selection=resumed.append,
+            coverage_progress=lambda *values:reused_blocks.append(values))
+        assert actual == fast
+        assert len(read_blocks) == 1
+        assert [values[3] for values in reused_blocks] == [False,True]
+        for code in catalog.codes:
+            assert pit_facts._json_safe(resumed[0].members[code]) == pit_facts._json_safe(selected[0].members[code])
+        read_blocks.clear()
+        assert validate_dated_announcement_batch(engine,**options) == fast
+        assert not read_blocks
+
     with engine.begin() as connection:
         connection.execute(text("DROP TRIGGER trg_pit_source_coverage_immutable_bu"))
         connection.execute(text("UPDATE st_pit_source_coverage SET coverage_fingerprint_hash=:hash WHERE batch_id=:batch"),

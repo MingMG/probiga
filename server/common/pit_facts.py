@@ -5924,6 +5924,7 @@ def _bind_historical_event_snapshot(
     window_start: date, window_end: date,
     event_progress: Callable[[int, int], None] | None = None, binding_units: int = 0,
     deadline: float | None = None,
+    coverage_store=None, coverage_progress=None,
 ) -> HistoricalAnnouncementSelection:
     from server.common.pit_source_coverage_index import PIT_SOURCE_COVERAGE_BATCH_INDEX_NAME
     from server.common.qmt_announcement_pit import (
@@ -5990,6 +5991,12 @@ def _bind_historical_event_snapshot(
         raise ValueError("historical announcement security master timing differs")
     requested_start = _qmt_time(datetime.combine(start, datetime.min.time()))
     requested_end = _qmt_time(cutoff)
+    coverage_generation = canonical_hash({
+        'schema': 'probiga.historical-event-coverage-blocks.v1',
+        'receipt': receipt, 'decision': decision, 'frontier': frontier,
+        'window_start': window_start, 'window_end': window_end,
+        'reader_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+    }) if coverage_store is not None else None
     with engine.connect() as connection:
         mysql = connection.dialect.name == "mysql"
         with _live_announcement_reply_budget(connection, deadline=deadline, stage="signed-historical-isolation"):
@@ -6049,6 +6056,30 @@ def _bind_historical_event_snapshot(
             event_progress(0, total)
         for offset in range(0, len(inventory), VALIDATION_INVENTORY_CODE_LIMIT):
             stock_batch = dict(inventory[offset:offset + VALIDATION_INVENTORY_CODE_LIMIT])
+            key = canonical_hash(stock_batch)
+            retained = coverage_store.get(coverage_generation, 'historical_event_coverage', key) if coverage_store is not None else None
+            if retained is not None:
+                if ({row['stock_code']: row['coverage_id'] for row, _ in retained['members']} != stock_batch
+                        or {entry['stock_code'] for entry in retained['entries']} != stock_batch.keys()
+                        or len(retained['entries']) != len(stock_batch)
+                        or len(retained['members']) != len(stock_batch)
+                        or any(type(head) is not bool or row['source'] != source or row['batch_id'] != batch_id
+                            or _row_datetime(row['known_at']) != received or _row_datetime(row['received_at']) != received
+                            for row, head in retained['members'])):
+                    raise ValueError('historical announcement checkpoint membership differs')
+                entries.extend(retained['entries'])
+                incremental_hashes.update(retained['incremental_hashes'])
+                for raw, head in retained['members']:
+                    row = dict(raw)
+                    if row['stock_code'] in requested:
+                        members[row['stock_code']] = (MappingProxyType(row), head)
+                if coverage_progress is not None:
+                    coverage_progress(len(entries), total, coverage_generation, False)
+                if event_progress is not None: event_progress(len(entries), total)
+                continue
+            block_members = []
+            block_start = len(entries)
+            block_incremental_hashes = set()
             links = _read_signed_historical_coverage_links(
                 connection, exact_ids=stock_batch, received=received, deadline=deadline, offset=offset,
                 head_frontier=frontier,
@@ -6115,12 +6146,22 @@ def _bind_historical_event_snapshot(
                     ):
                         raise ValueError("historical announcement durable member differs")
                     incremental_hashes.add(incremental["chain_root_hash"])
+                    block_incremental_hashes.add(incremental["chain_root_hash"])
+                    block_members.append((dict(row), head))
                     entries.append({"stock_code": code, "source_response_hash": row["source_response_hash"],
                                     "result_count": count, "provider_receipt_hash": evidence["provider_receipt_hash"]})
                     if code in requested:
                         members[code] = (MappingProxyType(row), head)
                 if event_progress is not None:
                     event_progress(len(entries), total)
+
+            if coverage_store is not None:
+                coverage_store.put(coverage_generation, 'historical_event_coverage', key, _json_safe({
+                    'members': block_members, 'entries': entries[block_start:],
+                    'incremental_hashes': sorted(block_incremental_hashes),
+                }))
+                if coverage_progress is not None:
+                    coverage_progress(len(entries), total, coverage_generation, True)
 
     _live_announcement_read_hint(mysql=False, deadline=deadline, stage="batch-verified")
     if (
@@ -6206,6 +6247,7 @@ def resolve_common_fact_cutoff(
     event_checkpoint_path: Path | None = None,
     event_progress: Callable[[int, int], None] | None = None,
     event_trade_date: date | str | None = None,
+    event_coverage_store=None, event_coverage_progress=None,
     finance_observation_at: datetime | str | None = None,
     required_premarket_announcement: FrozenPremarketAnnouncement | None = None,
     required_initial_announcement: FrozenInitialAnnouncement | None = None,
@@ -6314,7 +6356,8 @@ def resolve_common_fact_cutoff(
                 decision_at=decision,
                 window_start=windows["event"][0],
                 window_end=windows["event"][1],
-                **({'expected_trade_date':event_trade_date, 'event_progress':event_progress} if event_trade_date is not None else {}),
+                **({'expected_trade_date':event_trade_date, 'event_progress':event_progress,
+                    'coverage_store':event_coverage_store, 'coverage_progress':event_coverage_progress} if event_trade_date is not None else {}),
                 capture_historical_selection=(
                     historical_selections.append if capture_historical_selection else None
                 ),
