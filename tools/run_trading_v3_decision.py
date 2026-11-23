@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import signal
 import json
 import sys
 from datetime import date, datetime, time
@@ -17,6 +19,7 @@ from server.trading_v3.decision_worker import (
     run_daily_decision_v3,
     run_retrospective_research_v3,
 )
+from server.trading_v3.premarket_deadline import CUTOFF, SCHEMA
 from tools.env_config import create_tool_engine, load_project_env
 
 
@@ -80,6 +83,47 @@ def resolve_decision_at(
     }
     return datetime.combine(as_of, decision_times[mode])
 
+
+
+class PremarketDeadline(BaseException):
+    """A missed live cutoff must bypass provider retry wrappers."""
+
+
+def live_premarket_cutoff(*, mode, as_of, now, replay_only=False):
+    current = _shanghai_naive(now)
+    if mode == "premarket" and as_of == current.date() and not replay_only:
+        return datetime.combine(as_of, CUTOFF)
+    return None
+
+
+def missed_premarket_result(*, as_of, decision_at, cutoff):
+    return {"schema": SCHEMA, "status": "blocked",
+        "retryable": False, "run_status": "BLOCKED", "actionable_status": "UNAVAILABLE",
+        "as_of": as_of.isoformat(), "decision_at": decision_at.isoformat(sep=" "),
+        "deadline_at": cutoff.isoformat(sep=" "), "reason": "PREMARKET_DEADLINE_MISSED",
+        "observed_at": current_shanghai_time().isoformat(sep=" "),
+        "order_authority": False,
+        "notification": {"status": "suppressed", "reason": "PREMARKET_DEADLINE_MISSED"}}
+
+
+@contextmanager
+def premarket_budget(cutoff):
+    if cutoff is None:
+        yield
+        return
+    seconds = (cutoff - current_shanghai_time()).total_seconds()
+    if seconds <= 0:
+        raise PremarketDeadline("PREMARKET_DEADLINE_MISSED")
+    # This task is owned by the Linux scheduler; interrupt blocked reads as well as calculation.
+    def expired(_signum, _frame):
+        raise PremarketDeadline("PREMARKET_DEADLINE_MISSED")
+    previous = signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
 
 def main() -> int:
     parser = argparse.ArgumentParser()
@@ -147,7 +191,14 @@ def main() -> int:
             mode=args.mode,
             as_of_was_explicit=bool(args.as_of),
             explicit=args.decision_at,
+            now=research_known_at,
         )
+    cutoff = live_premarket_cutoff(mode=args.mode, as_of=requested_as_of,
+        now=research_known_at, replay_only=args.replay_only)
+    if cutoff is not None and research_known_at >= cutoff:
+        print(json.dumps(missed_premarket_result(as_of=requested_as_of,
+            decision_at=decision_at, cutoff=cutoff), ensure_ascii=False))
+        return 2
     load_project_env()
     primary = create_tool_engine()
     kline = get_kline_engine()
@@ -160,30 +211,34 @@ def main() -> int:
                     min(args.per_sleeve_limit, 5000),
                 ),
             }
-            if args.retrospective_research:
-                result = run_retrospective_research_v3(
-                    primary,
-                    as_of=requested_as_of,
-                    decision_at=decision_at,
-                    research_known_at=research_known_at,
-                    mode=args.mode,
-                    kline_engine=kline,
-                    **limits,
-                )
-            else:
-                result = run_daily_decision_v3(
-                    primary,
-                    as_of=requested_as_of,
-                    decision_at=decision_at,
-                    mode=args.mode,
-                    kline_engine=kline,
-                    execution_enabled=execution_enabled_for_request(
+            with premarket_budget(cutoff):
+                if args.retrospective_research:
+                    result = run_retrospective_research_v3(
+                        primary,
                         as_of=requested_as_of,
                         decision_at=decision_at,
+                        research_known_at=research_known_at,
+                        mode=args.mode,
+                        kline_engine=kline,
+                        **limits,
                     )
-                    and not args.replay_only,
-                    **limits,
-                )
+                else:
+                    result = run_daily_decision_v3(
+                        primary,
+                        as_of=requested_as_of,
+                        decision_at=decision_at,
+                        mode=args.mode,
+                        kline_engine=kline,
+                        execution_enabled=execution_enabled_for_request(
+                            as_of=requested_as_of,
+                            decision_at=decision_at,
+                        )
+                        and not args.replay_only,
+                        **limits,
+                    )
+        except PremarketDeadline:
+            result = missed_premarket_result(as_of=requested_as_of,
+                decision_at=decision_at, cutoff=cutoff)
         except Exception as exc:
             result = {
                 "schema": (
@@ -210,7 +265,9 @@ def main() -> int:
                         sep=" "
                     ),
                 })
-        if args.retrospective_research or args.replay_only:
+        if result.get("reason") == "PREMARKET_DEADLINE_MISSED":
+            pass  # The deadline receipt already suppresses notifications.
+        elif args.retrospective_research or args.replay_only:
             result["notification"] = {
                 "status": "suppressed",
                 "reason": (
