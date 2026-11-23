@@ -5587,6 +5587,12 @@ def _scheduler_output_build_shas(value: object) -> frozenset[str]:
     return frozenset(builds)
 
 
+def _task_history_lock_index(connection) -> str:
+    # A PRIMARY reverse scan locked newer histories belonging to other tasks.
+    return (" FORCE INDEX (idx_scheduled_task_history_task_run)"
+            if connection.dialect.name == "mysql" else "")
+
+
 def _reconcile_task_from_terminal_history(
     engine,
     row: dict,
@@ -5599,6 +5605,7 @@ def _reconcile_task_from_terminal_history(
     now = _now_shanghai_naive()
     try:
         with engine.begin() as connection:
+            history_index = _task_history_lock_index(connection)
             suffix = (
                 " FOR UPDATE"
                 if str(connection.dialect.name).lower() != "sqlite"
@@ -5606,7 +5613,7 @@ def _reconcile_task_from_terminal_history(
             )
             active_histories = connection.execute(
                 text(
-                    "SELECT run_uid FROM st_scheduled_task_history "
+                    f"SELECT run_uid FROM st_scheduled_task_history{history_index} "
                     "WHERE task_id=:task_id AND status='running' "
                     f"ORDER BY id DESC LIMIT 2{suffix}"
                 ),
@@ -5621,7 +5628,7 @@ def _reconcile_task_from_terminal_history(
                         "SELECT id, run_uid, task_id, task_type, run_at, "
                         "finished_at, status, duration, exit_code, host_name, "
                         "scheduler_instance_id, build_sha, trigger_source, "
-                        "output FROM st_scheduled_task_history "
+                        f"output FROM st_scheduled_task_history{history_index} "
                         "WHERE task_id=:task_id "
                         f"ORDER BY id DESC LIMIT 2{suffix}"
                     ),
@@ -5839,13 +5846,14 @@ def _recover_interrupted_manual_claim(
     try:
         current_build = _scheduler_build_commit_sha()
         with engine.begin() as connection:
+            history_index = _task_history_lock_index(connection)
             history_rows = [
                 dict(item)
                 for item in connection.execute(
                     text(
                         "SELECT run_uid, task_id, task_name, task_type, run_at, status, host_name, "
                         "scheduler_instance_id, build_sha, trigger_source, output "
-                        "FROM st_scheduled_task_history "
+                        f"FROM st_scheduled_task_history{history_index} "
                         "WHERE task_id=:task_id AND status='running' "
                         "ORDER BY run_at DESC, id DESC LIMIT 101 FOR UPDATE"
                     ),
@@ -5859,7 +5867,7 @@ def _recover_interrupted_manual_claim(
                 # Resolve the latest durable identity before releasing a
                 # summary whose timestamp differs from the running audit.
                 terminal = connection.execute(text(
-                    "SELECT run_uid,task_type,run_at,finished_at,status FROM st_scheduled_task_history "
+                    f"SELECT run_uid,task_type,run_at,finished_at,status FROM st_scheduled_task_history{history_index} "
                     "WHERE task_id=:task_id ORDER BY id DESC LIMIT 1 FOR UPDATE"
                 ), {"task_id": task_id}).mappings().first()
                 # The latest audit identifies the claim. Older launchers wrote
@@ -10065,6 +10073,7 @@ def _terminal_check_running(connection, uid, intent, *, for_update=False):
     if history["status"] != "running" or history["finished_at"] is not None:
         return False
     suffix = " FOR UPDATE" if for_update and connection.dialect.name != "sqlite" else ""
+    history_index = _task_history_lock_index(connection) if for_update else ""
     # DATETIME(0) claim stamps are not unique run identities. Lock the task and
     # require its latest actual audit UID, including same-second new claims.
     rows = connection.execute(text(
@@ -10072,7 +10081,7 @@ def _terminal_check_running(connection, uid, intent, *, for_update=False):
         "FROM st_scheduled_tasks WHERE id=:id" + suffix
     ), {"id": intent["identity"]["task_id"]}).mappings().all()
     latest = connection.execute(text(
-        "SELECT run_uid FROM st_scheduled_task_history WHERE task_id=:id "
+        f"SELECT run_uid FROM st_scheduled_task_history{history_index} WHERE task_id=:id "
         "ORDER BY id DESC LIMIT 1" + suffix
     ), {"id": intent["identity"]["task_id"]}).scalar()
     stamp = datetime.fromisoformat(intent["identity"]["run_at"])
