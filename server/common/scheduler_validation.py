@@ -2909,6 +2909,13 @@ def scheduler_output_status(
     same-day retries.  ``blocked`` accurately represents both conditions.
     """
     task_type = str(task.get("task_type") or "").strip()
+    if (task_type == "trading_v3_premarket_review"
+            and task.get("script_path") == "tools/run_trading_v3_decision.py"):
+        from server.trading_v3.premarket_deadline import SCHEMA, valid_premarket_deadline_receipt
+
+        receipt = _single_nested_machine_payload(output, schema=SCHEMA)
+        if receipt is not None:
+            return "blocked" if return_code == 2 and valid_premarket_deadline_receipt(receipt) else "failed"
     if task_type == "analysis_fast" and _single_nested_machine_payload(
         output, schema="probiga.formal-initial-score-blocked.v1",
     ) and return_code != 0:
@@ -4591,6 +4598,20 @@ def validate_scheduler_task_result(
     output: str | None = None,
 ) -> SchedulerValidationResult:
     task_type = str(task.get("task_type") or "").strip()
+    if (task_type == "trading_v3_premarket_review"
+            and task.get("script_path") == "tools/run_trading_v3_decision.py"):
+        from server.trading_v3.premarket_deadline import SCHEMA, valid_premarket_deadline_receipt
+
+        receipt = _single_nested_machine_payload(output, schema=SCHEMA)
+        if receipt is not None:
+            started = started_at
+            if started is not None and started.tzinfo is not None:
+                started = started.astimezone(PRODUCTION_TIMEZONE).replace(tzinfo=None)
+            ok = valid_premarket_deadline_receipt(receipt)
+            if ok:
+                observed = datetime.fromisoformat(receipt["observed_at"])
+                ok = started is not None and started.date() == observed.date() and started <= observed
+            return SchedulerValidationResult(True, ok, "premarket cutoff control receipt checked")
     if task_type == "strategy_external_overlay":
         from server.common.frozen_strategy_pool_work import PREMARKET_POOL_WORK_REF_SCHEMA
 

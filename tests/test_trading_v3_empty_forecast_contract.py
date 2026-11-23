@@ -981,3 +981,78 @@ def test_retrospective_research_exports_candidates_without_any_writer(
     ] is True
     assert artifact["consensus"][0]["stock_code"] == "000001"
     assert artifact["forecasts"][0]["stock_code"] == "000001"
+
+
+def test_late_live_premarket_never_enters_data_pipeline_or_paper_oms(monkeypatch, capsys):
+    monkeypatch.setattr('sys.argv',['run_trading_v3_decision.py','--mode','premarket','--as-of','2026-11-23'])
+    monkeypatch.setattr(run_trading_v3_decision,'current_shanghai_time',lambda:datetime(2026,11,23,10,39,20))
+    monkeypatch.setattr(run_trading_v3_decision,'create_tool_engine',lambda:pytest.fail('late review opened data pipeline'))
+    monkeypatch.setattr(run_trading_v3_decision,'run_daily_decision_v3',lambda *_a,**_k:pytest.fail('late review entered paper OMS'))
+    assert run_trading_v3_decision.main()==2
+    result=json.loads(capsys.readouterr().out)
+    assert result['reason']=='PREMARKET_DEADLINE_MISSED' and result['retryable'] is False
+    assert result['deadline_at']=='2026-11-23 09:30:00' and result['order_authority'] is False
+    task = {"task_type": "trading_v3_premarket_review", "script_path": "tools/run_trading_v3_decision.py"}
+    output = json.dumps(result)
+    assert scheduler_validation.scheduler_output_status(task, output, return_code=2) == "blocked"
+    validated = scheduler_validation.validate_scheduler_task_result(
+        task, engine=None, started_at=datetime(2026, 11, 23, 10, 39, 20), output=output,
+    )
+    assert validated.checked and validated.ok
+    assert not scheduler_runtime._task_status_is_retryable({
+        "last_run_status": "blocked", "last_run_output": output,
+    })
+    for changed in (
+        {"observed_at": "2026-11-23 09:29:59"},
+        {"deadline_at": "2026-11-23 10:30:00"},
+        {"as_of": "2026-11-20"}, {"order_authority": True}, {"retryable": True},
+    ):
+        invalid = json.dumps({**result, **changed})
+        assert scheduler_validation.scheduler_output_status(task, invalid, return_code=2) == "failed"
+        assert not scheduler_validation.validate_scheduler_task_result(
+            task, engine=None, started_at=datetime(2026, 11, 23, 10, 39, 20), output=invalid,
+        ).ok
+    assert scheduler_validation.scheduler_output_status(task, output, return_code=0) == "failed"
+    assert scheduler_validation.scheduler_output_status(
+        {**task, "task_type": "trading_v3_close_review"}, output, return_code=2,
+    ) != "blocked"
+
+
+def test_live_premarket_cutoff_does_not_relabel_historical_replay():
+    from datetime import date
+    cutoff=run_trading_v3_decision.live_premarket_cutoff
+    assert cutoff(mode='premarket',as_of=date(2026,11,23),now=datetime(2026,11,23,9,26))==datetime(2026,11,23,9,30)
+    assert cutoff(mode='premarket',as_of=date(2026,11,20),now=datetime(2026,11,23,10,39)) is None
+    assert cutoff(mode='premarket',as_of=date(2026,11,23),now=datetime(2026,11,23,10,39),replay_only=True) is None
+
+
+def test_running_premarket_budget_expires_and_restores_handler(monkeypatch):
+    tool=run_trading_v3_decision;handlers=[];timers=[]
+    monkeypatch.setattr(tool,'current_shanghai_time',lambda:datetime(2026,11,23,9,26))
+    monkeypatch.setattr(tool.signal,'SIGALRM',14,raising=False)
+    monkeypatch.setattr(tool.signal,'ITIMER_REAL',0,raising=False)
+    def install(_signal,handler):handlers.append(handler);return 'old_handler'
+    monkeypatch.setattr(tool.signal,'signal',install)
+    monkeypatch.setattr(tool.signal,'setitimer',lambda *args:timers.append(args),raising=False)
+    with pytest.raises(tool.PremarketDeadline):
+        with tool.premarket_budget(datetime(2026,11,23,9,30)):
+            handlers[0](None,None)
+    assert timers==[(0,240.0),(0,0)] and handlers[-1]=='old_handler'
+
+
+def test_premarket_interrupt_does_not_leave_a_processing_decision():
+    from sqlalchemy import create_engine, text
+    from server.trading_v3.repository import TradingV3Repository
+    db=create_engine('sqlite://')
+    with db.begin() as c:
+        c.execute(text('CREATE TABLE st_decision_run_v3(run_uid TEXT,status TEXT,error_message TEXT,completed_at TEXT)'))
+        c.execute(text("INSERT INTO st_decision_run_v3 VALUES('interrupted','PROCESSING',NULL,NULL)"))
+    repository=TradingV3Repository(db)
+    with pytest.raises(run_trading_v3_decision.PremarketDeadline):
+        with decision_worker._persisted_run_completion(repository,'interrupted',persist_result=True):
+            raise run_trading_v3_decision.PremarketDeadline('PREMARKET_DEADLINE_MISSED')
+    with db.connect() as c:
+        row=c.execute(text("SELECT * FROM st_decision_run_v3 WHERE run_uid='interrupted'")).mappings().one()
+        assert row['status']=='FAILED' and row['completed_at'] is not None
+        assert row['error_message']=='INTERRUPTED: PREMARKET_DEADLINE_MISSED'
+    db.dispose()

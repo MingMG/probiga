@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import hashlib
 import inspect
 import json
@@ -396,6 +398,16 @@ def _decision_truth_status(
         return "COMPLETED", "PAPER_ACTIONABLE"
     return "COMPLETED", "NO_ACTION"
 
+
+
+@contextmanager
+def _persisted_run_completion(repository, run_uid, *, persist_result):
+    try:
+        yield
+    except BaseException as exc:
+        if persist_result and not isinstance(exc, Exception):
+            repository.mark_run_failed(run_uid, stage="INTERRUPTED", error=exc)
+        raise
 
 def _run_daily_decision_v3(
     primary_engine: Engine,
@@ -798,275 +810,276 @@ def _run_daily_decision_v3(
             ),
         )
     research_artifact: dict[str, Any] | None = None
-    if persist_result:
-        saved = repository.save_decision(
-            run_uid=run_uid,
-            trade_date=dataset["trade_date"],
-            requested_as_of=as_of,
-            decision_at=decision_at,
-            mode=mode,
-            model_version=config["strategy_version"],
-            lifecycle_status=config["lifecycle_status"],
-            regime=result["regime"],
-            portfolio=result["portfolio"],
-            forecasts=all_forecasts,
-            theme_signals=all_theme_signals,
-            data_snapshot_hash=dataset["data_snapshot_hash"],
-            hypotheses=hypotheses,
-            run_status=run_status,
-            actionable_status=actionable_status,
-            snapshot_manifest=snapshot["manifest"],
-            defer_completion=True,
-        )
-    else:
-        forecast_rows = sorted(
-            (item.as_dict() for item in decision_forecasts),
-            key=lambda item: (
-                str(item.get("stock_code") or ""),
-                str(item.get("strategy_key") or ""),
-            ),
-        )
-        market_features = dict(dataset.get("market_features") or {})
-        research_artifact = {
-            "schema": "probiga.trading-v3-retrospective-research.v1",
-            "research_run_uid": run_uid,
-            "requested_as_of": as_of.isoformat(),
-            "trade_date": dataset["trade_date"].isoformat(),
-            "historical_fact_cutoff_at": decision_at.isoformat(sep=" "),
-            "research_known_at": context_cutoff_at.isoformat(sep=" "),
-            "interpretation": (
-                "CURRENT_CODE_AND_MODEL_APPLIED_TO_HISTORICAL_FACTS"
-            ),
-            "historical_production_decision": False,
-            "canonical_eligible": False,
-            "competition_eligible": False,
-            "order_authority": False,
-            "notification_eligible": False,
-            "persisted": False,
-            "model_evaluation": {
-                "strategy_version": str(config["strategy_version"]),
-                "lifecycle_status": str(config["lifecycle_status"]),
-                "evaluated_at": context_cutoff_at.isoformat(sep=" "),
-                "historical_model_identity_proven": False,
-                "active_calibration_model_versions": {
-                    key: str(value.model_version)
-                    for key, value in sorted(compatible_calibrations.items())
-                },
-            },
-            "research_assumptions": {
-                "account_snapshot_consumed": False,
-                "position_state_consumed": False,
-                "open_order_state_consumed": False,
-                "paper_learning_consumed": False,
-                "portfolio_allocation_computed": False,
-            },
-            "data_snapshot_hash": str(dataset["data_snapshot_hash"]),
-            "pit_evidence": {
-                "fact_cutoff_at": str(
-                    market_features.get("pit_fact_cutoff_at") or ""
-                ),
-                "decision_known_at": str(
-                    market_features.get("pit_decision_at") or ""
-                ),
-                "common_receipt_root_hash": str(
-                    market_features.get("pit_common_receipt_root_hash") or ""
-                ),
-                "reconstruction_mode": str(
-                    market_features.get("pit_reconstruction_mode") or ""
-                ),
-                "reconstruction_sha256": str(
-                    market_features.get("pit_reconstruction_sha256") or ""
-                ),
-                "reconstructed_at": str(
-                    market_features.get("pit_reconstructed_at") or ""
-                ),
-                "reconstruction_provenance": dict(
-                    market_features.get("pit_reconstruction_provenance") or {}
-                ),
-                "industry": dict(dataset.get("industry_pit") or {}),
-                "concept_snapshot_date": dataset.get(
-                    "concept_snapshot_date"
-                ),
-                "concept_snapshot_age_days": market_features.get(
-                    "concept_snapshot_age_days"
-                ),
-            },
-            "regime": result["regime"],
-            "strategy_weights": result.get("strategy_weights", {}),
-            "consensus": result.get("consensus", []),
-            "forecasts": forecast_rows,
-        }
-        research_artifact["artifact_sha256"] = hashlib.sha256(
-            json.dumps(
-                research_artifact,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-                default=str,
-            ).encode("utf-8")
-        ).hexdigest()
-        saved = {
-            "research_run_uid": run_uid,
-            "persisted": False,
-            "forecast_count": len(forecast_rows),
-            "validated_count": sum(
-                str(item.get("status") or "") == "VALIDATED_POSITIVE"
-                for item in forecast_rows
-            ),
-            "target_count": len(result["portfolio"].get("targets") or []),
-            "theme_signal_count": len(all_theme_signals),
-            "hypothesis_count": len(hypotheses),
-        }
-    position_targets = list(result["portfolio"]["targets"])
-    if mode == "premarket":
-        position_targets = [
-            target for target in position_targets
-            if str(target.get("stock_code") or "").zfill(6)
-            in (auction_buy_codes or set())
-        ]
-    if execution_enabled and all_forecasts and run_status == "COMPLETED":
-        try:
-            position_sync = sync_position_states(
-                primary_engine,
+    with _persisted_run_completion(repository, run_uid, persist_result=persist_result):
+        if persist_result:
+            saved = repository.save_decision(
+                run_uid=run_uid,
                 trade_date=dataset["trade_date"],
-                equity=equity,
-                stocks=dataset["stocks"],
+                requested_as_of=as_of,
+                decision_at=decision_at,
+                mode=mode,
+                model_version=config["strategy_version"],
+                lifecycle_status=config["lifecycle_status"],
+                regime=result["regime"],
+                portfolio=result["portfolio"],
                 forecasts=all_forecasts,
-                targets=position_targets,
+                theme_signals=all_theme_signals,
+                data_snapshot_hash=dataset["data_snapshot_hash"],
                 hypotheses=hypotheses,
-                decision_quality_status=regime.quality_status,
+                run_status=run_status,
+                actionable_status=actionable_status,
+                snapshot_manifest=snapshot["manifest"],
+                defer_completion=True,
             )
-        except Exception as exc:
-            repository.mark_run_failed(
-                run_uid,
-                stage="POSITION_SYNC",
-                error=exc,
+        else:
+            forecast_rows = sorted(
+                (item.as_dict() for item in decision_forecasts),
+                key=lambda item: (
+                    str(item.get("stock_code") or ""),
+                    str(item.get("strategy_key") or ""),
+                ),
             )
-            raise RuntimeError(
-                f"V3_POSITION_SYNC_FAILED: {exc}"
-            ) from exc
-    else:
-        # Historical/replay decisions and an empty forecast ledger may persist
-        # immutable evidence, but neither may rewrite today's position state.
-        position_sync = {
-            "status": (
-                "data_blocked" if execution_enabled else "replay_only"
-            ),
-            "updated_count": 0,
-        }
-    if execution_enabled and all_forecasts:
-        try:
-            execution_kwargs: dict[str, Any] = {"run_uid": run_uid}
-            if mode == "premarket":
-                execution_kwargs["allowed_buy_codes"] = (
-                    auction_buy_codes or set()
+            market_features = dict(dataset.get("market_features") or {})
+            research_artifact = {
+                "schema": "probiga.trading-v3-retrospective-research.v1",
+                "research_run_uid": run_uid,
+                "requested_as_of": as_of.isoformat(),
+                "trade_date": dataset["trade_date"].isoformat(),
+                "historical_fact_cutoff_at": decision_at.isoformat(sep=" "),
+                "research_known_at": context_cutoff_at.isoformat(sep=" "),
+                "interpretation": (
+                    "CURRENT_CODE_AND_MODEL_APPLIED_TO_HISTORICAL_FACTS"
+                ),
+                "historical_production_decision": False,
+                "canonical_eligible": False,
+                "competition_eligible": False,
+                "order_authority": False,
+                "notification_eligible": False,
+                "persisted": False,
+                "model_evaluation": {
+                    "strategy_version": str(config["strategy_version"]),
+                    "lifecycle_status": str(config["lifecycle_status"]),
+                    "evaluated_at": context_cutoff_at.isoformat(sep=" "),
+                    "historical_model_identity_proven": False,
+                    "active_calibration_model_versions": {
+                        key: str(value.model_version)
+                        for key, value in sorted(compatible_calibrations.items())
+                    },
+                },
+                "research_assumptions": {
+                    "account_snapshot_consumed": False,
+                    "position_state_consumed": False,
+                    "open_order_state_consumed": False,
+                    "paper_learning_consumed": False,
+                    "portfolio_allocation_computed": False,
+                },
+                "data_snapshot_hash": str(dataset["data_snapshot_hash"]),
+                "pit_evidence": {
+                    "fact_cutoff_at": str(
+                        market_features.get("pit_fact_cutoff_at") or ""
+                    ),
+                    "decision_known_at": str(
+                        market_features.get("pit_decision_at") or ""
+                    ),
+                    "common_receipt_root_hash": str(
+                        market_features.get("pit_common_receipt_root_hash") or ""
+                    ),
+                    "reconstruction_mode": str(
+                        market_features.get("pit_reconstruction_mode") or ""
+                    ),
+                    "reconstruction_sha256": str(
+                        market_features.get("pit_reconstruction_sha256") or ""
+                    ),
+                    "reconstructed_at": str(
+                        market_features.get("pit_reconstructed_at") or ""
+                    ),
+                    "reconstruction_provenance": dict(
+                        market_features.get("pit_reconstruction_provenance") or {}
+                    ),
+                    "industry": dict(dataset.get("industry_pit") or {}),
+                    "concept_snapshot_date": dataset.get(
+                        "concept_snapshot_date"
+                    ),
+                    "concept_snapshot_age_days": market_features.get(
+                        "concept_snapshot_age_days"
+                    ),
+                },
+                "regime": result["regime"],
+                "strategy_weights": result.get("strategy_weights", {}),
+                "consensus": result.get("consensus", []),
+                "forecasts": forecast_rows,
+            }
+            research_artifact["artifact_sha256"] = hashlib.sha256(
+                json.dumps(
+                    research_artifact,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                ).encode("utf-8")
+            ).hexdigest()
+            saved = {
+                "research_run_uid": run_uid,
+                "persisted": False,
+                "forecast_count": len(forecast_rows),
+                "validated_count": sum(
+                    str(item.get("status") or "") == "VALIDATED_POSITIVE"
+                    for item in forecast_rows
+                ),
+                "target_count": len(result["portfolio"].get("targets") or []),
+                "theme_signal_count": len(all_theme_signals),
+                "hypothesis_count": len(hypotheses),
+            }
+        position_targets = list(result["portfolio"]["targets"])
+        if mode == "premarket":
+            position_targets = [
+                target for target in position_targets
+                if str(target.get("stock_code") or "").zfill(6)
+                in (auction_buy_codes or set())
+            ]
+        if execution_enabled and all_forecasts and run_status == "COMPLETED":
+            try:
+                position_sync = sync_position_states(
+                    primary_engine,
+                    trade_date=dataset["trade_date"],
+                    equity=equity,
+                    stocks=dataset["stocks"],
+                    forecasts=all_forecasts,
+                    targets=position_targets,
+                    hypotheses=hypotheses,
+                    decision_quality_status=regime.quality_status,
                 )
-            execution = materialize_internal_paper_orders(
-                primary_engine,
-                **execution_kwargs,
-            )
-        except Exception as exc:
-            repository.mark_run_failed(
-                run_uid,
-                stage="ORDER_MATERIALIZATION",
-                error=exc,
-            )
-            raise RuntimeError(
-                f"V3_ORDER_MATERIALIZATION_FAILED: {exc}"
-            ) from exc
-    else:
-        execution = {
-            "status": (
-                "data_blocked" if execution_enabled else "replay_only"
+            except Exception as exc:
+                repository.mark_run_failed(
+                    run_uid,
+                    stage="POSITION_SYNC",
+                    error=exc,
+                )
+                raise RuntimeError(
+                    f"V3_POSITION_SYNC_FAILED: {exc}"
+                ) from exc
+        else:
+            # Historical/replay decisions and an empty forecast ledger may persist
+            # immutable evidence, but neither may rewrite today's position state.
+            position_sync = {
+                "status": (
+                    "data_blocked" if execution_enabled else "replay_only"
+                ),
+                "updated_count": 0,
+            }
+        if execution_enabled and all_forecasts:
+            try:
+                execution_kwargs: dict[str, Any] = {"run_uid": run_uid}
+                if mode == "premarket":
+                    execution_kwargs["allowed_buy_codes"] = (
+                        auction_buy_codes or set()
+                    )
+                execution = materialize_internal_paper_orders(
+                    primary_engine,
+                    **execution_kwargs,
+                )
+            except Exception as exc:
+                repository.mark_run_failed(
+                    run_uid,
+                    stage="ORDER_MATERIALIZATION",
+                    error=exc,
+                )
+                raise RuntimeError(
+                    f"V3_ORDER_MATERIALIZATION_FAILED: {exc}"
+                ) from exc
+        else:
+            execution = {
+                "status": (
+                    "data_blocked" if execution_enabled else "replay_only"
+                ),
+                "paper_order_count": 0,
+                "created": [],
+                "skipped": [],
+            }
+        if persist_result:
+            try:
+                repository.finalize_run(run_uid, status=run_status)
+            except Exception as exc:
+                repository.mark_run_failed(
+                    run_uid,
+                    stage="RUN_FINALIZATION",
+                    error=exc,
+                )
+                raise RuntimeError(f"V3_RUN_FINALIZATION_FAILED: {exc}") from exc
+        response = {
+            "schema": (
+                "probiga.trading-v3-decision-result.v1"
+                if persist_result
+                else "probiga.trading-v3-retrospective-research.v1"
             ),
-            "paper_order_count": 0,
-            "created": [],
-            "skipped": [],
+            "status": "blocked" if run_status == "BLOCKED" else "ok",
+            # DATA_BLOCKED is persisted as decision truth, but remains retryable
+            # at the scheduler layer after upstream data arrives the same day.
+            "retryable": run_status == "BLOCKED",
+            **saved,
+            "run_status": run_status,
+            "actionable_status": actionable_status,
+            "execution_enabled": bool(execution_enabled),
+            "snapshot_manifest_hash": (
+                snapshot["manifest"]["manifest_hash"] if snapshot else ""
+            ),
+            "trade_date": dataset["trade_date"].isoformat(),
+            "decision_at": decision_at.isoformat(sep=" "),
+            "mode": mode,
+            "source": dataset["source"],
+            "concept_snapshot_date": dataset.get("concept_snapshot_date"),
+            "theme_count": dataset.get("theme_count", 0),
+            "market_regime": result["regime"]["dominant_state"],
+            "risk_asset_cap": result["regime"]["risk_asset_cap"],
+            "strategy_weights": result.get("strategy_weights", {}),
+            "hypothesis_count": saved.get("hypothesis_count", 0),
+            "theme_signal_count": saved.get("theme_signal_count", 0),
+            "active_calibrated_sleeves": sorted(
+                compatible_calibrations
+            ),
+            "incompatible_calibrated_sleeves": sorted(
+                set(calibrations) - set(compatible_calibrations)
+            ),
+            "portfolio_status": result["portfolio"]["status"],
+            "paper_order_count": execution["paper_order_count"],
+            "paper_orders": execution["created"],
+            "paper_order_skipped": execution["skipped"],
+            "superseded_paper_orders": execution.get(
+                "cancelled_orders",
+                [],
+            ),
+            "superseded_execution_plans": execution.get(
+                "cancelled_execution_plans",
+                [],
+            ),
+            "superseded_partial_paper_orders": execution.get(
+                "cancelled_partial_orders",
+                [],
+            ),
+            "premarket_frozen_paper_orders": premarket_freeze.get(
+                "cancelled_orders",
+                [],
+            ),
+            "premarket_frozen_execution_plans": premarket_freeze.get(
+                "cancelled_execution_plans",
+                [],
+            ),
+            "position_state_updates": position_sync["updated_count"],
+            "real_order_count": 0,
+            "real_trading_enabled": False,
+            "paper_discovery_learning": paper_learning,
+            "premarket_gate": premarket_gate,
         }
-    if persist_result:
-        try:
-            repository.finalize_run(run_uid, status=run_status)
-        except Exception as exc:
-            repository.mark_run_failed(
-                run_uid,
-                stage="RUN_FINALIZATION",
-                error=exc,
-            )
-            raise RuntimeError(f"V3_RUN_FINALIZATION_FAILED: {exc}") from exc
-    response = {
-        "schema": (
-            "probiga.trading-v3-decision-result.v1"
-            if persist_result
-            else "probiga.trading-v3-retrospective-research.v1"
-        ),
-        "status": "blocked" if run_status == "BLOCKED" else "ok",
-        # DATA_BLOCKED is persisted as decision truth, but remains retryable
-        # at the scheduler layer after upstream data arrives the same day.
-        "retryable": run_status == "BLOCKED",
-        **saved,
-        "run_status": run_status,
-        "actionable_status": actionable_status,
-        "execution_enabled": bool(execution_enabled),
-        "snapshot_manifest_hash": (
-            snapshot["manifest"]["manifest_hash"] if snapshot else ""
-        ),
-        "trade_date": dataset["trade_date"].isoformat(),
-        "decision_at": decision_at.isoformat(sep=" "),
-        "mode": mode,
-        "source": dataset["source"],
-        "concept_snapshot_date": dataset.get("concept_snapshot_date"),
-        "theme_count": dataset.get("theme_count", 0),
-        "market_regime": result["regime"]["dominant_state"],
-        "risk_asset_cap": result["regime"]["risk_asset_cap"],
-        "strategy_weights": result.get("strategy_weights", {}),
-        "hypothesis_count": saved.get("hypothesis_count", 0),
-        "theme_signal_count": saved.get("theme_signal_count", 0),
-        "active_calibrated_sleeves": sorted(
-            compatible_calibrations
-        ),
-        "incompatible_calibrated_sleeves": sorted(
-            set(calibrations) - set(compatible_calibrations)
-        ),
-        "portfolio_status": result["portfolio"]["status"],
-        "paper_order_count": execution["paper_order_count"],
-        "paper_orders": execution["created"],
-        "paper_order_skipped": execution["skipped"],
-        "superseded_paper_orders": execution.get(
-            "cancelled_orders",
-            [],
-        ),
-        "superseded_execution_plans": execution.get(
-            "cancelled_execution_plans",
-            [],
-        ),
-        "superseded_partial_paper_orders": execution.get(
-            "cancelled_partial_orders",
-            [],
-        ),
-        "premarket_frozen_paper_orders": premarket_freeze.get(
-            "cancelled_orders",
-            [],
-        ),
-        "premarket_frozen_execution_plans": premarket_freeze.get(
-            "cancelled_execution_plans",
-            [],
-        ),
-        "position_state_updates": position_sync["updated_count"],
-        "real_order_count": 0,
-        "real_trading_enabled": False,
-        "paper_discovery_learning": paper_learning,
-        "premarket_gate": premarket_gate,
-    }
-    if research_artifact is not None:
-        response.update({
-            "result_scope": "RETROSPECTIVE_RESEARCH",
-            "canonical_eligible": False,
-            "competition_eligible": False,
-            "order_authority": False,
-            "notification_eligible": False,
-            "research_artifact": research_artifact,
-        })
-    return response
+        if research_artifact is not None:
+            response.update({
+                "result_scope": "RETROSPECTIVE_RESEARCH",
+                "canonical_eligible": False,
+                "competition_eligible": False,
+                "order_authority": False,
+                "notification_eligible": False,
+                "research_artifact": research_artifact,
+            })
+        return response
 
 
 @trading_v3_writer
