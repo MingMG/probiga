@@ -209,7 +209,7 @@ os.open = real_open_with_one_atomic_replace
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("changed while quiescent", result.stderr)
 
-    def test_unrelated_flat_checkpoint_writes_do_not_restart_live_tree_validation(self):
+    def test_unrelated_flat_checkpoint_writes_do_not_invalidate_fixed_risk_tree(self):
         injection = """
 import os
 import sys
@@ -232,9 +232,9 @@ os.open = real_open_with_unrelated_checkpoint
         self._accepted("live", injection=injection)
         assert (self.jobs / "stock-finance-daily-v2.json").read_bytes() == b"2"
         assert (self.results / "000001.json").read_bytes() == original
-        result = self._run("quiescent", injection=injection)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("changed while quiescent", result.stderr)
+        self._accepted("quiescent", injection=injection)
+        assert (self.jobs / "stock-finance-daily-v2.json").read_bytes() == b"2"
+        assert (self.results / "000001.json").read_bytes() == original
 
     def test_live_tree_created_after_absence_is_inspected(self):
         # Remove only the private fixture; the injected writer then creates a

@@ -201,7 +201,7 @@ os.lstat = replace_same_named_tree_before_second_pass
         self.assertEqual((self.base / "retained-risk-original" / BATCH /
                           "results/000001.json").read_bytes(), b"original result")
 
-    def _absent_risk_created_after_last_absence_check_is_rejected(self, phase):
+    def _absent_risk_created_after_last_absence_check_is_rejected(self, phase, check=2):
         (self.results / "000001.json").unlink()
         self.results.rmdir()
         (self.batch / "manifest.json").unlink()
@@ -236,6 +236,7 @@ def create_tree_after_second_proven_absence(name, *, dir_fd=None):
         raise
 os.lstat = create_tree_after_second_proven_absence
 '''
+        injection = injection.replace("absence_checks == 2", f"absence_checks == {check}")
         self._assert_injected_and_rejected(phase, injection)
 
     def test_quiescent_absent_risk_created_after_last_absence_check_is_rejected(self):
@@ -243,6 +244,34 @@ os.lstat = create_tree_after_second_proven_absence
 
     def test_live_absent_risk_created_after_last_absence_check_is_rejected(self):
         self._absent_risk_created_after_last_absence_check_is_rejected("live")
+
+    def test_quiescent_creation_during_final_absence_rebind_is_rejected(self):
+        self._absent_risk_created_after_last_absence_check_is_rejected("quiescent", check=4)
+
+    def test_live_creation_during_final_absence_rebind_is_rejected(self):
+        self._absent_risk_created_after_last_absence_check_is_rejected("live", check=4)
+
+    def test_quiescent_own_namespace_mutation_after_last_walk_is_rejected(self):
+        injection = r'''
+import os
+import sys
+sys.argv.pop()
+original_lstat = os.lstat
+parent_checks = 0
+
+def add_approved_batch_after_last_tree_walk(name, *, dir_fd=None):
+    global parent_checks
+    if name == sys.argv[1] and dir_fd is None:
+        parent_checks += 1
+        if parent_checks == 4:
+            # This changes only the risk directory, not the job-log parent.
+            os.mkdir(os.path.join(sys.argv[1], 'exposure-event-risk-watch-v1',
+                                  'exposure-risk-' + 'b' * 48), mode=0o755)
+            print('RACE_INJECTED', flush=True)
+    return original_lstat(name, dir_fd=dir_fd)
+os.lstat = add_approved_batch_after_last_tree_walk
+'''
+        self._assert_injected_and_rejected("quiescent", injection)
 
     def test_live_successor_must_remain_bound_to_current_named_inode(self):
         injection = r'''
