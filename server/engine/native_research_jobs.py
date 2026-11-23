@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 import json
 import os
 import socket
 import time
+import threading
 import uuid
 
 from sqlalchemy import text
@@ -17,6 +19,63 @@ from server.common.scheduler_task_lease import read as read_lease
 from server.engine.autonomous_strategy_research import now_shanghai
 
 JOB_TYPE = 'NATIVE_REPLAY'
+CLAIM_SECONDS = 20
+
+
+@contextmanager
+def claim_database_deadline(connection, deadline):
+    """Cancel this native session's SQL before its claim transaction commits."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError('NATIVE_CLAIM_DATABASE_DEADLINE')
+    if connection.dialect.name != 'mysql':
+        yield
+        if time.monotonic() >= deadline:
+            raise TimeoutError('NATIVE_CLAIM_DATABASE_DEADLINE')
+        return
+    from server.common.engine_factory import create_pooled_engine
+    from server.engine.strategy_native_backtest import LOCK
+    identity = int(connection.connection.driver_connection.thread_id())
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError('NATIVE_CLAIM_DATABASE_DEADLINE')
+    finished = threading.Event()
+    expired = threading.Event()
+    gate = threading.Lock()
+    errors = []
+
+    def cancel():
+        with gate:
+            if finished.is_set():
+                return
+            expired.set()
+            control = None
+            try:
+                control = create_pooled_engine(connection.engine.url, pool_size=1, max_overflow=0,
+                    pool_timeout=1, pool_pre_ping=False, isolation_level='AUTOCOMMIT',
+                    connect_args={'connect_timeout': 1, 'read_timeout': 1, 'write_timeout': 1})
+                with control.connect() as target:
+                    if target.execute(text('SELECT IS_USED_LOCK(:name)'), {'name': LOCK}).scalar() != identity:
+                        raise RuntimeError('native claim SQL session ownership changed')
+                    target.execute(text('KILL QUERY ' + str(identity)))
+            except Exception as exc:
+                errors.append(type(exc).__name__)
+            finally:
+                if control is not None:
+                    control.dispose()
+
+    timer = threading.Timer(remaining, cancel)
+    timer.daemon = True
+    timer.start()
+    try:
+        yield
+    finally:
+        with gate:
+            finished.set()
+        timer.cancel()
+        timer.join(timeout=1)
+        if expired.is_set() or time.monotonic() >= deadline:
+            raise TimeoutError('NATIVE_CLAIM_DATABASE_DEADLINE' + (': cancel failed ' + ','.join(errors) if errors else ''))
 
 
 def _locked(connection):
@@ -100,16 +159,17 @@ def _reclaimable(connection, job, state):
     return until < now_shanghai() and _absent(previous)
 
 
-def claim(connection):
+def claim(connection, *, deadline=None):
     """One native worker owns the named lock for the whole bounded attempt."""
     from server.engine import strategy_native_backtest as native
+    deadline = time.monotonic() + CLAIM_SECONDS if deadline is None else deadline
     connection.rollback()
-    candidates=list(connection.execute(text('''SELECT job_id FROM st_job_v2 WHERE job_type=:kind
+    candidates=list(connection.execute(text('''SELECT /*+ MAX_EXECUTION_TIME(2000) */ job_id FROM st_job_v2 WHERE job_type=:kind
         AND (status='RUNNING' OR (status='PENDING' AND (next_run_at IS NULL OR next_run_at<=:now)))
         ORDER BY requested_at,job_id LIMIT 64'''),{'kind':JOB_TYPE,'now':now_shanghai()}).scalars())
     connection.rollback()
     for job_id in candidates:
-        with connection.begin():
+        with connection.begin(), claim_database_deadline(connection, deadline):
             row=connection.execute(text('''SELECT * FROM st_job_v2 WHERE job_id=:id AND job_type=:kind
                 AND (status='RUNNING' OR (status='PENDING' AND (next_run_at IS NULL OR next_run_at<=:now)))'''+_locked(connection)),
                 {'id':job_id,'kind':JOB_TYPE,'now':now_shanghai()}).mappings().first()
@@ -139,11 +199,10 @@ def claim(connection):
 
 def _append_locked(connection, state, live, events=(), *, release=False):
     from server.engine import strategy_native_backtest as native
+    from server.common.strategy_audit_heads import latest_head
     expected = int(state['checkpoint_sequence'])
-    head = connection.execute(text('''SELECT action FROM st_strategy_governance_audit
-        WHERE entity_type=:entity AND entity_key=:uid ORDER BY created_at DESC,action DESC,audit_id DESC
-        LIMIT 1''' + _locked(connection)), {'entity': native.ENTITY, 'uid': state['run_id']}).scalar()
-    if head != f'CHECKPOINT_{expected:08d}':
+    head = latest_head(connection, native.ENTITY, state['run_id'], locking=True)
+    if head is None or head['action'] != f'CHECKPOINT_{expected:08d}':
         raise RuntimeError('native checkpoint sequence CAS lost')
     history = connection.execute(text('SELECT * FROM st_scheduled_task_history WHERE run_uid=:uid'),
                                  {'uid': live['scheduler_run_uid']}).mappings().one()

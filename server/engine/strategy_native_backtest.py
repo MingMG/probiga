@@ -25,22 +25,14 @@ class NativeStepDeadline(BaseException):
 
 def read_runs(connection, run_id=None):
     from server.engine.strategy_governance import _digest
-    # Find recent journal heads through the covering entity/time index before reading bodies.
-    scope = " AND entity_key=:uid" if run_id is not None else ""
-    # Seek each run's latest indexed timestamp instead of aggregating every checkpoint.
-    heads = connection.execute(text(f"""SELECT /*+ MAX_EXECUTION_TIME(8000) */
-        heads.entity_key,(SELECT created_at FROM st_strategy_governance_audit b
-            WHERE b.entity_type=:entity AND b.entity_key=heads.entity_key
-            ORDER BY created_at DESC LIMIT 1) AS latest_at
-        FROM (SELECT DISTINCT entity_key FROM st_strategy_governance_audit
-            WHERE entity_type=:entity{scope}) heads
-        ORDER BY latest_at DESC,heads.entity_key DESC LIMIT 8"""), {'entity':ENTITY,'uid':run_id}).mappings().all()
+    from server.common.strategy_audit_heads import latest_head, recent_heads
+    head = latest_head(connection, ENTITY, run_id) if run_id is not None else None
+    heads = ([head] if head else []) if run_id is not None else recent_heads(connection, ENTITY, 8)
     records=[]
     for head in heads:
         records.extend(connection.execute(text("""SELECT /*+ MAX_EXECUTION_TIME(4000) */ payload_json,audit_hash,after_json
-            FROM st_strategy_governance_audit WHERE entity_type=:entity AND entity_key=:uid
-            AND created_at=:latest_at ORDER BY action DESC,audit_id DESC LIMIT 1"""),
-            {'entity':ENTITY,'uid':head['entity_key'],'latest_at':head['latest_at']}).mappings().all())
+            FROM st_strategy_governance_audit WHERE audit_id=:id"""),
+            {'id':head['audit_id']}).mappings().all())
     result=[]
     for r in records:
         payload,after=json.loads(r['payload_json']),json.loads(r['after_json'])
@@ -564,16 +556,33 @@ def submit_native_experiments(engine):
 
 
 def native_tick(engine):
+    if engine.dialect.name != 'mysql':
+        return _native_tick(engine)
+    from server.common.engine_factory import create_pooled_engine
+    bounded = create_pooled_engine(engine.url, pool_timeout=5,
+        connect_args={'connect_timeout': 5, 'read_timeout': 35, 'write_timeout': 10})
+    try:
+        return _native_tick(bounded)
+    finally:
+        bounded.dispose()
+
+
+def _native_tick(engine):
     """Consume the typed queue only; audit-directory scans never select work."""
-    from server.engine.native_research_jobs import claim
+    from server.engine.native_research_jobs import claim, CLAIM_SECONDS
     from server.engine.native_research_prepare import PrepareYield
     from server.engine.native_research_dataset import PreparedDataset,PreparedInputMissing
-    state=None;previous_handler=None
+    state=None;previous_handler=None;attempt_started=time.monotonic()
     with engine.connect() as connection:
-        if connection.execute(text('SELECT GET_LOCK(:name,0)'),{'name':LOCK}).scalar()!=1:
-            return {'status':'RUNNING','reason':'已有原生回测持有互斥锁','business_started':False}
         try:
-            claimed=claim(connection)
+            def timeout(_signum,_frame):raise NativeStepDeadline('NATIVE_ATTEMPT_DEADLINE')
+            if hasattr(signal,'SIGALRM'):
+                previous_handler=signal.signal(signal.SIGALRM,timeout)
+                signal.setitimer(signal.ITIMER_REAL,max(.001,75-(time.monotonic()-attempt_started)))
+            if connection.dialect.name=='mysql':connection.execute(text('SET SESSION innodb_lock_wait_timeout=5'))
+            if connection.execute(text('SELECT GET_LOCK(:name,0)'),{'name':LOCK}).scalar()!=1:
+                return {'status':'RUNNING','reason':'已有原生回测持有互斥锁','business_started':False}
+            claimed=claim(connection,deadline=attempt_started+CLAIM_SECONDS)
             if claimed is None:return {'status':'idle'}
             state,owner=claimed
             if str(now_shanghai())>state['deadline_at']:raise TimeoutError('原生实验超过24小时执行时限')
@@ -583,9 +592,8 @@ def native_tick(engine):
             from server.engine.native_research_identity import producer_identity
             if state['phase'] in ('PLAN','PREPARE_BARS','PREPARE_DAYS') and producer_identity(state['strategies'][0]['source_kind'])!=state['producer_identity']:
                 raise ValueError('冻结数据转换版本已变化；未完成输入须按新转换身份登记，不能混用或错标版本')
-            def timeout(_signum,_frame):raise NativeStepDeadline('原生回测尝试超过300秒')
-            if hasattr(signal,'SIGALRM'):
-                previous_handler=signal.signal(signal.SIGALRM,timeout);signal.setitimer(signal.ITIMER_REAL,300)
+            if previous_handler is not None:
+                signal.setitimer(signal.ITIMER_REAL,max(.001,300-(time.monotonic()-attempt_started)))
             _step(connection,state,owner)
             if state['phase']!='FINISHED':_save(connection,state,owner,yield_job=True)
             return {key:state.get(key) for key in ('status','job_id','run_id','phase','completed_units','total_units','current_unit','reason')}

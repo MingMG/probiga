@@ -2,6 +2,7 @@ from copy import deepcopy
 from datetime import datetime, timedelta
 import json
 import socket
+import time
 
 import pytest
 from sqlalchemy import create_engine, event, text
@@ -173,3 +174,20 @@ def test_unexpired_owner_does_not_block_another_pending_experiment(queue):
         assert claimed[0]['run_id']==second['run_id']
         assert connection.execute(text('SELECT scheduler_run_uid FROM st_job_v2 WHERE result_ref=:id'),
             {'id':state['run_id']}).scalar()==owner['scheduler_run_uid']
+
+
+def test_claim_database_stall_rolls_back_before_job_or_head_publication(queue,monkeypatch):
+    with queue.begin() as connection:
+        first=jobs.enqueue(connection,experiment())
+        connection.connection.driver_connection.create_function('claim_stall',0,lambda:time.sleep(.05) or 0)
+        connection.execute(text('''CREATE TRIGGER delay_claim BEFORE UPDATE ON st_job_v2
+            WHEN NEW.status='RUNNING' BEGIN SELECT claim_stall(); END'''))
+    monkeypatch.setattr(jobs,'CLAIM_SECONDS',.01)
+    result=native.native_tick(queue)
+    assert result['status']=='FAILED' and 'NATIVE_CLAIM_DATABASE_DEADLINE' in result['reason']
+    with queue.connect() as connection:
+        job=connection.execute(text('SELECT status,scheduler_run_uid FROM st_job_v2 WHERE job_id=:id'),
+            {'id':first['job_id']}).mappings().one()
+        assert job['status']=='PENDING' and job['scheduler_run_uid'] is None
+        state=native.read_runs(connection,run_id=experiment()['run_id'])[0]
+        assert state['checkpoint_sequence']==1 and state['status']=='NOT_STARTED'
