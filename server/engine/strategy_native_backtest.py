@@ -51,7 +51,7 @@ def read_runs(connection, run_id=None):
 
 
 def _strategies(c):
-    rows=c.execute(text("""SELECT r.strategy_key,r.strategy_name,r.current_version,v.version_hash,
+    rows=c.execute(text("""SELECT /*+ MAX_EXECUTION_TIME(4000) */ r.strategy_key,r.strategy_name,r.current_version,v.version_hash,
         v.source_kind,v.evaluator_type,v.evaluator_config_json,v.parameters_json FROM st_strategy_registry r
         JOIN st_strategy_version v ON v.strategy_key=r.strategy_key AND v.version=r.current_version
         WHERE v.source_kind IN ('immutable_manifest','immutable_v3_sleeve') ORDER BY r.strategy_key""")).mappings()
@@ -136,11 +136,11 @@ def _start(connection,strategies,days,published,source_hash,*,frozen=None,
     request=request_identity(strategies=strategies,sessions=days,published=published,source_hash=source_hash,
         requested_at=requested,price_cutoff=cutoff,algorithm=algorithm,account=dict(ACCOUNT),
         allocation_policy=allocation_policy,producer=producer,execution_end_date=execution_end_date)
-    span=int(connection.execute(text('SELECT COUNT(DISTINCT trade_date) FROM si_trade_calendar '
+    span=int(connection.execute(text('SELECT /*+ MAX_EXECUTION_TIME(4000) */ COUNT(DISTINCT trade_date) FROM si_trade_calendar '
         'WHERE trade_status=1 AND trade_date BETWEEN :start AND :end'),{'start':days[0],'end':execution_end_date}).scalar())
     count=span+V3_DAILY_INPUT_SESSIONS
     if count>5000:raise ValueError('native calendar reference exceeds 5000 sessions')
-    calendar=sorted(str(value)[:10] for value in connection.execute(text('SELECT DISTINCT trade_date FROM si_trade_calendar '
+    calendar=sorted(str(value)[:10] for value in connection.execute(text('SELECT /*+ MAX_EXECUTION_TIME(4000) */ DISTINCT trade_date FROM si_trade_calendar '
         'WHERE trade_status=1 AND trade_date<=:end ORDER BY trade_date DESC LIMIT :count'),
         {'end':execution_end_date,'count':count}).scalars())
     if not set(days)<=set(calendar) or execution_end_date not in calendar:

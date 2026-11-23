@@ -5,6 +5,7 @@ import socket
 
 import pytest
 from sqlalchemy import create_engine, event, text
+from sqlalchemy.pool import StaticPool
 
 from server.common.scheduler_task_lease import encode
 from server.engine import native_research_jobs as jobs
@@ -14,7 +15,7 @@ from server.engine import strategy_native_control as control
 
 @pytest.fixture
 def queue(monkeypatch):
-    engine=create_engine('sqlite://')
+    engine=create_engine('sqlite://',connect_args={'check_same_thread':False},poolclass=StaticPool)
     @event.listens_for(engine,'connect')
     def functions(dbapi,_record):
         dbapi.create_function('GET_LOCK',2,lambda *_:1)

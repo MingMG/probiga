@@ -86,6 +86,14 @@
             if(r.kind==='NATIVE_SHADOW_RETROSPECTIVE'&&r.status==='FAILED')h+='<button type="button" data-qsw-retry="'+esc(r.result_id)+'"'+(s.resultLoading?' disabled':'')+'>从断点重试</button>';
             h+='<article class="qsw-result-detail"><h4>'+esc(r.strategy_name||r.strategy_key||r.reported_strategy_key||'历史报告')+' · 交易明细与证据</h4><p>'+esc(r.strategy_version)+' · '+esc(r.reason)+'</p><p>账户累计收益 '+metric(resultReturn(r),'%')+'；账户净盈利 '+metric(resultProfit(r),'元')+'；已平仓交易净盈利 '+metric(r.closed_trade_net_pnl_cny,'元')+'。费用属于原回测假设，真实成交另行验证。</p>';
             if(r.available_feature_sessions!=null)h+='<p>历史冻结特征 '+esc(r.available_feature_sessions)+' / '+esc(r.required_sessions)+' 日。'+esc((x.missing_feature_dates||[]).length)+' 日缺失；'+esc((x.partial_feature_dates||[]).length)+' 日部分可用，'+esc(r.complete_feature_sessions??'未知')+' 日完整。</p><details data-qsw-key="missing-'+esc(r.result_id)+'"><summary>缺失交易日</summary><p>'+esc((x.missing_feature_dates||[]).join('、')||'无')+'</p><p>部分可用：'+esc((x.partial_feature_dates||[]).join('、')||'无')+'</p></details>';
+            if(r.kind==='NATIVE_SHADOW_RETROSPECTIVE'&&r.evaluation_sessions?.length&&r.experiment_status!=='RUNNING'){
+                const days=r.evaluation_sessions,draft=s.experimentDraft?.resultId===r.result_id?s.experimentDraft.values:{};
+                const fields={evaluation_start:days[0],evaluation_end:days[days.length-1],execution_end_date:r.execution_end_date};
+                h+='<details data-qsw-key="new-experiment-'+esc(r.result_id)+'"><summary>用同一冻结输入新建实验</summary><p>沿用原策略版本和数据可用时间；可缩小评估区间，或比较市场状态调节入场预算。任务交给现有后台队列，结果自动保存在实验列表。</p><div class="qsw-toolbar" data-qsw-experiment-form="'+esc(r.result_id)+'">';
+                Object.entries(fields).forEach(([key,value])=>{h+='<label>'+esc(({evaluation_start:'评估开始',evaluation_end:'评估结束',execution_end_date:'成交窗口结束'})[key])+' <input type="date" data-qsw-experiment-field="'+key+'" value="'+esc(draft[key]||value)+'" min="'+esc(days[0])+'" max="'+esc(r.execution_end_date)+'"></label>';});
+                const policy=draft.allocation_policy||r.allocation_policy;
+                h+='<label>入场预算 <select data-qsw-experiment-field="allocation_policy"><option value="FIXED_SHADOW"'+(policy==='FIXED_SHADOW'?' selected':'')+'>固定仓位基准</option>'+(r.source_family==='immutable_v3_sleeve'?'<option value="ADAPTIVE_REGIME"'+(policy==='ADAPTIVE_REGIME'?' selected':'')+'>市场状态调节</option>':'')+'</select></label><button type="button" data-qsw-new-experiment="'+esc(r.result_id)+'"'+(s.resultLoading?' disabled':'')+'>登记回测实验</button></div></details>';
+            }
             if(r.return_scope==='VERIFIED_INPUT_SUBSET')h+='<p class="qsw-warning">上面的收益仅为可用输入子集回放；精确日期身份覆盖 '+esc(r.identity_covered_sessions)+' 个交易日，排除 '+esc(r.input_exclusion_count)+' 次证据不足的拟入场，不能代表完整策略收益。</p>';
             if(r.replay_run_id)h+='<p>实际回测身份 '+esc(r.replay_run_id)+'</p>';
             if(r.phase)h+='<p>当前阶段 '+esc(({PLAN:'核对来源',PREPARE_BARS:'准备行情',PREPARE_DAYS:'准备财务与公告',FEATURES:'计算特征',SIGNALS:'生成信号',REPLAY:'成交回放',FINISHED:'计算结束'})[r.phase]||r.phase)+' · '+esc(r.current_unit||'')+'；最近进展 '+esc(r.last_progress_at||'未知')+'</p>';
@@ -205,7 +213,17 @@
             const tab=e.target.closest('[data-qsw-tab]'), code=e.target.closest('[data-qsw-stock]');
             const result=e.target.closest('[data-qsw-result]');
             const retry=e.target.closest('[data-qsw-retry]');
-            if(retry){
+            const experiment=e.target.closest('[data-qsw-new-experiment]');
+            if(experiment){
+                if(s.resultLoading)return;
+                const form=experiment.closest('[data-qsw-experiment-form]');
+                const payload=Object.fromEntries(Array.from(form.querySelectorAll('[data-qsw-experiment-field]'),x=>[x.dataset.qswExperimentField,x.value]));
+                if(Object.values(payload).some(x=>!x)){s.resultError='请填写完整实验区间。';paint(s);return;}
+                s.resultLoading=true;s.resultError='';s.resultNotice='';paint(s);
+                try{const queued=await request('/api/quant-workbench/strategy-performance/'+encodeURIComponent(experiment.dataset.qswNewExperiment)+'/experiments?request_uid='+Array.from(crypto.getRandomValues(new Uint8Array(16)),b=>b.toString(16).padStart(2,'0')).join(''),20000,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});s.experimentId=queued.target_run_id;s.resultNotice=queued.reason;try{sessionStorage.setItem(pinKey,s.experimentId);}catch(err){}refreshPerformance(true);}
+                catch(err){s.resultError='实验登记失败：'+(err.message||err);}
+                finally{s.resultLoading=false;if(mount.isConnected)paint(s);}
+            }else if(retry){
                 if(s.resultLoading)return;
                 s.resultLoading=true;s.resultError='';s.resultNotice='';paint(s);
                 try{const queued=await request('/api/quant-workbench/strategy-performance/'+encodeURIComponent(retry.dataset.qswRetry)+'/retry?request_uid='+Array.from(crypto.getRandomValues(new Uint8Array(16)),b=>b.toString(16).padStart(2,'0')).join(''),20000,{method:'POST'});s.resultNotice=(queued.reason||'恢复请求已登记')+'；等待后台领取。';if(queued.target_run_id){s.experimentId=queued.target_run_id;try{sessionStorage.setItem(pinKey,s.experimentId);}catch(e){}}refreshPerformance(true);}
@@ -219,7 +237,12 @@
                 finally{s.resultLoading=false;if(mount.isConnected){paint(s);mount.querySelector('.qsw-result-detail')?.scrollIntoView({block:'nearest',behavior:'smooth'});}}
             }else if(tab)navigate(tab.dataset.qswTab);else if(code)stock(code.dataset.qswStock);else if(e.target.closest('[data-qsw-action]')){refresh();refreshPerformance(true);}
         };
+        mount.oninput=e=>{
+            const field=e.target.dataset.qswExperimentField,form=e.target.closest('[data-qsw-experiment-form]');
+            if(field&&form){if(s.experimentDraft?.resultId!==form.dataset.qswExperimentForm)s.experimentDraft={resultId:form.dataset.qswExperimentForm,values:{}};s.experimentDraft.values[field]=e.target.value;}
+        };
         mount.onchange=e=>{
+            if(e.target.matches('[data-qsw-experiment-field]')){mount.oninput(e);return;}
             if(e.target.matches('[data-qsw-experiment]')){s.experimentId=e.target.value;s.performanceHeadVersion='';try{sessionStorage.setItem(pinKey,s.experimentId);}catch(err){}refreshPerformance(true);return;}
             const series=e.target.dataset.qswSeries;
             if(series){const hidden=new Set(s.chartHidden);if(e.target.checked)hidden.delete(series);else hidden.add(series);s.chartHidden=Array.from(hidden);paint(s);return;}

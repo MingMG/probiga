@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import date,datetime
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Literal
 
 from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel
 from sqlalchemy import text
 
 from biz.intelligence.exposure_risk_watch import (
@@ -1206,6 +1207,30 @@ def retry_native_backtest(result_id: str,request_uid: str=Query(pattern=r"^[0-9a
         return request_retry(get_engine(),result_id,request_uid)
     except KeyError as exc:
         raise HTTPException(404,'回测记录不存在') from exc
+    except ValueError as exc:
+        raise HTTPException(409,str(exc)) from exc
+
+
+class NativeExperimentRequest(BaseModel):
+    model_config={'extra':'forbid'}
+    evaluation_start: date
+    evaluation_end: date
+    execution_end_date: date
+    allocation_policy: Literal['FIXED_SHADOW','ADAPTIVE_REGIME']='FIXED_SHADOW'
+
+
+@router.post('/strategy-performance/{result_id}/experiments',status_code=202)
+def create_native_experiment(result_id: str,payload: NativeExperimentRequest,
+                             request_uid: str=Query(pattern=r'^[0-9a-f]{32}$')):
+    from server.engine.strategy_native_control import request_experiment
+    try:
+        return request_experiment(get_engine(),result_id,request_uid,
+            evaluation_start=payload.evaluation_start.isoformat(),evaluation_end=payload.evaluation_end.isoformat(),
+            execution_end_date=payload.execution_end_date.isoformat(),allocation_policy=payload.allocation_policy)
+    except TimeoutError as exc:
+        raise HTTPException(504,str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(404,'来源回测记录不存在') from exc
     except ValueError as exc:
         raise HTTPException(409,str(exc)) from exc
 
