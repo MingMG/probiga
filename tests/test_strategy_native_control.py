@@ -70,3 +70,70 @@ def test_new_source_transform_has_a_distinct_identity_with_unchanged_raw_clocks(
     assert first['run_id']!=second['run_id'] and first['contract']==second['contract']
     assert first['requested_at']==second['requested_at']==old['requested_at']
     assert first['price_cutoff']==second['price_cutoff']==old['price_cutoff']
+
+
+
+def create_experiment(queue,old,uid='4'*32,**changes):
+    payload={'evaluation_start':old['sessions'][0],'evaluation_end':old['sessions'][0],
+        'execution_end_date':old['sessions'][-1],'allocation_policy':'FIXED_SHADOW'}
+    payload.update(changes)
+    return control.request_experiment(queue,'native:'+old['run_id']+':'+('a'*64),uid,**payload)
+
+
+def test_experiment_registration_freezes_scope_clocks_and_is_idempotent(queue,monkeypatch):
+    old=legacy(queue,monkeypatch)
+    first=create_experiment(queue,old)
+    assert first['business_started'] is False and first['queue_status']=='PENDING'
+    assert create_experiment(queue,old)==first
+    duplicate=create_experiment(queue,old,uid='5'*32)
+    assert duplicate['target_run_id']==first['target_run_id']
+    adaptive=create_experiment(queue,old,uid='6'*32,allocation_policy='ADAPTIVE_REGIME')
+    assert adaptive['target_run_id']!=first['target_run_id']
+    with queue.connect() as connection:
+        current=native.read_runs(connection,run_id=first['target_run_id'])[0]
+        for key in ('requested_at','price_cutoff','source_hash','published'):
+            assert current[key]==old[key]
+        assert current['sessions']==[old['sessions'][0]] and current['execution_end_date']==old['sessions'][-1]
+        assert current['source_run_id']==old['run_id'] and current['phase']=='PLAN'
+        assert connection.execute(text('SELECT COUNT(*) FROM st_job_v2')).scalar()==2
+        assert native.read_runs(connection,run_id=old['run_id'])[0]['status']=='FAILED'
+    with pytest.raises(ValueError,match='different experiment'):
+        create_experiment(queue,old,allocation_policy='ADAPTIVE_REGIME')
+
+
+@pytest.mark.parametrize('changes',[
+    {'evaluation_start':'2000-01-01'}, {'evaluation_end':'2099-01-01'},
+    {'execution_end_date':'2099-01-01'}, {'allocation_policy':'UNBOUNDED'},
+])
+def test_experiment_registration_rejects_new_data_scope_without_writes(queue,monkeypatch,changes):
+    old=legacy(queue,monkeypatch)
+    with pytest.raises(ValueError):create_experiment(queue,old,**changes)
+    with queue.connect() as connection:assert connection.execute(text('SELECT COUNT(*) FROM st_job_v2')).scalar()==0
+
+
+def test_experiment_registration_and_control_receipt_are_one_transaction(queue,monkeypatch):
+    old=legacy(queue,monkeypatch)
+    def fail(*_args,**_kwargs):raise RuntimeError('injected receipt failure')
+    monkeypatch.setattr(control,'_append_audit_connection',fail)
+    with pytest.raises(RuntimeError,match='receipt failure'):create_experiment(queue,old)
+    with queue.connect() as connection:
+        assert connection.execute(text('SELECT COUNT(*) FROM st_job_v2')).scalar()==0
+        assert len(native.read_runs(connection))==1
+
+
+def test_real_experiment_route_creates_the_typed_job_and_rejects_bad_payload(queue,monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from server.api.routers import quant_workbench as routes
+    old=legacy(queue,monkeypatch)
+    monkeypatch.setattr(routes,'get_engine',lambda:queue)
+    app=FastAPI();app.include_router(routes.router,prefix='/api')
+    url='/api/quant-workbench/strategy-performance/native:'+old['run_id']+':'+('a'*64)+'/experiments?request_uid='+('7'*32)
+    payload={'evaluation_start':old['sessions'][0],'evaluation_end':old['sessions'][0],
+             'execution_end_date':old['sessions'][-1],'allocation_policy':'FIXED_SHADOW'}
+    with TestClient(app) as client:
+        result=client.post(url,json=payload)
+        assert result.status_code==202,result.text
+        assert result.json()['business_started'] is False
+        assert client.post(url,json={**payload,'pretend_complete':True}).status_code==422
+        assert client.post(url,json={**payload,'evaluation_start':'not-a-date'}).status_code==422

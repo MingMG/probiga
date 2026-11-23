@@ -1,7 +1,10 @@
 """Leased retries and versioned recomputation of the same frozen research inputs."""
 import json
 import re
-from datetime import datetime,timedelta
+import time
+from contextlib import contextmanager
+from copy import deepcopy
+from datetime import date,datetime,timedelta
 
 from sqlalchemy import text
 
@@ -45,6 +48,7 @@ def request_retry(engine,result_id,request_uid):
             with connection.begin():
                 prior=read_requests(connection,request_uid)
                 if prior:
+                    if prior[0].get('kind')=='EXPERIMENT':raise ValueError('request identity belongs to an experiment registration')
                     if prior[0]['run_id']!=run_id:raise ValueError('retry identity is already bound to another experiment')
                     return prior[0]
                 states=native.read_runs(connection,run_id=run_id)
@@ -97,3 +101,82 @@ def request_retry(engine,result_id,request_uid):
         finally:
             connection.rollback()
             if mysql:connection.execute(text('SELECT RELEASE_LOCK(:name)'),{'name':native.LOCK});connection.commit()
+
+
+@contextmanager
+def _experiment_transaction(engine):
+    """Serialize registrations while leaving the execution owner independent."""
+    with engine.connect() as connection:
+        mysql=connection.dialect.name=='mysql'
+        acquired=False
+        try:
+            if mysql:
+                acquired=connection.execute(text("SELECT GET_LOCK('probiga:native-experiment-registration',3)")).scalar()==1
+                if not acquired:raise ValueError('另一个实验正在登记，请稍后重试')
+            connection.commit()
+            with connection.begin():yield connection
+        finally:
+            connection.rollback()
+            if acquired and not connection.invalidated:
+                connection.execute(text("SELECT RELEASE_LOCK('probiga:native-experiment-registration')"))
+                connection.commit()
+
+
+def request_experiment(engine,result_id,request_uid,*,evaluation_start,evaluation_end,
+                       execution_end_date,allocation_policy='FIXED_SHADOW'):
+    """Register a bounded experiment over an existing immutable source freeze."""
+    from server.common.analysis_pool_receipt import canonical_sha256
+    from server.engine.native_research_jobs import enqueue
+    if not re.fullmatch(r'[0-9a-f]{32}',request_uid):raise ValueError('invalid experiment request identity')
+    if not re.fullmatch(r'native:[0-9a-f]{64}:[0-9a-f]{64}',result_id):raise ValueError('invalid native source identity')
+    _,run_id,version_hash=result_id.split(':')
+    for value in (evaluation_start,evaluation_end,execution_end_date):
+        if date.fromisoformat(value).isoformat()!=value:raise ValueError('experiment dates must be exact ISO dates')
+    if allocation_policy not in ('FIXED_SHADOW','ADAPTIVE_REGIME'):raise ValueError('invalid allocation policy')
+    intent=canonical_sha256({'source_result_id':result_id,'evaluation_start':evaluation_start,
+        'evaluation_end':evaluation_end,'execution_end_date':execution_end_date,'allocation_policy':allocation_policy})
+    deadline=time.monotonic()+15
+    def check_deadline(stage):
+        if time.monotonic()>deadline:raise TimeoutError('EXPERIMENT_REGISTRATION_DEADLINE:'+stage)
+    with _experiment_transaction(engine) as connection:
+        prior=read_requests(connection,request_uid)
+        if prior:
+            if prior[0].get('intent_sha256')!=intent:raise ValueError('request identity is bound to a different experiment')
+            return prior[0]
+        runs=native.read_runs(connection,run_id=run_id)
+        check_deadline('SOURCE')
+        if not runs or not any(p['rule_hash']==version_hash for p in runs[0]['proposals']):raise KeyError(result_id)
+        source=runs[0]
+        if source['status'] not in ('COMPLETE','FAILED','BLOCKED'):
+            raise ValueError('来源实验仍在运行，请等待其终结后创建对照实验')
+        if not source['sessions'][0]<=evaluation_start<=evaluation_end<=source['sessions'][-1]:
+            raise ValueError('评估区间必须位于原冻结实验内')
+        sessions=[day for day in source['sessions'] if evaluation_start<=day<=evaluation_end]
+        if not sessions:raise ValueError('评估区间没有原实验交易日')
+        if not sessions[-1]<=execution_end_date<=source.get('execution_end_date',source['sessions'][-1]):
+            raise ValueError('成交窗口必须覆盖评估区间，且不能超出原冻结成交窗口')
+        family=source['strategies'][0]['source_kind']
+        if allocation_policy=='ADAPTIVE_REGIME' and family!='immutable_v3_sleeve':
+            raise ValueError('该策略族不提供市场状态调节入场实验')
+        strategies=[item for item in native._strategies(connection) if item['source_kind']==family]
+        check_deadline('STRATEGY')
+        if [(s['strategy_key'],s['version_hash']) for s in strategies]!=[(s['strategy_key'],s['version_hash']) for s in source['strategies']]:
+            raise ValueError('策略登记版本已变化，不能替换原实验规则')
+        frozen=deepcopy(source);frozen['sessions']=sessions
+        state=native._start(connection,strategies,sessions,source['published'],source['source_hash'],
+            frozen=frozen,allocation_policy=allocation_policy,execution_end_date=execution_end_date)
+        check_deadline('PLAN')
+        queued=enqueue(connection,state,requested_by='native-research-experiment')
+        if queued['status']=='FAILED':raise ValueError('相同冻结输入的实验已失败，请使用从断点重试')
+        value={'kind':'EXPERIMENT','request_uid':request_uid,'intent_sha256':intent,'run_id':run_id,
+            'target_run_id':queued['result_ref'],'job_id':queued['job_id'],'status':'COMPLETE','business_started':False,
+            'queue_status':queued['status'],
+            'evaluation_sessions':sessions,'execution_end_date':execution_end_date,'allocation_policy':allocation_policy,
+            'data_decision_known_at':state['requested_at'],'price_cutoff':state['price_cutoff'],
+            'requested_at':str(now_shanghai()),'reason':('冻结输入实验已登记；等待现有调度器执行'
+                if queued['status'] in ('PENDING','RUNNING') else '同一冻结输入已有结果，已复用保存的实验')}
+        _append_audit_connection(connection,entity_type=ENTITY,entity_key=request_uid,action='REQUEST_00000001',
+            operator='native-research-control',reason=value['reason'],before=None,after=value,
+            evidence={'source_run_id':run_id,'job_id':queued['job_id'],'real_order_authority':False})
+        check_deadline('QUEUE_AND_RECEIPT')
+        return value
