@@ -4,6 +4,8 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
+from threading import Barrier, Lock
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -100,3 +102,42 @@ def test_schema_guard_boundary_includes_trigger_metadata_authority():
     ]
     assert "include_migrator=True" in function
     assert "boundary.migrator_engine" in source
+
+
+def test_mysql_guard_checks_every_contract_in_bounded_parallel_batches():
+    barrier = Barrier(4)
+    lock = Lock()
+    active = 0
+    peak = 0
+    observed = []
+    progress = []
+
+    def validator(index):
+        def run(engine):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+                observed.append(index)
+            try:
+                barrier.wait(timeout=5)
+                if index == 3:
+                    raise RuntimeError("private database diagnostic")
+            finally:
+                with lock:
+                    active -= 1
+        return run
+
+    result = schema_guard.collect_schema_guard(
+        SimpleNamespace(dialect=SimpleNamespace(name="mysql")),
+        validators=tuple((str(i), validator(i)) for i in range(8)),
+        progress=progress.append,
+    )
+    assert sorted(observed) == list(range(8))
+    assert peak == 4
+    assert list(result["checks"]) == list(map(str, range(8)))
+    assert result["check_count"] == 8
+    assert result["mismatch_count"] == 1
+    assert result["checks"]["3"]["error_type"] == "RuntimeError"
+    assert len(progress) == 16
+    assert "private database diagnostic" not in json.dumps(progress)

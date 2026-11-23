@@ -11,6 +11,8 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable, Iterable
 from typing import Any
 
@@ -35,6 +37,7 @@ def collect_schema_guard(
     engine: Any,
     *,
     validators: Iterable[tuple[str, Callable[[Any], Any]]] | None = None,
+    progress: Callable[[dict[str, object]], None] | None = None,
 ) -> dict[str, object]:
     """Run every code-owned runtime schema validator without changing state."""
     from server.common import production_runtime_schema_bundle as bundle
@@ -45,26 +48,45 @@ def collect_schema_guard(
     if len({name for name, _ in entries}) != len(entries):
         raise SchemaGuardError("required_schema_inventory_duplicate")
 
-    checks: dict[str, dict[str, object]] = {}
     for name, validator in entries:
         if not isinstance(name, str) or not name or not callable(validator):
             raise SchemaGuardError("required_schema_inventory_invalid")
+
+    def check(entry: tuple[str, Callable[[Any], Any]]) -> dict[str, object]:
+        name, validator = entry
+        started = time.monotonic()
+        if progress is not None:
+            progress({"check": name, "state": "STARTED"})
         try:
             validator(engine)
         except Exception as exc:
-            checks[name] = {
+            result = {
                 "status": "MIGRATION_REQUIRED",
                 "error_type": type(exc).__name__,
                 "read_only": True,
             }
             args = getattr(getattr(exc, "orig", exc), "args", ())
             if args and type(args[0]) is int:
-                checks[name]["database_errno"] = args[0]
+                result["database_errno"] = args[0]
         else:
-            checks[name] = {
+            result = {
                 "status": "READY",
                 "read_only": True,
             }
+        if progress is not None:
+            progress({"check": name, "state": "FINISHED",
+                      "elapsed_seconds": round(time.monotonic() - started, 3),
+                      **result})
+        return result
+
+    # MySQL engines give each validator its own connection. Keep SQLite and
+    # other engines serial, including connection-local in-memory databases.
+    if getattr(getattr(engine, "dialect", None), "name", None) == "mysql":
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            results = tuple(executor.map(check, entries))
+    else:
+        results = tuple(map(check, entries))
+    checks = {name: result for (name, _), result in zip(entries, results)}
 
     metadata = bundle._contract_metadata()
     mismatch_count = sum(
@@ -110,14 +132,19 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     boundary = None
     try:
+        print("schema_guard database_boundary STARTED", file=sys.stderr, flush=True)
         boundary = _open_read_only_boundary()
+        print("schema_guard database_boundary READY", file=sys.stderr, flush=True)
         # Runtime has SELECT but no TRIGGER privilege, so MySQL hides trigger
         # metadata from information_schema. The read-only migrator connection
         # is required to validate the append-only trigger contracts.
         engine = boundary.migrator_engine
         if engine is None:
             raise SchemaGuardError("required_schema_inventory_unavailable")
-        result = collect_schema_guard(engine)
+        result = collect_schema_guard(engine, progress=lambda item: print(
+            "schema_guard " + json.dumps(item, sort_keys=True),
+            file=sys.stderr, flush=True,
+        ))
     except SchemaGuardError as exc:
         print(json.dumps({
             "schema": SCHEMA,
