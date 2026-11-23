@@ -32,13 +32,15 @@ def recent_heads(connection, entity, limit, *, deadline=None):
     keys = []
     cursor = ''
     while True:
-        key = connection.execute(text(f'''SELECT /*+ MAX_EXECUTION_TIME({_budget(deadline)}) */ entity_key
+        page = list(connection.execute(text(f'''SELECT /*+ MAX_EXECUTION_TIME({_budget(deadline)}) */ DISTINCT entity_key
             FROM st_strategy_governance_audit WHERE entity_type=:entity AND entity_key>:cursor
-            ORDER BY entity_key LIMIT 1'''), {'entity': entity, 'cursor': cursor}).scalar()
-        if key is None:
+            ORDER BY entity_key LIMIT 256'''), {'entity': entity, 'cursor': cursor}).scalars())
+        if not page:
             break
-        keys.append(key)
-        cursor = key
+        keys.extend(page)
+        cursor = page[-1]
+        if len(page) < 256:
+            break
     def batch(rows, sequence=False):
         # Eight constant seeks avoid the measured optimizer blow-up of wider UNIONs.
         parameters = {'entity': entity}
