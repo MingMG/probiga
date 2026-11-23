@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import time
 from collections import defaultdict
 from datetime import date
 
@@ -287,23 +288,16 @@ def read_performance(engine, day, *, experiment_id=None):
 def read_performance_version(engine, *, experiment_id=None):
     """Only indexed journal heads and small queue receipts; no result bodies."""
     headers=[]
+    from server.common.strategy_audit_heads import latest_head, recent_heads
+    deadline=time.monotonic()+4
     with engine.connect() as connection:
         for entity in ('NATIVE_REPLAY','AUTO_RESEARCH'):
-            rows=connection.execute(text('''SELECT /*+ MAX_EXECUTION_TIME(4000) */ h.entity_key,h.latest_at,MAX(a.action) AS sequence
-              FROM (SELECT heads.entity_key,
-                (SELECT created_at FROM st_strategy_governance_audit b
-                 WHERE b.entity_type=:entity AND b.entity_key=heads.entity_key ORDER BY created_at DESC LIMIT 1) latest_at
-                FROM (SELECT DISTINCT entity_key FROM st_strategy_governance_audit WHERE entity_type=:entity) heads
-                ORDER BY latest_at DESC,heads.entity_key DESC LIMIT 12) h
-              JOIN st_strategy_governance_audit a ON a.entity_type=:entity AND a.entity_key=h.entity_key AND a.created_at=h.latest_at
-              GROUP BY h.entity_key,h.latest_at ORDER BY h.latest_at DESC,h.entity_key DESC'''),{'entity':entity}).mappings().all()
+            rows=recent_heads(connection,entity,12,deadline=deadline)
             for row in rows:
-                headers.append((entity,row['entity_key'],str(row['latest_at']),row['sequence']))
+                headers.append((entity,row['entity_key'],str(row['latest_at']),row['action']))
         if experiment_id and not any(row[1]==experiment_id for row in headers):
-            row=connection.execute(text('''SELECT created_at,action FROM st_strategy_governance_audit
-                WHERE entity_type='NATIVE_REPLAY' AND entity_key=:uid ORDER BY created_at DESC,action DESC LIMIT 1'''),
-                {'uid':experiment_id}).first()
-            headers.append(('NATIVE_REPLAY',experiment_id,*(str(value) for value in row))) if row else None
+            row=latest_head(connection,'NATIVE_REPLAY',experiment_id,deadline=deadline)
+            if row:headers.append(('NATIVE_REPLAY',experiment_id,str(row['latest_at']),row['action']))
         jobs=[dict(row) for row in connection.execute(text('''SELECT /*+ MAX_EXECUTION_TIME(2000) */
             job_id,status,result_ref,finished_at FROM st_job_v2 ORDER BY requested_at DESC,job_id DESC LIMIT 24''')).mappings()]
     return {'version':canonical_json_hash({'heads':headers,'jobs':jobs}),'experiment_id':experiment_id,'refresh_seconds':20}
