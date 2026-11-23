@@ -200,3 +200,33 @@ def test_default_experiment_prefers_recent_terminal_over_old_failure_and_honors_
     assert performance.read_performance(engine,'2026-11-20')['experiment_id']=='4'*64
     assert performance.read_performance(engine,'2026-11-20',experiment_id='3'*64)['experiment_id']=='3'*64
     engine.dispose()
+
+
+def test_version_detects_old_and_same_second_appends_without_result_bodies():
+    from server.api.strategy_performance import read_performance_version
+    engine=create_engine('sqlite://')
+    with engine.begin() as c:
+        c.execute(text('''CREATE TABLE st_strategy_governance_audit (
+            audit_id TEXT PRIMARY KEY,entity_type TEXT,entity_key TEXT,created_at TEXT,action TEXT)'''))
+        c.execute(text('''CREATE TABLE st_job_v2 (
+            job_id TEXT,status TEXT,result_ref TEXT,finished_at TEXT,requested_at TEXT)'''))
+        for number in range(46):
+            c.execute(text('''INSERT INTO st_strategy_governance_audit VALUES (
+                :id,'NATIVE_REPLAY',:key,'2026-11-20','CHECKPOINT_00000010')'''),
+                {'id':f'zz{number}', 'key':f'run{number:03d}'})
+    def version():
+        return read_performance_version(engine,experiment_id='run045')['version']
+    previous=version()
+    assert version()==previous
+    for identity, entity, key, stamp, action in (
+        ('old','NATIVE_REPLAY','old-run','2000-01-01','CHECKPOINT_00000001'),
+        ('aa','NATIVE_REPLAY','run045','2026-11-20','CHECKPOINT_00000001'),
+        ('auto','AUTO_RESEARCH','other','2000-01-01','CHECKPOINT_00000001'),
+    ):
+        with engine.begin() as c:
+            c.execute(text('INSERT INTO st_strategy_governance_audit VALUES (:id,:entity,:key,:stamp,:action)'),
+                {'id':identity,'entity':entity,'key':key,'stamp':stamp,'action':action})
+        current=version()
+        assert current!=previous
+        previous=current
+    engine.dispose()
