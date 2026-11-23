@@ -132,23 +132,44 @@ def test_changed_reader_recomputes_original_frozen_window_without_copying_signal
         assert receipt['target_run_id']==current['run_id'] and receipt['source_contract']=='code'
 
 
-def test_new_compute_contract_never_runs_under_an_old_checkpoint(ledger,monkeypatch):
-    from server.common import authoritative_market_clock
+def test_pending_version_change_automatically_preserves_frozen_inputs_and_old_signals(ledger,monkeypatch):
     with ledger.connect() as c:
         state=native.read_runs(c)[0]
         state['status']='NOT_STARTED'
         _append_audit_connection(c,entity_type=native.ENTITY,entity_key=state['run_id'],action='CHECKPOINT_00000004',
             operator='test',reason='pending',before=None,after=state,evidence={})
         c.commit()
-    saved=[]
+    with ledger.connect() as c:original=native.read_runs(c)[0]
     monkeypatch.setattr(native,'_contract',lambda:'new-code')
     monkeypatch.setattr(native,'_owner',lambda _c:{'scheduler_run_uid':'new'})
     monkeypatch.setattr(native,'_resume_allowed',lambda *_:True)
-    monkeypatch.setattr(native,'_save',lambda _c,state,*_:saved.append(dict(state)))
-    monkeypatch.setattr(native,'_strategies',lambda _c:[])
-    monkeypatch.setattr(native,'_inventory',lambda *_:([],{},'source'))
-    monkeypatch.setattr(native,'_step',lambda *_:pytest.fail('old contract must not execute new calculations'))
-    monkeypatch.setattr(authoritative_market_clock,'authoritative_closed_trade_date',lambda *_a,**_k:'2026-11-20')
+    monkeypatch.setattr(native,'now_shanghai',lambda:datetime(2026,11,23,19))
+    monkeypatch.setattr(native,'_inventory',lambda *_:pytest.fail('pending work must retain its own frozen inventory'))
+    monkeypatch.setattr(native.signal,'SIGALRM',14,raising=False)
+    monkeypatch.setattr(native.signal,'ITIMER_REAL',0,raising=False)
+    monkeypatch.setattr(native.signal,'signal',lambda *_:None)
+    monkeypatch.setattr(native.signal,'setitimer',lambda *_:None,raising=False)
+    def save(c,state,owner,events=()):
+        state['checkpoint_sequence']=state.get('checkpoint_sequence',0)+1
+        state['owner']=owner
+        for item in [*events,{'entity_type':native.ENTITY,'entity_key':state['run_id'],
+                'action':f"CHECKPOINT_{state['checkpoint_sequence']:08d}",'after':state}]:
+            _append_audit_connection(c,**item,reason='version update',operator='test',before=None,evidence={})
+        c.commit()
+    monkeypatch.setattr(native,'_save',save)
+    processed=[]
+    def step(c,state,owner):
+        assert state['run_id']!=original['run_id'] and state['contract']=='new-code'
+        assert all(state[k]==original[k] for k in ('sessions','published','source_hash','requested_at','price_cutoff'))
+        assert native._partitions(c,state,state,'S')=={}
+        processed.append(state['run_id']);save(c,state,owner)
+    monkeypatch.setattr(native,'_step',step)
+    result=native.native_tick(ledger)
+    assert result['run_id']==processed[0]
+    with ledger.connect() as c:
+        previous=native.read_runs(c,run_id=original['run_id'])[0]
+        assert previous['status']=='BLOCKED' and previous['superseded_by_run_id']==processed[0]
+        assert previous['contract']=='code' and previous['cursor']==1 and previous['completed_units']==141
+        assert len(native._partitions(c,previous,previous,'S'))==2
     native.native_tick(ledger)
-    assert len(saved)==1 and saved[0]['status']=='BLOCKED'
-    assert saved[0]['contract']=='code' and saved[0]['cursor']==1 and saved[0]['completed_units']==141
+    assert processed==[processed[0],processed[0]]

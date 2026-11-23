@@ -33,10 +33,14 @@ def read_runs(connection, run_id=None):
     from server.engine.strategy_governance import _digest
     # Find recent journal heads through the covering entity/time index before reading bodies.
     scope = " AND entity_key=:uid" if run_id is not None else ""
-    heads = connection.execute(text(f"""SELECT /*+ MAX_EXECUTION_TIME(4000) */
-        entity_key,MAX(created_at) AS latest_at FROM st_strategy_governance_audit
-        WHERE entity_type=:entity{scope} GROUP BY entity_type,entity_key
-        ORDER BY latest_at DESC,entity_key DESC LIMIT 8"""), {'entity':ENTITY,'uid':run_id}).mappings().all()
+    # Seek each run's latest indexed timestamp instead of aggregating every checkpoint.
+    heads = connection.execute(text(f"""SELECT /*+ MAX_EXECUTION_TIME(8000) */
+        heads.entity_key,(SELECT created_at FROM st_strategy_governance_audit b
+            WHERE b.entity_type=:entity AND b.entity_key=heads.entity_key
+            ORDER BY created_at DESC LIMIT 1) AS latest_at
+        FROM (SELECT DISTINCT entity_key FROM st_strategy_governance_audit
+            WHERE entity_type=:entity{scope}) heads
+        ORDER BY latest_at DESC,heads.entity_key DESC LIMIT 8"""), {'entity':ENTITY,'uid':run_id}).mappings().all()
     records=[]
     for head in heads:
         records.extend(connection.execute(text("""SELECT /*+ MAX_EXECUTION_TIME(4000) */ payload_json,audit_hash,after_json
@@ -360,13 +364,18 @@ def _v2_day(c,state,day):
     return {'status':'COMPLETE','signals':selected,'source_run_uid':uid,'source_sha256':receipt['score_snapshot_sha256'],'identity':proof}
 
 
-def _start(c,strategies,days,published,source_hash,contract):
+def _start(c,strategies,days,published,source_hash,contract,*,frozen=None):
     from server.engine.autonomous_strategy_research import _read_states
     prior=next((r.get('price_backtest') for r in _read_states(c) if (r.get('price_backtest') or {}).get('sessions')==days),None)
     warmup=sorted(str(d)[:10] for d in c.execute(text('SELECT DISTINCT trade_date FROM si_trade_calendar WHERE trade_status=1 AND trade_date<:d ORDER BY trade_date DESC LIMIT 20'),{'d':days[0]}).scalars())
     clock=str(now_shanghai());versions=[(s['strategy_key'],s['current_version'],s['version_hash']) for s in strategies]
-    frozen=next((r for r in read_runs(c) if r['source_hash']==source_hash and r['sessions']==days
-        and [(s['strategy_key'],s['current_version'],s['version_hash']) for s in r['strategies']]==versions),None)
+    if frozen is not None and (frozen['source_hash']!=source_hash or frozen['sessions']!=days
+            or frozen['published']!=published
+            or [(s['strategy_key'],s['current_version'],s['version_hash']) for s in frozen['strategies']]!=versions):
+        raise ValueError('冻结回测输入与目标策略及来源身份不一致')
+    if frozen is None:
+        frozen=next((r for r in read_runs(c) if r['source_hash']==source_hash and r['sessions']==days
+            and [(s['strategy_key'],s['current_version'],s['version_hash']) for s in r['strategies']]==versions),None)
     # Retain input availability clocks and archives; a new execution has its own bounded budget.
     requested=frozen['requested_at'] if frozen else clock
     archives=(list(frozen['input_archives'])+[{'run_id':frozen['run_id'],'rule_hash':frozen['rule_hash']}]
@@ -470,11 +479,24 @@ def native_tick(engine):
                 if previous['contract']==contract:continue
                 if not _resume_allowed(c,previous,owner):
                     return {'status':'BLOCKED','reason':'计算规则已更新，等待旧运行所有者退出','run_id':previous['run_id']}
-                previous.update(status='BLOCKED',step_status='BLOCKED',reason='计算契约已变化，原检查点保留；使用同源行情建立当前契约研究')
+                candidate=_start(c,previous['strategies'],previous['sessions'],previous['published'],previous['source_hash'],contract,frozen=previous)
+                if any(candidate[k]!=previous[k] for k in ('sessions','published','source_hash','requested_at','price_cutoff')):
+                    raise ValueError('版本更新不能改变待执行回测的冻结输入及可用时间')
+                current=next((r for r in runs if r['run_id']==candidate['run_id']),None)
+                previous.update(status='BLOCKED',step_status='BLOCKED',
+                    superseded_by_run_id=candidate['run_id'],reason='计算契约已变化，原冻结输入移交当前契约研究：'+candidate['run_id'])
                 for p in previous['proposals']:
                     p['validation'].update(status='BLOCKED',reason=previous['reason'])
-                _save(c,previous,owner)
+                if current is None:
+                    previous['checkpoint_sequence']+=1
+                    event={'entity_type':ENTITY,'entity_key':previous['run_id'],
+                        'action':f"CHECKPOINT_{previous['checkpoint_sequence']:08d}",'after':previous}
+                    _save(c,candidate,owner,[event])
+                    runs.insert(0,candidate);pending.append(candidate)
+                else:
+                    _save(c,previous,owner)
                 pending.remove(previous)
+            pending.sort(key=lambda r:(r.get('requested_at',''),r['run_id']))
             state=next((r for r in pending if r.get('retry_after','')<=str(now_shanghai())),None)
             if pending and state is None:return {'status':'BLOCKED','reason':'等待有界数据库重试时间','run_id':pending[0]['run_id']}
             if state is None:
