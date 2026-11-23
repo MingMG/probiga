@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+import sqlite3
+
+import pytest
 
 from sqlalchemy import create_engine, text
 
@@ -56,6 +59,7 @@ def _engine():
         """))
         connection.execute(text("""
             CREATE TABLE qmt_concept_member_snapshot (
+                id INTEGER PRIMARY KEY,
                 snapshot_date DATE NOT NULL, source TEXT NOT NULL,
                 stock_code TEXT NOT NULL, concept_code TEXT NOT NULL,
                 concept_name TEXT NOT NULL, short_name TEXT NOT NULL,
@@ -268,6 +272,7 @@ def test_formal_concepts_bind_cutoff_and_prior_date_while_research_may_use_older
         """), {"concept_hash": _membership_hash([("A", "人工智能", "000001", "平安银行")])})
         connection.execute(text("""
             INSERT INTO qmt_concept_member_snapshot
+                (snapshot_date,source,stock_code,concept_code,concept_name,short_name,quality_status,captured_at)
             VALUES ('2026-08-11', :source, '000001', 'A', '人工智能',
                     '平安银行', 'QMT_VALIDATED', '2026-08-11 18:00:00')
         """), {"source": PROVIDER_ID})
@@ -304,6 +309,48 @@ def test_formal_concepts_bind_cutoff_and_prior_date_while_research_may_use_older
     )
     assert tampered["000001"] == [("801780", "银行", "industry")]
     assert source_date is None
+
+
+def _concept_reader_engine():
+    engine=_engine()
+    _insert_snapshot(engine,snapshot_date='2026-08-11',captured_at='2026-08-11 18:00:00',
+                     industry_code='801780',industry_name='银行')
+    with engine.begin() as c:
+        c.execute(text('''UPDATE qmt_membership_snapshot_run SET concept_relation_count=1,
+            concept_hash=:digest'''),{'digest':_membership_hash([('A','人工智能','000001','平安银行')])})
+        c.execute(text('''INSERT INTO qmt_concept_member_snapshot
+            (snapshot_date,source,stock_code,concept_code,concept_name,short_name,quality_status,captured_at)
+            VALUES ('2026-08-11',:source,'000001','A','人工智能','平安银行',
+                    'QMT_VALIDATED','2026-08-11 18:00:00')'''),{'source':PROVIDER_ID})
+    return engine
+
+
+def test_concept_full_market_read_does_not_expand_thousands_of_stock_parameters():
+    engine=_concept_reader_engine()
+    with engine.connect() as c:
+        c.connection.driver_connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER,999)
+    rows,snapshot=_load_theme_memberships(engine,as_of=date(2026,8,11),
+        decision_at=datetime(2026,8,11,20),codes=[f'{i:06d}' for i in range(1,4756)],industries={})
+    assert snapshot==date(2026,8,11)
+    assert rows['000001']==[('A','人工智能','concept')]
+    engine.dispose()
+
+
+def test_concept_member_read_failure_is_not_reported_as_missing_snapshot():
+    engine=_concept_reader_engine()
+    with engine.connect() as c:
+        dbapi=c.connection.driver_connection
+    def authorize(action,table,column,*_):
+        return (sqlite3.SQLITE_DENY if action==sqlite3.SQLITE_READ
+                and table=='qmt_concept_member_snapshot' and column=='concept_name' else sqlite3.SQLITE_OK)
+    dbapi.set_authorizer(authorize)
+    try:
+        with pytest.raises(RuntimeError,match='QMT_CONCEPT_SNAPSHOT_READ_FAILED:MEMBERS'):
+            _load_theme_memberships(engine,as_of=date(2026,8,11),decision_at=datetime(2026,8,11,20),
+                codes=['000001'],industries={})
+    finally:
+        dbapi.set_authorizer(None)
+        engine.dispose()
 
 
 def test_retrospective_research_may_use_verified_last_known_snapshot():
