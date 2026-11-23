@@ -85,6 +85,26 @@ def _bytes(payload):
     return bytes(raw)
 
 
+def _json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError('duplicate prepared JSON key')
+        result[key] = value
+    return result
+
+
+def _json_float(value):
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError('invalid prepared JSON number')
+    return number
+
+
+def _json_constant(value):
+    raise ValueError('invalid prepared JSON constant: ' + value)
+
+
 class PreparedDataset:
     def __init__(self, root=None, *, quota_bytes=DEFAULT_QUOTA_BYTES):
         configured = root or os.environ.get('PROBIGA_NATIVE_DATASET_ROOT')
@@ -161,7 +181,7 @@ class PreparedDataset:
         self._install(reference, payload)
         return reference
 
-    def get(self, reference):
+    def _verified_bytes(self, reference):
         path = self._path(reference['sha256'])
         if (reference.get('schema') != SCHEMA or type(reference.get('bytes')) is not int
                 or not 0 < reference['bytes'] <= MAX_BLOCK_BYTES):
@@ -170,13 +190,19 @@ class PreparedDataset:
             if path.stat().st_size != reference['bytes']:
                 raise PreparedInputMissing(reference['sha256'])
             raw = path.read_bytes()
-            if hashlib.sha256(raw).hexdigest() != reference['sha256']:
+            if len(raw) != reference['bytes'] or hashlib.sha256(raw).hexdigest() != reference['sha256']:
                 raise PreparedInputMissing(reference['sha256'])
         except FileNotFoundError:
             raise PreparedInputMissing(reference['sha256']) from None
-        payload = json.loads(raw)
-        if payload.get('schema') != SCHEMA or _bytes(payload) != raw:
-            raise ValueError('prepared input schema or canonical encoding differs')
+        return raw
+
+    def get(self, reference):
+        raw = self._verified_bytes(reference)
+        # The hash binds the canonical bytes checked at installation; do not serialize them again.
+        payload = json.loads(raw, object_pairs_hook=_json_object,
+                             parse_float=_json_float, parse_constant=_json_constant)
+        if type(payload) is not dict or payload.get('schema') != SCHEMA or 'value' not in payload:
+            raise ValueError('prepared input schema differs')
         return decode(payload['value'])
 
     def prepare(self, formal_store, references):
@@ -184,7 +210,7 @@ class PreparedDataset:
         missing = []
         for reference in references:
             try:
-                self.get(reference)
+                self._verified_bytes(reference)
             except PreparedInputMissing:
                 missing.append(reference)
         from server.common.formal_analysis_store import FORMAL_ANALYSIS_BATCH_MAX_BYTES
