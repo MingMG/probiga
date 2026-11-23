@@ -4148,6 +4148,7 @@ def _select_finance_atomic_batch_members(
     incremental_discovery: Mapping[str, Any] | None = None,
     catalog_binding: Mapping[str, Any] | None = None,
     sealed_members: Mapping[str, Mapping[str, Any]] | None = None,
+    coverage_store=None, coverage_generation=None, coverage_progress=None,
 ) -> tuple[list[dict[str, Any]], datetime]:
     """Select one strict finance disposition per catalog member.
 
@@ -4203,6 +4204,26 @@ def _select_finance_atomic_batch_members(
         with connection.begin():
             for offset in range(0, len(codes), batch_size):
                 code_batch = codes[offset : offset + batch_size]
+                checkpoint_key = canonical_hash(code_batch)
+                retained = coverage_store.get(coverage_generation, 'finance_source_coverage', checkpoint_key) if coverage_store is not None else None
+                if retained is not None:
+                    rows = retained['rows']
+                    if (retained['codes'] != code_batch or len(rows) != len(code_batch)
+                            or [_finance_atomic_member(row) for row in rows] != [sealed_members[code] for code in code_batch]):
+                        raise ValueError("finance source checkpoint member proof differs")
+                    for row in rows:
+                        for field in ('_latest_publication_at', '_source_publication_at'):
+                            if field in row:
+                                row[field] = _row_datetime(row[field])
+                        cutoff = _row_datetime(row['known_at'])
+                        if row.get('_incremental_discovery_binding'):
+                            cutoff = max(cutoff, _row_datetime(incremental_discovery['known_at']))
+                        source_cutoff = cutoff if source_cutoff is None else min(source_cutoff, cutoff)
+                    selected.extend(rows)
+                    if coverage_progress is not None:
+                        coverage_progress(offset + len(code_batch), len(codes), coverage_generation, False)
+                    continue
+                batch_start = len(selected)
                 parameters = {"codes": code_batch, "completed_known_at": completed_known_at}
                 if sealed_members is not None:
                     parameters["coverage_ids"] = [sealed_members[code]["coverage_id"] for code in code_batch]
@@ -4479,6 +4500,14 @@ def _select_finance_atomic_batch_members(
                         else min(source_cutoff, member_source_cutoff)
                     )
                     selected.append(compact)
+                if coverage_store is not None:
+                    rows = selected[batch_start:]
+                    if [_finance_atomic_member(row) for row in rows] != [sealed_members[code] for code in code_batch]:
+                        raise ValueError("finance source checkpoint member proof differs")
+                    coverage_store.put(coverage_generation, 'finance_source_coverage', checkpoint_key,
+                        _json_safe({'codes': code_batch, 'rows': rows}))
+                    if coverage_progress is not None:
+                        coverage_progress(offset + len(code_batch), len(codes), coverage_generation, True)
 
     if source_cutoff is None:
         raise ValueError("finance atomic batch catalog scope is empty")
@@ -5442,6 +5471,7 @@ def load_finance_atomic_batch_seal(
     as_of_date: date | str,
     seal_coverage_id: str = "",
     verify_source_rows: bool = True,
+    coverage_store=None, coverage_progress=None,
 ) -> dict[str, Any]:
     """Validate and resolve the latest immutable full-catalog finance seal."""
 
@@ -5556,6 +5586,12 @@ def load_finance_atomic_batch_seal(
                 incremental_discovery=incremental_discovery,
                 catalog_binding=catalog_binding,
                 sealed_members={code: member_map[code] for code in source_validation_codes},
+                coverage_store=coverage_store, coverage_progress=coverage_progress,
+                coverage_generation=canonical_hash({
+                    'schema': 'probiga.finance-source-coverage.v1',
+                    'seal': str(row['coverage_id']), 'evidence': evidence,
+                    'reader': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                }) if coverage_store is not None else None,
             )
         selected_map = {
             str(item.get("stock_code") or "").zfill(6): item
@@ -6210,6 +6246,7 @@ def resolve_common_fact_cutoff(
     event_progress: Callable[[int, int], None] | None = None,
     event_trade_date: date | str | None = None,
     event_coverage_store=None, event_coverage_progress=None,
+    finance_coverage_store=None, finance_coverage_progress=None,
     finance_observation_at: datetime | str | None = None,
     required_premarket_announcement: FrozenPremarketAnnouncement | None = None,
     required_initial_announcement: FrozenInitialAnnouncement | None = None,
@@ -6263,6 +6300,7 @@ def resolve_common_fact_cutoff(
             codes=normalized_codes,
             decision_at=finance_observation,
             as_of_date=windows["finance"][1],
+            coverage_store=finance_coverage_store, coverage_progress=finance_coverage_progress,
         )
     except Exception as exc:
         diagnostic = type(exc).__name__
@@ -6340,6 +6378,7 @@ def resolve_common_fact_cutoff(
                 finance_batch = load_finance_atomic_batch_seal(
                     engine, codes=normalized_codes, decision_at=finance_observation,
                     as_of_date=windows["finance"][1],
+                    coverage_store=finance_coverage_store, coverage_progress=finance_coverage_progress,
                 )
             except Exception as exc:
                 return {**blocked,"reason":"PIT_FINANCE_ATOMIC_BATCH_INVALID:"+type(exc).__name__}
