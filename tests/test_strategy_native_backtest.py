@@ -207,3 +207,45 @@ def test_native_journal_reads_latest_heads_without_sorting_historical_bodies():
         assert native.read_runs(c,run_id='run')[0]['checkpoint_sequence']==3
         assert native.read_runs(c,run_id='absent')==[]
     engine.dispose()
+
+
+def test_run_directory_seeks_latest_heads_within_the_old_aggregate_work_budget():
+    import json
+    from sqlalchemy.exc import OperationalError
+    from server.engine.strategy_governance import _digest
+    engine=create_engine('sqlite://')
+    with engine.begin() as c:
+        c.execute(text('CREATE TABLE st_strategy_governance_audit(audit_id INT PRIMARY KEY,entity_type TEXT,entity_key TEXT,action TEXT,created_at TEXT,payload_json TEXT,audit_hash TEXT,after_json TEXT)'))
+        c.execute(text('CREATE INDEX idx_strategy_governance_audit_entity ON st_strategy_governance_audit(entity_type,entity_key,created_at)'))
+        rows=[]
+        for run in range(80):
+            for checkpoint in range(100):
+                state={'schema':native.SCHEMA,'run_id':f'{run:064x}','checkpoint_sequence':checkpoint,'proposals':[]}
+                payload={'after':state}
+                rows.append({'id':len(rows),'entity':native.ENTITY,'key':state['run_id'],
+                    'action':f'CHECKPOINT_{checkpoint:08d}','stamp':f'2026-11-22 00:{checkpoint//60:02d}:{checkpoint%60:02d}',
+                    'payload':json.dumps(payload),'hash':_digest(payload),'after':json.dumps(state)})
+        c.execute(text('INSERT INTO st_strategy_governance_audit VALUES(:id,:entity,:key,:action,:stamp,:payload,:hash,:after)'),rows)
+    old="SELECT entity_key,MAX(created_at) AS latest_at FROM st_strategy_governance_audit WHERE entity_type='NATIVE_REPLAY' GROUP BY entity_type,entity_key ORDER BY latest_at DESC,entity_key DESC LIMIT 8"
+    with engine.connect() as c:
+        db=c.connection.driver_connection
+        count=[0]
+        def count_steps():count[0]+=1;return 0
+        db.set_progress_handler(count_steps,1)
+        expected=c.execute(text(old)).mappings().all()
+        old_steps=count[0]
+        count[0]=0
+        result=native.read_runs(c)
+        new_steps=count[0]
+        db.set_progress_handler(None,0)
+        assert [r['run_id'] for r in result]==[r['entity_key'] for r in expected]
+        assert all(r['checkpoint_sequence']==99 for r in result)
+        assert new_steps<old_steps*0.75
+        budget=int(old_steps*0.75)
+        def exhausted():count[0]+=1;return int(count[0]>budget)
+        db.set_progress_handler(exhausted,1);count[0]=0
+        with pytest.raises(OperationalError,match='interrupted'):c.execute(text(old)).all()
+        count[0]=0
+        assert len(native.read_runs(c))==8
+        db.set_progress_handler(None,0)
+    engine.dispose()

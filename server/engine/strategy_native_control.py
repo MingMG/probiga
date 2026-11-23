@@ -108,7 +108,7 @@ def consume_retries(engine):
                     if ([(s['strategy_key'],s['version_hash']) for s in strategies]
                             !=[(s['strategy_key'],s['version_hash']) for s in state['strategies']]):
                         return _reject_request(c,request,'策略登记版本已变化，禁止替换原研究规则',applied_at)
-                    candidate=native._start(c,strategies,state['sessions'],state['published'],state['source_hash'],contract)
+                    candidate=native._start(c,strategies,state['sessions'],state['published'],state['source_hash'],contract,frozen=state)
                     if any(candidate[k]!=state[k] for k in ('sessions','published','source_hash','requested_at','price_cutoff')):
                         return _reject_request(c,request,'重新计算不能改变原冻结输入及可用时间',applied_at)
                     if native.read_runs(c,run_id=candidate['run_id']):
