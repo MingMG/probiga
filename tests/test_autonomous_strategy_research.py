@@ -128,6 +128,41 @@ def test_research_replay_honors_next_session_t_plus_one_and_estimated_fees(rule,
     assert report["funding_eligible"] is False
 
 
+def test_completed_experiment_keeps_its_report_when_reader_release_changes(ledger, rule, replay_data, monkeypatch):
+    from server.engine import strategy_price_backtest as price
+    days, bars, signals = replay_data
+    report = replay_rule(rule, signals, bars, days)
+    assert report['completed_trade_count'] == 1
+    old_contract = '1' * 64
+    validation = {'status': report['status'], 'report': report,
+                  'backtest_contract': old_contract, 'replay_run_id': 'old-price-experiment'}
+    state = {'schema': research.SCHEMA, 'run_id': 'a' * 64, 'trade_date': days[-1],
+             'analysis_run_uid': 'b' * 32,
+             'analysis_payload_hash': 'c' * 64, 'stage': 'FINISHED', 'status': 'COMPLETE',
+             'proposals': [{'strategy_key': 'fixture', 'version': 'v1', 'rule': rule,
+                            'rule_hash': 'd' * 64, 'registration': {'status': 'COMPLETE'},
+                            'validation': deepcopy(validation)}],
+             'price_backtest': {'run_id': 'old-price-experiment', 'phase': 'FINISHED', 'contract': old_contract},
+             'provider_request_id': 'original-paid-request', 'completed_units': 3, 'total_units': 3}
+    with ledger.connect() as c:
+        c.connection.driver_connection.create_function('GET_LOCK', 2, lambda *_: 1)
+        c.connection.driver_connection.create_function('RELEASE_LOCK', 1, lambda *_: 1)
+        research._checkpoint(c, state, research._owner(c))
+    monkeypatch.setattr(research, 'authoritative_closed_trade_date', lambda *_a, **_k: days[-1])
+    monkeypatch.setattr(research, 'load_published_analysis_receipt', lambda *_a, **_k: {
+        'run_uid': 'b' * 32, 'score_snapshot': {'payload_sha256': 'c' * 64}})
+    monkeypatch.setattr(price, 'replay_contract', lambda: '9' * 64)
+    monkeypatch.setattr(research, 'generate_proposals', lambda *_a, **_k: pytest.fail('completed generation restarted'))
+    monkeypatch.setattr(research, '_step', lambda *_a, **_k: pytest.fail('completed backtest restarted'))
+    assert research.research_tick(ledger)['reused'] is True
+    with ledger.connect() as c:
+        saved = research._read_states(c)[0]
+        assert saved['proposals'][0]['validation'] == validation
+        assert saved['price_backtest']['run_id'] == 'old-price-experiment'
+        assert saved['provider_request_id'] == 'original-paid-request'
+        assert c.execute(text('SELECT COUNT(*) FROM st_strategy_governance_audit')).scalar() == 1
+
+
 def test_daily_stop_does_not_create_same_day_exit(rule, replay_data):
     days, bars, signals = replay_data
     rule["holding_days"] = 20

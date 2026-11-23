@@ -499,7 +499,19 @@ def research_tick(engine):
                 from server.engine.strategy_price_backtest import replay_contract, supports_price_rule
                 price_proposals = [p for p in state["proposals"] if supports_price_rule(p["rule"])]
                 contract = replay_contract() if price_proposals else None
-                if any(p["validation"].get("backtest_contract") != contract for p in price_proposals):
+                campaign = state.get("price_backtest") or {}
+                # Completed experiments retain their own immutable calculation version.
+                completed = (campaign.get("phase") == "FINISHED"
+                    and isinstance(campaign.get("contract"), str) and len(campaign["contract"]) == 64
+                    and bool(campaign.get("run_id"))) and all(
+                    p["validation"].get("backtest_contract") == campaign.get("contract")
+                    and p["validation"].get("replay_run_id") == campaign.get("run_id")
+                    and p["validation"].get("status") in {"COMPLETE", "PARTIAL", "BLOCKED"}
+                    and isinstance(p["validation"].get("report"), dict)
+                    and p["validation"]["report"].get("status") == p["validation"]["status"]
+                    for p in price_proposals
+                )
+                if not completed and any(p["validation"].get("backtest_contract") != contract for p in price_proposals):
                     # Evaluation has its own identity and deadline; generation and registration stay immutable.
                     state["generation_deadline_at"] = state.get("generation_deadline_at", state["deadline_at"])
                     price_keys = {p["strategy_key"] for p in price_proposals}

@@ -5,7 +5,8 @@ issued in the past. Receipt time and the hypothetical decision clock stay distin
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+from decimal import Decimal
 import hashlib
 import json
 from pathlib import Path
@@ -13,6 +14,7 @@ import time
 
 import pandas as pd
 from sqlalchemy import bindparam, text
+from sqlalchemy.exc import DBAPIError
 
 from server.common.analysis_pool_receipt import canonical_sha256
 from server.common.authoritative_market_clock import PRODUCTION_TIMEZONE
@@ -250,6 +252,41 @@ def _frozen_native_bars(connection, proofs, cutoff):
     return rows
 
 
+def _bar_checkpoint(rows, *, decode=False):
+    def cell(value):
+        if decode and isinstance(value, dict):
+            if set(value) == {'decimal'}:
+                return Decimal(value['decimal'])
+            if set(value) == {'datetime'}:
+                return datetime.fromisoformat(value['datetime'])
+            if set(value) == {'date'}:
+                return date.fromisoformat(value['date'])
+            raise ValueError('历史行情断点字段类型无效')
+        if isinstance(value, Decimal):
+            return {'decimal': str(value)}
+        if isinstance(value, datetime):
+            return {'datetime': value.isoformat()}
+        if isinstance(value, date):
+            return {'date': value.isoformat()}
+        return value
+    if any(set(row) != set(BAR_COLUMNS) for row in rows):
+        raise ValueError('历史行情断点字段不完整')
+    return [{key: cell(row[key]) for key in BAR_COLUMNS} for row in rows]
+
+
+def _validate_bar_day(rows, day, expected, scope, allowed):
+    if (len(rows) != expected or any(str(r['trade_date'])[:10] != day for r in rows)
+            or any(r['stock_code'] not in allowed for r in rows)
+            or len({r['stock_code'] for r in rows}) != len(rows)):
+        raise ValueError(day + ' 的已冻结行情覆盖在读取时发生变化')
+    from server.common.qmt_attestation_contract import expected_stock_set_contract
+    codes = [r['stock_code'] for r in rows]
+    actual = (expected_stock_set_contract(day, codes)['stock_set_hash']
+              if scope.get('native_receipt_id') else canonical_sha256(sorted(codes)))
+    if scope['stock_set_hash'] is not None and actual != scope['stock_set_hash']:
+        raise ValueError(day + ' 的行情证券集合与冻结证明不一致')
+
+
 def _read_bars(connection, days, inputs, cutoff):
     scopes = _resolved_scopes(connection, inputs, days, cutoff)
     bindings = {d: scopes[d]["catalog"] for d in days}
@@ -282,17 +319,56 @@ def _read_bars(connection, days, inputs, cutoff):
                     if r['list_date'] is not None and str(r['list_date'])[:10] <= day
                     and (r['expire_date'] is None or str(r['expire_date'])[:10] >= day)}
                     - set(scopes[day]['excluded_codes']) for day in mutable_days}
-    for offset in range(0, len(mutable_days), width):
-        chunk = mutable_days[offset:offset + width]
+    from server.common.formal_analysis_store import FormalAnalysisStore
+    # MySQL commits checkpoints independently of a later failed source read.
+    # SQLite keeps the caller's transaction and savepoint ownership intact.
+    store = FormalAnalysisStore(connection.engine if connection.dialect.name == 'mysql' else connection)
+    generation = canonical_sha256({'schema': 'probiga.verified-daily-bars.v1',
+                                   'cutoff': str(cutoff), 'columns': BAR_COLUMNS})
+    keys = {day: canonical_sha256({'day': day, 'proof': proofs.get(day),
+                                  'scope': scopes[day], 'expected_rows': expected[day]}) for day in mutable_days}
+    members = store.list_members(generation, 'price_daily_bars') if mutable_days else {}
+    retained = [day for day in mutable_days if keys[day] in members]
+    for offset in range(0, len(retained), 8):
+        group = retained[offset:offset + 8]
+        artifacts = store.load_artifacts([members[keys[day]] for day in group])
+        for day in group:
+            batch = _bar_checkpoint(artifacts[members[keys[day]]]['rows'], decode=True)
+            _validate_bar_day(batch, day, expected[day], scopes[day], allowed[day])
+            rows.extend(batch)
+
+    def read_chunk(chunk):
         # Apply the same dated catalog in memory; the per-row SQL join timed out on two days.
-        batch = connection.execute(text("""SELECT /*+ MAX_EXECUTION_TIME(12000) */
+        try:
+            batch = connection.execute(text("""SELECT /*+ MAX_EXECUTION_TIME(12000) */
             SUBSTR(k.stock_code,1,6) stock_code,k.trade_date,k.`open`,k.high,k.low,k.`close`,k.pre_close,k.volume,k.amount
             FROM sm_stock_kline k """ + force + """ WHERE k.k_type=1 AND k.adjust_type=0
             AND k.trade_date IN :days AND k.received_at<=:cutoff LIMIT 60001""").bindparams(bindparam('days', expanding=True)),
-            {'days': chunk, 'cutoff': cutoff}).mappings().all()
+                {'days': chunk, 'cutoff': cutoff}).mappings().all()
+        except DBAPIError as exc:
+            args = getattr(exc.orig, 'args', ())
+            timed_out = (args and args[0] == 3024) or getattr(exc.orig, 'sqlite_errorcode', None) == 9
+            if not timed_out or len(chunk) == 1:
+                raise
+            # Cold two-day reads exceeded 12s in production; split only that failed batch.
+            middle = len(chunk) // 2
+            read_chunk(chunk[:middle])
+            read_chunk(chunk[middle:])
+            return
         if len(batch) > 60000:
             raise ValueError('历史行情候选批次超过60000行')
-        rows.extend(dict(r) for r in batch if r['stock_code'] in allowed[str(r['trade_date'])[:10]])
+        selected = {}
+        for day in chunk:
+            selected[day] = [dict(r) for r in batch
+                             if str(r['trade_date'])[:10] == day and r['stock_code'] in allowed[day]]
+            _validate_bar_day(selected[day], day, expected[day], scopes[day], allowed[day])
+        store.put_many(generation, 'price_daily_bars',
+                       {keys[day]: {'rows': _bar_checkpoint(selected[day])} for day in chunk})
+        rows.extend(row for day in chunk for row in selected[day])
+
+    missing_days = [day for day in mutable_days if day not in retained]
+    for offset in range(0, len(missing_days), width):
+        read_chunk(missing_days[offset:offset + width])
     rows.sort(key=lambda r: (r['stock_code'], str(r['trade_date'])[:10]))
     seen = {str(r["trade_date"])[:10] for r in rows}
     if seen != set(days):

@@ -151,6 +151,8 @@ def test_historical_bar_batches_fit_query_budget_without_losing_daily_scope(monk
     from server.common.strategy_daily_input_window import daily_input_catalog_join
 
     engine = create_engine('sqlite://')
+    from server.db.formal_analysis_schema import privileged_migrate_formal_analysis_schema
+    privileged_migrate_formal_analysis_schema(engine)
     days = [d.date().isoformat() for d in pd.bdate_range('2026-08-27', periods=8)]
     codes = [f'{i:06d}' for i in range(5500)]
     with engine.begin() as c:
@@ -228,3 +230,100 @@ def test_frozen_native_values_survive_later_recapture_without_looking_ahead(monk
                   {'json':json.dumps(changed), 'hash':original['manifest_hash']})
         with pytest.raises(ValueError, match='冻结日线内容'):
             price._read_bars(c, [DAY], inputs, CUTOFF.isoformat(sep=' '))
+
+
+def test_daily_bars_resume_committed_dates_after_real_query_budget_interrupt(monkeypatch):
+    from sqlalchemy import event
+    from sqlalchemy.exc import OperationalError
+    from server.engine import strategy_price_backtest as price
+    from server.common.analysis_pool_receipt import canonical_sha256
+    from server.db.formal_analysis_schema import privileged_migrate_formal_analysis_schema
+    engine = create_engine('sqlite://')
+    privileged_migrate_formal_analysis_schema(engine)
+    days = ['2026-07-06', '2026-07-07', '2026-07-08', '2026-07-09']
+    codes = [f'{i:06d}' for i in range(500)]
+    with engine.begin() as c:
+        c.execute(text('CREATE TABLE qmt_stock_catalog_member(batch_id TEXT,stock_code TEXT,instrument_type TEXT,list_date TEXT,expire_date TEXT)'))
+        c.execute(text("INSERT INTO qmt_stock_catalog_member VALUES('bound',:c,'STOCK','2020-01-01',NULL)"), [{'c': x} for x in codes])
+        c.execute(text('CREATE TABLE sm_stock_kline(stock_code TEXT,trade_date TEXT,k_type INT,adjust_type INT,received_at TEXT,open REAL,high REAL,low REAL,close REAL,pre_close REAL,volume REAL,amount REAL)'))
+        c.execute(text('CREATE INDEX idx_date_ktype ON sm_stock_kline(trade_date,k_type,adjust_type)'))
+        c.execute(text("INSERT INTO sm_stock_kline VALUES(:c,:d,1,0,'2026-07-10',10,11,9,10,10,1000,10000)"), [{'c': x, 'd': d} for d in days for x in codes])
+    scopes = {d: {'catalog': 'bound', 'excluded_codes': [], 'stock_count': len(codes),
+                  'stock_set_hash': canonical_sha256(codes)} for d in days}
+    monkeypatch.setattr(price, '_resolved_scopes', lambda *_: scopes)
+    inputs = {'bound': {'row_counts': {d: len(codes) for d in days}}}
+    sample = 'SELECT SUBSTR(k.stock_code,1,6),k.trade_date,k.open,k.high,k.low,k.close,k.pre_close,k.volume,k.amount FROM sm_stock_kline k WHERE k.k_type=1 AND k.adjust_type=0 AND k.trade_date=:d AND k.received_at<=:cutoff LIMIT 60001'
+    with engine.connect() as c:
+        driver = c.connection.driver_connection
+        measured = [0]
+        def count():
+            measured[0] += 100
+            return 0
+        driver.set_progress_handler(count, 100)
+        c.execute(text(sample), {'d': days[0], 'cutoff': '2026-11-22'}).all()
+        driver.set_progress_handler(None, 0)
+        single_day_steps = measured[0]
+    failed = []; queried = []; fail_last = True
+    with engine.begin() as c:
+        driver = c.connection.driver_connection
+        def budget(_c, _cursor, statement, parameters, _context, _many):
+            driver.set_progress_handler(None, 0)
+            if 'FROM sm_stock_kline k' not in statement:
+                return
+            queried.append(tuple(x for x in parameters if x in days))
+            limit = single_day_steps // 2 if fail_last and days[-1] in parameters else single_day_steps * 3 // 2
+            used = 0
+            def progress():
+                nonlocal used
+                used += 100
+                if used > limit:
+                    failed.append(queried[-1])
+                    return 1
+                return 0
+            driver.set_progress_handler(progress, 100)
+        event.listen(c, 'before_cursor_execute', budget)
+        try:
+            with pytest.raises(OperationalError, match='interrupted'):
+                price._read_bars(c, days, inputs, '2026-11-22')
+        finally:
+            driver.set_progress_handler(None, 0)
+            event.remove(c, 'before_cursor_execute', budget)
+    assert failed and any(len(group) > 1 for group in failed)
+    fail_last = False
+    queried.clear()
+    with engine.begin() as c:
+        driver = c.connection.driver_connection
+        event.listen(c, 'before_cursor_execute', budget)
+        try:
+            result = price._read_bars(c, days, inputs, '2026-11-22')
+        finally:
+            driver.set_progress_handler(None, 0)
+            event.remove(c, 'before_cursor_execute', budget)
+    assert queried == [(days[-1],)]
+    assert len(result) == len(days) * len(codes)
+    assert {r['close'] for r in result} == {10}
+    with engine.begin() as c:
+        def no_source_read(_c, _cursor, statement, _parameters, _context, _many):
+            assert 'FROM sm_stock_kline k' not in statement
+        event.listen(c, 'before_cursor_execute', no_source_read)
+        assert price._read_bars(c, days, inputs, '2026-11-22') == result
+        event.remove(c, 'before_cursor_execute', no_source_read)
+        c.execute(text("UPDATE sm_stock_kline SET close=99,received_at='2026-11-23'"))
+        assert price._read_bars(c, days, inputs, '2026-11-22') == result
+        with pytest.raises(ValueError, match='覆盖'):
+            price._read_bars(c, days, inputs, '2026-11-22 00:00:01')
+        revised = deepcopy(inputs)
+        revised['bound']['proofs'] = {d: {'truth_hash': 'revised-source'} for d in days}
+        with pytest.raises(ValueError, match='覆盖'):
+            price._read_bars(c, days, revised, '2026-11-22')
+
+
+def test_bar_checkpoint_preserves_decimal_float_and_market_clock_types():
+    from decimal import Decimal
+    from server.engine import strategy_price_backtest as price
+    row = {'stock_code': '000001', 'trade_date': date(2026, 7, 6), 'open': Decimal('10.010000'),
+           'high': 11.1, 'low': 9, 'close': Decimal('10.070000'), 'pre_close': 10,
+           'volume': 123456789, 'amount': Decimal('123456789.012345')}
+    restored = price._bar_checkpoint(price._bar_checkpoint([row]), decode=True)
+    assert restored == [row]
+    assert all(type(restored[0][key]) is type(value) for key, value in row.items())
