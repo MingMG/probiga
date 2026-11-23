@@ -174,7 +174,7 @@ def request_experiment(engine,result_id,request_uid,*,evaluation_start,evaluatio
             'evaluation_sessions':sessions,'execution_end_date':execution_end_date,'allocation_policy':allocation_policy,
             'data_decision_known_at':state['requested_at'],'price_cutoff':state['price_cutoff'],
             'requested_at':str(now_shanghai()),'reason':('冻结输入实验已登记；等待现有调度器执行'
-                if queued['status'] in ('PENDING','RUNNING') else '同一冻结输入已有结果，已复用保存的实验')}
+                if queued['status']=='PENDING' else '已关联同一实验，查看其现有执行进度' if queued['status']=='RUNNING' else '同一冻结输入已有结果，已复用保存的实验')}
         _append_audit_connection(connection,entity_type=ENTITY,entity_key=request_uid,action='REQUEST_00000001',
             operator='native-research-control',reason=value['reason'],before=None,after=value,
             evidence={'source_run_id':run_id,'job_id':queued['job_id'],'real_order_authority':False})
