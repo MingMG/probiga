@@ -9,6 +9,20 @@ from .right_side_policy import right_side_setup_ready
 from .structural_mainline import weak_market_structural_mainline
 
 
+REQUIRED_BY_BUILDER = {
+    'theme_diffusion': ('sector_breadth_pct', 'sector_breadth_acceleration_pct', 'sector_relative_return_pct', 'sector_amount_acceleration_pct', 'leadership_quality', 'distance_ma20_pct', 'latest_change_pct', 'return_5d_pct', 'amount_ratio_5_20', 'close_above_ma20', 'ma20_above_ma60', 'market_return_20d_pct'),
+    'low_base_ignition': ('sector_breadth_pct', 'sector_breadth_acceleration_pct', 'sector_relative_return_pct', 'sector_amount_acceleration_pct', 'theme_opportunity_score', 'sector_crowding', 'return_5d_pct', 'return_20d_pct', 'return_60d_pct', 'distance_ma20_pct', 'latest_change_pct', 'amount_ratio_5_20', 'latest_amount', 'average_amount_20d', 'atr_14d_pct', 'breakout_20d_proximity', 'stock_leadership_score', 'stock_relative_to_theme_5d_pct'),
+    'right_side_trend': ('return_20d_pct', 'return_60d_pct', 'ma20_slope_5d_pct', 'breakout_20d_proximity', 'amount_ratio_5_20', 'relative_strength_20d_pct', 'close_above_ma20', 'ma20_above_ma60', 'atr_14d_pct'),
+    'event_drift': ('event_surprise', 'event_novelty', 'event_source_reliability', 'event_price_confirmation', 'event_priced_in', 'event_decay'),
+    'quality_momentum': ('quality_percentile', 'growth_percentile', 'cashflow_quality_percentile', 'valuation_percentile', 'momentum_60d_percentile', 'volatility_20d_percentile'),
+    'intraday_surprise': ('intraday_amount_surprise_z', 'price_vs_vwap_pct', 'interval_return_pct', 'sector_breadth_pct', 'sector_relative_return_pct', 'fill_probability', 'spread_bps'),
+    'right_side_trend_v301': ('return_20d_pct', 'return_60d_pct', 'ma20_slope_5d_pct', 'amount_ratio_5_20', 'relative_strength_20d_pct', 'distance_ma20_pct', 'latest_change_pct', 'close_above_ma20', 'ma20_above_ma60', 'atr_14d_pct'),
+    'right_side_trend_v302': ('market_return_20d_pct', 'return_20d_pct', 'return_60d_pct', 'ma20_slope_5d_pct', 'amount_ratio_5_20', 'relative_strength_20d_pct', 'distance_ma20_pct', 'close_above_ma20', 'ma20_above_ma60', 'atr_14d_pct'),
+    'right_side_trend_v303': ('market_return_20d_pct', 'return_20d_pct', 'return_60d_pct', 'ma20_slope_5d_pct', 'amount_ratio_5_20', 'relative_strength_20d_pct', 'distance_ma20_pct', 'latest_change_pct', 'close_above_ma20', 'ma20_above_ma60', 'atr_14d_pct', 'sector_relative_return_pct', 'sector_breadth_pct', 'sector_breadth_acceleration_pct', 'sector_amount_acceleration_pct', 'stock_leadership_score'),
+    'oversold_reversal': ('return_2d_pct', 'return_5d_pct', 'return_20d_pct', 'drawdown_20d_pct', 'distance_ma20_pct', 'distance_ma5_pct', 'ma20_slope_5d_pct', 'latest_change_pct', 'previous_change_pct', 'amount_ratio_1_20', 'rebound_from_low_pct', 'latest_relative_to_market_pct', 'atr_14d_pct', 'sector_relative_return_pct', 'sector_breadth_pct', 'theme_opportunity_score', 'stock_leadership_score'),
+}
+
+
 def _clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
     return max(lower, min(upper, value))
 
@@ -194,20 +208,7 @@ def theme_diffusion(
             f"消息面对所属主题的结构化影响{news_theme:+.2f}",
         ],
         features=features,
-        required=(
-            "sector_breadth_pct",
-            "sector_breadth_acceleration_pct",
-            "sector_relative_return_pct",
-            "sector_amount_acceleration_pct",
-            "leadership_quality",
-            "distance_ma20_pct",
-            "latest_change_pct",
-            "return_5d_pct",
-            "amount_ratio_5_20",
-            "close_above_ma20",
-            "ma20_above_ma60",
-            "market_return_20d_pct",
-        ),
+        required=REQUIRED_BY_BUILDER['theme_diffusion'],
     )
     sector_ready = bool(
         50.0 <= breadth <= 88.0
@@ -366,26 +367,7 @@ def low_base_ignition(
             f"消息面对所属主题的结构化影响{news_theme:+.2f}",
         ],
         features=features,
-        required=(
-            "sector_breadth_pct",
-            "sector_breadth_acceleration_pct",
-            "sector_relative_return_pct",
-            "sector_amount_acceleration_pct",
-            "theme_opportunity_score",
-            "sector_crowding",
-            "return_5d_pct",
-            "return_20d_pct",
-            "return_60d_pct",
-            "distance_ma20_pct",
-            "latest_change_pct",
-            "amount_ratio_5_20",
-            "latest_amount",
-            "average_amount_20d",
-            "atr_14d_pct",
-            "breakout_20d_proximity",
-            "stock_leadership_score",
-            "stock_relative_to_theme_5d_pct",
-        ),
+        required=REQUIRED_BY_BUILDER['low_base_ignition'],
     )
     setup_ready = bool(
         # This is a pre-diffusion entry.  Once four fifths of a sector are
@@ -473,17 +455,7 @@ def right_side_trend(
             f"相对强度{relative:.2f}%",
         ],
         features=features,
-        required=(
-            "return_20d_pct",
-            "return_60d_pct",
-            "ma20_slope_5d_pct",
-            "breakout_20d_proximity",
-            "amount_ratio_5_20",
-            "relative_strength_20d_pct",
-            "close_above_ma20",
-            "ma20_above_ma60",
-            "atr_14d_pct",
-        ),
+        required=REQUIRED_BY_BUILDER['right_side_trend'],
     )
 
 
@@ -524,14 +496,7 @@ def event_drift(
             f"价格确认{confirmation:.2f}",
         ],
         features=features,
-        required=(
-            "event_surprise",
-            "event_novelty",
-            "event_source_reliability",
-            "event_price_confirmation",
-            "event_priced_in",
-            "event_decay",
-        ),
+        required=REQUIRED_BY_BUILDER['event_drift'],
     )
 
 
@@ -573,14 +538,7 @@ def quality_momentum(
             f"中期动量分位{momentum:.1%}",
         ],
         features=features,
-        required=(
-            "quality_percentile",
-            "growth_percentile",
-            "cashflow_quality_percentile",
-            "valuation_percentile",
-            "momentum_60d_percentile",
-            "volatility_20d_percentile",
-        ),
+        required=REQUIRED_BY_BUILDER['quality_momentum'],
     )
 
 
@@ -624,15 +582,7 @@ def intraday_surprise(
             f"预计成交概率{fill_probability:.1%}",
         ],
         features=features,
-        required=(
-            "intraday_amount_surprise_z",
-            "price_vs_vwap_pct",
-            "interval_return_pct",
-            "sector_breadth_pct",
-            "sector_relative_return_pct",
-            "fill_probability",
-            "spread_bps",
-        ),
+        required=REQUIRED_BY_BUILDER['intraday_surprise'],
     )
 
 
@@ -691,18 +641,7 @@ def right_side_trend_v301(
             f"当日涨跌{latest_change:.2f}%，量能比{volume:.2f}",
         ],
         features=features,
-        required=(
-            "return_20d_pct",
-            "return_60d_pct",
-            "ma20_slope_5d_pct",
-            "amount_ratio_5_20",
-            "relative_strength_20d_pct",
-            "distance_ma20_pct",
-            "latest_change_pct",
-            "close_above_ma20",
-            "ma20_above_ma60",
-            "atr_14d_pct",
-        ),
+        required=REQUIRED_BY_BUILDER['right_side_trend_v301'],
     )
 
 
@@ -762,18 +701,7 @@ def right_side_trend_v302(
             f"量能比{volume:.2f}，相对强度{relative:.2f}%",
         ],
         features=features,
-        required=(
-            "market_return_20d_pct",
-            "return_20d_pct",
-            "return_60d_pct",
-            "ma20_slope_5d_pct",
-            "amount_ratio_5_20",
-            "relative_strength_20d_pct",
-            "distance_ma20_pct",
-            "close_above_ma20",
-            "ma20_above_ma60",
-            "atr_14d_pct",
-        ),
+        required=REQUIRED_BY_BUILDER['right_side_trend_v302'],
     )
     if signal.status == "SCORED" and market_return < 2.0:
         return RawSignal(
@@ -864,24 +792,7 @@ def right_side_trend_v303(
             ),
         ],
         features=features,
-        required=(
-            "market_return_20d_pct",
-            "return_20d_pct",
-            "return_60d_pct",
-            "ma20_slope_5d_pct",
-            "amount_ratio_5_20",
-            "relative_strength_20d_pct",
-            "distance_ma20_pct",
-            "latest_change_pct",
-            "close_above_ma20",
-            "ma20_above_ma60",
-            "atr_14d_pct",
-            "sector_relative_return_pct",
-            "sector_breadth_pct",
-            "sector_breadth_acceleration_pct",
-            "sector_amount_acceleration_pct",
-            "stock_leadership_score",
-        ),
+        required=REQUIRED_BY_BUILDER['right_side_trend_v303'],
     )
     selective_theme_watch = bool(
         aligned
@@ -1062,25 +973,7 @@ def oversold_reversal(
             "这是左侧超跌修复实验；先观察、再触发小仓模拟，不冒充确定性抄底",
         ],
         features=features,
-        required=(
-            "return_2d_pct",
-            "return_5d_pct",
-            "return_20d_pct",
-            "drawdown_20d_pct",
-            "distance_ma20_pct",
-            "distance_ma5_pct",
-            "ma20_slope_5d_pct",
-            "latest_change_pct",
-            "previous_change_pct",
-            "amount_ratio_1_20",
-            "rebound_from_low_pct",
-            "latest_relative_to_market_pct",
-            "atr_14d_pct",
-            "sector_relative_return_pct",
-            "sector_breadth_pct",
-            "theme_opportunity_score",
-            "stock_leadership_score",
-        ),
+        required=REQUIRED_BY_BUILDER['oversold_reversal'],
     )
     if signal.status != "SCORED":
         return signal
@@ -1151,6 +1044,21 @@ SLEEVE_BUILDERS: dict[str, Callable[..., RawSignal]] = {
     "oversold_reversal": oversold_reversal,
     "intraday_surprise": intraday_surprise,
 }
+
+
+def sleeve_required_features(strategy_key: str) -> tuple[str, ...]:
+    """The same declaration used by each active builder's data check."""
+    if strategy_key == 'weak_market_structural_mainline':
+        from .structural_mainline import REQUIRED_FEATURES
+        return REQUIRED_FEATURES
+    builder = SLEEVE_BUILDERS[strategy_key]
+    # v304 retains v302's required-data check before its setup qualification.
+    name = 'right_side_trend_v302' if builder is right_side_trend_v304 else builder.__name__
+    return REQUIRED_BY_BUILDER[name]
+
+
+def sleeve_input_mode(strategy_key: str) -> str:
+    return 'INTRADAY' if SLEEVE_BUILDERS[strategy_key] is intraday_surprise else 'CLOSED_DAILY'
 
 
 def generate_raw_signals(

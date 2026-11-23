@@ -54,7 +54,8 @@ def test_native_cannot_use_late_reconstructed_scores_as_historical_signals(monke
     monkeypatch.setattr(daily_delivery_control,'load_published_analysis_receipt',source)
     monkeypatch.setattr(analysis_pool_receipt,'read_score_snapshot_header',lambda *_a,**_k:{'decision_at':'2026-11-21 19:05:17'})
     monkeypatch.setattr(analysis_pool_receipt,'decode_score_snapshot',lambda *_a,**_k:pytest.fail('late scores must not be materialized'))
-    r=native._v2_day(None,{'published':{'2026-11-20':'receipt'},'requested_at':'2026-11-22 09:00:00'},'2026-11-20')
+    from server.engine.native_original_prepare import prepare_original_day
+    r=prepare_original_day(None,{'published':{'2026-11-20':'receipt'},'requested_at':'2026-11-22 09:00:00'},'2026-11-20')
     assert r['status']=='BLOCKED' and r['signals']=={}
     assert r['actual_decision_at']=='2026-11-21 19:05:17'
 
@@ -79,22 +80,25 @@ def test_native_audit_integrity_and_native_result_namespace():
     assert r['net_return_pct'] is None and rank_results([r])==[]
 
 
-def test_driver_replays_partial_sources_without_fabricating_zero_profit(monkeypatch):
+def test_driver_replays_partial_sources_without_fabricating_zero_profit(tmp_path):
     days,bars,strategy,signal=fixture()
     strategy['strategy_name']='native'
-    state={'phase':'REPLAY','status':'NOT_STARTED','run_id':'run','rule_hash':'hash',
+    from server.engine.native_research_dataset import PreparedDataset
+    from server.engine.strategy_rule_replay import ACCOUNT
+    state={'phase':'REPLAY','status':'RUNNING','run_id':'a'*64,'rule_hash':'hash',
         'sessions':days[20:],'input_sessions':days,'strategies':[strategy],
-        'contract':'code','total_units':61,'completed_units':60,
+        'contract':'code','total_units':62,'completed_units':60,'cursor':0,'reports':{},
+        'plans':{},'plan_summary':{day:{'status':'BLOCKED','reason':'历史身份不可得'} for day in days[20:]},
+        'signal_parts':{},'bars':{},'execution_input_sessions':[],
+        'account':ACCOUNT,'allocation_policy':'FIXED_SHADOW',
+        'price_cutoff':'2026-11-22 05:59:24','requested_at':'2026-11-22 18:05:19',
         'proposals':[{'strategy_key':'native','version':'v1','rule_hash':'a'*64,'name':'native','validation':{}}]}
-    parts={d:{'day':d,'status':'BLOCKED','reason':'历史身份不可得','signals':{}} for d in days[20:]}
-    monkeypatch.setattr(native,'_save',lambda *_a,**_k:None)
-    monkeypatch.setattr(native,'_input_parts',lambda *_a:{})
-    monkeypatch.setattr(native,'_partitions',lambda _c,_s,_p,kind:parts if kind=='S' else {})
-    native._step(None,state,None)
-    v=state['proposals'][0]['validation']
-    assert state['phase']=='FINISHED' and state['status']=='BLOCKED' and state['completed_units']==61
-    assert v['available_feature_sessions']==0 and len(v['source_gaps'])==10
-    assert v['report']['net_return_pct'] is None and v['report']['nav']==[]
+    native._report_one(state,PreparedDataset(tmp_path))
+    native._report_one(state,PreparedDataset(tmp_path))
+    validation=state['proposals'][0]['validation']
+    assert state['phase']=='FINISHED' and state['status']=='BLOCKED' and state['completed_units']==62
+    assert validation['available_feature_sessions']==0 and len(validation['source_gaps'])==10
+    assert validation['report']['net_return_pct'] is None and validation['report']['nav']==[]
 
 
 def test_historical_uncovered_finance_members_do_not_block_other_securities(monkeypatch):
@@ -105,7 +109,9 @@ def test_historical_uncovered_finance_members_do_not_block_other_securities(monk
     covered=set(sorted(identity)[4:])
     from server.db.formal_analysis_schema import privileged_migrate_formal_analysis_schema
     engine=create_engine('sqlite://');privileged_migrate_formal_analysis_schema(engine)
-    monkeypatch.setattr(native,'_identity_rows',lambda *_:(identity,{'status':'VERIFIED','sha256':'a'*64}))
+    from server.engine import strategy_price_backtest as price
+    from server.engine import native_research_prepare as prepare
+    monkeypatch.setattr(price,'_identity_rows',lambda *_:(identity,{'status':'VERIFIED','sha256':'a'*64}))
     monkeypatch.setattr(pit_facts,'load_latest_finance_atomic_batch_baseline',lambda *_a,**_k:{'as_of_date':'2026-08-03','members':dict.fromkeys(covered),'seal_coverage_id':'b'*64})
     monkeypatch.setattr(historical_announcement_read,'has_dated_announcement_candidate',lambda *_a,**_k:True)
     def cutoff(_engine,*,codes,**_kwargs):
@@ -114,8 +120,11 @@ def test_historical_uncovered_finance_members_do_not_block_other_securities(monk
         return {'status':'DATA_BLOCKED','reason':'公告窗口尚无完成记录'}
     monkeypatch.setattr(pit_facts,'resolve_common_fact_cutoff',cutoff)
     codes=sorted(covered)
-    result=native._v3_day(SimpleNamespace(engine=engine),{'requested_at':'2026-11-22 09:00:00',
-        'finance_scope_codes':codes,'finance_scope_sha256':native.canonical_sha256(codes)},'2026-08-03',None)
+    state={'requested_at':'2026-11-22 09:00:00','proposals':[]}
+    connection=SimpleNamespace(engine=engine)
+    plan=prepare.plan_v3_day(connection,state,'2026-08-03')
+    assert len(plan['eligible'])==4751
+    result=prepare.prepare_selection(connection,state,None,plan)
     assert result['reason']=='公告窗口尚无完成记录'
 
 
@@ -249,3 +258,25 @@ def test_run_directory_seeks_latest_heads_within_the_old_aggregate_work_budget()
         assert len(native.read_runs(c))==8
         db.set_progress_handler(None,0)
     engine.dispose()
+
+
+def test_original_signals_evaluate_only_historical_scored_identified_securities(monkeypatch):
+    from tests.test_native_shadow_trials import _strategy,_analysis_row
+    from server.engine.native_research_math import evaluate_manifest_signals
+    from server.common import versioned_strategy_config
+    strategy=_strategy()
+    row=_analysis_row()
+    row['model_version']=strategy['evaluator_config']['model_version']
+    missing={**row,'stock_code':'000002',strategy['evaluator_config']['score_field']:None}
+    no_identity={**row,'stock_code':'000003'}
+    prepared={'scored_rows':[row,missing,no_identity],'market':{'market_state':'trend_bullish'},
+        'identities':{row['stock_code']:{'short_name':'历史名称','industry_name':'银行'}},
+        'identity':{'status':'VERIFIED'},'source_run_uid':'old-receipt','source_sha256':'b'*64,
+        'signal_clock':'2026-08-21 18:05:00'}
+    monkeypatch.setattr(versioned_strategy_config,'load_stock_manifest',lambda:pytest.fail('pure original math read live rules'))
+    result=evaluate_manifest_signals(prepared,[strategy],day='2026-08-21')
+    key=strategy['strategy_key']
+    assert result['evaluation_security_sets'][key]==[row['stock_code']]
+    assert result['missing_feature_stocks'][key]==2
+    assert result['signals'][key][0]['industry']=='银行'
+    assert result['signals'][key][0]['signal_known_at']==prepared['signal_clock']

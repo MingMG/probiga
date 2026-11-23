@@ -153,10 +153,18 @@ def _research(run, proposal, *, native=False):
         "fees": report.get("fees"), "execution_mode": report.get("execution_mode"), "return_scope": return_scope}
     if native:
         cohort['native_execution_policy'] = report.get('execution_policy')
+        if validation.get('evaluation_set_sha256'):
+            cohort['evaluation_set_sha256']=validation['evaluation_set_sha256']
+            cohort['allocation_policy']=report.get('allocation_policy')
     comparable = net_return if net_return is not None else subset_return
     eligible = bool(comparable is not None and initial and cohort["dataset_sha256"]
                     and cohort["fees"] and report.get("status") in {"COMPLETE", "PARTIAL"} and trades)
     return {"result_id": ("native:" if native else "research:") + run["run_id"] + ":" + proposal["rule_hash"],
+        'experiment_id':run['run_id'],'experiment_kind':run.get('experiment_kind'),
+        'source_run_id':run.get('source_run_id'),'experiment_status':run.get('status'),
+        'phase':run.get('phase'),'current_unit':run.get('current_unit'),
+        'last_progress_at':run.get('last_progress_at'),'data_cutoff_at':run.get('price_cutoff'),
+        'decision_known_at':run.get('requested_at'),'algorithm_sha256':validation.get('algorithm_sha256'),
         "kind": "NATIVE_SHADOW_RETROSPECTIVE" if native else "MODEL_RULE_RETROSPECTIVE", "strategy_key": proposal["strategy_key"],
         "strategy_version": proposal["version"], "strategy_name": proposal["name"],
         "status": validation.get("status", "NOT_STARTED"), **{k: cohort[k] for k in ("start_date", "end_date", "initial_cash_cny")},
@@ -178,8 +186,11 @@ def _research(run, proposal, *, native=False):
         "reason": validation.get("reason") or "等待历史回放验证",
         "completed_units": validation.get("completed_units"), "total_units": validation.get("total_units"),
         "available_feature_sessions": validation.get("available_feature_sessions"),
+        'complete_feature_sessions':validation.get('complete_feature_sessions'),
+        'data_requirements':validation.get('data_requirements'),
         "required_sessions": validation.get("required_sessions"),
         "missing_feature_dates": validation.get("missing_feature_dates") or [],
+        'partial_feature_dates':validation.get('partial_feature_dates') or [],
         "out_of_sample_status": report.get("out_of_sample_status", "UNKNOWN"),
         "win_rate_history": _research_win_rate_history(trades, report, validation.get("sessions") or [])
             if validation.get("status") in {"COMPLETE", "PARTIAL"} else [],
@@ -209,7 +220,7 @@ def rank_results(records):
     return result
 
 
-def read_performance(engine, day):
+def read_performance(engine, day, *, experiment_id=None):
     from server.api.quant_strategy_workspace import read_strategy_workspace
     workspace = read_strategy_workspace(engine, day)
     records = [_research(run, p) for run in workspace["autonomous_research"].get("runs", [])
@@ -219,9 +230,13 @@ def read_performance(engine, day):
     try:
         with engine.connect() as connection:
             native_runs = read_runs(connection)
+            if experiment_id and not any(run['run_id']==experiment_id for run in native_runs):
+                native_runs=read_runs(connection,run_id=experiment_id)+native_runs
     except (SQLAlchemyError,ValueError) as exc:
         native_runs = []
         native_error = '原生回测审计读取失败：'+type(exc).__name__
+    if experiment_id and not native_error and not any(run['run_id']==experiment_id for run in native_runs):
+        raise KeyError(experiment_id)
     records.extend(_research(run,p,native=True) for run in native_runs for p in run["proposals"])
     repository = TradingV2ReadRepository(engine)
     sources = {"autonomous_research": {"status": workspace["autonomous_research"].get("status", "COMPLETE"),
@@ -234,14 +249,21 @@ def read_performance(engine, day):
         formal = []
         sources["historical_backtests"] = {"status": "FAILED", "reason": "历史回测读取失败：" + type(exc).__name__}
     records.extend(formal)
+    if experiment_id is None:
+        preferred=next((run for run in native_runs if run.get('status')=='RUNNING'),None)
+        preferred=preferred or next((run for run in native_runs if run.get('status')=='FAILED'),None)
+        if preferred:experiment_id=preferred['run_id']
     strategies = []
     for row in workspace["strategies"]:
         matching = [r for r in records if r["strategy_key"] == row["strategy_key"]
                     and r["strategy_version"] == row["current_version"]]
-        latest = matching[0] if matching else None
+        pinned=next((result for result in matching if result.get('experiment_id')==experiment_id),None)
+        latest = pinned or (matching[0] if matching else None)
+        valid=next((result for result in matching if result.get('completed_trades') and result.get('win_rate_pct') is not None),None)
         strategies.append({"strategy_key": row["strategy_key"], "strategy_name": row["strategy_name"],
             "strategy_version": row["current_version"], "result_id": latest["result_id"] if latest else None,
             "backtest_status": latest["status"] if latest else "FAILED" if native_error else "NOT_STARTED",
+            'last_valid_result_id':valid['result_id'] if valid else None,
             "reason": latest["reason"] if latest else native_error or "当前精确版本尚无已保存回测；不可复用旧版本或其他策略的收益",
             "forward_windows": row["windows"]})
     current_ids = {s["result_id"] for s in strategies}
@@ -250,11 +272,38 @@ def read_performance(engine, day):
         sources["win_rate_history"] = {"status": "COMPLETE", "reason": ""}
     except (SQLAlchemyError, ValueError) as exc:
         sources["win_rate_history"] = {"status": "FAILED", "reason": "胜率曲线读取失败：" + type(exc).__name__}
-    return {"trade_date": workspace["trade_date"], "strategies": strategies,
+    return {"trade_date": workspace["trade_date"], "strategies": strategies,'experiment_id':experiment_id,
+        'experiments':[{key:run.get(key) for key in ('run_id','source_run_id','requested_at','phase','status',
+            'completed_units','total_units','last_progress_at','reason','experiment_kind','allocation_policy','job_id')} for run in native_runs],
         "results": records, "leaderboards": rank_results(records), "sources": sources,
         "history_limit": 100, "history_limit_reached": len(formal) == 100,
         "method": "历史回测按同区间、同数据、同初始资金及费用执行口径分组。可用输入子集单列研究排名，缺少历史身份的拟入场被排除，其收益不能代表完整策略表现。模型规则回放属于事后研究，未经样本外验证不构成盈利结论。",
         "real_order_authority": False}
+
+
+def read_performance_version(engine, *, experiment_id=None):
+    """Only indexed journal heads and small queue receipts; no result bodies."""
+    headers=[]
+    with engine.connect() as connection:
+        for entity in ('NATIVE_REPLAY','AUTO_RESEARCH'):
+            rows=connection.execute(text('''SELECT /*+ MAX_EXECUTION_TIME(4000) */ h.entity_key,h.latest_at,MAX(a.action) AS sequence
+              FROM (SELECT heads.entity_key,
+                (SELECT created_at FROM st_strategy_governance_audit b
+                 WHERE b.entity_type=:entity AND b.entity_key=heads.entity_key ORDER BY created_at DESC LIMIT 1) latest_at
+                FROM (SELECT DISTINCT entity_key FROM st_strategy_governance_audit WHERE entity_type=:entity) heads
+                ORDER BY latest_at DESC,heads.entity_key DESC LIMIT 12) h
+              JOIN st_strategy_governance_audit a ON a.entity_type=:entity AND a.entity_key=h.entity_key AND a.created_at=h.latest_at
+              GROUP BY h.entity_key,h.latest_at ORDER BY h.latest_at DESC,h.entity_key DESC'''),{'entity':entity}).mappings().all()
+            for row in rows:
+                headers.append((entity,row['entity_key'],str(row['latest_at']),row['sequence']))
+        if experiment_id and not any(row[1]==experiment_id for row in headers):
+            row=connection.execute(text('''SELECT created_at,action FROM st_strategy_governance_audit
+                WHERE entity_type='NATIVE_REPLAY' AND entity_key=:uid ORDER BY created_at DESC,action DESC LIMIT 1'''),
+                {'uid':experiment_id}).first()
+            headers.append(('NATIVE_REPLAY',experiment_id,*(str(value) for value in row))) if row else None
+        jobs=[dict(row) for row in connection.execute(text('''SELECT /*+ MAX_EXECUTION_TIME(2000) */
+            job_id,status,result_ref,finished_at FROM st_job_v2 ORDER BY requested_at DESC,job_id DESC LIMIT 24''')).mappings()]
+    return {'version':canonical_json_hash({'heads':headers,'jobs':jobs}),'experiment_id':experiment_id,'refresh_seconds':20}
 
 
 def read_performance_detail(engine, result_id, *, offset=0, limit=50):
@@ -274,7 +323,8 @@ def read_performance_detail(engine, result_id, *, offset=0, limit=50):
                 "dispositions": (report.get("dispositions") or [])[:100], "fees": report.get("fees"),
                 "disposition_count": len(report.get("dispositions") or []),
                 "source_gaps": (proposal.get("validation") or {}).get("source_gaps") or [],
-                "missing_feature_dates": (proposal.get("validation") or {}).get("missing_feature_dates") or []}
+                "missing_feature_dates": (proposal.get("validation") or {}).get("missing_feature_dates") or [],
+                "partial_feature_dates": (proposal.get("validation") or {}).get("partial_feature_dates") or []}
     repository = TradingV2ReadRepository(engine)
     raw = repository.backtest(result_id)
     if not raw:

@@ -29,8 +29,10 @@ class TradingV3Engine:
     def __init__(
         self,
         calibrations: dict[str, CalibrationTable] | None = None,
+        *,
+        config: dict[str, Any] | None = None,
     ) -> None:
-        self.config = load_v3_config()
+        self.config = config if config is not None else load_v3_config()
         self.calibrations = calibrations or {}
 
     def forecast(self, signal: RawSignal) -> AlphaForecast:
@@ -433,7 +435,7 @@ class TradingV3Engine:
         opportunity_audit_forecasts: Iterable[AlphaForecast] | None = None,
         decision_at: datetime | None = None,
     ) -> dict[str, Any]:
-        regime = classify_regime_probabilities(market_features)
+        regime = classify_regime_probabilities(market_features,config=self.config)
         if regime.quality_status != "PASS":
             audit_forecasts = tuple(
                 opportunity_audit_forecasts

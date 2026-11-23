@@ -1,94 +1,48 @@
+from copy import deepcopy
 from datetime import timedelta
-import pytest
 
-from server.engine import strategy_native_backtest as native
+import pytest
+from sqlalchemy import text
+
 from server.common.formal_analysis_store import FormalAnalysisStore
 from server.db.formal_analysis_schema import privileged_migrate_formal_analysis_schema
-from tests.test_autonomous_strategy_research import ledger
+from server.engine import strategy_native_backtest as native
+from server.engine import native_research_jobs as jobs
+from tests.test_native_research_jobs import queue,experiment
 
 
-def test_new_execution_keeps_input_clocks_and_archives_with_a_bounded_fresh_deadline(ledger,monkeypatch):
-    now=native.now_shanghai()
-    monkeypatch.setattr(native,'now_shanghai',lambda:now)
-    strategy={'strategy_key':'native','strategy_name':'native','current_version':'v1','version_hash':'a'*64}
-    days=['2026-09-07','2026-09-08']
-    with ledger.begin() as c:
-        from sqlalchemy import text
-        c.execute(text('CREATE TABLE si_trade_calendar(trade_date TEXT,trade_status INT)'))
-    with ledger.connect() as c:
-        original={'schema':native.SCHEMA,'run_id':'d'*64,'rule_hash':'e'*64,'phase':'SIGNALS',
-            'status':'FAILED','source_hash':'a'*64,'strategies':[strategy],'sessions':days,
-            'requested_at':str(now-timedelta(hours=1)),'deadline_at':str(now+timedelta(hours=23)),
-            'price_cutoff':str(now-timedelta(hours=2)),'input_archives':[],
-            'fact_read_checkpoint':{'trade_date':days[0],'completed':800,'total':4755}}
-        native._save(c,original,native._owner(c))
-        revised=native._start(c,[strategy],days,{},'a'*64,'different-runtime')
-        assert revised['requested_at']==original['requested_at']
-        assert revised['price_cutoff']==original['price_cutoff']
-        assert revised['deadline_at']==str(now+timedelta(hours=24))
-        assert revised['fact_read_checkpoint']==original['fact_read_checkpoint']
-        assert revised['run_id']!=original['run_id']
-        assert revised['input_archives']==[{'run_id':original['run_id'],'rule_hash':original['rule_hash']}]
-        fresh=native._start(c,[strategy],days,{},'b'*64,'different-runtime')
-        assert fresh['requested_at']!=original['requested_at']
-        assert fresh['input_archives']==[]
-        assert fresh['fact_read_checkpoint']=={}
+@pytest.mark.parametrize('stage',['finance_facts','event_facts','event_metadata'])
+def test_source_budget_yields_durable_progress_and_stops_when_the_prefix_does_not_advance(queue,tmp_path,monkeypatch,stage):
+    privileged_migrate_formal_analysis_schema(queue)
+    monkeypatch.setenv('PROBIGA_NATIVE_DATASET_ROOT',str(tmp_path))
+    from server.engine import native_research_identity as identity
+    monkeypatch.setattr(identity,'algorithm_identity',lambda _config:{'sha256':'math'})
+    state=experiment()
+    with queue.begin() as connection:jobs.enqueue(connection,state)
+    def bounded(connection,state,owner):
+        FormalAnalysisStore(queue).put('e'*64,'native_source_part','verified-prefix',{'members':['000001']})
+        callback=jobs._source_progress(connection,state,owner,'2026-09-07',stage,deadline=-1)
+        callback(100,400,'fixed-source',True)
+    monkeypatch.setattr(native,'_step',bounded)
+    first=native.native_tick(queue)
+    assert first['status']=='RUNNING'
+    with queue.connect() as connection:
+        saved=native.read_runs(connection)[0]
+        assert saved['source_progress']['completed']==100
+        assert connection.execute(text('SELECT status FROM st_job_v2')).scalar()=='PENDING'
+        assert saved['requested_at']=='2026-11-22 18:05:19'
+    later=jobs.now_shanghai()+timedelta(seconds=2)
+    monkeypatch.setattr(jobs,'now_shanghai',lambda:later)
+    second=native.native_tick(queue)
+    assert second['status']=='FAILED' and 'NO_PROGRESS' in second['reason']
+    assert FormalAnalysisStore(queue).get('e'*64,'native_source_part','verified-prefix')=={'members':['000001']}
+    assert not list(tmp_path.glob('*.pin'))
 
 
-@pytest.mark.parametrize('field,dataset,prior,later_calculation',[
-    ('fact_read_checkpoint','finance',{},False),
-    ('event_read_checkpoint','event_facts',{},False),
-    ('event_read_checkpoint','event_facts',{},True),
-    ('coverage_read_checkpoint','event_coverage',{},True),
-    ('finance_source_read_checkpoint','finance_coverage',{},False),
-    ('finance_source_read_checkpoint','finance_coverage',{},True),
-    ('finance_source_read_checkpoint','finance_coverage',{'trade_date':'2026-09-07','scope':'c'*64,'completed':100},False),
-    ('event_read_checkpoint','event_facts',{'trade_date':'2026-09-07','scope':'c'*64,'completed':100},False),
-    ('event_metadata_read_checkpoint','event_chain_metadata',{},False),
-    ('event_metadata_read_checkpoint','event_chain_metadata',{},True),
-    ('event_metadata_read_checkpoint','event_chain_metadata',{'trade_date':'2026-09-07','scope':'c'*64,'completed':100},False),
-])
-@pytest.mark.parametrize('failure',['job_deadline','reply_deadline'])
-def test_step_deadline_resumes_only_after_new_durable_source_progress(ledger,monkeypatch,field,dataset,prior,later_calculation,failure):
-    privileged_migrate_formal_analysis_schema(ledger)
-    with ledger.connect() as c:
-        c.connection.driver_connection.create_function('GET_LOCK',2,lambda *_:1)
-        c.connection.driver_connection.create_function('RELEASE_LOCK',1,lambda *_:1)
-        owner=native._owner(c)
-        state={'schema':native.SCHEMA,'run_id':'a'*64,'phase':'SIGNALS','status':'NOT_STARTED',
-            'step_status':'COMPLETE','contract':'code','completed_units':211,'total_units':408,
-            'sessions':['2026-09-07'],'current_unit':'historical selection 2026-09-07',
-            'deadline_at':str(native.now_shanghai()+timedelta(hours=24)),
-            'proposals':[{'validation':{'status':'RUNNING'}}]}
-        state[field]=prior
-        native._save(c,state,owner)
-    monkeypatch.setattr(native,'_contract',lambda:'code')
-    monkeypatch.setattr(native.signal,'SIGALRM',14,raising=False)
-    monkeypatch.setattr(native.signal,'ITIMER_REAL',0,raising=False)
-    monkeypatch.setattr(native.signal,'signal',lambda *_:None)
-    monkeypatch.setattr(native.signal,'setitimer',lambda *_:None,raising=False)
-    def partial(c,state,owner):
-        store=FormalAnalysisStore(ledger)
-        store.put('b'*64,dataset+'_issuer_facts','verified-chunk',{'codes':['000001'],'status':'VERIFIED_TEST_METADATA'})
-        state[field]={'trade_date':'2026-09-07','dataset':dataset,'scope':'b'*64,
-            'completed':1,'total':2,'last_progress_at':str(native.now_shanghai())}
-        native._save(c,state,owner)
-        if later_calculation:
-            after_source=native.now_shanghai()+timedelta(minutes=3)
-            monkeypatch.setattr(native,'now_shanghai',lambda:after_source)
-        if failure=='reply_deadline':
-            raise RuntimeError('QMT_ANNOUNCEMENT_LIVE_BATCH_REPLY_DEADLINE:controlled-read')
-        raise native.NativeStepDeadline('controlled business step deadline')
-    monkeypatch.setattr(native,'_step',partial)
-    result=native.native_tick(ledger)
-    assert result['status']=='NOT_STARTED'
-    with ledger.connect() as c:
-        saved=native.read_runs(c)[0]
-    assert saved['step_status']=='COMPLETE' and saved[field]['completed']==1
-    assert FormalAnalysisStore(ledger).get('b'*64,dataset+'_issuer_facts','verified-chunk')['codes']==['000001']
-    later=native.now_shanghai()+timedelta(minutes=2)
-    monkeypatch.setattr(native,'now_shanghai',lambda:later)
-    stopped=native.native_tick(ledger)
-    assert stopped['status']=='FAILED'
-    with ledger.connect() as c:
-        assert native.read_runs(c)[0]['status']=='FAILED'
+def test_untyped_legacy_audits_are_history_and_never_an_execution_queue(queue,monkeypatch):
+    state=experiment();state.pop('job_id',None)
+    state.update(checkpoint_sequence=1,status='NOT_STARTED')
+    with queue.begin() as connection:native._append_state(connection,state)
+    monkeypatch.setattr(native,'_inventory',lambda *_:pytest.fail('audit scans recreated a job'))
+    monkeypatch.setattr(native,'_step',lambda *_:pytest.fail('untyped audit was executed'))
+    assert native.native_tick(queue)=={'status':'idle'}

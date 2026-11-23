@@ -636,21 +636,7 @@ def _build_features(frame: pd.DataFrame) -> pd.DataFrame:
     return frame
 
 
-def _execution_fee(
-    value: float,
-    *,
-    account: dict[str, Any],
-    sell: bool,
-) -> float:
-    result = max(
-        float(account["minimum_commission_cny"]),
-        value * float(account["commission_rate"]),
-    )
-    result += value * float(account["transfer_fee_rate"])
-    if sell:
-        result += value * float(account["sell_stamp_duty_rate"])
-    result += value * float(account["default_slippage_rate"])
-    return result
+from server.common.research_execution_math import _execution_fee
 
 
 def _bar_value(
@@ -678,26 +664,7 @@ def _raw_execution_bar(row: Any) -> dict[str, Any]:
     }
 
 
-def _execution_fee_with_impact(
-    value: float,
-    *,
-    account: dict[str, Any],
-    sell: bool,
-    participation_rate: float,
-    maximum_participation_rate: float,
-) -> tuple[float, float]:
-    """Return configured fees plus a nonlinear turnover-impact surcharge."""
-
-    impact_rate = nonlinear_impact_rate(
-        participation_rate=participation_rate,
-        maximum_participation_rate=maximum_participation_rate,
-        base_slippage_rate=float(account["default_slippage_rate"]),
-    )
-    impact_cny = value * impact_rate
-    return (
-        _execution_fee(value, account=account, sell=sell) + impact_cny,
-        impact_cny,
-    )
+from server.common.research_execution_math import _execution_fee_with_impact
 
 
 def _one_price_limit_bar(

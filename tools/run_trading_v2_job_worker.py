@@ -18,8 +18,7 @@ from server.trading_v2.job_worker import run_one_job
 from tools.env_config import load_project_env
 
 
-def run_native_backtest(engine):
-    from server.engine.strategy_native_backtest import native_tick
+def run_with_diagnostics(engine):
     from tools import run_ai_recommendation_premarket as diagnostics
     uid=os.environ.get('PROBIGA_SCHEDULER_HISTORY_RUN_UID','')
     path=None
@@ -30,7 +29,7 @@ def run_native_backtest(engine):
         diagnostics._start_analysis_stack_diagnostics(uid)
         path=diagnostics._analysis_diagnostics_root()/f'{uid}.stack.log'
     try:
-        return native_tick(engine)
+        return run_one_job(engine)
     finally:
         if path is not None:
             faulthandler.cancel_dump_traceback_later()
@@ -43,19 +42,20 @@ def main() -> int:
     load_project_env()
     engine = create_batch_engine()
     try:
-        result = run_one_job(engine)
-        if result["status"] == "idle":
+        result = run_with_diagnostics(engine)
+        if result["status"] == "idle" or result.get('job_type')=='NATIVE_REPLAY':
             from server.engine.strategy_execution_adapters import bootstrap_strategy_execution_adapter_registry
             from server.engine.autonomous_strategy_research import research_tick
             bootstrap_strategy_execution_adapter_registry(registry_rows=())
             result["autonomous_research"] = research_tick(engine)
-            from server.engine.strategy_native_control import consume_retries
-            result["native_retry_control"] = consume_retries(engine)
-            result["native_backtest"] = run_native_backtest(engine)
+            from server.engine.strategy_native_backtest import submit_native_experiments
+            if result['status']=='idle':result["native_submissions"] = submit_native_experiments(engine)
     finally:
         engine.dispose()
     print(json.dumps(result, ensure_ascii=False, default=str))
-    return 0 if result["status"] in {"idle", "COMPLETED"} else 2
+    healthy=result["status"] in {"idle", "COMPLETED", "COMPLETE", "RUNNING"}
+    subfailure=any(isinstance(value,dict) and value.get('status') in ('FAILED','BLOCKED') for value in result.values())
+    return 0 if healthy and not subfailure else 2
 
 
 if __name__ == "__main__":

@@ -275,6 +275,26 @@ _WINDOWS_RUNTIME_FILES = (
     # Windows premarket publication resolves the original signed announcement parent.
     "server/common/daily_delivery_control.py",
     "server/common/component_release_attestation.py",
+    # Windows evaluates and Linux revalidates this exact simulation formula closure.
+    'server/engine/qmt_strategy_simulation.py',
+    'biz/analysis/sync_analysis_fast.py',
+    'server/common/chase_risk_policy.py',
+    'server/common/versioned_strategy_config.py',
+    'server/common/strategy_daily_input_window.py',
+    'server/trading_v3/config.py',
+    'server/trading_v3/calibration.py',
+    'server/trading_v3/domain.py',
+    'server/trading_v3/engine.py',
+    'server/trading_v3/shadow_portfolio.py',
+    'server/trading_v3/repository.py',
+    'server/trading_v3/validation.py',
+    'server/trading_v3/sleeves.py',
+    'server/trading_v3/right_side_policy.py',
+    'server/trading_v3/regime.py',
+    'server/trading_v3/theme_features.py',
+    'server/trading_v3/daily_features.py',
+    'server/trading_v3/daily_feature_math.py',
+    'server/trading_v3/context_scoring.py',
 )
 
 # The export list is packaging, not a runtime contract with the other endpoint.

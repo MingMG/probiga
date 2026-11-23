@@ -76,6 +76,7 @@ def core_regime_probabilities(
 
 def classify_regime_probabilities(
     features: dict[str, Any],
+    *, config: dict[str, Any] | None = None,
 ) -> RegimeProbabilities:
     missing = [key for key in REQUIRED if features.get(key) is None]
     if missing:
@@ -86,7 +87,8 @@ def classify_regime_probabilities(
             quality_status="BLOCK",
             evidence=("缺少市场特征：" + "、".join(missing),),
         )
-    quality_policy = load_v3_config().get("data_quality", {})
+    config = config if config is not None else load_v3_config()
+    quality_policy = config.get("data_quality", {})
     minimum_stock_count = int(
         quality_policy.get("minimum_market_stock_count", 2000)
     )
@@ -167,7 +169,7 @@ def classify_regime_probabilities(
         realized_volatility_20d_pct=volatility,
         limit_down_ratio_pct=limit_down,
     )
-    caps = load_v3_config()["regime"]["risk_asset_caps"]
+    caps = config["regime"]["risk_asset_caps"]
     base_cap = sum(
         probabilities[state] * float(caps[state])
         for state in probabilities

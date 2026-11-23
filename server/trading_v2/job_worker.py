@@ -102,11 +102,12 @@ def _claim_job(engine: Engine) -> dict[str, Any] | None:
                 text(
                     """
                     SELECT * FROM st_job_v2
-                    WHERE status = 'PENDING'
+                    WHERE status = 'PENDING' AND job_type <> 'NATIVE_REPLAY'
+                      AND (next_run_at IS NULL OR next_run_at <= :now)
                     ORDER BY requested_at, job_id
                     LIMIT 1 FOR UPDATE
                     """
-                )
+                ), {"now": datetime.now()}
             ).mappings().first()
             if not row:
                 return None
@@ -2090,6 +2091,14 @@ def repair_orphaned_backtests(
 def run_one_job(engine: Engine) -> dict[str, Any]:
     job = _claim_job(engine)
     if not job:
+        from server.engine.strategy_native_backtest import native_tick
+        result = native_tick(engine)
+        if result['status'] != 'idle':
+            result['job_type']='NATIVE_REPLAY'
+            _heartbeat(engine, status='ERROR' if result['status'] in ('FAILED','BLOCKED') else 'IDLE',
+                success=result['status']=='COMPLETE', error_code='NATIVE_STAGE_FAILED' if result['status']=='FAILED' else None,
+                error_message=result.get('reason'))
+            return result
         _heartbeat(engine, status="IDLE")
         return {"status": "idle"}
     job_id = str(job["job_id"])

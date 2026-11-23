@@ -10007,7 +10007,7 @@ resolve_release_execution_scope() {
     RELEASE_EXECUTION_SCOPE=LINUX
     RECEIPT_FLAGS=("fast-forced-over-coordinated")
     log_release_warning \
-      "fast forced over classified COORDINATED scope; database migration is skipped"
+      "fast Linux scope: shared coordinated migrations skipped; native job schema prepared separately"
   else
     RELEASE_SCOPE=LINUX
     RELEASE_EXECUTION_SCOPE=LINUX
@@ -10160,8 +10160,13 @@ linux_release_failure() {
   trap - ERR
   log_release_error \
     "fast mode failed at: $failed_command (status=$failed_status)"
-  log_release_error \
-    "If this is a schema-related error, retry with: $EXPECTED_SHA --full"
+  if [ "$CUTOVER_STEP" = prepare_native_research_job_schema ]; then
+    log_release_error \
+      "Native job schema failed. Keep task 70 paused, retain additive columns/index, verify prior DDL owner terminal, then retry the same Linux release. Do not switch to --full."
+  else
+    log_release_error \
+      "If this is a schema-related error, retry with: $EXPECTED_SHA --full"
+  fi
   # Only the Linux controller can restore its transaction; the coordinated
   # rollback function creates QMT/SQL recovery effects and is never used here.
   "$BOOTSTRAP_PYTHON" -I "$COMPONENT_CONTROLLER" recover \
@@ -11381,10 +11386,13 @@ write_scheduler_dropin() {
     '' \
     '[Service]' \
     'Type=simple' \
+    'CacheDirectory=probiga-native-research' \
+    'CacheDirectoryMode=0700' \
+    'Environment=PROBIGA_NATIVE_DATASET_ROOT=/var/cache/probiga-native-research' \
     "User=$SERVICE_USER" \
     "Group=$SERVICE_USER" \
     "WorkingDirectory=$code_root" \
-    "ExecStart=/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin API_EMBEDDED_SCHEDULER_ENABLED=false API_SCHEDULER_MAX_CONCURRENT_TASKS=2 PROBIGA_DEPLOYMENT_MODE=production PROBIGA_STRATEGY_GOVERNANCE_MODE=$STRATEGY_GOVERNANCE_MODE PROBIGA_STRATEGY_GOVERNANCE_BASE_SCHEMA_READY=true PROBIGA_SCHEDULER_EXECUTOR_ROLE=linux_standalone QMT_ANNOUNCEMENT_CHECKPOINT_DIR=$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PROBIGA_EXPECTED_GIT_SHA=$revision PROBIGA_COMPONENT_RELEASE_PATH=/var/lib/probiga/release-artifacts/$revision/component-release.json PROBIGA_BUILD_COMMIT_SHA=$revision PROBIGA_CODE_ROOT=$code_root PROBIGA_EXPECTED_ADATA_SHA=$adata_sha PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha PROBIGA_ADATA_SOURCE_DIR=$adata_source PROBIGA_RELEASE_TREE_SHA256=$release_tree_sha PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$adapter_registry_seal_sha PYTHONPATH=$adata_source:$code_root $RELEASE_VENV_ROOT/$revision/bin/python -P $code_root/tools/run_scheduler_daemon.py" \
+    "ExecStart=/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin API_EMBEDDED_SCHEDULER_ENABLED=false API_SCHEDULER_MAX_CONCURRENT_TASKS=2 PROBIGA_DEPLOYMENT_MODE=production PROBIGA_STRATEGY_GOVERNANCE_MODE=$STRATEGY_GOVERNANCE_MODE PROBIGA_STRATEGY_GOVERNANCE_BASE_SCHEMA_READY=true PROBIGA_SCHEDULER_EXECUTOR_ROLE=linux_standalone QMT_ANNOUNCEMENT_CHECKPOINT_DIR=$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT PROBIGA_NATIVE_DATASET_ROOT=/var/cache/probiga-native-research GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PROBIGA_EXPECTED_GIT_SHA=$revision PROBIGA_COMPONENT_RELEASE_PATH=/var/lib/probiga/release-artifacts/$revision/component-release.json PROBIGA_BUILD_COMMIT_SHA=$revision PROBIGA_CODE_ROOT=$code_root PROBIGA_EXPECTED_ADATA_SHA=$adata_sha PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha PROBIGA_ADATA_SOURCE_DIR=$adata_source PROBIGA_RELEASE_TREE_SHA256=$release_tree_sha PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$adapter_registry_seal_sha PYTHONPATH=$adata_source:$code_root $RELEASE_VENV_ROOT/$revision/bin/python -P $code_root/tools/run_scheduler_daemon.py" \
     'Restart=on-failure' \
     'RestartSec=5s' \
     'Environment=API_EMBEDDED_SCHEDULER_ENABLED=false' \
@@ -15207,6 +15215,7 @@ prepared_v2_rollback_release_database_guard() {
 run_prepared_database_migration_tool() {
   local entrypoint="$1"
   shift
+  local -a native_deadline=()
   test "$entrypoint" = \
     "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_schema.py"
   test -f "$entrypoint"
@@ -15220,16 +15229,19 @@ run_prepared_database_migration_tool() {
     :
   elif [ "$#" -eq 3 ] && \
     [ "$1" = --phase ] && \
-    { [ "$2" = cutover ] || [ "$2" = resume ]; } && \
+    { [ "$2" = cutover ] || [ "$2" = resume ] || [ "$2" = native-replay ]; } && \
     [ "$3" = --writers-fenced ]; then
     :
   else
     echo "database migration runner rejected non-allowlisted arguments" >&2
     return 2
   fi
+  if [ "$#" -eq 3 ] && [ "$2" = native-replay ]; then
+    native_deadline=(/usr/bin/timeout --signal=TERM --kill-after=10s 180s)
+  fi
   (
     cd "$PREPARED_CODE_ROOT"
-    /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+    "${native_deadline[@]}" /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
       GIT_OPTIONAL_LOCKS=0 \
       PYTHONDONTWRITEBYTECODE=1 \
       PYTHONSAFEPATH=1 \
@@ -16879,6 +16891,10 @@ CUTOVER_STEP=prebuild_release_space
 prebuild_reclaim_release_space
 CUTOVER_STEP=prepare_release
 prepare_release
+CUTOVER_STEP=prepare_native_research_job_schema
+run_prepared_database_migration_tool \
+  "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_schema.py" \
+  --phase native-replay --writers-fenced
 if [ "$RELEASE_EXECUTION_SCOPE" = LINUX ]; then
   CUTOVER_STEP=fast_release_schema_guard
   check_fast_release_schema

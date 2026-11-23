@@ -3,12 +3,16 @@ from datetime import date, datetime
 
 from server.common.pit_execution_guard import daily_bar_execution_disposition
 from server.engine.shadow_trial_policy import frozen_shadow_execution_contract, shadow_initial_stop, shadow_exit_reason
-from server.engine.strategy_rule_replay import ACCOUNT
-from server.trading_v2.instrument_registry import _stock_rule
-from server.trading_v3.backtest import _execution_fee_with_impact
+from server.common.research_execution_math import _stock_rule, _execution_fee_with_impact
 
 
-def replay_native(strategy, signals, bars, sessions, *, evaluation_start, source_gaps):
+def replay_native(strategy, signals, bars, sessions, *, evaluation_start, source_gaps,
+                  account=None, allocation_policy='FIXED_SHADOW'):
+    if account is None:
+        from server.engine.strategy_rule_replay import ACCOUNT
+        account = dict(ACCOUNT)
+    if allocation_policy not in ('FIXED_SHADOW', 'ADAPTIVE_REGIME'):
+        raise ValueError('native allocation policy differs')
     if sessions != sorted(set(sessions)) or evaluation_start not in sessions:
         raise ValueError("native replay sessions differ")
     prices = {(str(r['trade_date'])[:10], r['stock_code']): r for r in bars}
@@ -46,7 +50,7 @@ def replay_native(strategy, signals, bars, sessions, *, evaluation_start, source
             if value/float(row['amount']) > .01:
                 dispositions.append({'stock_code': code, 'trade_date': day, 'status': 'KNOWN_UNFILLED', 'reason': '退出成交容量不足，顺延'})
                 continue
-            fee, impact = _execution_fee_with_impact(value, account=ACCOUNT, sell=True,
+            fee, impact = _execution_fee_with_impact(value, account=account, sell=True,
                 participation_rate=value/float(row['amount']), maximum_participation_rate=.01)
             cash += value-fee
             pnl = None if p.get('unknown') else value-fee-p['entry_value']-p['entry_fee']
@@ -92,7 +96,13 @@ def replay_native(strategy, signals, bars, sessions, *, evaluation_start, source
                 exclude('开盘价与冻结保护止损冲突', 'KNOWN_UNFILLED')
                 continue
             industry_value = sum(p['entry_value'] for p in held.values() if p['industry']==s['industry'])
-            budget = min(initial*policy['maximum_target_bp']/10000, initial*.3-industry_value,
+            multiplier = float(s['allocation_multiplier']) if allocation_policy == 'ADAPTIVE_REGIME' else 1.0
+            cap = float(s['risk_asset_cap']) if allocation_policy == 'ADAPTIVE_REGIME' else 1.0
+            if not 0 <= multiplier <= 100 or not 0 <= cap <= 1:
+                raise ValueError('native allocation multiplier or cap invalid')
+            held_value = sum(p['entry_value'] for p in held.values())
+            budget = min(initial*policy['maximum_target_bp']/10000*min(multiplier,1.0), initial*.3-industry_value,
+                         initial*cap-held_value if allocation_policy == 'ADAPTIVE_REGIME' else cash,
                          sum(amounts)/20*.01, opening_cash, cash)
             quantity = max(0,int(budget/(price*1.01)/instrument['buy_lot_size'])*instrument['buy_lot_size'])
             if quantity < instrument['first_buy_minimum']:
@@ -102,7 +112,7 @@ def replay_native(strategy, signals, bars, sessions, *, evaluation_start, source
             if value/float(row['amount']) > .01:
                 exclude('当日成交容量不足，原订单不按未来成交额缩量', 'KNOWN_UNFILLED')
                 continue
-            fee,impact = _execution_fee_with_impact(value, account=ACCOUNT, sell=False,
+            fee,impact = _execution_fee_with_impact(value, account=account, sell=False,
                 participation_rate=value/(sum(amounts)/20), maximum_participation_rate=.01)
             if value+fee > min(opening_cash,cash):
                 exclude('含费用现金不足', 'KNOWN_UNFILLED')
@@ -141,5 +151,6 @@ def replay_native(strategy, signals, bars, sessions, *, evaluation_start, source
         'input_exclusion_count': excluded, 'net_return_pct': result if not partial and not invalid else None,
         'verified_input_subset_return_pct': result if not invalid and trades else None,
         'return_scope': 'UNKNOWN' if invalid else 'VERIFIED_INPUT_SUBSET' if partial else 'FULL_REQUESTED_INPUTS',
-        'fees': {'kind':'ESTIMATE', **ACCOUNT}, 'out_of_sample_status': 'RETROSPECTIVE_NOT_PRISTINE',
+        'fees': {'kind':'ESTIMATE', **account}, 'out_of_sample_status': 'RETROSPECTIVE_NOT_PRISTINE',
+        'allocation_policy': allocation_policy,
         'funding_eligible': False, 'real_order_authority': False}

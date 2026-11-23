@@ -506,11 +506,14 @@ def _paper_research_theme_keywords() -> dict[str, tuple[str, ...]]:
     try:
         from .config import load_v3_config
 
-        raw_groups = (
-            load_v3_config().get("theme_research", {}).get("groups", {})
-        )
+        config=load_v3_config()
     except (FileNotFoundError, KeyError, TypeError, ValueError):
-        raw_groups = {}
+        config={}
+    return research_theme_keywords(config)
+
+
+def research_theme_keywords(config) -> dict[str, tuple[str,...]]:
+    raw_groups=config.get('theme_research',{}).get('groups',{})
     configured = {
         str(group): tuple(
             str(keyword)
@@ -523,7 +526,7 @@ def _paper_research_theme_keywords() -> dict[str, tuple[str, ...]]:
     return configured or PAPER_RESEARCH_THEME_KEYWORDS
 
 
-def paper_research_groups(theme_names: Any) -> list[str]:
+def paper_research_groups(theme_names: Any, *, keywords=None) -> list[str]:
     """Classify auditable paper-only research groups from all theme labels."""
 
     values = (
@@ -534,8 +537,8 @@ def paper_research_groups(theme_names: Any) -> list[str]:
     normalized = "|".join(str(value).upper() for value in values if value)
     return [
         group
-        for group, keywords in _paper_research_theme_keywords().items()
-        if any(keyword.upper() in normalized for keyword in keywords)
+        for group, values in (keywords if keywords is not None else _paper_research_theme_keywords()).items()
+        if any(keyword.upper() in normalized for keyword in values)
     ]
 
 
@@ -867,6 +870,7 @@ def attach_best_theme(
     *,
     memberships: dict[str, list[Membership]],
     statistics: dict[str, dict[str, Any]],
+    research_keywords=None,
 ) -> None:
     """Attach the best theme and retain every independently scored theme.
 
@@ -975,7 +979,7 @@ def attach_best_theme(
             item["all_theme_cluster_labels"] = all_theme_cluster_labels
             item["theme_signal_candidates"] = []
             item["paper_research_groups"] = paper_research_groups(
-                all_theme_names
+                all_theme_names, keywords=research_keywords,
             )
             item["stock_leadership_score"] = 0.0
             item["leadership_quality"] = 0.0
@@ -987,7 +991,7 @@ def attach_best_theme(
         item["all_theme_cluster_labels"] = all_theme_cluster_labels
         item["theme_signal_candidates"] = candidates
         item["paper_research_groups"] = paper_research_groups(
-            item["theme_names"]
+            item["theme_names"], keywords=research_keywords,
         )
         stats = candidates[0]
         for key, value in stats.items():
