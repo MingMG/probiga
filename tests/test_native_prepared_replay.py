@@ -95,6 +95,12 @@ def test_ready_inputs_produce_fills_reports_and_reuse_features_across_allocation
     monkeypatch.setenv('PROBIGA_NATIVE_DATASET_ROOT',str(tmp_path))
     local,store=storage.PreparedDataset(tmp_path),FormalAnalysisStore(queue)
     baseline=prepared_experiment(queue,local,store,monkeypatch,'FIXED_SHADOW')
+    budgets=[]
+    original_budget=native._feature_compute_deadline
+    def budget(started,*,arm_timer):
+        budgets.append(started)
+        return original_budget(started,arm_timer=arm_timer)
+    monkeypatch.setattr(native,'_feature_compute_deadline',budget)
     result=native.native_tick(queue)
     with queue.connect() as connection:
         first=native.read_runs(connection,run_id=baseline['run_id'])[0]
@@ -103,6 +109,9 @@ def test_ready_inputs_produce_fills_reports_and_reuse_features_across_allocation
     assert report['completed_trade_count']>0 and report['trades'][0]['estimated_fee_cny']>0
     assert first['completed_units']==first['total_units']
     assert first['reports']['quality_momentum']['available_feature_sessions']==1
+    assert budgets  # PREPARE_DAYS entered FEATURES in the same attempt.
+    assert first['source_progress']['dataset']=='feature_input_decode'
+    assert first['source_progress']['completed']==first['source_progress']['total']==70
     assert not list(tmp_path.glob('*.pin'))
     adaptive=prepared_experiment(queue,local,store,monkeypatch,'ADAPTIVE_REGIME')
     assert adaptive['run_id']!=baseline['run_id']

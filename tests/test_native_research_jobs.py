@@ -191,3 +191,48 @@ def test_claim_database_stall_rolls_back_before_job_or_head_publication(queue,mo
         assert job['status']=='PENDING' and job['scheduler_run_uid'] is None
         state=native.read_runs(connection,run_id=experiment()['run_id'])[0]
         assert state['checkpoint_sequence']==1 and state['status']=='NOT_STARTED'
+
+
+def test_feature_budget_uses_original_attempt_start_and_remains_bounded(monkeypatch):
+    timers=[]
+    monkeypatch.setattr(native.signal,'setitimer',lambda _kind,seconds:timers.append(seconds),raising=False)
+    monkeypatch.setattr(native.signal,'ITIMER_REAL',0,raising=False)
+    monkeypatch.setattr(native.time,'monotonic',lambda:400)
+    assert native._feature_compute_deadline(100,arm_timer=True)==1000
+    monkeypatch.setattr(native.time,'monotonic',lambda:700)
+    assert native._feature_compute_deadline(100,arm_timer=True)==1000
+    assert timers==[600,300]
+    monkeypatch.setattr(native.time,'monotonic',lambda:1000)
+    with pytest.raises(native.NativeStepDeadline,match='FEATURE_ATTEMPT_DEADLINE'):
+        native._feature_compute_deadline(100,arm_timer=False)
+
+
+def test_feature_decode_progress_only_counts_successful_day_reads_per_attempt(monkeypatch):
+    first,second,unrelated={},{},{}
+    state={'run_id':'b'*64,'attempt':29,'completed_units':101,'feature_windows':{'day':['one','two']},
+           'bars':{'one':{'tree':first},'two':{'tree':second}}}
+    saved=[]
+    monkeypatch.setattr(native,'_save',lambda _c,s,_o:saved.append(deepcopy(s)))
+    class Inputs:
+        def get_tree(self,tree):
+            if tree is second:raise ValueError('invalid content hash')
+            return ['exact decoded value']
+    monkeypatch.setattr(jobs.time,'monotonic',lambda:0)
+    observed=jobs.feature_input_progress(None,state,None,Inputs(),'day',deadline=900)
+    assert observed.get_tree(unrelated)==['exact decoded value']
+    assert 'source_progress' not in state
+    monkeypatch.setattr(jobs.time,'monotonic',lambda:31)
+    assert observed.get_tree(first)==['exact decoded value']
+    assert saved[-1]['source_progress']['completed']==1
+    assert saved[-1]['source_progress']['total']==2
+    assert saved[-1]['completed_units']==101
+    with pytest.raises(ValueError,match='invalid content hash'):observed.get_tree(second)
+    assert state['source_progress']['completed']==1
+    observed.get_tree(first)
+    assert len(saved)==1
+    previous_scope=state['source_progress']['scope']
+    state['attempt']=30
+    next_attempt=jobs.feature_input_progress(None,state,None,Inputs(),'day',deadline=900)
+    next_attempt.get_tree(first)
+    assert state['source_progress']['completed']==1
+    assert state['source_progress']['scope']!=previous_scope

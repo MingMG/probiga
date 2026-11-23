@@ -19,7 +19,7 @@ def test_source_budget_yields_durable_progress_and_stops_when_the_prefix_does_no
     monkeypatch.setattr(identity,'algorithm_identity',lambda _config:{'sha256':'math'})
     state=experiment()
     with queue.begin() as connection:jobs.enqueue(connection,state)
-    def bounded(connection,state,owner):
+    def bounded(connection,state,owner,*,feature_budget=None):
         FormalAnalysisStore(queue).put('e'*64,'native_source_part','verified-prefix',{'members':['000001']})
         callback=jobs._source_progress(connection,state,owner,'2026-09-07',stage,deadline=-1)
         callback(100,400,'fixed-source',True)

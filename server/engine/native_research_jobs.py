@@ -260,7 +260,7 @@ class PrepareYield(BaseException):
     """A committed source partition reached this attempt's time budget."""
 
 
-def _source_progress(connection, state, owner, day, stage, *, deadline):
+def _source_progress(connection, state, owner, day, stage, *, deadline, checkpoint_interval=5):
     from server.engine.strategy_native_backtest import _save
     from server.common.analysis_pool_receipt import canonical_sha256
     last_saved = time.monotonic()
@@ -279,13 +279,33 @@ def _source_progress(connection, state, owner, day, stage, *, deadline):
                 'completed': done, 'total': total, 'last_progress_at': str(now_shanghai()), 'fresh_source_write': fresh}
             cursors[key]=dict(state['source_progress'])
             state['last_progress_at'] = str(now_shanghai())
-        if advanced and (time.monotonic() - last_saved >= 5 or done == total):
+        if advanced and (time.monotonic() - last_saved >= checkpoint_interval or done == total):
             _save(connection, state, owner)
             last_saved = time.monotonic()
         if time.monotonic() >= deadline and done < total:
             if done<=starting.get(key,0):raise RuntimeError('PREPARE_NO_PROGRESS:'+stage)
             raise PrepareYield('来源断点已保存：' + stage)
     return progress
+
+
+def feature_input_progress(connection, state, owner, dataset, day, *, deadline):
+    """Observe decoded day trees without changing the frozen feature function."""
+    from server.common.analysis_pool_receipt import canonical_sha256
+    pending = {id(state['bars'][target]['tree']): target for target in state['feature_windows'][day]}
+    total = len(pending)
+    scope = canonical_sha256({'run_id': state['run_id'], 'attempt': state['attempt'], 'day': day})
+    progress = _source_progress(connection, state, owner, day, 'feature_input_decode',
+                                deadline=deadline, checkpoint_interval=30)
+
+    class ObservedInputs:
+        def get_tree(self, tree):
+            value = dataset.get_tree(tree)
+            if id(tree) in pending:
+                pending.pop(id(tree))
+                progress(total - len(pending), total, scope, False)
+            return value
+
+    return ObservedInputs()
 
 
 def source_deadline():
