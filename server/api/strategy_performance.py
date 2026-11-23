@@ -143,6 +143,10 @@ def _research(run, proposal, *, native=False):
     report = validation.get("report") or {}
     nav = report.get("nav") or []
     trades = report.get("trades") or []
+    curve_sessions = validation.get('sessions') or []
+    if native and curve_sessions:
+        # Closed trades can settle after the last signal evaluation date.
+        curve_sessions = [curve_sessions[0],run.get('execution_end_date') or curve_sessions[-1]]
     initial = _number(report.get("initial_cash_cny"))
     net_return = _number(report.get("net_return_pct")) if validation.get("status") == "COMPLETE" else None
     subset_return = (_number(report.get("verified_input_subset_return_pct"))
@@ -196,7 +200,7 @@ def _research(run, proposal, *, native=False):
         "missing_feature_dates": validation.get("missing_feature_dates") or [],
         'partial_feature_dates':validation.get('partial_feature_dates') or [],
         "out_of_sample_status": report.get("out_of_sample_status", "UNKNOWN"),
-        "win_rate_history": _research_win_rate_history(trades, report, validation.get("sessions") or [])
+        "win_rate_history": _research_win_rate_history(trades, report, curve_sessions)
             if validation.get("status") in {"COMPLETE", "PARTIAL"} else [],
         "funding_eligible": False}
 

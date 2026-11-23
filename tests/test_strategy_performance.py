@@ -116,6 +116,20 @@ def test_win_rate_curve_uses_all_closed_trades_and_aggregates_the_exit_day():
     assert _research_win_rate_history([], {"completed_trade_count":0}, ["2026-07-01","2026-07-31"]) == []
 
 
+def test_native_win_rate_includes_closes_in_the_frozen_execution_window():
+    run={'run_id':'run','sessions':['2026-09-07'],'execution_end_date':'2026-10-20'}
+    proposal={'rule_hash':'rule','strategy_key':'trend','version':'v1','name':'趋势',
+        'validation':{'status':'COMPLETE','sessions':['2026-09-07'],'dataset_sha256':'verified',
+            'report':{'status':'COMPLETE','completed_trade_count':1,'initial_cash_cny':1000,
+                'net_return_pct':5,'fees':{'kind':'ESTIMATE'},
+                'trades':[{'exit_at':'2026-09-08 15:00:00','net_pnl_cny':50}]}}}
+    row=_research(run,proposal,native=True)
+    assert row['win_rate_history']==[{'date':'2026-09-08','completed_trades':1,
+        'winning_trades':1,'win_rate_pct':100}]
+    proposal['validation']['report']['trades'][0]['exit_at']='2026-10-21 15:00:00'
+    assert _research(run,proposal,native=True)['win_rate_history']==[]
+
+
 def test_actual_sql_trade_pagination_and_coverage():
     engine = create_engine("sqlite://")
     raw = formal_row()

@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import math
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -417,12 +418,14 @@ def _load_theme_memberships(
             )
     as_of_exclusive = datetime.combine(as_of + timedelta(days=1), datetime.min.time())
     cutoff = normalize_decision_at(decision_at) if decision_at is not None else as_of_exclusive
+    deadline = time.monotonic() + 120
+    stage = 'RUN'
     try:
         with engine.connect() as connection:
             run = connection.execute(
                 text(
                     """
-                    SELECT snapshot_date, source, captured_at,
+                    SELECT /*+ MAX_EXECUTION_TIME(12000) */ snapshot_date, source, captured_at,
                            concept_relation_count, concept_hash
                     FROM qmt_membership_snapshot_run
                     WHERE snapshot_date <= :as_of
@@ -465,10 +468,11 @@ def _load_theme_memberships(
             if captured_at.date() != snapshot_date or not source_close <= captured_at <= cutoff:
                 return dict(result), None
             verify_prior = snapshot_date != as_of and not allow_research_last_known
+            stage = 'COVERAGE'
             relation_evidence = connection.execute(
                 text(
                     """
-                    SELECT COUNT(*) AS relation_count,
+                    SELECT /*+ MAX_EXECUTION_TIME(12000) */ COUNT(*) AS relation_count,
                            MIN(captured_at) AS first_captured_at,
                            MAX(captured_at) AS last_captured_at
                     FROM qmt_concept_member_snapshot
@@ -495,26 +499,50 @@ def _load_theme_memberships(
                 or normalize_decision_at(last_captured_at) != normalize_decision_at(captured_at)
             ):
                 return dict(result), None
-            stock_predicate = "" if verify_prior else "AND stock_code IN :codes"
-            statement = text(f"""
-                SELECT stock_code, concept_code, concept_name, short_name
-                FROM qmt_concept_member_snapshot
-                WHERE snapshot_date = :snapshot_date
-                  AND source = :source
-                  {stock_predicate}
-                  AND quality_status = 'QMT_VALIDATED'
-                  AND captured_at = :captured_at
-                ORDER BY stock_code, concept_code
-            """)
-            params = {
-                "snapshot_date": snapshot_date,
-                "source": source,
-                "captured_at": captured_at,
-            }
-            if not verify_prior:
-                statement = statement.bindparams(bindparam("codes", expanding=True))
-                params["codes"] = codes
-            rows = connection.execute(statement, params).mappings().all()
+            stage = 'DIRECTORY'
+            if expected_relations > 600000:
+                raise ValueError('concept snapshot exceeds 600000 relations')
+            directory_index = (' FORCE INDEX (uk_qmt_concept_member_snapshot)'
+                               if connection.dialect.name == 'mysql' else '')
+            directory = connection.execute(text('''SELECT /*+ MAX_EXECUTION_TIME(12000) */ id,stock_code
+                FROM qmt_concept_member_snapshot''' + directory_index + '''
+                WHERE snapshot_date=:day AND source=:source
+                ORDER BY concept_code,stock_code LIMIT 600001'''),
+                {'day':snapshot_date,'source':source}).mappings().all()
+            ids = [row['id'] for row in directory]
+            if len(ids)>600000 or len(ids)<expected_relations or len(ids)!=len(set(ids)):
+                raise ValueError('concept snapshot directory coverage differs')
+            requested = set(codes)
+            selected = [row['id'] for row in directory if verify_prior or row['stock_code'] in requested]
+            directory_codes = {row['id']:row['stock_code'] for row in directory}
+            primary = ' FORCE INDEX (PRIMARY)' if connection.dialect.name == 'mysql' else ''
+            statement_sql = '''SELECT /*+ MAX_EXECUTION_TIME({timeout_ms}) */ id,snapshot_date,source,
+                stock_code,concept_code,concept_name,short_name,quality_status,captured_at
+                FROM qmt_concept_member_snapshot''' + primary + ' WHERE id IN :ids'
+            rows = []
+            stage = 'MEMBERS'
+            for offset in range(0,len(selected),256):
+                remaining = deadline - time.monotonic()
+                if remaining<=0:
+                    raise TimeoutError('concept snapshot read exceeded 120 seconds')
+                batch=selected[offset:offset+256]
+                statement = text(statement_sql.format(timeout_ms=max(1,min(12000,int(remaining*1000))))).bindparams(
+                    bindparam('ids',expanding=True))
+                records=connection.execute(statement,{'ids':batch}).mappings().all()
+                if len(records)!=len(batch) or {row['id'] for row in records}!=set(batch):
+                    raise ValueError('concept snapshot member IDs differ')
+                for row in records:
+                    if str(row['snapshot_date'])[:10]!=snapshot_date.isoformat() or row['source']!=source:
+                        raise ValueError('concept snapshot member scope differs')
+                    if row['stock_code']!=directory_codes[row['id']]:
+                        raise ValueError('concept snapshot member security differs')
+                    if row['quality_status']=='QMT_VALIDATED':
+                        if normalize_decision_at(row['captured_at'])!=captured_at:
+                            raise ValueError('concept snapshot member clock differs')
+                        rows.append(row)
+            if time.monotonic()>=deadline:
+                raise TimeoutError('concept snapshot read exceeded 120 seconds')
+            rows.sort(key=lambda row:(row['stock_code'],row['concept_code']))
             if verify_prior:
                 identities = [
                     tuple(str(row[column] or "") for column in (
@@ -529,9 +557,8 @@ def _load_theme_memberships(
                     return dict(result), None
                 requested = set(codes)
                 rows = [row for row in rows if row["stock_code"] in requested]
-    except Exception:
-        # L1 membership remains available even if optional concepts cannot be read.
-        return dict(result), None
+    except Exception as exc:
+        raise RuntimeError('QMT_CONCEPT_SNAPSHOT_READ_FAILED:' + stage + ':' + type(exc).__name__) from exc
     recorded_at = captured_at
     if recorded_at.tzinfo is None or recorded_at.utcoffset() is None:
         recorded_at = recorded_at.replace(tzinfo=MARKET_TIMEZONE)
@@ -607,6 +634,8 @@ def _load_theme_memberships(
                     "concept",
                 )
             )
+    if time.monotonic()>=deadline:
+        raise RuntimeError('QMT_CONCEPT_SNAPSHOT_READ_FAILED:RESOLVE:TimeoutError')
     return dict(result), snapshot_date
 
 
