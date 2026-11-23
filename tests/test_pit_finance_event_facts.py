@@ -4044,3 +4044,53 @@ def test_premarket_announcement_uses_only_completed_signed_batch_members(tmp_pat
     assert {item["event_key"] for item in facts.facts[codes[0]]} == {"qmt:A-000001", "qmt:signed-event"}
     assert facts.status_for(codes[1]) == PIT_AVAILABLE and facts.facts[codes[1]] == []
     engine.dispose()
+
+
+def test_finance_source_validation_resumes_durable_chunks_after_step_deadline(monkeypatch):
+    from server.common import pit_facts as pit
+    from server.common.formal_analysis_store import FormalAnalysisStore
+    from server.db.formal_analysis_schema import privileged_migrate_formal_analysis_schema
+    from server.engine.strategy_native_backtest import NativeStepDeadline
+
+    engine, kwargs = _sealed_common_cutoff_case()
+    privileged_migrate_formal_analysis_schema(engine)
+    monkeypatch.setattr(pit, 'FINANCE_ATOMIC_BATCH_QUERY_CODE_LIMIT', 1)
+    selections = []
+    expected = resolve_common_fact_cutoff(engine, **kwargs, capture_finance_selection=selections.append)
+    store = FormalAnalysisStore(engine)
+    saved = []
+    def interrupt(done, total, scope, fresh):
+        if fresh:
+            saved.append((done, total, scope))
+            raise NativeStepDeadline('observed production step deadline')
+    with pytest.raises(NativeStepDeadline):
+        resolve_common_fact_cutoff(engine, **kwargs, finance_coverage_store=store,
+            finance_coverage_progress=interrupt)
+    assert len(saved) == 1 and saved[0][:2] == (1, 2)
+    queries = []
+    def source_boundary(_c, _cursor, statement, parameters, _ctx, _many):
+        if 'AS selected' in statement and 'selected.coverage_id IN' in statement:
+            assert '000001' not in parameters, 'completed source chunk queried again'
+            queries.append(parameters)
+    event.listen(engine, 'before_cursor_execute', source_boundary)
+    progress = []
+    try:
+        actual = resolve_common_fact_cutoff(engine, **kwargs, finance_coverage_store=store,
+            finance_coverage_progress=lambda *args: progress.append(args))
+        assert actual == expected
+        assert len(queries) == 1
+        assert [p[3] for p in progress] == [False, True]
+        queries.clear()
+        resumed = []
+        assert resolve_common_fact_cutoff(engine, **kwargs, finance_coverage_store=store,
+            capture_finance_selection=resumed.append) == expected
+        assert queries == []
+        from server.common.pit_sealed_finance_read import load_sealed_finance_facts
+        def facts(selection):
+            return load_sealed_finance_facts(engine, selection=selection, codes=kwargs['codes'],
+                decision_at=kwargs['decision_at'], fact_cutoff_at=expected['fact_cutoff_at'],
+                as_of_date=kwargs['finance_end_date'])
+        assert facts(resumed[0]) == facts(selections[0])
+    finally:
+        event.remove(engine, 'before_cursor_execute', source_boundary)
+        engine.dispose()

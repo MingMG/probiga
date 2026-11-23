@@ -198,12 +198,21 @@ def _v3_day(c,state,day,owner):
         for proposal in state['proposals']:
             proposal['validation'].update(status='RUNNING',reason=f'公告来源核对 {day}：已保存 {done}/{total} 个成员')
         state['last_progress_at']=str(now_shanghai());_save(c,state,owner)
+    def finance_coverage_progress(done,total,scope,fresh):
+        if not fresh:return
+        state['finance_source_read_checkpoint']={'trade_date':day,'dataset':'finance_coverage','completed':done,
+            'total':total,'scope':scope,'last_progress_at':str(now_shanghai())}
+        state['source_progress']=dict(state['finance_source_read_checkpoint'])
+        for proposal in state['proposals']:
+            proposal['validation'].update(status='RUNNING',reason=f'财务来源核对 {day}：已保存 {done}/{total} 个成员')
+        state['last_progress_at']=str(now_shanghai());_save(c,state,owner)
     if fact_inputs is None:
         cutoff=resolve_strategy_fact_cutoffs(c.engine,codes=eligible,decision_at=known,finance_start_date='1900-01-01',
             finance_end_date=day,event_start_date=target-timedelta(days=20),event_end_date=day,require_qmt_event_batch=True,
             event_trade_date=day,capture_finance_selection=finances.append,capture_historical_selection=events.append,
             finance_observation_at=finance_observation,
             event_progress=progress,
+            finance_coverage_store=FormalAnalysisStore(c.engine),finance_coverage_progress=finance_coverage_progress,
             event_coverage_store=FormalAnalysisStore(c.engine),event_coverage_progress=coverage_progress)
     else:
         cutoff=fact_inputs.cutoff
@@ -352,6 +361,7 @@ def _start(c,strategies,days,published,source_hash,contract):
         'cursor':0,'completed_units':0,'total_units':(len(warmup)+len(days))*2+len(days)+len(strategies),
         'last_progress_at':clock,'reason':'','proposals':[],
         'fact_read_checkpoint':dict(frozen.get('fact_read_checkpoint') or {}) if frozen else {},
+        'finance_source_read_checkpoint':dict(frozen.get('finance_source_read_checkpoint') or {}) if frozen else {},
         'coverage_read_checkpoint':dict(frozen.get('coverage_read_checkpoint') or {}) if frozen else {},
         'event_read_checkpoint':dict(frozen.get('event_read_checkpoint') or {}) if frozen else {}}
     inputs=_input_parts(c,state)
@@ -476,6 +486,7 @@ def native_tick(engine):
             checkpoint_before=dict(state.get('fact_read_checkpoint') or {})
             event_before=dict(state.get('event_read_checkpoint') or {})
             coverage_before=dict(state.get('coverage_read_checkpoint') or {})
+            finance_source_before=dict(state.get('finance_source_read_checkpoint') or {})
             def timeout(_signum,_frame):raise NativeStepDeadline('原生回测单步超过600秒')
             previous_handler=signal.signal(signal.SIGALRM,timeout);signal.setitimer(signal.ITIMER_REAL,600)
             _step(c,state,owner)
@@ -497,7 +508,10 @@ def native_tick(engine):
                 coverage_saved=state.get('coverage_read_checkpoint') or {}
                 coverage_earlier=coverage_before.get('completed',0) if (coverage_before.get('trade_date'),coverage_before.get('scope'))==(coverage_saved.get('trade_date'),coverage_saved.get('scope')) else 0
                 coverage_advanced=coverage_saved.get('completed',0)>coverage_earlier
-                if isinstance(ex,NativeStepDeadline) and (finance_advanced or event_advanced or coverage_advanced):
+                source_saved=state.get('finance_source_read_checkpoint') or {}
+                source_earlier=finance_source_before.get('completed',0) if (finance_source_before.get('trade_date'),finance_source_before.get('scope'))==(source_saved.get('trade_date'),source_saved.get('scope')) else 0
+                source_advanced=source_saved.get('completed',0)>source_earlier
+                if isinstance(ex,NativeStepDeadline) and (finance_advanced or event_advanced or coverage_advanced or source_advanced):
                     state.update(status='NOT_STARTED',step_status='COMPLETE',
                         reason='来源事实分块断点已保存；下一步继续',retry_after=str(now_shanghai()+timedelta(minutes=1)))
                 original=getattr(ex,'orig',ex);args=getattr(original,'args',())
