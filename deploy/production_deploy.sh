@@ -689,6 +689,23 @@ def inspect_directory(parent, name, level, snapshot, relative):
     finally:
         os.close(descriptor)
 
+def bind_subtree(parent):
+    # Sibling publications may change the parent. Recheck this name instead
+    # of treating unrelated parent timestamps as risk-checkpoint mutations.
+    while True:
+        bounded()
+        before = os.fstat(parent)
+        require(before, directory=True, jobs_root=True)
+        try:
+            current = os.lstat(subtree, dir_fd=parent)
+        except FileNotFoundError:
+            current = None
+        after = os.fstat(parent)
+        require(after, directory=True, jobs_root=True)
+        if stable_identity(before) == stable_identity(after):
+            return current
+
+
 before_root = os.lstat(root)
 require(before_root, directory=True, jobs_root=True)
 directory = os.open(root, directory_flags)
@@ -697,8 +714,6 @@ try:
     require(opened_root, directory=True, jobs_root=True)
     if object_identity(before_root) != object_identity(opened_root):
         raise SystemExit("exposure risk checkpoint job-log root changed")
-    if not live and stable_identity(before_root) != stable_identity(opened_root):
-        raise SystemExit("exposure risk checkpoint job-log root changed while quiescent")
     previous = None
     seen_subtree = False
     # A second fd-relative physical read rejects quiescent inode/namespace
@@ -725,26 +740,26 @@ try:
         require(held_root, directory=True, jobs_root=True)
         if not (object_identity(before_root) == object_identity(held_root) == object_identity(current_root)):
             raise SystemExit("exposure risk checkpoint job-log root changed")
-        if not live and not (stable_identity(before_root) == stable_identity(held_root) == stable_identity(current_root)):
-            raise SystemExit("exposure risk checkpoint job-log root changed while quiescent")
-        if live:
-            # Other jobs atomically publish flat checkpoints in this parent.
-            # Their writes do not change the fixed namespace being inspected.
-            # Bind that namespace again so a late creation is still scanned,
-            # and disappearance/replacement of a verified directory fails.
-            try:
-                latest_subtree = os.lstat(subtree, dir_fd=directory)
-            except FileNotFoundError:
-                if seen_subtree:
-                    raise SystemExit("exposure risk checkpoint directory disappeared")
-            else:
-                require(latest_subtree, directory=True)
-                verified_identity = directory_identities.get(subtree)
-                if verified_identity is None:
-                    stable_passes = 0
-                    continue
-                if object_identity(latest_subtree) != verified_identity:
-                    raise SystemExit("exposure risk checkpoint directory changed")
+        latest_subtree = bind_subtree(directory)
+        if latest_subtree is None:
+            if seen_subtree:
+                raise SystemExit("exposure risk checkpoint directory disappeared")
+        else:
+            require(latest_subtree, directory=True)
+            verified_identity = directory_identities.get(subtree)
+            if verified_identity is None:
+                if not live:
+                    raise SystemExit("exposure risk checkpoint namespace appeared while quiescent")
+                stable_passes = 0
+                continue
+            if object_identity(latest_subtree) != verified_identity:
+                raise SystemExit("exposure risk checkpoint directory changed")
+            if not live and stable_identity(latest_subtree) != snapshot[subtree]:
+                raise SystemExit("exposure risk checkpoint namespace changed while quiescent")
+        final_root = os.lstat(root)
+        require(final_root, directory=True, jobs_root=True)
+        if object_identity(before_root) != object_identity(final_root):
+            raise SystemExit("exposure risk checkpoint job-log root changed")
         previous = snapshot
         stable_passes += 1
 finally:
