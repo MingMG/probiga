@@ -254,7 +254,7 @@ def read_performance(engine, day, *, experiment_id=None):
     records.extend(formal)
     if experiment_id is None:
         preferred=next((run for run in native_runs if run.get('status')=='RUNNING'),None)
-        preferred=preferred or next((run for run in native_runs if run.get('status')=='FAILED'),None)
+        preferred=preferred or next((run for run in native_runs if run.get('status') in ('COMPLETE','BLOCKED','FAILED')),None)
         if preferred:experiment_id=preferred['run_id']
     strategies = []
     for row in workspace["strategies"]:

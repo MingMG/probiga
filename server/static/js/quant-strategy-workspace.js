@@ -147,6 +147,8 @@
         const focused=s.mount.contains(document.activeElement)?document.activeElement:null;
         const focusControl=focused&&focused.dataset.qswControl;
         const focusSeries=focused&&focused.dataset.qswSeries;
+        const focusExperimentField=focused&&focused.dataset.qswExperimentField;
+        const focusExperimentSelector=focused&&focused.hasAttribute('data-qsw-experiment');
         const focusPoint=focused&&focused.dataset.qswPoint;
         const focusKey=focused&&focused.closest('details')&&focused.closest('details').dataset.qswKey;
         const focusRefresh=focused&&focused.hasAttribute('data-qsw-action');
@@ -156,6 +158,8 @@
         let restore;
         if(focusControl)restore=Array.from(s.mount.querySelectorAll('[data-qsw-control]')).find(e=>e.dataset.qswControl===focusControl);
         else if(focusSeries)restore=Array.from(s.mount.querySelectorAll('[data-qsw-series]')).find(e=>e.dataset.qswSeries===focusSeries);
+        else if(focusExperimentField)restore=Array.from(s.mount.querySelectorAll('[data-qsw-experiment-field]')).find(e=>e.dataset.qswExperimentField===focusExperimentField);
+        else if(focusExperimentSelector)restore=s.mount.querySelector('[data-qsw-experiment]');
         else if(focusPoint)restore=Array.from(s.mount.querySelectorAll('[data-qsw-point]')).find(e=>e.dataset.qswPoint===focusPoint);
         else if(focusKey){const detail=Array.from(s.mount.querySelectorAll('details')).find(e=>e.dataset.qswKey===focusKey);restore=detail&&detail.querySelector('summary');}
         else if(focusRefresh)restore=s.mount.querySelector('[data-qsw-action]');
@@ -165,6 +169,13 @@
         const s={mount,window:'20',order:'name',data:null,market:null,timer:null,busy:false,performance:null,chartHidden:[],experimentId:''};
         const pinKey='qsw.native.experiment.'+day;
         try{const requested=new URLSearchParams(location.search).get('experiment_id')||'';s.experimentId=/^[0-9a-f]{64}$/.test(requested)?requested:sessionStorage.getItem(pinKey)||'';}catch(e){/* Browser storage is optional. */}
+        function bindExperiment(id){
+            s.experimentId=id;
+            try{sessionStorage.setItem(pinKey,id);}catch(err){}
+            const url=new URL(location.href);
+            if(id)url.searchParams.set('experiment_id',id);else url.searchParams.delete('experiment_id');
+            history.replaceState(history.state,'',url.pathname+url.search+url.hash);
+        }
         mount._strategyWorkspace=s;
         async function refresh() {
             if(s.busy||!mount.isConnected||(isActive&&!isActive()))return;
@@ -220,13 +231,13 @@
                 const payload=Object.fromEntries(Array.from(form.querySelectorAll('[data-qsw-experiment-field]'),x=>[x.dataset.qswExperimentField,x.value]));
                 if(Object.values(payload).some(x=>!x)){s.resultError='请填写完整实验区间。';paint(s);return;}
                 s.resultLoading=true;s.resultError='';s.resultNotice='';paint(s);
-                try{const queued=await request('/api/quant-workbench/strategy-performance/'+encodeURIComponent(experiment.dataset.qswNewExperiment)+'/experiments?request_uid='+Array.from(crypto.getRandomValues(new Uint8Array(16)),b=>b.toString(16).padStart(2,'0')).join(''),20000,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});s.experimentId=queued.target_run_id;s.resultNotice=queued.reason;try{sessionStorage.setItem(pinKey,s.experimentId);}catch(err){}refreshPerformance(true);}
+                try{const queued=await request('/api/quant-workbench/strategy-performance/'+encodeURIComponent(experiment.dataset.qswNewExperiment)+'/experiments?request_uid='+Array.from(crypto.getRandomValues(new Uint8Array(16)),b=>b.toString(16).padStart(2,'0')).join(''),20000,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});bindExperiment(queued.target_run_id);s.resultNotice=queued.reason;refreshPerformance(true);}
                 catch(err){s.resultError='实验登记失败：'+(err.message||err);}
                 finally{s.resultLoading=false;if(mount.isConnected)paint(s);}
             }else if(retry){
                 if(s.resultLoading)return;
                 s.resultLoading=true;s.resultError='';s.resultNotice='';paint(s);
-                try{const queued=await request('/api/quant-workbench/strategy-performance/'+encodeURIComponent(retry.dataset.qswRetry)+'/retry?request_uid='+Array.from(crypto.getRandomValues(new Uint8Array(16)),b=>b.toString(16).padStart(2,'0')).join(''),20000,{method:'POST'});s.resultNotice=(queued.reason||'恢复请求已登记')+'；等待后台领取。';if(queued.target_run_id){s.experimentId=queued.target_run_id;try{sessionStorage.setItem(pinKey,s.experimentId);}catch(e){}}refreshPerformance(true);}
+                try{const queued=await request('/api/quant-workbench/strategy-performance/'+encodeURIComponent(retry.dataset.qswRetry)+'/retry?request_uid='+Array.from(crypto.getRandomValues(new Uint8Array(16)),b=>b.toString(16).padStart(2,'0')).join(''),20000,{method:'POST'});s.resultNotice=(queued.reason||'恢复请求已登记')+'；等待后台领取。';if(queued.target_run_id)bindExperiment(queued.target_run_id);refreshPerformance(true);}
                 catch(err){s.resultError='恢复请求失败：'+(err.message||err);}
                 finally{s.resultLoading=false;if(mount.isConnected)paint(s);}
             }else if(result){
@@ -243,7 +254,7 @@
         };
         mount.onchange=e=>{
             if(e.target.matches('[data-qsw-experiment-field]')){mount.oninput(e);return;}
-            if(e.target.matches('[data-qsw-experiment]')){s.experimentId=e.target.value;s.performanceHeadVersion='';try{sessionStorage.setItem(pinKey,s.experimentId);}catch(err){}refreshPerformance(true);return;}
+            if(e.target.matches('[data-qsw-experiment]')){bindExperiment(e.target.value);s.performanceHeadVersion='';refreshPerformance(true);return;}
             const series=e.target.dataset.qswSeries;
             if(series){const hidden=new Set(s.chartHidden);if(e.target.checked)hidden.delete(series);else hidden.add(series);s.chartHidden=Array.from(hidden);paint(s);return;}
             const field=e.target.dataset.qswControl;if(field&&s.data){s[field]=e.target.value;paint(s);}

@@ -180,3 +180,23 @@ def test_browser_win_rate_lines_keep_current_versions_unknown_samples_and_toggle
     runner = tmp_path/"win-rate.cjs"
     runner.write_text("global.window={};require("+json.dumps(str(script))+");const s="+json.dumps(state)+";const render=window.QuantStrategyWorkspace.render;let h=render(s);for(const t of ['各策略累计胜率','50.00%','盈利 1 / 已平仓 2 笔','暂无有效样本'])if(!h.includes(t))throw Error(t);if((h.match(/<polyline/g)||[]).length!==1||h.includes('<img'))throw Error('invalid series');s.chartHidden=['trend'];h=render(s);if(h.includes('<polyline')||!h.includes('当前曲线均已隐藏'))throw Error('toggle');",encoding="utf-8")
     subprocess.run([node,str(runner)],timeout=10,check=True)
+
+
+
+def test_default_experiment_prefers_recent_terminal_over_old_failure_and_honors_pin(monkeypatch):
+    from server.api import strategy_performance as performance
+    from server.api import quant_strategy_workspace as workspace
+    from server.engine import strategy_native_backtest as native
+    engine=create_engine('sqlite://')
+    monkeypatch.setattr(workspace,'read_strategy_workspace',lambda *_a:{
+        'trade_date':'2026-11-20','autonomous_research':{'runs':[]},'strategies':[]})
+    runs=[{'run_id':str(index)*64,'status':status,'proposals':[]} for index,status in
+          ((1,'NOT_STARTED'),(2,'BLOCKED'),(3,'FAILED'))]
+    monkeypatch.setattr(native,'read_runs',lambda *_a,**_kw:runs)
+    monkeypatch.setattr(performance.TradingV2ReadRepository,'backtests',lambda *_a:[])
+    result=performance.read_performance(engine,'2026-11-20')
+    assert result['experiment_id']=='2'*64
+    runs.append({'run_id':'4'*64,'status':'RUNNING','proposals':[]})
+    assert performance.read_performance(engine,'2026-11-20')['experiment_id']=='4'*64
+    assert performance.read_performance(engine,'2026-11-20',experiment_id='3'*64)['experiment_id']=='3'*64
+    engine.dispose()
