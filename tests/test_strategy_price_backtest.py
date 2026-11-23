@@ -110,8 +110,8 @@ def test_native_receipt_uses_original_universe_and_reuses_immutable_scope(monkey
         c.execute(text('CREATE TABLE qmt_stock_catalog_member(batch_id TEXT,stock_code TEXT,instrument_type TEXT,list_date TEXT,expire_date TEXT)'))
         for batch, codes in [('original', ['000001', '000002', '000003']), ('later', ['000001', '000002', '000003', '000004'])]:
             c.execute(text("INSERT INTO qmt_stock_catalog_member VALUES(:batch,:code,'STOCK','2020-01-01',NULL)"), [{'batch': batch, 'code': code} for code in codes])
-        c.execute(text('CREATE TABLE sm_stock_kline(stock_code TEXT,trade_date TEXT,k_type INT,adjust_type INT,received_at TEXT,open REAL,high REAL,low REAL,close REAL,pre_close REAL,volume REAL,amount REAL)'))
-        c.execute(text("INSERT INTO sm_stock_kline VALUES(:code,:day,1,0,'2026-10-16 18:00:00',10,11,9,10,10,1000,10000)"), [{'code': f'00000{i}', 'day': day} for i in range(1, 5)])
+        c.execute(text('CREATE TABLE sm_stock_kline(id INTEGER PRIMARY KEY,stock_code TEXT,trade_date TEXT,k_type INT,adjust_type INT,received_at TEXT,open REAL,high REAL,low REAL,close REAL,pre_close REAL,volume REAL,amount REAL)'))
+        c.execute(text("INSERT INTO sm_stock_kline(stock_code,trade_date,k_type,adjust_type,received_at,open,high,low,close,pre_close,volume,amount) VALUES(:code,:day,1,0,'2026-10-16 18:00:00',10,11,9,10,10,1000,10000)"), [{'code': f'00000{i}', 'day': day} for i in range(1, 5)])
     group = {'sessions': [day], 'sources': {day: 'QMT_RETAINED'}}
     for _ in range(2):
         with engine.begin() as c:
@@ -157,7 +157,7 @@ def test_historical_bar_batches_fit_query_budget_without_losing_daily_scope(monk
     codes = [f'{i:06d}' for i in range(5500)]
     with engine.begin() as c:
         c.execute(text('CREATE TABLE qmt_stock_catalog_member(batch_id TEXT,stock_code TEXT,instrument_type TEXT,list_date TEXT,expire_date TEXT,PRIMARY KEY(batch_id,stock_code))'))
-        c.execute(text('CREATE TABLE sm_stock_kline(stock_code TEXT,trade_date TEXT,k_type INT,adjust_type INT,received_at TEXT,open REAL,high REAL,low REAL,close REAL,pre_close REAL,volume REAL,amount REAL)'))
+        c.execute(text('CREATE TABLE sm_stock_kline(id INTEGER PRIMARY KEY,stock_code TEXT,trade_date TEXT,k_type INT,adjust_type INT,received_at TEXT,open REAL,high REAL,low REAL,close REAL,pre_close REAL,volume REAL,amount REAL)'))
         c.execute(text('CREATE INDEX idx_date_ktype ON sm_stock_kline(trade_date,k_type,adjust_type)'))
         members = [{'code': code, 'kind': 'STOCK', 'listed': '2020-01-01', 'expired': None} for code in codes]
         members += [{'code': '990001', 'kind': 'ETF', 'listed': '2020-01-01', 'expired': None},
@@ -165,9 +165,9 @@ def test_historical_bar_batches_fit_query_budget_without_losing_daily_scope(monk
                     {'code': '990003', 'kind': 'STOCK', 'listed': '2020-01-01', 'expired': '2026-08-01'},
                     {'code': '990004', 'kind': 'STOCK', 'listed': '2020-01-01', 'expired': None}]
         c.execute(text("INSERT INTO qmt_stock_catalog_member VALUES('frozen',:code,:kind,:listed,:expired)"), members)
-        c.execute(text("INSERT INTO sm_stock_kline VALUES(:code,:day,1,0,'2026-09-10',10,11,9,10,10,1000,10000)"),
+        c.execute(text("INSERT INTO sm_stock_kline(stock_code,trade_date,k_type,adjust_type,received_at,open,high,low,close,pre_close,volume,amount) VALUES(:code,:day,1,0,'2026-09-10',10,11,9,10,10,1000,10000)"),
                   [{'code': member['code'], 'day': day} for day in days for member in members])
-        c.execute(text("INSERT INTO sm_stock_kline VALUES('000001',:day,1,0,'2026-11-23',99,99,99,99,99,1000,10000)"), [{'day': day} for day in days])
+        c.execute(text("INSERT INTO sm_stock_kline(stock_code,trade_date,k_type,adjust_type,received_at,open,high,low,close,pre_close,volume,amount) VALUES('000001',:day,1,0,'2026-11-23',99,99,99,99,99,1000,10000)"), [{'day': day} for day in days])
     scopes = {day: {'catalog': 'frozen', 'excluded_codes': ['990004'], 'stock_count': len(codes),
                     'stock_set_hash': canonical_sha256(codes)} for day in days}
     monkeypatch.setattr(price, '_resolved_scopes', lambda *_args: scopes)
@@ -245,9 +245,9 @@ def test_daily_bars_resume_committed_dates_after_real_query_budget_interrupt(mon
     with engine.begin() as c:
         c.execute(text('CREATE TABLE qmt_stock_catalog_member(batch_id TEXT,stock_code TEXT,instrument_type TEXT,list_date TEXT,expire_date TEXT)'))
         c.execute(text("INSERT INTO qmt_stock_catalog_member VALUES('bound',:c,'STOCK','2020-01-01',NULL)"), [{'c': x} for x in codes])
-        c.execute(text('CREATE TABLE sm_stock_kline(stock_code TEXT,trade_date TEXT,k_type INT,adjust_type INT,received_at TEXT,open REAL,high REAL,low REAL,close REAL,pre_close REAL,volume REAL,amount REAL)'))
+        c.execute(text('CREATE TABLE sm_stock_kline(id INTEGER PRIMARY KEY,stock_code TEXT,trade_date TEXT,k_type INT,adjust_type INT,received_at TEXT,open REAL,high REAL,low REAL,close REAL,pre_close REAL,volume REAL,amount REAL)'))
         c.execute(text('CREATE INDEX idx_date_ktype ON sm_stock_kline(trade_date,k_type,adjust_type)'))
-        c.execute(text("INSERT INTO sm_stock_kline VALUES(:c,:d,1,0,'2026-07-10',10,11,9,10,10,1000,10000)"), [{'c': x, 'd': d} for d in days for x in codes])
+        c.execute(text("INSERT INTO sm_stock_kline(stock_code,trade_date,k_type,adjust_type,received_at,open,high,low,close,pre_close,volume,amount) VALUES(:c,:d,1,0,'2026-07-10',10,11,9,10,10,1000,10000)"), [{'c': x, 'd': d} for d in days for x in codes])
     scopes = {d: {'catalog': 'bound', 'excluded_codes': [], 'stock_count': len(codes),
                   'stock_set_hash': canonical_sha256(codes)} for d in days}
     monkeypatch.setattr(price, '_resolved_scopes', lambda *_: scopes)
@@ -255,14 +255,20 @@ def test_daily_bars_resume_committed_dates_after_real_query_budget_interrupt(mon
     sample = 'SELECT SUBSTR(k.stock_code,1,6),k.trade_date,k.open,k.high,k.low,k.close,k.pre_close,k.volume,k.amount FROM sm_stock_kline k WHERE k.k_type=1 AND k.adjust_type=0 AND k.trade_date=:d AND k.received_at<=:cutoff LIMIT 60001'
     with engine.connect() as c:
         driver = c.connection.driver_connection
-        measured = [0]
-        def count():
-            measured[0] += 100
-            return 0
-        driver.set_progress_handler(count, 100)
-        c.execute(text(sample), {'d': days[0], 'cutoff': '2026-11-22'}).all()
-        driver.set_progress_handler(None, 0)
-        single_day_steps = measured[0]
+        def steps(statement, params):
+            measured = [0]
+            def count():
+                measured[0] += 1
+                return 0
+            driver.set_progress_handler(count, 1)
+            c.execute(text(statement), params).all()
+            driver.set_progress_handler(None, 0)
+            return measured[0]
+        old_steps = steps(sample, {'d': days[0], 'cutoff': '2026-11-22'})
+        directory_steps = steps("SELECT id,trade_date FROM sm_stock_kline WHERE k_type=1 AND adjust_type=0 AND trade_date IN ('2026-07-06','2026-07-07') ORDER BY trade_date,id LIMIT 60001", {})
+        primary_steps = steps("SELECT id,stock_code,trade_date,open,high,low,close,pre_close,volume,amount FROM sm_stock_kline WHERE id IN (" + ','.join(map(str,range(1,257))) + ") AND received_at<='2026-11-22'", {})
+        assert max(directory_steps, primary_steps) < old_steps
+        limit = (max(directory_steps, primary_steps) + old_steps) // 2
     failed = []; queried = []; fail_last = True
     with engine.begin() as c:
         driver = c.connection.driver_connection
@@ -270,25 +276,28 @@ def test_daily_bars_resume_committed_dates_after_real_query_budget_interrupt(mon
             driver.set_progress_handler(None, 0)
             if 'FROM sm_stock_kline k' not in statement:
                 return
-            queried.append(tuple(x for x in parameters if x in days))
-            limit = single_day_steps // 2 if fail_last and days[-1] in parameters else single_day_steps * 3 // 2
+            if 'WHERE k.id IN' in statement:
+                queried.append(tuple(x for x in parameters if x in days))
+            maximum = 1 if fail_last and 'WHERE k.id IN' in statement and days[-1] in parameters else limit
             used = 0
             def progress():
                 nonlocal used
-                used += 100
-                if used > limit:
-                    failed.append(queried[-1])
+                used += 1
+                if used > maximum:
+                    failed.append(tuple(x for x in parameters if x in days))
                     return 1
                 return 0
-            driver.set_progress_handler(progress, 100)
+            driver.set_progress_handler(progress, 1)
         event.listen(c, 'before_cursor_execute', budget)
         try:
+            with pytest.raises(OperationalError, match='interrupted'):
+                c.execute(text(sample), {'d': days[0], 'cutoff': '2026-11-22'}).all()
             with pytest.raises(OperationalError, match='interrupted'):
                 price._read_bars(c, days, inputs, '2026-11-22')
         finally:
             driver.set_progress_handler(None, 0)
             event.remove(c, 'before_cursor_execute', budget)
-    assert failed and any(len(group) > 1 for group in failed)
+    assert failed and (days[-1],) in failed
     fail_last = False
     queried.clear()
     with engine.begin() as c:
@@ -299,7 +308,7 @@ def test_daily_bars_resume_committed_dates_after_real_query_budget_interrupt(mon
         finally:
             driver.set_progress_handler(None, 0)
             event.remove(c, 'before_cursor_execute', budget)
-    assert queried == [(days[-1],)]
+    assert queried and set(queried) == {(days[-1],)}
     assert len(result) == len(days) * len(codes)
     assert {r['close'] for r in result} == {10}
     with engine.begin() as c:

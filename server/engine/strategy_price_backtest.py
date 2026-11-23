@@ -14,7 +14,6 @@ import time
 
 import pandas as pd
 from sqlalchemy import bindparam, text
-from sqlalchemy.exc import DBAPIError
 
 from server.common.analysis_pool_receipt import canonical_sha256
 from server.common.authoritative_market_clock import PRODUCTION_TIMEZONE
@@ -288,6 +287,7 @@ def _validate_bar_day(rows, day, expected, scope, allowed):
 
 
 def _read_bars(connection, days, inputs, cutoff):
+    deadline = time.monotonic() + 600
     scopes = _resolved_scopes(connection, inputs, days, cutoff)
     bindings = {d: scopes[d]["catalog"] for d in days}
     expected = {day: n for part in inputs.values() for day, n in part["row_counts"].items()}
@@ -298,12 +298,14 @@ def _read_bars(connection, days, inputs, cutoff):
     rows = _frozen_native_bars(connection, frozen, cutoff)
     mutable_days = [day for day in days if day not in frozen]
     # A six-day join exceeded 12s in production; two A-share days read in 2.6s.
-    width = max(1, min(8, 16000 // max(expected[d] for d in days)))
+    width = max(1, min(2, 16000 // max(expected[d] for d in days)))
     force = " FORCE INDEX (idx_date_ktype) " if connection.dialect.name == "mysql" else " "
+    primary = " FORCE INDEX (PRIMARY) " if connection.dialect.name == "mysql" else " "
     catalogs = {}
     missing = sorted({bindings[day] for day in mutable_days})
-    for offset in range(0, len(missing), 4):
-        batch_ids = missing[offset:offset + 4]
+    # Four cold catalog snapshots exceeded 12s; each read still covers a full stock catalog.
+    for offset in range(0, len(missing)):
+        batch_ids = missing[offset:offset + 1]
         members = connection.execute(text("""SELECT /*+ MAX_EXECUTION_TIME(12000) */
             batch_id,stock_code,list_date,expire_date FROM qmt_stock_catalog_member
             WHERE batch_id IN :batches AND instrument_type='STOCK' LIMIT 40001""").bindparams(bindparam('batches', expanding=True)),
@@ -338,33 +340,35 @@ def _read_bars(connection, days, inputs, cutoff):
             rows.extend(batch)
 
     def read_chunk(chunk):
-        # Apply the same dated catalog in memory; the per-row SQL join timed out on two days.
-        try:
-            batch = connection.execute(text("""SELECT /*+ MAX_EXECUTION_TIME(12000) */
-            SUBSTR(k.stock_code,1,6) stock_code,k.trade_date,k.`open`,k.high,k.low,k.`close`,k.pre_close,k.volume,k.amount
+        if time.monotonic() >= deadline:
+            raise TimeoutError('历史行情目录读取超过600秒总时限')
+        directory = connection.execute(text("""SELECT /*+ MAX_EXECUTION_TIME(12000) */ k.id,k.trade_date
             FROM sm_stock_kline k """ + force + """ WHERE k.k_type=1 AND k.adjust_type=0
-            AND k.trade_date IN :days AND k.received_at<=:cutoff LIMIT 60001""").bindparams(bindparam('days', expanding=True)),
-                {'days': chunk, 'cutoff': cutoff}).mappings().all()
-        except DBAPIError as exc:
-            args = getattr(exc.orig, 'args', ())
-            timed_out = (args and args[0] == 3024) or getattr(exc.orig, 'sqlite_errorcode', None) == 9
-            if not timed_out or len(chunk) == 1:
-                raise
-            # Cold two-day reads exceeded 12s in production; split only that failed batch.
-            middle = len(chunk) // 2
-            read_chunk(chunk[:middle])
-            read_chunk(chunk[middle:])
-            return
-        if len(batch) > 60000:
-            raise ValueError('历史行情候选批次超过60000行')
-        selected = {}
+            AND k.trade_date IN :days ORDER BY k.trade_date,k.id LIMIT 60001""").bindparams(bindparam('days', expanding=True)),
+            {'days': chunk}).mappings().all()
+        if len(directory) > 60000 or len(directory) != len({r['id'] for r in directory}):
+            raise ValueError('历史行情候选目录超过60000行或主键重复')
         for day in chunk:
-            selected[day] = [dict(r) for r in batch
-                             if str(r['trade_date'])[:10] == day and r['stock_code'] in allowed[day]]
-            _validate_bar_day(selected[day], day, expected[day], scopes[day], allowed[day])
-        store.put_many(generation, 'price_daily_bars',
-                       {keys[day]: {'rows': _bar_checkpoint(selected[day])} for day in chunk})
-        rows.extend(row for day in chunk for row in selected[day])
+            ids = [r['id'] for r in directory if str(r['trade_date'])[:10] == day]
+            selected = []
+            # Even a cold single-day secondary-index payload range exceeded 12s.
+            for start in range(0, len(ids), 256):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('历史行情主键读取超过600秒总时限')
+                group = ids[start:start + 256]
+                batch = connection.execute(text("""SELECT /*+ MAX_EXECUTION_TIME(12000) */
+                    k.id,SUBSTR(k.stock_code,1,6) stock_code,k.trade_date,k.`open`,k.high,k.low,k.`close`,k.pre_close,k.volume,k.amount
+                    FROM sm_stock_kline k """ + primary + """ WHERE k.id IN :ids
+                    AND k.k_type=1 AND k.adjust_type=0 AND k.trade_date=:day
+                    AND k.received_at<=:cutoff""").bindparams(bindparam('ids', expanding=True)),
+                    {'ids': group, 'day': day, 'cutoff': cutoff}).mappings().all()
+                if len(batch) != len({r['id'] for r in batch}) or not {r['id'] for r in batch} <= set(group):
+                    raise ValueError(day + ' 历史行情主键正文重复或范围不一致')
+                selected.extend({key: r[key] for key in BAR_COLUMNS} for r in batch
+                                if str(r['trade_date'])[:10] == day and r['stock_code'] in allowed[day])
+            _validate_bar_day(selected, day, expected[day], scopes[day], allowed[day])
+            store.put(generation, 'price_daily_bars', keys[day], {'rows': _bar_checkpoint(selected)})
+            rows.extend(selected)
 
     missing_days = [day for day in mutable_days if day not in retained]
     for offset in range(0, len(missing_days), width):
