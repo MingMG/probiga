@@ -115,3 +115,13 @@ if(!sent||sent.o.method!=='POST'||!/^.*request_uid=[0-9a-f]{32}$/.test(sent.u)||
 })();
 ''',encoding='utf-8')
     subprocess.run([node,str(runner)],check=True,timeout=10)
+
+
+def test_performance_poll_keeps_verified_data_and_user_state_on_domain_failure():
+    node = shutil.which('node')
+    if not node:
+        pytest.skip('Node is required for the browser module')
+    runner = Path(__file__).resolve().parent / 'frontend/quant-strategy-workspace-dom.cjs'
+    result = subprocess.run([node, str(runner)], capture_output=True, text=True,
+                            encoding='utf-8', timeout=20)
+    assert result.returncode == 0, result.stdout + result.stderr

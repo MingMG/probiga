@@ -199,11 +199,19 @@
             clearTimeout(s.performanceTimer);
             performanceBusy=true;
             const started=Date.now();
-            try{const pin=s.experimentId?'&experiment_id='+encodeURIComponent(s.experimentId):'';
+            try{const requestedExperiment=s.experimentId;
+                const pin=requestedExperiment?'&experiment_id='+encodeURIComponent(requestedExperiment):'';
                 const head=await request('/api/quant-workbench/strategy-performance-version?'+pin.replace(/^&/,''),5000,{cache:'no-store'});
                 if(!force&&head.version===s.performanceHeadVersion&&!s.performanceError)return;
                 const d=await request('/api/quant-workbench/strategy-performance?trade_date='+encodeURIComponent(day)+pin,20000,{cache:'no-store'});
-                if(!mount.isConnected)return;
+                if(!mount.isConnected||s.experimentId!==requestedExperiment)return;
+                if(!d||!Array.isArray(d.results)||!Array.isArray(d.strategies)||!Array.isArray(d.experiments)||!d.sources)
+                    throw new Error('回测结果快照不完整');
+                const failed=Object.values(d.sources).find(source=>source?.status==='FAILED');
+                if(failed)throw new Error(failed.reason||'回测来源读取失败');
+                const selected=requestedExperiment||d.experiment_id;
+                if((requestedExperiment&&d.experiment_id!==requestedExperiment)||(selected&&!d.experiments.some(run=>run.run_id===selected)))
+                    throw new Error('本次结果未包含所选实验，等待完整读取');
                 s.performanceHeadVersion=head.version;
                 if(!s.experimentId&&d.experiment_id){s.experimentId=d.experiment_id;try{sessionStorage.setItem(pinKey,s.experimentId);}catch(e){}}
                 const activeId=s.resultDetail?.summary?.result_id;
