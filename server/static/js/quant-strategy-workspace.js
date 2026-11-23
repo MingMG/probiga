@@ -197,7 +197,7 @@
             if(retry){
                 if(s.resultLoading)return;
                 s.resultLoading=true;s.resultError='';s.resultNotice='';paint(s);
-                try{await request('/api/quant-workbench/strategy-performance/'+encodeURIComponent(retry.dataset.qswRetry)+'/retry?request_uid='+Array.from(crypto.getRandomValues(new Uint8Array(16)),b=>b.toString(16).padStart(2,'0')).join(''),20000,{method:'POST'});s.resultNotice='恢复请求已登记，等待后台从原断点接续。';refreshPerformance();}
+                try{const queued=await request('/api/quant-workbench/strategy-performance/'+encodeURIComponent(retry.dataset.qswRetry)+'/retry?request_uid='+Array.from(crypto.getRandomValues(new Uint8Array(16)),b=>b.toString(16).padStart(2,'0')).join(''),20000,{method:'POST'});s.resultNotice=(queued.reason||'恢复请求已登记')+'；等待后台领取。';refreshPerformance();}
                 catch(err){s.resultError='恢复请求失败：'+(err.message||err);}
                 finally{s.resultLoading=false;if(mount.isConnected)paint(s);}
             }else if(result){

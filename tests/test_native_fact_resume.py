@@ -7,8 +7,9 @@ from server.db.formal_analysis_schema import privileged_migrate_formal_analysis_
 from tests.test_autonomous_strategy_research import ledger
 
 
-def test_runtime_repair_keeps_same_input_clock_archives_and_total_deadline(ledger):
+def test_new_execution_keeps_input_clocks_and_archives_with_a_bounded_fresh_deadline(ledger,monkeypatch):
     now=native.now_shanghai()
+    monkeypatch.setattr(native,'now_shanghai',lambda:now)
     strategy={'strategy_key':'native','strategy_name':'native','current_version':'v1','version_hash':'a'*64}
     days=['2026-09-07','2026-09-08']
     with ledger.begin() as c:
@@ -24,7 +25,7 @@ def test_runtime_repair_keeps_same_input_clock_archives_and_total_deadline(ledge
         revised=native._start(c,[strategy],days,{},'a'*64,'different-runtime')
         assert revised['requested_at']==original['requested_at']
         assert revised['price_cutoff']==original['price_cutoff']
-        assert revised['deadline_at']==original['deadline_at']
+        assert revised['deadline_at']==str(now+timedelta(hours=24))
         assert revised['fact_read_checkpoint']==original['fact_read_checkpoint']
         assert revised['run_id']!=original['run_id']
         assert revised['input_archives']==[{'run_id':original['run_id'],'rule_hash':original['rule_hash']}]
@@ -43,8 +44,12 @@ def test_runtime_repair_keeps_same_input_clock_archives_and_total_deadline(ledge
     ('finance_source_read_checkpoint','finance_coverage',{},True),
     ('finance_source_read_checkpoint','finance_coverage',{'trade_date':'2026-09-07','scope':'c'*64,'completed':100},False),
     ('event_read_checkpoint','event_facts',{'trade_date':'2026-09-07','scope':'c'*64,'completed':100},False),
+    ('event_metadata_read_checkpoint','event_chain_metadata',{},False),
+    ('event_metadata_read_checkpoint','event_chain_metadata',{},True),
+    ('event_metadata_read_checkpoint','event_chain_metadata',{'trade_date':'2026-09-07','scope':'c'*64,'completed':100},False),
 ])
-def test_step_deadline_resumes_only_after_new_durable_source_progress(ledger,monkeypatch,field,dataset,prior,later_calculation):
+@pytest.mark.parametrize('failure',['job_deadline','reply_deadline'])
+def test_step_deadline_resumes_only_after_new_durable_source_progress(ledger,monkeypatch,field,dataset,prior,later_calculation,failure):
     privileged_migrate_formal_analysis_schema(ledger)
     with ledger.connect() as c:
         c.connection.driver_connection.create_function('GET_LOCK',2,lambda *_:1)
@@ -71,6 +76,8 @@ def test_step_deadline_resumes_only_after_new_durable_source_progress(ledger,mon
         if later_calculation:
             after_source=native.now_shanghai()+timedelta(minutes=3)
             monkeypatch.setattr(native,'now_shanghai',lambda:after_source)
+        if failure=='reply_deadline':
+            raise RuntimeError('QMT_ANNOUNCEMENT_LIVE_BATCH_REPLY_DEADLINE:controlled-read')
         raise native.NativeStepDeadline('controlled business step deadline')
     monkeypatch.setattr(native,'_step',partial)
     result=native.native_tick(ledger)

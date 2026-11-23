@@ -1,8 +1,9 @@
-"""Explicit, idempotent retry requests consumed by the existing leased worker."""
+"""Leased retries and versioned recomputation of the same frozen research inputs."""
 import json
 import re
 import socket
 import os
+from datetime import datetime,timedelta
 
 from sqlalchemy import text
 
@@ -13,6 +14,7 @@ from server.common.market_dashboard_worker import process_identity
 
 ENTITY='NATIVE_REPLAY_RETRY'
 REQUEST_LOCK='probiga:native-replay-requests'
+RETRY_EXECUTION_BUDGET=timedelta(hours=24)
 
 
 def read_requests(c,request_uid=None):
@@ -48,12 +50,12 @@ def request_retry(engine,result_id,request_uid):
             if not states or not any(p['rule_hash']==version_hash for p in states[0]['proposals']):raise KeyError(result_id)
             state=states[0]
             if state['status']!='FAILED':raise ValueError('仅失败的回测可请求恢复；正在运行或缺少数据的批次继续沿用原状态')
-            if state['contract']!=native._contract():raise ValueError('规则计算代码已变化，后台将按新数据身份建立回测')
             if any(r['run_id']==run_id and r['status']=='NOT_STARTED' for r in read_requests(c)):
                 raise ValueError('该批次已有待处理的恢复请求')
             value={'request_uid':request_uid,'run_id':run_id,'version_hash':version_hash,'status':'NOT_STARTED',
                 'expected_sequence':state['checkpoint_sequence'],'source_contract':state['contract'],
-                'requested_at':str(now_shanghai()),'reason':'操作员请求从原断点恢复'}
+                'requested_at':str(now_shanghai()),'reason':('按原冻结输入重新计算当前规则版本'
+                    if state['contract']!=native._contract() else '操作员请求从原断点恢复')}
             _append_audit_connection(c,entity_type=ENTITY,entity_key=request_uid,action='RETRY_00000001',
                 reason=value['reason'],operator='native-research-control',before=None,after=value,evidence={'run_id':run_id})
             c.commit()
@@ -61,6 +63,14 @@ def request_retry(engine,result_id,request_uid):
         finally:
             c.rollback()
             if mysql:c.execute(text('SELECT RELEASE_LOCK(:name)'),{'name':REQUEST_LOCK});c.commit()
+
+
+def _reject_request(c,request,reason,applied_at):
+    value={**request,'status':'FAILED','applied_at':str(applied_at),'reason':reason}
+    _append_audit_connection(c,entity_type=ENTITY,entity_key=request['request_uid'],action='RETRY_00000002',
+        reason=reason,operator='native-research-control',before=request,after=value,evidence={'run_id':request['run_id']})
+    c.commit()
+    return {'status':'FAILED','request_uid':request['request_uid'],'reason':reason}
 
 
 def consume_retries(engine):
@@ -72,9 +82,12 @@ def consume_retries(engine):
             for request in read_requests(c):
                 if request['status']!='NOT_STARTED':continue
                 state=native.read_runs(c,run_id=request['run_id'])[0]
+                applied_at=now_shanghai()
                 if (state['status']!='FAILED' or state['checkpoint_sequence']!=request['expected_sequence']
-                        or state['contract']!=request['source_contract'] or state['contract']!=native._contract()):
-                    raise ValueError('恢复请求与原失败检查点不一致，禁止覆盖新进度')
+                        or state['contract']!=request['source_contract']):
+                    return _reject_request(c,request,'恢复请求与原失败检查点不一致，禁止覆盖新进度',applied_at)
+                if applied_at>=datetime.fromisoformat(request['requested_at'])+RETRY_EXECUTION_BUDGET:
+                    return _reject_request(c,request,'恢复请求超过24小时未执行，原检查点保持不变',applied_at)
                 old=state['owner']
                 history=c.execute(text('SELECT status FROM st_scheduled_task_history WHERE run_uid=:uid'),
                     {'uid':old['scheduler_run_uid']}).mappings().one()
@@ -88,6 +101,33 @@ def consume_retries(engine):
                         except PermissionError:pass
                 if history['status']=='running' or not absent:
                     return {'status':'BLOCKED','reason':'旧回测进程尚未证明退出，保持原检查点'}
+                contract=native._contract()
+                if state['contract']!=contract:
+                    family=state['strategies'][0]['source_kind']
+                    strategies=[s for s in native._strategies(c) if s['source_kind']==family]
+                    if ([(s['strategy_key'],s['version_hash']) for s in strategies]
+                            !=[(s['strategy_key'],s['version_hash']) for s in state['strategies']]):
+                        return _reject_request(c,request,'策略登记版本已变化，禁止替换原研究规则',applied_at)
+                    candidate=native._start(c,strategies,state['sessions'],state['published'],state['source_hash'],contract)
+                    if any(candidate[k]!=state[k] for k in ('sessions','published','source_hash','requested_at','price_cutoff')):
+                        return _reject_request(c,request,'重新计算不能改变原冻结输入及可用时间',applied_at)
+                    if native.read_runs(c,run_id=candidate['run_id']):
+                        return _reject_request(c,request,'当前版本同源批次已存在：'+candidate['run_id'],applied_at)
+                    reason='原冻结输入已移交当前规则版本：'+candidate['run_id']
+                    superseded={**state,'status':'BLOCKED','step_status':'BLOCKED','reason':reason,
+                        'superseded_by_run_id':candidate['run_id'],'checkpoint_sequence':state['checkpoint_sequence']+1}
+                    for proposal in superseded['proposals']:
+                        proposal['validation']={**proposal['validation'],'status':'BLOCKED','reason':reason}
+                    done={**request,'status':'COMPLETE','applied_at':str(applied_at),
+                        'scheduler_run_uid':owner['scheduler_run_uid'],'target_run_id':candidate['run_id'],
+                        'execution_contract':contract,'previous_deadline_at':state['deadline_at'],
+                        'execution_deadline_at':candidate['deadline_at']}
+                    events=[{'entity_type':native.ENTITY,'entity_key':state['run_id'],
+                        'action':f"CHECKPOINT_{superseded['checkpoint_sequence']:08d}",'after':superseded},
+                        {'entity_type':ENTITY,'entity_key':request['request_uid'],'action':'RETRY_00000002','after':done}]
+                    native._save(c,candidate,owner,events)
+                    return {'status':'COMPLETE','request_uid':request['request_uid'],'run_id':candidate['run_id'],
+                        'resumed_cursor':candidate['cursor'],'business_started':False,'recomputed':True}
                 kind='S' if state['phase']=='SIGNALS' else 'P' if state['phase']=='PRICES' else None
                 if kind:
                     days=state['sessions'] if kind=='S' else state['input_sessions']
@@ -97,11 +137,14 @@ def consume_retries(engine):
                     if set(parts)!=set(days[:prefix]):raise ValueError('已保存分区不连续，禁止猜测恢复位置')
                     state['completed_units']+=prefix-state['cursor']
                     state['cursor']=prefix
+                previous_deadline=state['deadline_at']
                 state.update(status='NOT_STARTED',step_status='NOT_STARTED',retry_count=0,retry_after='',
+                    deadline_at=str(applied_at+RETRY_EXECUTION_BUDGET),
                     recovery_request_uid=request['request_uid'],reason=request['reason'])
                 for proposal in state['proposals']:
                     proposal['validation'].update(status='NOT_STARTED',reason=request['reason'])
-                done={**request,'status':'COMPLETE','applied_at':str(now_shanghai()),'scheduler_run_uid':owner['scheduler_run_uid']}
+                done={**request,'status':'COMPLETE','applied_at':str(applied_at),'scheduler_run_uid':owner['scheduler_run_uid'],
+                    'previous_deadline_at':previous_deadline,'execution_deadline_at':state['deadline_at']}
                 event={'entity_type':ENTITY,'entity_key':request['request_uid'],'action':'RETRY_00000002','after':done}
                 native._save(c,state,owner,[event])
                 return {'status':'COMPLETE','request_uid':request['request_uid'],'run_id':state['run_id'],

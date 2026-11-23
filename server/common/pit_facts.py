@@ -5705,7 +5705,8 @@ def _announcement_batch_read_reason(error: Exception) -> str:
         r"stock-catalog|batch-verified|batch-inventory(?::[0-9]{1,8})?|"
         r"batch-payload(?:-size)?:[0-9]{1,8}|"
         r"incremental-parent|candidate-read|signed-historical-(?:isolation|catalog|native|inventory|"
-        r"(?:chain|heads|size|payload|bindings):[0-9]{1,8}(?::inventory)?)",
+        r"(?:chain|heads|size|payload|bindings|sorted):[0-9]{1,8}(?::inventory)?|"
+        r"(?:directory|rows|head-directory|head-rows):[0-9]{1,8}:[0-9]{1,8})",
         detail,
     ):
         return f"{reason}:{detail}"
@@ -5802,88 +5803,204 @@ def _load_certified_initial_event_selection(
     )
 
 
+def _read_historical_metadata_rows(
+    connection: Connection, identifiers: list[str], *, deadline: float, stage: str,
+    metadata_store=None, metadata_progress=None,
+) -> list[dict[str, Any]]:
+    from server.common.qmt_announcement_pit import _live_announcement_read_hint, _live_announcement_reply_budget
+    from server.common.formal_analysis_store import FormalAnalysisArtifactIntegrityError
+
+    mysql = connection.dialect.name == "mysql"
+    index = " FORCE INDEX (PRIMARY)" if mysql else ""
+    columns = ("coverage_id,scope_hash,stock_code,revision_no,supersedes_coverage_id,"
+        "known_at,received_at,covered_through_at,coverage_status,coverage_fingerprint_hash,fact_kind,source")
+    generation = canonical_hash({'schema':'probiga.historical-chain-metadata.v1','table':SOURCE_COVERAGE_TABLE,'columns':columns})
+    scope = canonical_hash({'generation':generation,'ids':identifiers})
+    selected = []
+    for group_start in range(0, len(identifiers), 512):
+        blocks = [(start, identifiers[start:start + 128])
+            for start in range(group_start, min(group_start + 512, len(identifiers)), 128)]
+        hashes = {canonical_hash(keys): (start, keys) for start, keys in blocks}
+        retained = metadata_store.get_many(generation, 'coverage_metadata', list(hashes)) if metadata_store is not None else {}
+        pending = {}
+        for key, (start, keys) in hashes.items():
+            unit = f"{stage}:{start}"
+            _live_announcement_read_hint(mysql=False, deadline=deadline, stage=unit)
+            if key in retained:
+                continue
+            hint = _live_announcement_read_hint(mysql=mysql, deadline=deadline, stage=unit)
+            statement = text(f"SELECT {hint}{columns} FROM {SOURCE_COVERAGE_TABLE}{index} WHERE coverage_id IN :ids").bindparams(bindparam("ids", expanding=True))
+            with _live_announcement_reply_budget(connection, deadline=deadline, stage=unit):
+                rows = [dict(row) for row in connection.execute(statement, {"ids":keys}).mappings().all()]
+            if len(rows) != len(keys) or {row['coverage_id'] for row in rows} != set(keys):
+                raise ValueError("historical announcement chain directory membership differs")
+            pending[key] = _json_safe({'ids':keys,'rows':rows})
+        if pending and metadata_store is not None:
+            metadata_store.put_many(generation, 'coverage_metadata', pending)
+        for key, (start, keys) in hashes.items():
+            value = pending[key] if key in pending else retained[key]
+            if (value['ids'] != keys or len(value['rows']) != len(keys)
+                    or {row['coverage_id'] for row in value['rows']} != set(keys)):
+                raise FormalAnalysisArtifactIntegrityError("historical announcement cached metadata identities differ")
+            for raw in value['rows']:
+                row = dict(raw)
+                if set(row) != set(columns.split(',')):
+                    raise FormalAnalysisArtifactIntegrityError("historical announcement cached metadata columns differ")
+                for field in ('known_at','received_at','covered_through_at'):
+                    row[field] = _row_datetime(row[field])
+                selected.append(row)
+            if metadata_progress is not None and metadata_store is not None:
+                metadata_progress(start + len(keys), len(identifiers), scope, key in pending)
+    return selected
+
+
+def _read_historical_chain_metadata(
+    connection: Connection, *, codes: list[str], scopes: list[str], source: str,
+    received: datetime, deadline: float, offset: int, frontier: datetime | None = None,
+    metadata_store=None, metadata_progress=None,
+) -> list[dict[str, Any]]:
+    from server.common.qmt_announcement_pit import (
+        _live_announcement_read_hint, _live_announcement_reply_budget, VALIDATION_READ_BATCH_SIZE,
+    )
+
+    mysql = connection.dialect.name == "mysql"
+    directory_index = " FORCE INDEX (idx_pit_coverage_decision)" if mysql else ""
+    directory: dict[str, tuple[str, datetime]] = {}
+    metadata_cutoff = max(received, frontier or received)
+    # Keep the date predicate in its covering index; avoid random clustered reads
+    # while the server is still discovering and sorting a whole history range.
+    for start in range(0, len(codes), VALIDATION_READ_BATCH_SIZE):
+        stage = f"signed-historical-directory:{offset}:{start}"
+        hint = _live_announcement_read_hint(mysql=mysql, deadline=deadline, stage=stage)
+        statement = text(
+            f"SELECT {hint}coverage_id,stock_code,known_at FROM {SOURCE_COVERAGE_TABLE}{directory_index} "
+            "WHERE fact_kind='event' AND stock_code IN :codes AND known_at<=:received LIMIT :limit"
+        ).bindparams(bindparam("codes", expanding=True))
+        with _live_announcement_reply_budget(connection, deadline=deadline, stage=stage):
+            rows = connection.execute(statement, {
+                "codes": codes[start:start + VALIDATION_READ_BATCH_SIZE], "received": metadata_cutoff,
+                "limit": 200001 - len(directory),
+            }).tuples().all()
+        for identifier, code, known in rows:
+            if identifier in directory:
+                raise ValueError("historical announcement directory has duplicate identities")
+            directory[identifier] = (code, _row_datetime(known))
+        if len(directory) > 200000:
+            raise ValueError("historical announcement chain directory exceeds 200000 records")
+
+    selected = []
+    scope_set = set(scopes)
+    rows = _read_historical_metadata_rows(connection, sorted(directory), deadline=deadline,
+        stage=f"signed-historical-rows:{offset}", metadata_store=metadata_store, metadata_progress=metadata_progress)
+    for row in rows:
+        if row["fact_kind"] != "event" or directory[row["coverage_id"]] != (row["stock_code"], row["known_at"]):
+            raise ValueError("historical announcement chain directory identity differs")
+        if row["scope_hash"] not in scope_set or row["source"] != source:
+            continue
+        row.pop("fact_kind")
+        row.pop("source")
+        selected.append(row)
+    selected.sort(key=lambda row: (row["scope_hash"], row["revision_no"]))
+    _live_announcement_read_hint(mysql=False, deadline=deadline, stage=f"signed-historical-sorted:{offset}")
+    return selected
+
+
+def _read_historical_later_scopes(
+    connection: Connection, *, selected_revisions, source, frontier, deadline, offset,
+    metadata_store=None, metadata_progress=None,
+):
+    from server.common.qmt_announcement_pit import _live_announcement_read_hint, _live_announcement_reply_budget, VALIDATION_READ_BATCH_SIZE
+
+    mysql = connection.dialect.name == 'mysql'
+    index = ' FORCE INDEX (uk_pit_coverage_scope_revision)' if mysql else ''
+    scopes = sorted(selected_revisions)
+    directory = {}
+    inspected = 0
+    for start in range(0, len(scopes), VALIDATION_READ_BATCH_SIZE):
+        group = scopes[start:start + VALIDATION_READ_BATCH_SIZE]
+        stage = f'signed-historical-head-directory:{offset}:{start}'
+        hint = _live_announcement_read_hint(mysql=mysql, deadline=deadline, stage=stage)
+        statement = text(f'SELECT {hint}coverage_id,scope_hash,revision_no FROM {SOURCE_COVERAGE_TABLE}{index} '
+            'WHERE scope_hash IN :scopes AND revision_no>:revision LIMIT :limit').bindparams(bindparam('scopes', expanding=True))
+        with _live_announcement_reply_budget(connection, deadline=deadline, stage=stage):
+            rows = connection.execute(statement, {'scopes':group,'revision':min(selected_revisions[s] for s in group),
+                'limit':200001 - inspected}).tuples().all()
+        inspected += len(rows)
+        if inspected > 200000:
+            raise ValueError('historical announcement head directory exceeds 200000 records')
+        for identifier, scope, revision in rows:
+            if revision > selected_revisions[scope]:
+                if identifier in directory:
+                    raise ValueError('historical announcement head directory has duplicate identities')
+                directory[identifier] = (scope, revision)
+    later = set()
+    rows = _read_historical_metadata_rows(connection, sorted(directory), deadline=deadline,
+        stage=f'signed-historical-head-rows:{offset}', metadata_store=metadata_store, metadata_progress=metadata_progress)
+    for row in rows:
+        if directory[row['coverage_id']] != (row['scope_hash'],row['revision_no']):
+            raise ValueError('historical announcement head directory identity differs')
+        if row['fact_kind']=='event' and row['source']==source and row['known_at']<=frontier and row['received_at']<=frontier:
+            later.add(row['scope_hash'])
+    return later
+
+
 def _read_signed_historical_coverage_links(
     connection: Connection, *, exact_ids: Mapping[str, str], received: datetime,
     deadline: float, offset: int, head_frontier: datetime | None = None,
-    source: str = CNINFO_EVENT_SOURCE,
+    source: str = CNINFO_EVENT_SOURCE, metadata_store=None, metadata_progress=None,
 ) -> dict[str, tuple[Mapping[str, Any] | None, bool]]:
     """Verify coverage links and the original frontier without reading other batches' payloads."""
-    from server.common.qmt_announcement_pit import _live_announcement_read_hint, _live_announcement_reply_budget
-
-    mysql = connection.dialect.name == "mysql"
-    stage = f"signed-historical-chain:{offset}"
-    hint = _live_announcement_read_hint(mysql=mysql, deadline=deadline, stage=stage)
-    # Filter the observation time in the index before fetching later revisions' rows.
-    index = " FORCE INDEX (idx_pit_coverage_decision)" if mysql else ""
     code_by_scope = {_source_coverage_scope_hash("event", code, source): code for code in exact_ids}
-    statement = text(
-        f"SELECT {hint}coverage_id,scope_hash,stock_code,revision_no,supersedes_coverage_id,"
-        "known_at,received_at,covered_through_at,coverage_status,coverage_fingerprint_hash "
-        f"FROM {SOURCE_COVERAGE_TABLE}{index} WHERE scope_hash IN :scopes AND stock_code IN :codes "
-        "AND fact_kind='event' AND source=:source AND known_at<=:received AND received_at<=:received "
-        "ORDER BY scope_hash,revision_no"
-    ).bindparams(bindparam("scopes", expanding=True), bindparam("codes", expanding=True)).execution_options(stream_results=True)
+    observed = _read_historical_chain_metadata(connection, codes=sorted(exact_ids), scopes=sorted(code_by_scope),
+        source=source, received=received, deadline=deadline, offset=offset,
+        frontier=head_frontier, metadata_store=metadata_store, metadata_progress=metadata_progress)
+    rows = [row for row in observed if row['known_at']<=received and row['received_at']<=received]
     links = {}
     selected_revisions = {}
-    with _live_announcement_reply_budget(connection, deadline=deadline, stage=stage):
-        with connection.execute(statement, {
-            "scopes": sorted(code_by_scope), "codes": sorted(exact_ids), "source": source, "received": received,
-        }) as result:
-            for scope, chain in groupby(result.mappings(), key=lambda row: row["scope_hash"]):
-                code = code_by_scope[scope]
-                selected_id = exact_ids[code]
-                previous = predecessor = None
-                for revision, row in enumerate(chain, start=1):
-                    fingerprint = row["coverage_fingerprint_hash"]
-                    known = _row_datetime(row["known_at"])
-                    if (
-                        row["stock_code"] != code or row["revision_no"] != revision
-                        or (row["supersedes_coverage_id"] or None) != (previous["coverage_id"] if previous else None)
-                        or (previous is not None and known < _row_datetime(previous["known_at"]))
-                        or not _row_datetime(row["received_at"]) <= known <= received
-                        or _row_datetime(row["covered_through_at"]) > known
-                        or row["coverage_status"] != "COMPLETE"
-                        or not _HASH_RE.fullmatch(str(fingerprint or ""))
-                        or row["coverage_id"] != canonical_hash({
-                            "schema": "probiga.pit-source-coverage-id.v1", "scope_hash": scope,
-                            "coverage_fingerprint_hash": fingerprint,
-                        })
-                    ):
-                        raise ValueError("historical announcement coverage chain differs")
-                    if row["coverage_id"] == selected_id:
-                        predecessor = previous
-                        links[selected_id] = (predecessor, False)
-                        selected_revisions[scope] = row["revision_no"]
-                    previous = row
-                if selected_id in links and previous is not None and previous["coverage_id"] == selected_id:
-                    links[selected_id] = (predecessor, True)
+    for scope, chain in groupby(rows, key=lambda row: row["scope_hash"]):
+        code = code_by_scope[scope]
+        selected_id = exact_ids[code]
+        previous = predecessor = None
+        for revision, row in enumerate(chain, start=1):
+            fingerprint = row["coverage_fingerprint_hash"]
+            known = _row_datetime(row["known_at"])
+            if (
+                row["stock_code"] != code or row["revision_no"] != revision
+                or (row["supersedes_coverage_id"] or None) != (previous["coverage_id"] if previous else None)
+                or (previous is not None and known < _row_datetime(previous["known_at"]))
+                or not _row_datetime(row["received_at"]) <= known <= received
+                or _row_datetime(row["covered_through_at"]) > known
+                or row["coverage_status"] != "COMPLETE"
+                or not _HASH_RE.fullmatch(str(fingerprint or ""))
+                or row["coverage_id"] != canonical_hash({
+                    "schema": "probiga.pit-source-coverage-id.v1", "scope_hash": scope,
+                    "coverage_fingerprint_hash": fingerprint,
+                })
+            ):
+                raise ValueError("historical announcement coverage chain differs")
+            if row["coverage_id"] == selected_id:
+                predecessor = previous
+                links[selected_id] = (predecessor, False)
+                selected_revisions[scope] = row["revision_no"]
+            previous = row
+        if selected_id in links and previous is not None and previous["coverage_id"] == selected_id:
+            links[selected_id] = (predecessor, True)
     if links.keys() != set(exact_ids.values()):
         raise ValueError("historical announcement selected coverage is unavailable at its original frontier")
     if head_frontier is not None and head_frontier > received:
         # Later revisions only determine whether an old empty result is still the head.
         # Their payloads and chains are outside the selected historical observation.
-        stage = f"signed-historical-heads:{offset}"
-        hint = _live_announcement_read_hint(mysql=mysql, deadline=deadline, stage=stage)
-        head_index = " FORCE INDEX (uk_pit_coverage_scope_revision)" if mysql else ""
-        required, head_params = [], {"source":source, "frontier":head_frontier}
-        for number, (scope, revision) in enumerate(sorted(selected_revisions.items())):
-            required.append(f"SELECT :head_scope_{number} AS scope_hash,:head_revision_{number} AS revision_no")
-            head_params[f"head_scope_{number}"] = scope
-            head_params[f"head_revision_{number}"] = revision
-        # Only the existence of a later observation is needed, not its maximum revision.
-        latest_statement = text(
-            f"SELECT {hint}required_scope.scope_hash,EXISTS(SELECT 1 FROM {SOURCE_COVERAGE_TABLE}{head_index} "
-            "WHERE scope_hash=required_scope.scope_hash AND revision_no>required_scope.revision_no "
-            "AND fact_kind='event' AND source=:source AND known_at<=:frontier AND received_at<=:frontier LIMIT 1) AS has_later "
-            "FROM (" + " UNION ALL ".join(required) + ") AS required_scope"
-        )
-        with _live_announcement_reply_budget(connection, deadline=deadline, stage=stage):
-            latest = dict(connection.execute(latest_statement, head_params).tuples().all())
-        if latest.keys() != selected_revisions.keys():
-            raise ValueError("historical announcement current coverage frontier is unavailable")
-        for scope, has_later in latest.items():
+        later = {row['scope_hash'] for row in observed
+            if row['revision_no']>selected_revisions[row['scope_hash']]
+            and row['known_at']<=head_frontier and row['received_at']<=head_frontier}
+        remaining = {scope:revision for scope,revision in selected_revisions.items() if scope not in later}
+        if remaining:
+            later.update(_read_historical_later_scopes(connection, selected_revisions=remaining,
+                source=source, frontier=head_frontier, deadline=deadline, offset=offset,
+                metadata_store=metadata_store, metadata_progress=metadata_progress))
+        for scope in selected_revisions:
             selected_id = exact_ids[code_by_scope[scope]]
-            links[selected_id] = (links[selected_id][0], not bool(has_later))
+            links[selected_id] = (links[selected_id][0], scope not in later)
     return links
 
 
@@ -5923,7 +6040,7 @@ def _bind_historical_event_snapshot(
     window_start: date, window_end: date,
     event_progress: Callable[[int, int], None] | None = None, binding_units: int = 0,
     deadline: float | None = None,
-    coverage_store=None, coverage_progress=None,
+    coverage_store=None, coverage_progress=None, metadata_progress=None,
 ) -> HistoricalAnnouncementSelection:
     from server.common.pit_source_coverage_index import PIT_SOURCE_COVERAGE_BATCH_INDEX_NAME
     from server.common.qmt_announcement_pit import (
@@ -6081,7 +6198,7 @@ def _bind_historical_event_snapshot(
             block_incremental_hashes = set()
             links = _read_signed_historical_coverage_links(
                 connection, exact_ids=stock_batch, received=received, deadline=deadline, offset=offset,
-                head_frontier=frontier,
+                head_frontier=frontier, metadata_store=coverage_store, metadata_progress=metadata_progress,
             )
             sizes = _read_live_announcement_payload_sizes(
                 connection, source=source, batch_id=batch_id, coverage_ids=list(stock_batch.values()),
@@ -6245,7 +6362,7 @@ def resolve_common_fact_cutoff(
     capture_finance_selection: Callable[[SealedFinanceInputs], None] | None = None,
     event_progress: Callable[[int, int], None] | None = None,
     event_trade_date: date | str | None = None,
-    event_coverage_store=None, event_coverage_progress=None,
+    event_coverage_store=None, event_coverage_progress=None, event_metadata_progress=None,
     finance_coverage_store=None, finance_coverage_progress=None,
     finance_observation_at: datetime | str | None = None,
     required_premarket_announcement: FrozenPremarketAnnouncement | None = None,
@@ -6357,7 +6474,8 @@ def resolve_common_fact_cutoff(
                 window_start=windows["event"][0],
                 window_end=windows["event"][1],
                 **({'expected_trade_date':event_trade_date, 'event_progress':event_progress,
-                    'coverage_store':event_coverage_store, 'coverage_progress':event_coverage_progress} if event_trade_date is not None else {}),
+                    'coverage_store':event_coverage_store, 'coverage_progress':event_coverage_progress,
+                    'metadata_progress':event_metadata_progress} if event_trade_date is not None else {}),
                 capture_historical_selection=(
                     historical_selections.append if capture_historical_selection or event_trade_date is not None else None
                 ),

@@ -284,6 +284,38 @@ class FormalAnalysisStore:
         with self._connection() as connection:
             return self._get_member(connection, generation, stage, key)
 
+    def get_many(self, generation_sha256: str, stage: str, keys: Sequence[str]) -> dict[str, Any]:
+        generation = _identity(generation_sha256, _SHA256, "generation digest")
+        stage = _identity(stage, _STAGE, "stage")
+        if isinstance(keys, (str, bytes)) or not isinstance(keys, Sequence) or len(keys) > FORMAL_ANALYSIS_BATCH_MAX_MEMBERS:
+            raise ValueError("formal analysis checkpoint read batch exceeds the member limit")
+        keys = list(dict.fromkeys(_identity(key, _KEY, "checkpoint key") for key in keys))
+        if not keys:
+            return {}
+        with self._connection() as connection:
+            members = _lookup(connection, f"""SELECT m.unit_key,m.artifact_sha256,a.payload_bytes
+                FROM {MEMBER_TABLE} m LEFT JOIN {ARTIFACT_TABLE} a ON a.artifact_sha256=m.artifact_sha256
+                WHERE m.generation_sha256=:generation AND m.stage=:stage AND m.unit_key IN :keys""",
+                "keys", keys, generation=generation, stage=stage)
+        sizes = {}
+        for row in members:
+            try:
+                digest = _identity(row['artifact_sha256'], _SHA256, 'stored artifact digest')
+            except ValueError as exc:
+                raise FormalAnalysisArtifactIntegrityError('formal analysis member digest is invalid') from exc
+            if row['payload_bytes'] is None:
+                raise FormalAnalysisArtifactMissing('formal analysis member artifact is unavailable')
+            if type(row['payload_bytes']) is not int or not 0 < row['payload_bytes'] <= FORMAL_ANALYSIS_ARTIFACT_MAX_BYTES:
+                raise FormalAnalysisArtifactIntegrityError('formal analysis artifact header differs')
+            sizes[digest] = row['payload_bytes']
+        if sum(sizes.values()) > _BATCH_MAX_BYTES:
+            raise FormalAnalysisArtifactIntegrityError('formal analysis checkpoint read batch exceeds the byte limit')
+        artifacts = {}
+        digests = list(sizes)
+        for start in range(0, len(digests), _LOAD_MAX_ARTIFACTS):
+            artifacts.update(self.load_artifacts(digests[start:start + _LOAD_MAX_ARTIFACTS]))
+        return {row['unit_key']:artifacts[row['artifact_sha256']] for row in members}
+
     @staticmethod
     def _get_member(connection: Connection, generation: str, stage: str, key: str, *, current: bool = False):
         params = {"generation": generation, "stage": stage, "key": key}

@@ -70,7 +70,7 @@ def _reconstruction_counts(connection, *, source, batch_id, deadline):
 
 
 def _read_reconstruction(engine, candidate, *, codes, decision, start, end, deadline,
-        capture_historical_selection, event_progress, coverage_store=None, coverage_progress=None):
+        capture_historical_selection, event_progress, coverage_store=None, coverage_progress=None, metadata_progress=None):
     from server.common.pit_facts import _bind_historical_event_snapshot
     from server.common.qmt_announcement_pit import (
         _assert_pit_fact_schema_prepared, _read_live_announcement_payload_rows,
@@ -105,13 +105,13 @@ def _read_reconstruction(engine, candidate, *, codes, decision, start, end, dead
     selected=_bind_historical_event_snapshot(engine,material,codes=codes,decision=decision,
         received=normalize_decision_at(material['reconstructed_at']),frontier=decision,
         window_start=start,window_end=end,event_progress=event_progress,deadline=deadline,
-        coverage_store=coverage_store,coverage_progress=coverage_progress)
+        coverage_store=coverage_store,coverage_progress=coverage_progress,metadata_progress=metadata_progress)
     if capture_historical_selection is not None:capture_historical_selection(selected)
     return dict(selected.batch)
 
 
 def _bind_dated_live_selection(engine, proof, bound_members, *, codes, decision, start, end, deadline,
-        coverage_store=None, coverage_progress=None, event_progress=None):
+        coverage_store=None, coverage_progress=None, event_progress=None, metadata_progress=None):
     from hashlib import sha256
     from pathlib import Path
     from server.common import pit_facts as pit
@@ -146,7 +146,8 @@ def _bind_dated_live_selection(engine, proof, bound_members, *, codes, decision,
                     # Check ancestry at its receipt; later observations only determine heads.
                     links=pit._read_signed_historical_coverage_links(c,
                         exact_ids={code:row['coverage_id'] for code,row in expected.items()},received=received,
-                        head_frontier=decision,deadline=deadline,offset=offset,source=source)
+                        head_frontier=decision,deadline=deadline,offset=offset,source=source,
+                        metadata_store=coverage_store,metadata_progress=metadata_progress)
                     retained={}
                     for code,row in expected.items():
                         parent,head=links[row['coverage_id']]
@@ -174,7 +175,7 @@ def _bind_dated_live_selection(engine, proof, bound_members, *, codes, decision,
 
 def validate_dated_announcement_batch(engine,*,codes,decision_at,window_start,window_end,expected_trade_date,
         capture_historical_selection=None,capture_live_reuse=None,event_progress=None,
-        coverage_store=None,coverage_progress=None):
+        coverage_store=None,coverage_progress=None,metadata_progress=None):
     requested=sorted({str(code).zfill(6) for code in codes})
     target=date.fromisoformat(str(expected_trade_date)[:10]);start=date.fromisoformat(str(window_start)[:10])
     end=date.fromisoformat(str(window_end)[:10]);decision=normalize_decision_at(decision_at)
@@ -204,7 +205,7 @@ def validate_dated_announcement_batch(engine,*,codes,decision_at,window_start,wi
                 if len(bound)!=1:raise ValueError('dated announcement validated capture differs')
                 capture_historical_selection(_bind_dated_live_selection(engine,proof,bound[0],codes=requested,
                     decision=decision,start=start,end=end,deadline=deadline,coverage_store=coverage_store,
-                    coverage_progress=coverage_progress,event_progress=event_progress))
+                    coverage_progress=coverage_progress,event_progress=event_progress,metadata_progress=metadata_progress))
             if capture_live_reuse is not None:capture_live_reuse()
             return proof
         if invalid:raise invalid[-1]
@@ -213,5 +214,5 @@ def validate_dated_announcement_batch(engine,*,codes,decision_at,window_start,wi
                 if candidate['watermark_kind']=='HISTORICAL_RECONSTRUCTION':
                     return _read_reconstruction(engine,candidate,codes=requested,decision=decision,start=start,end=end,
                         deadline=deadline,capture_historical_selection=capture_historical_selection,event_progress=event_progress,
-                        coverage_store=coverage_store,coverage_progress=coverage_progress)
+                        coverage_store=coverage_store,coverage_progress=coverage_progress,metadata_progress=metadata_progress)
     raise QMTAnnouncementBlocked('QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND','no-common-batch')

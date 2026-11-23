@@ -77,6 +77,26 @@ def test_conflict_is_atomic_and_caller_controls_transaction(engine):
         assert connection.execute(text(f"SELECT COUNT(*) FROM {ARTIFACT_TABLE}")).scalar_one() == 2
 
 
+def test_bulk_checkpoint_read_reuses_content_and_preserves_missing_keys(engine):
+    store=FormalAnalysisStore(engine)
+    payloads={'A':{'rows':[1,2]},'B':{'rows':[1,2]},'C':{'rows':[3]}}
+    store.put_many(GENERATION,'metadata',payloads)
+    store.put(OTHER_GENERATION,'metadata','A',{'other':True})
+    assert store.get_many(GENERATION,'metadata',['missing','B','A','C','A'])==payloads
+    assert store.get_many(GENERATION,'different',['A'])=={}
+    assert store.get_many(OTHER_GENERATION,'metadata',['A'])=={'A':{'other':True}}
+
+
+def test_bulk_checkpoint_read_enforces_combined_decoded_byte_budget(engine,monkeypatch):
+    from server.common import formal_analysis_store as module
+    store=FormalAnalysisStore(engine)
+    store.put_many(GENERATION,'metadata',{'A':{'v':'a'*50},'B':{'v':'b'*50}})
+    monkeypatch.setattr(module,'_BATCH_MAX_BYTES',80)
+    assert store.get_many(GENERATION,'metadata',['A'])=={'A':{'v':'a'*50}}
+    with pytest.raises(FormalAnalysisArtifactIntegrityError,match='byte limit'):
+        store.get_many(GENERATION,'metadata',['A','B'])
+
+
 def test_competing_frozen_cutoffs_converge_to_one_durable_value(engine):
     barrier = Barrier(2, timeout=5)
 

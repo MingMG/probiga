@@ -3000,7 +3000,9 @@ def test_common_cutoff_later_chunk_failure_cannot_return_partial_receipts(monkey
     engine.dispose()
 
 
-@pytest.mark.parametrize("stage, exposed", [("batch-payload:440", True), ("untrusted endpoint text", False)])
+@pytest.mark.parametrize("stage, exposed", [("batch-payload:440", True), ("untrusted endpoint text", False),
+    ('signed-historical-directory:400:40',True),('signed-historical-rows:400:128',True),
+    ('signed-historical-head-directory:400:40',True),('signed-historical-head-rows:400:128',True)])
 def test_common_cutoff_reports_only_fixed_announcement_reply_stages(monkeypatch, stage, exposed):
     from server.common.qmt_announcement_pit import LIVE_ANNOUNCEMENT_BATCH_REPLY_DEADLINE, QMTAnnouncementBlocked
 

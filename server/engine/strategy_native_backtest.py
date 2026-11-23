@@ -25,7 +25,7 @@ class NativeStepDeadline(BaseException):
 
 def _assert_read_succeeded(reason):
     if any(token in reason for token in ('OperationalError','Timeout','SQLAlchemyError',
-            'REPLY_FAILED','REPLY_DEADLINE','VALIDATION_DEADLINE','SCHEMA_UNAVAILABLE')):
+            'REPLY_FAILED','REPLY_DEADLINE','VALIDATION_DEADLINE','SCHEMA_UNAVAILABLE','FormalAnalysis')):
         raise RuntimeError('历史事实读取失败：'+reason)
 
 
@@ -212,6 +212,18 @@ def _v3_day(c,state,day,owner):
         for proposal in state['proposals']:
             proposal['validation'].update(status='RUNNING',reason=f'财务来源核对 {day}：已保存 {done}/{total} 个成员')
         state['last_progress_at']=str(now_shanghai());_save(c,state,owner)
+    def metadata_progress(done,total,scope,fresh):
+        nonlocal progress_at
+        if not fresh:return
+        observation={'trade_date':day,'dataset':'event_chain_metadata','completed':done,'total':total,
+            'scope':scope,'last_progress_at':str(now_shanghai())}
+        state['event_metadata_read_checkpoint']=observation
+        state['source_progress']=dict(observation)
+        for proposal in state['proposals']:
+            proposal['validation'].update(status='RUNNING',reason=f'公告链元数据 {day}：已保存 {done}/{total} 条')
+        state['last_progress_at']=str(now_shanghai())
+        if time.monotonic()-progress_at>=5 or done==total:
+            _save(c,state,owner);progress_at=time.monotonic()
     if fact_inputs is None:
         cutoff=resolve_strategy_fact_cutoffs(c.engine,codes=eligible,decision_at=known,finance_start_date='1900-01-01',
             finance_end_date=day,event_start_date=target-timedelta(days=20),event_end_date=day,require_qmt_event_batch=True,
@@ -219,7 +231,8 @@ def _v3_day(c,state,day,owner):
             finance_observation_at=finance_observation,
             event_progress=progress,
             finance_coverage_store=FormalAnalysisStore(c.engine),finance_coverage_progress=finance_coverage_progress,
-            event_coverage_store=FormalAnalysisStore(c.engine),event_coverage_progress=coverage_progress)
+            event_coverage_store=FormalAnalysisStore(c.engine),event_coverage_progress=coverage_progress,
+            event_metadata_progress=metadata_progress)
     else:
         cutoff=fact_inputs.cutoff
         finances,events=[fact_inputs.finance],[fact_inputs.events]
@@ -354,14 +367,14 @@ def _start(c,strategies,days,published,source_hash,contract):
     clock=str(now_shanghai());versions=[(s['strategy_key'],s['current_version'],s['version_hash']) for s in strategies]
     frozen=next((r for r in read_runs(c) if r['source_hash']==source_hash and r['sessions']==days
         and [(s['strategy_key'],s['current_version'],s['version_hash']) for s in r['strategies']]==versions),None)
-    # Re-evaluating the same frozen inputs retains their availability clock and checkpoints.
+    # Retain input availability clocks and archives; a new execution has its own bounded budget.
     requested=frozen['requested_at'] if frozen else clock
     archives=(list(frozen['input_archives'])+[{'run_id':frozen['run_id'],'rule_hash':frozen['rule_hash']}]
         if frozen else list(prior.get('input_archives',[]))+[{'run_id':prior['run_id'],'rule_hash':prior['rule_hash']}] if prior else [])
     uid=canonical_sha256({'versions':versions,'days':days,'source_hash':source_hash,'contract':contract})
     state={'schema':SCHEMA,'run_id':uid,'trade_date':days[-1],'strategies':strategies,'published':published,
         'sessions':days,'input_sessions':warmup+days,'price_cutoff':frozen['price_cutoff'] if frozen else prior['knowledge_cutoff'] if prior else requested,
-        'requested_at':requested,'deadline_at':frozen['deadline_at'] if frozen else str(now_shanghai()+timedelta(hours=24)),
+        'requested_at':requested,'deadline_at':str(now_shanghai()+timedelta(hours=24)),
         'input_archives':archives,
         'contract':contract,'source_hash':source_hash,'rule_hash':canonical_sha256(versions),'phase':'INPUTS','status':'NOT_STARTED',
         'cursor':0,'completed_units':0,'total_units':(len(warmup)+len(days))*2+len(days)+len(strategies),
@@ -369,6 +382,7 @@ def _start(c,strategies,days,published,source_hash,contract):
         'fact_read_checkpoint':dict(frozen.get('fact_read_checkpoint') or {}) if frozen else {},
         'finance_source_read_checkpoint':dict(frozen.get('finance_source_read_checkpoint') or {}) if frozen else {},
         'coverage_read_checkpoint':dict(frozen.get('coverage_read_checkpoint') or {}) if frozen else {},
+        'event_metadata_read_checkpoint':dict(frozen.get('event_metadata_read_checkpoint') or {}) if frozen else {},
         'event_read_checkpoint':dict(frozen.get('event_read_checkpoint') or {}) if frozen else {}}
     inputs=_input_parts(c,state)
     present={d for p in inputs.values() for d in p['sessions']}
@@ -444,7 +458,7 @@ def _step(c,state,owner):
 def native_tick(engine):
     """One bounded step on the existing Linux worker, fenced by its renewable lease."""
     from server.common.authoritative_market_clock import authoritative_closed_trade_date
-    state=None;checkpoint_before={};event_before={};coverage_before={}
+    state=None;checkpoint_before={};event_before={};coverage_before={};metadata_before={}
     with engine.connect() as c:
         if c.execute(text('SELECT GET_LOCK(:name,0)'),{'name':LOCK}).scalar()!=1:return {'status':'RUNNING','reason':'已有原生回测持有互斥锁'}
         previous_handler=None
@@ -493,6 +507,7 @@ def native_tick(engine):
             event_before=dict(state.get('event_read_checkpoint') or {})
             coverage_before=dict(state.get('coverage_read_checkpoint') or {})
             finance_source_before=dict(state.get('finance_source_read_checkpoint') or {})
+            metadata_before=dict(state.get('event_metadata_read_checkpoint') or {})
             def timeout(_signum,_frame):raise NativeStepDeadline('原生回测单步超过600秒')
             previous_handler=signal.signal(signal.SIGALRM,timeout);signal.setitimer(signal.ITIMER_REAL,600)
             _step(c,state,owner)
@@ -517,7 +532,11 @@ def native_tick(engine):
                 source_saved=state.get('finance_source_read_checkpoint') or {}
                 source_earlier=finance_source_before.get('completed',0) if (finance_source_before.get('trade_date'),finance_source_before.get('scope'))==(source_saved.get('trade_date'),source_saved.get('scope')) else 0
                 source_advanced=source_saved.get('completed',0)>source_earlier
-                if isinstance(ex,NativeStepDeadline) and (finance_advanced or event_advanced or coverage_advanced or source_advanced):
+                metadata_saved=state.get('event_metadata_read_checkpoint') or {}
+                metadata_earlier=metadata_before.get('completed',0) if (metadata_before.get('trade_date'),metadata_before.get('scope'))==(metadata_saved.get('trade_date'),metadata_saved.get('scope')) else 0
+                metadata_advanced=metadata_saved.get('completed',0)>metadata_earlier
+                resumable_timeout=isinstance(ex,NativeStepDeadline) or any(token in str(ex) for token in ('REPLY_DEADLINE','VALIDATION_DEADLINE'))
+                if resumable_timeout and (finance_advanced or event_advanced or coverage_advanced or source_advanced or metadata_advanced):
                     state.update(status='NOT_STARTED',step_status='COMPLETE',
                         reason='来源事实分块断点已保存；下一步继续',retry_after=str(now_shanghai()+timedelta(minutes=1)))
                 original=getattr(ex,'orig',ex);args=getattr(original,'args',())

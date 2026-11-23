@@ -136,6 +136,7 @@ def test_entry_scope_filters_stock_features_without_removing_market_bars(monkeyp
 @pytest.mark.parametrize('reason',[
     'QMT_ANNOUNCEMENT_LIVE_BATCH_REPLY_FAILED:batch-payload:3000',
     'PIT_COMMON_CUTOFF_SCHEMA_UNAVAILABLE:QMT_ANNOUNCEMENT_LIVE_BATCH_REPLY_FAILED:common-cutoff-coverage:80:size:400',
+    'PIT_QMT_EVENT_BATCH_UNAVAILABLE:FormalAnalysisArtifactIntegrityError',
 ])
 def test_observed_reply_failures_are_not_completed_no_data_dates(reason):
     with pytest.raises(RuntimeError,match='历史事实读取失败'):native._assert_read_succeeded(reason)
