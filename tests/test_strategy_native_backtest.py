@@ -179,3 +179,30 @@ def test_failure_lock_recovers_after_connection_invalidation_without_stealing():
             with pytest.raises(RuntimeError,match='互斥锁'):native._restore_failure_lock(second)
             assert first.execute(text('SELECT IS_USED_LOCK(:name)=CONNECTION_ID()'),{'name':native.LOCK}).scalar()==1
     finally:engine.dispose()
+
+
+def test_native_journal_reads_latest_heads_without_sorting_historical_bodies():
+    import json
+    from sqlalchemy import event
+    from server.engine.strategy_governance import _digest
+    engine=create_engine('sqlite://')
+    with engine.begin() as c:
+        c.execute(text('CREATE TABLE st_strategy_governance_audit(audit_id INT,entity_type TEXT,entity_key TEXT,action TEXT,created_at TEXT,payload_json TEXT,audit_hash TEXT,after_json TEXT)'))
+        for number,stamp in [(1,'2026-11-20'),(2,'2026-11-21'),(3,'2026-11-21')]:
+            state={'schema':native.SCHEMA,'run_id':'run','checkpoint_sequence':number,'proposals':[]}
+            payload={'after':state}
+            c.execute(text('INSERT INTO st_strategy_governance_audit VALUES(:n,:entity,\'run\',:action,:stamp,:payload,:hash,:after)'),
+                {'n':number,'entity':native.ENTITY,'action':f'CHECKPOINT_{number:08d}',
+                 'stamp':stamp,'payload':json.dumps(payload),'hash':_digest(payload),'after':json.dumps(state)})
+    def cold_history(_c,_cur,sql,params,_ctx,_many):
+        if 'MAX(action)' in sql:
+            from sqlalchemy.exc import OperationalError
+            raise OperationalError(sql,params,Exception(3024,'observed native journal history deadline'))
+        if 'payload_json' in sql:
+            assert 'created_at=' in sql, 'historical bodies sorted before limiting to the latest journal head'
+    event.listen(engine,'before_cursor_execute',cold_history)
+    with engine.connect() as c:
+        assert native.read_runs(c)[0]['checkpoint_sequence']==3
+        assert native.read_runs(c,run_id='run')[0]['checkpoint_sequence']==3
+        assert native.read_runs(c,run_id='absent')==[]
+    engine.dispose()
