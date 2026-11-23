@@ -947,6 +947,7 @@ def _configure_trigger_connection(
 def _create_migrator_engine(
     credential: OptionCredential,
     ssl_ca: Path,
+    *, io_timeout_seconds: int = MIGRATOR_IO_TIMEOUT_SECONDS,
 ) -> Engine:
     def creator() -> pymysql.Connection:
         return _connect_option(
@@ -958,7 +959,7 @@ def _create_migrator_engine(
             # connect event below so the server default cannot replace it.
             configure_trigger_session=False,
             autocommit=False,
-            io_timeout_seconds=MIGRATOR_IO_TIMEOUT_SECONDS,
+            io_timeout_seconds=io_timeout_seconds,
             # SQLAlchemy's MySQL dialect reads its initial server-version
             # result positionally.  DictCursor is reserved for the direct
             # DB-API administrator/lock paths below.
@@ -1487,6 +1488,7 @@ def _open_boundary(
     *,
     include_migrator: bool,
     expected_trust: int | None,
+    migrator_timeout_seconds: int | None = None,
 ) -> DatabaseBoundary:
     with _preflight_diagnostic_scope("database_root_execution"):
         _require_root_execution()
@@ -1517,9 +1519,12 @@ def _open_boundary(
                 "database credential file aliases the TLS CA"
             )
     with _preflight_diagnostic_scope("database_engine_construction"):
-        runtime_engine = create_tool_engine(future=True, poolclass=NullPool)
+        native_timeouts=({'connect_args':{'connect_timeout':8,'read_timeout':15,'write_timeout':15}}
+            if migrator_timeout_seconds is not None else {})
+        runtime_engine = create_tool_engine(future=True, poolclass=NullPool,**native_timeouts)
         migrator_engine = (
-            _create_migrator_engine(migrator_credential, ssl_ca)
+            _create_migrator_engine(migrator_credential, ssl_ca,
+                **({'io_timeout_seconds':migrator_timeout_seconds} if migrator_timeout_seconds is not None else {}))
             if migrator_credential is not None
             else None
         )
@@ -6280,7 +6285,53 @@ def _recover_trust(boundary: RecoveryBoundary) -> dict[str, Any]:
     }
 
 
+def _prepare_native_replay_schema() -> dict[str, Any]:
+    """Linux-only additive DDL; no trust switch or execution-evidence migration."""
+    from server.common.native_job_schema import validate_native_job_schema, privileged_migrate_native_job_schema
+    load_project_env()
+    boundary=_open_boundary(include_migrator=True,expected_trust=0,migrator_timeout_seconds=45)
+    admin=None;locked=False
+    try:
+        admin=_connect_admin(boundary)
+        locked=_acquire_lock(admin)
+        if not locked:raise RuntimeError('NATIVE_SCHEMA_WINDOW_BUSY')
+        from server.common.native_job_schema import LOCK as native_schema_lock
+        with boundary.runtime_engine.connect() as probe:
+            if probe.execute(text('SELECT IS_USED_LOCK(:name)'),{'name':native_schema_lock}).scalar() is not None:
+                raise RuntimeError('NATIVE_SCHEMA_PREVIOUS_DDL_NOT_TERMINAL')
+        try:
+            detail=validate_native_job_schema(boundary.runtime_engine)
+            return {'status':'ok','phase':'native-replay','migration_required':False,**detail}
+        except (RuntimeError,KeyError):
+            pass
+        if boundary.migrator_engine is None:raise RuntimeError('native job migrator unavailable')
+        with boundary.runtime_engine.begin() as connection:
+            task=connection.execute(text("SELECT id,enabled,task_type FROM st_scheduled_tasks WHERE id=70 FOR UPDATE")).mappings().one()
+            if task['task_type']!='trading_v2_job_worker' or task['enabled']:
+                raise RuntimeError('native queue DDL requires the existing research worker to be paused')
+            active=connection.execute(text("SELECT run_uid FROM st_scheduled_task_history WHERE task_id=70 AND status='running' LIMIT 1")).scalar()
+            if active is not None:raise RuntimeError('native queue old execution is not terminal')
+            if connection.execute(text("SELECT GET_LOCK('probiga:native-strategy-research',0)")).scalar()!=1:
+                raise RuntimeError('native queue old process still owns its runtime lock')
+            try:
+                with _catch_termination_signals():
+                    detail=privileged_migrate_native_job_schema(boundary.migrator_engine)
+                validate_native_job_schema(boundary.runtime_engine)
+            finally:
+                connection.execute(text("SELECT RELEASE_LOCK('probiga:native-strategy-research')"))
+        return {'status':'ok','phase':'native-replay','migration_required':True,'runtime_privileges_changed':False,
+                'global_trust_changed':False,'automatic_real_order_submission':False,**detail}
+    finally:
+        if locked and admin is not None:_release_lock(admin)
+        _close_quietly(admin)
+        boundary.runtime_engine.dispose()
+        if boundary.migrator_engine is not None:boundary.migrator_engine.dispose()
+
+
 def prepare_schema(*, phase: str, writers_fenced: bool) -> dict[str, Any]:
+    if phase=='native-replay':
+        if not writers_fenced:raise ValueError('native replay schema requires the independently verified worker fence')
+        return _prepare_native_replay_schema()
     fenced_phases = {"cutover", "resume"}
     if phase not in {"recover", "preflight", *fenced_phases}:
         raise ValueError("phase must be recover, preflight, cutover, or resume")
@@ -6367,6 +6418,13 @@ def prepare_schema(*, phase: str, writers_fenced: bool) -> dict[str, Any]:
 
 
 def _public_failure_payload(exc: BaseException, *, phase: str) -> dict[str, Any]:
+    if phase=='native-replay':
+        category,mysql_errno=_safe_cutover_failure_category(exc)
+        code=str(exc) if str(exc).startswith(('NATIVE_SCHEMA_','NATIVE_JOB_SCHEMA_')) else 'NATIVE_SCHEMA_PREPARATION_FAILED'
+        return {'status':'blocked','phase':phase,'reason_code':code.split(':',1)[0],
+            'failure_category':category,'mysql_errno':mysql_errno,'global_trust_changed':False,
+            'runtime_privileges_changed':False,'automatic_real_order_submission':False,
+            'recovery':'Keep worker 70 paused; verify prior DDL owner is terminal, retain additive schema, retry the Linux-only phase.'}
     evidence = (
         dict(exc.safety_evidence)
         if isinstance(exc, PrivilegedSchemaPreparationError)
@@ -6435,7 +6493,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--phase",
-        choices=("recover", "preflight", "cutover", "resume"),
+        choices=("recover", "preflight", "cutover", "resume", "native-replay"),
         required=True,
     )
     parser.add_argument(

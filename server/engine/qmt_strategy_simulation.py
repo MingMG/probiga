@@ -56,6 +56,8 @@ _SOURCE_FILES = (
     "server/trading_v3/regime.py",
     "server/trading_v3/theme_features.py",
     "server/trading_v3/daily_features.py",
+    "server/trading_v3/daily_feature_math.py",
+    "server/trading_v3/context_scoring.py",
 )
 
 

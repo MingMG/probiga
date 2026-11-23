@@ -26,8 +26,9 @@ class SchemaGuardError(RuntimeError):
 
 def _bundle_validators() -> tuple[tuple[str, Callable[[Any], Any]], ...]:
     from server.common import production_runtime_schema_bundle
+    from server.common.native_job_schema import validate_native_job_schema
 
-    return production_runtime_schema_bundle._VALIDATORS
+    return (*production_runtime_schema_bundle._VALIDATORS, ('native_research_jobs', validate_native_job_schema))
 
 
 def collect_schema_guard(

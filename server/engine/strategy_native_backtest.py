@@ -1,32 +1,26 @@
 """Scheduler-owned native strategy research with durable source/date checkpoints."""
 from datetime import date, datetime, timedelta
-import hashlib
 import json
-from pathlib import Path
+import logging
 import signal
 import time
 
-import pandas as pd
 from sqlalchemy import text
 
 from server.common.analysis_pool_receipt import canonical_sha256
-from server.engine.autonomous_strategy_research import _owner, _resume_allowed, now_shanghai
+from server.engine.native_feature_math import _features, _frame, _assert_read_succeeded
+from server.engine.autonomous_strategy_research import now_shanghai
 from server.engine.strategy_rule_backtest import _partitions, partition_key, PART_ENTITY
-from server.engine.strategy_price_backtest import _group_inputs, _validate_group, _read_bars, _input_parts, _identity_rows, _resolved_scopes
+from server.engine.strategy_price_backtest import _group_inputs, _validate_group, _read_bars, _input_parts
 
 ENTITY = 'NATIVE_REPLAY'
 SCHEMA = 'probiga.native-strategy-research.v1'
 LOCK = 'probiga:native-strategy-research'
+logger=logging.getLogger(__name__)
 
 
 class NativeStepDeadline(BaseException):
     """Source adapters must not convert the job deadline into a data gap."""
-
-
-def _assert_read_succeeded(reason):
-    if any(token in reason for token in ('OperationalError','Timeout','SQLAlchemyError',
-            'REPLY_FAILED','REPLY_DEADLINE','VALIDATION_DEADLINE','SCHEMA_UNAVAILABLE','FormalAnalysis')):
-        raise RuntimeError('历史事实读取失败：'+reason)
 
 
 def read_runs(connection, run_id=None):
@@ -54,18 +48,6 @@ def read_runs(connection, run_id=None):
             raise ValueError('native research audit integrity differs')
         result.append(after)
     return result
-
-
-def _contract():
-    from server.trading_v3 import daily_features,sleeves,engine,regime,config
-    from server.engine import strategy_native_replay,shadow_trial_policy,strategy_native_fact_snapshot
-    from server.common import historical_announcement_read,pit_sealed_event_read
-    paths=[Path(__file__),*(Path(m.__file__) for m in (daily_features,sleeves,engine,regime,strategy_native_replay,shadow_trial_policy,historical_announcement_read,strategy_native_fact_snapshot,pit_sealed_event_read))]
-    root=Path(__file__).resolve().parents[2]
-    paths.extend(root/p for p in ('server/engine/strategy_shadow_trials.py','server/engine/strategy_center.py',
-        'server/common/pit_facts.py','server/common/versioned_strategy_config.py',
-        'server/trading_v2/instrument_registry.py','server/trading_v3/backtest.py','server/engine/strategy_rule_replay.py'))
-    return canonical_sha256({'code':{p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in paths},'config':config.config_hash()})
 
 
 def _strategies(c):
@@ -107,19 +89,6 @@ def _inventory(c,day):
     return days,published,canonical_sha256(identity)
 
 
-def _save(c,state,owner,events=()):
-    from server.engine.strategy_governance import _append_audit_connection
-    c.commit()
-    if _owner(c,locking=True)!=owner or c.execute(text('SELECT IS_USED_LOCK(:name)=CONNECTION_ID()'),{'name':LOCK}).scalar()!=1:
-        raise ValueError('native research owner lease lost')
-    state.update(owner=owner,updated_at=str(now_shanghai()),checkpoint_sequence=state.get('checkpoint_sequence',0)+1)
-    for event in events:
-        _append_audit_connection(c,**event,reason='原生历史研究分区已处理',operator='native-strategy-research',before=None,evidence={'run_id':state['run_id'],'owner':owner})
-    _append_audit_connection(c,entity_type=ENTITY,entity_key=state['run_id'],action=f"CHECKPOINT_{state['checkpoint_sequence']:08d}",
-        operator='native-strategy-research',reason=state.get('reason') or state['phase'],before=None,after=state,evidence={'owner':owner,'real_order_authority':False})
-    c.commit()
-
-
 def _restore_failure_lock(connection):
     # Interrupted driver reads can invalidate the connection and release its session lock.
     if connection.execute(text('SELECT IS_USED_LOCK(:name)=CONNECTION_ID()'),{'name':LOCK}).scalar()!=1:
@@ -132,444 +101,520 @@ def _part(state,kind,day,value):
         'action':'PARTITION_COMPLETE','after':{'day':day,**value}}
 
 
-def _ensure_inputs(c,state,days,owner):
-    inputs=_input_parts(c,state)
-    present={d for part in inputs.values() for d in part['sessions']}
-    missing=sorted(set(days)-present)
-    for group in _group_inputs(c,missing,state['price_cutoff']) if missing else []:
-        value=_validate_group(c,group,state['price_cutoff'])
-        _save(c,state,owner,[_part(state,'D',group['sessions'][0],value)])
-    return _input_parts(c,state)
-
-
-def _window(c,state,days,inputs):
-    proofs={d:r for p in inputs.values() for d,r in p['proofs'].items()}
-    scopes=_resolved_scopes(c,inputs,days,state['price_cutoff'])
-    return {'schema':'probiga.strategy-daily-input-window.v1','sessions':days,'session_count':len(days),
-        'session_set_sha256':canonical_sha256(days),'daily_truth_sha256':canonical_sha256([proofs[d] for d in days]),
-        'daily_attested_row_count':sum(scopes[d]['stock_count'] for d in days),
-        'catalog_batches_by_session':{d:scopes[d]['catalog'] for d in days},
-        'daily_providers_by_session':{d:proofs[d].get('provider','qmt') for d in days},
-        'daily_partition_roots':{d:canonical_sha256(proofs[d]) for d in days},
-        'latest_daily_truth':proofs[days[-1]],'decision_known_at':state['price_cutoff']}
-
-
-def _v3_day(c,state,day,owner):
-    from server.common.strategy_daily_input_window import V3_DAILY_INPUT_SESSIONS
-    from server.common.pit_facts import resolve_strategy_fact_cutoffs,PIT_AVAILABLE
-    from server.common.historical_announcement_read import has_dated_announcement_candidate
-    from server.trading_v3.daily_features import normalize_daily_bars,build_daily_feature_universe,DailyFactInputs
-    from server.trading_v3.regime import classify_regime_probabilities
-    from server.trading_v3.engine import TradingV3Engine
-    from server.trading_v3.config import load_v3_config
-    from server.engine.strategy_shadow_trials import _v3_signal
-    identity,identity_proof=_identity_rows(c,day)
-    if identity_proof['status']!='VERIFIED':
-        return {'status':'BLOCKED','reason':'缺少精确日期证券身份和行业快照','identity':identity_proof,'signals':{}}
-    known=datetime.fromisoformat(state['requested_at'])
-    target=date.fromisoformat(day)
-    from server.common.pit_facts import load_latest_finance_atomic_batch_baseline
-    finance_observation=min(known,datetime.combine(target,datetime.max.time()))
-    baseline=load_latest_finance_atomic_batch_baseline(c.engine,decision_at=finance_observation)
-    if baseline.get('as_of_date')!=day:
-        return {'status':'BLOCKED','reason':'PIT_HISTORICAL_FINANCE_BATCH_NOT_FOUND',
-            'identity':identity_proof,'finance_observation_at':str(finance_observation),
-            'latest_finance_date':baseline.get('as_of_date'),'signals':{}}
-    eligible=(set(identity)&set(baseline.get('members',{})))-set(baseline.get('data_excluded_codes',[]))
-    excluded=sorted(set(identity)-eligible)
-    if not eligible:
-        return {'status':'BLOCKED','reason':'历史证券集合没有可验证的财务封存覆盖','identity':identity_proof,'signals':{}}
-    if not has_dated_announcement_candidate(c.engine,code=min(eligible),decision_at=known,target=target,window_start=target-timedelta(days=20)):
-        return {'status':'BLOCKED','reason':'QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND','identity':identity_proof,'signals':{}}
-    from server.engine.strategy_native_fact_snapshot import snapshot_identity,load_snapshot,save_snapshot
-    generation=snapshot_identity(day=day,decision=known,identity_hash=identity_proof['sha256'],
-        finance_seal=baseline['seal_coverage_id'],codes=eligible)
-    fact_inputs=load_snapshot(c.engine,generation)
-    from server.common.formal_analysis_store import FormalAnalysisStore
-    finances,events=[],[]
-    progress_at=time.monotonic()
-    def progress(done,total,kind='event'):
-        nonlocal progress_at
-        if done and (time.monotonic()-progress_at>=5 or done==total):
-            state['source_progress']={'trade_date':day,'dataset':kind,'completed':done,'total':total,'last_progress_at':str(now_shanghai())}
-            if kind=='finance':
-                prior=state.get('fact_read_checkpoint') or {}
-                if prior.get('trade_date')!=day or done>prior.get('completed',0):
-                    state['fact_read_checkpoint']=dict(state['source_progress'])
-            label='财务核对' if kind=='finance' else '公告批次核对'
-            for proposal in state['proposals']:
-                proposal['validation'].update(status='RUNNING',reason=f'{label} {day}：已处理 {done}/{total} 只')
-            state['last_progress_at']=str(now_shanghai());_save(c,state,owner);progress_at=time.monotonic()
-    def coverage_progress(done,total,scope,fresh):
-        if not fresh:return
-        state['coverage_read_checkpoint']={'trade_date':day,'dataset':'event_coverage','completed':done,
-            'total':total,'scope':scope,'last_progress_at':str(now_shanghai())}
-        state['source_progress']=dict(state['coverage_read_checkpoint'])
-        for proposal in state['proposals']:
-            proposal['validation'].update(status='RUNNING',reason=f'公告来源核对 {day}：已保存 {done}/{total} 个成员')
-        state['last_progress_at']=str(now_shanghai());_save(c,state,owner)
-    def finance_coverage_progress(done,total,scope,fresh):
-        if not fresh:return
-        state['finance_source_read_checkpoint']={'trade_date':day,'dataset':'finance_coverage','completed':done,
-            'total':total,'scope':scope,'last_progress_at':str(now_shanghai())}
-        state['source_progress']=dict(state['finance_source_read_checkpoint'])
-        for proposal in state['proposals']:
-            proposal['validation'].update(status='RUNNING',reason=f'财务来源核对 {day}：已保存 {done}/{total} 个成员')
-        state['last_progress_at']=str(now_shanghai());_save(c,state,owner)
-    def metadata_progress(done,total,scope,fresh):
-        nonlocal progress_at
-        if not fresh:return
-        observation={'trade_date':day,'dataset':'event_chain_metadata','completed':done,'total':total,
-            'scope':scope,'last_progress_at':str(now_shanghai())}
-        state['event_metadata_read_checkpoint']=observation
-        state['source_progress']=dict(observation)
-        for proposal in state['proposals']:
-            proposal['validation'].update(status='RUNNING',reason=f'公告链元数据 {day}：已保存 {done}/{total} 条')
-        state['last_progress_at']=str(now_shanghai())
-        if time.monotonic()-progress_at>=5 or done==total:
-            _save(c,state,owner);progress_at=time.monotonic()
-    if fact_inputs is None:
-        cutoff=resolve_strategy_fact_cutoffs(c.engine,codes=eligible,decision_at=known,finance_start_date='1900-01-01',
-            finance_end_date=day,event_start_date=target-timedelta(days=20),event_end_date=day,require_qmt_event_batch=True,
-            event_trade_date=day,capture_finance_selection=finances.append,capture_historical_selection=events.append,
-            finance_observation_at=finance_observation,
-            event_progress=progress,
-            finance_coverage_store=FormalAnalysisStore(c.engine),finance_coverage_progress=finance_coverage_progress,
-            event_coverage_store=FormalAnalysisStore(c.engine),event_coverage_progress=coverage_progress,
-            event_metadata_progress=metadata_progress)
-    else:
-        cutoff=fact_inputs.cutoff
-        finances,events=[fact_inputs.finance],[fact_inputs.events]
-    if cutoff['status']!=PIT_AVAILABLE:
-        reason=cutoff['reason']
-        _assert_read_succeeded(reason)
-        return {'status':'BLOCKED','reason':reason,'identity':identity_proof,'signals':{}}
-    source_clocks={kind:datetime.fromisoformat(value) for kind,value in cutoff['source_cutoff_at'].items()}
-    fact_clock=max(source_clocks.values())
-    if (any(clock.date()!=target for clock in source_clocks.values())
-            or source_clocks['event']<datetime.fromisoformat(day+' 15:35:00')):
-        return {'status':'BLOCKED','reason':'历史公告截止时间不能覆盖当日收盘或财务批次日期错误',
-            'source_cutoff_at':cutoff['source_cutoff_at'],'signals':{}}
-    if len(finances)!=1 or len(events)!=1:raise ValueError('历史事实快照未完整移交')
-    signal_clock=max(fact_clock,datetime.fromisoformat(str(identity_proof['captured_at'])),
-        datetime.fromisoformat(str(events[0].selection.batch.get('received_at') or fact_clock)))
-    if fact_inputs is None:
-        fact_inputs=DailyFactInputs(cutoff,finances[0],events[0])
-        save_snapshot(c.engine,generation,fact_inputs)
-    if (fact_inputs.finance.decision_at!=known or fact_inputs.finance.as_of_date!=target
-            or fact_inputs.finance.fact_cutoff_at!=source_clocks['finance'] or set(events[0].selection.members)!=eligible):
-        raise ValueError('native cached historical fact scope differs')
-    from server.common.pit_sealed_finance_read import load_sealed_finance_facts
-    financial=load_sealed_finance_facts(c.engine,selection=finances[0],codes=eligible,decision_at=known,
-        fact_cutoff_at=source_clocks['finance'],as_of_date=target,formal_store=FormalAnalysisStore(c.engine),
-        formal_generation_sha256=generation,read_progress=lambda done,total:progress(done,total,'finance'))
-    from server.common.pit_sealed_event_read import load_sealed_event_facts
-    def event_progress(done,total,scope,fresh):
-        nonlocal progress_at
-        if fresh or time.monotonic()-progress_at>=5 or done==total:
-            observation={'trade_date':day,'dataset':'event_facts','completed':done,'total':total,
-                'scope':scope,'last_progress_at':str(now_shanghai())}
-            state['source_progress']=observation
-            if fresh:state['event_read_checkpoint']=dict(observation)
-            for proposal in state['proposals']:
-                proposal['validation'].update(status='RUNNING',reason=f'公告事实核对 {day}：已处理 {done}/{total} 只')
-            state['last_progress_at']=str(now_shanghai());_save(c,state,owner);progress_at=time.monotonic()
-    event_facts=load_sealed_event_facts(c.engine,selection=events[0],codes=eligible,
-        formal_store=FormalAnalysisStore(c.engine),read_progress=event_progress)
-    days=sorted(str(d)[:10] for d in c.execute(text('SELECT DISTINCT trade_date FROM si_trade_calendar WHERE trade_status=1 AND trade_date<=:d ORDER BY trade_date DESC LIMIT :n'),{'d':day,'n':V3_DAILY_INPUT_SESSIONS}).scalars())
-    inputs=_ensure_inputs(c,state,days,owner)
-    raw=_read_bars(c,days,inputs,state['price_cutoff'])
-    frame=pd.DataFrame(raw);del raw
-    frame['trade_date']=pd.to_datetime(frame.trade_date).dt.date
-    frame['short_name']=[identity.get(code,{}).get('short_name','') if str(d)==day else '' for code,d in zip(frame.stock_code,frame.trade_date)]
-    frame.attrs['qmt_daily_input_window']=_window(c,state,days,inputs)
-    frame=normalize_daily_bars(frame)
-    dataset=build_daily_feature_universe(c.engine,as_of=target,dates=[date.fromisoformat(d) for d in days],frame=frame,
-        context_cutoff_at=known,limit=len(eligible),allow_research_industry_last_known=False,entry_scope_codes=eligible,
-        fact_inputs=DailyFactInputs(cutoff,finances[0],events[0],financial,event_facts))
-    _assert_read_succeeded(str(dataset['market_features'].get('pit_common_cutoff_reason') or ''))
-    for stock in dataset['stocks']:
-        _assert_read_succeeded(str(stock.get('finance_pit_reason') or '')+';'+str(stock.get('event_pit_reason') or ''))
-    market=classify_regime_probabilities(dataset['market_features'])
-    if market.quality_status!='PASS':
-        return {'status':'BLOCKED','reason':'市场状态输入不足：'+';'.join(market.evidence),'signals':{},'data_snapshot_hash':dataset['data_snapshot_hash']}
-    config=load_v3_config()
-    strategies=[s for s in state['strategies'] if s['source_kind']=='immutable_v3_sleeve']
-    if any(s['evaluator_config']['model_version']!=config['strategy_version'] for s in strategies):
-        raise ValueError('native current V3 model identity differs')
-    native=TradingV3Engine(calibrations={})
-    selected={s['strategy_key']:[] for s in strategies}
-    scored={s['strategy_key']:0 for s in strategies}
-    missing={s['strategy_key']:0 for s in strategies}
-    for stock in dataset['stocks']:
-        forecasts,_=native.evaluate_stock_with_theme_signals(stock['stock_code'],stock['stock_name'],stock,dataset['feature_time'],dataset['feature_time']+timedelta(days=30))
-        by_key={f.strategy_key:f for f in forecasts}
-        for strategy in strategies:
-            key=strategy['strategy_key'];f=by_key.get(key)
-            if f is None or f.status=='INSUFFICIENT_DATA':
-                if not (key=='event_drift' and stock.get('event_authoritative_empty')):missing[key]+=1
-                continue
-            scored[key]+=1
-            forecast={**f.as_dict(),'forecast_status':f.status,'features_json':json.dumps(f.features,default=str),'short_name':f.stock_name}
-            candidate=_v3_signal(strategy,forecast,day)
-            weights=strategy['evaluator_config']['shadow_trial_routing']['regime_weights']
-            multiplier=sum(market.probabilities[k]*weights[k] for k in weights)
-            if candidate is None or multiplier<=0 or market.risk_asset_cap<=0:continue
-            selected[key].append({**candidate,'industry':stock.get('industry_name'),
-                'signal_known_at':str(signal_clock),
-                'source_snapshot_hash':dataset['data_snapshot_hash'],'historical_production_decision':False})
-    for key,rows in selected.items():
-        rows.sort(key=lambda r:(-r['effective_score'],r['stock_code']))
-        for rank,row in enumerate(rows):row['rank']=rank+1
-    return {'status':'COMPLETE','signals':selected,'scored_stocks':scored,'missing_feature_stocks':missing,
-        'finance_scope_exclusions':excluded,'finance_seal_coverage_id':baseline['seal_coverage_id'],
-        'universe_identity_exclusion_count':max(0,frame.attrs['qmt_daily_input_window']['latest_daily_truth']['attested_row_count']-len(identity)),
-        'data_snapshot_hash':dataset['data_snapshot_hash'],'fact_cutoff':str(fact_clock),
-        'source_cutoff_at':cutoff['source_cutoff_at'],'identity':identity_proof,
-        'interpretation':'CURRENT_FROZEN_RULES_WITHOUT_FUTURE_CALIBRATIONS'}
-
-
-def _v2_day(c,state,day):
-    from server.common.daily_delivery_control import load_published_analysis_receipt
-    from server.common.analysis_pool_receipt import read_score_snapshot_header,decode_score_snapshot
-    from server.engine.strategy_center import _fixed_market_snapshot
-    from server.engine.strategy_shadow_trials import _manifest_signal
-    uid=state['published'].get(day)
-    if not uid:return {'status':'BLOCKED','reason':'缺少完整冻结评分及市场上下文批次','signals':{}}
-    receipt=load_published_analysis_receipt(c,day,run_uid=uid,decision_at=datetime.fromisoformat(state['requested_at']))
-    header=read_score_snapshot_header(receipt['score_snapshot'],trade_date=day,engine=c)
-    decision=datetime.fromisoformat(header['decision_at'])
-    if decision.date()!=date.fromisoformat(day):
-        return {'status':'BLOCKED','reason':'冻结评分实际可用时间晚于目标历史交易日','source_run_uid':uid,'actual_decision_at':str(decision),'signals':{}}
-    snapshot=decode_score_snapshot(receipt['score_snapshot'],trade_date=day,engine=c)
-    if any(s['evaluator_config']['market_state_config_hash']!=snapshot['fixed_market_context']['market_state_config_hash']
-           for s in state['strategies'] if s['source_kind']=='immutable_manifest'):
-        raise ValueError('冻结市场状态配置与原生策略版本不一致')
-    market=_fixed_market_snapshot(day,snapshot['fixed_market_context'],decision)
-    identities,proof=_identity_rows(c,day)
-    selected={}
-    for strategy in (s for s in state['strategies'] if s['source_kind']=='immutable_manifest'):
-        key=strategy['strategy_key'];picked=[]
-        for row in snapshot['scored_rows']:
-            if row.get(strategy['evaluator_config']['score_field']) is not None and row.get('model_version')!=strategy['evaluator_config']['model_version']:
-                raise ValueError('冻结评分模型版本与原生策略不一致')
-            candidate=_manifest_signal(strategy,row,target=day,market=market)
-            if candidate['signal_status']=='READY':
-                member=identities.get(candidate['stock_code'],{})
-                picked.append({**candidate,'stock_name':member.get('short_name',''),'industry':member.get('industry_name'),
-                    'signal_known_at':str(max(decision,datetime.fromisoformat(str(receipt['published_at'])))), 'source_run_uid':uid})
-        picked.sort(key=lambda r:(-r['effective_score'],r['stock_code']))
-        for rank,row in enumerate(picked):row['rank']=rank+1
-        selected[key]=picked
-    return {'status':'COMPLETE','signals':selected,'source_run_uid':uid,'source_sha256':receipt['score_snapshot_sha256'],'identity':proof}
-
-
-def _start(c,strategies,days,published,source_hash,contract,*,frozen=None):
+def _start(connection,strategies,days,published,source_hash,*,frozen=None,
+           allocation_policy=None,execution_end_date=None):
     from server.engine.autonomous_strategy_research import _read_states
-    prior=next((r.get('price_backtest') for r in _read_states(c) if (r.get('price_backtest') or {}).get('sessions')==days),None)
-    warmup=sorted(str(d)[:10] for d in c.execute(text('SELECT DISTINCT trade_date FROM si_trade_calendar WHERE trade_status=1 AND trade_date<:d ORDER BY trade_date DESC LIMIT 20'),{'d':days[0]}).scalars())
-    clock=str(now_shanghai());versions=[(s['strategy_key'],s['current_version'],s['version_hash']) for s in strategies]
+    from server.trading_v3.config import load_v3_config
+    from server.common.strategy_daily_input_window import V3_DAILY_INPUT_SESSIONS
+    from server.engine.strategy_rule_replay import ACCOUNT
+    from server.engine.native_research_identity import algorithm_identity,producer_identity,request_identity,feature_algorithm_identity
+    if not days or days!=sorted(set(days)):raise ValueError('native evaluation sessions must be ordered and unique')
+    versions=[(item['strategy_key'],item['current_version'],item['version_hash']) for item in strategies]
     if frozen is not None and (frozen['source_hash']!=source_hash or frozen['sessions']!=days
             or frozen['published']!=published
-            or [(s['strategy_key'],s['current_version'],s['version_hash']) for s in frozen['strategies']]!=versions):
+            or [(item['strategy_key'],item['current_version'],item['version_hash']) for item in frozen['strategies']]!=versions):
         raise ValueError('冻结回测输入与目标策略及来源身份不一致')
     if frozen is None:
-        frozen=next((r for r in read_runs(c) if r['source_hash']==source_hash and r['sessions']==days
-            and [(s['strategy_key'],s['current_version'],s['version_hash']) for s in r['strategies']]==versions),None)
-    # Retain input availability clocks and archives; a new execution has its own bounded budget.
+        frozen=next((run for run in read_runs(connection) if run['source_hash']==source_hash and run['sessions']==days
+            and [(item['strategy_key'],item['current_version'],item['version_hash']) for item in run['strategies']]==versions),None)
+    prior=None
+    if frozen is None:
+        prior=next((run.get('price_backtest') for run in _read_states(connection)
+            if (run.get('price_backtest') or {}).get('sessions')==days),None)
+    clock=str(now_shanghai())
     requested=frozen['requested_at'] if frozen else clock
-    archives=(list(frozen['input_archives'])+[{'run_id':frozen['run_id'],'rule_hash':frozen['rule_hash']}]
-        if frozen else list(prior.get('input_archives',[]))+[{'run_id':prior['run_id'],'rule_hash':prior['rule_hash']}] if prior else [])
-    uid=canonical_sha256({'versions':versions,'days':days,'source_hash':source_hash,'contract':contract})
-    state={'schema':SCHEMA,'run_id':uid,'trade_date':days[-1],'strategies':strategies,'published':published,
-        'sessions':days,'input_sessions':warmup+days,'price_cutoff':frozen['price_cutoff'] if frozen else prior['knowledge_cutoff'] if prior else requested,
-        'requested_at':requested,'deadline_at':str(now_shanghai()+timedelta(hours=24)),
-        'input_archives':archives,
-        'contract':contract,'source_hash':source_hash,'rule_hash':canonical_sha256(versions),'phase':'INPUTS','status':'NOT_STARTED',
-        'cursor':0,'completed_units':0,'total_units':(len(warmup)+len(days))*2+len(days)+len(strategies),
-        'last_progress_at':clock,'reason':'','proposals':[],
-        'fact_read_checkpoint':dict(frozen.get('fact_read_checkpoint') or {}) if frozen else {},
-        'finance_source_read_checkpoint':dict(frozen.get('finance_source_read_checkpoint') or {}) if frozen else {},
-        'coverage_read_checkpoint':dict(frozen.get('coverage_read_checkpoint') or {}) if frozen else {},
-        'event_metadata_read_checkpoint':dict(frozen.get('event_metadata_read_checkpoint') or {}) if frozen else {},
-        'event_read_checkpoint':dict(frozen.get('event_read_checkpoint') or {}) if frozen else {}}
-    inputs=_input_parts(c,state)
-    present={d for p in inputs.values() for d in p['sessions']}
-    state['completed_units']=sum(d in present for d in state['input_sessions'])
-    state['reused_input_sessions']=state['completed_units']
-    for s in strategies:
-        state['proposals'].append({'strategy_key':s['strategy_key'],'version':s['current_version'],'rule_hash':s['version_hash'],
-            'name':s['strategy_name'],'validation':{'status':'NOT_STARTED','reason':'原生历史回测已登记，等待来源检查'}})
+    cutoff=frozen['price_cutoff'] if frozen else prior['knowledge_cutoff'] if prior else requested
+    archives=(list(frozen['input_archives'])+[{'run_id':frozen['run_id'],'rule_hash':frozen['rule_hash']}] if frozen else
+        list(prior.get('input_archives',[]))+[{'run_id':prior['run_id'],'rule_hash':prior['rule_hash']}] if prior else [])
+    allocation_policy=allocation_policy or (frozen.get('allocation_policy','FIXED_SHADOW') if frozen else 'FIXED_SHADOW')
+    execution_end_date=execution_end_date or (frozen.get('execution_end_date',days[-1]) if frozen else days[-1])
+    if allocation_policy not in ('FIXED_SHADOW','ADAPTIVE_REGIME'):raise ValueError('native allocation policy differs')
+    if not days[-1]<=execution_end_date<=min(requested[:10],cutoff[:10]):
+        raise ValueError('native execution window exceeds frozen availability clocks')
+    config=json.loads(json.dumps(load_v3_config()))
+    algorithm=algorithm_identity(config);producer=producer_identity(strategies[0]['source_kind'])
+    request=request_identity(strategies=strategies,sessions=days,published=published,source_hash=source_hash,
+        requested_at=requested,price_cutoff=cutoff,algorithm=algorithm,account=dict(ACCOUNT),
+        allocation_policy=allocation_policy,producer=producer,execution_end_date=execution_end_date)
+    span=int(connection.execute(text('SELECT COUNT(DISTINCT trade_date) FROM si_trade_calendar '
+        'WHERE trade_status=1 AND trade_date BETWEEN :start AND :end'),{'start':days[0],'end':execution_end_date}).scalar())
+    count=span+V3_DAILY_INPUT_SESSIONS
+    if count>5000:raise ValueError('native calendar reference exceeds 5000 sessions')
+    calendar=sorted(str(value)[:10] for value in connection.execute(text('SELECT DISTINCT trade_date FROM si_trade_calendar '
+        'WHERE trade_status=1 AND trade_date<=:end ORDER BY trade_date DESC LIMIT :count'),
+        {'end':execution_end_date,'count':count}).scalars())
+    if not set(days)<=set(calendar) or execution_end_date not in calendar:
+        raise ValueError('native evaluation and execution dates must be observed trading sessions')
+    first=calendar.index(days[0])
+    inputs=calendar[max(0,first-20):]
+    state={'schema':SCHEMA,'architecture':'PREPARED_TYPED_NATIVE_JOB_V2',
+        'run_id':request['sha256'],'request_identity':request['sha256'],'request':request,
+        'trade_date':days[-1],'strategies':strategies,'published':published,'sessions':days,
+        'requested_at':requested,'price_cutoff':cutoff,'deadline_at':str(now_shanghai()+timedelta(hours=24)),
+        'input_archives':archives,'source_run_id':frozen['run_id'] if frozen else None,
+        'source_hash':source_hash,'rule_hash':canonical_sha256(versions),'contract':algorithm['sha256'],
+        'algorithm_identity':algorithm,'producer_identity':producer,'feature_algorithm_sha256':feature_algorithm_identity(algorithm),
+        'config':config,'account':dict(ACCOUNT),'allocation_policy':allocation_policy,
+        'experiment_kind':request['experiment_kind'],'execution_end_date':execution_end_date,
+        'calendar':calendar,'input_sessions':inputs,'performance_sessions':[day for day in inputs if day>=days[0]],
+        'phase':'PLAN','status':'NOT_STARTED','cursor':0,'completed_units':0,'total_units':len(days)+1,
+        'last_progress_at':clock,'reason':'','proposals':[],'input_index':None,
+        'plans':{},'plan_summary':{},'feature_windows':{},'feature_input_sessions':[],
+        'execution_input_sessions':[],'data_sessions':[],'prepared_references':{},
+        'bars':{},'day_inputs':{},'signal_parts':{},'reports':{},'base_data_by_day':{},'reused_input_sessions':0,'reused_feature_sessions':0}
+    if strategies[0]['source_kind']=='immutable_v3_sleeve':
+        from server.trading_v3.sleeves import SLEEVE_BUILDERS,sleeve_required_features,sleeve_input_mode
+        from server.trading_v3.daily_feature_math import ENTRY_PIT_STATUS_FIELDS
+        from server.trading_v3.regime import REQUIRED as REGIME_REQUIRED
+        state['strategy_dependencies']={item['strategy_key']:{
+            'builder':SLEEVE_BUILDERS[item['strategy_key']].__name__,
+            'required_features':list(sleeve_required_features(item['strategy_key'])),
+            'input_mode':sleeve_input_mode(item['strategy_key']),
+            'experiment_input_mode':'CLOSED_DAILY','entry_fact_status_fields':list(ENTRY_PIT_STATUS_FIELDS),
+            'market_required_features':list(REGIME_REQUIRED),
+            'qualification_contract_sha256':algorithm['sha256'],
+            'optional_context_policy':'EXPLICIT_AVAILABILITY_WITH_FROZEN_NEUTRAL_DEFAULTS',
+        } for item in strategies if item['strategy_key'] in SLEEVE_BUILDERS}
+    for item in strategies:
+        state['proposals'].append({'strategy_key':item['strategy_key'],'version':item['current_version'],
+            'rule_hash':item['version_hash'],'name':item['strategy_name'],
+            'validation':{'status':'NOT_STARTED','reason':'原生历史回测已登记，等待来源检查'}})
     return state
 
 
-def _step(c,state,owner):
-    state.update(status='RUNNING',step_status='RUNNING',reason='')
-    _save(c,state,owner)
-    days=state['sessions'];inputs=_input_parts(c,state)
-    if state['phase']=='INPUTS':
-        present={d for p in inputs.values() for d in p['sessions']}
-        missing=[d for d in state['input_sessions'] if d not in present]
-        _ensure_inputs(c,state,missing[:16],owner)
-        state['completed_units']+=min(16,len(missing))
-        if len(missing)<=16:state.update(phase='SIGNALS',cursor=0)
-    elif state['phase']=='SIGNALS':
-        deadline=time.monotonic()+75
-        for _ in range(32):
-            if state['cursor']>=len(days) or time.monotonic()>deadline:break
-            day=days[state['cursor']];state['current_unit']='原生历史选股 '+day;_save(c,state,owner)
-            value=(_v2_day(c,state,day) if state['strategies'][0]['source_kind']=='immutable_manifest'
-                   else _v3_day(c,state,day,owner))
-            state['cursor']+=1;state['completed_units']+=1;state['last_progress_at']=str(now_shanghai())
-            _save(c,state,owner,[_part(state,'S',day,value)])
-        if state['cursor']==len(days):state.update(phase='PRICES',cursor=0)
-    elif state['phase']=='PRICES':
-        parts=_partitions(c,state,state,'S')
-        codes={s['stock_code'] for p in parts.values() for picks in p['signals'].values() for s in picks}
-        chunk=state['input_sessions'][state['cursor']:state['cursor']+24]
-        raw=_read_bars(c,chunk,inputs,state['price_cutoff']) if codes else []
-        events=[_part(state,'P',d,{'bars':[r for r in raw if str(r['trade_date'])[:10]==d and r['stock_code'] in codes]}) for d in chunk]
-        state['cursor']+=len(chunk);state['completed_units']+=len(chunk);_save(c,state,owner,events)
-        if state['cursor']==len(state['input_sessions']):state.update(phase='REPLAY',cursor=0)
-    elif state['phase']=='REPLAY':
-        from server.engine.strategy_native_replay import replay_native
-        parts=_partitions(c,state,state,'S');prices=_partitions(c,state,state,'P')
-        source_hash=canonical_sha256({'prices':inputs,'sources':parts,'contract':state['contract']})
-        bars=[b for p in prices.values() for b in p['bars']]
-        for strategy,proposal in zip(state['strategies'],state['proposals']):
-            family=strategy['source_kind'];key=strategy['strategy_key']
-            gaps=[{'trade_date':d,'reason':parts[d]['reason']} for d in days if parts[d]['status']=='BLOCKED']
-            gaps.extend({'trade_date':d,'reason':f"部分证券历史身份或策略特征不足：身份 {parts[d].get('universe_identity_exclusion_count',0)}，财务覆盖 {len(parts[d].get('finance_scope_exclusions',[]))}，特征 {parts[d].get('missing_feature_stocks',{}).get(key,0)}"}
-                for d in days if parts[d]['status']=='COMPLETE' and (parts[d].get('universe_identity_exclusion_count',0) or parts[d].get('finance_scope_exclusions') or parts[d].get('missing_feature_stocks',{}).get(key,0)))
-            selected=[s for p in parts.values() for s in p['signals'].get(key,[])]
-            report=replay_native(strategy,selected,bars,state['input_sessions'],evaluation_start=days[0],source_gaps=gaps)
-            available=sum(parts[d]['status']=='COMPLETE' for d in days)
-            if not available:report.update(status='BLOCKED',net_return_pct=None,verified_input_subset_return_pct=None,nav=[])
-            proposal['validation']={'status':report['status'],'report':report,'sessions':days,'source_gaps':gaps,
-                'replay_run_id':state['run_id'],'completed_units':state['total_units'],'total_units':state['total_units'],
-                'available_feature_sessions':available,'required_sessions':len(days),
-                'missing_feature_dates':[d for d in days if parts[d]['status']=='BLOCKED'],
-                'identity_covered_sessions':sum(parts[d].get('identity',{}).get('status')=='VERIFIED' for d in days),
-                'source_input_sha256':canonical_sha256({'source':source_hash,'family':family}),
-                'reason':f"原生冻结影子规则已处理；历史输入可用 {available}/{len(days)} 日；"+(gaps[0]['reason'] if gaps else '详见成交、费用和净值'),
-                'funding_eligible':False}
-            state['completed_units']+=1
-        state.update(phase='FINISHED',status='BLOCKED' if any(p['validation']['status'] in ('BLOCKED','PARTIAL') for p in state['proposals']) else 'COMPLETE')
-    if state['phase']!='FINISHED':
-        state['status']='NOT_STARTED'
-        for p in state['proposals']:
-            p['validation'].update(status='RUNNING',completed_units=state['completed_units'],total_units=state['total_units'],
-                replay_run_id=state['run_id'],reason=state.get('current_unit') or state['phase'])
-    state.update(step_status='COMPLETE',last_progress_at=str(now_shanghai()))
-    _save(c,state,owner)
+def _contract():
+    from server.engine.native_research_identity import algorithm_identity
+    from server.trading_v3.config import load_v3_config
+    return algorithm_identity(load_v3_config())['sha256']
+
+
+def _failure_reason(state,exc):
+    from sqlalchemy.exc import SQLAlchemyError
+    chain=exc
+    database_error=False
+    for _ in range(10):
+        if chain is None:break
+        database_error=database_error or isinstance(chain,SQLAlchemyError)
+        chain=chain.__cause__
+    database_error=database_error or any(token in str(exc) for token in ('[SQL:','[parameters:','(pymysql.err.'))
+    state['diagnostic_error']=f'{type(exc).__name__}: {exc}'[:4000]
+    detail=('数据库读取或写入失败，原断点保留；详见运行诊断' if database_error else str(exc))
+    return f"{state.get('current_unit',state['phase'])}: {type(exc).__name__}: {detail}"[:1000]
+
+
+def _transient_source_error(exc):
+    from server.common.batch_db import _transient_db_errno
+    chain=exc
+    for _ in range(10):
+        if chain is None:break
+        if _transient_db_errno(chain) in (1205,1213,2003,2006,2013,3024):return True
+        chain=chain.__cause__ or chain.__context__
+    return False
+
+
+def _append_state(connection,state,events=()):
+    """No commits here: queue CAS, references and head share the caller transaction."""
+    from server.engine.strategy_governance import _append_audit_connection
+    for event in events:
+        _append_audit_connection(connection,**event,reason='原生历史研究分区已处理',
+            operator='native-strategy-research',before=None,evidence={'run_id':state['run_id'],'owner':state.get('owner')})
+    _append_audit_connection(connection,entity_type=ENTITY,entity_key=state['run_id'],
+        action=f"CHECKPOINT_{state['checkpoint_sequence']:08d}",operator='native-strategy-research',
+        reason=state.get('reason') or state['phase'],before=None,after=state,
+        evidence={'owner':state.get('owner'),'request_identity':state.get('request_identity'),
+                  'real_order_authority':False})
+
+
+def _save(connection,state,owner,events=(),*,yield_job=False):
+    from server.engine.native_research_jobs import checkpoint
+    checkpoint(connection,state,owner,events,yield_job=yield_job)
+
+
+def _begin_unit(connection,state,owner,name):
+    state.update(current_unit=name,unit_started_at=str(now_shanghai()))
+    _progress(state)
+    _save(connection,state,owner)
+
+
+def _put(dataset,store,state,key,value):
+    references=dict(state['prepared_references'])
+    tree=dataset.put_tree(store,state['run_id'],'native_prepared',key,value,references=references)
+    state['prepared_references']=references
+    dataset.pin(state['run_id'],references.values())
+    return tree
+
+
+def _finish_plan(state):
+    from server.common.strategy_daily_input_window import V3_DAILY_INPUT_SESSIONS
+    calendar=state['calendar']
+    feasible=[day for day in state['sessions'] if state['plan_summary'][day]['status']=='COMPLETE']
+    feature_dates=set()
+    for day in feasible:
+        index=calendar.index(day)
+        window=calendar[max(0,index-(V3_DAILY_INPUT_SESSIONS-1)):index+1]
+        if state['strategies'][0]['source_kind']=='immutable_v3_sleeve':
+            if len(window)!=V3_DAILY_INPUT_SESSIONS:
+                state['plan_summary'][day]={'status':'BLOCKED','reason':'历史特征预热不足70个交易日'}
+                continue
+            state['feature_windows'][day]=window
+            feature_dates.update(window)
+    feasible=[day for day in feasible if state['plan_summary'][day]['status']=='COMPLETE']
+    execution=[]
+    if feasible:
+        start=calendar.index(min(feasible))
+        execution=calendar[max(0,start-20):calendar.index(state['execution_end_date'])+1]
+    state.update(feature_input_sessions=sorted(feature_dates),execution_input_sessions=execution,
+        data_sessions=sorted(feature_dates|set(execution)),phase='PREPARE_BARS',cursor=0)
+    # PLAN is now final: no implicit feature acquisition changes this total.
+    state['total_units']=len(state['sessions'])+len(state['data_sessions'])+len(state['feature_windows'])*6+(len(feasible) if state['strategies'][0]['source_kind']=='immutable_manifest' else 0)+len(state['strategies'])+2
+
+
+def _prepare_bar(connection,state,owner,dataset,store,day):
+    from server.engine.strategy_price_backtest import _source_scope
+    inputs=state['input_index']
+    if not any(day in part['sessions'] for part in inputs.values()):
+        for group in _group_inputs(connection,[day],state['price_cutoff']):
+            value=_validate_group(connection,group,state['price_cutoff'])
+            inputs[group['sessions'][0]]=value
+            _save(connection,state,owner,[_part(state,'D',group['sessions'][0],value)])
+    proof=next(part['proofs'][day] for part in inputs.values() if day in part['proofs'])
+    with connection.engine.begin() as source:
+        scope=_source_scope(source,proof,day,state['price_cutoff'])
+    generation=canonical_sha256({'schema':'probiga.native-prepared-daily-bars.v1','day':day,
+        'cutoff':state['price_cutoff'],'proof':proof,'scope':scope})
+    retained=store.get(generation,'native_bar_handoff','complete')
+    if retained is None:
+        raw=_read_bars(connection,[day],inputs,state['price_cutoff'])
+        references={}
+        tree=dataset.put_tree(store,generation,'native_bar_rows','rows',raw,references=references)
+        retained={'tree':tree,'references':references,'proof':proof,'scope':scope,'row_count':len(raw),
+                  'producer_identity':state['producer_identity']}
+        store.put(generation,'native_bar_handoff','complete',retained)
+    else:
+        state['reused_input_sessions']+=1
+    if retained['proof']!=proof or retained['scope']!=scope:
+        raise ValueError('prepared bar source identity differs')
+    state['prepared_references'].update(retained['references'])
+    dataset.pin(state['run_id'],state['prepared_references'].values())
+    dataset.prepare(store,list(retained['references'].values()))
+    state['bars'][day]={'tree':retained['tree'],'proof':proof,'scope':scope,'row_count':retained['row_count']}
+
+
+def _prepare_trees(dataset,store,*trees):
+    references={}
+    for tree in trees:references.update(dataset.tree_references(tree))
+    dataset.prepare(store,list(references.values()))
+
+
+def _prepare_day(connection,state,owner,dataset,store,day):
+    from server.engine import native_research_prepare as prepare
+    from server.trading_v3.daily_features import prepare_feature_identity_context
+    inputs=state['day_inputs'].setdefault(day,{})
+    _prepare_trees(dataset,store,state['plans'][day])
+    plan=dataset.get_tree(state['plans'][day])
+    if plan['status']!='COMPLETE':
+        state['signal_parts'][day]=_put(dataset,store,state,day+':signals',
+            {'status':'BLOCKED','reason':plan['reason'],'identity':plan.get('identity',{}),'signals':{}})
+        return
+    for stage,function in [('selection',prepare.prepare_selection),('finance',prepare.prepare_finance),('events',prepare.prepare_events)]:
+        if stage in inputs:continue
+        _begin_unit(connection,state,owner,'PREPARE '+stage+' '+day)
+        inputs=state['day_inputs'][day]
+        if stage!='selection':_prepare_trees(dataset,store,inputs['selection'])
+        value=(function(connection,state,owner,plan) if stage=='selection' else
+               function(connection,state,owner,plan,dataset.get_tree(inputs['selection'])))
+        inputs=state['day_inputs'][day]
+        inputs[stage]=_put(dataset,store,state,day+':'+stage,value)
+        state['completed_units']+=1
+        if stage=='selection' and value['status']=='BLOCKED':
+            state['signal_parts'][day]=_put(dataset,store,state,day+':signals',{**value,'signals':{}})
+            state['completed_units']+=5
+        _save(connection,state,owner)
+        return
+    if 'context' not in inputs:
+        _begin_unit(connection,state,owner,'PREPARE context '+day)
+        _prepare_trees(dataset,store,*(state['bars'][target]['tree'] for target in state['feature_windows'][day]))
+        frame=_frame(dataset,state,plan,day)
+        from server.trading_v3.theme_features import research_theme_keywords
+        context=prepare_feature_identity_context(connection.engine,as_of=date.fromisoformat(day),
+            dates=[date.fromisoformat(value) for value in state['feature_windows'][day]],frame=frame,
+            context_cutoff_at=datetime.fromisoformat(state['requested_at']),entry_scope_codes=plan['eligible'],
+            research_keywords=research_theme_keywords(state['config']))
+        context['binding']={'day':day,'decision_at':state['requested_at'],'price_cutoff':state['price_cutoff'],
+            'identity_sha256':plan['identity']['sha256'],'finance_seal':plan['finance_seal']}
+        state['day_inputs'][day]['context']=_put(dataset,store,state,day+':context',context)
+        state['completed_units']+=1
+        _save(connection,state,owner)
+        return
+    _prepare_trees(dataset,store,*(inputs[key] for key in ('selection','finance','events','context')))
+    prepare.validate_ready_inputs(plan,*(dataset.get_tree(inputs[key]) for key in ('selection','finance','events','context')),
+        requested_at=state['requested_at'],price_cutoff=state['price_cutoff'],config=state['config'])
+    state['base_data_by_day'][day]=prepare.base_data_identity(plan,dataset.get_tree(inputs['selection']),
+        dataset.get_tree(inputs['context']),finance_reference=inputs['finance'],event_reference=inputs['events'])
+    inputs['ready']={key:inputs[key] for key in ('selection','finance','events','context')}
+    generation=_feature_generation(state,day)
+    retained=store.get(generation,'native_feature_handoff','complete')
+    if retained is not None:
+        if retained['input_identity']!=generation:raise ValueError('prepared feature input identity differs')
+        state['prepared_references'].update(retained['references'])
+        dataset.pin(state['run_id'],state['prepared_references'].values())
+        dataset.prepare(store,list(retained['references'].values()))
+        inputs['features']=retained['tree']
+        state['completed_units']+=1
+        state['reused_feature_sessions']+=1
+    state['current_unit']='READY '+day
+    _save(connection,state,owner)
+
+
+def _feature_generation(state,day):
+    return canonical_sha256({'schema':'probiga.native-prepared-feature.v1',
+        'algorithm':state['feature_algorithm_sha256'],'day':day,
+        'ready':state['day_inputs'][day]['ready'],
+        'bars':{target:{field:state['bars'][target][field] for field in ('tree','proof','scope')}
+                for target in state['feature_windows'][day]}})
+
+
+def _progress(state):
+    for proposal in state['proposals']:
+        if proposal['strategy_key'] in state['reports']:continue
+        proposal['validation'].update(status='RUNNING',completed_units=state['completed_units'],
+            total_units=state['total_units'],current_unit=state.get('current_unit'),phase=state['phase'],
+            replay_run_id=state['run_id'],reason=state.get('current_unit') or state['phase'])
+
+
+def _step(connection,state,owner):
+    from server.common.formal_analysis_store import FormalAnalysisStore
+    from server.engine.native_research_dataset import PreparedDataset
+    from server.engine.native_research_prepare import plan_v3_day
+    from server.engine.native_research_math import evaluate_native_signals
+    dataset,store=PreparedDataset(),FormalAnalysisStore(connection.engine)
+    if state['input_index'] is None:
+        from server.engine.native_research_prepare import validate_input_index
+        _begin_unit(connection,state,owner,'PLAN 原始数据断点')
+        state['input_index']=validate_input_index(_input_parts(connection,state))
+        state['completed_units']+=1
+        state['last_progress_at']=str(now_shanghai())
+        _save(connection,state,owner)
+    active=list(connection.execute(text("SELECT result_ref FROM st_job_v2 WHERE job_type='NATIVE_REPLAY' AND status IN ('PENDING','RUNNING') LIMIT 2001")).scalars())
+    if len(active)>2000:raise RuntimeError('PREPARE_ACTIVE_EXPERIMENT_LIMIT_EXCEEDED')
+    dataset.reconcile_pins(active)
+    dataset.pin(state['run_id'],state['prepared_references'].values())
+    deadline=time.monotonic()+100
+    while time.monotonic()<deadline and state['phase']!='FINISHED':
+        before=state['completed_units']
+        if state['phase']=='PLAN':
+            if state['cursor']>=len(state['sessions']):
+                _finish_plan(state)
+            else:
+                day=state['sessions'][state['cursor']]
+                _begin_unit(connection,state,owner,'PLAN '+day)
+                if state['strategies'][0]['source_kind']=='immutable_manifest':
+                    from server.engine.native_original_prepare import prepare_original_day
+                    value=prepare_original_day(connection,state,day)
+                else:value=plan_v3_day(connection,state,day)
+                state['plans'][day]=_put(dataset,store,state,'plan:'+day,value)
+                if state['strategies'][0]['source_kind']=='immutable_manifest':
+                    if value['status']!='COMPLETE':state['signal_parts'][day]=state['plans'][day]
+                    if value['status']=='COMPLETE':
+                        state['base_data_by_day'][day]=canonical_sha256({'score_snapshot':value['source_sha256'],
+                            'source_run_uid':value['source_run_uid'],'identities':value['identities'],
+                            'identity':value['identity'],'fixed_market_context':value['fixed_market_context']})
+                state['plan_summary'][day]={key:value[key] for key in ('status','reason') if key in value}
+                state['cursor']+=1;state['completed_units']+=1
+        elif state['phase']=='PREPARE_BARS':
+            if state['cursor']>=len(state['data_sessions']):state.update(phase='PREPARE_DAYS',cursor=0)
+            else:
+                day=state['data_sessions'][state['cursor']]
+                _begin_unit(connection,state,owner,'PREPARE bars '+day)
+                _prepare_bar(connection,state,owner,dataset,store,day)
+                state['cursor']+=1;state['completed_units']+=1
+        elif state['phase']=='PREPARE_DAYS':
+            days=[day for day in state['sessions'] if day in state['feature_windows']]
+            if state['cursor']>=len(days):state.update(phase='FEATURES',cursor=0)
+            else:
+                day=days[state['cursor']]
+                if day in state['signal_parts'] or state['day_inputs'].get(day,{}).get('ready'):state['cursor']+=1
+                else:_prepare_day(connection,state,owner,dataset,store,day)
+        elif state['phase']=='FEATURES':
+            days=[day for day in state['sessions'] if day in state['feature_windows'] and day not in state['signal_parts']]
+            if state['cursor']>=len(days):state.update(phase='SIGNALS',cursor=0)
+            else:
+                day=days[state['cursor']]
+                _begin_unit(connection,state,owner,'FEATURE '+day)
+                if 'features' not in state['day_inputs'][day]:
+                    _prepare_trees(dataset,store,state['plans'][day],*state['day_inputs'][day]['ready'].values(),
+                        *(state['bars'][target]['tree'] for target in state['feature_windows'][day]))
+                    value=_features(state,dataset,day)
+                    tree=_put(dataset,store,state,day+':features',value)
+                    state['day_inputs'][day]['features']=tree
+                    generation=_feature_generation(state,day)
+                    store.put(generation,'native_feature_handoff','complete',{'input_identity':generation,
+                        'tree':tree,'references':dataset.tree_references(tree)})
+                    state['completed_units']+=1
+                state['cursor']+=1
+        elif state['phase']=='SIGNALS':
+            manifest=state['strategies'][0]['source_kind']=='immutable_manifest'
+            days=([day for day in state['sessions'] if state['plan_summary'][day]['status']=='COMPLETE'] if manifest else
+                [day for day in state['sessions'] if day in state['day_inputs'] and 'features' in state['day_inputs'][day]])
+            if state['cursor']>=len(days):state.update(phase='REPLAY',cursor=0)
+            else:
+                day=days[state['cursor']]
+                _begin_unit(connection,state,owner,'SIGNAL '+day)
+                _prepare_trees(dataset,store,state['plans'][day])
+                plan=dataset.get_tree(state['plans'][day])
+                if manifest:
+                    from server.engine.native_research_math import evaluate_manifest_signals
+                    value=evaluate_manifest_signals(plan,state['strategies'],day=day)
+                else:
+                    inputs=state['day_inputs'][day]
+                    _prepare_trees(dataset,store,inputs['features'],inputs['selection'])
+                    features=dataset.get_tree(inputs['features']);selection=dataset.get_tree(inputs['selection'])
+                    value=evaluate_native_signals(features,state['strategies'],config=state['config'],day=day,
+                        signal_clock=selection['signal_clock'],allocation_policy=state['allocation_policy'],identities=plan['identity_rows'])
+                    value.update(identity=plan['identity'],finance_scope_exclusions=plan['excluded'],
+                        finance_seal_coverage_id=plan['finance_seal'],fact_cutoff=str(selection['fact_clock']),
+                        source_cutoff_at=selection['cutoff']['source_cutoff_at'],
+                        universe_identity_exclusion_count=max(0,features['market_features']['qmt_daily_input_window']['latest_daily_truth']['attested_row_count']-len(plan['identity_rows'])))
+                state['signal_parts'][day]=_put(dataset,store,state,day+':signals',value)
+                state['cursor']+=1;state['completed_units']+=1
+        elif state['phase']=='REPLAY':
+            if state['cursor']<len(state['strategies']):
+                _begin_unit(connection,state,owner,'REPLAY '+state['strategies'][state['cursor']]['strategy_key'])
+            if state['cursor']<len(state['strategies']):
+                _prepare_trees(dataset,store,*state['signal_parts'].values(),
+                    *(state['bars'][target]['tree'] for target in state['execution_input_sessions']))
+            _report_one(state,dataset)
+        else:raise ValueError('unknown native stage: '+state['phase'])
+        if state['completed_units']>before:state['last_progress_at']=str(now_shanghai())
+        _progress(state)
+        _save(connection,state,owner)
+
+
+def _report_one(state,dataset):
+    from server.engine.strategy_native_replay import replay_native
+    index=state['cursor']
+    if index>=len(state['strategies']):
+        state.update(phase='FINISHED',status='BLOCKED' if any(value['status']!='COMPLETE' for value in state['reports'].values()) else 'COMPLETE')
+        state['completed_units']+=1
+        return
+    strategy,proposal=state['strategies'][index],state['proposals'][index]
+    key=strategy['strategy_key'];state['current_unit']='REPLAY '+key
+    parts={day:(dataset.get_tree(state['signal_parts'][day]) if day in state['signal_parts'] else
+           {'status':'BLOCKED','reason':state['plan_summary'][day].get('reason','历史特征准备不可用'),'signals':{}})
+           for day in state['sessions']}
+    gaps=[{'trade_date':day,'reason':part['reason']} for day,part in parts.items() if part['status']=='BLOCKED']
+    gaps.extend({'trade_date':day,'reason':f"部分证券历史身份或策略特征不足：身份 {part.get('universe_identity_exclusion_count',0)}，财务覆盖 {len(part.get('finance_scope_exclusions',[]))}，特征 {part.get('missing_feature_stocks',{}).get(key,0)}"}
+        for day,part in parts.items() if part['status']=='COMPLETE' and (part.get('universe_identity_exclusion_count',0) or part.get('finance_scope_exclusions') or part.get('missing_feature_stocks',{}).get(key,0)))
+    signals=[signal for part in parts.values() for signal in part['signals'].get(key,[])]
+    codes={signal['stock_code'] for signal in signals}
+    bars=[bar for day in state['execution_input_sessions'] for bar in dataset.get_tree(state['bars'][day]['tree']) if bar['stock_code'] in codes]
+    report=replay_native(strategy,signals,bars,state['input_sessions'],evaluation_start=state['sessions'][0],
+        source_gaps=gaps,account=state['account'],allocation_policy=state['allocation_policy'])
+    usable=lambda part:part['status']=='COMPLETE' and bool(part.get('evaluation_security_sets',{}).get(key))
+    available=sum(usable(part) for part in parts.values())
+    fully_covered=lambda part:usable(part) and not part.get('missing_feature_stocks',{}).get(key,0) and not part.get('finance_scope_exclusions') and not part.get('universe_identity_exclusion_count',0)
+    complete=sum(fully_covered(part) for part in parts.values())
+    if not available:report.update(status='BLOCKED',net_return_pct=None,verified_input_subset_return_pct=None,nav=[])
+    # A single comparison base excludes strategy algorithms and their signal outputs.
+    base={'prices':{day:{'proof':part['proof'],'scope':part['scope']} for day,part in state['bars'].items()},
+          'non_price_sources':state.get('base_data_by_day',{}),
+          'evaluation_sessions':state['sessions'],'initial_cash_cny':250000.0,'account':state['account'],
+          'allocation_policy':state['allocation_policy'],'price_cutoff':state['price_cutoff'],
+          'requested_at':state['requested_at'],'execution_mode':'MODELED_DAILY_BAR'}
+    evaluation_set={day:part.get('evaluation_security_sets',{}).get(key,[])
+                    for day,part in parts.items() if part['status']=='COMPLETE'}
+    base['actual_evaluation_security_sets']=evaluation_set
+    validation={'status':report['status'],'report':report,'sessions':state.get('performance_sessions',state['sessions']),
+        'evaluation_sessions':state['sessions'],'source_gaps':gaps,
+        'replay_run_id':state['run_id'],'completed_units':state['total_units'],'total_units':state['total_units'],
+        'available_feature_sessions':available,'required_sessions':len(state['sessions']),
+        'complete_feature_sessions':complete,
+        'missing_feature_dates':[day for day,part in parts.items() if not usable(part)],
+        'partial_feature_dates':[day for day,part in parts.items() if usable(part) and not fully_covered(part)],
+        'identity_covered_sessions':sum(part.get('identity',{}).get('status')=='VERIFIED' for part in parts.values()),
+        'source_input_sha256':canonical_sha256(base),'algorithm_sha256':state['contract'],
+        'evaluation_set_sha256':canonical_sha256(evaluation_set),
+        'reason':f"计算结束·可用{available}/{len(state['sessions'])}日·"+('完整验证未完成；'+gaps[0]['reason'] if gaps else '详见成交、费用和净值'),
+        'funding_eligible':False}
+    requirements=state.get('strategy_dependencies',{}).get(key)
+    if requirements:
+        validation['data_requirements']=requirements
+        if requirements['input_mode']!=requirements['experiment_input_mode']:
+            validation['reason']='当前实验为已收盘日线；该策略需要盘中金额异常、VWAP、成交概率和点差，日线不能替代。'
+    proposal['validation']=validation;state['reports'][key]=validation
+    state['cursor']+=1;state['completed_units']+=1
+
+
+def submit_native_experiments(engine):
+    """Plan immutable typed jobs; this entry point never executes a replay."""
+    from server.common.authoritative_market_clock import authoritative_closed_trade_date
+    from server.engine.native_research_jobs import enqueue
+    with engine.begin() as connection:
+        day=authoritative_closed_trade_date(connection,now=now_shanghai())
+        strategies=_strategies(connection);days,published,source_hash=_inventory(connection,day)
+        submitted=[]
+        for family in ('immutable_manifest','immutable_v3_sleeve'):
+            group=[item for item in strategies if item['source_kind']==family]
+            if group:
+                policies=('FIXED_SHADOW','ADAPTIVE_REGIME') if family=='immutable_v3_sleeve' else ('FIXED_SHADOW',)
+                for policy in policies:
+                    submitted.append(enqueue(connection,_start(connection,group,days,published,source_hash,
+                        allocation_policy=policy)))
+        return {'status':'COMPLETE','jobs':submitted,'business_started':False}
 
 
 def native_tick(engine):
-    """One bounded step on the existing Linux worker, fenced by its renewable lease."""
-    from server.common.authoritative_market_clock import authoritative_closed_trade_date
-    state=None;checkpoint_before={};event_before={};coverage_before={};metadata_before={}
-    with engine.connect() as c:
-        if c.execute(text('SELECT GET_LOCK(:name,0)'),{'name':LOCK}).scalar()!=1:return {'status':'RUNNING','reason':'已有原生回测持有互斥锁'}
-        previous_handler=None
+    """Consume the typed queue only; audit-directory scans never select work."""
+    from server.engine.native_research_jobs import claim
+    from server.engine.native_research_prepare import PrepareYield
+    from server.engine.native_research_dataset import PreparedDataset,PreparedInputMissing
+    state=None;previous_handler=None
+    with engine.connect() as connection:
+        if connection.execute(text('SELECT GET_LOCK(:name,0)'),{'name':LOCK}).scalar()!=1:
+            return {'status':'RUNNING','reason':'已有原生回测持有互斥锁','business_started':False}
         try:
-            owner=_owner(c);runs=read_runs(c)
-            pending=[r for r in reversed(runs) if r['status'] in ('RUNNING','NOT_STARTED')]
-            contract=_contract()
-            for previous in list(pending):
-                if previous['contract']==contract:continue
-                if not _resume_allowed(c,previous,owner):
-                    return {'status':'BLOCKED','reason':'计算规则已更新，等待旧运行所有者退出','run_id':previous['run_id']}
-                candidate=_start(c,previous['strategies'],previous['sessions'],previous['published'],previous['source_hash'],contract,frozen=previous)
-                if any(candidate[k]!=previous[k] for k in ('sessions','published','source_hash','requested_at','price_cutoff')):
-                    raise ValueError('版本更新不能改变待执行回测的冻结输入及可用时间')
-                current=next((r for r in runs if r['run_id']==candidate['run_id']),None)
-                previous.update(status='BLOCKED',step_status='BLOCKED',
-                    superseded_by_run_id=candidate['run_id'],reason='计算契约已变化，原冻结输入移交当前契约研究：'+candidate['run_id'])
-                for p in previous['proposals']:
-                    p['validation'].update(status='BLOCKED',reason=previous['reason'])
-                if current is None:
-                    previous['checkpoint_sequence']+=1
-                    event={'entity_type':ENTITY,'entity_key':previous['run_id'],
-                        'action':f"CHECKPOINT_{previous['checkpoint_sequence']:08d}",'after':previous}
-                    _save(c,candidate,owner,[event])
-                    runs.insert(0,candidate);pending.append(candidate)
+            claimed=claim(connection)
+            if claimed is None:return {'status':'idle'}
+            state,owner=claimed
+            if str(now_shanghai())>state['deadline_at']:raise TimeoutError('原生实验超过24小时执行时限')
+            from server.engine.native_research_identity import algorithm_identity
+            if algorithm_identity(state['config'])['sha256']!=state['contract']:
+                raise ValueError('冻结实验算法在当前执行器不可用，禁止替换版本继续')
+            from server.engine.native_research_identity import producer_identity
+            if state['phase'] in ('PLAN','PREPARE_BARS','PREPARE_DAYS') and producer_identity(state['strategies'][0]['source_kind'])!=state['producer_identity']:
+                raise ValueError('冻结数据转换版本已变化；未完成输入须按新转换身份登记，不能混用或错标版本')
+            def timeout(_signum,_frame):raise NativeStepDeadline('原生回测尝试超过300秒')
+            if hasattr(signal,'SIGALRM'):
+                previous_handler=signal.signal(signal.SIGALRM,timeout);signal.setitimer(signal.ITIMER_REAL,300)
+            _step(connection,state,owner)
+            if state['phase']!='FINISHED':_save(connection,state,owner,yield_job=True)
+            return {key:state.get(key) for key in ('status','job_id','run_id','phase','completed_units','total_units','current_unit','reason')}
+        except (Exception,NativeStepDeadline,PrepareYield) as exc:
+            if previous_handler is not None:signal.setitimer(signal.ITIMER_REAL,0)
+            if state is None:return {'status':'FAILED','reason':f'{type(exc).__name__}: {exc}'}
+            connection.rollback();_restore_failure_lock(connection)
+            state.update(reason=_failure_reason(state,exc))
+            if isinstance(exc,(PrepareYield,PreparedInputMissing)):
+                state['status']='RUNNING'
+                _save(connection,state,owner,yield_job=True)
+            else:
+                key=state.get('current_unit',state['phase'])
+                retries=state.setdefault('source_error_retries',{})
+                if _transient_source_error(exc) and retries.get(key,0)<1:
+                    retries[key]=retries.get(key,0)+1
+                    state.update(status='RUNNING',retry_after=str(now_shanghai()+timedelta(minutes=1)))
+                    _save(connection,state,owner,yield_job=True)
                 else:
-                    _save(c,previous,owner)
-                pending.remove(previous)
-            pending.sort(key=lambda r:(r.get('requested_at',''),r['run_id']))
-            state=next((r for r in pending if r.get('retry_after','')<=str(now_shanghai())),None)
-            if pending and state is None:return {'status':'BLOCKED','reason':'等待有界数据库重试时间','run_id':pending[0]['run_id']}
-            if state is None:
-                day=authoritative_closed_trade_date(c,now=now_shanghai())
-                strategies=_strategies(c);days,published,source_hash=_inventory(c,day);contract=_contract()
-                latest=[]
-                for family in ('immutable_manifest','immutable_v3_sleeve'):
-                    group=[s for s in strategies if s['source_kind']==family]
-                    if not group:continue
-                    existing=next((r for r in runs if r['contract']==contract and r['source_hash']==source_hash
-                        and r['sessions']==days and [(s['strategy_key'],s['version_hash']) for s in r['strategies']]
-                        ==[(s['strategy_key'],s['version_hash']) for s in group]),None)
-                    if existing is not None:
-                        latest.append(existing)
-                        continue
-                    candidate=_start(c,group,days,published,source_hash,contract)
-                    existing=next((r for r in runs if r['run_id']==candidate['run_id']),None)
-                    if existing is None:
-                        _save(c,candidate,owner)
-                        if state is None:state=candidate
-                    else:latest.append(existing)
-                if state is None:
-                    return {'status':'BLOCKED' if any(r['status']!='COMPLETE' for r in latest) else 'COMPLETE',
-                            'run_ids':[r['run_id'] for r in latest],'reused':True}
-            if not _resume_allowed(c,state,owner):return {'status':'BLOCKED','reason':'原生回测旧所有者尚未退出','run_id':state['run_id']}
-            if state.get('retry_after','')>str(now_shanghai()):
-                return {'status':'BLOCKED','run_id':state['run_id'],'reason':state['reason'],'retry_after':state['retry_after']}
-            if str(now_shanghai())>state['deadline_at']:raise TimeoutError('原生回测超过24小时总时限')
-            checkpoint_before=dict(state.get('fact_read_checkpoint') or {})
-            event_before=dict(state.get('event_read_checkpoint') or {})
-            coverage_before=dict(state.get('coverage_read_checkpoint') or {})
-            finance_source_before=dict(state.get('finance_source_read_checkpoint') or {})
-            metadata_before=dict(state.get('event_metadata_read_checkpoint') or {})
-            def timeout(_signum,_frame):raise NativeStepDeadline('原生回测单步超过600秒')
-            previous_handler=signal.signal(signal.SIGALRM,timeout);signal.setitimer(signal.ITIMER_REAL,600)
-            _step(c,state,owner)
-            return {k:state.get(k) for k in ('status','run_id','phase','completed_units','total_units','reason')}
-        except (Exception,NativeStepDeadline) as ex:
-            if state is not None:
-                if previous_handler is not None:signal.setitimer(signal.ITIMER_REAL,0)
-                c.rollback()
-                _restore_failure_lock(c)
-                state.update(status='FAILED',step_status='FAILED',reason=f"{state.get('current_unit',state['phase'])}: {type(ex).__name__}: {ex}")
-                saved=state.get('fact_read_checkpoint') or {}
-                earlier=checkpoint_before.get('completed',0) if checkpoint_before.get('trade_date')==saved.get('trade_date') else 0
-                event_saved=state.get('event_read_checkpoint') or {}
-                event_earlier=event_before.get('completed',0) if (event_before.get('trade_date'),event_before.get('scope'))==(event_saved.get('trade_date'),event_saved.get('scope')) else 0
-                finance_advanced=(saved.get('completed',0)>earlier
-                    and (now_shanghai()-datetime.fromisoformat(saved['last_progress_at'])).total_seconds()<=120)
-                # New event chunks remain usable when later feature calculation exhausts the step.
-                event_advanced=event_saved.get('completed',0)>event_earlier
-                coverage_saved=state.get('coverage_read_checkpoint') or {}
-                coverage_earlier=coverage_before.get('completed',0) if (coverage_before.get('trade_date'),coverage_before.get('scope'))==(coverage_saved.get('trade_date'),coverage_saved.get('scope')) else 0
-                coverage_advanced=coverage_saved.get('completed',0)>coverage_earlier
-                source_saved=state.get('finance_source_read_checkpoint') or {}
-                source_earlier=finance_source_before.get('completed',0) if (finance_source_before.get('trade_date'),finance_source_before.get('scope'))==(source_saved.get('trade_date'),source_saved.get('scope')) else 0
-                source_advanced=source_saved.get('completed',0)>source_earlier
-                metadata_saved=state.get('event_metadata_read_checkpoint') or {}
-                metadata_earlier=metadata_before.get('completed',0) if (metadata_before.get('trade_date'),metadata_before.get('scope'))==(metadata_saved.get('trade_date'),metadata_saved.get('scope')) else 0
-                metadata_advanced=metadata_saved.get('completed',0)>metadata_earlier
-                resumable_timeout=isinstance(ex,NativeStepDeadline) or any(token in str(ex) for token in ('REPLY_DEADLINE','VALIDATION_DEADLINE'))
-                if resumable_timeout and (finance_advanced or event_advanced or coverage_advanced or source_advanced or metadata_advanced):
-                    state.update(status='NOT_STARTED',step_status='COMPLETE',
-                        reason='来源事实分块断点已保存；下一步继续',retry_after=str(now_shanghai()+timedelta(minutes=1)))
-                original=getattr(ex,'orig',ex);args=getattr(original,'args',())
-                transient=(args and args[0] in (1205,1213,2003,2006,2013,3024)) or any(t in str(ex) for t in ('errno=2013','errno=1205','errno=2006'))
-                if transient and state.get('retry_count',0)<1:
-                    state.update(status='NOT_STARTED',retry_count=1,retry_after=str(now_shanghai()+timedelta(minutes=5)))
-                for p in state['proposals']:
-                    if p['validation']['status'] in ('RUNNING','NOT_STARTED'):p['validation'].update(status=state['status'],reason=state['reason'])
-                _save(c,state,owner)
-            return {'status':state['status'] if state else 'FAILED','run_id':state['run_id'] if state else None,'reason':str(ex)}
+                    state['status']='FAILED'
+                    for proposal in state['proposals']:
+                        if proposal['strategy_key'] not in state['reports']:proposal['validation'].update(status='FAILED',reason=state['reason'])
+                    _save(connection,state,owner)
+            return {'status':state['status'],'job_id':state['job_id'],'run_id':state['run_id'],
+                'phase':state['phase'],'reason':state['reason'],'completed_units':state['completed_units'],'total_units':state['total_units']}
         finally:
+            if state is not None and state.get('owner') is None and state.get('status') in ('COMPLETE','BLOCKED','FAILED'):
+                try:PreparedDataset().release(state['run_id'])
+                except OSError:logger.warning('Native terminal input pin cleanup failed: %s',state['run_id'],exc_info=True)
             if previous_handler is not None:signal.setitimer(signal.ITIMER_REAL,0);signal.signal(signal.SIGALRM,previous_handler)
-            c.rollback()
-            if not c.invalidated:c.execute(text('SELECT RELEASE_LOCK(:name)'),{'name':LOCK});c.commit()
+            connection.rollback()
+            if not connection.invalidated:connection.execute(text('SELECT RELEASE_LOCK(:name)'),{'name':LOCK});connection.commit()

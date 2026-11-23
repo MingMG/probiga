@@ -1169,12 +1169,20 @@ def quant_workbench_strategies(trade_date: str = Query(default="")):
 
 
 @router.get("/strategy-performance")
-def strategy_performance(trade_date: str = Query(default="")):
+def strategy_performance(trade_date: str = Query(default=""),experiment_id: str = Query(default='',pattern=r'^([0-9a-f]{64})?$')):
     from server.api.strategy_performance import read_performance
     try:
-        return read_performance(get_engine(), trade_date)
+        return read_performance(get_engine(), trade_date,experiment_id=experiment_id or None)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="所选回测实验不存在") from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get('/strategy-performance-version')
+def strategy_performance_version(experiment_id: str = Query(default='',pattern=r'^([0-9a-f]{64})?$')):
+    from server.api.strategy_performance import read_performance_version
+    return read_performance_version(get_engine(),experiment_id=experiment_id or None)
 
 
 @router.get("/strategy-performance/{result_id}")

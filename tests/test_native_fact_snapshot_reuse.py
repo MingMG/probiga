@@ -138,21 +138,25 @@ def test_verified_finance_and_event_inputs_are_reused_by_feature_readers(monkeyp
             save_snapshot(engine,'f'*64,inputs)
     assert load_snapshot(engine,'f'*64) is None
 
-    # Real source readers must reach price/features even when finance was sealed before close.
-    from types import SimpleNamespace
+    # The new independent preparation stages consume the same verified selections.
     from server.engine import strategy_native_backtest as native
-    with engine.begin() as c:
-        c.execute(text('CREATE TABLE si_trade_calendar(trade_date TEXT,trade_status INT)'))
-        c.execute(text("INSERT INTO si_trade_calendar VALUES('2026-08-25',1)"))
+    from server.engine import strategy_price_backtest as price
+    from server.engine import native_research_prepare as prepare
     monkeypatch.undo()
-    monkeypatch.setattr(native,'_identity_rows',lambda *_:({code:{} for code in catalog.codes},
+    monkeypatch.setattr(price,'_identity_rows',lambda *_:({code:{} for code in catalog.codes},
         {'status':'VERIFIED','sha256':'a'*64,'captured_at':'2026-08-25 21:47:00'}))
     monkeypatch.setattr(native,'_save',lambda *_:None)
-    class SourceFactsReady(Exception):pass
-    def prices_after_verified_sources(*_args):raise SourceFactsReady()
-    monkeypatch.setattr(native,'_ensure_inputs',prices_after_verified_sources)
-    with engine.connect() as c,pytest.raises(SourceFactsReady):
-        native._v3_day(c,{'requested_at':str(decision),'proposals':[]},'2026-08-25',None)
+    state={'requested_at':str(decision),'proposals':[]}
+    with engine.connect() as connection:
+        plan=prepare.plan_v3_day(connection,state,'2026-08-25')
+        selection=prepare.prepare_selection(connection,state,None,plan)
+        assert selection['status']=='COMPLETE'
+        prepared_finance=prepare.prepare_finance(connection,state,None,plan,selection)
+        prepared_events=prepare.prepare_events(connection,state,None,plan,selection)
+    assert prepared_finance['000001']['roe_wtd']==14.5
+    assert prepared_events['notices']['000001']==restored_notices['000001']
+    assert set(prepared_events['evidence']['status_by_code'])==set(catalog.codes)
+    assert prepared_events['evidence']['status']=='AVAILABLE'
 
 
 def test_dated_reader_keeps_tampered_primary_batch_visible():

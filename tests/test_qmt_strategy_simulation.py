@@ -526,3 +526,20 @@ def test_target_day_error_never_exposes_connection_exception_text(monkeypatch):
         simulation._require_target_daily_truth(object(), TARGET, datetime(2026, 9, 30, 23, 59, 59), "V3_KLINE")
     assert "password" not in str(raised.value)
     assert str(raised.value).endswith("ValueError")
+
+
+@pytest.mark.parametrize('changed_path', ['server/trading_v3/daily_feature_math.py','server/trading_v3/context_scoring.py'])
+def test_extracted_formula_drift_rejects_the_original_snapshot(tmp_path,monkeypatch,changed_path):
+    original_root=simulation.ROOT
+    for relative in (*simulation._SOURCE_FILES,'strategies/stock_strategy_v2.json',
+                     'strategies/trading_v3.json','server/engine/strategy_governance.py'):
+        target=tmp_path/relative
+        target.parent.mkdir(parents=True,exist_ok=True)
+        target.write_bytes((original_root/relative).read_bytes())
+    monkeypatch.setattr(simulation,'ROOT',tmp_path)
+    original=snapshot()
+    simulation.validate_snapshot(original)
+    changed=tmp_path/changed_path
+    changed.write_bytes(changed.read_bytes()+b'\n# changed calculation artifact\n')
+    with pytest.raises(ValueError,match='formula contract differs'):
+        simulation.evaluate_snapshot(original)
