@@ -302,7 +302,15 @@ def feature_input_progress(connection, state, owner, dataset, day, *, deadline):
             value = dataset.get_tree(tree)
             if id(tree) in pending:
                 pending.pop(id(tree))
-                progress(total - len(pending), total, scope, False)
+                try:
+                    progress(total - len(pending), total, scope, False)
+                except PrepareYield:
+                    from server.engine.strategy_native_backtest import NativeStepDeadline
+                    # RAM decoding is observation, not a resumable source partition.
+                    raise NativeStepDeadline('NATIVE_FEATURE_ATTEMPT_DEADLINE') from None
+            if time.monotonic() >= deadline:
+                from server.engine.strategy_native_backtest import NativeStepDeadline
+                raise NativeStepDeadline('NATIVE_FEATURE_ATTEMPT_DEADLINE')
             return value
 
     return ObservedInputs()
