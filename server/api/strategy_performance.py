@@ -286,21 +286,24 @@ def read_performance(engine, day, *, experiment_id=None):
 
 
 def read_performance_version(engine, *, experiment_id=None):
-    """Only indexed journal heads and small queue receipts; no result bodies."""
+    """Detect immutable journal appends and small queue receipts without bodies."""
     headers=[]
-    from server.common.strategy_audit_heads import latest_head, recent_heads
+    from server.common.strategy_audit_heads import latest_head
     deadline=time.monotonic()+4
     with engine.connect() as connection:
-        for entity in ('NATIVE_REPLAY','AUTO_RESEARCH'):
-            rows=recent_heads(connection,entity,12,deadline=deadline)
-            for row in rows:
-                headers.append((entity,row['entity_key'],str(row['latest_at']),row['action']))
-        if experiment_id and not any(row[1]==experiment_id for row in headers):
+        # Audit UPDATE/DELETE are forbidden. Counts detect every committed append,
+        # including old experiments, same-second ties and late transactions.
+        counts=[dict(row) for row in connection.execute(text('''SELECT /*+ MAX_EXECUTION_TIME(4000) */
+            entity_type,COUNT(*) AS append_count FROM st_strategy_governance_audit
+            WHERE entity_type IN ('NATIVE_REPLAY','AUTO_RESEARCH')
+            GROUP BY entity_type''')).mappings()]
+        counts.sort(key=lambda row:row['entity_type'])
+        if experiment_id:
             row=latest_head(connection,'NATIVE_REPLAY',experiment_id,deadline=deadline)
             if row:headers.append(('NATIVE_REPLAY',experiment_id,str(row['latest_at']),row['action']))
         jobs=[dict(row) for row in connection.execute(text('''SELECT /*+ MAX_EXECUTION_TIME(2000) */
             job_id,status,result_ref,finished_at FROM st_job_v2 ORDER BY requested_at DESC,job_id DESC LIMIT 24''')).mappings()]
-    return {'version':canonical_json_hash({'heads':headers,'jobs':jobs}),'experiment_id':experiment_id,'refresh_seconds':20}
+    return {'version':canonical_json_hash({'counts':counts,'heads':headers,'jobs':jobs}),'experiment_id':experiment_id,'refresh_seconds':20}
 
 
 def read_performance_detail(engine, result_id, *, offset=0, limit=50):
