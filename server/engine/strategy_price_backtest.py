@@ -404,9 +404,33 @@ def _identity_rows(connection, day):
     if (run["quality_status"] != "QMT_VALIDATED" or run["capture_mode"] != "qmt_close_full_refresh"
             or not day + " 15:00:00" <= captured.isoformat(sep=" ") < (datetime.fromisoformat(day) + timedelta(days=1)).isoformat(sep=" ")):
         return {}, {"status": "UNAVAILABLE", "reason": "精确日期证券身份快照未通过收盘时间与质量验证"}
-    raw = [dict(r) for r in connection.execute(text("""SELECT /*+ MAX_EXECUTION_TIME(4000) */ *
+    from server.common.formal_analysis_store import FormalAnalysisStore
+    store = FormalAnalysisStore(connection.engine if connection.dialect.name == 'mysql' else connection)
+    generation = canonical_sha256({'schema': 'probiga.verified-historical-identity.v1',
+        'day': day, 'source': 'gj_big_qmt_inner', 'captured_at': str(run['captured_at']),
+        'hash': run['industry_hash'], 'relations': int(run['industry_relation_count']),
+        'industries': int(run['industry_count'])})
+    retained = store.get(generation, 'price_identity', day)
+    if retained is not None:
+        return retained['rows'], retained['proof']
+    deadline = time.monotonic() + 120
+    # Keep the date/source directory covering; cold range payload reads exceeded 4s.
+    ids = list(connection.execute(text("""SELECT /*+ MAX_EXECUTION_TIME(4000) */ id
         FROM qmt_industry_member_snapshot WHERE snapshot_date=:day AND source='gj_big_qmt_inner'
-        ORDER BY industry_code,stock_code"""), {"day": day}).mappings()]
+        ORDER BY industry_code,stock_code LIMIT 60001"""), {'day': day}).scalars())
+    if len(ids) > 60000 or len(ids) != int(run['industry_relation_count']):
+        raise ValueError(day + ' 证券身份快照目录覆盖不一致或超过60000行')
+    raw = []
+    for offset in range(0, len(ids), 256):
+        if time.monotonic() >= deadline:
+            raise TimeoutError(day + ' 证券身份快照读取超过120秒总时限')
+        batch = ids[offset:offset + 256]
+        records = [dict(r) for r in connection.execute(text("""SELECT /*+ MAX_EXECUTION_TIME(12000) */ *
+            FROM qmt_industry_member_snapshot WHERE id IN :ids""").bindparams(bindparam('ids', expanding=True)),
+            {'ids': batch}).mappings()]
+        if len(records) != len(batch) or {r['id'] for r in records} != set(batch):
+            raise ValueError(day + ' 证券身份快照正文缺失或重复')
+        raw.extend(records)
     if (len(raw) != int(run["industry_relation_count"]) or
             len({r["industry_code"] for r in raw}) != int(run["industry_count"]) or
             _membership_snapshot_hash(raw, member_type="industry") != run["industry_hash"] or
@@ -422,7 +446,9 @@ def _identity_rows(connection, day):
         result[code] = {"short_name": r["short_name"], "industry_name": r["industry_name"],
             "industry_snapshot_date": day, "industry_snapshot_source": "gj_big_qmt_inner",
             "membership_proof_sha256": run["industry_hash"]}
-    return result, {"status": "VERIFIED", "captured_at": str(captured), "sha256": run["industry_hash"], "stock_count": len(result)}
+    proof = {"status": "VERIFIED", "captured_at": str(captured), "sha256": run["industry_hash"], "stock_count": len(result)}
+    store.put(generation, 'price_identity', day, {'rows': result, 'proof': proof})
+    return result, proof
 
 
 def start_replay(connection, state, proposals, days):

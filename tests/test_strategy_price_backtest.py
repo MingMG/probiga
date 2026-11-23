@@ -327,3 +327,73 @@ def test_bar_checkpoint_preserves_decimal_float_and_market_clock_types():
     restored = price._bar_checkpoint(price._bar_checkpoint([row]), decode=True)
     assert restored == [row]
     assert all(type(restored[0][key]) is type(value) for key, value in row.items())
+
+
+def test_historical_identity_bounded_primary_reads_and_verified_reuse():
+    from sqlalchemy import event
+    from sqlalchemy.exc import OperationalError
+    from server.engine.strategy_center import _membership_snapshot_hash
+    from server.db.formal_analysis_schema import privileged_migrate_formal_analysis_schema
+    engine = create_engine('sqlite://')
+    privileged_migrate_formal_analysis_schema(engine)
+    day, captured = '2026-09-17', '2026-09-17 18:00:00'
+    raw = [{'id': i, 'snapshot_date': day, 'source': 'gj_big_qmt_inner',
+            'industry_code': 'I', 'industry_name': '行业', 'industry_type': '申万一级',
+            'stock_code': f'{i:06d}', 'short_name': f'证券{i}',
+            'quality_status': 'QMT_VALIDATED', 'captured_at': captured} for i in range(600)]
+    digest = _membership_snapshot_hash(raw, member_type='industry')
+    with engine.begin() as c:
+        c.execute(text('CREATE TABLE qmt_membership_snapshot_run(snapshot_date TEXT,source TEXT,quality_status TEXT,capture_mode TEXT,captured_at TEXT,industry_relation_count INT,industry_count INT,industry_hash TEXT)'))
+        c.execute(text("INSERT INTO qmt_membership_snapshot_run VALUES(:d,'gj_big_qmt_inner','QMT_VALIDATED','qmt_close_full_refresh',:c,600,1,:h)"), {'d': day, 'c': captured, 'h': digest})
+        c.execute(text('CREATE TABLE qmt_industry_member_snapshot(id INTEGER PRIMARY KEY,snapshot_date TEXT,source TEXT,industry_code TEXT,industry_name TEXT,industry_type TEXT,stock_code TEXT,short_name TEXT,quality_status TEXT,captured_at TEXT)'))
+        c.execute(text('CREATE UNIQUE INDEX by_scope ON qmt_industry_member_snapshot(snapshot_date,source,industry_code,stock_code)'))
+        c.execute(text('INSERT INTO qmt_industry_member_snapshot VALUES(:id,:snapshot_date,:source,:industry_code,:industry_name,:industry_type,:stock_code,:short_name,:quality_status,:captured_at)'), raw)
+        driver = c.connection.driver_connection
+        old = text("SELECT * FROM qmt_industry_member_snapshot WHERE snapshot_date=:day AND source='gj_big_qmt_inner' ORDER BY industry_code,stock_code")
+        directory = text(str(old).replace('SELECT *', 'SELECT id'))
+        def steps(statement, params):
+            count = [0]
+            def progress():
+                count[0] += 1
+                return 0
+            driver.set_progress_handler(progress, 1)
+            c.execute(statement, params).all()
+            driver.set_progress_handler(None, 0)
+            return count[0]
+        cheap = steps(directory, {'day': day})
+        expensive = steps(old, {'day': day})
+        chunk = steps(text('SELECT * FROM qmt_industry_member_snapshot WHERE id IN (' + ','.join(map(str, range(256))) + ')'), {})
+        assert max(cheap, chunk) < expensive
+        limit = (max(cheap, chunk) + expensive) // 2
+        reads = []
+        def budget(_c, _cursor, statement, parameters, _context, _many):
+            driver.set_progress_handler(None, 0)
+            if 'FROM qmt_industry_member_snapshot' not in statement:
+                return
+            reads.append(statement)
+            used = 0
+            def progress():
+                nonlocal used
+                used += 1
+                return int(used > limit)
+            driver.set_progress_handler(progress, 1)
+        event.listen(c, 'before_cursor_execute', budget)
+        try:
+            with pytest.raises(OperationalError, match='interrupted'):
+                c.execute(old, {'day': day}).all()
+            result, proof = _identity_rows(c, day)
+            assert len(result) == 600 and proof['sha256'] == digest
+            assert result['000001']['short_name'] == '证券1'
+            assert sum('WHERE id IN' in q for q in reads) == 3
+            reads.clear()
+            assert _identity_rows(c, day) == (result, proof)
+            assert reads == []
+            c.execute(text("UPDATE qmt_membership_snapshot_run SET industry_hash=:h"), {'h': 'f' * 64})
+            with pytest.raises(ValueError, match='完整集合哈希'):
+                _identity_rows(c, day)
+            c.execute(text('UPDATE qmt_membership_snapshot_run SET industry_hash=:h,captured_at=:c'), {'h': digest, 'c': '2026-09-18 00:00:00'})
+            assert _identity_rows(c, day)[1]['status'] == 'UNAVAILABLE'
+        finally:
+            driver.set_progress_handler(None, 0)
+            event.remove(c, 'before_cursor_execute', budget)
+    engine.dispose()

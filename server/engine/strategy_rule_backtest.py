@@ -25,20 +25,53 @@ def partition_key(state, proposal, kind, day):
 
 def _partitions(connection, state, proposal, kind):
     from server.engine.strategy_governance import _digest
+    deadline = time.monotonic() + 120
     prefix = state["run_id"][:24] + ":" + proposal["rule_hash"][:24] + ":" + kind + ":%"
-    rows = connection.execute(text("""
-        SELECT /*+ MAX_EXECUTION_TIME(4000) */ payload_json,audit_hash,after_json
+    headers = connection.execute(text("""
+        SELECT /*+ MAX_EXECUTION_TIME(4000) */ audit_id,entity_key
         FROM st_strategy_governance_audit WHERE entity_type=:entity AND entity_key LIKE :prefix
-        ORDER BY entity_key LIMIT 256
+        ORDER BY entity_key LIMIT 257
     """), {"entity": PART_ENTITY, "prefix": prefix}).mappings().all()
+    if len(headers) > 256:
+        raise ValueError("研究回放分区超过256条读取上限")
+    mysql = connection.dialect.name == "mysql"
+    if mysql:
+        from server.common.pit_facts import _decode_coverage_payload
+        columns = """audit_id,audit_hash,
+            OCTET_LENGTH(payload_json) AS payload_bytes,OCTET_LENGTH(after_json) AS after_bytes,
+            CASE WHEN OCTET_LENGTH(payload_json)<=33554432 THEN COMPRESS(payload_json) END AS payload_zip,
+            CASE WHEN OCTET_LENGTH(after_json)<=33554432 THEN COMPRESS(after_json) END AS after_zip"""
+    else:
+        columns = "audit_id,audit_hash,payload_json,after_json"
     parts = {}
-    for row in rows:
-        audit, value = json.loads(str(row["payload_json"])), json.loads(str(row["after_json"]))
-        if _digest(audit) != row["audit_hash"] or audit.get("after") != value:
-            raise ValueError("研究回放分区审计哈希无效")
-        if value["day"] in parts:
-            raise ValueError("研究回放分区重复")
-        parts[value["day"]] = value
+    # The secondary-index JSON range read exceeded its deadline in production.
+    # Keep its directory covering, then read bounded primary-key payload batches.
+    for offset in range(0, len(headers), 4):
+        if time.monotonic() >= deadline:
+            raise TimeoutError("研究回放分区读取超过120秒总时限")
+        ids = [row['audit_id'] for row in headers[offset:offset + 4]]
+        records = connection.execute(text(f"""SELECT /*+ MAX_EXECUTION_TIME(12000) */ {columns}
+            FROM st_strategy_governance_audit WHERE audit_id IN :ids
+        """).bindparams(bindparam('ids', expanding=True)), {'ids': ids}).mappings().all()
+        by_id = {row['audit_id']: row for row in records}
+        if len(records) != len(ids) or set(by_id) != set(ids):
+            raise ValueError("研究回放分区正文缺失或重复")
+        for identity in ids:
+            row = by_id[identity]
+            if mysql:
+                if any(type(row[key]) is not int or not 0 < row[key] <= 33554432
+                       for key in ('payload_bytes', 'after_bytes')):
+                    raise ValueError("研究回放分区正文超过32MiB读取上限")
+                payload = _decode_coverage_payload(row['payload_zip'], expected_bytes=row['payload_bytes'], stage='replay_partition')
+                after = _decode_coverage_payload(row['after_zip'], expected_bytes=row['after_bytes'], stage='replay_partition')
+            else:
+                payload, after = row['payload_json'], row['after_json']
+            audit, value = json.loads(payload), json.loads(after)
+            if _digest(audit) != row["audit_hash"] or audit.get("after") != value:
+                raise ValueError("研究回放分区审计哈希无效")
+            if value["day"] in parts:
+                raise ValueError("研究回放分区重复")
+            parts[value["day"]] = value
     return parts
 
 
