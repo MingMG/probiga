@@ -1471,8 +1471,6 @@ trap release_lock EXIT
 DATABASE_WRITER_GUARD_DIR=/var/lib/probiga/deploy-guards
 DATABASE_WRITER_GUARD_FILE="$DATABASE_WRITER_GUARD_DIR/database-migration-unverified"
 DATABASE_WRITER_RESTORE_FILE="$DATABASE_WRITER_GUARD_DIR/database-writer-restore-pending"
-LEDGER_PENDING_ROOT="$DATABASE_WRITER_GUARD_DIR/ledger-pending"
-readonly LEDGER_PENDING_DELAY_SECONDS=60
 ACTIVATION_UNIT_SNAPSHOT_DIR="$DATABASE_WRITER_GUARD_DIR/activation-unit-transaction"
 ACTIVATION_UNIT_SNAPSHOT_MANIFEST="$ACTIVATION_UNIT_SNAPSHOT_DIR/manifest"
 ACTIVATION_UNIT_SNAPSHOT_NEW_MANIFEST="$ACTIVATION_UNIT_SNAPSHOT_DIR/new-manifest"
@@ -9932,105 +9930,24 @@ materialize_component_deploy_tools() {
   COMPONENT_CONTROLLER="$COMPONENT_TOOL_ROOT/$tools_sha/linux_release_activation.py"
   COMPONENT_CLASSIFIER="$COMPONENT_TOOL_ROOT/$tools_sha/classify_release_scope.py"
 }
-prepare_ledger_pending_root() {
-  local pending_entry
-  if [ -e "$DATABASE_WRITER_GUARD_DIR" ] || \
-    [ -L "$DATABASE_WRITER_GUARD_DIR" ]; then
-    test -d "$DATABASE_WRITER_GUARD_DIR"
-    test ! -L "$DATABASE_WRITER_GUARD_DIR"
-  else
-    install -d -o root -g root -m 0700 "$DATABASE_WRITER_GUARD_DIR"
-  fi
-  test "$(readlink -f "$DATABASE_WRITER_GUARD_DIR")" = \
-    "$DATABASE_WRITER_GUARD_DIR"
-  test ! -L "$DATABASE_WRITER_GUARD_DIR"
-  test "$(stat -c '%U:%G' "$DATABASE_WRITER_GUARD_DIR")" = root:root
-  test "$(stat -c '%a' "$DATABASE_WRITER_GUARD_DIR")" = 700
-  if [ -e "$LEDGER_PENDING_ROOT" ] || [ -L "$LEDGER_PENDING_ROOT" ]; then
-    test -d "$LEDGER_PENDING_ROOT"
-    test ! -L "$LEDGER_PENDING_ROOT"
-  else
-    install -d -o root -g root -m 0700 "$LEDGER_PENDING_ROOT"
-  fi
-  test "$(readlink -f "$LEDGER_PENDING_ROOT")" = "$LEDGER_PENDING_ROOT"
-  test "$(stat -c '%U:%G' "$LEDGER_PENDING_ROOT")" = root:root
-  test "$(stat -c '%a' "$LEDGER_PENDING_ROOT")" = 700
-  while IFS= read -r pending_entry; do
-    [ -n "$pending_entry" ] || continue
-    [[ "$(basename "$pending_entry")" =~ \
-      ^component-release-[0-9a-f]{40}\.json$ ]] || {
-      log_release_error "unsafe ledger pending path: $pending_entry"
-      return 2
-    }
-    test -f "$pending_entry"
-    test ! -L "$pending_entry"
-    test "$(stat -c '%U:%G' "$pending_entry")" = root:root
-  done < <(find -P "$LEDGER_PENDING_ROOT" -mindepth 1 -maxdepth 1 -print)
-}
-warn_pending_component_releases() {
-  local pending_entry
-  local pending_count=0
-  while IFS= read -r pending_entry; do
-    [ -n "$pending_entry" ] || continue
-    pending_count=$((pending_count + 1))
-    log_release_warning \
-      "previous asynchronous component ledger publication is pending: $(basename "$pending_entry")"
-  done < <(find -P "$LEDGER_PENDING_ROOT" -mindepth 1 -maxdepth 1 \
-    -type f -name 'component-release-*.json' -print)
-  if [ "$pending_count" -gt 0 ]; then
-    log_release_warning \
-      "inspect $LEDGER_PENDING_ROOT and retry with --full if lineage remains incomplete"
-  fi
-}
-write_ledger_pending_marker() {
-  local marker="$1"
-  local status="$2"
-  local overwrite="${3:-0}"
-  local marker_tmp
-  if [ -e "$marker" ] || [ -L "$marker" ]; then
-    test -f "$marker"
-    test ! -L "$marker"
-    [ "$overwrite" -eq 1 ] || return 0
-  fi
-  marker_tmp="$(mktemp "$LEDGER_PENDING_ROOT/.pending-marker.XXXXXX")"
-  printf '{"schema":"probiga.component-release-ledger-pending.v1","status":"%s","linux_build_sha":"%s","recorded_at":"%s"}\n' \
-    "$status" "$EXPECTED_SHA" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    > "$marker_tmp"
-  chown root:root "$marker_tmp"
-  chmod 0600 "$marker_tmp"
-  mv -fT "$marker_tmp" "$marker"
-}
-start_fast_component_ledger_publication() {
-  local marker="$LEDGER_PENDING_ROOT/component-release-$EXPECTED_SHA.json"
-  local unit="probiga-ledger-${EXPECTED_SHA:0:12}-$RANDOM"
-  CUTOVER_STEP=schedule_component_ledger_publication
-  write_ledger_pending_marker "$marker" scheduled
-  if ! /usr/bin/timeout --signal=TERM --kill-after=2s 15s \
-    /usr/bin/systemd-run --quiet --collect --unit="$unit" \
-      --on-active="${LEDGER_PENDING_DELAY_SECONDS}s" \
-      --property=RuntimeMaxSec=120s \
-      /usr/bin/env -i \
-      PATH=/usr/sbin:/usr/bin:/sbin:/bin \
-      LANG=C.UTF-8 LC_ALL=C.UTF-8 \
-      PROBIGA_DEPLOYMENT_MODE=production \
-      PROBIGA_BUILD_COMMIT_SHA="$EXPECTED_SHA" \
-      PROBIGA_EXPECTED_GIT_SHA="$EXPECTED_SHA" \
-      PROBIGA_COMPONENT_RELEASE_PATH="$RELEASE_ARTIFACT_ROOT/$EXPECTED_SHA/component-release.json" \
-      PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
-      "PYTHONPATH=$ADATA_SOURCE:$PREPARED_CODE_ROOT" \
-      "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P \
-      "$PREPARED_CODE_ROOT/tools/publish_component_release.py" \
-      --manifest "$RELEASE_ARTIFACT_ROOT/$EXPECTED_SHA/component-release.json" \
-      --mode publish --pending-marker "$marker"; then
-    write_ledger_pending_marker "$marker" schedule_failed 1
-    COMPONENT_LEDGER_STATUS=schedule-failed
-    log_release_error \
-      "failed to schedule component ledger publication; retry with --full"
-    return 2
-  fi
-  COMPONENT_LEDGER_STATUS=async-pending
-  log_release \
-    "component ledger publication scheduled async unit=$unit delay=${LEDGER_PENDING_DELAY_SECONDS}s"
+publish_fast_component_ledger() {
+  CUTOVER_STEP=publish_component_ledger
+  /usr/bin/timeout --signal=TERM --kill-after=5s 120s \
+    /usr/bin/env -i \
+    PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+    LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+    PROBIGA_DEPLOYMENT_MODE=production \
+    PROBIGA_BUILD_COMMIT_SHA="$EXPECTED_SHA" \
+    PROBIGA_EXPECTED_GIT_SHA="$EXPECTED_SHA" \
+    PROBIGA_COMPONENT_RELEASE_PATH="$RELEASE_ARTIFACT_ROOT/$EXPECTED_SHA/component-release.json" \
+    PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
+    "PYTHONPATH=$ADATA_SOURCE:$PREPARED_CODE_ROOT" \
+    "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P \
+    "$PREPARED_CODE_ROOT/tools/publish_component_release.py" \
+    --manifest "$RELEASE_ARTIFACT_ROOT/$EXPECTED_SHA/component-release.json" \
+    --mode publish
+  COMPONENT_LEDGER_STATUS=synced
+  log_release "component ledger committed and verified before Linux activation"
 }
 recover_linux_activation_before_inventory() {
   local journal=/var/lib/probiga/linux-activation/transaction.json
@@ -10219,7 +10136,7 @@ PY
       "$CODE_VALIDATION_ROOT/tools/publish_component_release.py" \
       --manifest "$RELEASE_ARTIFACT_ROOT/$EXPECTED_SHA/component-release.json" \
       --mode sign
-    COMPONENT_LEDGER_STATUS=signed-pending-schedule
+    COMPONENT_LEDGER_STATUS=signed
   else
     for publication_mode in "${publication_modes[@]}"; do
       /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
@@ -10327,7 +10244,7 @@ activate_linux_release() {
     --health-interval "$HEALTH_INTERVAL" \
     --release-mode "$RELEASE_MODE" \
     --classified-scope "$RELEASE_CLASSIFIED_SCOPE" \
-    --ledger-status async-pending \
+    --ledger-status "$COMPONENT_LEDGER_STATUS" \
     "${receipt_arguments[@]}" \
     --main-source "$prepared_dir/main.conf" \
     --scheduler-source "$prepared_dir/scheduler.service" \
@@ -16944,8 +16861,6 @@ rollback() {
   fi
   exit "$failed_status"
 }
-prepare_ledger_pending_root
-warn_pending_component_releases
 classify_component_release
 if [ "$RELEASE_EXECUTION_SCOPE" = LINUX ]; then
   trap 'linux_release_failure "$?"' ERR
@@ -16967,7 +16882,7 @@ prepare_release
 if [ "$RELEASE_EXECUTION_SCOPE" = LINUX ]; then
   CUTOVER_STEP=fast_release_schema_guard
   check_fast_release_schema
-  start_fast_component_ledger_publication
+  publish_fast_component_ledger
   if [ "$RELEASE_SCOPE" = COORDINATED ]; then
     CUTOVER_STEP=ensure_inherited_qmt_windows_edge_activation
     ensure_qmt_windows_edge_activation 1

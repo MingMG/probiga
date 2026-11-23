@@ -222,3 +222,53 @@ def test_transport_uses_reviewed_configuration_and_no_persistent_proxy_changes()
     assert ENGINE.index("  prepare_adata_release\n") < ENGINE.index(
         "CUTOVER_STEP=ensure_inherited_qmt_windows_edge_activation"
     )
+
+
+@pytest.mark.parametrize("publication_exit", [0, 1, 124])
+def test_linux_activation_waits_for_durable_component_ledger(tmp_path, publication_exit):
+    import sqlite3
+    import sys
+    sha = "a" * 40
+    db = tmp_path / "publication.sqlite"
+    with sqlite3.connect(db) as c:
+        c.execute("CREATE TABLE ledger(build TEXT PRIMARY KEY)")
+    release = tmp_path / "release"
+    (release / "tools").mkdir(parents=True)
+    publisher = release / "tools/publish_component_release.py"
+    publisher.write_text(
+        "import sqlite3,sys\n"
+        + f"raise_code={publication_exit!r}\n"
+        + "if raise_code: raise SystemExit(raise_code)\n"
+        + f"with sqlite3.connect({str(db)!r}) as c: c.execute('INSERT INTO ledger VALUES(?)',({sha!r},))\n",
+        encoding="utf-8",
+    )
+    check = tmp_path / "verify_ledger.py"
+    check.write_text(
+        "import sqlite3\n"
+        + f"with sqlite3.connect({str(db)!r}) as c: assert c.execute('SELECT build FROM ledger').fetchall()==[({sha!r},)]\n"
+        + "print('ACTIVATED_AFTER_DURABLE_READBACK')\n", encoding="utf-8",
+    )
+    publish = function(ENGINE, "publish_fast_component_ledger").replace("/usr/bin/timeout", "publication_boundary")
+    branch = re.search(
+        r'(?ms)^if \[ "\$RELEASE_EXECUTION_SCOPE" = LINUX \]; then\n  CUTOVER_STEP=fast_release_schema_guard.*?^fi$',
+        ENGINE,
+    ).group(0)
+    harness = "\n".join([
+        "set -euo pipefail",
+        f"TEST_PYTHON={Path(sys.executable).as_posix()!r}",
+        f"EXPECTED_SHA={sha!r}",
+        f"PREPARED_CODE_ROOT={release.as_posix()!r}",
+        f"VERIFY_LEDGER={check.as_posix()!r}",
+        'ADATA_SOURCE=/unused', 'RELEASE_VENV_ROOT=/unused', 'RELEASE_ARTIFACT_ROOT=/unused',
+        'RELEASE_EXECUTION_SCOPE=LINUX', 'RELEASE_SCOPE=LINUX', 'COMPONENT_LEDGER_STATUS=signed',
+        'check_fast_release_schema() { :; }', 'log_release() { :; }',
+        # Execute the real publisher subprocess while checking the production deadline arguments.
+        'publication_boundary() { test "$1" = --signal=TERM; test "$2" = --kill-after=5s; test "$3" = 120s; shift 3; test "$1" = /usr/bin/env; shift 2; while [[ "$1" == *=* ]]; do shift; done; shift; "$TEST_PYTHON" "$@"; }',
+        'activate_linux_release() { test "$COMPONENT_LEDGER_STATUS" = synced; "$TEST_PYTHON" "$VERIFY_LEDGER"; }',
+        publish, branch,
+    ])
+    result = run_bash(harness)
+    assert result.returncode == publication_exit, result.stdout + result.stderr
+    assert ("ACTIVATED_AFTER_DURABLE_READBACK" in result.stdout) == (publication_exit == 0)
+    with sqlite3.connect(db) as c:
+        assert c.execute("SELECT COUNT(*) FROM ledger").fetchone()[0] == int(publication_exit == 0)

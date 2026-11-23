@@ -95,7 +95,7 @@ release_modes=fast,full
 
 `tools/check_schema_expected.py` 调用当前代码的运行时 schema validators，不执行 DDL、迁移、seed 或 recovery planner。任何一个 validator 要求的表/列/索引合同不满足时，发布在激活前失败并提示使用 `--full`。数据库边界不可达时日志明确标记跳过；激活后的健康检查仍会失败并回滚。
 
-快速路径立即生成独立签名的 `component-release-lite.json`，其中包含 `schema_version: lite-1`、原组件清单、Ed25519 签名和公钥。`component-release.json` 保持不可变自封格式，不在副本上改字段。MySQL 账本在 60 秒后由 transient systemd unit 异步补写；发布启动时若发现 `deploy-guards/ledger-pending/` 中仍有状态文件，会明确告警。
+快速路径立即生成独立签名的 `component-release-lite.json`，其中包含 `schema_version: lite-1`、原组件清单、Ed25519 签名和公钥。`component-release.json` 保持不可变自封格式，不在副本上改字段。MySQL 发布账本须在 Linux 激活前通过现有受保护发布入口写入，并由运行账号读回核验，单次限时 120 秒；失败时保留旧服务，重试复用同一版本的有效记录。历史 pending 文件保留为现场记录，不再产生新的异步补写任务。
 
 API 健康检查优先验证 MySQL 账本签名。只有账本表中的该 SHA 行可证明为“不存在”时，才接受根目录保护的 lite 证明；账本存在但内容、元数据或签名错误时绝不回退到本地证明。
 
