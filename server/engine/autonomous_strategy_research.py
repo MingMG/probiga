@@ -310,7 +310,7 @@ def _historical_inventory(connection, state):
     """), {"day": state["trade_date"]}).scalars().all()
     days = sorted(str(day)[:10] for day in sessions)
     records = connection.execute(text("""
-        SELECT /*+ MAX_EXECUTION_TIME(4000) */ s.trade_date,a.output_dataset_id,a.finished_at
+        SELECT /*+ MAX_EXECUTION_TIME(4000) JOIN_ORDER(s,a) */ s.trade_date,a.output_dataset_id,a.finished_at
         FROM st_daily_stage_attempt a JOIN st_daily_delivery_session s ON s.session_uid=a.session_uid
         WHERE a.stage_name='analysis_fast' AND a.status='SUCCESS'
           AND s.trade_date BETWEEN :start AND :end AND a.finished_at<=:cutoff
