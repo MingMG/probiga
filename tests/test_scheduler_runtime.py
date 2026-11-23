@@ -1469,6 +1469,30 @@ class SchedulerRuntimeTest(unittest.TestCase):
         self.assertIsNot(semaphore, scheduler_runtime._task_lane_semaphore(general))
         self.assertIsNot(semaphore, scheduler_runtime._task_lane_semaphore(fast))
 
+    def test_research_worker_runs_behind_collectors_with_one_bulk_owner(self):
+        # Production task45 and115 held both general slots while task70 was due.
+        scheduler_runtime._running_task_ids.update({45, 115})
+        scheduler_runtime._core_running_task_ids.update({45, 115})
+        worker = {"task_type": "trading_v2_job_worker"}
+        auxiliary = {"task_type": "sector_heat_east"}
+        self.assertTrue(scheduler_runtime._scheduler_lane_has_capacity(worker, max_general_tasks=2))
+        self.assertFalse(scheduler_runtime._scheduler_lane_has_capacity(auxiliary, max_general_tasks=2))
+        semaphore = scheduler_runtime._task_lane_semaphore(worker)
+        self.assertIs(semaphore, scheduler_runtime._get_bulk_history_semaphore())
+        self.assertIsNot(semaphore, scheduler_runtime._task_lane_semaphore(auxiliary))
+        self.assertTrue(semaphore.acquire(blocking=False))
+        try:
+            self.assertFalse(semaphore.acquire(blocking=False))
+        finally:
+            semaphore.release()
+        scheduler_runtime._running_task_ids.add(70)
+        scheduler_runtime._bulk_history_running_task_ids.add(70)
+        self.assertFalse(scheduler_runtime._scheduler_lane_has_capacity(worker, max_general_tasks=2))
+        self.assertFalse(scheduler_runtime._scheduler_lane_has_capacity(auxiliary, max_general_tasks=2))
+        scheduler_runtime._bulk_history_running_task_ids.clear()
+        scheduler_runtime._exclusive_running_task_ids.add(85)
+        self.assertFalse(scheduler_runtime._scheduler_lane_has_capacity(worker, max_general_tasks=2))
+
     def test_quote_lane_stays_available_when_general_and_fast_lanes_are_full(self):
         scheduler_runtime._running_task_ids.update({701, 702})
         scheduler_runtime._fast_lane_running_task_ids.add(702)

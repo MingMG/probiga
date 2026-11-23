@@ -6620,9 +6620,8 @@ def _get_task_semaphore() -> threading.Semaphore:
 
 
 def _uses_bulk_history_lane(row: dict) -> bool:
-    # Serialize QMT history-frame and DAT-cache publishers. This protects both
-    # the signed-in terminal and the two-worker general marketplace pipeline;
-    # native quote and user-delivery lanes remain independent.
+    # Bound historical ingestion and asynchronous research independently of
+    # foreground collection. Each host retains one bulk worker and its leases.
     return str(row.get("task_type") or "").strip() in {
         "qmt_local_history_2024",
         "qmt_local_gap_repair_execute",
@@ -6633,6 +6632,7 @@ def _uses_bulk_history_lane(row: dict) -> bool:
         "qmt_index_kline",
         "qmt_index_minute",
         "etf_forward_daily",
+        "trading_v2_job_worker",
     }
 
 
