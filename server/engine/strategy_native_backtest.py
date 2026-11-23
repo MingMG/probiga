@@ -31,12 +31,18 @@ def _assert_read_succeeded(reason):
 
 def read_runs(connection, run_id=None):
     from server.engine.strategy_governance import _digest
-    records = connection.execute(text("""SELECT /*+ MAX_EXECUTION_TIME(4000) */ a.payload_json,a.audit_hash,a.after_json
-        FROM st_strategy_governance_audit a JOIN (SELECT entity_key,MAX(action) last_action
-        FROM st_strategy_governance_audit WHERE entity_type=:entity GROUP BY entity_key) x
-        ON x.entity_key=a.entity_key AND x.last_action=a.action
-        WHERE a.entity_type=:entity AND (:uid IS NULL OR a.entity_key=:uid)
-        ORDER BY a.created_at DESC,a.audit_id DESC LIMIT 8"""), {'entity':ENTITY,'uid':run_id}).mappings()
+    # Find recent journal heads through the covering entity/time index before reading bodies.
+    scope = " AND entity_key=:uid" if run_id is not None else ""
+    heads = connection.execute(text(f"""SELECT /*+ MAX_EXECUTION_TIME(4000) */
+        entity_key,MAX(created_at) AS latest_at FROM st_strategy_governance_audit
+        WHERE entity_type=:entity{scope} GROUP BY entity_type,entity_key
+        ORDER BY latest_at DESC,entity_key DESC LIMIT 8"""), {'entity':ENTITY,'uid':run_id}).mappings().all()
+    records=[]
+    for head in heads:
+        records.extend(connection.execute(text("""SELECT /*+ MAX_EXECUTION_TIME(4000) */ payload_json,audit_hash,after_json
+            FROM st_strategy_governance_audit WHERE entity_type=:entity AND entity_key=:uid
+            AND created_at=:latest_at ORDER BY action DESC,audit_id DESC LIMIT 1"""),
+            {'entity':ENTITY,'uid':head['entity_key'],'latest_at':head['latest_at']}).mappings().all())
     result=[]
     for r in records:
         payload,after=json.loads(r['payload_json']),json.loads(r['after_json'])
