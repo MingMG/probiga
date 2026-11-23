@@ -374,7 +374,7 @@ def _progress(state):
             replay_run_id=state['run_id'],reason=state.get('current_unit') or state['phase'])
 
 
-def _step(connection,state,owner):
+def _step(connection,state,owner,*,feature_budget=None):
     from server.common.formal_analysis_store import FormalAnalysisStore
     from server.engine.native_research_dataset import PreparedDataset
     from server.engine.native_research_prepare import plan_v3_day
@@ -432,11 +432,14 @@ def _step(connection,state,owner):
             if state['cursor']>=len(days):state.update(phase='SIGNALS',cursor=0)
             else:
                 day=days[state['cursor']]
+                feature_deadline=feature_budget() if feature_budget is not None else time.monotonic()+900
                 _begin_unit(connection,state,owner,'FEATURE '+day)
                 if 'features' not in state['day_inputs'][day]:
                     _prepare_trees(dataset,store,state['plans'][day],*state['day_inputs'][day]['ready'].values(),
                         *(state['bars'][target]['tree'] for target in state['feature_windows'][day]))
-                    value=_features(state,dataset,day)
+                    from server.engine.native_research_jobs import feature_input_progress
+                    observed=feature_input_progress(connection,state,owner,dataset,day,deadline=feature_deadline)
+                    value=_features(state,observed,day)
                     tree=_put(dataset,store,state,day+':features',value)
                     state['day_inputs'][day]['features']=tree
                     generation=_feature_generation(state,day)
@@ -567,6 +570,18 @@ def native_tick(engine):
         bounded.dispose()
 
 
+def _feature_compute_deadline(attempt_started, *, arm_timer):
+    # A verified 70-day market frame exceeded 300s while still decoding and
+    # normalizing. Give this atomic CPU unit a finite 15-minute attempt budget.
+    deadline = attempt_started + 900
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise NativeStepDeadline('NATIVE_FEATURE_ATTEMPT_DEADLINE')
+    if arm_timer:
+        signal.setitimer(signal.ITIMER_REAL, remaining)
+    return deadline
+
+
 def _native_tick(engine):
     """Consume the typed queue only; audit-directory scans never select work."""
     from server.engine.native_research_jobs import claim, CLAIM_SECONDS
@@ -594,7 +609,8 @@ def _native_tick(engine):
                 raise ValueError('冻结数据转换版本已变化；未完成输入须按新转换身份登记，不能混用或错标版本')
             if previous_handler is not None:
                 signal.setitimer(signal.ITIMER_REAL,max(.001,300-(time.monotonic()-attempt_started)))
-            _step(connection,state,owner)
+            _step(connection,state,owner,feature_budget=lambda: _feature_compute_deadline(
+                attempt_started,arm_timer=previous_handler is not None))
             if state['phase']!='FINISHED':_save(connection,state,owner,yield_job=True)
             return {key:state.get(key) for key in ('status','job_id','run_id','phase','completed_units','total_units','current_unit','reason')}
         except (Exception,NativeStepDeadline,PrepareYield) as exc:
