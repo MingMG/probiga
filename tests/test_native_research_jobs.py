@@ -236,3 +236,15 @@ def test_feature_decode_progress_only_counts_successful_day_reads_per_attempt(mo
     next_attempt.get_tree(first)
     assert state['source_progress']['completed']==1
     assert state['source_progress']['scope']!=previous_scope
+
+    # A checkpoint crossing the deadline must fail, rather than auto-yield
+    # and restart a RAM-only decode prefix indefinitely on new attempts.
+    clock=[31]
+    monkeypatch.setattr(jobs.time,'monotonic',lambda:clock[0])
+    monkeypatch.setattr(native,'_save',lambda *_:clock.__setitem__(0,1000))
+    state['attempt']=31
+    expired=jobs.feature_input_progress(None,state,None,Inputs(),'day',deadline=900)
+    clock[0]=62
+    with pytest.raises(native.NativeStepDeadline,match='FEATURE_ATTEMPT_DEADLINE'):
+        expired.get_tree(first)
+    assert state['completed_units']==101
