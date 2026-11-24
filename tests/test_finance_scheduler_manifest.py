@@ -191,10 +191,10 @@ def finance_manifest_history():
         columns = tuple(historical)
         connection.execute(text(
             "CREATE INDEX idx_pit_coverage_decision ON st_pit_source_coverage "
-            "(fact_kind,stock_code,known_at,window_start,window_end)"
+            "(fact_kind,stock_code,source,known_at,window_start,window_end)"
         ))
-        # Earlier matching rows outside the two-member target catalog grow the
-        # generic aggregate. The exact persisted seal still covers two members.
+        # Earlier coverage from another provider makes even LIMIT 1 scan history.
+        # The exact persisted seal still covers the same two catalog members.
         connection.execute(text(
             "INSERT INTO st_pit_source_coverage (" + ",".join(columns) + ") VALUES ("
             + ",".join(":" + column for column in columns) + ")"
@@ -203,7 +203,8 @@ def finance_manifest_history():
                 **historical,
                 "coverage_id": f"{number:064x}",
                 "scope_hash": f"{number + 6000:064x}",
-                "stock_code": f"{number + 100000:06d}",
+                "stock_code": "000000",
+                "source": "some.other.provider",
                 "batch_id": f"older-finance-{number}",
             }
             for number in range(1, 6001)
@@ -240,15 +241,15 @@ def _validate_finance_history(engine, receipt):
     )
 
 
-def test_finance_scheduler_checks_presence_then_reads_the_exact_seal_within_budget(finance_manifest_history):
+def test_finance_scheduler_reads_exact_seal_when_history_presence_exceeds_budget(finance_manifest_history):
     engine, receipt = finance_manifest_history
     where = validation.TASK_OUTPUT_REQUIREMENTS["stock_finance"][0].where_sql
     with _sqlite_query_work_budget(engine):
         with pytest.raises(OperationalError, match="interrupted"):
             with engine.connect() as connection:
                 connection.execute(text(
-                    "SELECT COUNT(*) AS row_count, MAX(known_at) AS max_freshness "
-                    f"FROM st_pit_source_coverage WHERE ({where})"
+                    "SELECT 1 AS found "
+                    f"FROM st_pit_source_coverage WHERE ({where}) LIMIT 1"
                 )).one()
 
     with _sqlite_query_work_budget(engine):
@@ -262,7 +263,7 @@ def test_finance_scheduler_checks_presence_then_reads_the_exact_seal_within_budg
     ("seal_coverage_id", "output atomic seal validation failed"),
     ("batch_root_sha256", "output seal identity, full catalog or exclusions differ"),
 ])
-def test_finance_scheduler_requires_the_submitted_seal_after_presence_check(
+def test_finance_scheduler_requires_the_submitted_seal(
     finance_manifest_history, field, reason,
 ):
     engine, receipt = finance_manifest_history
@@ -274,7 +275,7 @@ def test_finance_scheduler_requires_the_submitted_seal_after_presence_check(
     assert reason in result.message
 
 
-def test_finance_scheduler_presence_requires_an_actual_qualifying_source_row():
+def test_finance_scheduler_never_accepts_unrelated_raw_rows_as_an_exact_seal():
     engine = create_engine("sqlite://")
     try:
         with engine.begin() as connection:
@@ -292,7 +293,7 @@ def test_finance_scheduler_presence_requires_an_actual_qualifying_source_row():
         _sqlite_finance_metadata(engine)
         result = _validate_finance_history(engine, _receipt())
         assert result.checked and not result.ok
-        assert "st_pit_source_coverage: only 0 rows" in result.message
+        assert "stock_finance:" in result.message
     finally:
         engine.dispose()
 

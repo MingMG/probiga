@@ -4923,14 +4923,13 @@ def validate_scheduler_task_result(
                 ):
                     raise ValueError("canonical governance replay differs from the scheduled scope")
                 flow_target_date = date.fromisoformat(governance_replay["trade_date"])
-        # The final transaction writes and verifies the projection. At this
-        # point a staged initial score can only be read from its immutable store.
-        for requirement in (() if staged_initial is not None else requirements or ()):
+        # Staged scores and finance seals are verified by their exact readers
+        # below; an unrelated history scan cannot prove their completeness.
+        for requirement in (() if staged_initial is not None or task_type == "stock_finance" else requirements or ()):
             effective_requirement = (
                 replace(requirement, require_fresh=False)
                 if (
-                    task_type == "stock_finance"
-                    or governance_replay is not None
+                    governance_replay is not None
                     or task_type == _CAPITAL_FLOW_BATCH_TASK_TYPE
                     and (historical_flow_receipt or direct_flow_receipt)
                 )
