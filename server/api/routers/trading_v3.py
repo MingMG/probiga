@@ -6666,14 +6666,20 @@ def paper_ledger(
     )
     total_market_value = round(sum(float(row.get("market_value") or 0) for row in positions), 2)
     total_unrealized_pnl = round(sum(float(row.get("unrealized_pnl") or 0) for row in positions), 2)
-    legacy_account_present = bool(
-        legacy_capital_rows or legacy_positions or legacy_orders
+    legacy_account_active = bool(legacy_positions) or any(
+        str(row.get("status") or "").upper() in {"PENDING", "PARTIAL"}
+        for row in legacy_orders
     )
-    if legacy_account_present and v2_positions:
+    canonical_account_active = bool(v2_positions) or any(
+        str(row.get("status") or "").upper() in {
+            "CREATED", "RISK_APPROVED", "QUEUED", "PARTIALLY_FILLED",
+        } for row in v2_orders
+    )
+    if legacy_account_active and canonical_account_active:
         display_account_scope = "MERGED_LEDGER"
         display_cash_balance = canonical_cash + legacy_cash_balance
         display_total_equity = canonical_total_equity + legacy_total_equity
-    elif legacy_account_present:
+    elif legacy_account_active:
         display_account_scope = "LEGACY_EVENT_SIM_ACTIVE"
         display_cash_balance = legacy_cash_balance
         display_total_equity = legacy_total_equity
