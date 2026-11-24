@@ -5542,7 +5542,6 @@ def _prepare_batch_outputs(
     reuse_preliminary_snapshot: bool = False,
     return_scored: bool = False,
     allow_degraded_inputs: bool = False,
-    event_checkpoint_path: Path | None = None,
     pool_decision_phase: StrategyPoolDecisionPhase | None = None,
     required_premarket_announcement: FrozenPremarketAnnouncement | None = None,
     formal_store: FormalAnalysisStore | None = None,
@@ -5752,8 +5751,7 @@ def _prepare_batch_outputs(
             event_end_date=event_window_end,
             require_qmt_event_batch=True,
             capture_historical_selection=historical_event_reads.append,
-            event_checkpoint_path=event_checkpoint_path,
-            event_progress=announcement_progress if event_checkpoint_path is not None else None,
+            event_progress=announcement_progress if progress_callback is not None else None,
             **({"capture_finance_selection": finance_reads.append} if require_complete_pit_sources else {}),
             **({"required_premarket_announcement": required_premarket_announcement}
                if required_premarket_announcement is not None else {}),
@@ -6410,8 +6408,6 @@ def run_batch(
                     stock_codes=None, progress_callback=progress_callback, news_cutoff_time=execution_time,
                     publisher_build_sha=build_sha, reuse_preliminary_snapshot=True,
                     return_scored=True, pool_decision_phase="INITIAL",
-                    event_checkpoint_path=Path(os.environ.get("PROBIGA_JOB_LOG_ROOT") or "/var/lib/probiga/jobs")
-                    / "analysis-event-coverage.sqlite",
                     formal_store=store, formal_generation_sha256=generation,
                 )
                 verify_write_owner()
