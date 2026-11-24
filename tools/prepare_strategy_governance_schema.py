@@ -6285,8 +6285,17 @@ def _recover_trust(boundary: RecoveryBoundary) -> dict[str, Any]:
     }
 
 
+def _assert_pit_index_ddl_terminal(engine) -> None:
+    # A timed-out client can leave its server-side online index build running.
+    with engine.connect() as connection:
+        for process in connection.execute(text('SHOW FULL PROCESSLIST')).mappings():
+            statement=' '.join(str(process.get('Info') or '').replace('`','').lower().split())
+            if re.match(r'alter table (?:\w+\.)?st_pit_source_coverage\b',statement):
+                raise RuntimeError('NATIVE_SCHEMA_PREVIOUS_PIT_DDL_NOT_TERMINAL')
+
+
 def _prepare_native_replay_schema() -> dict[str, Any]:
-    """Linux-only additive DDL; no trust switch or execution-evidence migration."""
+    """Linux index and queue DDL; no trust switch or execution-evidence migration."""
     from server.common.native_job_schema import validate_native_job_schema, privileged_migrate_native_job_schema
     load_project_env()
     boundary=_open_boundary(include_migrator=True,expected_trust=0,migrator_timeout_seconds=1800)
@@ -6301,6 +6310,7 @@ def _prepare_native_replay_schema() -> dict[str, Any]:
                 raise RuntimeError('NATIVE_SCHEMA_PREVIOUS_DDL_NOT_TERMINAL')
         from server.common.pit_source_coverage_index import ensure_pit_source_coverage_date_index
         if boundary.migrator_engine is None:raise RuntimeError('native job migrator unavailable')
+        _assert_pit_index_ddl_terminal(boundary.migrator_engine)
         inventory_index=ensure_pit_source_coverage_date_index(boundary.migrator_engine)
         try:
             detail=validate_native_job_schema(boundary.runtime_engine)

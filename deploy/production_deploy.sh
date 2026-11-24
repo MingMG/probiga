@@ -15252,7 +15252,7 @@ run_prepared_database_migration_tool() {
     return 2
   fi
   if [ "$#" -eq 3 ] && [ "$2" = native-replay ]; then
-    native_deadline=(/usr/bin/timeout --signal=TERM --kill-after=10s 180s)
+    native_deadline=(/usr/bin/timeout --signal=TERM --kill-after=10s 1800s)
   fi
   (
     cd "$PREPARED_CODE_ROOT"
