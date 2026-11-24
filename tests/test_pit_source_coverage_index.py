@@ -4,7 +4,7 @@ import re
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 
 from server.common import pit_facts
 from server.common import pit_source_coverage_index as migration
@@ -275,3 +275,29 @@ def test_existing_date_index_stops_fetching_wide_rows_for_batch_inventory(storag
     assert source_rows(storage) == original
     assert not migration.ensure_pit_source_coverage_date_index(fixture)['created']
     assert fixture.ddl_calls == 1
+
+
+@pytest.mark.parametrize('statement', [
+    'ALTER TABLE `st_pit_source_coverage` DROP INDEX `idx_pit_coverage_source_known_batch`, ADD INDEX x (stock_code)',
+    ' alter  table probiga.st_pit_source_coverage ADD INDEX x (stock_code)',
+])
+def test_interrupted_index_owner_must_exit_before_another_migration(statement):
+    from tools.prepare_strategy_governance_schema import _assert_pit_index_ddl_terminal
+    engine = create_engine('sqlite://')
+    with engine.begin() as connection:
+        connection.exec_driver_sql('CREATE TABLE owned_processes (Info TEXT)')
+        connection.execute(text('INSERT INTO owned_processes VALUES (:ddl)'), {'ddl': statement})
+
+    @event.listens_for(engine, 'before_cursor_execute', retval=True)
+    def owned_mysql_process_inventory(connection, cursor, sql, args, context, many):
+        if sql == 'SHOW FULL PROCESSLIST':
+            return 'SELECT Info FROM owned_processes', args
+        return sql, args
+
+    with pytest.raises(RuntimeError, match='NATIVE_SCHEMA_PREVIOUS_PIT_DDL_NOT_TERMINAL'):
+        _assert_pit_index_ddl_terminal(engine)
+    with engine.begin() as connection:
+        connection.exec_driver_sql('DELETE FROM owned_processes')
+        connection.exec_driver_sql("INSERT INTO owned_processes VALUES ('ALTER TABLE unrelated ADD INDEX x (id)')")
+    _assert_pit_index_ddl_terminal(engine)
+    engine.dispose()
