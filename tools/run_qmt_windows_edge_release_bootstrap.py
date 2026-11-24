@@ -981,6 +981,7 @@ def append_recoverable_release_request(
                 _attest_frozen_handoff_prior(
                     connection, runtime_engine, finalized_windows_sha=prior_build_sha,
                     finalized_linux_sha=finalized_linux_sha, actual_windows_sha=actual_prior,
+                    controller_build_sha=target_build_sha,
                 )
             if finalized_linux_sha is not None:
                 prior_identity["handoff_prior_build_sha"] = actual_prior
@@ -1013,6 +1014,7 @@ def append_recoverable_release_request(
                 component = _attest_granted_prior_component(
                     runtime, finalized_windows_sha=prior_build_sha,
                     finalized_linux_sha=finalized_linux_sha, actual_windows_sha=actual_prior,
+                    controller_build_sha=target_build_sha,
                 )
                 _assert_split_prior_git_ancestry(actual_prior, target_build_sha)
                 seal = _attest_split_prior_database(
@@ -1152,20 +1154,26 @@ def _attest_forward_prior_database(
 def _attest_granted_prior_component(
     runtime_connection: Any, *, finalized_windows_sha: str,
     finalized_linux_sha: str, actual_windows_sha: str,
+    controller_build_sha: str,
 ) -> dict[str, Any]:
     from server.common.component_release_attestation import load_component_attestation
 
     finalized = load_component_attestation(runtime_connection, finalized_linux_sha)
     actual = load_component_attestation(runtime_connection, actual_windows_sha)
+    controller = load_component_attestation(runtime_connection, controller_build_sha)
+    # The granted Windows upgrade is the actual prior; a coordinated successor
+    # may advance its contract after the existing seal, ancestry and writer checks.
     if (
         finalized["linux_build_sha"] != finalized_linux_sha
         or finalized["windows_build_sha"] != finalized_windows_sha
-        or actual["scope"] != "COORDINATED"
-        or any(actual[key] != actual_windows_sha for key in (
-            "linux_build_sha", "windows_build_sha", "contract_build_sha",
-        ))
-        or actual["parent_linux_build_sha"] != finalized_linux_sha
-        or actual["contract_sha256"] != finalized["contract_sha256"]
+        or any(
+            component["scope"] != "COORDINATED"
+            or component["parent_linux_build_sha"] != finalized_linux_sha
+            or any(component[key] != sha for key in (
+                "linux_build_sha", "windows_build_sha", "contract_build_sha",
+            ))
+            for component, sha in ((actual, actual_windows_sha), (controller, controller_build_sha))
+        )
     ):
         raise RuntimeError("RECOVERY_BLOCKED: granted prior component lineage or contract differs")
     return actual
@@ -1231,6 +1239,7 @@ def _assert_split_prior_git_ancestry(actual_windows_sha: str, target_build_sha: 
 def _attest_frozen_handoff_prior(
     connection: Any, runtime_engine: Any, *, finalized_windows_sha: str,
     finalized_linux_sha: str | None, actual_windows_sha: str,
+    controller_build_sha: str,
 ) -> None:
     if actual_windows_sha != finalized_windows_sha and finalized_linux_sha is None:
         raise RuntimeError("RECOVERY_BLOCKED: original prior build differs")
@@ -1246,6 +1255,7 @@ def _attest_frozen_handoff_prior(
             _attest_granted_prior_component(
                 runtime, finalized_windows_sha=finalized_windows_sha,
                 finalized_linux_sha=finalized_linux_sha, actual_windows_sha=actual_windows_sha,
+                controller_build_sha=controller_build_sha,
             )
 
 
@@ -1444,6 +1454,7 @@ def append_forward_release_request(
             _attest_frozen_handoff_prior(
                 connection, runtime_engine, finalized_windows_sha=prior,
                 finalized_linux_sha=finalized_linux_sha, actual_windows_sha=actual_prior,
+                controller_build_sha=target,
             )
             return {**base, "status": "idempotent",
                     "hold_run_uid": latest["hold_run_uid"],
@@ -1470,6 +1481,7 @@ def append_forward_release_request(
         _attest_frozen_handoff_prior(
             connection, runtime_engine, finalized_windows_sha=prior,
             finalized_linux_sha=finalized_linux_sha, actual_windows_sha=actual_prior,
+            controller_build_sha=target,
         )
         if actual_prior != prior:
             _assert_split_prior_git_ancestry(actual_prior, target)
@@ -1548,6 +1560,7 @@ def append_precutover_abort(
                     component = _attest_granted_prior_component(
                         runtime, finalized_windows_sha=prior_build_sha,
                         finalized_linux_sha=prior_linux_build_sha, actual_windows_sha=actual_prior,
+                        controller_build_sha=expected_build_sha,
                     )
                     seal = _attest_split_prior_database(
                         connection, runtime, actual_windows_sha=actual_prior,

@@ -177,12 +177,12 @@ def _ready(engine, sha):
         return ledger.check_qmt_edge_release_activation(connection, expected_build_sha=sha)[0]
 
 
-def _coordinated_manifest(build, parent):
+def _coordinated_manifest(build, parent, *, contract="c" * 64):
     from server.common.component_release import build_component_release
 
     return build_component_release(
         linux_build_sha=build, windows_build_sha=build, contract_build_sha=build,
-        contract_sha256="c" * 64, parent_linux_build_sha=parent, scope="COORDINATED",
+        contract_sha256=contract, parent_linux_build_sha=parent, scope="COORDINATED",
         created_at="2026-09-05T02:00:00Z",
     )
 
@@ -200,6 +200,8 @@ def granted_split(engine, monkeypatch):
     manifests = {
         OLD: _coordinated_manifest(OLD, "f" * 40),
         NEW: _coordinated_manifest(NEW, OLD),
+        NEXT: _coordinated_manifest(NEXT, OLD),
+        FOURTH: _coordinated_manifest(FOURTH, OLD),
     }
     metadata_reads = []
     ancestry_checks = []
@@ -301,8 +303,32 @@ def test_granted_split_prior_uses_standard_handoff_without_pruned_linux_checkout
     assert granted_split.ancestry_checks == [(NEW, NEXT)]
 
 
+def test_granted_contract_upgrade_resumes_from_actual_writer_and_preserves_abort(granted_split):
+    # Production had Linux on the finalized old contract, Windows already
+    # granted the new contract, and a successor still requiring a full cutover.
+    granted_split.manifests[NEW] = _coordinated_manifest(NEW, OLD, contract="d" * 64)
+    granted_split.manifests[NEXT] = _coordinated_manifest(NEXT, OLD, contract="e" * 64)
+    engine = granted_split.engine
+    result = _split_fresh(engine)
+    assert result["context"]["prior_build_sha"] == NEW
+    assert result["context"]["prior_instance_id"] == "WIN-42"
+    assert not _ready(engine, NEW) and not _ready(engine, NEXT)
+    assert _split_fresh(engine)["context"] == result["context"]
+    aborted = bootstrap.append_precutover_abort(
+        engine, engine, expected_build_sha=NEXT, target_build_sha=NEXT,
+        prior_build_sha=OLD, prior_linux_build_sha=OLD,
+        deployment_attempt_id=NEXT_ATTEMPT, now=AT + timedelta(seconds=12),
+    )
+    assert aborted["resume_build_sha"] == NEW
+    assert _ready(engine, NEW) and not _ready(engine, NEXT)
+    assert granted_split.metadata_reads == [granted_split.manifests[NEW]["manifest_sha256"]] * 2
+
+
 @pytest.mark.parametrize(("fault", "message"), [
     ("wrong_lineage", "lineage or contract differs"),
+    ("target_lineage", "lineage or contract differs"),
+    ("target_scope", "lineage or contract differs"),
+    ("target_windows", "lineage or contract differs"),
     ("wrong_ancestry", "target is not a descendant of the granted Windows prior"),
     ("stale", "fresh prior Windows writer identity unavailable"),
     ("ambiguous", "fresh prior Windows writer identity unavailable"),
@@ -311,6 +337,11 @@ def test_granted_split_rejects_unproven_prior_without_new_hold(granted_split, fa
     engine = granted_split.engine
     if fault == "wrong_lineage":
         granted_split.manifests[NEW] = _coordinated_manifest(NEW, FOURTH)
+    elif fault.startswith("target_"):
+        changes = {"target_lineage": {"parent_linux_build_sha": FOURTH},
+                   "target_scope": {"scope": "LINUX"},
+                   "target_windows": {"windows_build_sha": OLD}}
+        granted_split.manifests[NEXT] = {**granted_split.manifests[NEXT], **changes[fault]}
     elif fault == "wrong_ancestry":
         granted_split.rejected_targets.add(NEXT)
     elif fault == "stale":
@@ -364,7 +395,11 @@ def test_granted_split_abort_after_lost_ack_revalidates_exact_frozen_prior(grant
     assert granted_split.ancestry_checks == [(NEW, NEXT)]
 
 
-def test_granted_split_pending_renewal_and_successor_keep_actual_original_prior(granted_split):
+@pytest.mark.parametrize("contract_upgrade", [False, True])
+def test_granted_split_pending_renewal_and_successor_keep_actual_original_prior(granted_split, contract_upgrade):
+    if contract_upgrade:
+        for sha, digest in ((NEW, "d"), (NEXT, "e"), (FOURTH, "f")):
+            granted_split.manifests[sha] = _coordinated_manifest(sha, OLD, contract=digest * 64)
     engine = granted_split.engine
     first = _split_fresh(engine)["context"]
     with engine.begin() as connection:
