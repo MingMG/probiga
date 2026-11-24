@@ -155,7 +155,8 @@ def load_source_daily_rows(
             connection.execute(
                 text(
                     f"""
-                    SELECT stock_code, trade_date, `open`, `close`, high, low,
+                    SELECT /*+ MAX_EXECUTION_TIME(4000) INDEX(sm_stock_kline idx_date_ktype) */
+                           stock_code, trade_date, `open`, `close`, high, low,
                            volume, amount, pre_close, data_source, quality_status,
                            permission_status
                       FROM sm_stock_kline
