@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from server.api.routers import trading_v3
 from server.trading_v2 import repository as v2_repository
 
@@ -64,6 +66,48 @@ class _Connection:
 class _Engine:
     def connect(self):
         return _Connection()
+
+
+@pytest.mark.parametrize("legacy_status", [None, "FILLED", "CANCELLED", "EXPIRED", "PENDING"])
+def test_queued_main_paper_buy_uses_its_account_despite_closed_legacy_history(monkeypatch, legacy_status):
+    class HistoryConnection(_Connection):
+        def execute(self, statement, params):
+            sql = str(statement)
+            if "AS realized_profit" in sql:
+                return _Rows([{"realized_profit": -44034.11}])
+            if "FROM st_sim_position" in sql:
+                return _Rows([])
+            if "FROM st_sim_order" in sql:
+                return _Rows([] if legacy_status is None else [{
+                    "id": 1, "stock_code": "600001", "side": "BUY", "status": legacy_status,
+                    "requested_shares": 100, "filled_shares": 0, "limit_price": 10,
+                }])
+            return super().execute(statement, params)
+
+    monkeypatch.setattr(trading_v3, "get_engine", lambda: type(
+        "HistoryEngine", (), {"connect": lambda self: HistoryConnection()},
+    )())
+    monkeypatch.setattr(v2_repository.TradingV2ReadRepository, "account", lambda self, account_id: {
+        "account_id": account_id, "initial_cash": 200000, "cash_balance": 200000,
+        "latest_equity": {"cash_balance": 200000, "market_value": 0, "total_equity": 200000},
+    })
+    monkeypatch.setattr(v2_repository.TradingV2ReadRepository, "positions", lambda self, account_id: [])
+    pending = {"order_id": "main-buy", "stock_code": "000001", "side": "BUY",
+               "quantity": 100, "status": "QUEUED"}
+    monkeypatch.setattr(v2_repository.TradingV2ReadRepository, "orders", lambda self, account_id, limit: [pending])
+    data = trading_v3.paper_ledger(account_id="paper-main-v2", limit=20)["data"]
+    summary = data["summary"]
+    assert summary["canonical_total_equity"] == 200000
+    assert summary["legacy_total_equity"] == 955965.89
+    assert data["orders"][0] == {**pending, "ledger_source": "V2_CANONICAL"}
+    assert data["real_trading_enabled"] is False
+    if legacy_status == "PENDING":
+        assert summary["display_account_scope"] == "MERGED_LEDGER"
+        assert summary["display_cash_balance"] == 1154965.89
+        assert summary["display_total_equity"] == 1155965.89
+    else:
+        assert summary["display_account_scope"] == "V2_CANONICAL"
+        assert summary["display_cash_balance"] == summary["display_total_equity"] == 200000
 
 
 def test_paper_ledger_uses_real_v2_read_repository(monkeypatch):
