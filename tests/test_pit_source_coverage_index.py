@@ -282,22 +282,26 @@ def test_existing_date_index_stops_fetching_wide_rows_for_batch_inventory(storag
     ' alter  table probiga.st_pit_source_coverage ADD INDEX x (stock_code)',
 ])
 def test_interrupted_index_owner_must_exit_before_another_migration(statement):
-    from tools.prepare_strategy_governance_schema import _assert_pit_index_ddl_terminal
+    from tools.prepare_strategy_governance_schema import _assert_pit_index_ddl_terminal, _public_failure_payload
     engine = create_engine('sqlite://')
     with engine.begin() as connection:
-        connection.exec_driver_sql('CREATE TABLE owned_processes (Info TEXT)')
-        connection.execute(text('INSERT INTO owned_processes VALUES (:ddl)'), {'ddl': statement})
+        connection.exec_driver_sql('CREATE TABLE owned_processes (Info TEXT, Id INTEGER, Time INTEGER, State TEXT, Command TEXT)')
+        connection.execute(text("INSERT INTO owned_processes VALUES (:ddl,51,1200,'altering table','Query')"), {'ddl': statement})
 
     @event.listens_for(engine, 'before_cursor_execute', retval=True)
     def owned_mysql_process_inventory(connection, cursor, sql, args, context, many):
         if sql == 'SHOW FULL PROCESSLIST':
-            return 'SELECT Info FROM owned_processes', args
+            return 'SELECT * FROM owned_processes', args
         return sql, args
 
-    with pytest.raises(RuntimeError, match='NATIVE_SCHEMA_PREVIOUS_PIT_DDL_NOT_TERMINAL'):
+    with pytest.raises(RuntimeError, match='NATIVE_SCHEMA_PREVIOUS_PIT_DDL_NOT_TERMINAL') as failure:
         _assert_pit_index_ddl_terminal(engine)
+    assert failure.value.blocking_ddl_owner == {
+        'connection_id':51,'elapsed_seconds':1200,'state':'altering table','command':'Query',
+    }
+    assert _public_failure_payload(failure.value, phase='native-replay')['blocking_ddl_owner'] == failure.value.blocking_ddl_owner
     with engine.begin() as connection:
         connection.exec_driver_sql('DELETE FROM owned_processes')
-        connection.exec_driver_sql("INSERT INTO owned_processes VALUES ('ALTER TABLE unrelated ADD INDEX x (id)')")
+        connection.exec_driver_sql("INSERT INTO owned_processes (Info) VALUES ('ALTER TABLE unrelated ADD INDEX x (id)')")
     _assert_pit_index_ddl_terminal(engine)
     engine.dispose()
