@@ -1,5 +1,5 @@
 from copy import deepcopy
-from datetime import timedelta
+from datetime import datetime,timedelta
 
 import pandas as pd
 import pytest
@@ -70,6 +70,23 @@ def test_new_source_transform_has_a_distinct_identity_with_unchanged_raw_clocks(
     assert first['run_id']!=second['run_id'] and first['contract']==second['contract']
     assert first['requested_at']==second['requested_at']==old['requested_at']
     assert first['price_cutoff']==second['price_cutoff']==old['price_cutoff']
+
+
+def test_changed_source_freezes_current_availability_instead_of_unrelated_legacy_cutoff(queue,monkeypatch):
+    old=legacy(queue,monkeypatch)
+    from server.engine import autonomous_strategy_research as research
+    monkeypatch.setattr(research,'_read_states',lambda *_a,**_k:[{'price_backtest':{
+        'sessions':old['sessions'],'knowledge_cutoff':old['price_cutoff'],
+        'run_id':'legacy-price','rule_hash':'legacy-rule','input_archives':[]}}])
+    observed='2026-11-25 05:23:44'
+    monkeypatch.setattr(native,'now_shanghai',lambda:datetime.fromisoformat(observed))
+    with queue.connect() as connection:
+        current=native._start(connection,old['strategies'],old['sessions'],{},'f'*64)
+        assert current['requested_at']==current['price_cutoff']==observed
+        assert current['input_archives']==[] and current['source_run_id'] is None
+        assert current['run_id']!=old['run_id']
+        unchanged=native.read_runs(connection,old['run_id'])[0]
+        assert unchanged['status']=='FAILED' and unchanged['price_cutoff']==old['price_cutoff']
 
 
 
