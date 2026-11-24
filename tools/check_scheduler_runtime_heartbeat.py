@@ -12,9 +12,35 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from server.common.scheduler_runtime_health import (
-    check_linux_standalone_scheduler_heartbeat,
-)
+from tools.linux_release_activation import Services
+
+
+def probe_scheduler_heartbeat(expected_build_sha: str, expected_pid: int, *, services=None) -> dict:
+    """Use the running API's database view, as Linux activation does."""
+    transport = services or Services()
+    with transport.open_http("http://127.0.0.1/api/health", timeout=5) as response:
+        raw = response.read(512 * 1024 + 1)
+    if len(raw) > 512 * 1024:
+        raise ValueError("health response exceeds bound")
+    health = json.loads(raw)
+    revision = health.get("release_revision") or {}
+    scheduler = health.get("standalone_scheduler") or {}
+    heartbeat = health.get("standalone_scheduler_heartbeat") or {}
+    detail = heartbeat.get("detail") or {}
+    current = detail.get("current") or {}
+    errors = list(detail.get("errors") or [])
+    if health.get("status") != "ok" or revision.get("actual_git_sha") != expected_build_sha or revision.get("matches_expected") is not True:
+        errors.append("api_release_not_ready")
+    if scheduler.get("verified") is not True or scheduler.get("active") is not True or scheduler.get("pid") != expected_pid:
+        errors.append("scheduler_instance_differs")
+    if heartbeat.get("ready") is not True or detail.get("fresh_row_count") != 1 or detail.get("future_row_count") != 0:
+        errors.append("scheduler_heartbeat_not_ready")
+    if current.get("pid") != expected_pid or current.get("build_sha") != expected_build_sha or current.get("executor_role") != "linux_standalone":
+        errors.append("heartbeat_identity_differs")
+    return {"status": "FAIL" if errors else "PASS",
+            "check": "linux_standalone_scheduler_heartbeat_current",
+            "source": "LIVE_LOCAL_API_HEALTH",
+            "detail": {**detail, "errors": sorted(set(errors))}}
 
 
 def main() -> int:
@@ -23,31 +49,18 @@ def main() -> int:
     parser.add_argument("--expected-scheduler-pid", required=True, type=int)
     args = parser.parse_args()
 
-    from tools.env_config import create_tool_engine, load_project_env
-
-    load_project_env()
     try:
-        engine = create_tool_engine()
-        with engine.connect() as connection:
-            passed, detail = check_linux_standalone_scheduler_heartbeat(
-                connection,
-                expected_build_sha=args.expected_build_sha,
-                expected_pid=args.expected_scheduler_pid,
-            )
-        payload = {
-            "status": "PASS" if passed else "FAIL",
-            "check": "linux_standalone_scheduler_heartbeat_current",
-            "detail": detail,
-        }
+        payload = probe_scheduler_heartbeat(args.expected_build_sha, args.expected_scheduler_pid)
         print(json.dumps(payload, sort_keys=True, default=str))
-        return 0 if passed else 1
-    except Exception:
+        return 0 if payload["status"] == "PASS" else 1
+    except Exception as exc:
         print(
             json.dumps(
                 {
                     "status": "ERROR",
                     "check": "linux_standalone_scheduler_heartbeat_current",
                     "error_code": "scheduler_heartbeat_probe_failed",
+                    "error_type": type(exc).__name__,
                 },
                 sort_keys=True,
             )

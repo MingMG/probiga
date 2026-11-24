@@ -122,7 +122,7 @@ readonly DEPENDENCY_DOWNLOAD_TIMEOUT=30m
 # The read-only guard checks all 39 runtime contracts. Production measured
 # 1m53s for a complete scan, so a 20s deadline rejected healthy databases.
 readonly FAST_SCHEMA_GUARD_TIMEOUT=180s
-HEARTBEAT_RETRIES="${HEARTBEAT_RETRIES:-10}"
+HEARTBEAT_RETRIES="${HEARTBEAT_RETRIES:-60}"
 HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-2}"
 HEALTH_RETRIES="${HEALTH_RETRIES:-60}"
 HEALTH_INTERVAL="${HEALTH_INTERVAL:-4}"
@@ -17464,10 +17464,11 @@ test "${SCHEDULER_CMDLINE[2]}" = \
 CUTOVER_STEP=wait_for_first_scheduler_heartbeat
 SCHEDULER_HEARTBEAT_READY=0
 for _heartbeat_attempt in $(seq 1 "$HEARTBEAT_RETRIES"); do
-  if run_prepared_python_tool \
+  if SCHEDULER_HEARTBEAT_OUTPUT="$(run_prepared_python_tool \
       "$PREPARED_CODE_ROOT/tools/check_scheduler_runtime_heartbeat.py" \
       --expected-build-sha "$EXPECTED_SHA" \
-      --expected-scheduler-pid "$SCHEDULER_MAIN_PID" >/dev/null; then
+      --expected-scheduler-pid "$SCHEDULER_MAIN_PID")"; then
+    printf '%s\n' "$SCHEDULER_HEARTBEAT_OUTPUT"
     SCHEDULER_HEARTBEAT_READY=1
     break
   fi
@@ -17475,6 +17476,9 @@ for _heartbeat_attempt in $(seq 1 "$HEARTBEAT_RETRIES"); do
     sleep "$HEARTBEAT_INTERVAL"
   fi
 done
+if [ "$SCHEDULER_HEARTBEAT_READY" -ne 1 ]; then
+  printf '%s\n' "$SCHEDULER_HEARTBEAT_OUTPUT" >&2
+fi
 test "$SCHEDULER_HEARTBEAT_READY" -eq 1
 CUTOVER_STEP=record_strategy_governance_scheduler_heartbeat
 CUTOVER_STEP=verify_health
