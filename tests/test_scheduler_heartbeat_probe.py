@@ -1,6 +1,7 @@
 import json
 import sys
 import threading
+import time
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -35,6 +36,7 @@ def local_api(payload):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             state["requests"] += 1
+            time.sleep(state.get("delay_seconds", 0))
             self.send_response(state["http"])
             self.end_headers()
             self.wfile.write(json.dumps(state["payload"]).encode())
@@ -57,6 +59,15 @@ def local_api(payload):
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_live_owner_health_can_complete_after_the_observed_five_second_deadline():
+    with local_api(healthy()) as (state, services):
+        state["delay_seconds"] = 5.2
+        result = probe.probe_scheduler_heartbeat(SHA, PID, services=services)
+    assert result["status"] == "PASS"
+    assert result["detail"]["current"]["pid"] == PID
+    assert state["requests"] == 1
 
 
 def test_probe_uses_live_application_without_controller_database_credentials(monkeypatch, capsys):
