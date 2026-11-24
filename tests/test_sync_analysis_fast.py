@@ -62,6 +62,32 @@ from server.trading_v4.factors.chase_risk import (
 
 
 class SyncAnalysisFastTest(unittest.TestCase):
+    def test_preliminary_and_formal_analysis_reach_real_pit_validation(self):
+        from biz.analysis.sync_analysis_fast import _prepare_batch_outputs
+        from server.common.pit_facts import ensure_pit_fact_schema
+
+        engine = create_engine("sqlite://")
+        ensure_pit_fact_schema(engine)
+        evidence = build_turnover_evidence({
+            "status": "DATA_BLOCKED", "stock_code": "600001",
+            "trade_date": "2026-11-24", "decision_known_at": "2026-11-24 22:20:00",
+            "source_table": "st_market_field_capture_row", "reason": "DATA_BLOCKED: not captured",
+        })
+        frame = pd.DataFrame([{"stock_code": "600001", "turnover_evidence_json": evidence}])
+        for phase in (None, "PREMARKET_REVISION"):
+            with self.subTest(phase=phase), patch(
+                "biz.analysis.sync_analysis_fast.load_kline_features", return_value=frame,
+            ):
+                # Both callers must reach the real sealed-source reader, not fail
+                # on an obsolete SQLite checkpoint argument before reading facts.
+                with self.assertRaisesRegex(RuntimeError, "ANALYSIS_INPUT_BATCH_BLOCKED: QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND"):
+                    _prepare_batch_outputs(
+                        engine, "2026-11-24", 62, 80,
+                        news_cutoff_time="2026-11-25 08:30:00",
+                        pool_decision_phase=phase, progress_callback=lambda _: None,
+                    )
+        engine.dispose()
+
     def test_blocked_turnover_evidence_remains_research_only(self):
         evidence = build_turnover_evidence({
             "status": "DATA_BLOCKED",
