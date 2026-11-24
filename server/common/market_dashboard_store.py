@@ -111,21 +111,27 @@ def finish_component(day, component, run_id, token, *, published, error=None):
 def publish(day, component, payload, *, source_at, basis, token):
     now = clock()
     source = stamp(source_at) if source_at else None
-    if basis not in ("source", "received", "close") or (basis != "received" and source is None):
+    if basis not in ("source", "received", "close", "observation") or (basis != "received" and source is None):
         raise ValueError("dashboard source time basis missing")
     if source and (source.date().isoformat() != day or source > now):
         raise ValueError("dashboard source date or future timestamp differs")
     if any(payload.get(key) not in (None, day) for key in ("trade_date", "requested_date")):
         raise ValueError("dashboard payload session differs")
+    observed = stamp(payload["captured_at"]) if basis == "observation" and payload.get("captured_at") else None
+    if basis == "observation" and (observed is None or observed.date().isoformat() != day
+                                    or observed > now or source > observed):
+        raise ValueError("dashboard observation capture time differs")
     encoded = json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
     if len(encoded.encode("utf-8")) > MAX_BYTES:
         raise ValueError("dashboard observation exceeds bound")
     version = canonical_digest(payload)
     with database(write=True) as db, db:
         _authorized(db, token, now)
-        previous = db.execute("SELECT source_at FROM dashboard_observation WHERE trade_date=? AND component=?",
+        previous = db.execute("SELECT source_at,basis,payload FROM dashboard_observation WHERE trade_date=? AND component=?",
                               (day, component)).fetchone()
-        if previous and previous[0] and source and stamp(previous[0]) > source:
+        if previous and basis == previous["basis"] == "observation" and stamp(json.loads(previous["payload"])["captured_at"]) > observed:
+            raise ValueError("dashboard capture observation moved backwards")
+        if previous and basis != "observation" and previous[0] and source and stamp(previous[0]) > source:
             raise ValueError("dashboard source observation moved backwards")
         run_id = db.execute("SELECT run_id FROM dashboard_owner WHERE slot=1").fetchone()[0]
         db.execute("""INSERT INTO dashboard_observation VALUES (?,?,?,?,?,?,?,?)
@@ -138,11 +144,14 @@ def publish(day, component, payload, *, source_at, basis, token):
             raise RuntimeError("dashboard durable observation readback differs")
 
 
-def freshness(row, day, *, now):
+def freshness(row, day, *, now, payload=None):
     now = clock(now)
     source = stamp(row["source_at"]) if row["source_at"] else None
     received = stamp(row["captured_at"])
-    age_from = source or received
+    observed = None
+    if row["basis"] == "observation":
+        observed = stamp((payload if payload is not None else json.loads(row["payload"]))["captured_at"])
+    age_from = observed or source or received
     anchor = now
     paused = day == now.date().isoformat() and time(11, 30) < now.time() < time(13)
     if paused:
@@ -155,7 +164,8 @@ def freshness(row, day, *, now):
     else:
         state = "expired" if age > EXPIRED_SECONDS else "delayed" if age > FRESH_SECONDS else "fresh"
     return {"version": row["version"], "capture_run_id": row["run_id"], "source_at": row["source_at"], "received_at": row["captured_at"],
-            "age_seconds": age, "age_basis": "source" if source else "received", "state": state,
+            "observation_at": iso(observed) if observed else None,
+            "age_seconds": age, "age_basis": "observation" if observed else "source" if source else "received", "state": state,
             "fresh_seconds": FRESH_SECONDS, "expired_seconds": EXPIRED_SECONDS}
 
 
@@ -177,7 +187,7 @@ def read(day, *, now=None, root=None):
         payload = json.loads(row["payload"])
         if canonical_digest(payload) != row["version"]:
             raise ValueError("dashboard persisted observation digest differs")
-        meta = freshness(row, day, now=now)
+        meta = freshness(row, day, now=now, payload=payload)
         name = row["component"]
         owner = "indices" if name.startswith("index:") else "heatmap" if name.startswith("heat:") else name
         if owner not in attempts and owner in ("quotes", "indices", "turnover", "ladder"):

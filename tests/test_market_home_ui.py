@@ -38,6 +38,26 @@ assert.doesNotMatch(wrongDate,/回撤样本/);
 """);
 
 
+def test_market_observation_badge_separates_actual_capture_from_source_range():
+    run_node(r"""
+const date='2026-11-23', captured=date+'T10:30:00+08:00', source=date+'T10:29:01+08:00';
+const observation={version:'one',age_basis:'observation',observation_at:captured,source_at:source,
+    received_at:captured,state:'fresh',age_seconds:0,fresh_seconds:20,expired_seconds:60};
+const liquidity={status:'available',trade_date:date,captured_at:captured,as_of:source,
+    source_time_min:source,source_time_max:captured,turnover_median_pct:2.5,volume_ratio_median:1.2,
+    turnover_sample_count:5500,volume_sample_count:5500,definition:'采样时60秒内有效贡献样本',observation};
+const state={liquidity};
+const current=page.render(state,date,{server_time:date+'T10:30:19+08:00'});
+assert.match(current,/源报价 2026-11-23T10:29:01/);
+assert.match(current,/观察采样时间 2026-11-23 10:30:00/);
+assert.match(current,/19秒前/);
+assert.doesNotMatch(current,/已过期，保留参考/);
+const expired=page.render(state,date,{server_time:date+'T10:31:01+08:00'});
+assert.match(expired,/已过期，保留参考/);
+assert.match(expired,/61秒前/);
+""")
+
+
 def test_dashboard_distinguishes_current_stale_and_missing_evidence():
     run_node(r"""
 const date = '2026-11-06';

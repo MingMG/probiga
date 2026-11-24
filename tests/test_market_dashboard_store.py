@@ -92,6 +92,41 @@ def test_expired_source_is_reference_and_is_not_relabelled_realtime(snapshots):
     assert value["as_of"] == store.iso(NOW)
 
 
+def test_liquidity_observation_keeps_source_range_and_original_capture_on_republication(snapshots, monkeypatch):
+    source = store.iso(NOW-timedelta(seconds=59))
+    payload = {"trade_date": DAY, "as_of": source, "captured_at": store.iso(NOW),
+               "source_time_min": source, "source_time_max": store.iso(NOW), "turnover_median_pct": 2.5}
+    store.publish(DAY, "liquidity", payload, source_at=source, basis="observation", token=TOKEN)
+    first = store.component(DAY, "liquidity", now=NOW+timedelta(seconds=19))
+    assert first["observation"]["state"] == "fresh"
+    assert first["observation"]["age_seconds"] == 19
+    assert first["observation"]["source_at"] == source == first["as_of"]
+    assert first["observation"]["observation_at"] == payload["captured_at"]
+    with store.database(write=True) as db, db:
+        db.execute("UPDATE dashboard_owner SET lease_until=?", (store.iso(NOW+timedelta(seconds=120)),))
+    original_clock = store.clock
+    monkeypatch.setattr(store, "clock", lambda value=None: original_clock(value or NOW+timedelta(seconds=31)))
+    store.publish(DAY, "liquidity", payload, source_at=source, basis="observation", token=TOKEN)
+    later = store.component(DAY, "liquidity", now=NOW+timedelta(seconds=61))
+    assert later["version"] == first["version"]
+    assert later["observation"]["received_at"] == store.iso(NOW+timedelta(seconds=31))
+    assert later["observation"]["state"] == "expired"
+    assert later["observation"]["age_seconds"] == 61
+
+
+def test_market_observation_order_uses_capture_not_oldest_constituent(snapshots):
+    source = store.iso(NOW-timedelta(seconds=20))
+    payload = {"trade_date": DAY, "captured_at": store.iso(NOW-timedelta(seconds=10))}
+    store.publish(DAY, "liquidity", payload, source_at=source, basis="observation", token=TOKEN)
+    newer = {**payload, "captured_at": store.iso(NOW)}
+    store.publish(DAY, "liquidity", newer, source_at=store.iso(NOW-timedelta(seconds=59)), basis="observation", token=TOKEN)
+    with pytest.raises(ValueError, match="capture observation moved backwards"):
+        store.publish(DAY, "liquidity", payload, source_at=source, basis="observation", token=TOKEN)
+    with pytest.raises(ValueError, match="capture time differs"):
+        store.publish(DAY, "liquidity", {**payload, "captured_at": store.iso(NOW+timedelta(seconds=1))},
+                      source_at=source, basis="observation", token=TOKEN)
+
+
 def test_missing_ladder_does_not_prevent_new_quote_publication(snapshots):
     _publish_board(DAY, board_value(), TOKEN, closed=False)
     next_value = board_value()
