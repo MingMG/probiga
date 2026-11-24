@@ -2426,25 +2426,37 @@ def _daily_real_trading_safety(repository: Any) -> dict[str, Any]:
         "guard_source": "information_schema.TRIGGERS",
         "required_guards": list(_DAILY_REAL_TRADING_GUARDS),
     }
+    production = os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip().lower() == "production"
+    if production:
+        base["guard_source"] = "PRIVILEGED_CUTOVER_TABLE_METADATA_SEAL"
     try:
-        guard_reader = getattr(
-            repository,
-            "real_trading_guard_readiness",
-            None,
-        )
-        if not callable(guard_reader):
-            raise RuntimeError("real trading guard reader unavailable")
-        raw_guards = guard_reader()
-        if not isinstance(raw_guards, Mapping):
-            raise ValueError("real trading guard evidence is invalid")
-        guards = {
-            name: raw_guards.get(name) is True
-            for name in _DAILY_REAL_TRADING_GUARDS
-        }
         engine = getattr(repository, "engine", None)
         if engine is None:
             raise RuntimeError("real trading account engine unavailable")
         with engine.connect() as connection:
+            if production:
+                from server.engine.strategy_governance import validate_privileged_trigger_migration_seal
+
+                # Least-privilege runtime cannot see trigger metadata. The
+                # privileged cutover seals the complete V2/V3 trigger contract.
+                seal = validate_privileged_trigger_migration_seal(connection)
+                guards = {name: True for name in _DAILY_REAL_TRADING_GUARDS}
+                base.update({
+                    "guard_contract_build_sha": seal["attested_build_sha"],
+                    "guard_inventory_contract_hash": seal["trigger_inventory_contract_hash"],
+                    "live_trigger_metadata_checked": False,
+                })
+            else:
+                guard_reader = getattr(repository, "real_trading_guard_readiness", None)
+                if not callable(guard_reader):
+                    raise RuntimeError("real trading guard reader unavailable")
+                raw_guards = guard_reader()
+                if not isinstance(raw_guards, Mapping):
+                    raise ValueError("real trading guard evidence is invalid")
+                guards = {
+                    name: raw_guards.get(name) is True
+                    for name in _DAILY_REAL_TRADING_GUARDS
+                }
             rows = connection.execute(
                 text(
                     """
