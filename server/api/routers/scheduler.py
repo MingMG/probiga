@@ -603,7 +603,7 @@ def run_task_now(task_id: int, trade_date: date | None = None, index_codes: str 
         if exact_index:
             task["_index_repair_codes"] = tuple(codes)
         elif exact_stock_daily:
-            task["script_args"] = f"--date {target} --backfill-sina --json"
+            task["_stock_daily_history_only"] = True
         elif exact_overview and not full_overview:
             task["_limit_ladder_only"] = True
     root = Path(__file__).resolve().parents[3]

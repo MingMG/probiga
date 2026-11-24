@@ -47,6 +47,9 @@ def test_manual_daily_repair_binds_date_without_changing_registration(monkeypatc
     assert scheduler.run_task_now(138, trade_date=date(2026, 11, 23))["accepted"]
     assert registered["script_args"] == "--date latest --json" and registered["enabled"] == 0
     row = {**claimed[0], "_trigger_source": "manual"}
+    from server.api.scheduler_runtime import scheduler_task_host_owner, SCHEDULER_OWNER_LINUX
+    assert scheduler_task_host_owner(row) == SCHEDULER_OWNER_LINUX
+    assert row["script_args"] == registered["script_args"]
     assert row["_scheduler_target_trade_date"] == "2026-11-23"
     assert build_scheduler_task_args(row, row["script_path"], "2026-11-23") == ["--date", "2026-11-23", "--backfill-sina", "--json"]
     from fastapi import HTTPException

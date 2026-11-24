@@ -235,6 +235,14 @@ def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: s
 
     args = script_args_raw.split() if script_args_raw else []
     args.extend(_date_param_args(date_param_raw))
+    if row.get("_stock_daily_history_only") is True:
+        if (task_type != "free_stock_daily_canonical"
+                or normalized_path != "tools/sync_free_stock_daily.py"
+                or str(row.get("_trigger_source") or "").strip() != "manual"
+                or not scheduler_target_bound or date_param_raw
+                or args != ["--date", "latest", "--json"]):
+            raise ValueError("daily history repair requires the exact registered manual task")
+        return ["--date", today, "--backfill-sina", "--json"]
     if task_type == "daily_pool":
         if normalized_path != "tools/run_daily_pool.py" or not scheduler_target_bound:
             raise ValueError("daily research pool requires an exact closed session")
