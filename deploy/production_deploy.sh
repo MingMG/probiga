@@ -14856,7 +14856,12 @@ install_prepared_dropins() {
 run_prepared_python_tool() {
   (
     cd "$PREPARED_CODE_ROOT" || return 1
-    sudo -u "$SERVICE_USER" /usr/bin/env -i \
+    local -a tool_deadline=()
+    if [ "${1:-}" = "$PREPARED_CODE_ROOT/tools/add_qmt_announcement_task.py" ] && \
+      [ "${2:-}" = --restore-enabled-policy ]; then
+      tool_deadline=(/usr/bin/timeout --signal=TERM --kill-after=5s 90s)
+    fi
+    "${tool_deadline[@]}" sudo -u "$SERVICE_USER" /usr/bin/env -i \
       PATH=/usr/sbin:/usr/bin:/sbin:/bin \
       GIT_OPTIONAL_LOCKS=0 \
       PYTHONDONTWRITEBYTECODE=1 \

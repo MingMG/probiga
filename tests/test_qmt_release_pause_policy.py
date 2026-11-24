@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
+import pymysql
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import OperationalError
 
 from tools import add_qmt_announcement_task as announcement
 from tools import check_strategy_governance_health as health
@@ -13,8 +16,8 @@ from tools.qmt_host_ownership_contract import WINDOWS_QMT_EDGE_TASK_TYPES
 
 
 @pytest.fixture
-def engine():
-    value = create_engine("sqlite+pysqlite:///:memory:", future=True)
+def engine(tmp_path):
+    value = create_engine(f"sqlite+pysqlite:///{tmp_path / 'policy.sqlite'}", future=True)
     with value.begin() as connection:
         connection.execute(text("""
             CREATE TABLE st_scheduled_tasks (
@@ -58,6 +61,56 @@ def _snapshot(engine, tmp_path, *, enabled=0):
         [row for row in rows if row["task_type"] != announcement.TASK["task_type"]],
     )
     return path
+
+
+@pytest.mark.parametrize("failure_point", ["connect", "commit_reply"])
+def test_enabled_restore_recovers_dropped_connection_with_real_policy_readback(
+    engine, tmp_path, monkeypatch, failure_point,
+):
+    old = _snapshot(engine, tmp_path, enabled=1)
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE st_scheduled_tasks SET enabled=0, last_run_output='durable observation'"))
+    before = _rows(engine)
+    begin = engine.begin
+    attempts = []
+
+    @contextmanager
+    def interrupted_begin():
+        attempts.append(failure_point)
+        if len(attempts) == 1 and failure_point == "connect":
+            raise OperationalError(None, None, pymysql.err.OperationalError(2013, "handshake disconnected"))
+        with begin() as connection:
+            yield connection
+        if len(attempts) == 1 and failure_point == "commit_reply":
+            # The first transaction really committed: the retry must read it
+            # back and preserve the same sealed policy and runtime fields.
+            raise OperationalError(None, None, pymysql.err.OperationalError(2013, "commit reply disconnected"))
+
+    monkeypatch.setattr(engine, "begin", interrupted_begin)
+    monkeypatch.setattr(announcement.time, "sleep", lambda _: None)
+    result = announcement._restore_enabled_policy(engine, old)
+    assert result["restored_row_count"] == 6
+    assert len(attempts) == 2
+    assert _rows(engine) == [{**row, "enabled": 1} for row in before]
+
+
+def test_enabled_restore_stops_after_two_transport_failures(engine, tmp_path, monkeypatch):
+    old = _snapshot(engine, tmp_path, enabled=1)
+    before = _rows(engine)
+    attempts = []
+
+    @contextmanager
+    def disconnected_begin():
+        attempts.append(1)
+        raise OperationalError(None, None, pymysql.err.OperationalError(2013, "handshake disconnected"))
+        yield
+
+    monkeypatch.setattr(engine, "begin", disconnected_begin)
+    monkeypatch.setattr(announcement.time, "sleep", lambda _: None)
+    with pytest.raises(OperationalError):
+        announcement._restore_enabled_policy(engine, old)
+    assert len(attempts) == 2
+    assert _rows(engine) == before
 
 
 @pytest.mark.parametrize("old_enabled", [0, 1])

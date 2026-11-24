@@ -8,9 +8,11 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 from typing import Any
 
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -310,6 +312,22 @@ def _restore_snapshot(engine, path: Path) -> dict[str, Any]:
 
 
 def _restore_enabled_policy(engine, path: Path) -> dict[str, Any]:
+    # Restoring exact sealed bits is idempotent, including an unknown commit.
+    # A dropped connection must not strand the whole release after cutover.
+    for attempt in range(2):
+        try:
+            return _restore_enabled_policy_transaction(engine, path)
+        except DBAPIError as exc:
+            args = getattr(exc.orig, "args", ())
+            errno = args[0] if args and type(args[0]) is int else None
+            if errno not in {2003, 2006, 2013, 2055} or attempt == 1:
+                raise
+            engine.dispose()
+            print(f"QMT enabled policy reconnect attempt=2/2 errno={errno}", file=sys.stderr, flush=True)
+            time.sleep(0.5)
+
+
+def _restore_enabled_policy_transaction(engine, path: Path) -> dict[str, Any]:
     """Restore only the pre-cutover user policy, never old runtime/configuration.
 
     The deployment's existing sealed OLD snapshot is taken before its temporary
