@@ -185,7 +185,7 @@
 
     function observationState(meta, clock) {
         if (!meta) return {};
-        const source = meta.source_at || meta.received_at;
+        const source = meta.age_basis === 'observation' ? meta.observation_at : meta.source_at || meta.received_at;
         const parsed = Date.parse(source || '');
         const current = Date.parse(clock?.server_time || '');
         const age = Number.isFinite(parsed) && Number.isFinite(current)
@@ -202,7 +202,7 @@
         if (!meta) return '';
         const {state,age,source,fixed} = observationState(meta,clock);
         const names = {fresh:'新近观测',delayed:'数据延迟',expired:'已过期，保留参考',retained:'上次观测',paused:'午间暂停',closed:'收盘观测',reference:'历史参照'};
-        const basis = meta.age_basis === 'received' ? '接收时间' : '数据时间';
+        const basis = meta.age_basis === 'observation' ? '观察采样时间' : meta.age_basis === 'received' ? '接收时间' : '数据时间';
         const text = (names[state] || '观测状态待核验') + (source ? ` · ${basis} ${source.replace('T',' ').slice(0,19)}` : '') +
             (!fixed && Number.isFinite(age) ? ` · ${age}秒前` : '') + (meta.age_basis === 'received' ? ' · 源端更新时间未提供' : '') +
             (meta.last_error ? ' · 本次采集失败' : '');
@@ -411,7 +411,7 @@
             tile('成交额', amount(market?.total_amount), observationMeta(market,clock)) +
             tile(hasLiveLiquidity ? '换手中位 / 盘中量比中位' : '换手中位 / 收盘日量比', metric(liquidity?.turnover_median_pct, '%') + ' / ' + metric(ratio, '倍'),
                 liquidity ? `换手 ${metric(liquidity.turnover_sample_count, '只', 0)} · ${hasLiveLiquidity ? '量比' : '日量比同样本'} ${metric(liquidity.volume_sample_count, '只', 0)} · ` +
-                    (hasLiveLiquidity ? `${escape(liquidity.definition)} · 数据时间 ${escape(liquidity.as_of)}${observationBadge(liquidity.observation,clock)}` : '较前5个完整交易日均量') : '换手和量比数据待核验') + '</div>';
+                    (hasLiveLiquidity ? `${escape(liquidity.definition)} · 源报价 ${escape(liquidity.source_time_min || liquidity.as_of)} ～ ${escape(liquidity.source_time_max || liquidity.as_of)}${observationBadge(liquidity.observation,clock)}` : '较前5个完整交易日均量') : '换手和量比数据待核验') + '</div>';
     }
 
     function renderBreadth(market, snapshot, clock) {

@@ -35,11 +35,12 @@ def _fetch(deadline, *, selected, now):
                 }, host="push2delay.eastmoney.com", timeout=min(2, int(remaining)))
                 if payload.get("rc") != 0:
                     raise ValueError("source rejected request")
-                return _page_items(payload, page=number)
+                count, items = _page_items(payload, page=number)
+                return count, items, now+timedelta(seconds=monotonic()-started)
             except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
                 failure = exc
         raise RuntimeError(f"liquidity_live: page {number} failed after two attempts") from failure
-    total, first = page(1)
+    total, first, _ = page(1)
     if not 3000 <= total <= 7000 or len(first) != 100:
         raise ValueError("liquidity_live: A-share source inventory differs")
     with closing(sqlite3.connect(_path(create=True), timeout=1)) as db:
@@ -48,11 +49,11 @@ def _fetch(deadline, *, selected, now):
         pages = {1: first}
         with db:
             db.execute("DELETE FROM live_liquidity_page WHERE day<>? OR inventory<>? OR captured_at<?",
-                       (selected, total, (now-timedelta(seconds=30)).isoformat()))
+                       (selected, total, (now-timedelta(seconds=EXPIRED_SECONDS)).isoformat()))
         for number, captured, digest, encoded in db.execute(
                 "SELECT page,captured_at,digest,payload FROM live_liquidity_page WHERE day=? AND inventory=?",
                 (selected, total)).fetchall():
-            if 1 < number <= (total+99)//100 and 0 <= (now-datetime.fromisoformat(captured)).total_seconds() <= 30:
+            if 1 < number <= (total+99)//100 and 0 <= (now-datetime.fromisoformat(captured)).total_seconds() <= EXPIRED_SECONDS:
                 items = json.loads(encoded)
                 if canonical_digest(items) != digest:
                     raise ValueError("liquidity_live: partial page digest differs")
@@ -64,13 +65,13 @@ def _fetch(deadline, *, selected, now):
             for future in as_completed(futures):
                 number = futures[future]
                 try:
-                    count, items = future.result()
+                    count, items, captured = future.result()
                     if count != total or len(items) != min(100, total-(number-1)*100):
                         raise ValueError("pagination coverage differs")
                     encoded, digest = json.dumps(items, allow_nan=False), canonical_digest(items)
                     with db:
                         db.execute("INSERT OR REPLACE INTO live_liquidity_page VALUES (?,?,?,?,?,?)",
-                                   (number, selected, total, (now+timedelta(seconds=monotonic()-started)).isoformat(), digest, encoded))
+                                   (number, selected, total, captured.isoformat(), digest, encoded))
                     pages[number] = items
                 except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
                     failures.append(number)
@@ -86,12 +87,12 @@ def _fetch(deadline, *, selected, now):
     return rows
 
 
-def _normalize(rows, selected, now):
-    anchor = now
-    if time(11, 30) < now.time() < time(13):
-        anchor = now.replace(hour=11, minute=30, second=0, microsecond=0)
-    elif now.time() >= time(15):
-        anchor = now.replace(hour=15, minute=0, second=0, microsecond=0)
+def _normalize(rows, selected, captured_at):
+    anchor = captured_at
+    if time(11, 30) < captured_at.time() < time(13):
+        anchor = captured_at.replace(hour=11, minute=30, second=0, microsecond=0)
+    elif captured_at.time() >= time(15):
+        anchor = captured_at.replace(hour=15, minute=0, second=0, microsecond=0)
     rates, ratios, stamps = [], [], []
     dated_count = 0
     for row in rows:
@@ -101,7 +102,7 @@ def _normalize(rows, selected, now):
             price = float(row["f2"])
             if (not isinstance(code, str) or not code.isascii() or len(code) != 6 or not code.isdecimal()
                     or isinstance(row["f2"], bool) or not math.isfinite(price) or price <= 0 or stamp.date().isoformat() != selected
-                    or stamp.time() < time(9, 25) or stamp > now or (anchor-stamp).total_seconds() > EXPIRED_SECONDS):
+                    or stamp.time() < time(9, 25) or stamp > captured_at or (anchor-stamp).total_seconds() > EXPIRED_SECONDS):
                 continue
         except (KeyError, ValueError, TypeError, OverflowError, OSError):
             continue
@@ -123,6 +124,8 @@ def _normalize(rows, selected, now):
         raise ValueError("liquidity_live: insufficient current-session source coverage")
     return {"status": "available", "requested_date": selected, "trade_date": selected,
             "mode": "intraday", "source": "eastmoney.push2.f8_f10",
+            "captured_at": captured_at.replace(tzinfo=_ZONE).isoformat(),
+            "raw_snapshot_sha256": canonical_digest(rows),
             "as_of": min(stamps).replace(tzinfo=_ZONE).isoformat(),
             "source_time_min": min(stamps).replace(tzinfo=_ZONE).isoformat(),
             "source_time_max": max(stamps).replace(tzinfo=_ZONE).isoformat(),
@@ -131,7 +134,7 @@ def _normalize(rows, selected, now):
             "provider_total": len(rows), "dated_quote_count": dated_count,
             "fresh_quote_count": len(stamps), "excluded_quote_count": len(rows)-len(stamps),
             "freshness_budget_seconds": EXPIRED_SECONDS,
-            "definition": "东财当日60秒内有效贡献样本：逐股换手率、源端量比的中位数"}
+            "definition": "东财采样时60秒内有效贡献样本：逐股换手率、源端量比的中位数"}
 
 
 def read_live_liquidity(selected, *, now, deadline):
@@ -148,7 +151,7 @@ def read_live_liquidity(selected, *, now, deadline):
                 rows = json.loads(stored[3])
                 if canonical_digest(rows) != stored[2]:
                     raise ValueError("liquidity_live: persisted digest differs")
-                return _normalize(rows, selected, now)
+                return _normalize(rows, selected, datetime.fromisoformat(stored[1]))
             started = monotonic()
             rows = _fetch(deadline, selected=selected, now=now)
             observed = now+timedelta(seconds=monotonic()-started)

@@ -504,7 +504,7 @@ def capture_once(token):
                     raise RuntimeError("intraday liquidity not available")
                 store.publish(day, name, value, source_at=value.get("as_of") if name == "liquidity" else
                     day+"T15:00:00+08:00" if closed else None,
-                    basis="close" if closed else "source" if name == "liquidity" else "received", token=token)
+                    basis="close" if closed else "observation" if name == "liquidity" else "received", token=token)
                 published = 1
         except Exception as exc:
             failure = market_home._source_failure(exc)

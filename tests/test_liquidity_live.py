@@ -33,6 +33,52 @@ def test_liquidity_full_source_capture_is_durable_and_reused(tmp_path, monkeypat
     assert first["provider_total"] == first["dated_quote_count"] == 20
 
 
+def test_raw_cache_reuses_original_capture_clock_and_boundary_quality(tmp_path, monkeypatch):
+    monkeypatch.setenv("PROBIGA_JOB_LOG_ROOT", str(tmp_path))
+    captured_rows = rows(NOW-timedelta(seconds=59))
+    calls = []
+    def fetch(deadline, **kwargs):
+        calls.append(1)
+        return captured_rows
+    monkeypatch.setattr(liquidity_live, "_fetch", fetch)
+    first = liquidity_live.read_live_liquidity(DAY, now=NOW, deadline=monotonic()+22)
+    cached = liquidity_live.read_live_liquidity(DAY, now=NOW+timedelta(seconds=10), deadline=monotonic()+22)
+    assert cached == first
+    assert len(calls) == 1
+    assert datetime.fromisoformat(cached["captured_at"]).replace(tzinfo=None) < NOW+timedelta(seconds=1)
+    assert cached["as_of"] == (NOW-timedelta(seconds=59)).replace(tzinfo=ZoneInfo("Asia/Shanghai")).isoformat()
+
+
+def test_new_response_can_advance_capture_clock_without_changing_raw_identity(tmp_path, monkeypatch):
+    monkeypatch.setenv("PROBIGA_JOB_LOG_ROOT", str(tmp_path))
+    monkeypatch.setattr(liquidity_live, "_fetch", lambda deadline, **kw: rows())
+    first = liquidity_live.read_live_liquidity(DAY, now=NOW, deadline=monotonic()+22)
+    later = liquidity_live.read_live_liquidity(DAY, now=NOW+timedelta(seconds=20), deadline=monotonic()+22)
+    assert first["raw_snapshot_sha256"] == later["raw_snapshot_sha256"]
+    assert first["as_of"] == later["as_of"]
+    assert datetime.fromisoformat(later["captured_at"]) > datetime.fromisoformat(first["captured_at"])
+
+
+@pytest.mark.parametrize("failure", ["source_quality", "transport"])
+def test_failed_capture_retains_original_raw_identity_and_clock(tmp_path, monkeypatch, failure):
+    from contextlib import closing
+    import sqlite3
+    monkeypatch.setenv("PROBIGA_JOB_LOG_ROOT", str(tmp_path))
+    monkeypatch.setattr(liquidity_live, "_fetch", lambda deadline, **kw: rows())
+    liquidity_live.read_live_liquidity(DAY, now=NOW, deadline=monotonic()+22)
+    def raw():
+        with closing(sqlite3.connect(liquidity_live._path())) as db:
+            return db.execute('SELECT day,captured_at,digest,payload FROM live_liquidity_snapshot').fetchone()
+    before = raw()
+    if failure == "transport":
+        def unavailable(*args, **kwargs):
+            raise RuntimeError('liquidity_live: missing pages [9]; completed pages checkpointed')
+        monkeypatch.setattr(liquidity_live, '_fetch', unavailable)
+    with pytest.raises((RuntimeError, ValueError), match="coverage|missing pages"):
+        liquidity_live.read_live_liquidity(DAY, now=NOW+timedelta(seconds=90), deadline=monotonic()+22)
+    assert raw() == before
+
+
 def test_missing_metric_preserves_other_valid_values():
     data = rows()
     data[0]["f8"] = "-"
@@ -153,6 +199,35 @@ def test_bulk_failure_resumes_only_missing_pages(tmp_path, monkeypatch):
     result = liquidity_live._fetch(monotonic()+22, selected=DAY, now=NOW+timedelta(seconds=2))
     assert sorted(calls) == [1, 9]
     assert len(result) == 3000
+
+
+@pytest.mark.parametrize("initial_source_age,accepted", [(10, True), (30, False)])
+def test_page_resume_at_45_seconds_revalidates_original_source_age(tmp_path, monkeypatch, initial_source_age, accepted):
+    monkeypatch.setenv("PROBIGA_JOB_LOG_ROOT", str(tmp_path))
+    calls, fail = [], True
+    def request(url, params, **kwargs):
+        number = params["pn"]
+        calls.append(number)
+        if number == 9 and fail:
+            raise TimeoutError("source page deadline")
+        stamp = NOW-timedelta(seconds=initial_source_age) if fail else NOW+timedelta(seconds=45)
+        data = rows(stamp, 100)
+        for offset, item in enumerate(data):
+            item['f12'] = f'{(number-1)*100+offset:06d}'
+        return {"rc": 0, "data": {"total": 3000, "diff": data}}
+    monkeypatch.setattr(liquidity_live, "_resolved_curl_json", request)
+    with pytest.raises(RuntimeError, match="missing pages.*9"):
+        liquidity_live.read_live_liquidity(DAY, now=NOW, deadline=monotonic()+22)
+    fail = False
+    calls.clear()
+    if accepted:
+        result = liquidity_live.read_live_liquidity(DAY, now=NOW+timedelta(seconds=45), deadline=monotonic()+22)
+        assert result['fresh_quote_count'] == 3000
+        assert datetime.fromisoformat(result['captured_at']).replace(tzinfo=None) >= NOW+timedelta(seconds=45)
+    else:
+        with pytest.raises(ValueError, match="coverage"):
+            liquidity_live.read_live_liquidity(DAY, now=NOW+timedelta(seconds=45), deadline=monotonic()+22)
+    assert sorted(calls) == [1, 9]
 
 
 def test_liquidity_route_binds_intraday_requests_to_exact_session(monkeypatch):
