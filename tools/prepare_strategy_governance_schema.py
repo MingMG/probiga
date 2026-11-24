@@ -6291,7 +6291,13 @@ def _assert_pit_index_ddl_terminal(engine) -> None:
         for process in connection.execute(text('SHOW FULL PROCESSLIST')).mappings():
             statement=' '.join(str(process.get('Info') or '').replace('`','').lower().split())
             if re.match(r'alter table (?:\w+\.)?st_pit_source_coverage\b',statement):
-                raise RuntimeError('NATIVE_SCHEMA_PREVIOUS_PIT_DDL_NOT_TERMINAL')
+                failure=RuntimeError('NATIVE_SCHEMA_PREVIOUS_PIT_DDL_NOT_TERMINAL')
+                failure.blocking_ddl_owner={
+                    'connection_id':int(process['Id']), 'elapsed_seconds':int(process['Time']),
+                    'state':str(process.get('State') or '')[:120],
+                    'command':str(process.get('Command') or '')[:32],
+                }
+                raise failure
 
 
 def _prepare_native_replay_schema() -> dict[str, Any]:
@@ -6439,6 +6445,7 @@ def _public_failure_payload(exc: BaseException, *, phase: str) -> dict[str, Any]
         return {'status':'blocked','phase':phase,'reason_code':code.split(':',1)[0],
             'failure_category':category,'mysql_errno':mysql_errno,'global_trust_changed':False,
             'runtime_privileges_changed':False,'automatic_real_order_submission':False,
+            **({'blocking_ddl_owner':exc.blocking_ddl_owner} if hasattr(exc,'blocking_ddl_owner') else {}),
             'recovery':'Keep worker 70 paused; verify prior DDL owner is terminal, retain additive schema, retry the Linux-only phase.'}
     evidence = (
         dict(exc.safety_evidence)
