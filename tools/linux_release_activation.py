@@ -228,7 +228,10 @@ class Services:
 
     def health(self):
         with self.open_http("http://127.0.0.1/api/health", timeout=30) as response:
-            return json.load(response)
+            raw = response.read(512 * 1024 + 1)
+        if len(raw) > 512 * 1024:
+            raise ActivationError("health_response_exceeds_bound")
+        return json.loads(raw)
 
     def reload_static(self):
         result = subprocess.run(["/usr/sbin/nginx", "-t"],

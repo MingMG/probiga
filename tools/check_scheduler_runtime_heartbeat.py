@@ -18,12 +18,7 @@ from tools.linux_release_activation import Services
 def probe_scheduler_heartbeat(expected_build_sha: str, expected_pid: int, *, services=None) -> dict:
     """Use the running API's database view, as Linux activation does."""
     transport = services or Services()
-    # The live schema/owner health read took 10.5s under production load.
-    with transport.open_http("http://127.0.0.1/api/health", timeout=15) as response:
-        raw = response.read(512 * 1024 + 1)
-    if len(raw) > 512 * 1024:
-        raise ValueError("health response exceeds bound")
-    health = json.loads(raw)
+    health = transport.health()
     revision = health.get("release_revision") or {}
     scheduler = health.get("standalone_scheduler") or {}
     heartbeat = health.get("standalone_scheduler_heartbeat") or {}

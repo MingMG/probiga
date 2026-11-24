@@ -61,9 +61,9 @@ def local_api(payload):
         thread.join(timeout=2)
 
 
-def test_live_owner_health_can_complete_after_the_observed_five_second_deadline():
+def test_live_owner_health_uses_the_controller_budget_after_observed_fifteen_second_timeout():
     with local_api(healthy()) as (state, services):
-        state["delay_seconds"] = 5.2
+        state["delay_seconds"] = 15.2
         result = probe.probe_scheduler_heartbeat(SHA, PID, services=services)
     assert result["status"] == "PASS"
     assert result["detail"]["current"]["pid"] == PID
@@ -84,6 +84,13 @@ def test_probe_uses_live_application_without_controller_database_credentials(mon
     result = json.loads(capsys.readouterr().out)
     assert result["status"] == "PASS"
     assert result["detail"]["current"]["pid"] == PID
+
+
+def test_controller_and_owner_probe_reject_oversized_health_before_acceptance():
+    payload = {**healthy(), "padding": "x" * (512 * 1024)}
+    with local_api(payload) as (_, services):
+        with pytest.raises(Exception, match="health_response_exceeds_bound"):
+            probe.probe_scheduler_heartbeat(SHA, PID, services=services)
 
 
 @pytest.mark.parametrize("fault", ["old_api", "wrong_process", "ambiguous_lease", "wrong_build"])
