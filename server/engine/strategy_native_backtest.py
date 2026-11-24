@@ -95,7 +95,6 @@ def _part(state,kind,day,value):
 
 def _start(connection,strategies,days,published,source_hash,*,frozen=None,
            allocation_policy=None,execution_end_date=None):
-    from server.engine.autonomous_strategy_research import _read_states
     from server.trading_v3.config import load_v3_config
     from server.common.strategy_daily_input_window import V3_DAILY_INPUT_SESSIONS
     from server.engine.strategy_rule_replay import ACCOUNT
@@ -109,15 +108,11 @@ def _start(connection,strategies,days,published,source_hash,*,frozen=None,
     if frozen is None:
         frozen=next((run for run in read_runs(connection) if run['source_hash']==source_hash and run['sessions']==days
             and [(item['strategy_key'],item['current_version'],item['version_hash']) for item in run['strategies']]==versions),None)
-    prior=None
-    if frozen is None:
-        prior=next((run.get('price_backtest') for run in _read_states(connection)
-            if (run.get('price_backtest') or {}).get('sessions')==days),None)
     clock=str(now_shanghai())
     requested=frozen['requested_at'] if frozen else clock
-    cutoff=frozen['price_cutoff'] if frozen else prior['knowledge_cutoff'] if prior else requested
+    cutoff=frozen['price_cutoff'] if frozen else requested
     archives=(list(frozen['input_archives'])+[{'run_id':frozen['run_id'],'rule_hash':frozen['rule_hash']}] if frozen else
-        list(prior.get('input_archives',[]))+[{'run_id':prior['run_id'],'rule_hash':prior['rule_hash']}] if prior else [])
+        [])
     allocation_policy=allocation_policy or (frozen.get('allocation_policy','FIXED_SHADOW') if frozen else 'FIXED_SHADOW')
     execution_end_date=execution_end_date or (frozen.get('execution_end_date',days[-1]) if frozen else days[-1])
     if allocation_policy not in ('FIXED_SHADOW','ADAPTIVE_REGIME'):raise ValueError('native allocation policy differs')
