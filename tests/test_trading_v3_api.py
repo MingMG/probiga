@@ -1394,6 +1394,59 @@ def test_daily_real_trading_safety_query_failure_is_fail_closed():
     ]
 
 
+@pytest.mark.parametrize("enabled,seal_valid", [(0, True), (1, True), (0, False)])
+def test_production_daily_safety_uses_privileged_seal_with_hidden_trigger_metadata(
+    monkeypatch, enabled, seal_valid,
+):
+    from server.engine import strategy_governance
+
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    with engine.begin() as connection:
+        connection.execute(text("""
+            CREATE TABLE st_trade_account_v2 (
+                account_id TEXT PRIMARY KEY, real_trading_enabled INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """))
+        connection.execute(text("""
+            INSERT INTO st_trade_account_v2 VALUES ('paper-main-v2', :enabled, '2026-11-24 15:30:00')
+        """), {"enabled": enabled})
+
+    class Repository:
+        def __init__(self):
+            self.engine = engine
+
+        def real_trading_guard_readiness(self):
+            return {name: False for name in trading_v3._DAILY_REAL_TRADING_GUARDS}
+
+    repository = Repository()
+    monkeypatch.delenv("PROBIGA_DEPLOYMENT_MODE", raising=False)
+    assert "REAL_TRADING_GUARD_MISSING" in trading_v3._daily_real_trading_safety(repository)["reason_codes"]
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+
+    def validate_seal(connection):
+        assert connection.engine is engine
+        if not seal_valid:
+            raise RuntimeError("privileged trigger contract differs")
+        return {"attested_build_sha": "a" * 40, "trigger_inventory_contract_hash": "b" * 64}
+
+    monkeypatch.setattr(strategy_governance, "validate_privileged_trigger_migration_seal", validate_seal)
+    result = trading_v3._daily_real_trading_safety(repository)
+    assert result["guard_source"] == "PRIVILEGED_CUTOVER_TABLE_METADATA_SEAL"
+    assert result["verified"] is (seal_valid and not enabled)
+    if not seal_valid:
+        assert result["status"] == "UNAVAILABLE"
+        assert "REAL_TRADING_SAFETY_READ_FAILED" in result["reason_codes"]
+    else:
+        assert result["enabled_account_count"] == enabled
+        assert result["live_trigger_metadata_checked"] is False
+        assert result["guard_contract_build_sha"] == "a" * 40
+        assert result["guard_inventory_contract_hash"] == "b" * 64
+        assert all(result["guards"].values())
+        assert result["reason_codes"] == (["REAL_TRADING_SWITCH_ENABLED"] if enabled else [])
+    engine.dispose()
+
+
 @pytest.mark.parametrize(
     "result_hash",
     ["f" * 63, "f" * 65, "g" * 64, "00" * 31 + "ZZ"],
