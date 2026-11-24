@@ -17027,11 +17027,14 @@ if [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ]; then
   LOCAL_SCHEDULER_PID="$(systemctl show probiga-scheduler \
     --property=MainPID --value)"
   [[ "$LOCAL_SCHEDULER_PID" =~ ^[1-9][0-9]*$ ]]
+  LOCAL_SCHEDULER_HEARTBEAT_STATUS=0
   LOCAL_SCHEDULER_HEARTBEAT_OUTPUT="$(run_prepared_python_tool \
     "$PREPARED_CODE_ROOT/tools/check_scheduler_runtime_heartbeat.py" \
     --expected-build-sha "$PREVIOUS_SHA" \
-    --expected-scheduler-pid "$LOCAL_SCHEDULER_PID")"
+    --expected-scheduler-pid "$LOCAL_SCHEDULER_PID")" || \
+      LOCAL_SCHEDULER_HEARTBEAT_STATUS=$?
   printf '%s\n' "$LOCAL_SCHEDULER_HEARTBEAT_OUTPUT"
+  test "$LOCAL_SCHEDULER_HEARTBEAT_STATUS" -eq 0
   LOCAL_SCHEDULER_INSTANCE_ID="$(
     printf '%s' "$LOCAL_SCHEDULER_HEARTBEAT_OUTPUT" | \
       "$BOOTSTRAP_PYTHON" -I -c \
