@@ -5738,14 +5738,17 @@ def _bind_signed_live_event_selection(
         window_start=window_start, window_end=window_end, source=source,
         _required_batch_id=receipt["batch_id"], _capture_bound_members=captured.append,
     )
-    if len(captured) != 1 or any(
-        batch.get(field) != receipt[field] for field in (
-            "batch_id", "batch_root_hash", "source", "fact_cutoff_at", "received_at",
-            "window_start", "window_end", "capture_window_start", "incremental_chain_root_hash",
-            "parent_batch_id", "parent_batch_root_hash", "catalog_batch_id",
-            "catalog_manifest_hash", "catalog_member_set_hash", "fallback_reason",
-        )
-    ) or batch.get("catalog_member_count") != receipt.get("stock_count"):
+    fields = (
+        "batch_id", "batch_root_hash", "source", "fact_cutoff_at", "received_at",
+        "window_start", "window_end", "catalog_batch_id",
+        "catalog_manifest_hash", "catalog_member_set_hash",
+    )
+    if receipt.get("mode") != "validate-existing-complete-batch":
+        fields += ("capture_window_start", "incremental_chain_root_hash", "parent_batch_id", "parent_batch_root_hash")
+    # Read-only receipts bind the complete validated chain through its unchanged batch root.
+    if (len(captured) != 1 or any(batch.get(field) != receipt[field] for field in fields)
+            or batch.get("fallback_reason", "") != receipt.get("fallback_reason", "")
+            or batch.get("catalog_member_count") != receipt.get("stock_count")):
         raise ValueError("announcement durable batch differs from its signed stage receipt")
     members = captured[0]
     return _SignedLiveEventSelection(
