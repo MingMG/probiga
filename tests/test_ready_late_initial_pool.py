@@ -95,7 +95,8 @@ def test_initial_cutoff_may_follow_the_plan_but_revision_cutoff_is_fixed(pool_ca
 
 
 @pytest.mark.parametrize("cross_session", [False, True], ids=["same-session", "compatible-prior-session"])
-def test_late_signed_source_obeys_actual_availability_and_round_trips_sealed_pool(pool_calendar, monkeypatch, cross_session):
+@pytest.mark.parametrize("source_mode", ["original", "validated-qmt", "validated-cninfo"])
+def test_late_signed_source_obeys_actual_availability_and_round_trips_sealed_pool(pool_calendar, monkeypatch, cross_session, source_mode):
     from server.common import component_release_attestation
 
     engine = pool_calendar
@@ -129,6 +130,28 @@ def test_late_signed_source_obeys_actual_availability_and_round_trips_sealed_poo
         "capture_seconds": int((received - source_cutoff).total_seconds()),
         "automatic_real_order_submission": False, "real_order_authority": False,
     }
+    if source_mode != "original":
+        source_receipt.pop("fallback_reason")
+        source_receipt.update(
+            mode="validate-existing-complete-batch", trade_date=TARGET,
+            reason_code="QMT_ANNOUNCEMENT_EXISTING_FULL_MARKET_COMPLETE", detail="",
+            funding_eligible=True, event_count=1, empty_stock_count=0,
+            calendar_batch_id="calendar", calendar_manifest_hash="f" * 64,
+            database_writes=False, validation_run_uid=source_uid,
+            validation_build_sha=source_release,
+        )
+        if source_mode == "validated-cninfo":
+            source_receipt.update(
+                source="cninfo.announcement", primary_source="qmt.announcement",
+                fallback_reason="QMT_ANNOUNCEMENT_API_UNAVAILABLE",
+                batch_id="cninfo-ann-late-certified-announcement",
+                reason_code="ANNOUNCEMENT_FALLBACK_EXISTING_FULL_MARKET_COMPLETE",
+            )
+        from tools.sync_qmt_announcement_pit import validate_existing_task_result
+        assert validate_existing_task_result(
+            source_receipt, 0, expected_trade_date=TARGET,
+            expected_scheduler_run_uid=source_uid, expected_build_sha=source_release,
+        ) == "complete"
     replay = json.dumps(source_receipt)
     digest = hashlib.sha256(replay.encode()).hexdigest()
     evidence = {
@@ -162,9 +185,33 @@ def test_late_signed_source_obeys_actual_availability_and_round_trips_sealed_poo
     assert selected.score_binding["contract_release_id"] == source_release
     assert selected.score_binding["producer_build_sha"] == source_release
     assert selected.score_binding["input_receipt_root_sha256"] == digest
+    if source_mode != "original":
+        for field, invalid in (("validation_run_uid", "9" * 32),
+                               ("validation_build_sha", "9" * 40),
+                               ("database_writes", True)):
+            invalid_replay = json.dumps({**source_receipt, field: invalid})
+            invalid_digest = hashlib.sha256(invalid_replay.encode()).hexdigest()
+            invalid_evidence = {
+                **evidence, "replay_output": invalid_replay,
+                "replay_output_sha256": invalid_digest,
+                "input_receipt_root_sha256": invalid_digest,
+            }
+            for body, root in ((invalid_evidence, invalid_digest), (evidence, digest)):
+                with engine.begin() as connection:
+                    connection.execute(text(f"UPDATE {control.ATTEMPT_TABLE} SET checkpoint_json=:body, input_root_sha256=:root WHERE scheduler_run_uid=:uid"), {
+                        "body": json.dumps({**body, "evidence_sha256": control.canonical_sha256(body)}),
+                        "root": root, "uid": source_uid,
+                    })
+                if root == invalid_digest:
+                    assert control.select_frozen_initial_announcement_source(engine, **exact) is None
     replay_uid = "3" * 32
     replay_finished = finished + timedelta(minutes=1)
     replay_evidence = {**evidence, "run_uid": replay_uid, "build_sha": BUILD_SHA, "contract_release_id": BUILD_SHA}
+    if source_mode != "original":
+        replay_text = json.dumps({**source_receipt, "validation_run_uid": replay_uid, "validation_build_sha": BUILD_SHA})
+        replay_digest = hashlib.sha256(replay_text.encode()).hexdigest()
+        replay_evidence.update(replay_output=replay_text, replay_output_sha256=replay_digest,
+                               input_receipt_root_sha256=replay_digest)
     monkeypatch.setattr(control, "_control_now", lambda: replay_finished - timedelta(seconds=30))
     control.start_daily_stage_attempt(
         engine, scheduler_run_uid=replay_uid, stage_name=stage, trade_date=TARGET,
@@ -172,7 +219,7 @@ def test_late_signed_source_obeys_actual_availability_and_round_trips_sealed_poo
     )
     with engine.begin() as connection:
         control.finish_daily_stage_attempt(
-            connection, scheduler_run_uid=replay_uid, status="success", input_root_sha256=digest,
+            connection, scheduler_run_uid=replay_uid, status="success", input_root_sha256=replay_evidence["input_receipt_root_sha256"],
             checkpoint={**replay_evidence, "evidence_sha256": control.canonical_sha256(replay_evidence)},
             now=replay_finished,
         )
@@ -251,7 +298,8 @@ def test_late_signed_source_obeys_actual_availability_and_round_trips_sealed_poo
         control.load_frozen_initial_announcement_parent(engine, TARGET, BUILD_SHA)
 
 
-def test_late_cutoff_reads_the_bound_durable_event_batch(tmp_path):
+@pytest.mark.parametrize("revalidated", [False, True])
+def test_late_cutoff_reads_the_bound_durable_event_batch(tmp_path, revalidated):
     from server.common.qmt_announcement_pit import synchronize_qmt_announcements
     from tests.test_qmt_announcement_pit import _Clock, _XtData, _catalog, _engine, _frame, _install_catalog
 
@@ -265,8 +313,13 @@ def test_late_cutoff_reads_the_bound_durable_event_batch(tmp_path):
         checkpoint_root=tmp_path, now_fn=_Clock(datetime(2026, 8, 25, 18, 20)),
     )
     assert batch["status"] == "COMPLETE"
+    receipt = dict(batch)
+    if revalidated:
+        receipt["mode"] = "validate-existing-complete-batch"
+        for field in ("capture_window_start", "incremental_chain_root_hash", "parent_batch_id", "parent_batch_root_hash", "fallback_reason"):
+            receipt.pop(field, None)
     signed = control.FrozenInitialAnnouncement({
-        **batch, "stage_finished_at": "2026-08-25T22:21:00+08:00",
+        **receipt, "stage_finished_at": "2026-08-25T22:21:00+08:00",
         "stage_attempt_uid": "a" * 64, "stage_evidence_sha256": "b" * 64,
     }, {})
     scope = dict(codes=[code], data_date=target, window_start=start, window_end=target)
@@ -283,6 +336,10 @@ def test_late_cutoff_reads_the_bound_durable_event_batch(tmp_path):
     )
     assert facts.status_for(code) == pit_facts.PIT_AVAILABLE
     assert {item["event_key"] for item in facts.facts[code]} == {"qmt:A-000001"}
+    if revalidated:
+        altered = control.FrozenInitialAnnouncement({**signed.receipt, "batch_root_hash": "0" * 64}, {})
+        with pytest.raises(ValueError, match="durable batch differs"):
+            pit_facts._load_certified_initial_event_selection(engine, altered, decision=actual, **scope)
     engine.dispose()
 
 @pytest.mark.parametrize("mismatch_run", [False, True], ids=["signed", "wrong-scheduler-run"])

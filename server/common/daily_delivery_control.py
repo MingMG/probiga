@@ -313,7 +313,7 @@ def signed_initial_announcement_window_matches(
     ):
         return False
     mode = receipt.get("mode")
-    if not mode:
+    if not mode or mode == "validate-existing-complete-batch":
         return True
     provenance = receipt.get("reconstruction_provenance")
     return (
@@ -414,7 +414,15 @@ def _read_signed_announcement_completion(
                 ))
             ):
                 raise ValueError("nightly announcement completion differs")
-            if batch is None and item.get("mode"):
+            if item.get("mode") == "validate-existing-complete-batch":
+                from tools.sync_qmt_announcement_pit import validate_existing_task_result
+
+                validate_existing_task_result(
+                    item, 0, expected_trade_date=target,
+                    expected_scheduler_run_uid=str(attempt["scheduler_run_uid"]),
+                    expected_build_sha=checkpoint["build_sha"],
+                )
+            elif batch is None and item.get("mode"):
                 validation_uid = str(attempt["scheduler_run_uid"])
                 validation_build = checkpoint["build_sha"]
                 provenance = item["reconstruction_provenance"]
@@ -1998,10 +2006,13 @@ def load_frozen_initial_announcement_parent(engine, trade_date, release_id):
         selected.score_binding["batch_root_hash"] != announcement.get("input_root")
     ):
         raise DailyDeliveryControlError("initial frozen announcement batch root differs")
-    return {key: selected.receipt[key] for key in (
-        "batch_id", "batch_root_hash", "source", "fallback_reason", "received_at",
-        "window_start", "window_end", "fact_cutoff_at",
-    )}
+    return {
+        **{key: selected.receipt[key] for key in (
+            "batch_id", "batch_root_hash", "source", "received_at",
+            "window_start", "window_end", "fact_cutoff_at",
+        )},
+        "fallback_reason": selected.receipt.get("fallback_reason", ""),
+    }
 
 
 @dataclass(frozen=True)
