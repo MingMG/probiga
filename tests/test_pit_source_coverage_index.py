@@ -46,7 +46,7 @@ class MysqlIndexConnection:
             self.fixture.ddl_calls += 1
             assert "ALGORITHM=INPLACE" in sql and "LOCK=NONE" in sql
             match = re.fullmatch(
-                r"ALTER TABLE `st_pit_source_coverage` ADD INDEX `([^\x60]+)` "
+                r"ALTER TABLE `st_pit_source_coverage` (?:DROP INDEX `[^\x60]+`, )?ADD INDEX `([^\x60]+)` "
                 r"\(([^)]+)\), ALGORITHM=INPLACE, LOCK=NONE",
                 sql,
             )
@@ -57,6 +57,8 @@ class MysqlIndexConnection:
                 return MetadataRows([])
             if self.fixture.ddl_outcome == "wrong":
                 columns = columns[:-1]
+            if "DROP INDEX" in sql:
+                self.connection.exec_driver_sql(f'DROP INDEX "{self.fixture.name}"')
             self.fixture.create_index(self.connection, columns)
             return MetadataRows([])
         raise AssertionError("Unexpected statement in the index migration")
@@ -233,7 +235,7 @@ def test_batch_index_contract_is_exact():
 
 def test_dated_batch_index_is_managed_without_changing_pit_contract(storage):
     name = migration.PIT_SOURCE_COVERAGE_DATE_INDEX_NAME
-    columns = ("fact_kind", "source", "watermark_kind", "known_at", "batch_id")
+    columns = migration.PIT_SOURCE_COVERAGE_DATE_INDEX_COLUMNS
     fixture = MysqlIndexFixture(storage, name=name)
     original = source_rows(storage)
     before = pit_facts.pit_fact_schema_health(storage)
@@ -246,3 +248,30 @@ def test_dated_batch_index_is_managed_without_changing_pit_contract(storage):
     assert fixture.ddl_calls == 1
     assert source_rows(storage) == original
     assert pit_facts.pit_fact_schema_health(storage) == before
+
+
+def test_existing_date_index_stops_fetching_wide_rows_for_batch_inventory(storage):
+    name = migration.PIT_SOURCE_COVERAGE_DATE_INDEX_NAME
+    fixture = MysqlIndexFixture(storage, name=name)
+    original = source_rows(storage)
+    query = f'''SELECT batch_id, MIN(stock_code), MIN(known_at), MAX(known_at),
+        MIN(received_at), MAX(received_at), MIN(covered_through_at), MAX(covered_through_at),
+        MIN(window_start), MAX(window_start), MIN(window_end), MAX(window_end),
+        COUNT(*), COUNT(DISTINCT stock_code), SUM(result_count),
+        SUM(CASE WHEN coverage_status='COMPLETE' THEN 0 ELSE 1 END)
+        FROM st_pit_source_coverage INDEXED BY "{name}"
+        WHERE fact_kind='finance' AND source='test.finance' AND watermark_kind='CAPTURED_AT'
+        AND known_at>='2026-11-10' GROUP BY batch_id'''
+    with storage.begin() as connection:
+        fixture.create_index(connection, migration.PIT_SOURCE_COVERAGE_DATE_INDEX_COLUMNS[:5])
+        expected = connection.exec_driver_sql(query).all()
+        old_plan = str(connection.exec_driver_sql('EXPLAIN QUERY PLAN ' + query).all())
+    assert expected and 'COVERING INDEX' not in old_plan
+    result = migration.ensure_pit_source_coverage_date_index(fixture)
+    assert result['created'] and result['verified']
+    with storage.connect() as connection:
+        assert connection.exec_driver_sql(query).all() == expected
+        assert 'COVERING INDEX' in str(connection.exec_driver_sql('EXPLAIN QUERY PLAN ' + query).all())
+    assert source_rows(storage) == original
+    assert not migration.ensure_pit_source_coverage_date_index(fixture)['created']
+    assert fixture.ddl_calls == 1

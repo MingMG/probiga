@@ -6289,7 +6289,7 @@ def _prepare_native_replay_schema() -> dict[str, Any]:
     """Linux-only additive DDL; no trust switch or execution-evidence migration."""
     from server.common.native_job_schema import validate_native_job_schema, privileged_migrate_native_job_schema
     load_project_env()
-    boundary=_open_boundary(include_migrator=True,expected_trust=0,migrator_timeout_seconds=45)
+    boundary=_open_boundary(include_migrator=True,expected_trust=0,migrator_timeout_seconds=1800)
     admin=None;locked=False
     try:
         admin=_connect_admin(boundary)
@@ -6299,9 +6299,13 @@ def _prepare_native_replay_schema() -> dict[str, Any]:
         with boundary.runtime_engine.connect() as probe:
             if probe.execute(text('SELECT IS_USED_LOCK(:name)'),{'name':native_schema_lock}).scalar() is not None:
                 raise RuntimeError('NATIVE_SCHEMA_PREVIOUS_DDL_NOT_TERMINAL')
+        from server.common.pit_source_coverage_index import ensure_pit_source_coverage_date_index
+        if boundary.migrator_engine is None:raise RuntimeError('native job migrator unavailable')
+        inventory_index=ensure_pit_source_coverage_date_index(boundary.migrator_engine)
         try:
             detail=validate_native_job_schema(boundary.runtime_engine)
-            return {'status':'ok','phase':'native-replay','migration_required':False,**detail}
+            return {'status':'ok','phase':'native-replay','migration_required':inventory_index['created'],
+                    'announcement_inventory_index':inventory_index,**detail}
         except (RuntimeError,KeyError):
             pass
         if boundary.migrator_engine is None:raise RuntimeError('native job migrator unavailable')
@@ -6320,7 +6324,8 @@ def _prepare_native_replay_schema() -> dict[str, Any]:
             finally:
                 connection.execute(text("SELECT RELEASE_LOCK('probiga:native-strategy-research')"))
         return {'status':'ok','phase':'native-replay','migration_required':True,'runtime_privileges_changed':False,
-                'global_trust_changed':False,'automatic_real_order_submission':False,**detail}
+                'global_trust_changed':False,'automatic_real_order_submission':False,
+                'announcement_inventory_index':inventory_index,**detail}
     finally:
         if locked and admin is not None:_release_lock(admin)
         _close_quietly(admin)
