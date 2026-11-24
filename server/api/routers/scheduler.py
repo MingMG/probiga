@@ -581,9 +581,14 @@ def run_task_now(task_id: int, trade_date: date | None = None, index_codes: str 
             and task.get("script_path") == "tools/fetch_concept_flow_datacenter.py"
             and str(task.get("script_args") or "").split() == ["--strict-authority", "--json"]
         )
+        exact_stock_daily = (
+            task_type == "free_stock_daily_canonical" and not index_codes and not full_overview
+            and task.get("script_path") == "tools/sync_free_stock_daily.py"
+            and str(task.get("script_args") or "").split() == ["--date", "latest", "--json"]
+        )
         if (
             trade_date is None or task.get("date_param")
-            or not (exact_index or exact_overview or exact_concept_flow)
+            or not (exact_index or exact_overview or exact_concept_flow or exact_stock_daily)
         ):
             raise HTTPException(422, "该任务不支持指定的交易日和采集范围")
         target = trade_date.isoformat()
@@ -597,6 +602,8 @@ def run_task_now(task_id: int, trade_date: date | None = None, index_codes: str 
         task["_scheduler_target_trade_date"] = target
         if exact_index:
             task["_index_repair_codes"] = tuple(codes)
+        elif exact_stock_daily:
+            task["script_args"] = f"--date {target} --backfill-sina --json"
         elif exact_overview and not full_overview:
             task["_limit_ladder_only"] = True
     root = Path(__file__).resolve().parents[3]
