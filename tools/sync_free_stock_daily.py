@@ -724,7 +724,8 @@ def _source_counts(
             rows = connection.execute(
                 text(
                     f"""
-                    SELECT data_source, COUNT(*) AS row_count
+                    SELECT /*+ MAX_EXECUTION_TIME(4000) INDEX(sm_stock_kline idx_date_ktype) */
+                           data_source, COUNT(*) AS row_count
                       FROM sm_stock_kline
                      WHERE stock_code IN ({placeholders})
                        AND trade_date=:trade_date
