@@ -136,6 +136,9 @@ def test_bigqmt_full_snapshot_writes_limit_events_in_the_same_transaction(
     statements = []
 
     class _Connection:
+        def in_transaction(self):
+            return True
+
         def execute(self, statement, params=None):
             statements.append(str(statement))
             return None
@@ -167,8 +170,9 @@ def test_bigqmt_full_snapshot_writes_limit_events_in_the_same_transaction(
         [{"stock_code": "000001", "price": Decimal("11.000000")}]
     )
     bridge._replace_full_snapshot(
-        _Engine(),
+        connection,
         frame,
+        universe=['000001'],
         limit_up_events=[{"event_key": "event-1"}],
     )
 

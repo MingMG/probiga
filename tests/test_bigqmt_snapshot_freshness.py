@@ -118,14 +118,9 @@ def _frozen_datetime_class(now: datetime):
 def _ingest(monkeypatch, tmp_path, payload, now: datetime, *, publishes: bool):
     _prepare_ingest(monkeypatch, payload, now)
     if publishes:
-        monkeypatch.setattr(
-            consumer,
-            "_replace_full_snapshot",
-            lambda _e, frame, **_kwargs: len(frame),
-        )
         receipts: list[dict] = []
-        monkeypatch.setattr(consumer, "_record_realtime_sync_receipt",
-                            lambda _engine, **kw: receipts.append(kw) or {"quality_status": "PASS"})
+        monkeypatch.setattr(consumer, "_publish_full_snapshot",
+            lambda _engine, frame, **kw: (len(frame), receipts.append(kw) or {"quality_status": "PASS"}))
     else:
         receipts = []
         for writer in ("_replace_full_snapshot", "_replace_tracked_subset",

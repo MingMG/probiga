@@ -1,3 +1,14 @@
+param(
+    [ValidateSet('all', 'big_qmt_bridge')][string]$ServiceScope = 'all',
+    [ValidateSet('Ensure', 'Restart', 'RetireDuplicate')][string]$ConsumerAction = 'Ensure',
+    [string]$RegisteredRoot = '',
+    [string]$ExpectedBuildSha = '',
+    [int]$ExpectedProcessId = 0,
+    [long]$ExpectedStartFileTimeUtc = 0,
+    [string]$ExpectedProcessBuildSha = '',
+    [string]$DuplicateRoot = ''
+)
+
 $ErrorActionPreference = "Stop"
 
 $Root = Split-Path -Parent $PSScriptRoot
@@ -135,7 +146,18 @@ function Test-LiveQuoteRuntimeEnabled {
 }
 
 function Test-BigQmtBridgeEnabled {
-    return ([string]$env:BIG_QMT_BRIDGE_ENABLED).Trim().ToLowerInvariant() -in @(
+    # Recheck the persisted desired state after waiting for consumer control.
+    # A retiring checkout must not be resurrected by an already-started pass.
+    $configured = [string]$env:BIG_QMT_BRIDGE_ENABLED
+    $switchPath = Join-Path $Root '.env'
+    if (Test-Path -LiteralPath $switchPath) {
+        foreach ($line in [IO.File]::ReadAllLines($switchPath)) {
+            if ($line -match '^[ \t]*BIG_QMT_BRIDGE_ENABLED[ \t]*=(.*)$') {
+                $configured = $Matches[1].Trim()
+            }
+        }
+    }
+    return $configured.Trim().ToLowerInvariant() -in @(
         "1", "true", "yes", "on"
     )
 }
@@ -273,6 +295,87 @@ function Get-ManagedPidPath {
     return (Join-Path $DataDir "$ServiceKey.pid")
 }
 
+function Enter-BigQmtConsumerControl {
+    $bytes = [Text.Encoding]::UTF8.GetBytes([IO.Path]::GetFullPath($Root).TrimEnd('\', '/').ToLowerInvariant())
+    $hash = [Security.Cryptography.SHA256]::Create()
+    try { $identity = ([BitConverter]::ToString($hash.ComputeHash($bytes))).Replace('-', '') }
+    finally { $hash.Dispose() }
+    $mutex = [Threading.Mutex]::new($false, "Global\ProBigA.BigQmtConsumer.$identity")
+    $owned = $false
+    try {
+        try { $owned = $mutex.WaitOne(10000) }
+        catch [Threading.AbandonedMutexException] { $owned = $true }
+        if (!$owned) { throw 'BigQMT consumer control is busy; no action taken' }
+        return $mutex
+    }
+    catch { $mutex.Dispose(); throw }
+}
+
+function Exit-BigQmtConsumerControl {
+    param($Mutex)
+    try { $Mutex.ReleaseMutex() }
+    finally { $Mutex.Dispose() }
+}
+
+function Assert-BigQmtConsumerIdentity {
+    param([int]$ExpectedProcessId, [long]$ExpectedStartFileTimeUtc, [string]$ExpectedBuildSha)
+    if ($ExpectedProcessId -le 0 -or $ExpectedStartFileTimeUtc -le 0 -or
+        $ExpectedBuildSha -cnotmatch '^[0-9a-f]{40}$') {
+        throw 'BigQMT consumer action requires exact PID, birth and recorded build'
+    }
+    $parts = ([IO.File]::ReadAllText((Get-ManagedPidPath 'big_qmt_bridge'))).Trim().Split('|', 4)
+    if ($parts.Count -ne 4 -or $parts[0] -cne [string]$ExpectedProcessId -or
+        $parts[1] -cne [string]$ExpectedStartFileTimeUtc -or $parts[2] -cne 'run_big_qmt_bridge.py' -or
+        $parts[3] -cne $ExpectedBuildSha) {
+        throw 'BigQMT consumer managed identity changed; no action taken'
+    }
+    $actual = Get-Process -Id $ExpectedProcessId -ErrorAction Stop
+    if ($actual.ProcessName -notlike 'python*' -or
+        $actual.StartTime.ToUniversalTime().ToFileTimeUtc() -ne $ExpectedStartFileTimeUtc) {
+        throw 'BigQMT consumer PID was reused; no action taken'
+    }
+    return $actual
+}
+
+function New-PrivateConsumerEnvFile {
+    param([string]$Path, [Security.AccessControl.FileSecurity]$Security)
+    # Same CreateNew + explicit ACL primitive as secondary_edge/export_cold_package.
+    return [IO.FileStream]::new($Path, [IO.FileMode]::CreateNew,
+        [Security.AccessControl.FileSystemRights]::WriteData, [IO.FileShare]::None,
+        4096, [IO.FileOptions]::WriteThrough, $Security)
+}
+
+function Disable-BigQmtConsumer {
+    # A permanent desired-state change for Stop/Retire, never a release hold.
+    $path = Join-Path $Root '.env'
+    $bytes = [IO.File]::ReadAllBytes($path)
+    $bom = $bytes.Length -ge 3 -and $bytes[0] -eq 239 -and $bytes[1] -eq 187 -and $bytes[2] -eq 191
+    $encoding = [Text.UTF8Encoding]::new($bom, $true)
+    $original = [IO.File]::ReadAllText($path, $encoding)
+    $pattern = '(?m)^[ \t]*BIG_QMT_BRIDGE_ENABLED[ \t]*=[^\r\n]*'
+    $matches = [regex]::Matches($original, $pattern)
+    if ($matches.Count -gt 1) { throw 'Duplicate BIG_QMT_BRIDGE_ENABLED declarations; no state changed' }
+    $replacement = if ($matches.Count -eq 1) {
+        [regex]::Replace($original, $pattern, 'BIG_QMT_BRIDGE_ENABLED=false')
+    } else {
+        $original + $(if ($original.EndsWith("`n")) { '' } else { "`r`n" }) + "BIG_QMT_BRIDGE_ENABLED=false`r`n"
+    }
+    if ($replacement -ceq $original) { return }
+    $temporary = $path + '.consumer-' + [Guid]::NewGuid().ToString('N')
+    try {
+        $security = [IO.File]::GetAccessControl($path)
+        $stream = New-PrivateConsumerEnvFile $temporary $security
+        try {
+            $payload = [byte[]]($encoding.GetPreamble() + $encoding.GetBytes($replacement))
+            $stream.Write($payload, 0, $payload.Length)
+            $stream.Flush($true)
+        }
+        finally { $stream.Dispose() }
+        [IO.File]::Replace($temporary, $path, [NullString]::Value)
+    }
+    finally { if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force } }
+}
+
 function Get-ManagedProcess {
     param([string]$ServiceKey)
     $pidPath = Get-ManagedPidPath $ServiceKey
@@ -332,16 +435,50 @@ function Get-BuildBoundConsumer {
 }
 
 function Stop-ManagedProcess {
-    param([string]$ServiceKey)
+    param([string]$ServiceKey, [int]$ExpectedProcessId = 0,
+        [long]$ExpectedStartFileTimeUtc = 0, [string]$ExpectedBuildSha = '')
+    if ($ExpectedProcessId -gt 0) {
+        if ($ServiceKey -ne 'big_qmt_bridge') { throw 'Exact consumer identity is not valid for another service' }
+        $null = Assert-BigQmtConsumerIdentity $ExpectedProcessId $ExpectedStartFileTimeUtc $ExpectedBuildSha
+    }
     $proc = Get-ManagedProcess $ServiceKey
     if ($proc) {
         if ($ServiceKey -eq "big_qmt_bridge") {
             # The bridge can own a delegated ETF subprocess.  Killing only the
             # venv launcher leaves that child orphaned and its scheduler lease
             # stuck at running, so terminate this verified process tree.
-            & taskkill.exe /PID $proc.Id /T /F 2>$null | Out-Null
+            $children = @()
+            $tree = @($proc.Id)
+            $inventory = @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" -OperationTimeoutSec 5)
+            do {
+                $next = @($inventory | Where-Object { $_.ParentProcessId -in $tree -and $_.ProcessId -notin $tree })
+                $children += $next
+                $tree += @($next.ProcessId)
+                if ($tree.Count -gt 64) { throw 'Unexpected consumer process tree; no stop attempted' }
+            } while ($next.Count)
+            $stopper = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\taskkill.exe') `
+                -ArgumentList @('/PID', [string]$proc.Id, '/T', '/F') -WindowStyle Hidden -PassThru
+            if (!$stopper.WaitForExit(10000)) {
+                # This is our own taskkill helper, never the consumer/native process.
+                # It must be terminal before releasing the consumer control mutex.
+                if (!$stopper.HasExited) { $stopper.Kill() }
+                if (!$stopper.WaitForExit(2000)) {
+                    throw 'BigQMT stop helper did not terminate; inspect before another action'
+                }
+                throw 'BigQMT consumer tree stop deadline; inspect before another action'
+            }
             if (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue) {
                 Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            }
+            if (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue) {
+                throw 'BigQMT consumer tree did not stop; keep its managed identity'
+            }
+            foreach ($child in $children) {
+                $remaining = Get-Process -Id $child.ProcessId -ErrorAction SilentlyContinue
+                if ($remaining -and $remaining.StartTime.ToUniversalTime().ToFileTimeUtc() -eq
+                    $child.CreationDate.ToUniversalTime().ToFileTimeUtc()) {
+                    throw 'BigQMT maintenance child did not stop; keep its managed identity'
+                }
             }
         }
         else {
@@ -506,6 +643,96 @@ function Ensure-Process {
     }
     Set-ManagedProcess $serviceKey $ScriptName $proc $ExpectedBuildSha
     Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') started $serviceKey pid=$($proc.Id)"
+}
+
+function Assert-ConsumerProductionRoot {
+    param([string]$RegisteredRoot)
+    if ($RegisteredRoot -notmatch '^[A-Za-z]:[\\/]') { throw 'Consumer control requires its registered production root' }
+    $registered = [IO.Path]::GetFullPath($RegisteredRoot).TrimEnd('\', '/')
+    if ([IO.Path]::GetFullPath($Root).TrimEnd('\', '/') -ine $registered) {
+        throw 'Consumer controller differs from its registered production root'
+    }
+    $item = Get-Item -LiteralPath $registered -Force
+    if (!$item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw 'Consumer production root must be an ordinary directory'
+    }
+    $task = Get-ScheduledTask -TaskName 'ProBigA QMT Windows Edge Scheduler' -ErrorAction Stop
+    $arguments = [string]($task.Actions.Arguments -join ' ')
+    if ($arguments -notmatch '-RegisteredRoot\s+"([^"]+)"' -or
+        [IO.Path]::GetFullPath($Matches[1]).TrimEnd('\', '/') -ine $registered) {
+        throw 'Consumer production root differs from the registered Windows authority'
+    }
+}
+
+function Invoke-BigQmtConsumerScope {
+    param([string]$Action, [string]$RegisteredRoot, [string]$ExpectedBuildSha,
+        [int]$ExpectedProcessId, [long]$ExpectedStartFileTimeUtc,
+        [string]$ExpectedProcessBuildSha, [string]$DuplicateRoot = '')
+    Assert-ConsumerProductionRoot $RegisteredRoot
+    if ($Action -eq 'RetireDuplicate') {
+        if ($DuplicateRoot -notmatch '^[A-Za-z]:[\\/]') { throw 'Duplicate consumer root must be explicit and absolute' }
+        $target = [IO.Path]::GetFullPath($DuplicateRoot).TrimEnd('\', '/')
+        if ($target -ieq [IO.Path]::GetFullPath($Root).TrimEnd('\', '/')) {
+            throw 'RetireDuplicate cannot disable the authoritative production root'
+        }
+        $item = Get-Item -LiteralPath $target -Force
+        if (!$item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw 'Duplicate consumer root must be an ordinary directory'
+        }
+        $Root = $target
+        $DataDir = Join-Path $Root 'data'
+    }
+    $control = Enter-BigQmtConsumerControl
+    try {
+        if ($Action -eq 'RetireDuplicate') {
+            if ($ExpectedProcessId -le 0 -or $ExpectedStartFileTimeUtc -le 0 -or
+                $ExpectedProcessBuildSha -cnotmatch '^[0-9a-f]{40}$') {
+                throw 'Duplicate retirement requires its exact original identity'
+            }
+            if (!(Test-Path -LiteralPath (Get-ManagedPidPath 'big_qmt_bridge')) -and !(Test-BigQmtBridgeEnabled)) {
+                $prior = Get-Process -Id $ExpectedProcessId -ErrorAction SilentlyContinue
+                if (!$prior -or $prior.StartTime.ToUniversalTime().ToFileTimeUtc() -ne $ExpectedStartFileTimeUtc) {
+                    return @{ status = 'COMPLETE'; action = $Action; consumer_root = $Root; changed = $false; disabled = $true }
+                }
+                throw 'Duplicate retirement has no managed record but its original process is still alive'
+            }
+            $null = Assert-BigQmtConsumerIdentity $ExpectedProcessId $ExpectedStartFileTimeUtc $ExpectedProcessBuildSha
+            Disable-BigQmtConsumer
+            Stop-ManagedProcess 'big_qmt_bridge' -ExpectedProcessId $ExpectedProcessId `
+                -ExpectedStartFileTimeUtc $ExpectedStartFileTimeUtc -ExpectedBuildSha $ExpectedProcessBuildSha
+            return @{ status = 'COMPLETE'; action = $Action; consumer_root = $Root; changed = $true; disabled = $true }
+        }
+        $checkout = Get-ConsumerCheckoutBuild
+        if ($ExpectedBuildSha -cne $checkout) { throw 'Consumer target build differs from its production checkout' }
+        if (!(Test-BigQmtBridgeEnabled)) { throw 'Consumer is disabled; control does not change its configured state' }
+        $existing = Get-ManagedProcess 'big_qmt_bridge'
+        if ($existing) {
+            $parts = ([IO.File]::ReadAllText((Get-ManagedPidPath 'big_qmt_bridge'))).Trim().Split('|', 4)
+            if ($parts.Count -eq 4 -and $parts[2] -ceq 'run_big_qmt_bridge.py' -and $parts[3] -ceq $checkout) {
+                $null = Assert-BigQmtConsumerIdentity $existing.Id ($existing.StartTime.ToUniversalTime().ToFileTimeUtc()) $checkout
+                return @{ status = 'COMPLETE'; action = $Action; pid = $existing.Id; build_sha = $checkout; changed = $false }
+            }
+            if ($Action -ne 'Restart') { throw 'Existing consumer differs; exact Restart identity is required' }
+            Stop-ManagedProcess 'big_qmt_bridge' -ExpectedProcessId $ExpectedProcessId `
+                -ExpectedStartFileTimeUtc $ExpectedStartFileTimeUtc -ExpectedBuildSha $ExpectedProcessBuildSha
+        }
+        elseif ($Action -eq 'Restart') {
+            throw 'Expected consumer already exited; inspect current identity before a new action'
+        }
+        $python = Join-Path $Root 'runtime\qmt-py313\Scripts\python.exe'
+        if (!(Test-Path -LiteralPath $python)) { throw 'Consumer Python runtime is missing' }
+        $null = Ensure-Process -PythonExe $python -ScriptName 'run_big_qmt_bridge.py' `
+            -ArgLine 'tools/run_big_qmt_bridge.py' -ExpectedBuildSha $checkout `
+            -StdOutPath (Join-Path $DataDir 'big_qmt_bridge.out.log') `
+            -StdErrPath (Join-Path $DataDir 'big_qmt_bridge.err.log')
+        $actual = Get-ManagedProcess 'big_qmt_bridge'
+        if (!$actual) { throw 'Consumer process did not remain active after startup' }
+        $birth = $actual.StartTime.ToUniversalTime().ToFileTimeUtc()
+        $null = Assert-BigQmtConsumerIdentity $actual.Id $birth $checkout
+        return @{ status = 'COMPLETE'; action = $Action; pid = $actual.Id; birth = $birth;
+            build_sha = $checkout; changed = $true }
+    }
+    finally { Exit-BigQmtConsumerControl $control }
 }
 
 function Ensure-QmtClient {
@@ -704,6 +931,15 @@ function Ensure-QmtClient {
     Start-Sleep -Seconds 15
 }
 
+if ($ServiceScope -eq 'big_qmt_bridge') {
+    Invoke-BigQmtConsumerScope -Action $ConsumerAction -RegisteredRoot $RegisteredRoot `
+        -ExpectedBuildSha $ExpectedBuildSha -ExpectedProcessId $ExpectedProcessId `
+        -ExpectedStartFileTimeUtc $ExpectedStartFileTimeUtc `
+        -ExpectedProcessBuildSha $ExpectedProcessBuildSha -DuplicateRoot $DuplicateRoot |
+        ConvertTo-Json -Compress
+    return
+}
+
 $python = Resolve-PythonPath
 $qmtPython = Join-Path $Root "runtime\qmt-py313\Scripts\python.exe"
 
@@ -723,6 +959,9 @@ if (
 Stop-DuplicateProcesses
 if (Test-BigQmtBridgeEnabled) {
     Stop-PublicQuoteService
+    $consumerControl = Enter-BigQmtConsumerControl
+    try {
+    if (Test-BigQmtBridgeEnabled) {
     $consumerBuildSha = Get-ConsumerCheckoutBuild
     $existingBridge = Get-BuildBoundConsumer -BuildSha $consumerBuildSha
     if ($existingBridge) {
@@ -899,8 +1138,11 @@ if (Test-BigQmtBridgeEnabled) {
         -ExpectedBuildSha $consumerBuildSha `
         -StdOutPath (Join-Path $DataDir "big_qmt_bridge.out.log") `
         -StdErrPath (Join-Path $DataDir "big_qmt_bridge.err.log")
+    }
+    }
+    finally { Exit-BigQmtConsumerControl $consumerControl }
 
-    if (Test-BigQmtStrategyAutoRecover) {
+    if ((Test-BigQmtBridgeEnabled) -and (Test-BigQmtStrategyAutoRecover)) {
         $strategyRecoveryScript = Join-Path $Root "tools\ensure_big_qmt_strategy_running.ps1"
         $strategyMinBackoffSeconds = 30
         $strategyMaxBackoffSeconds = 900
@@ -972,7 +1214,11 @@ elseif (!(Test-LiveQuoteRuntimeEnabled)) {
 # on the next process start.  The public scheduler tasks are the sole market
 # quote owners when the QMT embedded bridge is disabled.
 if (!(Test-BigQmtBridgeEnabled)) {
-    Stop-ManagedProcess "big_qmt_bridge"
+    $consumerControl = Enter-BigQmtConsumerControl
+    try {
+        if (!(Test-BigQmtBridgeEnabled)) { Stop-ManagedProcess "big_qmt_bridge" }
+    }
+    finally { Exit-BigQmtConsumerControl $consumerControl }
 }
 
 if (!(Test-LegacyMiniQmtEnabled)) {

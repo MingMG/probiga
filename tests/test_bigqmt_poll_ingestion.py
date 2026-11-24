@@ -151,10 +151,10 @@ def test_observed_native_zero_price_retains_unpriced_allowance(monkeypatch, tmp_
     payload = _coverage_payload()
     payload["quotes"]["000010.SZ"]["lastPrice"] = 0
     _prepare_coverage_ingest(monkeypatch, payload)
-    monkeypatch.setattr(consumer, "_replace_full_snapshot", lambda _engine, frame: len(frame))
     receipts = []
-    monkeypatch.setattr(consumer, "_record_realtime_sync_receipt",
-                        lambda _engine, **kw: receipts.append(kw) or {"quality_status": "PASS"})
+    monkeypatch.setattr(consumer, "_capture_limit_up_events", lambda *_a, **_k: ([], {}))
+    monkeypatch.setattr(consumer, "_publish_full_snapshot",
+        lambda _engine, frame, **kw: (len(frame), receipts.append(kw) or {"quality_status": "PASS"}))
 
     result = consumer.ingest_once(object(), qmt_home=tmp_path,
                                  universe=[f"{index:06d}" for index in range(1, 11)],
@@ -177,7 +177,7 @@ def test_fresh_tracked_envelope_does_not_republish_stale_native_event(monkeypatc
                         (payload, "tracked-file") if kind == "tracked" else ({}, ""))
     monkeypatch.setattr(consumer, "_table_exists", lambda *args: False)
     monkeypatch.setattr(consumer, "_write_status", lambda *args, **kw: None)
-    def publish(_engine, frame):
+    def publish(_engine, frame, **_kwargs):
         assert frame.empty
         return 0
     monkeypatch.setattr(consumer, "_replace_tracked_subset", publish)
