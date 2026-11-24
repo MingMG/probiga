@@ -125,7 +125,7 @@ def _load_qmt_closes(engine, target: date, pool: list[dict], cutoff: datetime) -
         return []
     with engine.connect() as connection:
         statement = text("""
-            SELECT /*+ MAX_EXECUTION_TIME(8000) */ stock_code, trade_date, close AS price,
+            SELECT /*+ MAX_EXECUTION_TIME(8000) INDEX(sm_stock_kline idx_date_ktype) */ stock_code, trade_date, close AS price,
                    data_source, quality_status, permission_status
             FROM sm_stock_kline WHERE trade_date=:day AND k_type=1 AND adjust_type=0
               AND stock_code IN :codes AND etl_sync_at BETWEEN :closed_at AND :cutoff
