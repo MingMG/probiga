@@ -15,6 +15,20 @@ DAY = date(2026, 11, 6)
 DAY_TEXT = DAY.isoformat()
 
 
+def test_live_snapshot_failure_keeps_safe_stage_and_database_errno():
+    from sqlalchemy.exc import OperationalError
+    from server.common.qmt_announcement_pit import QMTAnnouncementBlocked
+    original = OperationalError('SELECT confidential', {'password': 'do-not-expose'},
+                                Exception(3024, 'query interrupted'))
+    failure = QMTAnnouncementBlocked('QMT_ANNOUNCEMENT_LIVE_BATCH_REPLY_DEADLINE',
+                                     'market-board-live-snapshot')
+    failure.__cause__ = original
+    result = market_home._source_failure(failure)
+    assert result['stage'] == 'market-board-live-snapshot'
+    assert result['database_errno'] == 3024
+    assert 'confidential' not in json.dumps(result) and 'do-not-expose' not in json.dumps(result)
+
+
 def test_event_history_pages_equal_timestamps_across_sources_without_gaps(market_db):
     with market_db.begin() as c:
         for i in range(1, 76):

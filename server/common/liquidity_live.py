@@ -10,6 +10,7 @@ from threading import Lock
 from time import monotonic
 from zoneinfo import ZoneInfo
 
+from server.common.market_dashboard_store import EXPIRED_SECONDS
 from server.common.qmt_attestation_contract import canonical_digest
 from server.common.sector_heatmap_store import _path
 from tools.crawl_intraday_capital_flow_fast import EASTMONEY_MARKETS
@@ -92,6 +93,7 @@ def _normalize(rows, selected, now):
     elif now.time() >= time(15):
         anchor = now.replace(hour=15, minute=0, second=0, microsecond=0)
     rates, ratios, stamps = [], [], []
+    dated_count = 0
     for row in rows:
         try:
             code = row["f12"]
@@ -99,11 +101,12 @@ def _normalize(rows, selected, now):
             price = float(row["f2"])
             if (not isinstance(code, str) or not code.isascii() or len(code) != 6 or not code.isdecimal()
                     or isinstance(row["f2"], bool) or not math.isfinite(price) or price <= 0 or stamp.date().isoformat() != selected
-                    or stamp.time() < time(9, 25) or stamp > now or (anchor-stamp).total_seconds() > 180):
+                    or stamp.time() < time(9, 25) or stamp > now or (anchor-stamp).total_seconds() > EXPIRED_SECONDS):
                 continue
         except (KeyError, ValueError, TypeError, OverflowError, OSError):
             continue
-        stamps.append(stamp)
+        dated_count += 1
+        contributes = False
         for field, values in (("f8", rates), ("f10", ratios)):
             try:
                 if isinstance(row[field], bool):
@@ -111,17 +114,24 @@ def _normalize(rows, selected, now):
                 value = float(row[field])
                 if math.isfinite(value) and value >= 0:
                     values.append(value)
+                    contributes = True
             except (KeyError, ValueError, TypeError):
                 pass
+        if contributes:
+            stamps.append(stamp)
     if len(stamps) < math.ceil(len(rows)*0.9) or (not rates and not ratios):
         raise ValueError("liquidity_live: insufficient current-session source coverage")
     return {"status": "available", "requested_date": selected, "trade_date": selected,
             "mode": "intraday", "source": "eastmoney.push2.f8_f10",
             "as_of": min(stamps).replace(tzinfo=_ZONE).isoformat(),
+            "source_time_min": min(stamps).replace(tzinfo=_ZONE).isoformat(),
+            "source_time_max": max(stamps).replace(tzinfo=_ZONE).isoformat(),
             "turnover_median_pct": median(rates) if rates else None, "turnover_sample_count": len(rates),
             "volume_ratio_median": median(ratios) if ratios else None, "volume_sample_count": len(ratios),
-            "provider_total": len(rows), "dated_quote_count": len(stamps),
-            "definition": "东财当日有效行情样本：逐股换手率、源端量比的中位数"}
+            "provider_total": len(rows), "dated_quote_count": dated_count,
+            "fresh_quote_count": len(stamps), "excluded_quote_count": len(rows)-len(stamps),
+            "freshness_budget_seconds": EXPIRED_SECONDS,
+            "definition": "东财当日60秒内有效贡献样本：逐股换手率、源端量比的中位数"}
 
 
 def read_live_liquidity(selected, *, now, deadline):

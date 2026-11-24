@@ -1,8 +1,10 @@
 """Release migration is read-only when the current-quote schema is canonical."""
 from copy import deepcopy
+from types import SimpleNamespace
 
 import pytest
 
+from server.common import current_quote_schema as schema
 from server.common.current_quote_schema import privileged_migrate_current_quote_storage
 
 
@@ -32,6 +34,10 @@ class Connection:
     def __init__(self, engine):
         self.engine = engine
         self.closed = False
+        self.connection = SimpleNamespace(dbapi_connection=SimpleNamespace(_read_timeout=None, _write_timeout=None))
+
+    def detach(self):
+        self.engine.detached += 1
 
     def __enter__(self):
         return self
@@ -48,6 +54,19 @@ class Connection:
         sql = ' '.join(str(statement).split())
         engine = self.engine
         engine.statements.append((sql, parameters))
+        if parameters and parameters.get('table_name') == 'st_qmt_realtime_sync_receipt_v2':
+            return Result(engine.receipt_index)
+        if sql == 'SET SESSION lock_wait_timeout=5':
+            engine.metadata_wait_bounded = True
+            return Result(None)
+        if sql.startswith('ALTER TABLE st_qmt_realtime_sync_receipt_v2 ADD INDEX'):
+            assert engine.metadata_wait_bounded
+            assert 0 < self.connection.dbapi_connection._read_timeout <= 180
+            assert 'ALGORITHM=INPLACE, LOCK=NONE' in sql
+            if engine.receipt_build_error:
+                raise RuntimeError('online build interrupted')
+            engine.receipt_index = deepcopy(engine.canonical_receipt_index)
+            return Result(None)
         if 'information_schema.STATISTICS' in sql:
             if engine.checked and engine.drift:
                 if engine.drift == 'redundant':
@@ -89,6 +108,14 @@ class Connection:
 
 class Engine:
     def __init__(self, *, redundant=False, lock_result=1):
+        self.dialect = SimpleNamespace(name='mysql')
+        self.canonical_receipt_index = [dict(NON_UNIQUE=1, SEQ_IN_INDEX=index, COLUMN_NAME=column,
+            SUB_PART=None, INDEX_TYPE='BTREE', COLLATION='A', IS_VISIBLE='YES', EXPRESSION=None) for index, column in enumerate(
+                ('source_provider','published_at','created_at'),1)]
+        self.receipt_index = deepcopy(self.canonical_receipt_index)
+        self.receipt_build_error = False
+        self.metadata_wait_bounded = False
+        self.detached = 0
         self.indexes = {
             'PRIMARY': _index('id', unique=True),
             'uk_qmt_sm_stock_current_code': _index('stock_code', unique=True),
@@ -235,3 +262,45 @@ def test_write_migration_keeps_existing_fail_closed_checks(corruption):
     assert any('RELEASE_LOCK' in sql for sql, _ in engine.statements)
     if corruption != 'row_drift':
         assert not any(sql.startswith('ALTER') for sql, _ in engine.statements)
+
+
+def test_live_receipt_index_migration_is_online_idempotent_and_does_not_read_business_rows():
+    engine = Engine(lock_result=0)
+    engine.receipt_index = []
+    before = deepcopy(engine.rows)
+    result = schema.privileged_migrate_live_quote_receipt_read_index(engine)
+    assert result['created'] and result['verified'] and not result['read_only']
+    assert schema.privileged_migrate_live_quote_receipt_read_index(engine)['created'] is False
+    assert engine.rows == before and engine.open_connections == 0
+    assert len([sql for sql, _ in engine.statements if sql.startswith('ALTER')]) == 1
+    assert not any('GET_LOCK' in sql or 'SELECT *' in sql or 'CHECK TABLE' in sql for sql, _ in engine.statements)
+    assert engine.detached == 2
+
+
+@pytest.mark.parametrize('field,value',[
+    ('NON_UNIQUE',0),('COLUMN_NAME','capture_mode'),('SUB_PART',4),('INDEX_TYPE','HASH'),('COLLATION','D'),
+    ('IS_VISIBLE','NO'),('EXPRESSION','lower(source_provider)')])
+def test_live_receipt_index_rejects_conflicting_definition_without_ddl(field,value):
+    engine = Engine()
+    engine.receipt_index[0][field] = value
+    with pytest.raises(RuntimeError,match='definition differs'):
+        schema.privileged_migrate_live_quote_receipt_read_index(engine)
+    assert not any(sql.startswith('ALTER') for sql, _ in engine.statements)
+
+
+def test_live_receipt_index_build_failure_is_terminal_and_does_not_repeat_ddl():
+    engine = Engine()
+    engine.receipt_index = []
+    engine.receipt_build_error = True
+    with pytest.raises(RuntimeError,match='online index build'):
+        schema.privileged_migrate_live_quote_receipt_read_index(engine)
+    assert not engine.receipt_index and engine.open_connections == 0
+    assert len([sql for sql, _ in engine.statements if sql.startswith('ALTER')]) == 1
+
+
+def test_existing_release_entrypoint_includes_the_receipt_index_migration():
+    engine = Engine()
+    engine.receipt_index = []
+    result = privileged_migrate_current_quote_storage(engine)
+    assert result['live_quote_receipt_read_index']['created'] is True
+    assert result['read_only'] is False and result['integrity_verified'] is True

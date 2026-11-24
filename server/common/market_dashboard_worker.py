@@ -411,7 +411,18 @@ def capture_once(token):
                     basis="close" if closed else "source" if name == "liquidity" else "received", token=token)
                 published = 1
         except Exception as exc:
-            error = error or getattr(exc, "reason_code", None) or getattr(exc, "code", None) or type(exc).__name__
+            failure = market_home._source_failure(exc)
+            detail = getattr(exc, "detail", None)
+            if isinstance(detail, dict):
+                # Liquidity already supplies structured, bounded source diagnostics.
+                for key in ("error", "stage", "type", "code", "database_errno"):
+                    item = detail.get(key)
+                    if isinstance(item, (str, int)) and len(str(item)) <= 120:
+                        failure[key] = item
+                reason = detail.get("reason")
+                if isinstance(reason, str) and reason.startswith("liquidity_live:"):
+                    failure["reason"] = reason[:200]
+            error = error or json.dumps(failure, ensure_ascii=True)[:1000]
             LOGGER.warning("dashboard %s failed: %s", name, error)
         store.finish_component(day, name, run_id, token, published=published, error=error)
     with ThreadPoolExecutor(max_workers=len(jobs) or 1) as pool:

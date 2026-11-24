@@ -3,10 +3,76 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 
 from sqlalchemy import text
 
 from server.common.mysql_lock import mysql_named_lock
+
+
+_LIVE_RECEIPT_TABLE = 'st_qmt_realtime_sync_receipt_v2'
+_LIVE_RECEIPT_INDEX = 'idx_qmt_realtime_source_published'
+_LIVE_RECEIPT_COLUMNS = ('source_provider', 'published_at', 'created_at')
+
+
+def privileged_migrate_live_quote_receipt_read_index(engine):
+    """Add the online physical read index without changing collector contracts.
+
+    The release/admin caller owns the bounded connection establishment. A
+    dedicated checkout bounds metadata waits and DDL replies; an interrupted
+    DDL is never retried here because its server outcome must first be read back.
+    No business rows or receipt payloads are scanned for this additive index.
+    """
+    result = {'table': _LIVE_RECEIPT_TABLE, 'index': _LIVE_RECEIPT_INDEX,
+              'columns': list(_LIVE_RECEIPT_COLUMNS), 'created': False,
+              'verified': False, 'read_only': True}
+    if engine.dialect.name != 'mysql':
+        return {**result, 'not_applicable': True}
+    deadline = time.monotonic() + 180
+    with engine.connect() as connection:
+        # Do not return the migration's socket/session limits to a runtime pool.
+        connection.detach()
+        driver = connection.connection.dbapi_connection
+        original = {name: getattr(driver, name, None) for name in ('_read_timeout', '_write_timeout')}
+
+        def execute(sql, parameters=None, *, stage):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('live quote receipt read index deadline: ' + stage)
+            for name, value in original.items():
+                setattr(driver, name, min(remaining, value) if value is not None else remaining)
+            try:
+                rows = connection.execute(text(sql), parameters or {})
+            except Exception as exc:
+                raise RuntimeError('live quote receipt read index failed: ' + stage) from exc
+            if time.monotonic() >= deadline:
+                raise TimeoutError('live quote receipt read index deadline: ' + stage)
+            return rows
+
+        def inspect():
+            rows = execute('''SELECT /*+ MAX_EXECUTION_TIME(4000) */
+                NON_UNIQUE,SEQ_IN_INDEX,COLUMN_NAME,SUB_PART,INDEX_TYPE,COLLATION,IS_VISIBLE,EXPRESSION
+                FROM information_schema.STATISTICS
+                WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=:table_name AND INDEX_NAME=:index_name
+                ORDER BY SEQ_IN_INDEX''', {'table_name': _LIVE_RECEIPT_TABLE, 'index_name': _LIVE_RECEIPT_INDEX},
+                stage='index metadata').mappings().all()
+            actual = [(int(row['NON_UNIQUE']), int(row['SEQ_IN_INDEX']), row['COLUMN_NAME'],
+                       row['SUB_PART'], row['INDEX_TYPE'], row['COLLATION'],
+                       row['IS_VISIBLE'], row['EXPRESSION']) for row in rows]
+            expected = [(1, index, column, None, 'BTREE', 'A', 'YES', None)
+                        for index, column in enumerate(_LIVE_RECEIPT_COLUMNS, 1)]
+            if rows and actual != expected:
+                raise RuntimeError('live quote receipt read index definition differs')
+            return bool(rows)
+
+        if inspect():
+            return {**result, 'verified': True}
+        execute('SET SESSION lock_wait_timeout=5', stage='metadata lock budget')
+        execute(f'ALTER TABLE {_LIVE_RECEIPT_TABLE} ADD INDEX {_LIVE_RECEIPT_INDEX} '
+                '(source_provider,published_at,created_at), ALGORITHM=INPLACE, LOCK=NONE', stage='online index build')
+        if not inspect():
+            raise RuntimeError('live quote receipt read index missing after online build')
+    return {**result, 'created': True, 'verified': True, 'read_only': False}
 
 
 def _indexes(connection):
@@ -78,7 +144,7 @@ def _check_integrity(connection):
         raise RuntimeError('current quote table integrity check failed after index migration')
 
 
-def privileged_migrate_current_quote_storage(engine):
+def _privileged_migrate_current_quote_storage(engine):
     """Called only by the release migrator while both endpoints are fenced.
 
     The full unique stock key supersedes the old nonunique stock key. Removing
@@ -127,3 +193,11 @@ def privileged_migrate_current_quote_storage(engine):
             result.update(redundant_index_removed=True, preserved_rows=len(after), rows_sha256=before_hash)
         _check_integrity(connection)
     return {**validate_current_quote_storage(engine), **result, 'integrity_verified': True, 'read_only': False}
+
+
+def privileged_migrate_current_quote_storage(engine):
+    """Run the existing quote migration and its release-owned receipt read index."""
+    quotes = _privileged_migrate_current_quote_storage(engine)
+    receipt = privileged_migrate_live_quote_receipt_read_index(engine)
+    return {**quotes, 'live_quote_receipt_read_index': receipt,
+            'read_only': quotes['read_only'] and receipt['read_only']}

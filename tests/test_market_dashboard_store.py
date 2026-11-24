@@ -35,6 +35,34 @@ def board_value():
                          "as_of": store.iso(NOW), "source": "public.index"}]}
 
 
+def test_liquidity_capture_persists_structured_failure_without_private_fields(snapshots, monkeypatch):
+    import json
+    from fastapi import HTTPException
+    from server.api.routers import market_home
+    from server.common import market_dashboard_worker as worker
+
+    def unavailable(_day):
+        raise HTTPException(status_code=503, detail={
+            'error': 'intraday_liquidity_unavailable', 'stage': 'liquidity_snapshot',
+            'type': 'RuntimeError', 'code': 'RuntimeError',
+            'reason': 'liquidity_live: missing pages [17]; completed pages checkpointed',
+            'password': 'must-not-publish', 'sql': 'must-not-publish'})
+
+    monkeypatch.setattr(worker, '_target', lambda: (DAY, NOW, True, NOW+timedelta(days=1)))
+    for name in ('build_market_board', 'build_sector_heatmap', 'read_live_turnover', 'capture_live_ladder'):
+        monkeypatch.setattr(market_home, name, lambda *a, **kw: {})
+    monkeypatch.setattr(market_home, 'read_live_indices', lambda *a, **kw: [])
+    monkeypatch.setattr(market_home, '_breadth_history', lambda *a: [])
+    monkeypatch.setattr(market_home, '_read_event_page', lambda *a: {'requested_date': DAY, 'events': []})
+    monkeypatch.setattr(market_home, '_capture_liquidity', unavailable)
+    worker.capture_once(TOKEN)
+    error = store.read(DAY)[1]['liquidity']['error']
+    detail = json.loads(error)
+    assert detail['stage'] == 'liquidity_snapshot'
+    assert detail['reason'].startswith('liquidity_live: missing pages [17]')
+    assert 'must-not-publish' not in error
+
+
 def test_failed_capture_retains_durable_data_identity_and_time(snapshots):
     store.start_component(DAY, "board", "run1", TOKEN)
     _publish_board(DAY, board_value(), TOKEN, closed=False)
