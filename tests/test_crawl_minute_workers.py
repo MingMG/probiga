@@ -4,6 +4,9 @@ from __future__ import annotations
 from collections import Counter
 from datetime import datetime
 from threading import Barrier, Lock, get_ident
+from contextlib import contextmanager
+
+from sqlalchemy import create_engine, event, text
 
 import pytest
 
@@ -222,3 +225,281 @@ def test_request_crossing_a_minute_uses_response_time_watermark(monkeypatch):
         received = list(results)
     assert received[0][2] == datetime(2026, 9, 11, 9, 35, 1)
     assert crawler._required_grid("2026-09-11", received[0][2])[-1] == "09:32"
+
+
+@pytest.fixture
+def flow_publication(tmp_path, monkeypatch):
+    """SQLite proves commit boundaries; MySQL access plans need live acceptance."""
+    engine = create_engine('sqlite:///' + str(tmp_path / 'flow.db'))
+    fields = ','.join(column + (' TEXT' if column not in crawler.VALUE_FIELDS['flow'] else ' NUMERIC')
+                      for column in crawler.FLOW_WRITE_COLUMNS)
+    stage = 'sm_stock_capital_flow_min_stage_0123456789ab'
+    connection = engine.connect()
+    connection.execute(text('CREATE TABLE sm_stock_capital_flow_min (id INTEGER PRIMARY KEY,' + fields + ')'))
+    connection.execute(text('CREATE INDEX idx_scfm_code_time ON sm_stock_capital_flow_min(stock_code,trade_time)'))
+    connection.execute(text('CREATE TEMPORARY TABLE ' + stage + ' (id INTEGER PRIMARY KEY,' + fields + ')'))
+    rows = []
+    for number in range(1, 34):
+        for minute in (31, 32):
+            row = {field: 1 for field in crawler.VALUE_FIELDS['flow']}
+            row.update(stock_code=f'{number:06}', trade_time=f'2026-09-11 09:{minute}:00',
+                       source_time=f'2026-09-11 09:{minute}:00', received_at='2026-09-11 09:33:00',
+                       snapshot_at='2026-09-11 09:33:00', etl_sync_at='2026-09-11 09:33:00',
+                       data_source=crawler.PUBLIC_MINUTE_SOURCE)
+            rows.append(row)
+    columns = ','.join(crawler.FLOW_WRITE_COLUMNS)
+    values = ','.join(':' + key for key in crawler.FLOW_WRITE_COLUMNS)
+    connection.execute(text(f'INSERT INTO {stage} ({columns}) VALUES ({values})'), rows)
+    connection.execute(text(f'INSERT INTO sm_stock_capital_flow_min ({columns}) VALUES ({values})'),
+                       [{**row, 'main_net_inflow': 0} for row in rows])
+    connection.commit()
+    @contextmanager
+    def lock(_engine, _name, **kwargs):
+        assert kwargs['connection'] is connection
+        yield kwargs.get('connection', connection)
+    monkeypatch.setattr(crawler, 'mysql_named_lock', lock)
+    monkeypatch.setattr(crawler, '_now', lambda: datetime(2026, 9, 11, 9, 34))
+    # Translate only the original MySQL multi-table DELETE for this transaction regression.
+    @event.listens_for(connection, 'before_cursor_execute', retval=True)
+    def sqlite_delete(_conn, _cursor, statement, parameters, _context, _many):
+        if statement.lstrip().startswith('DELETE target_rows'):
+            statement = (f'DELETE FROM sm_stock_capital_flow_min WHERE stock_code IN '
+                         f'(SELECT DISTINCT stock_code FROM {stage}) '
+                         'AND trade_time >= ? AND trade_time < datetime(?, "+1 day")')
+        return statement, parameters
+    yield engine, connection, stage, rows
+    connection.close()
+    engine.dispose()
+
+
+def flow_proofs(rows):
+    return {code: [code, len(values), crawler._code_rows_digest(values, 'flow'), '2026-09-11 09:33:00']
+            for code in sorted({row['stock_code'] for row in rows})
+            for values in [[row for row in rows if row['stock_code'] == code]]}
+
+
+def test_flow_later_partition_failure_keeps_earlier_commits(flow_publication):
+    engine, connection, stage, rows = flow_publication
+    connection.execute(text("CREATE TRIGGER reject_second_batch BEFORE INSERT ON sm_stock_capital_flow_min "
+                            "WHEN NEW.stock_code='000017' BEGIN SELECT RAISE(ABORT,'second batch failed'); END"))
+    connection.commit()
+    progress = []
+    with pytest.raises(RuntimeError, match='publication incomplete'):
+        crawler._publish_flow_stage(engine, connection, stage, '2026-09-11',
+                                   proofs=flow_proofs(rows), progress=progress.append)
+    connection.rollback()
+    with engine.connect() as reader:
+        assert reader.execute(text("SELECT main_net_inflow FROM sm_stock_capital_flow_min "
+                                   "WHERE stock_code='000001' LIMIT 1")).scalar_one() == 1
+        assert reader.execute(text("SELECT main_net_inflow FROM sm_stock_capital_flow_min "
+                                   "WHERE stock_code='000017' LIMIT 1")).scalar_one() == 0
+        assert reader.execute(text("SELECT main_net_inflow FROM sm_stock_capital_flow_min "
+                                   "WHERE stock_code='000033' LIMIT 1")).scalar_one() == 1
+    assert progress[-1]['publication_completed_units'] == 17
+    assert progress[-1]['publication_failed_codes'] == [f'{n:06}' for n in range(17, 33)]
+    connection.execute(text('DROP TRIGGER reject_second_batch'))
+    connection.commit()
+    progress.clear()
+    assert crawler._publish_flow_stage(engine, connection, stage, '2026-09-11',
+                                      proofs=flow_proofs(rows), progress=progress.append) == 66
+    assert progress[-1]['publication_written_rows'] == 32
+    assert progress[-1]['publication_reused_rows'] == 34
+
+
+def test_flow_publish_preserves_other_dates_and_missing_securities(flow_publication):
+    engine, connection, stage, rows = flow_publication
+    columns = ','.join(crawler.FLOW_WRITE_COLUMNS)
+    values = ','.join(':' + key for key in crawler.FLOW_WRITE_COLUMNS)
+    untouched = [{**rows[0], 'stock_code': '999999', 'main_net_inflow': 7},
+                 {**rows[0], 'trade_time': '2026-09-10 09:31:00', 'main_net_inflow': 8}]
+    connection.execute(text(f'INSERT INTO sm_stock_capital_flow_min ({columns}) VALUES ({values})'), untouched)
+    connection.commit()
+    assert crawler._publish_flow_stage(engine, connection, stage, '2026-09-11', proofs=flow_proofs(rows)) == 66
+    with engine.connect() as reader:
+        assert reader.execute(text("SELECT main_net_inflow FROM sm_stock_capital_flow_min "
+                                   "WHERE stock_code='999999'")).scalar_one() == 7
+        assert reader.execute(text("SELECT main_net_inflow FROM sm_stock_capital_flow_min "
+                                   "WHERE trade_time='2026-09-10 09:31:00'")).scalar_one() == 8
+
+
+def test_flow_bad_source_stage_does_not_replace_its_batch(flow_publication):
+    engine, connection, stage, rows = flow_publication
+    connection.execute(text(f"UPDATE {stage} SET main_net_inflow=9 WHERE stock_code='000001'"))
+    connection.commit()
+    with pytest.raises(RuntimeError, match='publication incomplete'):
+        crawler._publish_flow_stage(engine, connection, stage, '2026-09-11', proofs=flow_proofs(rows))
+    with engine.connect() as reader:
+        assert reader.execute(text("SELECT main_net_inflow FROM sm_stock_capital_flow_min "
+                                   "WHERE stock_code='000001' LIMIT 1")).scalar_one() == 0
+        assert reader.execute(text("SELECT main_net_inflow FROM sm_stock_capital_flow_min "
+                                   "WHERE stock_code='000017' LIMIT 1")).scalar_one() == 1
+
+
+def test_flow_reuses_only_complete_rows_with_the_original_source_capture(flow_publication):
+    engine, connection, stage, rows = flow_publication
+    connection.execute(text('UPDATE sm_stock_capital_flow_min SET main_net_inflow=1'))
+    connection.execute(text("DELETE FROM sm_stock_capital_flow_min WHERE stock_code='000017' "
+                            "AND trade_time='2026-09-11 09:32:00'"))
+    connection.execute(text("UPDATE sm_stock_capital_flow_min SET received_at='2026-09-11 09:32:59' "
+                            "WHERE stock_code='000018'"))
+    retained = list(connection.execute(text("SELECT id FROM sm_stock_capital_flow_min "
+                                           "WHERE stock_code='000001' ORDER BY id")).scalars())
+    connection.commit()
+    progress = []
+    assert crawler._publish_flow_stage(engine, connection, stage, '2026-09-11',
+                                      proofs=flow_proofs(rows), progress=progress.append) == 66
+    assert progress[-1]['publication_written_rows'] == 4
+    assert progress[-1]['publication_reused_rows'] == 62
+    assert list(connection.execute(text("SELECT id FROM sm_stock_capital_flow_min "
+                                        "WHERE stock_code='000001' ORDER BY id")).scalars()) == retained
+    assert set(connection.execute(text("SELECT received_at FROM sm_stock_capital_flow_min "
+                                       "WHERE stock_code='000018'")).scalars()) == {'2026-09-11 09:33:00'}
+
+
+def test_flow_oversized_existing_batch_is_not_deleted(flow_publication):
+    engine, connection, stage, rows = flow_publication
+    columns = ','.join(crawler.FLOW_WRITE_COLUMNS)
+    values = ','.join(':' + key for key in crawler.FLOW_WRITE_COLUMNS)
+    connection.execute(text(f'INSERT INTO sm_stock_capital_flow_min ({columns}) VALUES ({values})'),
+                       [{**rows[0], 'main_net_inflow': 7}] * crawler.FLOW_PUBLISH_ROWS)
+    connection.commit()
+    with pytest.raises(RuntimeError, match='publication incomplete'):
+        crawler._publish_flow_stage(engine, connection, stage, '2026-09-11', proofs=flow_proofs(rows))
+    with engine.connect() as reader:
+        assert reader.execute(text('SELECT COUNT(*) FROM sm_stock_capital_flow_min '
+                                   'WHERE main_net_inflow=7')).scalar_one() == crawler.FLOW_PUBLISH_ROWS
+
+
+def test_flow_publication_deadline_stops_before_replacement(flow_publication, monkeypatch):
+    engine, connection, stage, rows = flow_publication
+    monkeypatch.setattr(crawler, 'FLOW_PUBLISH_SECONDS', 0)
+    progress = []
+    with pytest.raises(TimeoutError, match='publication deadline'):
+        crawler._publish_flow_stage(engine, connection, stage, '2026-09-11',
+                                   proofs=flow_proofs(rows), progress=progress.append)
+    assert progress[-1]['publication_completed_units'] == 0
+    assert progress[-1]['publication_deadline_exceeded'] is True
+    with engine.connect() as reader:
+        assert reader.execute(text('SELECT COUNT(*) FROM sm_stock_capital_flow_min '
+                                   'WHERE main_net_inflow=0')).scalar_one() == 66
+
+
+def test_flow_lost_commit_reply_is_read_back_once_without_success(flow_publication, monkeypatch):
+    engine, connection, stage, rows = flow_publication
+    commit = engine.dialect.do_commit
+    commits = []
+    def lose_reply(dbapi_connection):
+        commit(dbapi_connection)
+        commits.append(True)
+        if len(commits) == 1:
+            raise RuntimeError('COMMIT reply lost after commit')
+    monkeypatch.setattr(engine.dialect, 'do_commit', lose_reply)
+    progress = []
+    with pytest.raises(RuntimeError, match='COMMIT reply uncertain'):
+        crawler._publish_flow_stage(engine, connection, stage, '2026-09-11',
+                                   proofs=flow_proofs(rows), progress=progress.append)
+    assert progress[-1]['publication_commit_uncertain'] is True
+    assert progress[-1]['publication_commit_readback_matches'] is True
+    assert progress[-1]['publication_completed_units'] == 16
+    assert commits == [True]
+    with engine.connect() as reader:
+        assert reader.execute(text("SELECT COUNT(*) FROM sm_stock_capital_flow_min "
+                                   "WHERE main_net_inflow=1")).scalar_one() == 32
+
+
+def test_flow_lost_stage_connection_stops_without_restarting_or_losing_commits(flow_publication):
+    engine, connection, stage, rows = flow_publication
+    deletes = []
+    @event.listens_for(connection, 'after_cursor_execute')
+    def lose_stage(conn, _cursor, statement, _parameters, _context, _many):
+        if statement.startswith('DELETE FROM'):
+            deletes.append(True)
+            if len(deletes) == 2:
+                conn.invalidate()
+                raise RuntimeError('stage connection lost')
+    with pytest.raises(RuntimeError, match='stage connection lost'):
+        crawler._publish_flow_stage(engine, connection, stage, '2026-09-11', proofs=flow_proofs(rows))
+    assert len(deletes) == 2
+    with engine.connect() as reader:
+        assert reader.execute(text("SELECT COUNT(*) FROM sm_stock_capital_flow_min "
+                                   "WHERE main_net_inflow=1")).scalar_one() == 32
+
+
+def run_mysql_flow_publication_acceptance(engine):
+    """Explicit operator entry point; only connection-local TEMPORARY targets.
+
+    Call with the authorized minute engine. This does not choose credentials,
+    start collectors, acquire the business publisher lock, or write business rows.
+    """
+    import uuid
+    if engine.dialect.name != 'mysql':
+        raise ValueError('real MySQL transaction acceptance requires MySQL')
+    token = uuid.uuid4().hex[:12]
+    target = 'flow_publish_accept_' + token
+    original_lock = crawler.mysql_named_lock
+    stage, connection = crawler._create_flow_stage(engine)
+    @contextmanager
+    def isolated_lock(bound_engine, _name, **kwargs):
+        assert kwargs['connection'] is connection
+        with original_lock(bound_engine, 'probiga:flow-accept:' + token, **kwargs) as bound:
+            yield bound
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(crawler, 'FLOW_TABLE', target)
+        patch.setattr(crawler, 'mysql_named_lock', isolated_lock)
+        patch.setattr(crawler, '_now', lambda: datetime(2026, 9, 11, 9, 34))
+        try:
+            connection.execute(text(f'CREATE TEMPORARY TABLE `{target}` LIKE sm_stock_capital_flow_min'))
+            assert connection.engine is not engine
+            dbapi = connection.connection.driver_connection
+            assert dbapi._read_timeout == dbapi._write_timeout == 30
+            assert connection.execute(text('SELECT @@SESSION.innodb_lock_wait_timeout')).scalar_one() == 5
+            rows = []
+            for number in range(1, 34):
+                for minute in (31, 32):
+                    row = {field: 1 for field in crawler.VALUE_FIELDS['flow']}
+                    row.update(stock_code=f'{number:06}', trade_time=f'2026-09-11 09:{minute}:00',
+                               source_time=f'2026-09-11 09:{minute}:00', received_at='2026-09-11 09:33:00',
+                               snapshot_at='2026-09-11 09:33:00', etl_sync_at='2026-09-11 09:33:00',
+                               data_source=crawler.PUBLIC_MINUTE_SOURCE)
+                    rows.append(row)
+            columns = ','.join(crawler.FLOW_WRITE_COLUMNS)
+            values = ','.join(':' + key for key in crawler.FLOW_WRITE_COLUMNS)
+            connection.execute(text(f'INSERT INTO `{stage}` ({columns}) VALUES ({values})'), rows)
+            connection.execute(text(f'INSERT INTO `{target}` ({columns}) VALUES ({values})'),
+                               [{**row, 'main_net_inflow': 0} for row in rows])
+            connection.commit()
+            deletes = []
+            def fail_second(_conn, _cursor, statement, _parameters, _context, _many):
+                if statement.lstrip().startswith(f'DELETE FROM `{target}`'):
+                    deletes.append(True)
+                    if len(deletes) == 2:
+                        raise RuntimeError('controlled failure after second batch DELETE')
+            event.listen(connection, 'after_cursor_execute', fail_second)
+            try:
+                with pytest.raises(RuntimeError, match='publication incomplete'):
+                    crawler._publish_flow_stage(engine, connection, stage, '2026-09-11', proofs=flow_proofs(rows))
+            finally:
+                event.remove(connection, 'after_cursor_execute', fail_second)
+            connection.rollback()
+            assert connection.execute(text(f'SELECT COUNT(*) FROM `{target}` WHERE main_net_inflow=1')).scalar_one() == 34
+            assert connection.execute(text(f'SELECT COUNT(*) FROM `{target}` WHERE main_net_inflow=0')).scalar_one() == 32
+            connection.commit()
+            progress = []
+            assert crawler._publish_flow_stage(engine, connection, stage, '2026-09-11',
+                                              proofs=flow_proofs(rows), progress=progress.append) == 66
+            assert progress[-1]['publication_reused_rows'] == 34
+            assert progress[-1]['publication_written_rows'] == 32
+            return dict(status='COMPLETE', permanent_rows_written=0, real_mysql_transactions=True,
+                        temporary_source_rows=66, earlier_and_later_committed_rows_after_failure=34,
+                        failed_batch_original_rows_preserved=32, resumed_reused_rows=34,
+                        resumed_inserted_rows=32, named_lock_connection='same stage connection',
+                        dedicated_engine=True, transport_read_write_seconds=30, lock_wait_seconds=5,
+                        data_kind='synthetic isolated transaction fixture, not market observations')
+        finally:
+            try:
+                if not connection.closed and not connection.invalidated:
+                    connection.rollback()
+                    connection.execute(text(f'DROP TEMPORARY TABLE IF EXISTS `{target}`'))
+                    connection.commit()
+            finally:
+                crawler._drop_flow_stage(connection)

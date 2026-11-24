@@ -110,6 +110,9 @@ RETRY_DELAY = _env_float("MINUTE_RETRY_DELAY", "1.0")
 FETCH_WORKERS = 6
 
 FLOW_TABLE = "sm_stock_capital_flow_min"
+FLOW_PUBLISH_CODES = 16
+FLOW_PUBLISH_ROWS = FLOW_PUBLISH_CODES * 240
+FLOW_PUBLISH_SECONDS = 15 * 60
 FLOW_WRITE_COLUMNS = (
     "stock_code",
     "trade_time",
@@ -825,8 +828,17 @@ def save_kline(
 
 def _create_flow_stage(engine) -> tuple[str, Connection]:
     stage = f"{FLOW_TABLE}_stage_{uuid.uuid4().hex[:12]}"
-    connection = engine.connect()
+    stage_engine = engine
+    if engine.dialect.name == "mysql":
+        from server.common.engine_factory import create_pooled_engine
+        stage_engine = create_pooled_engine(engine.url, pool_size=1, max_overflow=0,
+            pool_timeout=5, connect_args={"connect_timeout": 8, "read_timeout": 30, "write_timeout": 30})
+    connection = None
     try:
+        connection = stage_engine.connect()
+        connection._flow_stage_engine = stage_engine if stage_engine is not engine else None
+        if connection.dialect.name == "mysql":
+            connection.execute(text("SET SESSION innodb_lock_wait_timeout=5"))
         connection.execute(
             text(
                 f"CREATE TEMPORARY TABLE {quote_identifier(stage)} "
@@ -836,12 +848,20 @@ def _create_flow_stage(engine) -> tuple[str, Connection]:
         connection.commit()
         return stage, connection
     except BaseException:
-        connection.close()
+        if connection is not None:
+            connection.close()
+        if stage_engine is not engine:
+            stage_engine.dispose()
         raise
 
 
 def _drop_flow_stage(connection: Connection) -> None:
-    connection.close()
+    try:
+        connection.close()
+    finally:
+        owned = getattr(connection, "_flow_stage_engine", None)
+        if owned is not None:
+            owned.dispose()
 
 
 def _append_flow_stage(connection: Connection, stage: str, rows: list[dict]) -> int:
@@ -865,38 +885,166 @@ def _append_flow_stage(connection: Connection, stage: str, rows: list[dict]) -> 
     return len(df)
 
 
-def _publish_flow_stage(
-    engine,
-    stage_connection: Connection,
-    stage: str,
-    trade_date: str,
-) -> int:
-    """Replace only proven code/day partitions; retain missing codes' old rows."""
-    columns = ", ".join(quote_identifier(column) for column in FLOW_WRITE_COLUMNS)
-    lock_timeout = max(0, _env_int("FLOW_MINUTE_LOCK_TIMEOUT", "0"))
-    with mysql_named_lock(
-        engine,
-        "probiga:capital_flow_minute",
-        timeout_seconds=lock_timeout,
-    ):
-        with stage_connection.begin():
-            stage_connection.execute(
-                text(
-                    f"DELETE target_rows FROM {quote_identifier(FLOW_TABLE)} AS target_rows "
-                    f"INNER JOIN (SELECT DISTINCT stock_code FROM {quote_identifier(stage)}) AS scope_rows "
-                    "ON target_rows.stock_code=scope_rows.stock_code "
-                    "WHERE target_rows.trade_time >= :trade_date "
-                    "AND target_rows.trade_time < DATE_ADD(:trade_date, INTERVAL 1 DAY)"
-                ),
-                {"trade_date": trade_date},
-            )
-            result = stage_connection.execute(
-                text(
-                    f"INSERT INTO {quote_identifier(FLOW_TABLE)} ({columns}) "
-                    f"SELECT {columns} FROM {quote_identifier(stage)}"
-                )
-            )
-    return int(result.rowcount if result.rowcount is not None and result.rowcount >= 0 else 0)
+def _flow_publication_rows(connection, table, codes, trade_date):
+    """Read at most one publication batch through the stock/day access path."""
+    index = " FORCE INDEX (idx_scfm_code_time)" if connection.dialect.name == "mysql" else ""
+    query = text(
+        "SELECT /*+ MAX_EXECUTION_TIME(30000) */ id," + ",".join(quote_identifier(field) for field in FLOW_WRITE_COLUMNS)
+        + f" FROM {quote_identifier(table)}{index} WHERE stock_code IN :codes "
+        "AND trade_time>=:opening AND trade_time<:ending "
+        "ORDER BY stock_code,trade_time LIMIT :limit"
+    ).bindparams(bindparam("codes", expanding=True))
+    rows = [dict(row) for row in connection.execute(query, {
+        "codes": codes, "opening": trade_date + " 00:00:00",
+        "ending": (date.fromisoformat(trade_date) + timedelta(days=1)).isoformat() + " 00:00:00",
+        "limit": FLOW_PUBLISH_ROWS + 1,
+    }).mappings()]
+    if len(rows) > FLOW_PUBLISH_ROWS:
+        raise RuntimeError("minute flow publication batch exceeds 3840 rows")
+    return rows
+
+
+def _flow_rows_match(rows, code, proof, trade_date):
+    if len(rows) != proof[1] or any(str(row["stock_code"]) != code for row in rows):
+        return False
+    try:
+        captured = datetime.fromisoformat(proof[3])
+        values = [{**row, "trade_time": datetime.fromisoformat(str(row["trade_time"]))} for row in rows]
+        _validate_grid(values, trade_date=trade_date, captured_at=captured)
+        if any(datetime.fromisoformat(str(row["received_at"])) != captured
+               or datetime.fromisoformat(str(row["source_time"])) != row["trade_time"]
+               or not captured <= datetime.fromisoformat(str(row["etl_sync_at"])) <= _now()
+               or row["data_source"] != PUBLIC_MINUTE_SOURCE for row in values):
+            return False
+        return _code_rows_digest(values, "flow") == proof[2]
+    except (ValueError, TypeError, KeyError, MinuteSourceError):
+        return False
+
+
+def _publish_flow_stage(engine, stage_connection: Connection, stage: str, trade_date: str,
+                        *, proofs, progress=None) -> int:
+    """Commit verified securities in bounded batches; never delete a whole day."""
+    deadline = time.monotonic() + FLOW_PUBLISH_SECONDS
+    codes = sorted(proofs)
+    if not codes or len(codes) > 10000 or any(not 0 < proofs[code][1] <= 240 for code in codes):
+        raise ValueError("invalid minute flow publication scope")
+    if stage_connection.in_transaction():
+        stage_connection.commit()
+    if stage_connection.dialect.name == "mysql":
+        indexes = stage_connection.execute(text(f"SHOW INDEX FROM {quote_identifier(FLOW_TABLE)}")).mappings().all()
+        columns = [row["Column_name"] for row in sorted(
+            (row for row in indexes if row["Key_name"] == "idx_scfm_code_time"),
+            key=lambda row: row["Seq_in_index"])]
+        if columns != ["stock_code", "trade_time"]:
+            raise RuntimeError("minute flow publication requires the exact stock/time index")
+        stage_connection.commit()
+    columns = ",".join(quote_identifier(column) for column in FLOW_WRITE_COLUMNS)
+    insert = text(f"INSERT INTO {quote_identifier(FLOW_TABLE)} ({columns}) SELECT {columns} "
+                  f"FROM {quote_identifier(stage)} WHERE stock_code IN :codes "
+                  "AND trade_time>=:opening AND trade_time<:ending").bindparams(bindparam("codes", expanding=True))
+    delete = text(f"DELETE FROM {quote_identifier(FLOW_TABLE)} WHERE id IN :ids").bindparams(
+        bindparam("ids", expanding=True))
+    done, failed = set(), set()
+    written_rows = reused_rows = 0
+    first_failure = None
+
+    def report(current, **extra):
+        if progress is not None:
+            progress(dict(phase="PUBLISH", publication_total_units=len(codes),
+                          publication_completed_units=len(done), publication_failed_codes=sorted(failed),
+                          publication_written_rows=written_rows, publication_reused_rows=reused_rows,
+                          current_unit=current, **extra))
+
+    with mysql_named_lock(engine, "probiga:capital_flow_minute",
+                          timeout_seconds=max(0, _env_int("FLOW_MINUTE_LOCK_TIMEOUT", "0")),
+                          connection=stage_connection):
+        stage_connection.commit()
+        for offset in range(0, len(codes), FLOW_PUBLISH_CODES):
+            batch = codes[offset:offset + FLOW_PUBLISH_CODES]
+            if time.monotonic() >= deadline:
+                report(batch[0], publication_deadline_exceeded=True)
+                raise TimeoutError("minute flow publication deadline; resume from durable source checkpoints")
+            commit_started = False
+            reused, replaced = [], []
+            operation = "read_stage"
+            try:
+                with stage_connection.begin():
+                    staged = _flow_publication_rows(stage_connection, stage, batch, trade_date)
+                    operation = "read_existing"
+                    existing = _flow_publication_rows(stage_connection, FLOW_TABLE, batch, trade_date)
+                    operation = "validate_source"
+                    for code in batch:
+                        source_rows = [row for row in staged if row["stock_code"] == code]
+                        if not _flow_rows_match(source_rows, code, proofs[code], trade_date):
+                            raise RuntimeError("minute flow stage source proof differs: " + code)
+                        destination = [row for row in existing if row["stock_code"] == code]
+                        (reused if _flow_rows_match(destination, code, proofs[code], trade_date) else replaced).append(code)
+                    if replaced:
+                        ids = [row["id"] for row in existing if row["stock_code"] in replaced]
+                        if ids:
+                            operation = "delete_partition_ids"
+                            stage_connection.execute(delete, {"ids": ids})
+                        operation = "insert_partitions"
+                        result = stage_connection.execute(insert, {
+                            "codes": replaced, "opening": trade_date + " 00:00:00",
+                            "ending": (date.fromisoformat(trade_date) + timedelta(days=1)).isoformat() + " 00:00:00",
+                        })
+                        if result.rowcount != sum(proofs[code][1] for code in replaced):
+                            raise RuntimeError("minute flow publication inserted row count differs")
+                    operation = "transaction_readback"
+                    actual = _flow_publication_rows(stage_connection, FLOW_TABLE, batch, trade_date)
+                    if any(not _flow_rows_match([row for row in actual if row["stock_code"] == code],
+                                               code, proofs[code], trade_date) for code in batch):
+                        raise RuntimeError("minute flow transaction readback differs")
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("minute flow publication transaction deadline")
+                    operation = "commit"
+                    commit_started = True
+            except Exception as exc:
+                failed.update(batch)
+                first_failure = first_failure or exc
+                error = dict(publication_error_stage=operation, publication_error_type=type(exc).__name__,
+                             publication_error_code=getattr(getattr(exc, "orig", None), "args", [None])[0])
+                if commit_started:
+                    # A lost COMMIT reply is never permission to publish the same shard again.
+                    verified = False
+                    readback_engine = engine
+                    try:
+                        stage_connection.rollback()
+                        if engine.dialect.name == "mysql":
+                            from server.common.engine_factory import create_pooled_engine
+                            readback_engine = create_pooled_engine(engine.url, pool_size=1, max_overflow=0,
+                                pool_timeout=5, connect_args={"connect_timeout": 8, "read_timeout": 30, "write_timeout": 30})
+                        with readback_engine.connect() as reader:
+                            actual = _flow_publication_rows(reader, FLOW_TABLE, batch, trade_date)
+                            verified = all(_flow_rows_match([row for row in actual if row["stock_code"] == code],
+                                                           code, proofs[code], trade_date) for code in batch)
+                    except Exception:
+                        pass
+                    finally:
+                        if readback_engine is not engine:
+                            readback_engine.dispose()
+                    if verified:
+                        done.update(batch)
+                        failed.difference_update(batch)
+                        reused_rows += sum(proofs[code][1] for code in reused)
+                        written_rows += sum(proofs[code][1] for code in replaced)
+                    report(batch[-1], **error, publication_commit_uncertain=True,
+                           publication_commit_readback_matches=verified)
+                    raise RuntimeError("minute flow COMMIT reply uncertain; resume from durable source checkpoints") from exc
+                report(batch[-1], **error)
+                if isinstance(exc, TimeoutError):
+                    raise
+                if stage_connection.closed or stage_connection.invalidated:
+                    raise RuntimeError("minute flow stage connection lost; resume from durable source checkpoints") from exc
+                continue
+            done.update(batch)
+            reused_rows += sum(proofs[code][1] for code in reused)
+            written_rows += sum(proofs[code][1] for code in replaced)
+            report(batch[-1])
+    if failed:
+        raise RuntimeError(f"minute flow publication incomplete: {len(done)}/{len(codes)} securities committed") from first_failure
+    return written_rows + reused_rows
 
 
 def _codes_csv(codes):
@@ -1218,11 +1366,26 @@ def _collect_minutes(engine, codes, *, kind, table, trade_date, min_coverage,
         nonlocal last_progress_count
         completed = len(proofs) + len(no_trade)
         if store is not None and completed != last_progress_count:
-            store.save("__progress__", dict(total_units=len(expected),
+            store.save("__progress__", dict(total_units=len(expected), phase="ACQUIRE",
                 completed_units=completed, current_unit=code,
                 last_progress_at=_now().isoformat(sep=" "), run_uid=context["run_uid"],
                 durable_completed_codes_sha256=_digest(sorted(proofs))))
             last_progress_count = completed
+
+    publication_progress = {}
+    publication_last_progress_at = None
+
+    def published_progress(values):
+        nonlocal publication_last_progress_at
+        if values["publication_completed_units"] > publication_progress.get("publication_completed_units", 0):
+            publication_last_progress_at = _now().isoformat(sep=" ")
+        publication_progress.update(values)
+        if store is not None:
+            store.save("__progress__", dict(total_units=len(expected),
+                completed_units=len(proofs) + len(no_trade), acquired_units=len(proofs) + len(no_trade),
+                last_progress_at=publication_last_progress_at or collection_finished_text,
+                publication_observed_at=_now().isoformat(sep=" "), run_uid=context["run_uid"],
+                durable_completed_codes_sha256=_digest(sorted(proofs)), **values))
 
     def consume(code, native, captured_at, *, restored=False):
         nonlocal reused_count, last_progress_unit
@@ -1319,11 +1482,14 @@ def _collect_minutes(engine, codes, *, kind, table, trade_date, min_coverage,
             result.update(status="coverage_failed", acquisition_status="FAILED", written_rows=0)
             return _seal_result(result)
         validate_result(_seal_result(result))
-        published = (_publish_flow_stage(engine, connection, stage, trade_date) if is_flow
+        published = (_publish_flow_stage(engine, connection, stage, trade_date,
+                                        proofs=proofs, progress=published_progress) if is_flow
                      else _publish_kline_stage(engine, connection, stage, table, receipt_engine=receipt_engine))
         if published != staged_rows:
             raise RuntimeError("published row count mismatch")
         result["finished_at"] = _now().isoformat(sep=" ")
+        if is_flow:
+            result["publication_progress"] = publication_progress
         return _seal_result(result)
     except BaseException:
         try:

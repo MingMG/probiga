@@ -26,7 +26,7 @@ def harness(monkeypatch, tmp_path):
     def append(connection, stage, rows):
         state["staged"].extend(deepcopy(rows))
         return len(rows)
-    def publish(*args):
+    def publish(*args, **kwargs):
         state["published"] += 1
         return len(state["staged"])
     monkeypatch.setattr(collector, "_append_flow_stage", append)
@@ -78,6 +78,26 @@ def test_retry_restores_real_closed_source_without_refetch_or_retimestamp(monkey
     assert {row["received_at"] for row in state["staged"] if row["stock_code"] == "000001"} == {datetime(2026, 9, 11, 16, 0, 5)}
     assert collector.validate_result(result) == "success"
     assert store.load("__progress__")["total_units"] == 2
+
+
+def test_publication_failure_preserves_sources_and_distinguishes_committed_progress(monkeypatch, tmp_path):
+    state = harness(monkeypatch, tmp_path)
+    state['interrupted'] = False
+    def publish(_engine, _connection, _stage, _day, *, proofs, progress):
+        assert set(proofs) == {'000001', '600000'}
+        progress(dict(phase='PUBLISH', publication_total_units=2, publication_completed_units=1,
+                      publication_failed_codes=['600000'], publication_written_rows=240,
+                      publication_reused_rows=0, current_unit='600000'))
+        raise RuntimeError('second publication failed')
+    monkeypatch.setattr(collector, '_publish_flow_stage', publish)
+    with pytest.raises(RuntimeError, match='second publication failed'):
+        collect(context())
+    store = collector._checkpoint_store('flow', DAY, context(), [code for code, _ in CODES])
+    proof = store.load('__progress__')
+    assert proof['phase'] == 'PUBLISH'
+    assert proof['acquired_units'] == proof['completed_units'] == 2
+    assert proof['publication_completed_units'] == 1
+    assert all(store.load(code)['captured_at'] == DAY + ' 16:00:05' for code, _ in CODES)
     assert store.load("__progress__")["completed_units"] == 2
 
 
@@ -128,8 +148,8 @@ def test_completed_flow_is_published_after_slow_collection_or_database_work(
         with original_fetch(*args) as rows:
             yield rows
         state["now"] += timedelta(minutes=collection_minutes)
-    def slow_publish(*args):
-        count = original_publish(*args)
+    def slow_publish(*args, **kwargs):
+        count = original_publish(*args, **kwargs)
         state["now"] += timedelta(hours=publication_hours)
         return count
     monkeypatch.setattr(collector, "_minute_fetch_workers", slow_fetch)
