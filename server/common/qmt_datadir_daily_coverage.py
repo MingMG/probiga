@@ -25,6 +25,9 @@ from server.common.official_historical_daily_evidence import (
     official_daily_suspension_evidence,
 )
 from server.common.historical_daily_bar_evidence import SINA_PROVIDER, SINA_QUALITY, verify_public_bar
+from server.common.historical_suspension_evidence import (
+    KIND as HISTORICAL_SUSPENSION_KIND, validate_suspension_evidence,
+)
 from server.common.qmt_post_close_block_evidence import KIND as POST_CLOSE_KIND, verify_post_close_revision
 from server.common.qmt_stock_catalog import load_stock_catalog
 from server.common.qmt_trade_calendar import load_trade_calendar_receipt
@@ -239,6 +242,7 @@ def build_manifest(*, catalog, calendar, day: str, rows: Sequence[Mapping[str, A
                    daily_suspension_documents: Mapping[str, list[dict]] | None = None,
                    daily_delisting_documents: Mapping[str, list[dict]] | None = None,
                    historical_documents: Mapping[str, list[dict]] | None = None,
+                   historical_suspensions: Mapping[str, dict] | None = None,
                    historical_public_bars: Mapping[str, dict] | None = None,
                    previous_session: str = "", native_content_sha256: str = "") -> dict:
     captured = _stamp(captured_at).replace(microsecond=0)
@@ -253,15 +257,19 @@ def build_manifest(*, catalog, calendar, day: str, rows: Sequence[Mapping[str, A
         raise ValueError("daily rows differ from independent catalog")
     if any(row["trade_date"] != day for row in bars):
         raise ValueError("daily row date differs")
-    if historical_documents is not None:
-        if captured.date().isoformat() <= day or set(historical_documents) != set(expected) - by_code.keys():
+    historical_suspensions = dict(historical_suspensions or {})
+    historical = historical_documents is not None or bool(historical_suspensions)
+    if historical:
+        if (captured.date().isoformat() <= day
+                or set(historical_documents or {}) & set(historical_suspensions)
+                or (set(historical_documents or {}) | set(historical_suspensions)) != set(expected) - by_code.keys()):
             raise ValueError("historical daily lifecycle inventory differs")
     suspensions = dict(daily_suspension_documents or {})
-    if suspensions and (historical_documents is not None
+    if suspensions and (historical
                         or not set(suspensions) <= set(expected) - by_code.keys() - set(listings or {})):
         raise ValueError("official daily suspension inventory differs")
     delistings = dict(daily_delisting_documents or {})
-    if delistings and (historical_documents is not None or not set(delistings) <=
+    if delistings and (historical or not set(delistings) <=
                        set(expected) - by_code.keys() - set(listings or {}) - set(suspensions)):
         raise ValueError("official daily delisting inventory differs")
     public = dict(historical_public_bars or {})
@@ -276,6 +284,12 @@ def build_manifest(*, catalog, calendar, day: str, rows: Sequence[Mapping[str, A
     for code in expected:
         if code in by_code:
             kind, evidence = "TRADED", by_code[code]
+        elif code in historical_suspensions:
+            kind = "NO_TRADE"
+            evidence = validate_suspension_evidence(
+                historical_suspensions[code], stock_code=code, day=day,
+                cutoff=captured.replace(tzinfo=CHINA),
+            )
         elif historical_documents is not None:
             try:
                 kind, evidence = historical_daily_evidence(historical_documents[code], stock_code=code,
@@ -303,7 +317,7 @@ def build_manifest(*, catalog, calendar, day: str, rows: Sequence[Mapping[str, A
             "catalog_member_set_hash": catalog.member_set_hash,
             "calendar_batch_id": calendar.batch_id, "calendar_manifest_hash": calendar.manifest_hash,
             "entities": entities}
-    if historical_documents is not None:
+    if historical:
         core["historical_reconstruction"] = True
     if public:
         core.update(historical_public_bars=public, previous_session=previous_session)
@@ -378,6 +392,13 @@ def validate_manifest(manifest: Mapping[str, Any], *, catalog, calendar) -> dict
                 previous_day=previous_session, cutoff=_stamp(original["captured_at"]),
             ) != row:
                 raise ValueError("historical public source bar differs from exact publication")
+        elif historical and entity["evidence"].get("kind") == HISTORICAL_SUSPENSION_KIND:
+            proof = validate_suspension_evidence(
+                entity["evidence"], stock_code=entity["stock_code"], day=original["trade_date"],
+                cutoff=_stamp(original["captured_at"]).replace(tzinfo=CHINA),
+            )
+            if entity["classification"] != "NO_TRADE" or proof != entity["evidence"]:
+                raise ValueError("historical suspension classification differs")
         elif historical:
             classification, proof = historical_daily_evidence(
                 entity["evidence"]["documents"], stock_code=entity["stock_code"],
