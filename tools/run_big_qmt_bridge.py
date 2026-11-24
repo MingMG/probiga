@@ -1575,33 +1575,40 @@ def _insert_limit_up_events(connection, events: list[dict[str, Any]]) -> None:
 
 
 def _replace_full_snapshot(
-    engine,
+    connection,
     frame: pd.DataFrame,
     *,
+    universe: list[str],
     limit_up_events: list[dict[str, Any]] | None = None,
 ) -> int:
+    """Write FULL rows/events inside the caller's receipt publication transaction."""
     if frame.empty:
         raise ValueError("Big QMT full snapshot is empty")
-    frame = _database_frame(engine, frame)
     codes = frame["stock_code"].astype(str).drop_duplicates().tolist()
+    if not set(codes) <= set(universe) or not connection.in_transaction():
+        raise ValueError("Big QMT full publication requires its universe and transaction")
     delete_sql = text(
-        "DELETE FROM sm_stock_current WHERE stock_code NOT IN :stock_codes"
-    ).bindparams(bindparam("stock_codes", expanding=True))
-    with mysql_named_lock(engine, "probiga:stock_current", timeout_seconds=1):
-        with engine.begin() as conn:
-            _upsert_current_rows(conn, frame)
-            conn.execute(delete_sql, {"stock_codes": codes})
-            _insert_limit_up_events(conn, limit_up_events or [])
+        "DELETE FROM sm_stock_current WHERE stock_code IN :universe AND stock_code NOT IN :stock_codes"
+    ).bindparams(bindparam("universe", expanding=True), bindparam("stock_codes", expanding=True))
+    _upsert_current_rows(connection, frame)
+    connection.execute(delete_sql, {"universe": universe, "stock_codes": codes})
+    _insert_limit_up_events(connection, limit_up_events or [])
     return int(len(frame))
 
 
-def _replace_tracked_subset(engine, frame: pd.DataFrame) -> int:
+def _replace_tracked_subset(engine, frame: pd.DataFrame, *, universe: list[str]) -> int:
+    # A tracked observation cannot replace a row bound to a different FULL
+    # receipt, or borrow that receipt's batch id for its newer values.
+    if not frame.empty:
+        frame = frame.loc[~frame['stock_code'].astype(str).isin(set(universe))].copy()
     if frame.empty:
         return 0
     frame = _database_frame(engine, frame)
-    with mysql_named_lock(engine, "probiga:stock_current", timeout_seconds=1):
-        with engine.begin() as conn:
-            _upsert_current_rows(conn, frame)
+    with engine.connect() as connection:
+        with mysql_named_lock(engine, "probiga:stock_current", timeout_seconds=1, connection=connection):
+            connection.commit()
+            with connection.begin():
+                _upsert_current_rows(connection, frame)
     return int(len(frame))
 
 
@@ -1671,7 +1678,7 @@ def _timestamp_datetime(value: Any) -> datetime | None:
 
 
 def _record_realtime_sync_receipt(
-    engine,
+    connection,
     *,
     full_payload: dict[str, Any],
     full_file_token: str,
@@ -1683,6 +1690,8 @@ def _record_realtime_sync_receipt(
     capture_mode: str,
 ) -> dict[str, Any]:
     """Persist proof that the exact QMT file reached the current-quote table."""
+    if not connection.in_transaction():
+        raise RuntimeError("Big QMT receipt requires its FULL publication transaction")
 
     source_generated_at = _timestamp_datetime(
         full_payload.get("generated_ts")
@@ -1739,48 +1748,52 @@ def _record_realtime_sync_receipt(
         "full_quote_count": full_payload.get("quote_count"),
         "source_full_file_token": full_file_token,
     }
-    validate_qmt_realtime_sync_receipt_runtime_schema(engine)
-    with engine.begin() as connection:
-        connection.execute(
-            text(
-                """
-                INSERT INTO st_qmt_realtime_sync_receipt_v2 (
-                    receipt_id, source_provider, source_snapshot_token,
-                    source_full_file_token, source_generated_at, heartbeat_at,
-                    expected_count, observed_count, coverage, published_at,
-                    capture_mode, quality_status, evidence_json, created_at
-                )
-                VALUES (
-                    :receipt_id, :source_provider, :source_snapshot_token,
-                    :source_full_file_token, :source_generated_at, :heartbeat_at,
-                    :expected_count, :observed_count, :coverage, :published_at,
-                    :capture_mode, :quality_status, :evidence_json, :created_at
-                )
-                ON DUPLICATE KEY UPDATE
-                    source_full_file_token=VALUES(source_full_file_token),
-                    heartbeat_at=VALUES(heartbeat_at),
-                    expected_count=VALUES(expected_count),
-                    observed_count=VALUES(observed_count),
-                    coverage=VALUES(coverage),
-                    published_at=VALUES(published_at),
-                    capture_mode=VALUES(capture_mode),
-                    quality_status=VALUES(quality_status),
-                    evidence_json=VALUES(evidence_json)
-                """
+    connection.execute(
+        text(
+            """
+            INSERT INTO st_qmt_realtime_sync_receipt_v2 (
+                receipt_id, source_provider, source_snapshot_token,
+                source_full_file_token, source_generated_at, heartbeat_at,
+                expected_count, observed_count, coverage, published_at,
+                capture_mode, quality_status, evidence_json, created_at
+            )
+            VALUES (
+                :receipt_id, :source_provider, :source_snapshot_token,
+                :source_full_file_token, :source_generated_at, :heartbeat_at,
+                :expected_count, :observed_count, :coverage, :published_at,
+                :capture_mode, :quality_status, :evidence_json, :created_at
+            )
+            ON DUPLICATE KEY UPDATE
+                source_full_file_token=VALUES(source_full_file_token),
+                heartbeat_at=VALUES(heartbeat_at),
+                expected_count=VALUES(expected_count),
+                observed_count=VALUES(observed_count),
+                coverage=VALUES(coverage),
+                published_at=VALUES(published_at),
+                capture_mode=VALUES(capture_mode),
+                quality_status=VALUES(quality_status),
+                evidence_json=VALUES(evidence_json)
+            """
+        ),
+        {
+            "receipt_id": receipt_id,
+            **receipt_payload,
+            "evidence_json": json.dumps(
+                evidence,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
             ),
-            {
-                "receipt_id": receipt_id,
-                **receipt_payload,
-                "evidence_json": json.dumps(
-                    evidence,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    default=str,
-                ),
-                "created_at": published_at,
-            },
-        )
+            "created_at": published_at,
+        },
+    )
+    # Replaying the same source token updates the existing unique row without
+    # replacing its primary key. Return that persisted identity, not a new hash.
+    receipt_id = connection.execute(text(
+        "SELECT receipt_id FROM st_qmt_realtime_sync_receipt_v2 "
+        "WHERE source_provider=:source AND source_snapshot_token=:token"
+    ), {"source": PROVIDER_ID, "token": source_snapshot_token}).scalar_one()
     return {
         "receipt_id": receipt_id,
         "source_batch_id": str(full_payload.get("batch_id") or ""),
@@ -1803,6 +1816,26 @@ def _record_realtime_sync_receipt(
         "capture_mode": capture_mode,
         "quality_status": quality_status,
     }
+
+
+def _publish_full_snapshot(engine, frame, *, universe, full_payload, full_file_token,
+                           heartbeat, expected_count, observed_count, coverage, limit_up_events):
+    """Make the FULL rows, events and exact receipt visible in one commit."""
+    frame = _database_frame(engine, frame)
+    validate_qmt_realtime_sync_receipt_runtime_schema(engine)
+    with engine.connect() as connection:
+        with mysql_named_lock(engine, "probiga:stock_current", timeout_seconds=1, connection=connection):
+            connection.commit()
+            with connection.begin():
+                count = _replace_full_snapshot(connection, frame, universe=universe,
+                                               limit_up_events=limit_up_events)
+                # Sample after row DML, immediately before the receipt INSERT.
+                # Success is confirmed only when the surrounding commit returns.
+                receipt = _record_realtime_sync_receipt(connection,
+                    full_payload=full_payload, full_file_token=full_file_token, heartbeat=heartbeat,
+                    expected_count=expected_count, observed_count=observed_count, coverage=coverage,
+                    published_at=datetime.now().replace(microsecond=0), capture_mode="LIVE_FORWARD")
+    return count, receipt
 
 
 def ingest_once(
@@ -1943,30 +1976,26 @@ def ingest_once(
                     "maximum_unpriced_ratio": max_unpriced_ratio,
                 },
             )
-        published_at = datetime.now().replace(microsecond=0)
+        captured_at = datetime.now().replace(microsecond=0)
         limit_up_events, next_limit_states = _capture_limit_up_events(
             engine,
             full_frame,
-            now=published_at,
+            now=captured_at,
         )
-        result["full_rows"] = _replace_full_snapshot(
+        result["full_rows"], sync_receipt = _publish_full_snapshot(
             engine,
             full_frame,
+            universe=universe,
             limit_up_events=limit_up_events,
-        )
-        _limit_event_states.update(next_limit_states)
-        result["limit_up_event_rows"] = len(limit_up_events)
-        sync_receipt = _record_realtime_sync_receipt(
-            engine,
             full_payload=full_payload,
             full_file_token=full_file_token,
             heartbeat=heartbeat,
             expected_count=eligible_expected,
             observed_count=actual,
             coverage=coverage,
-            published_at=published_at,
-            capture_mode="LIVE_FORWARD",
         )
+        _limit_event_states.update(next_limit_states)
+        result["limit_up_event_rows"] = len(limit_up_events)
         tokens["full"] = full_token
         tokens["full_file"] = full_file_token
         tokens["full_sync_receipt"] = sync_receipt
@@ -2012,7 +2041,7 @@ def ingest_once(
         elif not freshness_required:
             result["quote_events_skipped_off_session"] = int(len(tracked_frame))
         if freshness_required:
-            result["tracked_rows"] = _replace_tracked_subset(engine, tracked_frame)
+            result["tracked_rows"] = _replace_tracked_subset(engine, tracked_frame, universe=universe)
         tokens["tracked"] = tracked_token
         tokens["tracked_file"] = tracked_file_token
         result["status"] = "success"
@@ -2118,7 +2147,7 @@ def sync_big_qmt_realtime(
                 engine,
                 live_frame.to_dict(orient="records"),
             )
-    written = _replace_tracked_subset(engine, frame) if freshness_required else 0
+    written = _replace_tracked_subset(engine, frame, universe=watchlist['universe']) if freshness_required else 0
     result = {
         "status": "success" if freshness_required else "idle_market_closed",
         "source": PROVIDER_ID,

@@ -74,22 +74,46 @@ def renew(token, *, child_pid=None):
                    (store.iso(now), store.iso(now+timedelta(seconds=LEASE_SECONDS)), child_pid))
 
 
+def _retry_control(operation):
+    deadline = monotonic()+5
+    for attempt in range(3):
+        try:
+            return operation()
+        except sqlite3.OperationalError as exc:
+            code = getattr(exc, "sqlite_errorcode", 0) & 255
+            if code not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED) or attempt == 2 or monotonic() >= deadline:
+                raise
+            _stop.wait(min(.25*(attempt+1), max(0, deadline-monotonic())))
+
+
+def _control_error(stage, exc):
+    return json.dumps({"stage": stage, "type": type(exc).__name__,
+        "errno": getattr(exc, "sqlite_errorcode", None) or getattr(exc, "errno", None)}, separators=(",", ":"))
+
+
 def _terminate(child):
     if child.poll() is not None:
         return
-    if os.name == "posix":
-        if os.getpgid(child.pid) != child.pid:
-            raise RuntimeError("dashboard capture process group identity changed")
-        os.killpg(child.pid, signal.SIGTERM)
-    else:
-        child.terminate()
+    try:
+        if os.name == "posix":
+            if os.getpgid(child.pid) != child.pid:
+                raise RuntimeError("dashboard capture process group identity changed")
+            os.killpg(child.pid, signal.SIGTERM)
+        else:
+            child.terminate()
+    except ProcessLookupError:
+        child.wait(timeout=3)
+        return
     try:
         child.wait(timeout=3)
     except subprocess.TimeoutExpired:
-        if os.name == "posix":
-            os.killpg(child.pid, signal.SIGKILL)
-        else:
-            child.kill()
+        try:
+            if os.name == "posix":
+                os.killpg(child.pid, signal.SIGKILL)
+            else:
+                child.kill()
+        except ProcessLookupError:
+            pass
         child.wait(timeout=3)
 
 
@@ -101,8 +125,48 @@ def _terminal(token, reason=None):
         db.execute("""UPDATE dashboard_capture SET status='FAILED',finished_at=?,error=?
             WHERE run_id=? AND status='RUNNING'""", (store.iso(now), reason or "capture_child_ended", state["run_id"]))
         failed = db.execute("SELECT COUNT(*) FROM dashboard_capture WHERE run_id=? AND status='FAILED'", (state["run_id"],)).fetchone()[0]
-        db.execute("UPDATE dashboard_owner SET state=?,child_pid=NULL WHERE slot=1",
-                   ("FAILED" if failed or reason else "COMPLETE",))
+        completed = db.execute("SELECT COUNT(*) FROM dashboard_capture WHERE run_id=? AND status IN ('FAILED','COMPLETE')", (state["run_id"],)).fetchone()[0]
+        db.execute("UPDATE dashboard_owner SET state=?,child_pid=NULL,completed_units=?,last_progress_at=? WHERE slot=1",
+                   ("FAILED" if failed or reason else "COMPLETE", completed, store.iso(now)))
+        if not failed and not reason:
+            previous = db.execute("""SELECT trade_date,error FROM dashboard_capture
+                WHERE trade_date=(SELECT trade_date FROM dashboard_capture
+                    WHERE run_id=? AND component<>'supervisor' LIMIT 1)
+                  AND component='supervisor' AND status='FAILED'""", (state["run_id"],)).fetchone()
+            if previous:
+                db.execute("UPDATE dashboard_capture SET status='COMPLETE',finished_at=?,error=? WHERE trade_date=? AND component='supervisor'",
+                    (store.iso(now), json.dumps({"failure": previous["error"], "recovered_by_run_id": state["run_id"]}), previous["trade_date"]))
+
+
+def _record_supervisor_failure(token, reason, *, child_terminal=True):
+    now = store.clock()
+    with store.database(write=True) as db, db:
+        _parent(db, token)
+        run_id = db.execute("SELECT run_id FROM dashboard_owner WHERE slot=1").fetchone()[0]
+        if not run_id:
+            LOGGER.error("dashboard control failure cannot be persisted without a run: %s", reason)
+            return
+        if child_terminal:
+            db.execute("""UPDATE dashboard_capture SET status='FAILED',finished_at=?,error=?
+                WHERE run_id=? AND status='RUNNING'""", (store.iso(now), reason, run_id))
+        day = db.execute("SELECT trade_date FROM dashboard_capture WHERE run_id=? LIMIT 1", (run_id,)).fetchone()
+        day = day[0] if day else now.date().isoformat()
+        exists = db.execute("SELECT 1 FROM dashboard_capture WHERE trade_date=? AND component='supervisor' AND run_id=?", (day, run_id)).fetchone()
+        db.execute("""INSERT INTO dashboard_capture VALUES (?,'supervisor',?,'FAILED',?,?,?,0)
+            ON CONFLICT(trade_date,component) DO UPDATE SET run_id=excluded.run_id,status='FAILED',
+            started_at=excluded.started_at,finished_at=excluded.finished_at,error=excluded.error,published=0""",
+            (day, run_id, store.iso(now), store.iso(now), reason))
+        completed = db.execute("SELECT COUNT(*) FROM dashboard_capture WHERE run_id=? AND status IN ('FAILED','COMPLETE')", (run_id,)).fetchone()[0]
+        db.execute("""UPDATE dashboard_owner SET state='FAILED',total_units=COALESCE(total_units,0)+?,
+            completed_units=?,last_progress_at=? WHERE slot=1""",
+            (0 if exists else 1, completed, store.iso(now)))
+
+
+def _release_owner(token, state):
+    with store.database(write=True) as db, db:
+        _parent(db, token)
+        db.execute("""UPDATE dashboard_owner SET token=NULL,child_pid=NULL,state=?,lease_until=?
+            WHERE slot=1 AND token=? AND pid=?""", (state, store.iso(store.clock()), token, os.getpid()))
 
 
 def _supervise():
@@ -110,18 +174,28 @@ def _supervise():
     token = uuid.uuid4().hex
     child = None
     fd = None
+    owned = False
+    failure = None
+    stage = "initialize"
     try:
-        store.initialize()
+        _retry_control(store.initialize)
         lock_path = store._path().parent / "market-dashboard-owner.lock"
         fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        stage = "owner_lock"
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        while not _stop.is_set() and not claim(token):
+        stage = "claim"
+        while not _stop.is_set():
+            if _retry_control(lambda: claim(token)):
+                owned = True
+                break
             _stop.wait(2)
         if _stop.is_set():
             return
         while not _stop.is_set():
-            renew(token)
-            state = store.runtime()
+            stage = "renew"
+            _retry_control(lambda: renew(token))
+            stage = "runtime"
+            state = _retry_control(store.runtime)
             due = state.get("next_capture_at")
             if due and store.stamp(due) > store.clock():
                 _stop.wait(min(5, (store.stamp(due)-store.clock()).total_seconds()))
@@ -130,38 +204,60 @@ def _supervise():
             command = [sys.executable, "-m", "server.common.market_dashboard_worker", "--capture", token]
             if _external_role:
                 command.append("--external")
+            stage = "spawn"
             child = subprocess.Popen(command,
                 cwd=str(Path(__file__).resolve().parents[2]), stdin=subprocess.DEVNULL,
                 start_new_session=True)
-            renew(token, child_pid=child.pid)
+            stage = "renew_child"
+            _retry_control(lambda: renew(token, child_pid=child.pid))
             timed_out = False
+            stage = "wait"
             while child.poll() is None and not _stop.wait(2):
-                renew(token, child_pid=child.pid)
+                stage = "renew_child"
+                _retry_control(lambda: renew(token, child_pid=child.pid))
                 if monotonic()-started >= CAPTURE_DEADLINE_SECONDS:
                     timed_out = True
                     break
+                stage = "wait"
             if child.poll() is None:
+                stage = "terminate"
                 _terminate(child)
+            stage = "wait"
             result = child.wait(timeout=3)
-            _terminal(token, "capture_deadline_exceeded" if timed_out else "capture_child_failed" if result else None)
             child = None
+            stage = "terminal"
+            _retry_control(lambda: _terminal(token, "capture_deadline_exceeded" if timed_out else "capture_child_failed" if result else None))
             _stop.wait(max(1, CYCLE_SECONDS-(monotonic()-started)))
-    except BlockingIOError:
-        LOGGER.info("dashboard producer already owned by another API process")
     except Exception as exc:
-        LOGGER.error("dashboard producer stopped: %s", type(exc).__name__)
+        if stage == "owner_lock" and isinstance(exc, BlockingIOError):
+            LOGGER.info("dashboard producer already owned by another API process")
+        else:
+            failure = _control_error(stage, exc)
+            LOGGER.error("dashboard producer failed: %s", failure)
     finally:
         if child is not None:
-            _terminate(child)
-        try:
-            with store.database(write=True) as db, db:
-                db.execute("""UPDATE dashboard_capture SET status='FAILED',finished_at=?,error='producer_supervisor_stopped'
-                    WHERE status='RUNNING' AND run_id=(SELECT run_id FROM dashboard_owner WHERE token=? AND pid=?)""",
-                    (store.iso(store.clock()), token, os.getpid()))
-                db.execute("""UPDATE dashboard_owner SET token=NULL,child_pid=NULL,state=?,lease_until=?
-                    WHERE slot=1 AND token=? AND pid=?""", ("NOT_STARTED" if _stop.is_set() else "FAILED", store.iso(store.clock()), token, os.getpid()))
-        except (OSError, sqlite3.Error, RuntimeError):
-            LOGGER.error("dashboard producer release could not be recorded")
+            try:
+                _terminate(child)
+                child.wait(timeout=3)
+                child = None
+            except Exception as exc:
+                cleanup = _control_error("cleanup_terminate", exc)
+                failure = json.dumps({"failure": json.loads(failure), "cleanup": json.loads(cleanup)}) if failure else cleanup
+                LOGGER.error("dashboard child terminal state unproven: %s", cleanup)
+        if owned:
+            try:
+                if failure:
+                    _retry_control(lambda: _record_supervisor_failure(token, failure, child_terminal=child is None))
+                elif child is None:
+                    _retry_control(lambda: _terminal(token, "producer_shutdown"))
+            except Exception as exc:
+                LOGGER.error("dashboard control failure could not be persisted: %s; original=%s",
+                    _control_error("persist_failure", exc), failure)
+            if child is None:
+                try:
+                    _retry_control(lambda: _release_owner(token, "NOT_STARTED" if _stop.is_set() and not failure else "FAILED"))
+                except Exception as exc:
+                    LOGGER.error("dashboard owner release failed: %s", _control_error("release_owner", exc))
         if fd is not None:
             os.close(fd)
 

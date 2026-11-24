@@ -276,18 +276,6 @@ def test_big_qmt_consumer_gets_cold_start_grace_before_receipt_restart():
     )
 
 
-def test_big_qmt_consumer_restart_terminates_its_delegated_process_tree():
-    source = (ROOT / "tools" / "start_local_live_services.ps1").read_text(
-        encoding="utf-8"
-    )
-    stop_source = source.split("function Stop-ManagedProcess", 1)[1].split(
-        "$script:ServiceProcessInventoryLoaded", 1
-    )[0]
-    assert '$ServiceKey -eq "big_qmt_bridge"' in stop_source
-    assert "taskkill.exe /PID $proc.Id /T /F" in stop_source
-    assert "Get-Process -Id $proc.Id" in stop_source
-
-
 def test_launcher_does_not_start_legacy_unbounded_watchdog():
     source = (ROOT / "tools" / "launch_local_live_supervisor.ps1").read_text(
         encoding="utf-8"

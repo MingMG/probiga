@@ -226,6 +226,11 @@ def native_engine(native_server):
                 UNIQUE KEY uk_qmt_sm_stock_current_code(stock_code)
             ) ENGINE=InnoDB
         """)
+        from server.common.auxiliary_runtime_schema import _QMT_REALTIME_SYNC_RECEIPT_DDL
+        from server.common.current_quote_schema import privileged_migrate_live_quote_receipt_read_index
+        conn.exec_driver_sql('DROP TABLE IF EXISTS st_qmt_realtime_sync_receipt_v2')
+        conn.exec_driver_sql(_QMT_REALTIME_SYNC_RECEIPT_DDL)
+    privileged_migrate_live_quote_receipt_read_index(engine)
     yield engine
     engine.dispose()
 
@@ -246,6 +251,16 @@ def stored(engine):
         )).mappings()]
 
 
+def publish_snapshot(engine, frame, *, universe=None, limit_up_events=None):
+    now = datetime.now()
+    count, _receipt = bridge._publish_full_snapshot(engine,frame,
+        universe=universe if universe is not None else frame.stock_code.tolist(),
+        full_payload={'batch_id':frame.iloc[0]['batch_id'],'generated_ts':now.timestamp(),'quote_count':len(frame)},
+        full_file_token='test-file',heartbeat={'updated_ts':now.timestamp(),'status':'running'},
+        expected_count=len(frame),observed_count=len(frame),coverage=1.0,limit_up_events=limit_up_events or [])
+    return count
+
+
 def test_native_full_and_subset_preserve_ids_precision_and_batch(native_engine):
     # More than one SQL chunk, so this covers every chunk's values/bind names.
     codes = [f"{i:06d}" for i in range(1, 503)]
@@ -257,18 +272,18 @@ def test_native_full_and_subset_preserve_ids_precision_and_batch(native_engine):
 
     event.listen(native_engine, "after_cursor_execute", collect_warnings)
     try:
-        assert bridge._replace_full_snapshot(native_engine, quotes(codes)) == 502
+        assert publish_snapshot(native_engine, quotes(codes)) == 502
         first = stored(native_engine)
-        assert bridge._replace_tracked_subset(native_engine, quotes([codes[0]], price=11, batch="tracked")) == 1
+        assert bridge._replace_tracked_subset(native_engine, quotes([codes[0]], price=11, batch="tracked"), universe=codes) == 0
         subset = stored(native_engine)
-        assert [r["id"] for r in first] == [r["id"] for r in subset]
-        assert subset[0]["price"] == Decimal("11.000000")
-        assert subset[0]["batch_id"] == "tracked"
-        assert subset[1:] == first[1:]
-        assert bridge._replace_full_snapshot(native_engine, quotes(codes[:-1], price=12, batch="second")) == 501
+        assert subset == first
+        assert bridge._replace_tracked_subset(native_engine, quotes(['510300'], price=11, batch="tracked"), universe=codes) == 1
+        assert publish_snapshot(native_engine, quotes(codes[:-1], price=12, batch="second"), universe=codes) == 501
         final = stored(native_engine)
-        assert [r["id"] for r in final] == [r["id"] for r in first[:-1]]
-        assert all(r["batch_id"] == "second" for r in final)
+        stocks = [r for r in final if r['stock_code'] != '510300']
+        assert [r["id"] for r in stocks] == [r["id"] for r in first[:-1]]
+        assert all(r["batch_id"] == "second" for r in stocks)
+        assert next(r for r in final if r['stock_code']=='510300')['batch_id']=='tracked'
         assert all(r["change"] == r["change_pct"] == Decimal(0) for r in final)
         assert all(r["amount"] == Decimal("1000.123457") for r in final)
         assert warning_counts and not any(warning_counts)
@@ -277,7 +292,7 @@ def test_native_full_and_subset_preserve_ids_precision_and_batch(native_engine):
 
 
 def test_native_full_snapshot_failure_rolls_back_all_prior_chunks(native_engine):
-    bridge._replace_full_snapshot(native_engine, quotes(["000001", "000999"]))
+    publish_snapshot(native_engine, quotes(["000001", "000999"]))
     before = stored(native_engine)
     calls = 0
 
@@ -291,7 +306,7 @@ def test_native_full_snapshot_failure_rolls_back_all_prior_chunks(native_engine)
     event.listen(native_engine, "before_cursor_execute", fail_second_chunk)
     try:
         with pytest.raises(RuntimeError, match="second chunk"):
-            bridge._replace_full_snapshot(native_engine, quotes([f"{i:06d}" for i in range(1, 503)], price=20))
+            publish_snapshot(native_engine, quotes([f"{i:06d}" for i in range(1, 503)], price=20))
     finally:
         event.remove(native_engine, "before_cursor_execute", fail_second_chunk)
     assert calls == 2
@@ -300,7 +315,7 @@ def test_native_full_snapshot_failure_rolls_back_all_prior_chunks(native_engine)
 
 @pytest.mark.parametrize("corruption", ["unique_key", "precision", "duplicate", "nan"])
 def test_native_invalid_contract_or_payload_never_changes_current_rows(native_engine, corruption):
-    bridge._replace_full_snapshot(native_engine, quotes(["000001"]))
+    publish_snapshot(native_engine, quotes(["000001"]))
     frame = quotes(["000001"], price=11)
     with native_engine.begin() as conn:
         if corruption == "unique_key":
@@ -313,12 +328,12 @@ def test_native_invalid_contract_or_payload_never_changes_current_rows(native_en
             frame.loc[0, "change"] = float("nan")
     before = stored(native_engine)
     with pytest.raises((ValueError, RuntimeError)):
-        bridge._replace_full_snapshot(native_engine, frame)
+        publish_snapshot(native_engine, frame)
     assert stored(native_engine) == before
 
 
 def test_native_release_removes_only_redundant_index_preserving_all_rows(native_engine):
-    bridge._replace_full_snapshot(native_engine, quotes(["000001", "000002"]))
+    publish_snapshot(native_engine, quotes(["000001", "000002"]))
     with native_engine.begin() as connection:
         connection.exec_driver_sql("ALTER TABLE sm_stock_current ADD INDEX idx_sc_code(stock_code)")
     before = stored(native_engine)
@@ -334,7 +349,7 @@ def test_native_release_removes_only_redundant_index_preserving_all_rows(native_
 
 
 def test_native_release_refuses_different_index_without_mutation(native_engine):
-    bridge._replace_full_snapshot(native_engine, quotes(["000001"]))
+    publish_snapshot(native_engine, quotes(["000001"]))
     with native_engine.begin() as connection:
         connection.exec_driver_sql("ALTER TABLE sm_stock_current ADD INDEX idx_sc_code(stock_code,price)")
     before = stored(native_engine)
@@ -346,7 +361,7 @@ def test_native_release_refuses_different_index_without_mutation(native_engine):
 
 
 def test_native_canonical_release_checks_integrity_without_taking_writer_lock(native_engine):
-    bridge._replace_full_snapshot(native_engine, quotes(["000001", "000002"]))
+    publish_snapshot(native_engine, quotes(["000001", "000002"]))
     before = stored(native_engine)
     statements = []
 
@@ -371,7 +386,7 @@ def test_native_canonical_release_checks_integrity_without_taking_writer_lock(na
 
 
 def test_native_redundant_index_release_does_not_bypass_contended_writer_lock(native_engine):
-    bridge._replace_full_snapshot(native_engine, quotes(["000001"]))
+    publish_snapshot(native_engine, quotes(["000001"]))
     with native_engine.begin() as connection:
         connection.exec_driver_sql('ALTER TABLE sm_stock_current ADD INDEX idx_sc_code(stock_code)')
     before = stored(native_engine)

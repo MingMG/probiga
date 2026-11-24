@@ -269,3 +269,163 @@ def test_external_observation_publishes_its_own_receipt_without_main_calendar(sn
     assert store.runtime()["state"] == "COMPLETE"
     assert store.component(DAY, "external")["snapshot_id"] == "verified-external-batch"
     assert store.runtime()["current_units"][0]["published"] == 41
+
+
+def test_supervisor_control_recovers_real_sqlite_lock_without_restarting_owner(snapshots):
+    import sqlite3
+    import threading
+    from server.common import market_dashboard_worker as worker
+    path = store._path()
+    locked = threading.Event()
+    release = threading.Event()
+    def hold():
+        with sqlite3.connect(path) as db:
+            db.execute('BEGIN IMMEDIATE')
+            locked.set()
+            assert release.wait(5), 'SQLite contention release deadline'
+    thread = threading.Thread(target=hold)
+    thread.start()
+    assert locked.wait(1)
+    attempts = []
+    def renew_same_owner():
+        attempts.append(TOKEN)
+        try:
+            worker.renew(TOKEN)
+        except sqlite3.OperationalError:
+            release.set()
+            raise
+    try:
+        worker._retry_control(renew_same_owner)
+    finally:
+        release.set()
+        thread.join(timeout=1)
+    assert attempts == [TOKEN, TOKEN]
+    with store.database() as db:
+        owner = db.execute('SELECT token,pid,renewed_at FROM dashboard_owner').fetchone()
+        assert tuple(owner) == (TOKEN, os.getpid(), store.iso(NOW))
+
+
+def test_supervisor_real_sqlite_lock_has_bounded_exhaustion(tmp_path):
+    import sqlite3
+    from time import monotonic
+    from server.common import market_dashboard_worker as worker
+    path = tmp_path / 'persistent-lock.sqlite3'
+    owner = sqlite3.connect(path)
+    owner.execute('CREATE TABLE value (n INTEGER)')
+    owner.commit()
+    owner.execute('BEGIN IMMEDIATE')
+    attempts = []
+    def blocked():
+        attempts.append(TOKEN)
+        with sqlite3.connect(path, timeout=.02) as db:
+            db.execute('INSERT INTO value VALUES (1)')
+    started = monotonic()
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            worker._retry_control(blocked)
+    finally:
+        owner.close()
+    assert len(attempts) == 3
+    assert monotonic()-started < 5
+
+
+def test_supervisor_failure_is_durable_and_recovers_only_after_successful_cycle(snapshots):
+    import json
+    from server.common import market_dashboard_worker as worker
+    store.start_component(DAY, 'quotes', 'run1', TOKEN)
+    store.finish_component(DAY, 'quotes', 'run1', TOKEN, published=1)
+    with store.database(write=True) as db, db:
+        db.execute('UPDATE dashboard_owner SET total_units=1')
+    reason = worker._control_error('renew', OSError(5, 'private SQL/password must not be copied'))
+    worker._record_supervisor_failure(TOKEN, reason)
+    runtime = store.runtime()
+    assert runtime['total_units'] == runtime['completed_units'] == 2
+    assert store.read(DAY)[1]['quotes']['status'] == 'COMPLETE'
+    failure = store.read(DAY)[1]['supervisor']
+    assert json.loads(failure['error']) == {'stage': 'renew', 'type': 'OSError', 'errno': 5}
+    assert 'private' not in failure['error']
+    with store.database(write=True) as db, db:
+        db.execute("UPDATE dashboard_owner SET run_id='run2',total_units=1,completed_units=0")
+    store.start_component(DAY, 'quotes', 'run2', TOKEN)
+    assert store.read(DAY)[1]['supervisor']['status'] == 'FAILED'
+    assert all(unit['component'] != 'supervisor' for unit in store.runtime()['current_units'])
+    store.finish_component(DAY, 'quotes', 'run2', TOKEN, published=1)
+    worker._terminal(TOKEN)
+    recovered = store.read(DAY)[1]['supervisor']
+    assert recovered['status'] == 'COMPLETE'
+    assert json.loads(recovered['error'])['recovered_by_run_id'] == 'run2'
+
+
+def test_terminate_reaps_real_child_that_exits_between_poll_and_group_lookup(monkeypatch):
+    import errno
+    import subprocess
+    import sys
+    from server.common import market_dashboard_worker as worker
+    child = subprocess.Popen([sys.executable, '-c', 'pass'], start_new_session=True)
+    class ExitedBetweenChecks:
+        pid = child.pid
+        def poll(self):
+            child.wait(timeout=3)
+            return None
+        def wait(self, timeout):
+            return child.wait(timeout=timeout)
+    monkeypatch.setattr(worker.os, 'getpgid', lambda pid: (_ for _ in ()).throw(
+        ProcessLookupError(errno.ESRCH, 'child already exited')), raising=False)
+    # The process/wait is real; Windows cannot exercise POSIX process groups.
+    monkeypatch.setattr(worker.os, 'name', 'posix')
+    worker._terminate(ExitedBetweenChecks())
+    assert child.returncode == 0
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='requires actual POSIX process groups')
+def test_terminate_handles_actual_posix_exit_race():
+    import subprocess
+    import sys
+    from server.common import market_dashboard_worker as worker
+    child = subprocess.Popen([sys.executable, '-c', 'pass'], start_new_session=True)
+    class ExitedBetweenChecks:
+        pid = child.pid
+        def poll(self):
+            child.wait(timeout=3)
+            return None
+        def wait(self, timeout):
+            return child.wait(timeout=timeout)
+    # A reaped real PID makes getpgid raise ESRCH on Linux without mocking it.
+    worker._terminate(ExitedBetweenChecks())
+    assert child.returncode == 0
+
+
+def test_supervisor_keeps_unproven_child_running_and_does_not_recover_on_failed_cycle(snapshots):
+    from server.common import market_dashboard_worker as worker
+    store.start_component(DAY, 'quotes', 'run1', TOKEN)
+    with store.database(write=True) as db, db:
+        db.execute('UPDATE dashboard_owner SET total_units=1')
+    worker._record_supervisor_failure(TOKEN, worker._control_error('terminate', TimeoutError()), child_terminal=False)
+    assert store.read(DAY)[1]['quotes']['status'] == 'RUNNING'
+    assert store.runtime()['completed_units'] == 1
+    assert store.runtime()['total_units'] == 2
+    with store.database(write=True) as db, db:
+        db.execute("UPDATE dashboard_owner SET run_id='run2',total_units=1,completed_units=0")
+    store.start_component(DAY, 'quotes', 'run2', TOKEN)
+    store.finish_component(DAY, 'quotes', 'run2', TOKEN, published=0, error='source_failure')
+    worker._terminal(TOKEN)
+    assert store.read(DAY)[1]['supervisor']['status'] == 'FAILED'
+
+
+def test_successful_cycle_does_not_clear_prior_day_or_clear_without_target_evidence(snapshots):
+    from server.common import market_dashboard_worker as worker
+    store.start_component(DAY, 'quotes', 'run1', TOKEN)
+    worker._record_supervisor_failure(TOKEN, worker._control_error('renew', OSError(5, 'unavailable')))
+    next_day = (NOW+timedelta(days=1)).date().isoformat()
+    with store.database(write=True) as db, db:
+        db.execute("UPDATE dashboard_owner SET run_id='run2',total_units=0,completed_units=0")
+    worker._terminal(TOKEN)
+    assert store.read(DAY)[1]['supervisor']['status'] == 'FAILED'
+    worker.renew(TOKEN, child_pid=os.getpid())
+    with store.database(write=True) as db, db:
+        db.execute('UPDATE dashboard_owner SET total_units=1')
+    store.start_component(next_day, 'quotes', 'run2', TOKEN)
+    store.finish_component(next_day, 'quotes', 'run2', TOKEN, published=1)
+    worker._terminal(TOKEN)
+    assert store.runtime()['state'] == 'COMPLETE'
+    assert store.read(DAY)[1]['supervisor']['status'] == 'FAILED'
