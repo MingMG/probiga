@@ -7,7 +7,8 @@ from types import SimpleNamespace
 import pymysql
 import pytest
 from pymysql.cursors import Cursor
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.dialects.mysql.pymysql import dialect
 
 from server.common import qmt_datadir_daily_coverage as coverage
@@ -177,16 +178,56 @@ def test_daily_proof_uses_bounded_pymysql_multi_row_inserts():
     entity_inserts = [
         query for query in sent if query.lstrip().startswith("INSERT INTO qmt_history_coverage_entity")
     ]
-    assert len(entity_inserts) == 3
-    assert [query.count("),(") + 1 for query in entity_inserts] == [256, 256, 9]
+    assert len(entity_inserts) == 9
+    assert [query.count("),(") + 1 for query in entity_inserts] == [64] * 8 + [9]
     assert sent[0].strip() == "SELECT CURRENT_TIMESTAMP"
-    assert len(sent) == 5
+    assert len(sent) == 11
     assert sent[1].lstrip().startswith("INSERT INTO qmt_history_coverage_manifest")
     timestamp_literal = f"'{server_time:%Y-%m-%d %H:%M:%S}'"
-    assert [query.count(timestamp_literal) for query in sent[1:]] == [1, 256, 256, 9]
+    assert [query.count(timestamp_literal) for query in sent[1:]] == [1] + [64] * 8 + [9]
     persisted_rows = "".join(query.split("VALUES", 1)[1] for query in entity_inserts)
     for entity in proof["entities"]:
         assert persisted_rows.count(f",'{entity['stock_code']}',") == 1
+
+
+def test_lost_entity_batch_reply_rolls_back_before_same_manifest_can_resume(monkeypatch):
+    engine = database(monkeypatch)
+    catalog, calendar = authorities()
+    codes = [str(600000 + offset) for offset in range(130)]
+    catalog.eligible_codes = lambda day: sorted((*codes, *SUSPENDED, IPO))
+    proof = coverage.build_manifest(
+        catalog=catalog, calendar=calendar, day=DAY,
+        rows=[{**bar(), "stock_code": code} for code in codes],
+        run_id="qdd-batch-timeout", captured_at=CUTOFF, snapshot=snapshot(), listings=listing(),
+    )
+    completed_batches = []
+
+    def lose_reply(connection, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().startswith("INSERT INTO qmt_history_coverage_entity"):
+            completed_batches.append(len(parameters))
+            if len(completed_batches) == 2:
+                # Both batches reached the real database before the caller
+                # lost its reply, as in the production publication failure.
+                raise OperationalError(None, None, pymysql.err.OperationalError(2013, "read operation timed out"))
+
+    event.listen(engine, "after_cursor_execute", lose_reply)
+    with pytest.raises(OperationalError, match="read operation timed out"):
+        with engine.begin() as connection:
+            coverage.insert_manifest(connection, proof)
+    event.remove(engine, "after_cursor_execute", lose_reply)
+    assert len(completed_batches) == 2
+    with engine.connect() as connection:
+        for table in (coverage.MANIFEST_TABLE, coverage.ENTITY_TABLE):
+            assert connection.execute(text(f"SELECT COUNT(*) FROM {table} WHERE manifest_hash=:hash"),
+                                      {"hash": proof["manifest_hash"]}).scalar_one() == 0
+    with engine.begin() as connection:
+        coverage.insert_manifest(connection, proof)
+    with engine.connect() as connection:
+        rows = connection.execute(text("SELECT stock_code,row_hash FROM qmt_history_coverage_entity "
+                                       "WHERE manifest_hash=:hash ORDER BY stock_code"),
+                                  {"hash": proof["manifest_hash"]}).all()
+    assert rows == [(entity["stock_code"], entity["row_hash"]) for entity in proof["entities"]]
+    engine.dispose()
 
 
 def test_recovered_suspension_is_visible_only_after_real_native_observation(monkeypatch):

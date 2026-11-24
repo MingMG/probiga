@@ -39,7 +39,8 @@ CHINA = ZoneInfo("Asia/Shanghai")
 MANIFEST_TABLE = "qmt_history_coverage_manifest"
 ENTITY_TABLE = "qmt_history_coverage_entity"
 NATIVE_AMOUNT_WORD = 2 ** 32
-ENTITY_INSERT_BATCH_SIZE = 256
+# A 256-entity INSERT exceeded the production 30s read deadline under daily load.
+ENTITY_INSERT_BATCH_SIZE = 64
 _MAX_NATIVE_PUBLIC_REPLACEMENTS = 32
 _SHA256 = re.compile(r"[a-f0-9]{64}")
 
