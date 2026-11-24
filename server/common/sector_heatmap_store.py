@@ -34,8 +34,14 @@ def _path(*, create: bool = False, root: Path | None = None) -> Path:
             raise OSError("sector observation runtime root is not private")
     path = root / _FILE_NAME
     if create:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
-        os.close(fd)
+        # Closing another descriptor for an existing SQLite inode releases this
+        # process's POSIX locks, including locks held by active DB connections.
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        except FileExistsError:
+            pass
+        else:
+            os.close(fd)
     info = path.lstat()
     if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
         raise OSError("sector observation database must be a regular single-link file")
