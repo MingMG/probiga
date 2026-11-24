@@ -298,6 +298,71 @@ def _prepare_trees(dataset,store,*trees):
     dataset.prepare(store,list(references.values()))
 
 
+def _context_generation(state,day):
+    from server.common.strategy_daily_input_window import V3_DAILY_INPUT_SESSIONS
+    from server.trading_v3.theme_features import research_theme_keywords
+    window=state['feature_windows'][day]
+    if (len(window)!=V3_DAILY_INPUT_SESSIONS or window!=sorted(set(window)) or window[-1]!=day):
+        raise ValueError('prepared context feature window differs')
+    return canonical_sha256({'schema':'probiga.native-ready-context-input.v1','day':day,
+        'known_at':state['requested_at'],'price_cutoff':state['price_cutoff'],
+        'producer':state['producer_identity'],'algorithm':state['feature_algorithm_sha256'],
+        'config':state['config'],'research_keywords':research_theme_keywords(state['config']),
+        'plan':state['plans'][day],
+        'facts':{key:state['day_inputs'][day][key] for key in ('selection','finance','events')},
+        'bars':[{'day':target,**{field:state['bars'][target][field] for field in ('tree','proof','scope')}}
+                for target in window]})
+
+
+def _context_handoff(state,day,dataset):
+    inputs=state['day_inputs'][day]
+    if inputs.get('ready')!={key:inputs[key] for key in ('selection','finance','events','context')}:
+        raise ValueError('prepared context requires an exact READY completion')
+    tree=inputs['context']
+    return {'schema':'probiga.native-ready-context-handoff.v1',
+        'input_identity':_context_generation(state,day),'tree':tree,'references':dataset.tree_references(tree)}
+
+
+def retain_ready_context(connection,source_state,day,*,dataset,store):
+    """Index an explicitly selected audited READY context without recapturing it."""
+    from server.engine import native_research_prepare as prepare
+    source=read_runs(connection,run_id=source_state['run_id'])
+    if not source or source[0]!=source_state:
+        raise ValueError('prepared context source differs from its audited state')
+    record=_context_handoff(source_state,day,dataset)
+    inputs=source_state['day_inputs'][day]
+    _prepare_trees(dataset,store,source_state['plans'][day],*inputs['ready'].values())
+    plan=dataset.get_tree(source_state['plans'][day])
+    if plan.get('status')!='COMPLETE' or plan.get('day')!=day:
+        raise ValueError('prepared context source plan differs')
+    values={key:dataset.get_tree(inputs[key]) for key in ('selection','finance','events','context')}
+    prepare.validate_ready_inputs(plan,*(values[key] for key in ('selection','finance','events','context')),
+        requested_at=source_state['requested_at'],price_cutoff=source_state['price_cutoff'],config=source_state['config'])
+    identity=prepare.base_data_identity(plan,values['selection'],values['context'],
+        finance_reference=inputs['finance'],event_reference=inputs['events'])
+    if source_state.get('base_data_by_day',{}).get(day)!=identity:
+        raise ValueError('prepared context source has no matching READY data identity')
+    digest=store.put(record['input_identity'],'native_context_handoff','complete',record)
+    return {'generation':record['input_identity'],'artifact_sha256':digest}
+
+
+def _retained_context(state,day,plan,dataset,store):
+    from server.engine import native_research_prepare as prepare
+    generation=_context_generation(state,day)
+    record=store.get(generation,'native_context_handoff','complete')
+    if record is None:return None
+    if (type(record) is not dict or set(record)!={'schema','input_identity','tree','references'}
+            or record['schema']!='probiga.native-ready-context-handoff.v1'
+            or record['input_identity']!=generation
+            or record['references']!=dataset.tree_references(record['tree'])):
+        raise ValueError('prepared context handoff identity differs')
+    inputs=state['day_inputs'][day]
+    _prepare_trees(dataset,store,*(inputs[key] for key in ('selection','finance','events')),record['tree'])
+    prepare.validate_ready_inputs(plan,*(dataset.get_tree(inputs[key]) for key in ('selection','finance','events')),
+        dataset.get_tree(record['tree']),requested_at=state['requested_at'],price_cutoff=state['price_cutoff'],config=state['config'])
+    return record
+
+
 def _prepare_day(connection,state,owner,dataset,store,day):
     from server.engine import native_research_prepare as prepare
     from server.trading_v3.daily_features import prepare_feature_identity_context
@@ -325,6 +390,14 @@ def _prepare_day(connection,state,owner,dataset,store,day):
         return
     if 'context' not in inputs:
         _begin_unit(connection,state,owner,'PREPARE context '+day)
+        retained=_retained_context(state,day,plan,dataset,store)
+        if retained is not None:
+            state['prepared_references'].update(retained['references'])
+            dataset.pin(state['run_id'],state['prepared_references'].values())
+            state['day_inputs'][day]['context']=retained['tree']
+            state['completed_units']+=1
+            _save(connection,state,owner)
+            return
         _prepare_trees(dataset,store,*(state['bars'][target]['tree'] for target in state['feature_windows'][day]))
         frame=_frame(dataset,state,plan,day)
         from server.trading_v3.theme_features import research_theme_keywords
@@ -344,6 +417,8 @@ def _prepare_day(connection,state,owner,dataset,store,day):
     state['base_data_by_day'][day]=prepare.base_data_identity(plan,dataset.get_tree(inputs['selection']),
         dataset.get_tree(inputs['context']),finance_reference=inputs['finance'],event_reference=inputs['events'])
     inputs['ready']={key:inputs[key] for key in ('selection','finance','events','context')}
+    context_handoff=_context_handoff(state,day,dataset)
+    store.put(context_handoff['input_identity'],'native_context_handoff','complete',context_handoff)
     generation=_feature_generation(state,day)
     retained=store.get(generation,'native_feature_handoff','complete')
     if retained is not None:

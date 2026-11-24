@@ -503,34 +503,12 @@ def test_kline_stage_insert_failure_rolls_back_partition_delete(monkeypatch):
     }
 
 
-def test_publish_flow_stage_replaces_day_in_one_transaction(monkeypatch):
+def test_publish_flow_stage_rejects_empty_source_proofs_before_touching_rows():
     crawler = _crawler()
-    statements = []
-
-    class _Connection:
-        def begin(self):
-            return nullcontext(self)
-
-        def execute(self, statement, params=None):
-            statements.append((str(statement), params))
-            return SimpleNamespace(rowcount=7)
-
-    connection = _Connection()
-    engine = object()
-    monkeypatch.setattr(crawler, "mysql_named_lock", lambda *args, **kwargs: nullcontext())
-
-    assert crawler._publish_flow_stage(
-        engine,
-        connection,
-        "flow_stage",
-        "2026-08-11",
-    ) == 7
-    assert len(statements) == 2
-    assert statements[0][0].lstrip().upper().startswith("DELETE TARGET_ROWS")
-    assert "SELECT DISTINCT STOCK_CODE" in statements[0][0].upper()
-    assert "TRADE_TIME >=" in statements[0][0].upper()
-    assert statements[1][0].lstrip().upper().startswith("INSERT INTO")
-    assert "SELECT" in statements[1][0].upper()
+    connection = SimpleNamespace(execute=MagicMock())
+    with pytest.raises(ValueError, match='invalid minute flow publication scope'):
+        crawler._publish_flow_stage(object(), connection, 'flow_stage', '2026-08-11', proofs={})
+    connection.execute.assert_not_called()
 
 
 def test_fetch_with_retries_recovers_transient_empty_result(monkeypatch):
