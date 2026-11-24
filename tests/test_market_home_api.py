@@ -269,6 +269,27 @@ def test_close_volume_ratio_uses_common_verified_securities_and_previous_session
     assert result["evidence_mode"] == "CURRENT_OBSERVATION"
 
 
+@pytest.mark.parametrize("provider,quality,expected", [
+    ("sina_history", "SOURCE_VERIFIED", 3),
+    ("sina_history", "VERIFIED", None),
+    ("unknown", "SOURCE_VERIFIED", None),
+])
+def test_close_volume_ratio_reuses_verified_public_history(market_db, provider, quality, expected):
+    sessions = ["2026-10-30", "2026-11-02", "2026-11-03", "2026-11-04", "2026-11-05"]
+    with market_db.begin() as connection:
+        for session in sessions:
+            connection.execute(text("INSERT INTO si_trade_calendar VALUES (:day,1)"), {"day": session})
+            _stock(connection, "000001", 100, day=session, source=provider)
+        _stock(connection, "000001", 100)
+        connection.execute(text("UPDATE sm_stock_kline SET quality_status=:quality, volume=100 WHERE trade_date<>:day"),
+                           {"quality": quality, "day": DAY_TEXT})
+        connection.execute(text("UPDATE sm_stock_kline SET volume=300 WHERE trade_date=:day"), {"day": DAY_TEXT})
+    result = market_home._close_liquidity(DAY_TEXT, [{"stock_code": "000001", "turnover_rate": 1}],
+                                        datetime(2026, 11, 7), float("inf"))
+    assert result["volume_ratio5"] == expected
+    assert result["volume_sample_count"] == (1 if expected else 0)
+
+
 def test_missing_volume_baseline_does_not_erase_verified_turnover(market_db, monkeypatch):
     monkeypatch.setattr(market_home, "_close_volume_ratio", lambda *_: (_ for _ in ()).throw(TimeoutError("deadline")))
     result = market_home._close_liquidity(DAY_TEXT, [{"stock_code": "000001", "turnover_rate": 0}],

@@ -637,6 +637,8 @@ def _close_volume_ratio(day: str, stocks: list[dict], now: datetime, deadline: f
     slots = ",".join(":" + key for key in params)
     codes = {f"sample_{index}": row["stock_code"] for index, row in enumerate(stocks)}
     code_slots = ",".join(":" + key for key in codes)
+    sources = {f"free_source_{index}": value for index, value in enumerate(sorted(VERIFIED_FREE_DAILY_ROW_SOURCES))}
+    source_slots = ",".join(":" + key for key in sources)
     rows = _read(get_kline_engine(), f"""
         SELECT /*+ MAX_EXECUTION_TIME(2500) */
                COUNT(*) AS sample_count, SUM(current_volume) AS current_volume,
@@ -647,12 +649,14 @@ def _close_volume_ratio(day: str, stocks: list[dict], now: datetime, deadline: f
                    SUM(CASE WHEN trade_date<>:day THEN volume ELSE 0 END) AS previous_volume
             FROM sm_stock_kline WHERE trade_date IN ({slots}) AND k_type=1 AND adjust_type=0
               AND stock_code IN ({code_slots})
-              AND permission_status='SUPPORTED' AND quality_status IN ('VERIFIED','QMT_ATTESTED')
-              AND data_source IN ('qmt_datadir','gj_big_qmt_inner') AND volume>=0
+              AND permission_status='SUPPORTED'
+              AND ((quality_status IN ('VERIFIED','QMT_ATTESTED') AND data_source IN ('qmt_datadir','gj_big_qmt_inner'))
+                   OR (quality_status='SOURCE_VERIFIED' AND data_source IN ({source_slots})))
+              AND volume>=0
               AND close>0 AND pre_close>0 AND etl_sync_at<=:now
             GROUP BY stock_code HAVING COUNT(*)=6 AND COUNT(DISTINCT trade_date)=6
         ) AS common_sample
-    """, {**params, **codes, "day": day, "now": now}, deadline=deadline)
+    """, {**params, **codes, **sources, "day": day, "now": now}, deadline=deadline)
     if len(rows) != 1:
         return {}
     row = rows[0]
