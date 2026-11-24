@@ -254,11 +254,46 @@ def _coverage_manifest(engine, *, session, harvested, run_id, historical_documen
         )
     rows = _harvested_daily_rows(harvested)
     missing = sorted(set(catalog.eligible_codes(day)) - set(harvested["codes"]))
+    historical_suspensions = {}
+    if archive_native_evidence:
+        from server.common.formal_analysis_store import FormalAnalysisStore
+        from server.common.historical_suspension_evidence import (
+            SCHEMA as SUSPENSION_SCHEMA, MAX_SECURITIES, build_suspension_evidence,
+        )
+        from integrations.myquant.bridge import upper_limit_history_evidence, to_gm_symbol
+
+        historical_documents = dict(historical_documents or {})
+        unresolved = sorted(set(missing) - set(historical_documents))
+        if unresolved:
+            symbols = [to_gm_symbol(code) for code in unresolved]
+            if len(symbols) > MAX_SECURITIES or None in symbols:
+                raise ValueError(f"historical native suspension source scope unsupported: {day} {len(unresolved)} securities")
+            generation = canonical_digest({"schema": SUSPENSION_SCHEMA, "day": day, "codes": unresolved})
+            store = FormalAnalysisStore(engine)
+            response = store.get(generation, "historical_suspension", "complete")
+            retained = response is not None
+            if response is None:
+                response = upper_limit_history_evidence(symbols, start_date=day, end_date=day, timeout=45)
+            cutoff = dt.datetime.now(CST).replace(tzinfo=None)
+            historical_suspensions = build_suspension_evidence(
+                response, codes=unresolved, day=day, cutoff=cutoff.replace(tzinfo=CST),
+            )
+            if not retained:
+                store.put(generation, "historical_suspension", "complete", response)
+            # The existing manifest column has second precision. Publish only
+            # after that timestamp can include the exact SDK capture clock.
+            source_at = dt.datetime.fromisoformat(response["captured_at"]).astimezone(CST)
+            boundary = source_at.replace(microsecond=0) + dt.timedelta(seconds=bool(source_at.microsecond))
+            delay = (boundary - dt.datetime.now(CST)).total_seconds()
+            if delay > 0:
+                time.sleep(min(delay, 1.0))
     if historical_documents is not None:
+        cutoff = dt.datetime.now(CST).replace(tzinfo=None)
         manifest = build_manifest(
             catalog=catalog, calendar=calendar, day=day, rows=rows, run_id=run_id,
             captured_at=cutoff, historical_documents={code: historical_documents[code] for code in missing
                                                       if code in historical_documents},
+            historical_suspensions=historical_suspensions,
             historical_public_bars=historical_public_bars, previous_session=previous_session,
             native_content_sha256=harvested["digest"] if archive_native_evidence else "",
         )
@@ -918,7 +953,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     exact_repair = bool(args.repair_native_amount_only or args.repair_native_post_close_code)
     native_public_repair = bool(args.repair_native_public_code)
-    repair = bool(args.historical_lifecycle or exact_repair or native_public_repair)
+    repair = bool(args.historical_lifecycle or args.archive_native_evidence or exact_repair or native_public_repair)
     load_project_env()
     engine = (create_batch_engine(connect_args={"connect_timeout": 5, "read_timeout": 30, "write_timeout": 15})
               if repair else create_batch_engine())
@@ -933,20 +968,21 @@ def main(argv: list[str] | None = None) -> int:
         end = dt.date.fromisoformat(args.end)
     if args.public_fallback_code and (not args.historical_lifecycle or start != end):
         parser.error("public fallback requires a single explicit historical lifecycle session")
-    if args.archive_native_evidence and (not args.historical_lifecycle or args.public_fallback_code):
-        parser.error("native archive requires historical lifecycle evidence and exclusively native traded bars")
+    if args.archive_native_evidence and (args.public_fallback_code or exact_repair or native_public_repair):
+        parser.error("native archive requires exclusively native traded bars and no ordinary-product repair")
     locators = historical_documents = None
     deadline = None
-    if args.historical_lifecycle:
+    if args.historical_lifecycle or args.archive_native_evidence:
         latest = dt.date.fromisoformat(authoritative_closed_trade_date(engine))
         if args.latest_session or args.replace_existing or not start <= end < latest or (end - start).days > 6:
             parser.error("historical lifecycle repair requires an explicit prior range of up to seven days")
-        with args.historical_lifecycle.open("rb") as handle:
-            raw_locators = handle.read(32 * 1024 + 1)
-        if len(raw_locators) > 32 * 1024:
-            parser.error("historical lifecycle locator file exceeds 32 KiB")
         deadline = time.monotonic() + 300
-        locators = json.loads(raw_locators)
+        if args.historical_lifecycle:
+            with args.historical_lifecycle.open("rb") as handle:
+                raw_locators = handle.read(32 * 1024 + 1)
+            if len(raw_locators) > 32 * 1024:
+                parser.error("historical lifecycle locator file exceeds 32 KiB")
+            locators = json.loads(raw_locators)
     if exact_repair or native_public_repair:
         latest = dt.date.fromisoformat(authoritative_closed_trade_date(engine))
         if (args.latest_session or args.replace_existing or args.historical_lifecycle or start != end or end > latest
