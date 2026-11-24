@@ -14,11 +14,17 @@ PIT_SOURCE_COVERAGE_BATCH_INDEX_DDL = (
 )
 
 PIT_SOURCE_COVERAGE_DATE_INDEX_NAME = "idx_pit_coverage_source_known_batch"
-PIT_SOURCE_COVERAGE_DATE_INDEX_COLUMNS = ("fact_kind", "source", "watermark_kind", "known_at", "batch_id")
+PIT_SOURCE_COVERAGE_DATE_INDEX_COLUMNS = (
+    "fact_kind", "source", "watermark_kind", "known_at", "batch_id",
+    "stock_code", "received_at", "covered_through_at", "window_start", "window_end",
+    "coverage_status", "result_count",
+)
 PIT_SOURCE_COVERAGE_DATE_INDEX_DDL = (
     "ALTER TABLE `st_pit_source_coverage` "
     "ADD INDEX `idx_pit_coverage_source_known_batch` "
-    "(`fact_kind`,`source`,`watermark_kind`,`known_at`,`batch_id`), "
+    "(`fact_kind`,`source`,`watermark_kind`,`known_at`,`batch_id`,"
+    "`stock_code`,`received_at`,`covered_through_at`,`window_start`,`window_end`,"
+    "`coverage_status`,`result_count`), "
     "ALGORITHM=INPLACE, LOCK=NONE"
 )
 
@@ -62,8 +68,9 @@ def _ensure_index(engine, index_name: str, columns: tuple[str, ...], ddl: str, l
 
     The migrator already bounds metadata locks to 120 seconds and complete
     database replies to 1800 seconds. There are no retries or destructive DDL.
-    A failed/ambiguous ADD is resolved by checking the index on the next normal
-    preparation, preserving the original decision index and every fact row.
+    A failed/ambiguous build is resolved by checking the index on the next normal
+    preparation. The lookup-only date index is replaced online with its covering
+    shape; the original decision index and every fact row are preserved.
     """
     detail = {
         "table": PIT_SOURCE_COVERAGE_TABLE,
@@ -77,6 +84,15 @@ def _ensure_index(engine, index_name: str, columns: tuple[str, ...], ddl: str, l
         return {**detail, "not_applicable": True}
     with engine.begin() as connection:
         rows = _index_rows(connection, index_name)
+        if (index_name == PIT_SOURCE_COVERAGE_DATE_INDEX_NAME and rows
+                and tuple(row["column_name"] for row in rows) == columns[:5]):
+            _validate_index(rows, index_name, columns[:5], label)
+            # Cover the complete batch envelope without random reads of the wide fact table.
+            connection.execute(text(ddl.replace(
+                "ADD INDEX", f"DROP INDEX `{index_name}`, ADD INDEX", 1,
+            )))
+            detail["created"] = True
+            rows = _index_rows(connection, index_name)
         if not rows:
             connection.execute(text(ddl))
             detail["created"] = True
