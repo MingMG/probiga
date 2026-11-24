@@ -21,7 +21,7 @@ from typing import Any
 
 import pandas as pd
 import requests
-from sqlalchemy import text
+from sqlalchemy import insert, text
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,6 +32,7 @@ if str(VENDOR_ROOT) not in sys.path:
     sys.path.insert(0, str(VENDOR_ROOT))
 
 from server.common.batch_db import create_batch_engine, replace_table_rows_exact_keys
+from server.common.acquisition_shards import AcquisitionShards
 from server.common.kline_data import get_kline_engine
 from server.common.mysql_lock import STOCK_KLINE_FREEZE_LOCK_NAME
 from server.common.qmt_attestation_contract import canonical_digest
@@ -567,6 +568,23 @@ def fetch_sina_history_day(
     )
 
     requested = sorted({str(code).zfill(6) for code in codes if code})
+    shards = AcquisitionShards("stock_daily", {
+        "source": SINA_HISTORY_SOURCE, "target_date": target_date,
+        "codes_sha256": canonical_digest(requested), "adjust_type": 0,
+    })
+    retained = shards.load("source_rows")
+    if retained is not None:
+        frame = pd.DataFrame(retained["rows"])
+        if (frame.empty or frame["stock_code"].duplicated().any()
+                or not set(frame["stock_code"]).issubset(requested)
+                or not frame["trade_date"].astype(str).str[:10].eq(target_date).all()
+                or len(frame) / len(requested) < FREE_HISTORY_MIN_CATALOG_COVERAGE
+                or retained["evidence"]["received_count"] != len(frame)):
+            raise FreeDailyBlocked("Sina source checkpoint inventory differs")
+        frame["trade_time"] = pd.to_datetime(frame["trade_time"])
+        frame["trade_date"] = pd.to_datetime(frame["trade_date"]).dt.date
+        _progress("sina_history_source_reused", row_count=len(frame), target_date=target_date)
+        return frame, retained["evidence"]
     deadline = time.monotonic() + HISTORY_DEADLINE_SECONDS
 
     def pull(code: str) -> pd.DataFrame | None:
@@ -627,12 +645,18 @@ def fetch_sina_history_day(
             "Sina historical catalog coverage below threshold: "
             f"{len(frame)}/{len(requested)} ({coverage:.2%})"
         )
-    return frame.reset_index(drop=True), {
+    frame = frame.reset_index(drop=True)
+    evidence = {
         "requested_count": len(requested),
         "received_count": len(frame),
         "coverage_ratio": coverage,
         "captured_at": _now().strftime("%Y-%m-%d %H:%M:%S"),
     }
+    shards.save("source_rows", {
+        "rows": frame.astype(object).where(pd.notna(frame), None).to_dict(orient="records"),
+        "evidence": evidence,
+    })
+    return frame, evidence
 
 
 def _load_existing_rows(
@@ -1446,6 +1470,15 @@ def publish_sina_history(
     )
     frame["batch_id"] = batch_id
     frame["data_version"] = row_hash
+    attempted = 0
+    def write_chunk(table, connection, keys, data_iter):
+        nonlocal attempted
+        rows = [dict(zip(keys, row)) for row in data_iter]
+        result = connection.execute(insert(table.table).values(rows))
+        attempted += len(rows)
+        _progress("database_write_progress", attempted_rows=attempted,
+                  total_rows=len(frame), committed=False)
+        return result.rowcount
     _progress("database_write_start", row_count=len(frame))
     replace_table_rows_exact_keys(
         frame,
@@ -1453,6 +1486,7 @@ def publish_sina_history(
         engine,
         key_columns=("stock_code", "trade_date", "k_type", "adjust_type"),
         lock_name=STOCK_KLINE_FREEZE_LOCK_NAME,
+        method=write_chunk,
     )
     _progress("database_write_complete", row_count=len(frame))
     counts = _source_counts(
