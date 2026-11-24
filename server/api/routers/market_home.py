@@ -701,8 +701,20 @@ def _breadth_comparison(history: list[dict], up: int, total: int) -> dict:
 
 
 def _source_failure(exc: Exception) -> dict:
-    return {"type": type(exc).__name__,
-            "code": getattr(exc, "reason_code", None) or getattr(exc, "code", None) or type(exc).__name__}
+    result = {"type": type(exc).__name__,
+              "code": getattr(exc, "reason_code", None) or getattr(exc, "code", None) or type(exc).__name__}
+    if getattr(exc, "detail", None) == "market-board-live-snapshot":
+        result["stage"] = exc.detail
+    # Keep driver diagnostics without returning SQL, parameters or connection URLs.
+    cause, seen = exc, set()
+    while cause is not None and id(cause) not in seen and len(seen) < 8:
+        seen.add(id(cause))
+        args = getattr(getattr(cause, "orig", None), "args", ())
+        if args and type(args[0]) is int:
+            result["database_errno"] = args[0]
+            break
+        cause = cause.__cause__
+    return result
 
 
 def _live_board_inputs(day: str, now: datetime, deadline: float) -> dict:

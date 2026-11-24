@@ -42,6 +42,51 @@ def test_missing_metric_preserves_other_valid_values():
     assert result["turnover_median_pct"] == 10
 
 
+@pytest.mark.parametrize("age_seconds", [59, 90])
+def test_old_noncontributing_quote_does_not_expire_fresh_aggregate(age_seconds):
+    data = rows()
+    data[0].update(f8="-", f10="-", f124=int(
+        (NOW-timedelta(seconds=age_seconds)).replace(tzinfo=ZoneInfo("Asia/Shanghai")).timestamp()))
+    result = liquidity_live._normalize(data, DAY, NOW)
+    assert result["as_of"] == NOW.replace(tzinfo=ZoneInfo("Asia/Shanghai")).isoformat()
+    assert result["fresh_quote_count"] == 19
+    assert result["excluded_quote_count"] == 1
+    assert result["provider_total"] == 20
+
+
+def test_old_contributors_are_excluded_and_source_range_uses_actual_contributors():
+    data = rows(NOW-timedelta(seconds=5))
+    data[0].update(f8=900, f10=900, f124=int(
+        (NOW-timedelta(seconds=61)).replace(tzinfo=ZoneInfo("Asia/Shanghai")).timestamp()))
+    data[1]["f124"] = int((NOW-timedelta(seconds=60)).replace(
+        tzinfo=ZoneInfo("Asia/Shanghai")).timestamp())
+    data[2].update(f8="-", f10="-", f124=int(
+        (NOW-timedelta(seconds=59)).replace(tzinfo=ZoneInfo("Asia/Shanghai")).timestamp()))
+    result = liquidity_live._normalize(data, DAY, NOW)
+    earliest = (NOW-timedelta(seconds=60)).replace(tzinfo=ZoneInfo("Asia/Shanghai")).isoformat()
+    latest = (NOW-timedelta(seconds=5)).replace(tzinfo=ZoneInfo("Asia/Shanghai")).isoformat()
+    assert result["as_of"] == result["source_time_min"] == earliest
+    assert result["source_time_max"] == latest
+    assert result["fresh_quote_count"] == 18
+    assert result["excluded_quote_count"] == 2
+    assert result["dated_quote_count"] == 19
+    assert result["turnover_sample_count"] == result["volume_sample_count"] == 18
+    assert result["turnover_median_pct"] == 10.5
+
+
+@pytest.mark.parametrize("missing_metrics", [False, True])
+def test_less_than_ninety_percent_fresh_contributors_is_rejected(missing_metrics):
+    data = rows()
+    for item in data[:3]:
+        if missing_metrics:
+            item.update(f8="-", f10="-")
+        else:
+            item["f124"] = int((NOW-timedelta(seconds=61)).replace(
+                tzinfo=ZoneInfo("Asia/Shanghai")).timestamp())
+    with pytest.raises(ValueError, match="coverage"):
+        liquidity_live._normalize(data, DAY, NOW)
+
+
 @pytest.mark.parametrize("stamp", [NOW-timedelta(days=1), NOW-timedelta(minutes=4), NOW+timedelta(seconds=1)])
 def test_widespread_wrong_date_stale_or_future_rows_fail(stamp):
     with pytest.raises(ValueError, match="coverage"):
