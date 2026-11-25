@@ -103,6 +103,7 @@ CNINFO_NONFILING_ISSUERS: dict[str, str] = {
     # ST Cuìhuá did not file its 2025 annual report or 2026 Q1 report by the
     # statutory deadline.  CNInfo org ids are issuer identities, not secrets.
     "002731": "9900022974",
+    "688613": "nssc1000537",
 }
 
 FINANCE_COLUMN_MAP = {

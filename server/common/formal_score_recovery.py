@@ -66,6 +66,8 @@ _PERMITTED_VALIDATION_FILES = frozenset({
     "tools/run_trading_v2_job_worker.py",
     "tools/classify_release_scope.py",
     "biz/stock_finance/sync_finance.py",
+    # Acquisition proof parsing does not alter an already frozen score snapshot.
+    "server/common/finance_nonfiling_evidence.py",
     "server/trading_v2/quotes.py",
     "tools/validate_trading_v2_level1.py",
     "tools/prepare_strategy_governance_schema.py",
@@ -216,6 +218,14 @@ def _scorer_source(root: Path, relative: str) -> bytes:
 def _without_validation_body(path: str, source: bytes) -> str:
     tree = ast.parse(source, filename=path)
     if path == "server/common/pit_facts.py":
+        # Physical read batching retains the same members and validation rules.
+        for node in tree.body:
+            if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and node.targets[0].id == "FINANCE_ATOMIC_BATCH_QUERY_CODE_LIMIT"
+                    and isinstance(node.value, ast.Constant)
+                    and type(node.value.value) is int and node.value.value in (10, 100)):
+                node.value.value = 10
         # Physical access hints preserve the seal predicates, ordering and evidence.
         for function in tree.body:
             if isinstance(function, ast.FunctionDef) and function.name == "_load_latest_finance_atomic_seal_evidence":

@@ -92,6 +92,38 @@ def test_body_finds_current_period_behind_unrelated_title_and_wrong_period(captu
     body.validate_document_body_evidence(evidence, "002731", "2026-06-30")
 
 
+def test_third_quarter_delayed_issuer_uses_reviewed_identity_and_current_body(capture):
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 11, 25, 22, 0, tzinfo=tz)
+
+    capture.setattr(sync, "datetime", Clock)
+    item = row("1225677704", 19, "关于股票交易严重异常波动公告")
+    item.update(secCode="688613", orgId="nssc1000537",
+                announcementTime=int(datetime(2026, 11, 19, tzinfo=sync.ZoneInfo("Asia/Shanghai")).timestamp() * 1000),
+                adjunctUrl="finalpage/2026-11-19/1225677704.PDF")
+    seen, responses = install_network(capture, [{
+        "totalRecordNum": 1, "hasMore": False, "announcements": [item],
+    }], {"1225677704": "证券代码：688613。需复核前期财务数据，导致公司无法按期披露2026年第三季度报告。"})
+    post = sync.requests.post
+
+    def reviewed_post(url, **kwargs):
+        assert kwargs["data"]["stock"] == "688613,nssc1000537"
+        return post(url, **kwargs)
+
+    capture.setattr(sync.requests, "post", reviewed_post)
+    result = sync.fetch_cninfo_nonfiling_evidence(
+        "688613", as_of=date(2026, 11, 25), expected_report_date=date(2026, 9, 30),
+    )
+    assert result["expected_report_date"] == "2026-09-30"
+    assert result["valid_until"] == "2026-11-26"
+    assert result["catalog_identity"]["complete"] is True
+    assert result["nonfiling_statement"] == "导致公司无法按期披露2026年第三季度报告"
+    assert seen == ["1225677704"] and all(response.closed for response in responses)
+    body.validate_document_body_evidence(result, "688613", "2026-09-30")
+
+
 @pytest.mark.parametrize("case", ["truncated", "duplicate", "wrong_issuer", "document_date", "missing_more"])
 def test_catalogue_must_be_complete_and_identity_bound(capture, case):
     item = row("1", 7)

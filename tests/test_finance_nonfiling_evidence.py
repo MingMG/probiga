@@ -109,6 +109,27 @@ def test_other_period_completion_does_not_erase_precise_missing_period():
     assert evidence.nonfiling_statement(BODY + "公司已披露2025年年度报告。", CODE, PERIOD) == STATEMENT
 
 
+@pytest.mark.parametrize("prefix", ["", "公司需复核前期财务数据，"])
+def test_current_causal_inability_in_official_third_quarter_notice(prefix):
+    statement = "导致公司无法按期披露2026年第三季度报告"
+    assert evidence.nonfiling_statement(
+        "证券代码：688613。" + prefix + statement + "。", "688613", "2026-09-30",
+    ) == statement
+
+
+@pytest.mark.parametrize("sentence", [
+    "预计导致公司无法按期披露2026年第三季度报告。",
+    "可能导致公司无法按期披露2026年第三季度报告。",
+    "若导致公司无法按期披露2026年第三季度报告，将停牌。",
+    "公司将无法按期披露2026年第三季度报告。",
+    "公司可能无法按期披露2026年第三季度报告。",
+    "公司引用《关于导致公司无法按期披露2026年第三季度报告的公告》。",
+    "导致公司无法按期披露2026年第三季度报告。现已披露2026年第三季度报告。",
+])
+def test_causal_inability_still_rejects_forecast_quotation_and_later_filing(sentence):
+    assert evidence.nonfiling_statement("证券代码：688613。" + sentence, "688613", "2026-09-30") is None
+
+
 @pytest.mark.parametrize("text", [
     BODY.replace("002731", "002732"),
     BODY.replace("证券代码：002731", "002731"),

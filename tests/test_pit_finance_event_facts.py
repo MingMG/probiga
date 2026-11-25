@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine, event, text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.dialects import mysql
 from sqlalchemy.exc import DatabaseError, OperationalError
 from sqlalchemy.pool import QueuePool
@@ -679,6 +680,49 @@ def test_finance_atomic_seal_binds_full_catalog_and_completion_watermark(
     assert loaded["rows"]["002731"]["_expected_report_date"] == (
         "2026-03-31"
     )
+
+
+def test_finance_member_query_budget_preserves_all_dispositions(monkeypatch):
+    engine = _engine()
+    codes = [f"{value:06d}" for value in range(1, 32)]
+    for code in codes:
+        append_finance_expected_unavailable(
+            engine, stock_code=code, expected_report_date="2026-03-31",
+            known_at="2026-08-30 01:06:35", official_evidence=_nonfiling_evidence(stock_code=code),
+            batch_id=f"bounded-member-{code}",
+        )
+    kwargs = dict(codes=codes, listing_dates={}, completed_known_at=datetime(2026, 8, 30, 1, 10),
+                  as_of_date=date(2026, 8, 30))
+    expected = pit_module._select_finance_atomic_batch_members(engine, **kwargs)
+
+    def bound_query(connection, _cursor, sql, _params, _context, _many):
+        if sql.startswith("SELECT selected."):
+            steps = 0
+
+            def budget():
+                nonlocal steps
+                steps += 1
+                return int(steps >= 2000)
+
+            connection.connection.driver_connection.set_progress_handler(budget, 1)
+
+    def clear_budget(connection, *_args):
+        connection.connection.driver_connection.set_progress_handler(None, 0)
+
+    event.listen(engine, "before_cursor_execute", bound_query)
+    event.listen(engine, "after_cursor_execute", clear_budget)
+    try:
+        monkeypatch.setattr(pit_module, "FINANCE_ATOMIC_BATCH_QUERY_CODE_LIMIT", 100)
+        with pytest.raises(OperationalError, match="interrupted"):
+            pit_module._select_finance_atomic_batch_members(engine, **kwargs)
+        with engine.connect() as connection:
+            clear_budget(connection)
+        monkeypatch.undo()
+        assert pit_module._select_finance_atomic_batch_members(engine, **kwargs) == expected
+    finally:
+        event.remove(engine, "before_cursor_execute", bound_query)
+        event.remove(engine, "after_cursor_execute", clear_budget)
+        engine.dispose()
 
 
 def _finance_discovery_evidence(
