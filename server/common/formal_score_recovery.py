@@ -51,6 +51,9 @@ _PERMITTED_VALIDATION_FILES = frozenset({
     "server/common/scheduler_validation.py",
     "server/engine/strategy_governance.py",
     "server/engine/strategy_governance_orchestrator.py",
+    # These execution/evidence readers are not called by the formal scorer.
+    "server/engine/governance_daily_market.py",
+    "server/engine/strategy_native_backtest.py",
     "server/static/js/trading-v3.js",
     "server/static/trading-v3.html",
     "tools/run_strategy_governance_daily.py",
