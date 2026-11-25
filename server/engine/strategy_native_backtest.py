@@ -2,6 +2,7 @@
 from datetime import date, datetime, timedelta
 import json
 import logging
+import re
 import signal
 import time
 
@@ -195,6 +196,12 @@ def _transient_source_error(exc):
     for _ in range(10):
         if chain is None:break
         if _transient_db_errno(chain) in (1205,1213,2003,2006,2013,3024):return True
+        # PIT returns a sanitized diagnostic before the feature guard raises;
+        # the original SQLAlchemy exception is no longer in this chain.
+        if isinstance(chain, RuntimeError) and re.fullmatch(
+                r'历史事实读取失败：PIT_[A-Z_]+:OperationalError:errno='
+                r'(?:1205|1213|2003|2006|2013|3024)(?::stage=[a-z_]+)?', str(chain)):
+            return True
         chain=chain.__cause__ or chain.__context__
     return False
 
