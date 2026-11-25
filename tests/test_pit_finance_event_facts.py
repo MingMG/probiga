@@ -3235,7 +3235,7 @@ def test_live_common_cutoff_preserves_full_event_chains_with_bounded_mysql_trans
         from server.common.formal_analysis_store import FormalAnalysisStore
         from server.db.formal_analysis_schema import privileged_migrate_formal_analysis_schema
         from server.common import qmt_announcement_pit as announcement_module
-        from tests.test_historical_coverage_chain_access import _mysql_packets_in_sqlite
+        from tests.test_historical_coverage_chain_access import _mysql_packets_in_sqlite, _sqlite_directory_join
         _mysql_packets_in_sqlite(engine)
         privileged_migrate_formal_analysis_schema(engine)
         store=FormalAnalysisStore(engine)
@@ -3243,7 +3243,7 @@ def test_live_common_cutoff_preserves_full_event_chains_with_bounded_mysql_trans
         monkeypatch.setattr(announcement_module,'_assert_pit_fact_schema_prepared',
             lambda target:check_sink(engine if target is mysql_reader else target))
         def mysql_indexes(_c,_cursor,sql,parameters,_context,_many):
-            return re.sub(r' FORCE INDEX \([A-Za-z0-9_]+\)','',sql),parameters
+            return re.sub(r' FORCE INDEX \([A-Za-z0-9_]+\)','',_sqlite_directory_join(sql)),parameters
         event.listen(engine,'before_cursor_execute',mysql_indexes,retval=True)
         dated={**kwargs,'event_trade_date':cutoff.date(),'event_coverage_store':store}
         selected=[]

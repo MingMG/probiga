@@ -447,7 +447,8 @@ def test_finance_machine_result_requires_nonempty_full_coverage() -> None:
     ) == "success"
 
 
-def test_finance_v2_machine_result_accepts_exact_incremental_reuse() -> None:
+@pytest.mark.parametrize("nonfiling_code", [None, "688613", "000002"])
+def test_finance_v2_machine_result_accepts_exact_incremental_reuse(nonfiling_code) -> None:
     passing = {
         "schema": "probiga.finance-sync-result.v2",
         "status": "PASS",
@@ -491,6 +492,25 @@ def test_finance_v2_machine_result_accepts_exact_incremental_reuse() -> None:
         },
     }
     task = {"task_type": "stock_finance"}
+    if nonfiling_code:
+        passing.update(
+            nonempty_code_count=5557,
+            nonempty_code_coverage=5557 / 5558,
+            expected_unavailable_code_count=1,
+            expected_unavailable_code_sample={nonfiling_code: {
+                "reason_code": "CNINFO_REGULATORY_PERIODIC_REPORT_NOT_FILED",
+                "announcement_id": "1225677704",
+                "valid_until": "2026-09-08",
+                "next_retry_date": "2026-09-08",
+                "disposition_id": "e" * 64,
+            }},
+        )
+        passing["atomic_batch"]["expected_unavailable_count"] = 1
+    if nonfiling_code == "000002":
+        assert scheduler_validation.scheduler_output_status(
+            task, json.dumps(passing), return_code=0
+        ) == "failed"
+        return
     assert scheduler_validation.scheduler_output_status(
         task, json.dumps(passing), return_code=0
     ) == "success"
