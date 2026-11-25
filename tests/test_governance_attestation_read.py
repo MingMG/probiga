@@ -56,7 +56,7 @@ def test_bounded_primary_reads_pass_statement_budget_and_reuse_original_availabi
             def budget():
                 nonlocal ticks
                 ticks += 1
-                return ticks > 60
+                return ticks > (20 if "a.source_pre_close" in sql else 60)
 
             db = c.connection.driver_connection
             db.set_progress_handler(budget, 1000)
@@ -73,6 +73,11 @@ def test_bounded_primary_reads_pass_statement_budget_and_reuse_original_availabi
     unbounded = body_sql[0].split(" AND a.attestation_id IN (")[0]
     with pytest.raises(OperationalError, match="interrupted"):
         read(unbounded, params, database=engine)
+    large_ids=[row["attestation_id"] for row in rows[:512]]
+    placeholders=",".join(f":cold_{i}" for i in range(len(large_ids)))
+    with pytest.raises(OperationalError, match="interrupted"):
+        read(unbounded+f" AND a.attestation_id IN ({placeholders})",
+             {**params,**{f"cold_{i}":value for i,value in enumerate(large_ids)}},database=engine)
     body_sql.clear()
     earlier = {**params, "decision_known_at": datetime(2026, 6, 1, 23, 59, 59)}
     rows = market.read_legacy_attestations(read, earlier, database=engine, deadline=time.monotonic() + 10)
@@ -98,6 +103,34 @@ def test_deadline_resumes_completed_pages_without_rereading_them(evidence, monke
         market.read_legacy_attestations(read, params, database=engine, deadline=1)
     rows = market.read_legacy_attestations(read, params, database=engine, deadline=3)
     assert len(rows) == len(fetched) == len(set(fetched)) == 1536
+
+
+def test_inventory_keyset_reads_fit_a_budget_that_interrupts_the_old_range(evidence):
+    engine,params=evidence
+    work=[];limit=[None]
+    def read(sql,params,*,database):
+        with database.connect() as c:
+            used=0
+            def progress():
+                nonlocal used
+                used+=50
+                return limit[0] is not None and used>limit[0]
+            driver=c.connection.driver_connection
+            driver.set_progress_handler(progress,50)
+            try:return [dict(row) for row in c.execute(text(sql),params).mappings()]
+            finally:
+                driver.set_progress_handler(None,0)
+                if 'a.source_pre_close' not in sql:work.append(used)
+    old=("SELECT a.trade_date,a.attestation_id FROM qmt_kline_attestation_row a "
+         "WHERE a.protocol_version=:protocol_version AND a.trade_date BETWEEN :start_date AND :as_of_date "
+         f"AND {market.a_share_stock_code_sql('a.stock_code')} LIMIT 250001")
+    assert len(read(old,params,database=engine))==1536
+    old_cost=work.pop()
+    assert len(market.read_legacy_attestations(read,params,database=engine,deadline=time.monotonic()+30))==1536
+    assert work and max(work)<old_cost
+    limit[0]=old_cost-50
+    with pytest.raises(OperationalError,match='interrupted'):read(old,params,database=engine)
+    assert len(market.read_legacy_attestations(read,params,database=engine,deadline=time.monotonic()+30))==1536
 
 
 def test_invalid_hash_and_non_native_origin_are_not_admitted(evidence):

@@ -721,6 +721,13 @@ def test_authoritative_windows_require_exact_calendar_qmt_date_set(monkeypatch, 
                 and _params["start_date"] <= row["trade_date"]
                 <= _params["as_of_date"]]
             selected = {value for key, value in _params.items() if key.startswith("attestation_")}
+            if "inventory_day" in _params:
+                cursor=(_params["cursor_code"],_params["cursor_id"])
+                return sorted(
+                    [row for row in records if row["trade_date"]==_params["inventory_day"]
+                     and (row["stock_code"],row["attestation_id"])>cursor],
+                    key=lambda row:(row["stock_code"],row["attestation_id"]),
+                )[:400]
             return [row for row in records if not selected or row["attestation_id"] in selected]
         raise AssertionError(sql)
 
