@@ -38,6 +38,7 @@ from server.common.finance_coverage import (
     report_period_gate_applies,
 )
 from server.common.finance_nonfiling_evidence import (
+    CNINFO_NONFILING_ISSUERS,
     EVIDENCE_SCHEMA as FINANCE_NONFILING_BODY_SCHEMA,
     validate_document_body_evidence,
 )
@@ -2171,10 +2172,13 @@ def _validate_nonfiling_evidence_version(
     window_start = _date_value(catalog.get("window_start"), required=True)
     window_end = _date_value(catalog.get("window_end"), required=True)
     published = normalize_decision_at(str(evidence.get("announcement_published_at") or ""))
+    org_id = str(catalog.get("org_id") or "")
+    expected_org = CNINFO_NONFILING_ISSUERS.get(code)
+    issuer_matches = org_id == expected_org if expected_org else bool(re.fullmatch(r"\d+", org_id))
     if (
         catalog.get("schema") != "probiga.cninfo-nonfiling-catalogue.v1"
         or catalog.get("stock_code") != code
-        or not re.fullmatch(r"\d+", str(catalog.get("org_id") or ""))
+        or not issuer_matches
         or catalog.get("complete") is not True
         or type(catalog.get("page_count")) is not int
         or not 1 <= catalog["page_count"] <= 20

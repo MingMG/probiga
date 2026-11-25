@@ -123,6 +123,27 @@ def test_third_quarter_delayed_issuer_uses_reviewed_identity_and_current_body(ca
     assert seen == ["1225677704"] and all(response.closed for response in responses)
     body.validate_document_body_evidence(result, "688613", "2026-09-30")
 
+    from test_pit_finance_event_facts import _engine
+    from server.common.pit_facts import append_finance_expected_unavailable, load_finance_expected_unavailable
+
+    known_at = "2026-11-25 22:01:00"
+    engine = _engine()
+    with pytest.raises(ValueError, match="catalogue or publication binding"):
+        append_finance_expected_unavailable(
+            engine, stock_code="688613", expected_report_date="2026-09-30", known_at=known_at,
+            official_evidence=result | {"catalog_identity": result["catalog_identity"] | {"org_id": "9900022974"}},
+            batch_id="unrelated-issuer",
+        )
+    receipt = append_finance_expected_unavailable(
+        engine, stock_code="688613", expected_report_date="2026-09-30", known_at=known_at,
+        official_evidence=result, batch_id="reviewed-cninfo-issuer",
+    )
+    available, invalid = load_finance_expected_unavailable(
+        engine, codes=["688613"], expected_report_date="2026-09-30", decision_at=known_at,
+    )
+    assert not invalid and available["688613"]["coverage_id"] == receipt.coverage_id
+    engine.dispose()
+
 
 @pytest.mark.parametrize("case", ["truncated", "duplicate", "wrong_issuer", "document_date", "missing_more"])
 def test_catalogue_must_be_complete_and_identity_bound(capture, case):
