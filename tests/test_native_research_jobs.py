@@ -90,6 +90,35 @@ def test_claim_yield_and_reclaim_preserve_frozen_request(queue,monkeypatch):
         assert second_owner==owner
 
 
+def test_yielded_long_job_does_not_starve_other_ready_experiments(queue,monkeypatch):
+    clock=jobs.now_shanghai()
+    monkeypatch.setattr(jobs,'now_shanghai',lambda:clock)
+    first=experiment()
+    second=deepcopy(first)
+    second.update(run_id='c'*64,request_identity='c'*64)
+    with queue.begin() as connection:
+        jobs.enqueue(connection,first)
+    clock+=timedelta(seconds=1)
+    with queue.begin() as connection:
+        jobs.enqueue(connection,second)
+    with queue.connect() as connection:
+        state,owner=jobs.claim(connection)
+        assert state['run_id']==first['run_id']
+        state['completed_units']=1
+        jobs.checkpoint(connection,state,owner,yield_job=True)
+    clock+=timedelta(seconds=2)
+    with queue.connect() as connection:
+        next_state,next_owner=jobs.claim(connection)
+        assert next_state['run_id']==second['run_id']
+        assert next_state['requested_at']==second['requested_at']
+        assert next_state['price_cutoff']==second['price_cutoff']
+        jobs.checkpoint(connection,next_state,next_owner,yield_job=True)
+    clock+=timedelta(seconds=2)
+    with queue.connect() as connection:
+        resumed,_=jobs.claim(connection)
+        assert resumed['run_id']==first['run_id'] and resumed['completed_units']==1
+
+
 @pytest.mark.parametrize('lost',['queue','sequence','lease'])
 def test_late_owner_cannot_publish_partition_or_head(queue,lost):
     state,owner=start(queue)
