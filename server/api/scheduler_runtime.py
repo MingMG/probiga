@@ -4715,6 +4715,21 @@ def _strategy_pipeline_dependencies_ready(
     row: dict, engine, now: datetime
 ) -> tuple[bool, str]:
     task_type = str(row.get("task_type") or "").strip()
+    if (task_type == "analysis_fast" and row.get("_release_analysis_recovery_requested") is True
+            and row.get("_release_analysis_research_mode") is not True):
+        from server.common.formal_score_recovery import reusable_initial_source_runs
+
+        try:
+            frozen = reusable_initial_source_runs(
+                engine, trade_date=str(row.get("_scheduler_target_trade_date") or ""),
+                build_sha=_scheduler_build_commit_sha(), decision_at=now,
+            )
+        except Exception as exc:
+            return False, f"formal_recovery_inputs:{type(exc).__name__}"
+        if frozen is not None:
+            row["_strategy_inputs_ready_at"] = frozen["decision_at"]
+            row["_strategy_inputs_run_uids"] = frozen["source_runs"]
+            return True, "verified_frozen_formal_inputs"
     if task_type == RESEARCH_POOL_TASK_TYPE:
         if row.get("_research_pool_dependencies_ready") is True:
             return True, "ready"

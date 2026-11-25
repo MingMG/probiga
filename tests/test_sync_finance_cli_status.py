@@ -987,7 +987,7 @@ def test_finance_upsert_null_dates_remain_null(monkeypatch, field):
         engine, frame, stock_code="000001", coverage_end=date(2026, 9, 1),
         observed_at=datetime(2026, 9, 1, 20, 0),
     ) == 2
-    assert source_rows[0][field] is None
+    assert next(row for row in source_rows if row["report_date"] == "2025-12-31")[field] is None
     guard = coverages[0]["watermark_evidence"]["source_timestamp_guard"]
     key = "maximum_notice_date" if field == "notice_date" else "maximum_update_date"
     assert guard[key] == "2026-09-01"
@@ -1003,11 +1003,20 @@ def test_bulk_finance_write_preserves_report_ids_cache_order_and_atomic_coverage
         connection.execute(text("CREATE TABLE si_stock_finance (stock_code TEXT, report_date TEXT, "
             "report_type TEXT,notice_date TEXT,basic_eps REAL,etl_sync_at TEXT, "
             "UNIQUE(stock_code,report_date))"))
-    statements, display_batches, fail_display = [], [], [False]
+    statements, display_batches, fail_display, metadata_batches = [], [], [False], []
 
     @event.listens_for(engine, "before_cursor_execute", retval=True)
     def adapt_display_upsert(_conn, _cursor, statement, parameters, _context, many):
         statements.append(statement)
+        driver = _conn.connection.driver_connection
+        driver.set_progress_handler(None, 0)
+        if statement.startswith("SELECT identity_hash,") and "FROM st_pit_finance_revision" in statement:
+            metadata_batches.append(tuple(parameters))
+            work = [0]
+            def budget():
+                work[0] += 100
+                return int(work[0] > 1000)
+            driver.set_progress_handler(budget, 100)
         if statement.lstrip().startswith("INSERT INTO si_stock_finance"):
             if fail_display[0]:
                 raise RuntimeError("display write interrupted")
@@ -1042,9 +1051,10 @@ def test_bulk_finance_write_preserves_report_ids_cache_order_and_atomic_coverage
     upsert(frame, 20)
     original = fact_rows()
     assert len(original) == 41 and display_batches == [(True, 41)]
-    repeated_sql = upsert(frame, 21)
+    upsert(frame, 21)
     assert fact_rows() == original  # No relabelling capture time or batch on immutable facts.
-    assert len(repeated_sql) == 5  # One locked read, one display batch, three coverage statements.
+    first_locked_ids = [key for batch in metadata_batches[:5] for key in batch]
+    assert len(first_locked_ids) == 41 and first_locked_ids == sorted(first_locked_ids)
     assert display_batches == [(True, 41), (True, 41)]
     changed = frame.copy()
     changed.loc[40, "basic_eps"] = 2.5

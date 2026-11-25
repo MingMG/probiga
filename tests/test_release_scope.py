@@ -98,6 +98,28 @@ def test_windows_runtime_body_change_is_not_a_schema_change(repo, path):
     assert result["base_contract_sha256"] == result["contract_sha256"]
 
 
+def test_linux_formal_recovery_branch_preserves_windows_artifact_identity(repo):
+    path = "server/api/scheduler_runtime.py"
+    head = 'REVISION = 1\n\ndef _strategy_pipeline_dependencies_ready(row, engine, now):\n    task_type = str(row.get("task_type") or "").strip()\n'
+    tail = '    return validate_shared_qmt_dependencies(row)\n'
+    repo.write(path, head + tail)
+    windows = repo.commit()
+    branch = ('    if (task_type == "analysis_fast" and row.get("_release_analysis_recovery_requested") is True\n'
+              '            and row.get("_release_analysis_research_mode") is not True):\n'
+              '        return validate_frozen_formal_inputs(engine)\n')
+    repo.write(path, head + branch + tail)
+    linux = repo.commit()
+    assert repo.classify(linux, base=windows, windows_base=windows)["scope"] == "LINUX"
+    for changed in (
+        (head + branch + tail).replace("analysis_fast", "analysis_upper_evidence_prepare"),
+        (head + branch + tail).replace("validate_shared_qmt_dependencies", "changed_qmt_dependencies"),
+    ):
+        repo.write(path, changed)
+        result = repo.classify(repo.commit(), base=linux, windows_base=windows)
+        assert result["scope"] == "COORDINATED"
+        assert result["windows_runtime_changed_paths"] == [path]
+
+
 def _missed_windows_runtime_release(
     repo, path="server/common/qmt_datadir_minute_coverage.py",
 ):
