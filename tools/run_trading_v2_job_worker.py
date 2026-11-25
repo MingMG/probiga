@@ -40,7 +40,8 @@ def run_with_diagnostics(engine):
 
 def main() -> int:
     load_project_env()
-    engine = create_batch_engine()
+    engine = create_batch_engine(pool_timeout=5,
+        connect_args={'connect_timeout': 8, 'read_timeout': 15, 'write_timeout': 10})
     try:
         result = run_with_diagnostics(engine)
         if result["status"] == "idle" or result.get('job_type')=='NATIVE_REPLAY':

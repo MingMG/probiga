@@ -62,6 +62,7 @@ _PERMITTED_VALIDATION_FILES = frozenset({
     "server/static/js/trading-v3.js",
     "server/static/trading-v3.html",
     "tools/run_strategy_governance_daily.py",
+    "tools/run_trading_v2_job_worker.py",
     "server/static/index.html",
     "server/static/js/app.js",
     # These display-only modules are not imported by the scoring process.

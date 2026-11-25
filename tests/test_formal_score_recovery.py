@@ -520,6 +520,7 @@ def calculate(conn):
         "server/engine/strategy_native_backtest.py",
         "server/engine/native_research_jobs.py",
         "server/engine/native_research_prepare.py",
+        "tools/run_trading_v2_job_worker.py",
         "server/common/historical_announcement_read.py",
         "deploy/production_deploy.sh",
     ):
