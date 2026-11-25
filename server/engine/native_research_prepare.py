@@ -59,6 +59,8 @@ def prepare_selection(connection, state, owner, plan):
             event_coverage_progress=_source_progress(connection, state, owner, day, 'event_coverage', deadline=deadline),
             event_metadata_progress=_source_progress(connection, state, owner, day, 'event_metadata', deadline=deadline))
         if cutoff['status'] != PIT_AVAILABLE:
+            if cutoff['reason'].endswith(':RuntimeError'):
+                raise RuntimeError('历史事实读取失败：' + cutoff['reason'])
             _assert_read_succeeded(cutoff['reason'])
             return {'status': 'BLOCKED', 'reason': cutoff['reason'], 'identity': plan['identity']}
         if len(finances) != 1 or len(events) != 1:

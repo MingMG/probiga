@@ -52,6 +52,37 @@ def test_header_inventory_does_not_silently_truncate_oversized_batch():
             _reconstruction_counts(c, source='cninfo.announcement', batch_id='oversized', deadline=monotonic() + 30)
 
 
+def test_verified_header_prefix_fits_bounded_cache_reply_budget(tmp_path, monkeypatch):
+    from server.common import qmt_announcement_pit as announcements
+    from server.common.formal_analysis_store import FormalAnalysisStore
+    from server.db.formal_analysis_schema import privileged_migrate_formal_analysis_schema
+    engine = create_engine('sqlite:///' + str(tmp_path / 'warm-headers.sqlite'))
+    privileged_migrate_formal_analysis_schema(engine)
+    with engine.begin() as c:
+        c.execute(text('CREATE TABLE st_pit_source_coverage(coverage_id TEXT PRIMARY KEY,fact_kind TEXT,source TEXT,batch_id TEXT,stock_code TEXT,result_count INT)'))
+        c.execute(text("INSERT INTO st_pit_source_coverage VALUES(:code,'event','cninfo.announcement','selected',:code,:count)"),
+                  [{'code': f'{i:06d}', 'count': i % 7} for i in range(2000)])
+    store = FormalAnalysisStore(engine)
+    expected = [i % 7 for i in range(2000)]
+    with engine.connect() as c:
+        assert _reconstruction_counts(c, source='cninfo.announcement', batch_id='selected',
+                                      deadline=monotonic() + 30, coverage_store=store) == expected
+    clock = [0]
+    monkeypatch.setattr(announcements, 'monotonic', lambda: clock[0])
+
+    def network_latency(_connection, _cursor, statement, _parameters, _context, _many):
+        if 'st_formal_analysis_artifact' in statement:
+            clock[0] += 1
+
+    event.listen(engine, 'before_cursor_execute', network_latency)
+    try:
+        with engine.connect() as c:
+            assert _reconstruction_counts(c, source='cninfo.announcement', batch_id='selected',
+                                          deadline=10, coverage_store=store) == expected
+    finally:
+        event.remove(engine, 'before_cursor_execute', network_latency)
+
+
 def test_header_counts_resume_durable_pages_without_reading_the_verified_prefix(tmp_path):
     from server.common.formal_analysis_store import FormalAnalysisStore
     from server.db.formal_analysis_schema import privileged_migrate_formal_analysis_schema

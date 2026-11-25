@@ -11,6 +11,64 @@ from server.engine import native_research_jobs as jobs
 from tests.test_native_research_jobs import queue,experiment
 
 
+def test_source_no_progress_is_not_swallowed_as_a_blocked_day(queue, tmp_path, monkeypatch):
+    from server.common import pit_facts as pit
+    from server.common import historical_announcement_read as history
+    from server.engine import native_research_prepare as prepare
+    from server.engine import native_research_identity as identity
+    privileged_migrate_formal_analysis_schema(queue)
+    monkeypatch.setenv('PROBIGA_NATIVE_DATASET_ROOT', str(tmp_path))
+    monkeypatch.setattr(identity, 'algorithm_identity', lambda _config: {'sha256': 'math'})
+    monkeypatch.setattr(prepare, 'source_deadline', lambda: -1)
+    monkeypatch.setattr(pit, 'load_finance_atomic_batch_seal', lambda *_a, **_k: {'seal': 'verified'})
+    state = experiment()
+    state.update(phase='PREPARE_DAYS', completed_units=78, total_units=105)
+    with queue.begin() as connection:
+        jobs.enqueue(connection, state)
+
+    def source(_engine, **kwargs):
+        kwargs['metadata_progress'](100, 400, 'fixed-source', True)
+
+    monkeypatch.setattr(history, 'validate_dated_announcement_batch', source)
+    plan = {'day': '2026-09-07', 'decision_at': state['requested_at'], 'eligible': ['000001'],
+            'finance_observation_at': '2026-09-07 23:59:59', 'snapshot_generation': 'e' * 64,
+            'identity': {'status': 'VERIFIED'}}
+
+    def selection_step(connection, state, owner, *, feature_budget=None):
+        result = prepare.prepare_selection(connection, state, owner, plan)
+        state['incorrect_data_gap'] = result
+        state['completed_units'] += 6
+
+    monkeypatch.setattr(native, '_step', selection_step)
+    assert native.native_tick(queue)['status'] == 'RUNNING'
+    later = jobs.now_shanghai() + timedelta(seconds=2)
+    monkeypatch.setattr(jobs, 'now_shanghai', lambda: later)
+    result = native.native_tick(queue)
+    assert result['status'] == 'FAILED' and 'NO_PROGRESS' in result['reason']
+    with queue.connect() as connection:
+        saved = native.read_runs(connection)[0]
+        assert saved['completed_units'] == 78 and 'incorrect_data_gap' not in saved
+        assert saved['source_progress']['completed'] == 100
+
+
+def test_unexpected_runtime_source_failure_is_not_a_missing_dataset(queue, monkeypatch):
+    from server.common import pit_facts as pit
+    from server.common import historical_announcement_read as history
+    from server.engine import native_research_prepare as prepare
+    privileged_migrate_formal_analysis_schema(queue)
+    monkeypatch.setattr(pit, 'load_finance_atomic_batch_seal', lambda *_a, **_k: {'seal': 'verified'})
+
+    def source(*_args, **_kwargs):
+        raise RuntimeError('source reader failed')
+
+    monkeypatch.setattr(history, 'validate_dated_announcement_batch', source)
+    plan = {'day': '2026-09-07', 'decision_at': '2026-11-22 18:05:19', 'eligible': ['000001'],
+            'finance_observation_at': '2026-09-07 23:59:59', 'snapshot_generation': 'e' * 64,
+            'identity': {'status': 'VERIFIED'}}
+    with queue.connect() as connection, pytest.raises(RuntimeError, match='历史事实读取失败'):
+        prepare.prepare_selection(connection, experiment(), None, plan)
+
+
 def test_pit_connection_loss_uses_one_existing_retry_and_keeps_source_checkpoint(queue, tmp_path, monkeypatch):
     from server.engine import native_research_identity as identity
     monkeypatch.setattr(identity, 'algorithm_identity', lambda _config: {'sha256': 'math'})
