@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from time import monotonic
@@ -52,7 +52,8 @@ def _live_receipt_gate(
                                 MAX(source_generated_at) AS latest_source_at,
                                 MAX(published_at) AS latest_published_at
                             FROM st_qmt_realtime_sync_receipt_v2
-                            WHERE DATE(source_generated_at) = :trade_date
+                            WHERE source_generated_at >= :trade_date
+                              AND source_generated_at < :next_trade_date
                               AND capture_mode = 'LIVE_FORWARD'
                               AND quality_status = 'PASS'
                               AND (
@@ -61,7 +62,7 @@ def _live_receipt_gate(
                               )
                             """
                         ),
-                        {"trade_date": trade_day},
+                        {"trade_date": trade_day, "next_trade_date": trade_day + timedelta(days=1)},
                     ).mappings().first()
                 receipt_count = int((row or {}).get("receipt_count") or 0)
                 receipt_minutes = int((row or {}).get("receipt_minutes") or 0)

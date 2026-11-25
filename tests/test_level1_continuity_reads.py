@@ -123,6 +123,33 @@ def test_validation_stops_before_secondary_queries_when_index_is_missing(storage
     assert validator.run_validation()['block_reason'] == 'level1_read_index_unavailable'
 
 
+def test_receipt_range_avoids_old_wide_rows_and_preserves_session_filters(storage):
+    with storage.begin() as connection:
+        connection.exec_driver_sql('''CREATE TABLE st_qmt_realtime_sync_receipt_v2 (
+            source_generated_at TEXT,published_at TEXT,capture_mode TEXT,quality_status TEXT,evidence_json TEXT)''')
+        connection.exec_driver_sql('''CREATE INDEX idx_qmt_realtime_level1_continuity
+            ON st_qmt_realtime_sync_receipt_v2(capture_mode,quality_status,source_generated_at,published_at)''')
+        rows=[{'at':'2026-11-24 09:31:00','mode':'LIVE_FORWARD','quality':'PASS'} for _ in range(5000)]
+        rows += [{'at':at,'mode':'LIVE_FORWARD','quality':'PASS'} for at in [
+            '2026-11-25 09:31:00','2026-11-25 09:32:00','2026-11-25 15:00:59',
+            '2026-11-25 09:30:59','2026-11-25 12:00:00','2026-11-25 15:01:00',
+            '2026-11-26 09:31:00']]
+        rows += [dict(at='2026-11-25 09:33:00',mode='HISTORICAL',quality='PASS'),
+                 dict(at='2026-11-25 09:34:00',mode='LIVE_FORWARD',quality='FAIL')]
+        connection.execute(text('''INSERT INTO st_qmt_realtime_sync_receipt_v2
+            VALUES (:at,:at,:mode,:quality,'original source payload')'''),rows)
+    with storage.connect() as connection:
+        driver=connection.connection.dbapi_connection
+        driver.set_progress_handler(lambda:1,1000)
+        try:
+            result=validator._live_receipt_gate(storage,date(2026,11,25))
+        finally:
+            driver.set_progress_handler(None,0)
+    assert result['reason']=='insufficient_live_receipts'
+    assert result['receipt_count']==3 and result['receipt_minutes']==3
+    assert result['days'][0]['latest_source_at']=='2026-11-25 15:00:59'
+
+
 @pytest.mark.parametrize('fault', [None, 'missing', 'column', 'prefix', 'hidden', 'expression', 'hash'])
 def test_physical_index_readiness_checks_complete_definition(storage, fault):
     rows = [dict(COLUMN_NAME=name,SUB_PART=None,INDEX_TYPE='BTREE',IS_VISIBLE='YES',EXPRESSION=None)
