@@ -486,6 +486,8 @@ def test_pruned_previous_checkout_reuses_only_immutable_git_and_current_scorer(t
         path = source / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"def scorer():\n    return 7\n")
+        if relative == "server/common/pit_facts.py":
+            path.write_bytes(path.read_bytes() + b"\ndef _bind_historical_event_snapshot(conn):\n    return conn.all()\n")
     scheduler = "server/api/scheduler_runtime.py"
     scheduler_source = b"""
 def _terminal_snapshot(conn):
@@ -511,6 +513,8 @@ def calculate(conn):
     previous = git("rev-parse", "HEAD")
 
     scheduler_file.write_bytes(scheduler_source.replace(b"conn.older()", b"conn.exact()"))
+    historical = source / "server/common/pit_facts.py"
+    historical.write_bytes(historical.read_bytes().replace(b"conn.all()", b"conn.bounded()"))
     for relative in (
         "server/static/js/app.js", "server/api/main.py", "server/api/routers/market_home.py",
         "server/api/routers/research_futures.py", "server/static/js/research-tools.js",

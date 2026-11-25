@@ -6048,6 +6048,7 @@ def _bind_historical_event_snapshot(
     from server.common.pit_source_coverage_index import PIT_SOURCE_COVERAGE_BATCH_INDEX_NAME
     from server.common.qmt_announcement_pit import (
         LIVE_ANNOUNCEMENT_BATCH_VALIDATION_BUDGET_SECONDS, VALIDATION_INVENTORY_CODE_LIMIT,
+        VALIDATION_READ_BATCH_SIZE,
         AnnouncementCatalog, HistoricalAnnouncementSelection,
         QMT_ANNOUNCEMENT_RECONSTRUCTION_BATCH_SCHEMA,
         _batch_root_from_entries, _bounded_announcement_payload_keys, _fallback_receipt_valid,
@@ -6203,10 +6204,14 @@ def _bind_historical_event_snapshot(
                 connection, exact_ids=stock_batch, received=received, deadline=deadline, offset=offset,
                 head_frontier=frontier, metadata_store=coverage_store, metadata_progress=metadata_progress,
             )
-            sizes = _read_live_announcement_payload_sizes(
-                connection, source=source, batch_id=batch_id, coverage_ids=list(stock_batch.values()),
-                deadline=deadline, stage=f"signed-historical-size:{offset}",
-            )
+            sizes = {}
+            coverage_ids = list(stock_batch.values())
+            for size_start in range(0, len(coverage_ids), VALIDATION_READ_BATCH_SIZE):
+                sizes.update(_read_live_announcement_payload_sizes(
+                    connection, source=source, batch_id=batch_id,
+                    coverage_ids=coverage_ids[size_start:size_start + VALIDATION_READ_BATCH_SIZE],
+                    deadline=deadline, stage=f"signed-historical-size:{offset}:{size_start}",
+                ))
             for keys in _bounded_announcement_payload_keys(list(sizes.items())):
                 selected_ids = [key for key, _ in keys]
                 rows = _read_live_announcement_payload_rows(

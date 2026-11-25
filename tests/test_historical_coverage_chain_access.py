@@ -13,6 +13,91 @@ from server.common.formal_analysis_store import FormalAnalysisStore
 from server.db.formal_analysis_schema import MEMBER_TABLE,privileged_migrate_formal_analysis_schema
 
 
+def test_historical_payload_size_reads_fit_per_query_budget(monkeypatch, tmp_path):
+    from datetime import date
+    from types import SimpleNamespace
+    from server.common import qmt_announcement_pit as announcement
+    from server.common.announcement_provider import CninfoMarketAnnouncementProvider, ProviderBackedAnnouncementAdapter
+    from server.common.historical_announcement_read import validate_dated_announcement_batch
+    from tests.test_announcement_provider_fallback import _Client, _master, _row_on_date, _historical_authority_v3
+
+    target = date(2026, 9, 1)
+    started = datetime(2026, 9, 3, 13)
+    received = started + timedelta(seconds=20)
+    codes = ('000001', '600519')
+    catalog = announcement.AnnouncementCatalog('size-budget', 'a'*64, 'b'*64,
+        codes, dict(zip(codes, ('000001.SZ', '600519.SH'))))
+    master = _master(*codes)
+    client = _Client(masters=[master, master], rows_by_code={
+        codes[0]: [_row_on_date(codes[0], 0, target)], codes[1]: []})
+    provider = CninfoMarketAnnouncementProvider(client=client, minimum_request_interval=0,
+        now_fn=lambda: started+timedelta(seconds=10))
+    monkeypatch.setattr(ProviderBackedAnnouncementAdapter, 'bind_capture_deadline',
+        lambda adapter, **_kwargs:setattr(adapter, '_deadline_monotonic', monotonic()+30))
+    engine = create_engine('sqlite://')
+    pit.ensure_pit_fact_schema(engine)
+    clocks = iter((started, received))
+    publication = announcement.synchronize_historical_cninfo_announcements(engine,
+        adapter=ProviderBackedAnnouncementAdapter(provider, workers=1), checkpoint_root=tmp_path,
+        catalog=catalog, context=announcement.HistoricalReconstructionContext(
+            target_trade_date=target, source_query_cutoff_at=datetime.combine(target, datetime.max.time()),
+            reconstruction_started_at=started, scheduler_run_uid='1'*32, build_sha='2'*40,
+            authority=_historical_authority_v3(catalog, target)),
+        now_fn=lambda: next(clocks, received+timedelta(seconds=1)), batch_size=2)
+    assert publication['status'] == 'COMPLETE'
+    catalog_proof = SimpleNamespace(batch_id=catalog.batch_id, manifest_hash=catalog.manifest_hash,
+        member_set_hash=catalog.member_set_hash, members=[{'stock_code':code,'qmt_code':catalog.qmt_by_code[code]}
+            for code in codes], eligible_codes=lambda _day:list(codes))
+    monkeypatch.setattr('server.common.qmt_stock_catalog.load_stock_catalog', lambda *_a,**_k:catalog_proof)
+    options = dict(codes=list(codes), decision_at=received+timedelta(seconds=1),
+        window_start=target-timedelta(days=30), window_end=target, expected_trade_date=target)
+    expected = validate_dated_announcement_batch(engine, **options)
+    with engine.connect() as connection:
+        ids = list(connection.execute(text('SELECT coverage_id FROM st_pit_source_coverage ORDER BY stock_code')).scalars())
+        driver = connection.connection.driver_connection
+        steps = [0]
+        def count_steps():
+            steps[0] += 1
+            return 0
+        driver.set_progress_handler(count_steps, 1)
+        try:
+            announcement._read_live_announcement_payload_sizes(connection, source=publication['source'],
+                batch_id=publication['batch_id'], coverage_ids=ids[:1], deadline=monotonic()+5, stage='size-budget')
+        finally:
+            driver.set_progress_handler(None, 0)
+    budget = steps[0] + steps[0]//4
+    def bound_size_read(connection, _cursor, sql, _parameters, _context, _many):
+        if 'LENGTH(CAST(payload_json AS BLOB))' in sql:
+            used = [0]
+            def stop_large_read():
+                used[0] += 1
+                return int(used[0] > budget)
+            connection.connection.driver_connection.set_progress_handler(stop_large_read, 1)
+    def clear_budget(connection, *_args):
+        connection.connection.driver_connection.set_progress_handler(None, 0)
+    event.listen(engine, 'before_cursor_execute', bound_size_read)
+    event.listen(engine, 'after_cursor_execute', clear_budget)
+    monkeypatch.setattr(announcement, 'VALIDATION_READ_BATCH_SIZE', 1)
+    try:
+        with engine.connect() as connection:
+            try:
+                with pytest.raises(OperationalError, match='interrupted'):
+                    announcement._read_live_announcement_payload_sizes(connection, source=publication['source'],
+                        batch_id=publication['batch_id'], coverage_ids=ids, deadline=monotonic()+5, stage='size-budget')
+            finally:
+                clear_budget(connection)
+        selected = []
+        assert validate_dated_announcement_batch(engine, **options, capture_historical_selection=selected.append) == expected
+        assert set(selected[0].members) == set(codes)
+        assert [selected[0].members[code][0]['result_count'] for code in codes] == [1, 0]
+    finally:
+        event.remove(engine, 'before_cursor_execute', bound_size_read)
+        event.remove(engine, 'after_cursor_execute', clear_budget)
+        with engine.connect() as connection:
+            clear_budget(connection)
+        engine.dispose()
+
+
 @pytest.mark.parametrize('source',['cninfo.announcement','qmt.announcement','eastmoney.notice'])
 def test_historical_chain_filters_future_revisions_before_row_reads(monkeypatch,source):
     engine = create_engine('sqlite://')
