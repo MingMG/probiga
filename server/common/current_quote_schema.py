@@ -15,7 +15,7 @@ _LIVE_RECEIPT_INDEX = 'idx_qmt_realtime_source_published'
 _LIVE_RECEIPT_COLUMNS = ('source_provider', 'published_at', 'created_at')
 
 
-def privileged_migrate_live_quote_receipt_read_index(engine):
+def _privileged_migrate_quote_read_index(engine, *, table, index, columns, timeout_seconds):
     """Add the online physical read index without changing collector contracts.
 
     The release/admin caller owns the bounded connection establishment. A
@@ -23,12 +23,12 @@ def privileged_migrate_live_quote_receipt_read_index(engine):
     DDL is never retried here because its server outcome must first be read back.
     No business rows or receipt payloads are scanned for this additive index.
     """
-    result = {'table': _LIVE_RECEIPT_TABLE, 'index': _LIVE_RECEIPT_INDEX,
-              'columns': list(_LIVE_RECEIPT_COLUMNS), 'created': False,
+    result = {'table': table, 'index': index,
+              'columns': list(columns), 'created': False,
               'verified': False, 'read_only': True}
     if engine.dialect.name != 'mysql':
         return {**result, 'not_applicable': True}
-    deadline = time.monotonic() + 180
+    deadline = time.monotonic() + timeout_seconds
     with engine.connect() as connection:
         # Do not return the migration's socket/session limits to a runtime pool.
         connection.detach()
@@ -38,15 +38,15 @@ def privileged_migrate_live_quote_receipt_read_index(engine):
         def execute(sql, parameters=None, *, stage):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError('live quote receipt read index deadline: ' + stage)
+                raise TimeoutError(f'quote read index {table} deadline: ' + stage)
             for name, value in original.items():
                 setattr(driver, name, min(remaining, value) if value is not None else remaining)
             try:
                 rows = connection.execute(text(sql), parameters or {})
             except Exception as exc:
-                raise RuntimeError('live quote receipt read index failed: ' + stage) from exc
+                raise RuntimeError(f'quote read index {table} failed: ' + stage) from exc
             if time.monotonic() >= deadline:
-                raise TimeoutError('live quote receipt read index deadline: ' + stage)
+                raise TimeoutError(f'quote read index {table} deadline: ' + stage)
             return rows
 
         def inspect():
@@ -54,25 +54,41 @@ def privileged_migrate_live_quote_receipt_read_index(engine):
                 NON_UNIQUE,SEQ_IN_INDEX,COLUMN_NAME,SUB_PART,INDEX_TYPE,COLLATION,IS_VISIBLE,EXPRESSION
                 FROM information_schema.STATISTICS
                 WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=:table_name AND INDEX_NAME=:index_name
-                ORDER BY SEQ_IN_INDEX''', {'table_name': _LIVE_RECEIPT_TABLE, 'index_name': _LIVE_RECEIPT_INDEX},
+                ORDER BY SEQ_IN_INDEX''', {'table_name': table, 'index_name': index},
                 stage='index metadata').mappings().all()
             actual = [(int(row['NON_UNIQUE']), int(row['SEQ_IN_INDEX']), row['COLUMN_NAME'],
                        row['SUB_PART'], row['INDEX_TYPE'], row['COLLATION'],
                        row['IS_VISIBLE'], row['EXPRESSION']) for row in rows]
             expected = [(1, index, column, None, 'BTREE', 'A', 'YES', None)
-                        for index, column in enumerate(_LIVE_RECEIPT_COLUMNS, 1)]
+                        for index, column in enumerate(columns, 1)]
             if rows and actual != expected:
-                raise RuntimeError('live quote receipt read index definition differs')
+                raise RuntimeError(f'quote read index {table} definition differs')
             return bool(rows)
 
         if inspect():
             return {**result, 'verified': True}
         execute('SET SESSION lock_wait_timeout=5', stage='metadata lock budget')
-        execute(f'ALTER TABLE {_LIVE_RECEIPT_TABLE} ADD INDEX {_LIVE_RECEIPT_INDEX} '
-                '(source_provider,published_at,created_at), ALGORITHM=INPLACE, LOCK=NONE', stage='online index build')
+        execute(f'ALTER TABLE {table} ADD INDEX {index} '
+                f'({",".join(columns)}), ALGORITHM=INPLACE, LOCK=NONE', stage='online index build')
         if not inspect():
-            raise RuntimeError('live quote receipt read index missing after online build')
+            raise RuntimeError(f'quote read index {table} missing after online build')
     return {**result, 'created': True, 'verified': True, 'read_only': False}
+
+
+def privileged_migrate_live_quote_receipt_read_index(engine):
+    return _privileged_migrate_quote_read_index(
+        engine, table=_LIVE_RECEIPT_TABLE, index=_LIVE_RECEIPT_INDEX,
+        columns=_LIVE_RECEIPT_COLUMNS, timeout_seconds=180,
+    )
+
+
+def privileged_migrate_level1_read_index(engine):
+    from server.trading_v2.quotes import LEVEL1_TIME_INDEX, LEVEL1_TIME_INDEX_COLUMNS
+
+    return _privileged_migrate_quote_read_index(
+        engine, table='st_quote_event_v2', index=LEVEL1_TIME_INDEX,
+        columns=LEVEL1_TIME_INDEX_COLUMNS, timeout_seconds=600,
+    )
 
 
 def _indexes(connection):

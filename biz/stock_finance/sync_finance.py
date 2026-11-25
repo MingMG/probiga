@@ -146,7 +146,8 @@ class FinanceStaleResponse(RuntimeError):
 
 def get_engine():
     return create_batch_engine(pool_size=5, max_overflow=10, pool_timeout=5,
-        connect_args={'connect_timeout':8,'read_timeout':15,'write_timeout':10})
+        # The verified 5,581-member parent seal can take 37s to read cold.
+        connect_args={'connect_timeout':8,'read_timeout':60,'write_timeout':10})
 
 
 def get_finance_stock_universe(

@@ -615,6 +615,10 @@ def calculate(conn):
         "tools/run_trading_v2_job_worker.py",
         "tools/classify_release_scope.py",
         "biz/stock_finance/sync_finance.py",
+        "server/trading_v2/quotes.py",
+        "tools/validate_trading_v2_level1.py",
+        "tools/prepare_strategy_governance_schema.py",
+        "server/common/current_quote_schema.py",
         "server/common/historical_announcement_read.py",
         "deploy/production_deploy.sh",
     ):
