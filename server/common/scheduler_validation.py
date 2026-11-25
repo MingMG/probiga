@@ -165,6 +165,7 @@ _QMT_MEMBERSHIP_VERIFICATION_SCHEMA = (
 _QMT_MEMBERSHIP_PUBLICATION_SCHEMA = (
     "probiga.qmt-membership-publication.v1"
 )
+_FINANCE_EXPECTED_UNAVAILABLE_CODES = frozenset({"002731"})
 _FINANCE_AUTHORITATIVE_SOURCES = frozenset({
     "adata.finance.core_index",
     "eastmoney.finance.mainfinadata.direct",
@@ -3451,7 +3452,7 @@ def scheduler_output_status(
             and isinstance(unavailable_sample, Mapping)
             and len(unavailable_sample) == unavailable
             and set(map(str, unavailable_sample))
-            <= CNINFO_NONFILING_ISSUERS.keys()
+            <= _FINANCE_EXPECTED_UNAVAILABLE_CODES
             and disclosure_deadline >= minimum_report
             and (
                 applicable == 0
