@@ -87,7 +87,7 @@ def archived(tmp_path, monkeypatch):
     monkeypatch.setattr(recovery, "_same_scorer", lambda parent, current: (parent, current) == (PARENT, CURRENT))
 
     def original_sources(authority, *, trade_date, decision_at, build_sha):
-        assert authority is engine and exact_time(decision_at) == CUTOFF
+        assert (authority is engine or authority.engine is engine) and exact_time(decision_at) == CUTOFF
         assert trade_date == TARGET and build_sha == PARENT
         return ATTEMPTS
 
@@ -236,6 +236,69 @@ def test_rebind_published_original_after_compatible_linux_release(archived, monk
     assert rebound["generation_sha256"] == original["generation_sha256"]
     assert rebound["selection_sha256"] == original["selection_sha256"]
     recovery.verify_recovered_initial_selection(engine, rebound, proposed_cutoff=PROPOSAL)
+
+
+def _published_before_dispatch(archived, monkeypatch):
+    engine, original = archived
+    receipt = _published_record(engine, original)
+    with engine.begin() as connection:
+        for table in ("st_daily_stage_attempt", "st_scheduled_task_history", "st_recommended_run_history"):
+            key = "scheduler_run_uid" if table == "st_daily_stage_attempt" else "run_uid"
+            connection.execute(text(f"DELETE FROM {table} WHERE {key}=:uid"), {"uid": FIRST_RETRY})
+    monkeypatch.setattr(recovery, "daily_session_identity", lambda *_: {"session_uid": "session"})
+    monkeypatch.setattr(recovery, "load_published_analysis_receipt", lambda *_a, **_k: receipt)
+    return engine, original
+
+
+def test_formal_dispatch_reuses_published_inputs_without_new_build_collection(archived, monkeypatch):
+    from server.api import scheduler_runtime as scheduler
+
+    engine, original = _published_before_dispatch(archived, monkeypatch)
+    monkeypatch.setattr(scheduler, "_scheduler_build_commit_sha", lambda: CURRENT)
+    monkeypatch.setattr(FormalAnalysisStore, "load_artifacts", lambda *_: pytest.fail("dispatch reloaded score rows"))
+    row = {"task_type": "analysis_fast", "_scheduler_target_trade_date": TARGET,
+           "_release_analysis_recovery_requested": True}
+    with engine.connect() as connection:
+        before = connection.connection.driver_connection.total_changes
+    assert scheduler._strategy_pipeline_dependencies_ready(row, engine, datetime.fromisoformat(PROPOSAL)) == (
+        True, "verified_frozen_formal_inputs",
+    )
+    assert row["_strategy_inputs_run_uids"] == ATTEMPTS
+    assert row["_strategy_inputs_ready_at"].isoformat(timespec="seconds") == original["decision_at"]
+    with engine.connect() as connection:
+        assert connection.connection.driver_connection.total_changes == before
+
+
+@pytest.mark.parametrize("fault", ["scorer", "source", "publication", "active"])
+def test_formal_dispatch_reuse_rejects_unproven_original_inputs(archived, monkeypatch, fault):
+    engine, _ = _published_before_dispatch(archived, monkeypatch)
+    if fault == "scorer":
+        monkeypatch.setattr(recovery, "_same_scorer", lambda *_: False)
+    elif fault == "source":
+        monkeypatch.setattr(source_evidence, "frozen_initial_source_runs", lambda *_a, **_k: {
+            **ATTEMPTS, "target_turnover_snapshot": "0" * 32,
+        })
+    elif fault == "active":
+        _record(engine, run_uid=FIRST_RETRY, build=CURRENT)
+    else:
+        with engine.begin() as connection:
+            connection.execute(text("UPDATE st_recommended_run_history SET canonical_pool_sha256=:bad"), {"bad": "f" * 64})
+    arguments = dict(trade_date=TARGET, build_sha=CURRENT, decision_at=datetime.fromisoformat(PROPOSAL))
+    if fault == "publication":
+        with pytest.raises(FormalScoreContractError, match="publication differs"):
+            recovery.reusable_initial_source_runs(engine, **arguments)
+    else:
+        assert recovery.reusable_initial_source_runs(engine, **arguments) is None
+
+
+def test_formal_dispatch_input_proof_has_a_total_deadline(archived, monkeypatch):
+    engine, _ = _published_before_dispatch(archived, monkeypatch)
+    monkeypatch.setattr(recovery, "_compatible_recovery_builds", lambda *_: {PARENT, CURRENT})
+    ticks = iter((0, 91))
+    monkeypatch.setattr(recovery, "monotonic", lambda: next(ticks))
+    with pytest.raises(TimeoutError, match="FORMAL_DISPATCH_INPUTS_90_SECONDS"):
+        recovery.reusable_initial_source_runs(engine, trade_date=TARGET, build_sha=CURRENT,
+            decision_at=datetime.fromisoformat(PROPOSAL))
 
 
 @pytest.mark.parametrize("published_origin", [False, True])
@@ -502,6 +565,9 @@ def _daily_delivery_runtime_health(conn):
 def _build_daily_result_delivery_receipt(conn):
     return conn.receipt()
 
+def _strategy_pipeline_dependencies_ready(conn):
+    return conn.dependencies()
+
 def calculate(conn):
     return conn.score()
 """
@@ -525,6 +591,7 @@ def calculate(conn):
         "server/engine/native_research_jobs.py",
         "server/engine/native_research_prepare.py",
         "tools/run_trading_v2_job_worker.py",
+        "tools/classify_release_scope.py",
         "biz/stock_finance/sync_finance.py",
         "server/common/historical_announcement_read.py",
         "deploy/production_deploy.sh",

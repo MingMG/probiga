@@ -50,6 +50,7 @@ from server.common.pit_facts import (
     FINANCE_INCREMENTAL_DISCOVERY_CODE,
     FINANCE_INCREMENTAL_DISCOVERY_SCHEMA,
     FINANCE_INCREMENTAL_DISCOVERY_SOURCE,
+    _finance_revision_arguments,
     append_finance_atomic_batch_seal,
     append_finance_expected_unavailable,
     append_finance_revisions,
@@ -1598,15 +1599,22 @@ def upsert_finance(
     ]
     legacy_rows = [{**{column: row[column] for column in available}, "etl_sync_at": now}
                    for row in source_rows]
+    lock_order = sorted(range(len(source_rows)), key=lambda index: canonical_hash({
+        "schema": "probiga.pit-finance-identity.v1",
+        **_finance_revision_arguments(source_rows[index])["identity_payload"],
+    }))
     with engine.begin() as conn:
-        # Lock/read this issuer's existing report identities in bounded batches.
-        # Immutable fact comparison and append still precede every display write.
-        receipts = append_finance_revisions(
-            conn, source_rows, known_at=now_dt, received_at=now_dt,
-            source=PRIMARY_FINANCE_SOURCE, batch_id=batch_id,
-        )
-        fact_bindings = [{"revision_id": receipt.revision_id, "content_hash": receipt.content_hash}
-                         for receipt in receipts]
+        # Live 40-identity reads exceeded 5 s; 10 completed in 4.4 s. Preserve the
+        # global lock order and one issuer transaction while bounding each read.
+        fact_bindings = [None] * len(source_rows)
+        for offset in range(0, len(lock_order), 10):
+            indices = lock_order[offset:offset + 10]
+            receipts = append_finance_revisions(
+                conn, [source_rows[index] for index in indices], known_at=now_dt, received_at=now_dt,
+                source=PRIMARY_FINANCE_SOURCE, batch_id=batch_id,
+            )
+            for index, receipt in zip(indices, receipts, strict=True):
+                fact_bindings[index] = {"revision_id": receipt.revision_id, "content_hash": receipt.content_hash}
         for offset in range(0, len(legacy_rows), 500):
             conn.execute(sql, legacy_rows[offset:offset + 500])
         append_source_coverage(

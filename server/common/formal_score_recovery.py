@@ -30,6 +30,7 @@ from server.common.daily_delivery_control import (
     DailyDeliveryControlError,
     analysis_publication_reference,
     canonical_sha256,
+    daily_session_identity,
     load_published_analysis_receipt,
     strategy_release_identity,
 )
@@ -63,6 +64,7 @@ _PERMITTED_VALIDATION_FILES = frozenset({
     "server/static/trading-v3.html",
     "tools/run_strategy_governance_daily.py",
     "tools/run_trading_v2_job_worker.py",
+    "tools/classify_release_scope.py",
     "biz/stock_finance/sync_finance.py",
     "server/static/index.html",
     "server/static/js/app.js",
@@ -96,6 +98,7 @@ _VALIDATION_ONLY_BODIES = {
     "server/api/scheduler_runtime.py": (
         "_terminal_snapshot", "_daily_result_recovery_target",
         "_daily_delivery_runtime_health", "_build_daily_result_delivery_receipt",
+        "_strategy_pipeline_dependencies_ready",
     ),
     "server/engine/strategy_center.py": ("_dynamic_execution_signals",),
     "server/engine/strategy_shadow_trials.py": ("native_trial_candidate_batch",),
@@ -419,7 +422,7 @@ def _verify_terminal_publication(
     from server.common.scheduler_validation import _single_nested_machine_payload
 
     try:
-        with engine.connect() as connection:
+        with (nullcontext(engine) if hasattr(engine, "execute") else engine.connect()) as connection:
             receipt = load_published_analysis_receipt(
                 connection, trade_date, decision_at=consumer_started_at, run_uid=record["run_uid"],
             )
@@ -703,6 +706,66 @@ def _candidate(
     except (KeyError, TypeError, RuntimeError, ValueError) as exc:
         raise FormalScoreContractError("formal recovery exact original evidence could not be verified") from exc
     return original
+
+
+def reusable_initial_source_runs(
+    engine, *, trade_date: str, build_sha: str, decision_at: datetime,
+) -> dict | None:
+    """Prove published frozen inputs before scheduling their existing recovery."""
+    from biz.analysis.sync_analysis_fast import MODEL_VERSION
+    from server.common.formal_score_source_evidence import frozen_initial_source_runs
+    from server.common.qmt_announcement_pit import _live_announcement_reply_budget
+    from server.common.scheduler_validation import _single_nested_machine_payload
+
+    deadline = monotonic() + 90
+    decision = _local_decision(decision_at, whole_seconds=False)
+    runtime = load_runtime_component_release()
+    if runtime["scope"] != "LINUX" or runtime["linux_build_sha"] != build_sha:
+        return None
+    scope = daily_session_identity(trade_date, runtime["contract_build_sha"])
+    with engine.connect() as connection:
+        mysql = connection.dialect.name == "mysql"
+        with (_live_announcement_reply_budget(connection, deadline=deadline, stage="formal-dispatch-history")
+              if mysql else nullcontext()):
+            attempts = _attempts_in_session(connection, scope["session_uid"], shard_id="main")
+        if not attempts or attempts[0]["build_sha"] == build_sha:
+            return None
+        prior = attempts[0]
+        builds = _compatible_recovery_builds(connection, runtime)
+        if not _published_terminal(prior, builds, trade_date):
+            return None
+        work = _single_nested_machine_payload(prior["output"], schema=FORMAL_SCORE_WORK_SCHEMA)
+        if not work:
+            return None
+        with (_live_announcement_reply_budget(connection, deadline=deadline, stage="formal-dispatch-publication")
+              if mysql else nullcontext()):
+            store = FormalAnalysisStore(connection)
+            verify_initial_selection(store, work, run_uid=prior["run_uid"], build_sha=prior["build_sha"], trade_date=trade_date)
+            _verify_terminal_publication(connection, prior, work, trade_date=trade_date, consumer_started_at=decision)
+            manifest = _read_score_manifest(work["score_snapshot"], trade_date=trade_date, store=store)
+        origin = manifest["origin"]
+        if origin["build_sha"] not in builds or not all(
+            _same_scorer(producer, build_sha) for producer in {prior["build_sha"], origin["build_sha"]}
+        ):
+            return None
+        cutoff = _local_decision(work["decision_at"])
+        if not datetime.combine(date.fromisoformat(trade_date), STRATEGY_POOL_INITIAL_TIME) <= cutoff <= decision:
+            raise FormalScoreContractError("formal recovery dispatch cutoff differs")
+        with (_live_announcement_reply_budget(connection, deadline=deadline, stage="formal-dispatch-sources")
+              if mysql else nullcontext()):
+            sources = frozen_initial_source_runs(connection, trade_date=trade_date, decision_at=cutoff, build_sha=origin["build_sha"])
+    if monotonic() >= deadline:
+        raise TimeoutError("FORMAL_DISPATCH_INPUTS_90_SECONDS")
+    generation = canonical_sha256({
+        "schema": "probiga.initial-selection-generation.v1", "trade_date": trade_date,
+        "decision_at": cutoff.isoformat(timespec="seconds"), "build_sha": origin["build_sha"],
+        "model_version": MODEL_VERSION, "source_runs_sha256": canonical_sha256(sources),
+        "min_score": 62.0, "top_n": 80,
+    })
+    if (set(sources) != _REQUIRED_INPUTS or generation != work["generation_sha256"]
+            or float(prior["min_score"]) != 62.0 or int(prior["top_n"]) != 80):
+        return None
+    return {"decision_at": cutoff, "source_runs": sources}
 
 
 def recover_initial_selection(

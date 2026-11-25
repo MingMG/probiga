@@ -496,6 +496,31 @@ def _contract(git: Git, tree: dict[str, Entry], *, strict: bool) -> str:
     return hashlib.sha256(canonical).hexdigest()
 
 
+def _windows_runtime_changed(git, path, before, after):
+    if before == after:
+        return False
+    if path != "server/api/scheduler_runtime.py" or before is None or after is None or before.mode != after.mode:
+        return True
+    # Formal recovery is Linux-owned. Keep the complete shared dependency
+    # validator in the Windows identity except this exact unreachable branch.
+    guard = ast.parse("task_type == 'analysis_fast' and row.get('_release_analysis_recovery_requested') is True "
+                      "and row.get('_release_analysis_research_mode') is not True", mode="eval").body
+    normalized = []
+    for blob in git.blobs([before.oid, after.oid]):
+        try:
+            module = ast.parse(blob)
+        except (SyntaxError, ValueError) as exc:
+            raise ScopeError("windows_runtime_identity_invalid") from exc
+        for node in module.body:
+            if isinstance(node, ast.FunctionDef) and node.name == "_strategy_pipeline_dependencies_ready":
+                node.body = [statement for statement in node.body if not (
+                    isinstance(statement, ast.If) and not statement.orelse
+                    and ast.dump(statement.test) == ast.dump(guard)
+                )]
+        normalized.append(ast.dump(module))
+    return normalized[0] != normalized[1]
+
+
 def classify_release_scope(*, base_sha: str, target_sha: str,
                            windows_base_sha: str | None = None,
                            repository: str | Path | None = None,
@@ -537,7 +562,7 @@ def classify_release_scope(*, base_sha: str, target_sha: str,
     if base_contract != target_contract:
         reasons.add("schema_contract_changed")
     windows_runtime_changes = [path for path in _WINDOWS_RUNTIME_FILES
-                               if windows_base.get(path) != target.get(path)]
+                               if _windows_runtime_changed(git, path, windows_base.get(path), target.get(path))]
     if windows_runtime_changes:
         reasons.add("windows_runtime_changed")
     return {
