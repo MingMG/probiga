@@ -516,6 +516,8 @@ def calculate(conn):
         "server/api/routers/research_futures.py", "server/static/js/research-tools.js",
         "server/static/js/market-home.js",
         "server/static/css/research-tools.css",
+        "server/engine/governance_daily_market.py",
+        "server/engine/strategy_native_backtest.py",
     ):
         display_file = source / relative
         display_file.parent.mkdir(parents=True, exist_ok=True)
