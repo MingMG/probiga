@@ -572,6 +572,18 @@ def _load_latest_finance_atomic_seal_evidence(engine, *, decision_at, seal_cover
         assert normalize(original) != normalize(allowed.replace(before, after))
 
 
+def test_finance_read_batch_limit_keeps_score_identity_without_masking_selection():
+    path = "server/common/pit_facts.py"
+    source = ("FINANCE_ATOMIC_BATCH_QUERY_CODE_LIMIT = 100\n" + "\n".join(
+        f"def {name}(conn):\n    return conn.get()" for name in recovery._VALIDATION_ONLY_BODIES[path]
+    ) + '\ndef select(conn):\n    return conn.execute("known_at<=:decision_at")\n').encode()
+    normalize = lambda value: recovery._without_validation_body(path, value)
+    assert normalize(source) == normalize(source.replace(b"= 100", b"= 10"))
+    for replacement in (b"= 0", b"= True", b"= 1000", b"= 10.0", b"= configured_limit"):
+        assert normalize(source) != normalize(source.replace(b"= 100", replacement))
+    assert normalize(source) != normalize(source.replace(b"known_at<=", b"known_at>="))
+
+
 def test_pruned_previous_checkout_reuses_only_immutable_git_and_current_scorer(tmp_path, monkeypatch):
     source = tmp_path / "source"
     source.mkdir()
