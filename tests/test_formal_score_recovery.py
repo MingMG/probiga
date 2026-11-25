@@ -573,6 +573,7 @@ def test_pruned_previous_checkout_reuses_only_immutable_git_and_current_scorer(t
         path.write_bytes(b"def scorer():\n    return 7\n")
         if relative == "server/common/pit_facts.py":
             path.write_bytes(path.read_bytes() + b"\ndef _bind_historical_event_snapshot(conn):\n    return conn.all()\n")
+            path.write_bytes(path.read_bytes() + b"\ndef _read_historical_chain_metadata(conn):\n    return conn.directory()\n\ndef _read_historical_later_scopes(conn):\n    return conn.heads()\n")
     scheduler = "server/api/scheduler_runtime.py"
     scheduler_source = b"""
 def _terminal_snapshot(conn):

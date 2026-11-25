@@ -209,6 +209,9 @@ def _transient_source_error(exc):
                 r'历史事实读取失败：PIT_[A-Z_]+:OperationalError:errno='
                 r'(?:1205|1213|2003|2006|2013|3024)(?::stage=[a-z_]+)?', str(chain)):
             return True
+        if isinstance(chain, RuntimeError) and re.fullmatch(
+                r'历史事实读取失败：QMT_ANNOUNCEMENT_LIVE_BATCH_REPLY_(?:DEADLINE|FAILED):[A-Za-z0-9:_-]+', str(chain)):
+            return True
         chain=chain.__cause__ or chain.__context__
     return False
 
