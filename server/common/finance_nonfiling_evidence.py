@@ -13,6 +13,8 @@ from typing import Any, Mapping
 
 
 EVIDENCE_SCHEMA = "probiga.cninfo-finance-nonfiling-evidence.v2"
+# Official CNInfo issuer identities verified for the collection workflow.
+CNINFO_NONFILING_ISSUERS = {"002731": "9900022974", "688613": "nssc1000537"}
 MAX_PDF_BYTES = 8 * 1024 * 1024
 MAX_PDF_PAGES = 30
 MAX_TEXT_BYTES = 256 * 1024

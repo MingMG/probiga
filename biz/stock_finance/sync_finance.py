@@ -60,6 +60,7 @@ from server.common.pit_facts import (
     load_latest_finance_atomic_batch_baseline,
 )
 from server.common.finance_nonfiling_evidence import (
+    CNINFO_NONFILING_ISSUERS,
     build_document_evidence,
     validate_document_body_evidence,
 )
@@ -99,13 +100,6 @@ CNINFO_STATIC_ROOT = "https://static.cninfo.com.cn/"
 FINANCE_NONFILING_REASON = "CNINFO_REGULATORY_PERIODIC_REPORT_NOT_FILED"
 FINANCE_NONFILING_MAX_AGE_DAYS = 7
 FINANCE_NONFILING_QUERY_DAYS = 45
-CNINFO_NONFILING_ISSUERS: dict[str, str] = {
-    # ST Cuìhuá did not file its 2025 annual report or 2026 Q1 report by the
-    # statutory deadline.  CNInfo org ids are issuer identities, not secrets.
-    "002731": "9900022974",
-    "688613": "nssc1000537",
-}
-
 FINANCE_COLUMN_MAP = {
     "SECURITY_CODE": "stock_code",
     "SECURITY_NAME_ABBR": "short_name",
@@ -617,9 +611,7 @@ def select_daily_finance_candidates(
                     "source_time", "detail_url", "data_source", "data_version",
                 )
             })
-            member = members.get(code)
-            if not _finance_notice_reflected(member, row):
-                add(code, "NEW_OR_CORRECTED_ANNOUNCEMENT")
+            add(code, "NEW_OR_CORRECTED_ANNOUNCEMENT")
 
     checkpoint = dict(checkpoint or {})
     for code in checkpoint.get("unresolved_codes") or ():
@@ -663,21 +655,6 @@ def select_daily_finance_candidates(
             "announcements": sorted(notice_inputs.get(code, []), key=canonical_hash),
         }) for code, listing_date in universe.items()},
     )
-
-
-def _finance_notice_reflected(member, notice) -> bool:
-    if not isinstance(member, Mapping) or member.get("coverage_status") != "COMPLETE":
-        return False
-    try:
-        source = datetime.fromisoformat(str(member.get("known_at") or ""))
-        received = datetime.fromisoformat(str(notice.get("received_at") or ""))
-        published = datetime.fromisoformat(str(notice.get("display_time") or notice.get("source_time") or ""))
-        publication_date = coerce_optional_date(notice.get("notice_date"))
-    except (ValueError, TypeError):
-        return False
-    return (source.tzinfo is None and received.tzinfo is None and published.tzinfo is None
-            and publication_date is not None and publication_date <= received.date()
-            and published <= received <= source)
 
 
 def _fetch_eastmoney_result_set(
@@ -2057,10 +2034,15 @@ def main(argv: list[str] | None = None) -> int:
                 str(previous_checkpoint.get("as_of") or "")
                 == run_as_of.isoformat()
             ):
+                # The original checkpoint remains valid only for the exact plan it proved.
+                exact_prior_plan = (
+                    previous_checkpoint.get("schema") == "probiga.finance-daily-checkpoint.v2"
+                    and previous_checkpoint.get("input_root_sha256") == candidate_input_root_sha256
+                )
                 resumed_codes = {
                     code for code in all_fetch_codes
                     if code in previous_checkpoint.get("completed_codes", ())
-                    and completed_inputs.get(code) == current_inputs[code]
+                    and (exact_prior_plan or completed_inputs.get(code) == current_inputs[code])
                 }
             checkpoint_state = {
                 "schema": "probiga.finance-daily-checkpoint.v3",
