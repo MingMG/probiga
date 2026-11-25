@@ -215,6 +215,13 @@ def _scorer_source(root: Path, relative: str) -> bytes:
 
 def _without_validation_body(path: str, source: bytes) -> str:
     tree = ast.parse(source, filename=path)
+    if path == "server/common/pit_facts.py":
+        # Physical access hints preserve the seal predicates, ordering and evidence.
+        for function in tree.body:
+            if isinstance(function, ast.FunctionDef) and function.name == "_load_latest_finance_atomic_seal_evidence":
+                for node in ast.walk(function):
+                    if isinstance(node, ast.Constant) and node.value == " FORCE INDEX (idx_pit_coverage_source_known_batch)":
+                        node.value = " FORCE INDEX (idx_pit_coverage_decision)"
     if path == "server/api/scheduler_runtime.py":
         # Only the governance retry gate is independent of shared input selection.
         retry_gate = ast.dump(ast.parse(

@@ -2625,6 +2625,8 @@ def _mysql_seal_transport(engine, *, corrupt=None):
             if not hasattr(statement, 'text'):
                 return self.connection.execute(statement, params)
             sql = statement.text.replace(" FORCE INDEX (idx_pit_coverage_decision)", "").replace(
+                " FORCE INDEX (idx_pit_coverage_source_known_batch)", "",
+            ).replace(
                 " FORCE INDEX (idx_pit_coverage_batch_stock)", "",
             )
             if "row_ids" in statement._bindparams:
@@ -2728,6 +2730,63 @@ def test_finance_compressed_history_is_byte_exact_and_preserves_all_seal_results
     assert packed == plain  # Original payload bytes, IDs, roots, members and every parent.
     assert len(packed[3]) == 3
     engine.dispose()
+
+
+def test_finance_seal_lookup_avoids_other_sources_under_read_budget():
+    engine, kwargs = _multi_seal_common_cutoff_case()
+    expected = pit_module._load_latest_finance_atomic_seal_evidence(
+        engine, decision_at=kwargs["decision_at"])
+    with engine.begin() as connection:
+        connection.execute(text("CREATE INDEX idx_pit_coverage_decision ON "
+            "st_pit_source_coverage(fact_kind,stock_code,known_at,window_start,window_end)"))
+        connection.execute(text("CREATE INDEX idx_pit_coverage_source_known_batch ON "
+            "st_pit_source_coverage(fact_kind,source,watermark_kind,known_at,batch_id,"
+            "stock_code,received_at,covered_through_at,window_start,window_end,coverage_status,result_count)"))
+        template = dict(connection.execute(text(
+            "SELECT * FROM st_pit_source_coverage WHERE source='probiga.finance.atomic_batch' LIMIT 1"
+        )).mappings().one())
+        columns = list(template)
+        connection.execute(text(
+            "INSERT INTO st_pit_source_coverage (" + ",".join(columns) + ") VALUES ("
+            + ",".join(":" + key for key in columns) + ")"
+        ), [{**template, "coverage_id": f"unrelated-{number}", "scope_hash": f"scope-{number}",
+             "source": "unrelated.finance", "known_at": "2026-08-30 01:12:00",
+             "received_at": "2026-08-30 01:12:00", "payload_json": "{}"} for number in range(2000)])
+
+    queries = []
+
+    def bounded_lookup(connection, _cursor, sql, params, _context, _many):
+        if "SELECT coverage_id, scope_hash, revision_no" not in sql:
+            return
+        queries.append(sql)
+        driver = connection.connection.driver_connection
+        driver.set_progress_handler(lambda: 1, 4000)
+
+    def clear_budget(connection, *_args):
+        connection.connection.driver_connection.set_progress_handler(None, 0)
+
+    # Both hints execute against real SQLite indexes; the old broad access path
+    # exceeds this instruction budget before it can filter the unrelated rows.
+    reader = _mysql_seal_transport(engine)
+    original_connect = reader.connect
+
+    class IndexedConnection(original_connect):
+        def execute(self, statement, params):
+            if hasattr(statement, "text") and "SELECT coverage_id, scope_hash, revision_no" in statement.text:
+                statement = text(statement.text.replace(" FORCE INDEX (", " INDEXED BY ").replace(
+                    ") WHERE", " WHERE"))
+            return super().execute(statement, params)
+
+    event.listen(engine, "before_cursor_execute", bounded_lookup)
+    event.listen(engine, "after_cursor_execute", clear_budget)
+    try:
+        assert pit_module._load_latest_finance_atomic_seal_evidence(
+            SimpleNamespace(connect=IndexedConnection), decision_at=kwargs["decision_at"]) == expected
+        assert len(queries) == 1
+    finally:
+        event.remove(engine, "before_cursor_execute", bounded_lookup)
+        event.remove(engine, "after_cursor_execute", clear_budget)
+        engine.dispose()
 
 
 @pytest.mark.parametrize("damage", [None, "old_payload", "current_payload", "parent_revision"])

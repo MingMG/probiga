@@ -66,6 +66,7 @@ def _mysql_transport(engine, *, corrupt_code=None, fail_code=None, invalid_reply
                         "SUBSTR(COMPRESS(payload_json),1,LENGTH(COMPRESS(payload_json))-1) AS payload_json_compressed",
                     )
             sql = sql.replace(" FORCE INDEX (idx_pit_coverage_decision)", "")
+            sql = sql.replace(" FORCE INDEX (idx_pit_coverage_source_known_batch)", "")
             sql = sql.replace(" FORCE INDEX (PRIMARY)", "")
             if sql != original_sql:
                 options = statement.get_execution_options()

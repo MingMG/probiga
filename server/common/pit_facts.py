@@ -5207,7 +5207,7 @@ def _load_latest_finance_atomic_seal_evidence(
         # appended. Recheck their links, then load only this snapshot and its
         # explicit parent. Full-history payload auditing remains a separate job.
         index_hint = (
-            " FORCE INDEX (idx_pit_coverage_decision)"
+            " FORCE INDEX (idx_pit_coverage_source_known_batch)"
             if connection.dialect.name == "mysql"
             else ""
         )
