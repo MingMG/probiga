@@ -4715,8 +4715,9 @@ def _strategy_pipeline_dependencies_ready(
     row: dict, engine, now: datetime
 ) -> tuple[bool, str]:
     task_type = str(row.get("task_type") or "").strip()
-    if (task_type == "analysis_fast" and row.get("_release_analysis_recovery_requested") is True
-            and row.get("_release_analysis_research_mode") is not True):
+    if (task_type == "strategy_governance_daily" or (
+            task_type == "analysis_fast" and row.get("_release_analysis_recovery_requested") is True
+            and row.get("_release_analysis_research_mode") is not True)):
         from server.common.formal_score_recovery import reusable_initial_source_runs
 
         try:
@@ -4726,9 +4727,15 @@ def _strategy_pipeline_dependencies_ready(
             )
         except Exception as exc:
             return False, f"formal_recovery_inputs:{type(exc).__name__}"
-        if frozen is not None:
+        if frozen is not None and (
+            (task_type == "analysis_fast" and frozen["publisher_build_sha"] != _scheduler_build_commit_sha())
+            or (task_type == "strategy_governance_daily" and frozen["publisher_build_sha"] == _scheduler_build_commit_sha())
+        ):
             row["_strategy_inputs_ready_at"] = frozen["decision_at"]
-            row["_strategy_inputs_run_uids"] = frozen["source_runs"]
+            row["_strategy_inputs_run_uids"] = dict(frozen["source_runs"])
+            if task_type == "strategy_governance_daily":
+                row["_strategy_inputs_ready_at"] = frozen["available_at"]
+                row["_strategy_inputs_run_uids"]["analysis_fast"] = frozen["publisher_run_uid"]
             return True, "verified_frozen_formal_inputs"
     if task_type == RESEARCH_POOL_TASK_TYPE:
         if row.get("_research_pool_dependencies_ready") is True:

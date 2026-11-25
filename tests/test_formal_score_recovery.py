@@ -84,7 +84,7 @@ def archived(tmp_path, monkeypatch):
     monkeypatch.setattr(recovery, "load_component_attestation", lambda _, build: RUNTIME if build == CURRENT else ORIGIN_COMPONENT)
     monkeypatch.setattr(recovery, "require_compatible_component_build", lambda _, parent, current: ORIGIN_COMPONENT)
     monkeypatch.setattr(recovery, "strategy_release_identity", lambda: "b" * 64)
-    monkeypatch.setattr(recovery, "_same_scorer", lambda parent, current: (parent, current) == (PARENT, CURRENT))
+    monkeypatch.setattr(recovery, "_same_scorer", lambda parent, current: parent == current or (parent, current) == (PARENT, CURRENT))
 
     def original_sources(authority, *, trade_date, decision_at, build_sha):
         assert (authority is engine or authority.engine is engine) and exact_time(decision_at) == CUTOFF
@@ -299,6 +299,28 @@ def test_formal_dispatch_input_proof_has_a_total_deadline(archived, monkeypatch)
     with pytest.raises(TimeoutError, match="FORMAL_DISPATCH_INPUTS_90_SECONDS"):
         recovery.reusable_initial_source_runs(engine, trade_date=TARGET, build_sha=CURRENT,
             decision_at=datetime.fromisoformat(PROPOSAL))
+
+
+def test_governance_dispatch_keeps_current_publication_and_original_inputs(archived, monkeypatch):
+    from server.api import scheduler_runtime as scheduler
+
+    engine, original = _published_before_dispatch(archived, monkeypatch)
+    monkeypatch.setattr(scheduler, "_scheduler_build_commit_sha", lambda: CURRENT)
+    old_row = {"task_type": "strategy_governance_daily", "_scheduler_target_trade_date": TARGET}
+    assert not scheduler._strategy_pipeline_dependencies_ready(old_row, engine, datetime.fromisoformat(PROPOSAL))[0]
+    assert "_strategy_inputs_run_uids" not in old_row
+    work = load_initial_selection(FormalAnalysisStore(engine), generation=original["generation_sha256"],
+        run_uid=FIRST_RETRY, build_sha=CURRENT)["reference"]
+    _record(engine, run_uid=FIRST_RETRY, build=CURRENT)
+    receipt = _published_record(engine, work, published_at="2026-11-15T20:20:00", finished_at="2026-11-15T20:21:00")
+    monkeypatch.setattr(recovery, "load_published_analysis_receipt", lambda *_a, **_k: receipt)
+    monkeypatch.setattr(scheduler, "_scheduler_build_commit_sha", lambda: CURRENT)
+    row = {"task_type": "strategy_governance_daily", "_scheduler_target_trade_date": TARGET}
+    assert scheduler._strategy_pipeline_dependencies_ready(row, engine, datetime(2026, 11, 15, 20, 30)) == (
+        True, "verified_frozen_formal_inputs",
+    )
+    assert row["_strategy_inputs_run_uids"] == {**ATTEMPTS, "analysis_fast": FIRST_RETRY}
+    assert row["_strategy_inputs_ready_at"] == datetime(2026, 11, 15, 20, 21)
 
 
 @pytest.mark.parametrize("published_origin", [False, True])
