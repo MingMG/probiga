@@ -46,6 +46,7 @@ _RELEASE_ROOT = Path("/opt/ProBigA-releases")
 _RELEASE_GIT_CACHE = Path("/var/lib/probiga/release-sources/probiga.git")
 _MAX_SCORER_SOURCE_BYTES = 8 * 1024 * 1024
 _PERMITTED_VALIDATION_FILES = frozenset({
+    "deploy/production_deploy.sh",
     "server/common/formal_score_recovery.py",
     "server/common/formal_score_source_evidence.py",
     "server/common/scheduler_validation.py",

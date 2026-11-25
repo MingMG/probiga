@@ -518,6 +518,7 @@ def calculate(conn):
         "server/static/css/research-tools.css",
         "server/engine/governance_daily_market.py",
         "server/engine/strategy_native_backtest.py",
+        "deploy/production_deploy.sh",
     ):
         display_file = source / relative
         display_file.parent.mkdir(parents=True, exist_ok=True)

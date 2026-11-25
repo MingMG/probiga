@@ -158,7 +158,8 @@ def test_job_deadline_cannot_be_swallowed_by_source_exception_handlers():
         except Exception:pytest.fail('source error wrapper swallowed the deadline')
 
 
-def test_failure_lock_recovers_after_connection_invalidation_without_stealing():
+@pytest.mark.parametrize('stale_connection',[False,True])
+def test_failure_lock_recovers_after_connection_invalidation_without_stealing(stale_connection):
     from itertools import count
     from sqlalchemy import event
     from sqlalchemy.pool import QueuePool
@@ -183,7 +184,11 @@ def test_failure_lock_recovers_after_connection_invalidation_without_stealing():
         with engine.connect() as first,engine.connect() as second:
             native._restore_failure_lock(first)
             old=first.execute(text('SELECT CONNECTION_ID()')).scalar()
-            first.invalidate();first.rollback()
+            if stale_connection:
+                # The server can close a socket before SQLAlchemy knows it is dead.
+                first.connection.driver_connection.close()
+            else:
+                first.invalidate();first.rollback()
             native._restore_failure_lock(first)
             assert first.execute(text('SELECT CONNECTION_ID()')).scalar()!=old
             with pytest.raises(RuntimeError,match='互斥锁'):native._restore_failure_lock(second)
