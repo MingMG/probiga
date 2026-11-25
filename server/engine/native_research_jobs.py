@@ -166,7 +166,7 @@ def claim(connection, *, deadline=None):
     connection.rollback()
     candidates=list(connection.execute(text('''SELECT /*+ MAX_EXECUTION_TIME(2000) */ job_id FROM st_job_v2 WHERE job_type=:kind
         AND (status='RUNNING' OR (status='PENDING' AND (next_run_at IS NULL OR next_run_at<=:now)))
-        ORDER BY requested_at,job_id LIMIT 64'''),{'kind':JOB_TYPE,'now':now_shanghai()}).scalars())
+        ORDER BY COALESCE(next_run_at,requested_at),requested_at,job_id LIMIT 64'''),{'kind':JOB_TYPE,'now':now_shanghai()}).scalars())
     connection.rollback()
     for job_id in candidates:
         with connection.begin(), claim_database_deadline(connection, deadline):

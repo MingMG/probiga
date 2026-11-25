@@ -13,6 +13,8 @@ from server.common.mysql_lock import mysql_named_lock
 _LIVE_RECEIPT_TABLE = 'st_qmt_realtime_sync_receipt_v2'
 _LIVE_RECEIPT_INDEX = 'idx_qmt_realtime_source_published'
 _LIVE_RECEIPT_COLUMNS = ('source_provider', 'published_at', 'created_at')
+_LEVEL1_RECEIPT_INDEX = 'idx_qmt_realtime_level1_continuity'
+_LEVEL1_RECEIPT_COLUMNS = ('capture_mode', 'quality_status', 'source_generated_at', 'published_at')
 
 
 def _privileged_migrate_quote_read_index(engine, *, table, index, columns, timeout_seconds):
@@ -100,6 +102,13 @@ def privileged_migrate_level1_read_index(engine):
     return _privileged_migrate_quote_read_index(
         engine, table='st_quote_event_v2', index=LEVEL1_TIME_INDEX,
         columns=LEVEL1_TIME_INDEX_COLUMNS, timeout_seconds=1800,
+    )
+
+
+def privileged_migrate_level1_receipt_read_index(engine):
+    return _privileged_migrate_quote_read_index(
+        engine, table=_LIVE_RECEIPT_TABLE, index=_LEVEL1_RECEIPT_INDEX,
+        columns=_LEVEL1_RECEIPT_COLUMNS, timeout_seconds=180,
     )
 
 
@@ -228,5 +237,7 @@ def privileged_migrate_current_quote_storage(engine):
     quotes = _privileged_migrate_current_quote_storage(engine)
     receipt = privileged_migrate_live_quote_receipt_read_index(engine)
     level1 = privileged_migrate_level1_read_index(engine)
+    level1_receipt = privileged_migrate_level1_receipt_read_index(engine)
     return {**quotes, 'live_quote_receipt_read_index': receipt,'level1_read_index':level1,
-            'read_only': quotes['read_only'] and receipt['read_only'] and level1['read_only']}
+            'level1_receipt_read_index':level1_receipt,
+            'read_only': quotes['read_only'] and receipt['read_only'] and level1['read_only'] and level1_receipt['read_only']}

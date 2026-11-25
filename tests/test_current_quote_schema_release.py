@@ -57,6 +57,8 @@ class Connection:
         if sql == 'SHOW FULL PROCESSLIST':
             return Result(engine.owned_ddl)
         if parameters and parameters.get('table_name') == 'st_qmt_realtime_sync_receipt_v2':
+            if parameters['index_name'] == schema._LEVEL1_RECEIPT_INDEX:
+                return Result(engine.level1_receipt_index)
             return Result(engine.receipt_index)
         if parameters and parameters.get('table_name') == 'st_quote_event_v2':
             return Result(engine.level1_index)
@@ -69,7 +71,10 @@ class Connection:
             assert 'ALGORITHM=INPLACE, LOCK=NONE' in sql
             if engine.receipt_build_error:
                 raise RuntimeError('online build interrupted')
-            engine.receipt_index = deepcopy(engine.canonical_receipt_index)
+            if schema._LEVEL1_RECEIPT_INDEX in sql:
+                engine.level1_receipt_index = deepcopy(engine.canonical_level1_receipt_index)
+            else:
+                engine.receipt_index = deepcopy(engine.canonical_receipt_index)
             return Result(None)
         if sql.startswith('ALTER TABLE st_quote_event_v2 ADD INDEX'):
             assert engine.metadata_wait_bounded
@@ -125,6 +130,10 @@ class Engine:
             SUB_PART=None, INDEX_TYPE='BTREE', COLLATION='A', IS_VISIBLE='YES', EXPRESSION=None) for index, column in enumerate(
                 ('source_provider','published_at','created_at'),1)]
         self.receipt_index = deepcopy(self.canonical_receipt_index)
+        self.canonical_level1_receipt_index = [dict(self.canonical_receipt_index[0],
+            COLUMN_NAME=column, SEQ_IN_INDEX=index)
+            for index,column in enumerate(schema._LEVEL1_RECEIPT_COLUMNS,1)]
+        self.level1_receipt_index = deepcopy(self.canonical_level1_receipt_index)
         from server.trading_v2.quotes import LEVEL1_TIME_INDEX_COLUMNS
         self.canonical_level1_index = [dict(row, COLUMN_NAME=column, SEQ_IN_INDEX=index)
             for index, column in enumerate(LEVEL1_TIME_INDEX_COLUMNS, 1)
@@ -344,6 +353,22 @@ def test_quote_storage_migration_owns_level1_index():
     result=privileged_migrate_current_quote_storage(engine)
     assert result['level1_read_index']['created'] and result['level1_read_index']['verified']
     assert not result['read_only']
+
+
+def test_receipt_continuity_index_is_owned_idempotent_and_preserves_source_index():
+    engine=Engine()
+    engine.level1_receipt_index=[]
+    original_source_index=deepcopy(engine.receipt_index)
+    original_rows=deepcopy(engine.rows)
+    result=privileged_migrate_current_quote_storage(engine)
+    assert result['level1_receipt_read_index']['created']
+    assert result['level1_receipt_read_index']['verified']
+    assert not result['read_only']
+    assert privileged_migrate_current_quote_storage(engine)['read_only']
+    assert engine.receipt_index==original_source_index and engine.rows==original_rows
+    assert [sql for sql,_ in engine.statements if sql.startswith('ALTER')]==[
+        'ALTER TABLE st_qmt_realtime_sync_receipt_v2 ADD INDEX idx_qmt_realtime_level1_continuity '
+        '(capture_mode,quality_status,source_generated_at,published_at), ALGORITHM=INPLACE, LOCK=NONE']
 
 
 def test_quote_migration_does_not_duplicate_existing_server_ddl():
