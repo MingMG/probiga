@@ -873,6 +873,97 @@ def test_daily_finance_resumes_matching_completed_shards_without_refetch(monkeyp
     assert report['provider_fetch_code_count']==1
 
 
+def test_daily_finance_new_candidate_keeps_completed_unchanged_issuer(monkeypatch,tmp_path,capsys):
+    target = date.today()
+    codes = ['000001','000002','000003']
+    _stub_atomic_batch_seal(monkeypatch)
+    monkeypatch.setattr(sync_finance,'get_engine',lambda:object())
+    monkeypatch.setattr(sync_finance,'get_finance_stock_universe',lambda *_a,**_k:dict.fromkeys(codes))
+    _install_verified_parent(monkeypatch,{code:{**_baseline(code,window_end=target-timedelta(days=1)),
+        'latest_report_date':sync_finance.finance_disclosure_gate(target).minimum_report_date}
+        for code in codes},target-timedelta(days=1))
+    notices = codes[:2]
+    monkeypatch.setattr(sync_finance,'read_frame',lambda *_a,**_k:pd.DataFrame([
+        {'id':i,'stock_code':code,'title':'季度报告更正公告','notice_date':target}
+        for i,code in enumerate(notices,1)]))
+    monkeypatch.setattr(sync_finance,'fetch_finance_incremental_discovery',lambda **_k:{
+        'events':[],'changed_codes':[],'stable_content_sha256':'c'*64})
+    monkeypatch.setattr(sync_finance,'append_finance_incremental_discovery',lambda *_a,**_k:'d'*64)
+    calls=[]
+    def fetch(code):
+        calls.append(code)
+        if code=='000002' and calls.count(code)==1:raise TimeoutError('stock-local source timeout')
+        return _finance_frame(code)
+    monkeypatch.setattr(sync_finance,'fetch_finance',fetch)
+    monkeypatch.setattr(sync_finance,'upsert_finance',lambda *_a,**_k:1)
+    arguments=['--daily-incremental','--sleep','0','--checkpoint-file',str(tmp_path/'finance.json')]
+    assert sync_finance.main(arguments)==0
+    capsys.readouterr()
+    notices.append('000003')
+    assert sync_finance.main(arguments)==0
+    report=next(json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith('{"as_of"'))
+    assert calls==['000001','000002','000002','000003']
+    assert report['checkpoint_resumed_code_count']==1
+    assert report['provider_fetch_code_count']==2
+
+
+@pytest.mark.parametrize('changed_input',['announcement','financial_event'])
+def test_daily_finance_input_change_retries_only_that_issuer(monkeypatch,tmp_path,capsys,changed_input):
+    target = date.today()
+    codes=['000001','000002','000003']
+    _stub_atomic_batch_seal(monkeypatch)
+    monkeypatch.setattr(sync_finance,'get_engine',lambda:object())
+    monkeypatch.setattr(sync_finance,'get_finance_stock_universe',lambda *_a,**_k:dict.fromkeys(codes))
+    _install_verified_parent(monkeypatch,{code:_baseline(code,window_end=target-timedelta(days=1))
+        for code in codes},target-timedelta(days=1))
+    notices=[{'id':i,'stock_code':code,'title':'季度报告更正公告','notice_date':target}
+        for i,code in enumerate(codes,1)]
+    monkeypatch.setattr(sync_finance,'read_frame',lambda *_a,**_k:pd.DataFrame(notices))
+    event={'stock_code':'000001','query_date':target.isoformat(),'row_content_sha256':'1'*64}
+    monkeypatch.setattr(sync_finance,'fetch_finance_incremental_discovery',lambda **_k:{
+        'events':[dict(event)],'changed_codes':['000001'],'stable_content_sha256':'c'*64})
+    monkeypatch.setattr(sync_finance,'append_finance_incremental_discovery',lambda *_a,**_k:'d'*64)
+    calls=[]
+    def fetch(code):
+        calls.append(code)
+        if code=='000003' and calls.count(code)==1:raise TimeoutError('stock-local source timeout')
+        return _finance_frame(code)
+    monkeypatch.setattr(sync_finance,'fetch_finance',fetch)
+    monkeypatch.setattr(sync_finance,'upsert_finance',lambda *_a,**_k:1)
+    checkpoint=tmp_path/'finance.json'
+    arguments=['--daily-incremental','--sleep','0','--checkpoint-file',str(checkpoint)]
+    assert sync_finance.main(arguments)==0
+    capsys.readouterr()
+    if changed_input=='announcement':notices[0]['title']+='（更新）'
+    else:event['row_content_sha256']='2'*64
+    assert sync_finance.main(arguments)==0
+    report=next(json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith('{"as_of"'))
+    assert calls==['000001','000002','000003','000001','000003']
+    assert report['checkpoint_resumed_code_count']==1
+    assert report['provider_fetch_code_count']==2
+    saved=sync_finance._checkpoint_payload(checkpoint)
+    assert saved['schema']=='probiga.finance-daily-checkpoint.v3'
+    assert set(saved['completed_input_roots'])==set(codes)
+
+
+@pytest.mark.parametrize('received,published,refresh',[
+    ('21:00:00','20:00:00',False),('23:30:00','23:00:00',True),
+    (None,'20:00:00',True),('21:00:00',None,True),('21:00:00','23:30:00',True),
+])
+def test_sealed_finance_skips_only_notices_with_proven_earlier_clocks(monkeypatch,received,published,refresh):
+    target=date.today()
+    row={**_baseline('000001',window_end=target),
+         'known_at':datetime.combine(target,datetime.min.time()).replace(hour=23),
+         'latest_report_date':sync_finance.finance_disclosure_gate(target).minimum_report_date}
+    _install_verified_parent(monkeypatch,{'000001':row},target)
+    notice={'id':1,'stock_code':'000001','title':'季度报告更正公告','notice_date':target,
+            'received_at':f'{target} {received}' if received else None,
+            'display_time':f'{target} {published}' if published else None}
+    monkeypatch.setattr(sync_finance,'read_frame',lambda *_a,**_k:pd.DataFrame([notice]))
+    actual=sync_finance.select_daily_finance_candidates(object(),{'000001':None},as_of=target)
+    assert actual.codes==(['000001'] if refresh else [])
+
+
 def test_incremental_plan_blocks_when_discovery_unproven(
     monkeypatch,
 ):

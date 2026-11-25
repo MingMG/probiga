@@ -278,6 +278,7 @@ class FinanceCandidatePlan:
     parent_batch_root_sha256: str
     input_root_sha256: str
     parent_as_of_date: date
+    code_input_roots: dict[str, str]
 
 
 def _checkpoint_payload(path: Path) -> dict[str, Any]:
@@ -591,7 +592,8 @@ def select_daily_finance_candidates(
                 raise TimeoutError('FINANCE_NOTICE_CANDIDATE_DEADLINE')
             keys = identifiers[offset:offset+128]
             rows = read_frame(text(
-                'SELECT /*+ MAX_EXECUTION_TIME(8000) */ id,stock_code,title,notice_date,received_at '
+                'SELECT /*+ MAX_EXECUTION_TIME(8000) */ id,stock_code,title,notice_date,received_at,'
+                'art_code,display_time,source_time,detail_url,data_source,data_version '
                 'FROM si_notice_eastmoney WHERE association_validated=1 AND id IN :ids '
                 'AND notice_date>=:window_start AND notice_date<=:window_end'
             ).bindparams(bindparam('ids',expanding=True)),engine,
@@ -603,9 +605,21 @@ def select_daily_finance_candidates(
         raise RuntimeError(
             "DATA_BLOCKED: finance announcement candidate source unavailable"
         ) from exc
+    notice_inputs: dict[str, list[dict[str, Any]]] = {}
     for row in notices:
         if FINANCE_NOTICE_KEYWORDS.search(str(row.get("title") or "")):
-            add(str(row.get("stock_code") or ""), "NEW_OR_CORRECTED_ANNOUNCEMENT")
+            code = str(row.get("stock_code") or "").strip().zfill(6)
+            if code not in universe:
+                continue
+            notice_inputs.setdefault(code, []).append({
+                key: row.get(key) for key in (
+                    "id", "title", "notice_date", "received_at", "art_code", "display_time",
+                    "source_time", "detail_url", "data_source", "data_version",
+                )
+            })
+            member = members.get(code)
+            if not _finance_notice_reflected(member, row):
+                add(code, "NEW_OR_CORRECTED_ANNOUNCEMENT")
 
     checkpoint = dict(checkpoint or {})
     for code in checkpoint.get("unresolved_codes") or ():
@@ -639,7 +653,31 @@ def select_daily_finance_candidates(
         ),
         input_root_sha256=input_root,
         parent_as_of_date=parent_as_of,
+        code_input_roots={code: canonical_hash({
+            "schema": "probiga.finance-issuer-candidate-input.v1",
+            "stock_code": code, "as_of": as_of.isoformat(),
+            "listing_date": listing_date,
+            "minimum_report_date": gate.minimum_report_date,
+            "disclosure_deadline": gate.disclosure_deadline,
+            "provider_contract_version": PRIMARY_FINANCE_CONTRACT_VERSION,
+            "announcements": sorted(notice_inputs.get(code, []), key=canonical_hash),
+        }) for code, listing_date in universe.items()},
     )
+
+
+def _finance_notice_reflected(member, notice) -> bool:
+    if not isinstance(member, Mapping) or member.get("coverage_status") != "COMPLETE":
+        return False
+    try:
+        source = datetime.fromisoformat(str(member.get("known_at") or ""))
+        received = datetime.fromisoformat(str(notice.get("received_at") or ""))
+        published = datetime.fromisoformat(str(notice.get("display_time") or notice.get("source_time") or ""))
+        publication_date = coerce_optional_date(notice.get("notice_date"))
+    except (ValueError, TypeError):
+        return False
+    return (source.tzinfo is None and received.tzinfo is None and published.tzinfo is None
+            and publication_date is not None and publication_date <= received.date()
+            and published <= received <= source)
 
 
 def _fetch_eastmoney_result_set(
@@ -1379,6 +1417,9 @@ def build_finance_incremental_plan(
             if code in universe and changed is not None and candidate.parent_as_of_date < changed <= as_of:
                 reasons.setdefault(code,set()).add('SOURCE_NOTICE_OR_UPDATE_CHANGED')
     fetch_codes = sorted(reasons)
+    events_by_code: dict[str, list[dict[str, Any]]] = {}
+    for event in discovery.get("events") or ():
+        events_by_code.setdefault(str(event.get("stock_code") or ""), []).append(event)
     return {
         'mode':'INCREMENTAL_DISCOVERY' if discovery_coverage_id else 'EXACT_REUSE_AND_TARGETED_REFRESH',
         'fetch_codes':fetch_codes,
@@ -1387,6 +1428,11 @@ def build_finance_incremental_plan(
         'discovery':discovery,
         'discovery_coverage_id':discovery_coverage_id,
         'fallback_reason':'',
+        'code_input_roots': {code: canonical_hash({
+            'schema': 'probiga.finance-issuer-refresh-input.v1',
+            'candidate': candidate.code_input_roots[code],
+            'discovery_events': sorted(events_by_code.get(code, []), key=canonical_hash),
+        }) for code in fetch_codes},
     }
 
 
@@ -2003,25 +2049,28 @@ def main(argv: list[str] | None = None) -> int:
             ),
         })
         if args.daily_incremental:
+            current_inputs = incremental_plan["code_input_roots"]
+            completed_inputs = previous_checkpoint.get("completed_input_roots") or {}
+            if not isinstance(completed_inputs, dict):
+                raise RuntimeError("DATA_BLOCKED: finance issuer checkpoint inputs are malformed")
             if (
                 str(previous_checkpoint.get("as_of") or "")
                 == run_as_of.isoformat()
-                and str(previous_checkpoint.get("input_root_sha256") or "")
-                == candidate_input_root_sha256
             ):
                 resumed_codes = {
-                    str(code).zfill(6)
-                    for code in previous_checkpoint.get("completed_codes") or ()
-                    if str(code).zfill(6) in all_fetch_codes
+                    code for code in all_fetch_codes
+                    if code in previous_checkpoint.get("completed_codes", ())
+                    and completed_inputs.get(code) == current_inputs[code]
                 }
             checkpoint_state = {
-                "schema": "probiga.finance-daily-checkpoint.v2",
+                "schema": "probiga.finance-daily-checkpoint.v3",
                 "status": "IN_PROGRESS",
                 "as_of": run_as_of.isoformat(),
                 "input_root_sha256": candidate_input_root_sha256,
                 "planned_codes": planned_codes,
                 "provider_fetch_codes": all_fetch_codes,
                 "completed_codes": sorted(resumed_codes),
+                "completed_input_roots": {code: current_inputs[code] for code in resumed_codes},
                 "unresolved_codes": sorted(
                     set(all_fetch_codes) - resumed_codes
                 ),
@@ -2097,6 +2146,8 @@ def main(argv: list[str] | None = None) -> int:
                         checkpoint_state["completed_codes"] = sorted({
                             *checkpoint_state.get("completed_codes", ()), code,
                         })
+                        checkpoint_state["completed_input_roots"][code] = current_inputs[code]
+                        _write_checkpoint(checkpoint_path, checkpoint_state)
                     continue
                 try:
                     latest = validate_finance_response(
@@ -2189,10 +2240,11 @@ def main(argv: list[str] | None = None) -> int:
                 }
                 if resolved_this_code:
                     completed_checkpoint_codes.add(code)
+                    checkpoint_state["completed_input_roots"][code] = current_inputs[code]
                 checkpoint_state.update({
                     "completed_codes": sorted(completed_checkpoint_codes),
                     "unresolved_codes": sorted(
-                        set(planned_codes) - completed_checkpoint_codes
+                        set(all_fetch_codes) - completed_checkpoint_codes
                     ),
                     "updated_at": datetime.now().replace(
                         microsecond=0
