@@ -54,6 +54,8 @@ class Connection:
         sql = ' '.join(str(statement).split())
         engine = self.engine
         engine.statements.append((sql, parameters))
+        if sql == 'SHOW FULL PROCESSLIST':
+            return Result(engine.owned_ddl)
         if parameters and parameters.get('table_name') == 'st_qmt_realtime_sync_receipt_v2':
             return Result(engine.receipt_index)
         if parameters and parameters.get('table_name') == 'st_quote_event_v2':
@@ -128,6 +130,7 @@ class Engine:
             for index, column in enumerate(LEVEL1_TIME_INDEX_COLUMNS, 1)
             for row in [self.canonical_receipt_index[0]]]
         self.level1_index = deepcopy(self.canonical_level1_index)
+        self.owned_ddl = []
         self.receipt_build_error = False
         self.metadata_wait_bounded = False
         self.detached = 0
@@ -333,6 +336,25 @@ def test_level1_index_uses_existing_online_migrator_without_changing_rows():
     assert ddl == ['ALTER TABLE st_quote_event_v2 ADD INDEX idx_quote_event_v2_time_quality '
                    '(quote_at,received_at,source_provider,bid1,ask1,bid1_volume,ask1_volume), '
                    'ALGORITHM=INPLACE, LOCK=NONE']
+
+
+def test_quote_storage_migration_owns_level1_index():
+    engine=Engine()
+    engine.level1_index=[]
+    result=privileged_migrate_current_quote_storage(engine)
+    assert result['level1_read_index']['created'] and result['level1_read_index']['verified']
+    assert not result['read_only']
+
+
+def test_quote_migration_does_not_duplicate_existing_server_ddl():
+    engine=Engine()
+    engine.level1_index=[]
+    engine.owned_ddl=[dict(Id=175677,Time=1564,State='altering table',
+        Info='ALTER TABLE probiga.st_quote_event_v2 ADD INDEX idx_quote_event_v2_time_quality (quote_at)')]
+    with pytest.raises(RuntimeError,match='prior DDL is not terminal') as failure:
+        schema.privileged_migrate_level1_read_index(engine)
+    assert failure.value.blocking_ddl_owner['connection_id']==175677
+    assert not any(sql.startswith('ALTER') for sql,_ in engine.statements)
 
 
 @pytest.mark.parametrize('fault', ['conflict', 'interrupted'])

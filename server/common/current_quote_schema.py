@@ -69,6 +69,16 @@ def _privileged_migrate_quote_read_index(engine, *, table, index, columns, timeo
 
         if inspect():
             return {**result, 'verified': True}
+        for process in execute('SHOW FULL PROCESSLIST', stage='prior online index owner').mappings():
+            statement=' '.join(str(process.get('Info') or '').replace('`','').lower().split())
+            if statement.startswith((f'alter table {table} ',f'alter table probiga.{table} ')):
+                failure=RuntimeError(f'quote read index {table} prior DDL is not terminal')
+                failure.native_schema_stage=f'{table}:prior_ddl'
+                failure.blocking_ddl_owner={
+                    'connection_id':int(process['Id']),'elapsed_seconds':int(process['Time']),
+                    'state':str(process.get('State') or '')[:120],
+                }
+                raise failure
         execute('SET SESSION lock_wait_timeout=5', stage='metadata lock budget')
         execute(f'ALTER TABLE {table} ADD INDEX {index} '
                 f'({",".join(columns)}), ALGORITHM=INPLACE, LOCK=NONE', stage='online index build')
@@ -214,8 +224,9 @@ def _privileged_migrate_current_quote_storage(engine):
 
 
 def privileged_migrate_current_quote_storage(engine):
-    """Run the existing quote migration and its release-owned receipt read index."""
+    """Own quote read indexes here; unrelated Linux releases need no quote DDL."""
     quotes = _privileged_migrate_current_quote_storage(engine)
     receipt = privileged_migrate_live_quote_receipt_read_index(engine)
-    return {**quotes, 'live_quote_receipt_read_index': receipt,
-            'read_only': quotes['read_only'] and receipt['read_only']}
+    level1 = privileged_migrate_level1_read_index(engine)
+    return {**quotes, 'live_quote_receipt_read_index': receipt,'level1_read_index':level1,
+            'read_only': quotes['read_only'] and receipt['read_only'] and level1['read_only']}

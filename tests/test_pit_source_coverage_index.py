@@ -280,8 +280,6 @@ def test_existing_date_index_stops_fetching_wide_rows_for_batch_inventory(storag
 @pytest.mark.parametrize('statement', [
     'ALTER TABLE `st_pit_source_coverage` DROP INDEX `idx_pit_coverage_source_known_batch`, ADD INDEX x (stock_code)',
     ' alter  table probiga.st_pit_source_coverage ADD INDEX x (stock_code)',
-    'ALTER TABLE `st_quote_event_v2` ADD INDEX idx_quote_event_v2_time_quality (quote_at)',
-    'alter table probiga.st_quote_event_v2 ADD INDEX x (quote_at)',
 ])
 def test_interrupted_index_owner_must_exit_before_another_migration(statement):
     from tools.prepare_strategy_governance_schema import _assert_pit_index_ddl_terminal, _public_failure_payload
@@ -296,8 +294,7 @@ def test_interrupted_index_owner_must_exit_before_another_migration(statement):
             return 'SELECT * FROM owned_processes', args
         return sql, args
 
-    kind = 'QUOTE' if 'st_quote_event_v2' in statement else 'PIT'
-    with pytest.raises(RuntimeError, match=f'NATIVE_SCHEMA_PREVIOUS_{kind}_DDL_NOT_TERMINAL') as failure:
+    with pytest.raises(RuntimeError, match='NATIVE_SCHEMA_PREVIOUS_PIT_DDL_NOT_TERMINAL') as failure:
         _assert_pit_index_ddl_terminal(engine)
     assert failure.value.blocking_ddl_owner == {
         'connection_id':51,'elapsed_seconds':1200,'state':'altering table','command':'Query',
@@ -305,6 +302,6 @@ def test_interrupted_index_owner_must_exit_before_another_migration(statement):
     assert _public_failure_payload(failure.value, phase='native-replay')['blocking_ddl_owner'] == failure.value.blocking_ddl_owner
     with engine.begin() as connection:
         connection.exec_driver_sql('DELETE FROM owned_processes')
-        connection.exec_driver_sql("INSERT INTO owned_processes (Info) VALUES ('ALTER TABLE unrelated ADD INDEX x (id)')")
+        connection.exec_driver_sql("INSERT INTO owned_processes VALUES ('ALTER TABLE probiga.st_quote_event_v2 ADD INDEX idx_quote_event_v2_time_quality (quote_at)',175677,1564,'altering table','Query')")
     _assert_pit_index_ddl_terminal(engine)
     engine.dispose()
