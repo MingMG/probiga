@@ -89,6 +89,8 @@ _REQUIRED_INPUTS = frozenset({
 _SHA40 = re.compile(r"[0-9a-f]{40}")
 _RUN_UID = re.compile(r"[0-9a-f]{32}")
 _VALIDATION_ONLY_BODIES = {
+    # Historical reconstruction IO does not change a frozen score's formula or inputs.
+    "server/common/pit_facts.py": ("_bind_historical_event_snapshot",),
     "server/api/routers/hot_data.py": ("_recommended_stocks_v2", "_recommended_data_freshness"),
     "server/api/scheduler_runtime.py": (
         "_terminal_snapshot", "_daily_result_recovery_target",
