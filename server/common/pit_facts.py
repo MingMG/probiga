@@ -5867,24 +5867,35 @@ def _read_historical_chain_metadata(
     metadata_store=None, metadata_progress=None,
 ) -> list[dict[str, Any]]:
     from server.common.qmt_announcement_pit import (
-        _live_announcement_read_hint, _live_announcement_reply_budget, VALIDATION_READ_BATCH_SIZE,
+        _live_announcement_read_hint, VALIDATION_READ_BATCH_SIZE,
     )
     from server.common.historical_announcement_read import _read_historical_directory_rows
 
     mysql = connection.dialect.name == "mysql"
-    directory_index = " FORCE INDEX (idx_pit_coverage_decision)" if mysql else ""
     directory: dict[str, tuple[str, datetime]] = {}
     metadata_cutoff = max(received, frontier or received)
-    # Keep the date predicate in its covering index; avoid random clustered reads
-    # while the server is still discovering and sorting a whole history range.
-    for start in range(0, len(codes), VALIDATION_READ_BATCH_SIZE):
-        stage = f"signed-historical-directory:{offset}:{start}"
+    # Join from the bounded code list so MySQL makes covering index seeks.
+    # In production the alternative range plan timed out on the same codes.
+    if mysql:
         statement = text(
-            f"SELECT coverage_id,stock_code,known_at FROM {SOURCE_COVERAGE_TABLE}{directory_index} "
+            "SELECT c.coverage_id,c.stock_code,c.known_at FROM JSON_TABLE("
+            ":codes, '$[*]' COLUMNS (stock_code VARCHAR(6) CHARACTER SET utf8mb4 "
+            "COLLATE utf8mb4_bin PATH '$')) AS wanted STRAIGHT_JOIN "
+            f"{SOURCE_COVERAGE_TABLE} AS c FORCE INDEX (idx_pit_coverage_decision) "
+            "ON c.fact_kind='event' AND c.stock_code=wanted.stock_code "
+            "AND c.known_at<=:received LIMIT :limit"
+        )
+    else:
+        statement = text(
+            f"SELECT coverage_id,stock_code,known_at FROM {SOURCE_COVERAGE_TABLE} "
             "WHERE fact_kind='event' AND stock_code IN :codes AND known_at<=:received LIMIT :limit"
         ).bindparams(bindparam("codes", expanding=True))
+    batch_size = 10 if mysql else VALIDATION_READ_BATCH_SIZE
+    for start in range(0, len(codes), batch_size):
+        stage = f"signed-historical-directory:{offset}:{start}"
+        batch = codes[start:start + batch_size]
         rows = _read_historical_directory_rows(connection, statement, {
-            "codes": codes[start:start + VALIDATION_READ_BATCH_SIZE], "received": metadata_cutoff,
+            "codes": json.dumps(batch) if mysql else batch, "received": metadata_cutoff,
             "limit": 200001 - len(directory),
         }, fields=('coverage_id','stock_code','known_at'), deadline=deadline, stage=stage)
         for identifier, code, known in rows:
@@ -6177,10 +6188,23 @@ def _bind_historical_event_snapshot(
         total = len(inventory) + binding_units
         if event_progress is not None:
             event_progress(0, total)
-        for offset in range(0, len(inventory), VALIDATION_INVENTORY_CODE_LIMIT):
-            stock_batch = dict(inventory[offset:offset + VALIDATION_INVENTORY_CODE_LIMIT])
-            key = canonical_hash(stock_batch)
-            retained = coverage_store.get(coverage_generation, 'historical_event_coverage', key) if coverage_store is not None else None
+        # Save each small verified block before reading the next cold range.
+        block_size = VALIDATION_INVENTORY_CODE_LIMIT
+        if coverage_store is not None:
+            block_size = min(40, block_size)
+        blocks = [(offset, dict(inventory[offset:offset + block_size]))
+                  for offset in range(0, len(inventory), block_size)]
+        keys_by_block = [canonical_hash(stock_batch) for _, stock_batch in blocks]
+        retained_blocks = {}
+        for i, ((offset, stock_batch), key) in enumerate(zip(blocks, keys_by_block, strict=True)):
+            if coverage_store is not None and i % 8 == 0:
+                _live_announcement_read_hint(
+                    mysql=False, deadline=deadline, stage=f"signed-historical-directory:{offset}:0",
+                )
+                retained_blocks = coverage_store.get_many(
+                    coverage_generation, 'historical_event_coverage', keys_by_block[i:i + 8],
+                )
+            retained = retained_blocks.get(key)
             if retained is not None:
                 if ({row['stock_code']: row['coverage_id'] for row, _ in retained['members']} != stock_batch
                         or {entry['stock_code'] for entry in retained['entries']} != stock_batch.keys()

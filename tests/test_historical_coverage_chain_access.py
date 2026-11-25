@@ -30,6 +30,14 @@ def _mysql_packets_in_sqlite(engine):
             format.replace('%i','%M').replace('%s','%S')))
 
 
+def _sqlite_directory_join(sql):
+    return re.sub(
+        r"JSON_TABLE\((\?), '\$\[\*\]' COLUMNS \(stock_code VARCHAR\(6\) CHARACTER SET utf8mb4 "
+        r"COLLATE utf8mb4_bin PATH '\$'\)\) AS wanted STRAIGHT_JOIN",
+        r"json_each(\1) AS wanted CROSS JOIN", sql,
+    ).replace("wanted.stock_code", "wanted.value")
+
+
 def test_compressed_directory_crosses_same_row_reply_limit_without_losing_identities(monkeypatch):
     from types import SimpleNamespace
     from server.common.historical_announcement_read import _read_historical_directory_rows
@@ -194,7 +202,7 @@ def test_historical_chain_filters_future_revisions_before_row_reads(monkeypatch,
             driver.set_progress_handler(progress, 1000)
             return re.sub(r' FORCE INDEX \((\w+)\)',
                 lambda match:' INDEXED BY '+('sqlite_autoindex_st_pit_source_coverage_1'
-                    if match[1]=='PRIMARY' else match[1]), statement), parameters
+                    if match[1]=='PRIMARY' else match[1]), _sqlite_directory_join(statement)), parameters
         event.listen(c, 'before_cursor_execute', bounded_access, retval=True)
         received = datetime(2026, 9, 1, 0, 6)
         try:
@@ -273,7 +281,7 @@ def test_cold_historical_metadata_read_resumes_committed_chunks_under_query_budg
                     if resumed:assert not keys&committed_ids,'resuming must not reload committed source records'
                     else:committed_ids.update(keys)
                 return re.sub(r' FORCE INDEX \((\w+)\)',lambda m:' INDEXED BY '+
-                    ('sqlite_autoindex_st_pit_source_coverage_1' if m[1]=='PRIMARY' else m[1]),sql),parameters
+                    ('sqlite_autoindex_st_pit_source_coverage_1' if m[1]=='PRIMARY' else m[1]),_sqlite_directory_join(sql)),parameters
             event.listen(c,'before_cursor_execute',bounded_access,retval=True)
             received=datetime(2026,11,8,18)
             old=text('''SELECT coverage_id,scope_hash,stock_code,revision_no,supersedes_coverage_id,
