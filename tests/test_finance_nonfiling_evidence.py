@@ -119,6 +119,8 @@ def test_current_causal_inability_in_official_third_quarter_notice(prefix):
 
 @pytest.mark.parametrize("sentence", [
     "预计导致公司无法按期披露2026年第三季度报告。",
+    "公司将导致公司无法按期披露2026年第三季度报告。",
+    "公司将因此导致公司无法按期披露2026年第三季度报告。",
     "可能导致公司无法按期披露2026年第三季度报告。",
     "若导致公司无法按期披露2026年第三季度报告，将停牌。",
     "公司将无法按期披露2026年第三季度报告。",
