@@ -145,3 +145,30 @@ def test_invalid_hash_and_non_native_origin_are_not_admitted(evidence):
 
     rows = market.read_legacy_attestations(read, params, database=engine, deadline=time.monotonic() + 10)
     assert len(rows) == 1534 and not {'000001', '000002'} & {row['stock_code'] for row in rows}
+
+
+def test_retained_pages_fit_network_round_trip_budget(evidence, monkeypatch):
+    engine, params = evidence
+
+    def read(sql, params, *, database):
+        with database.connect() as c:
+            return [dict(row) for row in c.execute(text(sql), params).mappings()]
+
+    assert len(market.read_legacy_attestations(read, params, database=engine,
+                                             deadline=time.monotonic() + 10)) == 1536
+    clock = [0]
+    monkeypatch.setattr(market.time, "monotonic", lambda: clock[0])
+
+    def network_latency(_connection, _cursor, statement, _parameters, _context, _many):
+        # Production took 30.84s for 32 cached pages, versus 1.49s in bulk.
+        if "st_formal_analysis_artifact" in statement:
+            clock[0] += 1
+
+    event.listen(engine, "before_cursor_execute", network_latency)
+    earlier = {**params, "decision_known_at": datetime(2026, 6, 1, 23, 59, 59)}
+    try:
+        rows = market.read_legacy_attestations(read, earlier, database=engine, deadline=10)
+    finally:
+        event.remove(engine, "before_cursor_execute", network_latency)
+    assert len(rows) == 1535
+    assert len({row["attestation_id"] for row in rows}) == 1535

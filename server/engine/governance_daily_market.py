@@ -92,9 +92,13 @@ def read_legacy_attestations(read, params, *, database, deadline):
         for offset in range(0, len(day_ids), 64):
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"QMT certification read deadline: {completed}/{len(ids)}; verified pages retained")
+            if offset % 2048 == 0:
+                page_keys = [canonical_digest(day_ids[start:start + 64])
+                             for start in range(offset, min(offset + 2048, len(day_ids)), 64)]
+                retained_pages = store.get_many(generation, "governance_attestation_rows", page_keys)
             selected = day_ids[offset:offset + 64]
             key = canonical_digest(selected)
-            retained = store.get(generation, "governance_attestation_rows", key)
+            retained = retained_pages.get(key)
             fresh = retained is None
             if fresh:
                 placeholders = ",".join(f":attestation_{i}" for i in range(len(selected)))
