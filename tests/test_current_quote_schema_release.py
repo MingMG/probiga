@@ -56,6 +56,8 @@ class Connection:
         engine.statements.append((sql, parameters))
         if parameters and parameters.get('table_name') == 'st_qmt_realtime_sync_receipt_v2':
             return Result(engine.receipt_index)
+        if parameters and parameters.get('table_name') == 'st_quote_event_v2':
+            return Result(engine.level1_index)
         if sql == 'SET SESSION lock_wait_timeout=5':
             engine.metadata_wait_bounded = True
             return Result(None)
@@ -66,6 +68,14 @@ class Connection:
             if engine.receipt_build_error:
                 raise RuntimeError('online build interrupted')
             engine.receipt_index = deepcopy(engine.canonical_receipt_index)
+            return Result(None)
+        if sql.startswith('ALTER TABLE st_quote_event_v2 ADD INDEX'):
+            assert engine.metadata_wait_bounded
+            assert 0 < self.connection.dbapi_connection._read_timeout <= 600
+            assert 'ALGORITHM=INPLACE, LOCK=NONE' in sql
+            if engine.receipt_build_error:
+                raise RuntimeError('online index build interrupted')
+            engine.level1_index = deepcopy(engine.canonical_level1_index)
             return Result(None)
         if 'information_schema.STATISTICS' in sql:
             if engine.checked and engine.drift:
@@ -113,6 +123,11 @@ class Engine:
             SUB_PART=None, INDEX_TYPE='BTREE', COLLATION='A', IS_VISIBLE='YES', EXPRESSION=None) for index, column in enumerate(
                 ('source_provider','published_at','created_at'),1)]
         self.receipt_index = deepcopy(self.canonical_receipt_index)
+        from server.trading_v2.quotes import LEVEL1_TIME_INDEX_COLUMNS
+        self.canonical_level1_index = [dict(row, COLUMN_NAME=column, SEQ_IN_INDEX=index)
+            for index, column in enumerate(LEVEL1_TIME_INDEX_COLUMNS, 1)
+            for row in [self.canonical_receipt_index[0]]]
+        self.level1_index = deepcopy(self.canonical_level1_index)
         self.receipt_build_error = False
         self.metadata_wait_bounded = False
         self.detached = 0
@@ -304,3 +319,30 @@ def test_existing_release_entrypoint_includes_the_receipt_index_migration():
     result = privileged_migrate_current_quote_storage(engine)
     assert result['live_quote_receipt_read_index']['created'] is True
     assert result['read_only'] is False and result['integrity_verified'] is True
+
+
+def test_level1_index_uses_existing_online_migrator_without_changing_rows():
+    engine = Engine()
+    engine.level1_index = []
+    before = deepcopy(engine.rows)
+    result = schema.privileged_migrate_level1_read_index(engine)
+    assert result['created'] and result['verified'] and not result['read_only']
+    assert not schema.privileged_migrate_level1_read_index(engine)['created']
+    assert engine.rows == before and engine.open_connections == 0
+    ddl = [sql for sql, _ in engine.statements if sql.startswith('ALTER')]
+    assert ddl == ['ALTER TABLE st_quote_event_v2 ADD INDEX idx_quote_event_v2_time_quality '
+                   '(quote_at,received_at,source_provider,bid1,ask1,bid1_volume,ask1_volume), '
+                   'ALGORITHM=INPLACE, LOCK=NONE']
+
+
+@pytest.mark.parametrize('fault', ['conflict', 'interrupted'])
+def test_level1_index_failure_is_terminal_without_retry(fault):
+    engine = Engine()
+    if fault == 'conflict': engine.level1_index[0]['SUB_PART'] = 4
+    else:
+        engine.level1_index = []
+        engine.receipt_build_error = True
+    with pytest.raises(RuntimeError, match='definition differs|online index build'):
+        schema.privileged_migrate_level1_read_index(engine)
+    assert len([sql for sql, _ in engine.statements if sql.startswith('ALTER')]) == (fault == 'interrupted')
+    assert engine.open_connections == 0

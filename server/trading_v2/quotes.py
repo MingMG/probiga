@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable, Mapping
+from time import monotonic
 
 from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine
@@ -18,6 +19,67 @@ PROTOCOL_VERSION = "level1_continuity_v2.0.0"
 MINIMUM_COMPLETE_TRADE_DAYS = 5
 MINIMUM_SESSION_MINUTES = 228
 MINIMUM_COMPLETE_ROW_RATIO = Decimal("0.99")
+LEVEL1_TIME_INDEX = "idx_quote_event_v2_time_quality"
+LEVEL1_TIME_INDEX_COLUMNS = (
+    "quote_at", "received_at", "source_provider", "bid1", "ask1",
+    "bid1_volume", "ask1_volume",
+)
+
+
+def _level1_time_index_ready(connection: Connection, *, deadline: float) -> bool:
+    if connection.dialect.name != "mysql":
+        return True
+    from server.common.qmt_announcement_pit import _live_announcement_reply_budget
+
+    with _live_announcement_reply_budget(connection, deadline=deadline, stage="level1-time-index"):
+        rows = connection.execute(text("""
+            SELECT /*+ MAX_EXECUTION_TIME(3000) */ COLUMN_NAME, SUB_PART,
+                   INDEX_TYPE, IS_VISIBLE, EXPRESSION
+            FROM information_schema.STATISTICS
+            WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='st_quote_event_v2'
+              AND INDEX_NAME=:index_name ORDER BY SEQ_IN_INDEX
+        """), {"index_name": LEVEL1_TIME_INDEX}).mappings().all()
+    return (
+        tuple(row["COLUMN_NAME"] for row in rows) == LEVEL1_TIME_INDEX_COLUMNS
+        and all(row["SUB_PART"] is None and row["EXPRESSION"] is None
+                and row["INDEX_TYPE"] == "BTREE" and row["IS_VISIBLE"] == "YES"
+                for row in rows)
+    )
+
+
+def _read_level1_day(
+    connection: Connection, trade_day: date, *, genuine: bool, deadline: float,
+) -> Mapping[str, Any]:
+    from server.common.qmt_announcement_pit import _live_announcement_reply_budget
+
+    mysql = connection.dialect.name == "mysql"
+    index = f" FORCE INDEX ({LEVEL1_TIME_INDEX})" if mysql else ""
+    genuine_filter = """
+        AND source_provider = 'gj_big_qmt_inner'
+        AND received_at >= quote_at
+        AND TIMESTAMPDIFF(SECOND, quote_at, received_at) <= 15
+    """ if genuine else ""
+    with _live_announcement_reply_budget(
+        connection, deadline=deadline, stage=f"level1-day:{trade_day}:{genuine}",
+    ):
+        return connection.execute(text(f"""
+            SELECT /*+ MAX_EXECUTION_TIME(8000) */
+                COUNT(*) AS event_count,
+                COUNT(DISTINCT DATE_FORMAT(quote_at, '%H:%i')) AS session_minutes,
+                SUM(CASE WHEN bid1 > 0 AND ask1 > 0
+                              AND bid1_volume > 0 AND ask1_volume > 0
+                         THEN 1 ELSE 0 END) AS complete_events,
+                MIN(TIMESTAMPDIFF(SECOND, quote_at, received_at)) AS minimum_ingress_seconds,
+                MAX(TIMESTAMPDIFF(SECOND, quote_at, received_at)) AS maximum_ingress_seconds
+            FROM st_quote_event_v2{index}
+            WHERE quote_at >= :day_start AND quote_at < :day_end
+              {genuine_filter}
+              AND (TIME(quote_at) BETWEEN '09:31:00' AND '11:30:59'
+                   OR TIME(quote_at) BETWEEN '13:01:00' AND '15:00:59')
+        """), {
+            "day_start": datetime.combine(trade_day, datetime.min.time()),
+            "day_end": datetime.combine(trade_day + timedelta(days=1), datetime.min.time()),
+        }).mappings().one()
 
 
 def _nullable_decimal(value: Any) -> Decimal | None:
@@ -177,7 +239,7 @@ def _trade_days(engine: Engine, end_date: date, limit: int) -> list[date]:
         rows = connection.execute(
             text(
                 """
-                SELECT trade_date FROM si_trade_calendar
+                SELECT /*+ MAX_EXECUTION_TIME(8000) */ trade_date FROM si_trade_calendar
                 WHERE trade_status = 1 AND trade_date <= :end_date
                 ORDER BY trade_date DESC LIMIT :limit
                 """
@@ -206,30 +268,11 @@ def validate_level1_continuity(
     days = _trade_days(engine, end_date, MINIMUM_COMPLETE_TRADE_DAYS)
     evidence_days: list[dict[str, Any]] = []
     consecutive = 0
+    deadline = monotonic() + 120
     with source_engine.connect() as connection:
-        for trade_day in days:
-            row = connection.execute(
-                text(
-                    """
-                    SELECT
-                        COUNT(*) AS event_count,
-                        COUNT(DISTINCT DATE_FORMAT(quote_at, '%H:%i'))
-                            AS session_minutes,
-                        SUM(CASE WHEN bid1 > 0 AND ask1 > 0
-                                      AND bid1_volume > 0 AND ask1_volume > 0
-                                 THEN 1 ELSE 0 END) AS complete_events,
-                        MAX(TIMESTAMPDIFF(SECOND, quote_at, received_at))
-                            AS maximum_ingress_seconds
-                    FROM st_quote_event_v2
-                    WHERE DATE(quote_at) = :trade_date
-                      AND (
-                        TIME(quote_at) BETWEEN '09:31:00' AND '11:30:59'
-                        OR TIME(quote_at) BETWEEN '13:01:00' AND '15:00:59'
-                      )
-                    """
-                ),
-                {"trade_date": trade_day},
-            ).mappings().first()
+        index_ready = _level1_time_index_ready(connection, deadline=deadline)
+        for trade_day in days if index_ready else []:
+            row = _read_level1_day(connection, trade_day, genuine=False, deadline=deadline)
             event_count = int((row or {}).get("event_count") or 0)
             session_minutes = int((row or {}).get("session_minutes") or 0)
             complete_events = int((row or {}).get("complete_events") or 0)
@@ -274,7 +317,11 @@ def validate_level1_continuity(
         "maximum_quote_age_seconds": 15,
         "last_price_fallback": "PROHIBITED",
         "days": evidence_days,
+        "required_read_index": LEVEL1_TIME_INDEX,
+        "read_index_ready": index_ready,
     }
+    if not index_ready:
+        evidence["block_reason"] = "level1_read_index_unavailable"
     with engine.begin() as connection:
         connection.execute(
             text(
@@ -314,9 +361,12 @@ def validate_level1_continuity(
                 "passed_at": now if passed else None,
             },
         )
-    return {
+    result = {
         "capability_code": CAPABILITY_CODE,
         "status": "PASS" if passed else "BLOCK",
         "consecutive_trade_days": consecutive,
         "evidence": evidence,
     }
+    if not index_ready:
+        result["block_reason"] = evidence["block_reason"]
+    return result

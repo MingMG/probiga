@@ -7,6 +7,7 @@ import sys
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
+from time import monotonic
 
 from sqlalchemy import text
 
@@ -15,9 +16,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from server.common.batch_db import create_batch_engine
-from server.common.kline_data import get_kline_engine
+from server.common.config import get_kline_mysql_url
+from server.common.qmt_announcement_pit import _live_announcement_reply_budget
 from server.trading_v2.calendar import latest_trade_day
-from server.trading_v2.quotes import validate_level1_continuity
+from server.trading_v2.quotes import _read_level1_day, validate_level1_continuity
 from tools.env_config import load_project_env
 
 
@@ -33,30 +35,34 @@ def _live_receipt_gate(
 
     days = [trade_days] if isinstance(trade_days, date) else list(trade_days)
     daily: list[dict[str, object]] = []
+    deadline = monotonic() + 120
     try:
         with evidence_engine.connect() as connection:
             for trade_day in days:
-                row = connection.execute(
-                    text(
-                        """
-                        SELECT
-                            COUNT(*) AS receipt_count,
-                            COUNT(DISTINCT DATE_FORMAT(source_generated_at, '%H:%i'))
-                                AS receipt_minutes,
-                            MAX(source_generated_at) AS latest_source_at,
-                            MAX(published_at) AS latest_published_at
-                        FROM st_qmt_realtime_sync_receipt_v2
-                        WHERE DATE(source_generated_at) = :trade_date
-                          AND capture_mode = 'LIVE_FORWARD'
-                          AND quality_status = 'PASS'
-                          AND (
-                            TIME(source_generated_at) BETWEEN '09:31:00' AND '11:30:59'
-                            OR TIME(source_generated_at) BETWEEN '13:01:00' AND '15:00:59'
-                          )
-                        """
-                    ),
-                    {"trade_date": trade_day},
-                ).mappings().first()
+                with _live_announcement_reply_budget(
+                    connection, deadline=deadline, stage=f"level1-receipt:{trade_day}",
+                ):
+                    row = connection.execute(
+                        text(
+                            """
+                            SELECT /*+ MAX_EXECUTION_TIME(8000) */
+                                COUNT(*) AS receipt_count,
+                                COUNT(DISTINCT DATE_FORMAT(source_generated_at, '%H:%i'))
+                                    AS receipt_minutes,
+                                MAX(source_generated_at) AS latest_source_at,
+                                MAX(published_at) AS latest_published_at
+                            FROM st_qmt_realtime_sync_receipt_v2
+                            WHERE DATE(source_generated_at) = :trade_date
+                              AND capture_mode = 'LIVE_FORWARD'
+                              AND quality_status = 'PASS'
+                              AND (
+                                TIME(source_generated_at) BETWEEN '09:31:00' AND '11:30:59'
+                                OR TIME(source_generated_at) BETWEEN '13:01:00' AND '15:00:59'
+                              )
+                            """
+                        ),
+                        {"trade_date": trade_day},
+                    ).mappings().first()
                 receipt_count = int((row or {}).get("receipt_count") or 0)
                 receipt_minutes = int((row or {}).get("receipt_minutes") or 0)
                 daily.append(
@@ -139,36 +145,11 @@ def _genuine_level1_event_gate(
 
     days = [trade_days] if isinstance(trade_days, date) else list(trade_days)
     daily: list[dict[str, object]] = []
+    deadline = monotonic() + 120
     try:
         with evidence_engine.connect() as connection:
             for trade_day in days:
-                row = connection.execute(
-                    text(
-                        """
-                        SELECT
-                            COUNT(*) AS event_count,
-                            COUNT(DISTINCT DATE_FORMAT(quote_at, '%H:%i'))
-                                AS session_minutes,
-                            SUM(CASE WHEN bid1 > 0 AND ask1 > 0
-                                          AND bid1_volume > 0 AND ask1_volume > 0
-                                     THEN 1 ELSE 0 END) AS complete_events,
-                            MIN(TIMESTAMPDIFF(SECOND, quote_at, received_at))
-                                AS minimum_ingress_seconds,
-                            MAX(TIMESTAMPDIFF(SECOND, quote_at, received_at))
-                                AS maximum_ingress_seconds
-                        FROM st_quote_event_v2
-                        WHERE DATE(quote_at) = :trade_date
-                          AND source_provider = 'gj_big_qmt_inner'
-                          AND received_at >= quote_at
-                          AND TIMESTAMPDIFF(SECOND, quote_at, received_at) <= 15
-                          AND (
-                            TIME(quote_at) BETWEEN '09:31:00' AND '11:30:59'
-                            OR TIME(quote_at) BETWEEN '13:01:00' AND '15:00:59'
-                          )
-                        """
-                    ),
-                    {"trade_date": trade_day},
-                ).mappings().first()
+                row = _read_level1_day(connection, trade_day, genuine=True, deadline=deadline)
                 event_count = int((row or {}).get("event_count") or 0)
                 session_minutes = int((row or {}).get("session_minutes") or 0)
                 complete_events = int((row or {}).get("complete_events") or 0)
@@ -217,16 +198,21 @@ def _genuine_level1_event_gate(
 
 
 def run_validation() -> dict[str, object]:
-    engine = create_batch_engine()
+    bounded = {"pool_timeout": 5, "connect_args": {
+        "connect_timeout": 8, "read_timeout": 15, "write_timeout": 10,
+    }}
+    engine = create_batch_engine(**bounded)
     evidence_engine = None
     try:
-        evidence_engine = get_kline_engine()
+        evidence_engine = create_batch_engine(get_kline_mysql_url(), **bounded)
         end_date = latest_trade_day(engine, date.today())
         result = validate_level1_continuity(
             engine,
             end_date=end_date,
             evidence_engine=evidence_engine,
         )
+        if result.get("block_reason") == "level1_read_index_unavailable":
+            return result
         evidence_days = [
             date.fromisoformat(str(item["trade_date"])[:10])
             for item in (result.get("evidence") or {}).get("days", [])
