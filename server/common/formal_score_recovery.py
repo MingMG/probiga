@@ -55,6 +55,8 @@ _PERMITTED_VALIDATION_FILES = frozenset({
     # These execution/evidence readers are not called by the formal scorer.
     "server/engine/governance_daily_market.py",
     "server/engine/strategy_native_backtest.py",
+    # Only dated replay sets event_trade_date and calls this reader.
+    "server/common/historical_announcement_read.py",
     "server/static/js/trading-v3.js",
     "server/static/trading-v3.html",
     "tools/run_strategy_governance_daily.py",
