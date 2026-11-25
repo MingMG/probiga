@@ -929,7 +929,12 @@ directory_fd = os.open(
 )
 try:
     for name in os.listdir(directory_fd):
-        observed = os.lstat(name, dir_fd=directory_fd)
+        try:
+            observed = os.lstat(name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            if name in {"sector-heatmap-v1.sqlite3" + suffix for suffix in ("-journal", "-wal", "-shm")}:
+                continue  # A live SQLite writer can remove its temporary sidecar.
+            raise
         # Validated read-only by migrate_legacy_flow_progress inspect; moved
         # only after all writers stop, before the final flat-log check.
         if re.fullmatch(r"flow-\d{4}-\d{2}-\d{2}", name) and stat.S_ISDIR(observed.st_mode):

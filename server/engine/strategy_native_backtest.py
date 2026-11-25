@@ -7,6 +7,7 @@ import signal
 import time
 
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 
 from server.common.analysis_pool_receipt import canonical_sha256
 from server.engine.native_feature_math import _features, _frame, _assert_read_succeeded
@@ -84,7 +85,13 @@ def _inventory(c,day):
 
 def _restore_failure_lock(connection):
     # Interrupted driver reads can invalidate the connection and release its session lock.
-    if connection.execute(text('SELECT IS_USED_LOCK(:name)=CONNECTION_ID()'),{'name':LOCK}).scalar()!=1:
+    try:
+        owned=connection.execute(text('SELECT IS_USED_LOCK(:name)=CONNECTION_ID()'),{'name':LOCK}).scalar()==1
+    except DBAPIError as exc:
+        if not exc.connection_invalidated:raise
+        connection.rollback()
+        owned=connection.execute(text('SELECT IS_USED_LOCK(:name)=CONNECTION_ID()'),{'name':LOCK}).scalar()==1
+    if not owned:
         if connection.execute(text('SELECT GET_LOCK(:name,0)'),{'name':LOCK}).scalar()!=1:
             raise RuntimeError('原生回测失败回执无法恢复互斥锁')
 

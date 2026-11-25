@@ -159,6 +159,47 @@ def _snapshot(model):
     return {path: dict(node) for path, node in model.nodes.items()}
 
 
+@pytest.mark.parametrize("name", ["sector-heatmap-v1.sqlite3" + suffix for suffix in ("-journal", "-wal", "-shm")])
+def test_live_prepare_accepts_sqlite_sidecar_removed_after_directory_listing(name):
+    model = _PosixModel()
+    model.file("/jobs/" + name)
+    original_listdir = model.listdir
+    def disappear(fd):
+        names = original_listdir(fd)
+        del model.nodes["/jobs/" + name]
+        return names
+    model.listdir = disappear
+    _run(model, "prepare_probiga_job_log_root")
+    assert not model.handles and not model.mutations
+
+
+@pytest.mark.parametrize("name", ["sector-heatmap-v1.sqlite3", "unknown.sqlite3-journal", "run.log"])
+def test_live_prepare_rejects_disappearance_of_non_sidecar_files(name):
+    model = _PosixModel()
+    model.file("/jobs/" + name)
+    original_listdir = model.listdir
+    def disappear(fd):
+        names = original_listdir(fd)
+        del model.nodes["/jobs/" + name]
+        return names
+    model.listdir = disappear
+    with pytest.raises(FileNotFoundError):
+        _run(model, "prepare_probiga_job_log_root")
+    assert not model.handles and not model.mutations
+
+
+@pytest.mark.parametrize("field,value", [("st_mode", stat.S_IFLNK | 0o600), ("st_uid", 0), ("st_nlink", 2)])
+def test_live_prepare_still_rejects_unsafe_existing_sqlite_sidecars(field, value):
+    model = _PosixModel()
+    node = model.file("/jobs/sector-heatmap-v1.sqlite3-journal")
+    node[field] = value
+    original = _snapshot(model)
+    with pytest.raises(SystemExit):
+        _run(model, "prepare_probiga_job_log_root")
+    assert _snapshot(model) == original
+    assert not model.handles and not model.mutations
+
+
 def test_prepare_migrate_and_final_find_use_the_one_closed_validator():
     prepare = _body("prepare_probiga_job_log_root")
     migrate = _body("migrate_probiga_job_log_legacy_modes")
