@@ -74,9 +74,13 @@ def _reconstruction_counts(connection, *, source, batch_id, deadline, coverage_s
     counts=[]
     # 128 cold rows exhausted the observed 10-second reply limit.
     for offset in range(0,len(inventory),64):
+        if coverage_store is not None and offset % 2048 == 0:
+            page_keys=[canonical_hash(inventory[start:start+64])
+                for start in range(offset,min(offset+2048,len(inventory)),64)]
+            retained_pages=coverage_store.get_many(generation,'historical_header_counts',page_keys)
         selected=inventory[offset:offset+64]
         key=canonical_hash(selected)
-        retained=coverage_store.get(generation,'historical_header_counts',key) if coverage_store is not None else None
+        retained=retained_pages.get(key) if coverage_store is not None else None
         fresh=retained is None
         stage=f'historical-header-counts:{offset}'
         hint=_live_announcement_read_hint(mysql=connection.dialect.name=='mysql',deadline=deadline,stage=stage)

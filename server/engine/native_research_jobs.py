@@ -261,7 +261,7 @@ class PrepareYield(BaseException):
 
 
 def _source_progress(connection, state, owner, day, stage, *, deadline, checkpoint_interval=5):
-    from server.engine.strategy_native_backtest import _save
+    from server.engine.strategy_native_backtest import NativeStepDeadline, _save
     from server.common.analysis_pool_receipt import canonical_sha256
     last_saved = time.monotonic()
     starting={key:value['completed'] for key,value in state.get('source_cursors',{}).items()}
@@ -283,7 +283,7 @@ def _source_progress(connection, state, owner, day, stage, *, deadline, checkpoi
             _save(connection, state, owner)
             last_saved = time.monotonic()
         if time.monotonic() >= deadline and done < total:
-            if done<=starting.get(key,0):raise RuntimeError('PREPARE_NO_PROGRESS:'+stage)
+            if done<=starting.get(key,0):raise NativeStepDeadline('PREPARE_NO_PROGRESS:'+stage)
             raise PrepareYield('来源断点已保存：' + stage)
     return progress
 
