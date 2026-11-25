@@ -646,8 +646,9 @@ def native_tick(engine):
     if engine.dialect.name != 'mysql':
         return _native_tick(engine)
     from server.common.engine_factory import create_pooled_engine
+    # The announcement adapter bounds a whole call by the tighter socket timeout.
     bounded = create_pooled_engine(engine.url, pool_timeout=5,
-        connect_args={'connect_timeout': 5, 'read_timeout': 35, 'write_timeout': 10})
+        connect_args={'connect_timeout': 5, 'read_timeout': 35, 'write_timeout': 35})
     try:
         return _native_tick(bounded)
     finally:
