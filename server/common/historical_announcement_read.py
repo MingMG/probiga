@@ -14,6 +14,46 @@ from server.common.qmt_announcement_pit import (
 )
 
 
+def _read_historical_directory_rows(connection, statement, parameters, *, fields, deadline, stage):
+    """Read one bounded directory as one packet, preserving its exact fields."""
+    from sqlalchemy import String, cast, column, func, select
+    from server.common.pit_facts import _decode_coverage_payload
+    from server.common.qmt_announcement_pit import _live_announcement_read_hint, _live_announcement_reply_budget
+
+    mysql = connection.dialect.name == 'mysql'
+    hint = _live_announcement_read_hint(mysql=mysql, deadline=deadline, stage=stage)
+    if mysql:
+        directory = statement.columns(*(column(name) for name in fields)).subquery('directory')
+        values = [func.date_format(directory.c[name], '%Y-%m-%d %H:%i:%s.%f')
+                  if name == 'known_at' else directory.c[name] for name in fields]
+        body = select(func.count().label('row_count'),
+            cast(func.json_arrayagg(func.json_array(*values)), String).label('body')
+        ).select_from(directory).subquery('packed_directory')
+        query = select(body.c.row_count, func.octet_length(body.c.body).label('raw_bytes'),
+            func.compress(body.c.body).label('packed')).prefix_with(hint)
+    else:
+        query = statement
+    with _live_announcement_reply_budget(connection, deadline=deadline, stage=stage):
+        if not mysql:
+            return connection.execute(query, parameters).tuples().all()
+        packet = connection.execute(query, parameters).mappings().one()
+    count = packet['row_count']
+    if type(count) is not int or not 0 <= count <= parameters['limit']:
+        raise ValueError('historical announcement directory packet count differs')
+    if count == 0:
+        if packet['raw_bytes'] is not None or packet['packed'] is not None:
+            raise ValueError('historical announcement empty directory packet differs')
+        return []
+    if type(packet['raw_bytes']) is not int or not 0 < packet['raw_bytes'] <= 32 * 1024 * 1024:
+        raise ValueError('historical announcement directory packet exceeds byte budget')
+    rows = json.loads(_decode_coverage_payload(packet['packed'], expected_bytes=packet['raw_bytes'], stage=stage))
+    if (not isinstance(rows, list) or len(rows) != count
+            or any(not isinstance(row, list) or len(row) != len(fields) for row in rows)):
+        raise ValueError('historical announcement directory packet membership differs')
+    _live_announcement_read_hint(mysql=False, deadline=deadline, stage=stage)
+    return rows
+
+
 def _inventory(engine,*,code,decision_at,target,window_start,source=None):
     with engine.connect() as c:
         rows=c.execute(text("""SELECT /*+ MAX_EXECUTION_TIME(4000) */ source,batch_id,

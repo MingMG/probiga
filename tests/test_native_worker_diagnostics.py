@@ -8,6 +8,17 @@ from tools.run_trading_v2_job_worker import run_with_diagnostics
 from tools import run_trading_v2_job_worker as worker
 
 
+@pytest.mark.parametrize('reason,expected',[
+    ('QMT_ANNOUNCEMENT_LIVE_BATCH_REPLY_DEADLINE:signed-historical-directory:800:0',True),
+    ('QMT_ANNOUNCEMENT_LIVE_BATCH_REPLY_FAILED:signed-historical-head-directory:800:0',True),
+    ('QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND:no-common-batch',False),
+    ('QMT_ANNOUNCEMENT_LIVE_BATCH_REPLY_DEADLINE:invalid detail',False),
+    ('PIT_EVENT_COVERAGE_CHAIN_DIFFERS',False),
+])
+def test_sanitized_announcement_transport_failure_keeps_existing_bounded_retry(reason,expected):
+    assert native._transient_source_error(RuntimeError('历史事实读取失败：'+reason)) is expected
+
+
 def test_slow_failure_diagnostics_keep_the_business_result_and_stack(tmp_path,monkeypatch):
     from tools import run_ai_recommendation_premarket as diagnostics
     monkeypatch.setenv('PROBIGA_SCHEDULER_HISTORY_RUN_UID','1'*32)

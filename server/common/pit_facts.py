@@ -5865,6 +5865,7 @@ def _read_historical_chain_metadata(
     from server.common.qmt_announcement_pit import (
         _live_announcement_read_hint, _live_announcement_reply_budget, VALIDATION_READ_BATCH_SIZE,
     )
+    from server.common.historical_announcement_read import _read_historical_directory_rows
 
     mysql = connection.dialect.name == "mysql"
     directory_index = " FORCE INDEX (idx_pit_coverage_decision)" if mysql else ""
@@ -5874,16 +5875,14 @@ def _read_historical_chain_metadata(
     # while the server is still discovering and sorting a whole history range.
     for start in range(0, len(codes), VALIDATION_READ_BATCH_SIZE):
         stage = f"signed-historical-directory:{offset}:{start}"
-        hint = _live_announcement_read_hint(mysql=mysql, deadline=deadline, stage=stage)
         statement = text(
-            f"SELECT {hint}coverage_id,stock_code,known_at FROM {SOURCE_COVERAGE_TABLE}{directory_index} "
+            f"SELECT coverage_id,stock_code,known_at FROM {SOURCE_COVERAGE_TABLE}{directory_index} "
             "WHERE fact_kind='event' AND stock_code IN :codes AND known_at<=:received LIMIT :limit"
         ).bindparams(bindparam("codes", expanding=True))
-        with _live_announcement_reply_budget(connection, deadline=deadline, stage=stage):
-            rows = connection.execute(statement, {
-                "codes": codes[start:start + VALIDATION_READ_BATCH_SIZE], "received": metadata_cutoff,
-                "limit": 200001 - len(directory),
-            }).tuples().all()
+        rows = _read_historical_directory_rows(connection, statement, {
+            "codes": codes[start:start + VALIDATION_READ_BATCH_SIZE], "received": metadata_cutoff,
+            "limit": 200001 - len(directory),
+        }, fields=('coverage_id','stock_code','known_at'), deadline=deadline, stage=stage)
         for identifier, code, known in rows:
             if identifier in directory:
                 raise ValueError("historical announcement directory has duplicate identities")
@@ -5913,6 +5912,7 @@ def _read_historical_later_scopes(
     metadata_store=None, metadata_progress=None,
 ):
     from server.common.qmt_announcement_pit import _live_announcement_read_hint, _live_announcement_reply_budget, VALIDATION_READ_BATCH_SIZE
+    from server.common.historical_announcement_read import _read_historical_directory_rows
 
     mysql = connection.dialect.name == 'mysql'
     index = ' FORCE INDEX (uk_pit_coverage_scope_revision)' if mysql else ''
@@ -5922,12 +5922,11 @@ def _read_historical_later_scopes(
     for start in range(0, len(scopes), VALIDATION_READ_BATCH_SIZE):
         group = scopes[start:start + VALIDATION_READ_BATCH_SIZE]
         stage = f'signed-historical-head-directory:{offset}:{start}'
-        hint = _live_announcement_read_hint(mysql=mysql, deadline=deadline, stage=stage)
-        statement = text(f'SELECT {hint}coverage_id,scope_hash,revision_no FROM {SOURCE_COVERAGE_TABLE}{index} '
+        statement = text(f'SELECT coverage_id,scope_hash,revision_no FROM {SOURCE_COVERAGE_TABLE}{index} '
             'WHERE scope_hash IN :scopes AND revision_no>:revision LIMIT :limit').bindparams(bindparam('scopes', expanding=True))
-        with _live_announcement_reply_budget(connection, deadline=deadline, stage=stage):
-            rows = connection.execute(statement, {'scopes':group,'revision':min(selected_revisions[s] for s in group),
-                'limit':200001 - inspected}).tuples().all()
+        rows = _read_historical_directory_rows(connection, statement, {
+            'scopes':group,'revision':min(selected_revisions[s] for s in group),'limit':200001 - inspected,
+        }, fields=('coverage_id','scope_hash','revision_no'), deadline=deadline, stage=stage)
         inspected += len(rows)
         if inspected > 200000:
             raise ValueError('historical announcement head directory exceeds 200000 records')

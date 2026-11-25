@@ -71,7 +71,7 @@ class Connection:
             return Result(None)
         if sql.startswith('ALTER TABLE st_quote_event_v2 ADD INDEX'):
             assert engine.metadata_wait_bounded
-            assert 0 < self.connection.dbapi_connection._read_timeout <= 600
+            assert 0 < self.connection.dbapi_connection._read_timeout <= 1800
             assert 'ALGORITHM=INPLACE, LOCK=NONE' in sql
             if engine.receipt_build_error:
                 raise RuntimeError('online index build interrupted')
@@ -342,7 +342,9 @@ def test_level1_index_failure_is_terminal_without_retry(fault):
     else:
         engine.level1_index = []
         engine.receipt_build_error = True
-    with pytest.raises(RuntimeError, match='definition differs|online index build'):
+    with pytest.raises(RuntimeError, match='definition differs|online index build') as failure:
         schema.privileged_migrate_level1_read_index(engine)
+    if fault == 'interrupted':
+        assert failure.value.native_schema_stage == 'st_quote_event_v2:online index build'
     assert len([sql for sql, _ in engine.statements if sql.startswith('ALTER')]) == (fault == 'interrupted')
     assert engine.open_connections == 0

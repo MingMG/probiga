@@ -13,6 +13,65 @@ from server.common.formal_analysis_store import FormalAnalysisStore
 from server.db.formal_analysis_schema import MEMBER_TABLE,privileged_migrate_formal_analysis_schema
 
 
+def _mysql_packets_in_sqlite(engine):
+    import json
+    import zlib
+    class JsonArrayAgg:
+        def __init__(self): self.rows=[]
+        def step(self,value): self.rows.append(json.loads(value))
+        def finalize(self): return json.dumps(self.rows,separators=(',',':'))
+    with engine.connect() as connection:
+        driver=connection.connection.driver_connection
+        driver.create_aggregate('json_arrayagg',1,JsonArrayAgg)
+        driver.create_function('octet_length',1,lambda value:len(value.encode()) if value is not None else None)
+        driver.create_function('compress',1,lambda value:(len(value.encode()).to_bytes(4,'little')+
+            zlib.compress(value.encode())) if value is not None else None)
+        driver.create_function('date_format',2,lambda value,format:datetime.fromisoformat(value).strftime(
+            format.replace('%i','%M').replace('%s','%S')))
+
+
+def test_compressed_directory_crosses_same_row_reply_limit_without_losing_identities(monkeypatch):
+    from types import SimpleNamespace
+    from server.common.historical_announcement_read import _read_historical_directory_rows
+    engine=create_engine('sqlite://')
+    _mysql_packets_in_sqlite(engine)
+    instant=datetime(2026,11,19,0,22,14,952573)
+    expected=[(hashlib.sha256(str(i).encode()).hexdigest(),'002283',instant) for i in range(1360)]
+    with engine.begin() as c:
+        c.execute(text('CREATE TABLE directory_fixture (coverage_id TEXT,stock_code TEXT,known_at TEXT)'))
+        c.execute(text('INSERT INTO directory_fixture VALUES (:id,:code,:known)'),
+            [dict(id=identifier,code=code,known=str(known)) for identifier,code,known in expected])
+    class Result:
+        def __init__(self,result): self.result=result
+        def tuples(self): return self
+        def all(self):
+            rows=self.result.tuples().all()
+            if len(rows)>64:raise TimeoutError('row packet reply deadline')
+            return rows
+        def mappings(self): self.result=self.result.mappings();return self
+        def one(self): return self.result.one()
+    with engine.connect() as c:
+        class Connection:
+            dialect=SimpleNamespace(name='mysql')
+            connection=c.connection
+            def execute(self,*args): return Result(c.execute(*args))
+        connection=Connection()
+        statement=text('SELECT coverage_id,stock_code,known_at FROM directory_fixture LIMIT :limit')
+        with pytest.raises(TimeoutError,match='row packet reply deadline'):
+            connection.execute(statement,{'limit':200001}).tuples().all()
+        actual=_read_historical_directory_rows(connection,statement,{'limit':200001},
+            fields=('coverage_id','stock_code','known_at'),deadline=monotonic()+10,stage='signed-historical-directory:800:0')
+        assert [(identifier,code,datetime.fromisoformat(known)) for identifier,code,known in actual]==expected
+        empty=_read_historical_directory_rows(connection,statement,{'limit':0},
+            fields=('coverage_id','stock_code','known_at'),deadline=monotonic()+10,stage='empty-directory')
+        assert empty==[]
+        c.connection.driver_connection.create_function('compress',1,lambda _value:b'broken-frame')
+        with pytest.raises(ValueError,match='compressed payload length differs'):
+            _read_historical_directory_rows(connection,statement,{'limit':200001},
+                fields=('coverage_id','stock_code','known_at'),deadline=monotonic()+10,stage='corrupted-directory')
+    engine.dispose()
+
+
 def test_historical_payload_size_reads_fit_per_query_budget(monkeypatch, tmp_path):
     from datetime import date
     from types import SimpleNamespace
@@ -101,6 +160,7 @@ def test_historical_payload_size_reads_fit_per_query_budget(monkeypatch, tmp_pat
 @pytest.mark.parametrize('source',['cninfo.announcement','qmt.announcement','eastmoney.notice'])
 def test_historical_chain_filters_future_revisions_before_row_reads(monkeypatch,source):
     engine = create_engine('sqlite://')
+    _mysql_packets_in_sqlite(engine)
     codes = ['000001', '000002']
     scopes = {code: pit._source_coverage_scope_hash('event', code, source) for code in codes}
     selected, parents, rows = {}, {}, []
@@ -168,6 +228,7 @@ def test_historical_chain_filters_future_revisions_before_row_reads(monkeypatch,
 def test_cold_historical_metadata_read_resumes_committed_chunks_under_query_budget(tmp_path,monkeypatch):
     url=f"sqlite:///{tmp_path / 'historical-metadata.db'}"
     engine=create_engine(url)
+    _mysql_packets_in_sqlite(engine)
     cache_engine=create_engine(url)
     privileged_migrate_formal_analysis_schema(cache_engine)
     source='cninfo.announcement'
@@ -204,7 +265,8 @@ def test_cold_historical_metadata_read_resumes_committed_chunks_under_query_budg
                 def progress():
                     nonlocal used
                     used+=1000
-                    return int(used>20000)
+                    # JSON aggregation adds VM work while returning one wire packet.
+                    return int(used>(60000 if 'json_arrayagg' in sql else 20000))
                 driver.set_progress_handler(progress,1000)
                 if 'coverage_fingerprint_hash,fact_kind,source' in sql:
                     keys=set(context.compiled_parameters[0].values())

@@ -69,7 +69,12 @@ def test_unexpected_runtime_source_failure_is_not_a_missing_dataset(queue, monke
         prepare.prepare_selection(connection, experiment(), None, plan)
 
 
-def test_pit_connection_loss_uses_one_existing_retry_and_keeps_source_checkpoint(queue, tmp_path, monkeypatch):
+@pytest.mark.parametrize('reason',[
+    'PIT_FINANCE_ATOMIC_BATCH_INVALID:OperationalError:errno=2013:stage=finance_seal_history',
+    'QMT_ANNOUNCEMENT_LIVE_BATCH_REPLY_DEADLINE:signed-historical-directory:800:0',
+    'QMT_ANNOUNCEMENT_LIVE_BATCH_REPLY_FAILED:signed-historical-head-directory:800:0',
+])
+def test_pit_connection_loss_uses_one_existing_retry_and_keeps_source_checkpoint(queue, tmp_path, monkeypatch, reason):
     from server.engine import native_research_identity as identity
     monkeypatch.setattr(identity, 'algorithm_identity', lambda _config: {'sha256': 'math'})
     monkeypatch.setenv('PROBIGA_NATIVE_DATASET_ROOT', str(tmp_path))
@@ -81,8 +86,7 @@ def test_pit_connection_loss_uses_one_existing_retry_and_keeps_source_checkpoint
         jobs.enqueue(connection, state)
 
     def disconnected(*_args, **_kwargs):
-        native._assert_read_succeeded(
-            'PIT_FINANCE_ATOMIC_BATCH_INVALID:OperationalError:errno=2013:stage=finance_seal_history')
+        raise RuntimeError('历史事实读取失败：'+reason)
 
     monkeypatch.setattr(native, '_step', disconnected)
     first = native.native_tick(queue)

@@ -2622,6 +2622,8 @@ def _mysql_seal_transport(engine, *, corrupt=None):
             return self.connection.begin()
 
         def execute(self, statement, params):
+            if not hasattr(statement, 'text'):
+                return self.connection.execute(statement, params)
             sql = statement.text.replace(" FORCE INDEX (idx_pit_coverage_decision)", "").replace(
                 " FORCE INDEX (idx_pit_coverage_batch_stock)", "",
             )
@@ -3130,6 +3132,8 @@ def test_live_common_cutoff_preserves_full_event_chains_with_bounded_mysql_trans
         from server.common.formal_analysis_store import FormalAnalysisStore
         from server.db.formal_analysis_schema import privileged_migrate_formal_analysis_schema
         from server.common import qmt_announcement_pit as announcement_module
+        from tests.test_historical_coverage_chain_access import _mysql_packets_in_sqlite
+        _mysql_packets_in_sqlite(engine)
         privileged_migrate_formal_analysis_schema(engine)
         store=FormalAnalysisStore(engine)
         check_sink=announcement_module._assert_pit_fact_schema_prepared

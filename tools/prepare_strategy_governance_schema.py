@@ -6320,7 +6320,11 @@ def _prepare_native_replay_schema() -> dict[str, Any]:
         _assert_pit_index_ddl_terminal(boundary.migrator_engine)
         inventory_index=ensure_pit_source_coverage_date_index(boundary.migrator_engine)
         from server.common.current_quote_schema import privileged_migrate_level1_read_index
+        print(json.dumps({'phase':'native-replay','stage':'level1_read_index','state':'RUNNING',
+                          'deadline_seconds':1800}),flush=True)
         level1_index = privileged_migrate_level1_read_index(boundary.migrator_engine)
+        print(json.dumps({'phase':'native-replay','stage':'level1_read_index','state':'COMPLETE',
+                          'result':level1_index}),flush=True)
         try:
             detail=validate_native_job_schema(boundary.runtime_engine)
             return {'status':'ok','phase':'native-replay',
@@ -6450,6 +6454,7 @@ def _public_failure_payload(exc: BaseException, *, phase: str) -> dict[str, Any]
             'failure_category':category,'mysql_errno':mysql_errno,'global_trust_changed':False,
             'runtime_privileges_changed':False,'automatic_real_order_submission':False,
             **({'blocking_ddl_owner':exc.blocking_ddl_owner} if hasattr(exc,'blocking_ddl_owner') else {}),
+            **({'failed_stage':exc.native_schema_stage} if hasattr(exc,'native_schema_stage') else {}),
             'recovery':'Keep worker 70 paused; verify prior DDL owner is terminal, retain additive schema, retry the Linux-only phase.'}
     evidence = (
         dict(exc.safety_evidence)

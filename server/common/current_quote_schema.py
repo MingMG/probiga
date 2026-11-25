@@ -44,7 +44,9 @@ def _privileged_migrate_quote_read_index(engine, *, table, index, columns, timeo
             try:
                 rows = connection.execute(text(sql), parameters or {})
             except Exception as exc:
-                raise RuntimeError(f'quote read index {table} failed: ' + stage) from exc
+                failure = RuntimeError(f'quote read index {table} failed: ' + stage)
+                failure.native_schema_stage = f'{table}:{stage}'
+                raise failure from exc
             if time.monotonic() >= deadline:
                 raise TimeoutError(f'quote read index {table} deadline: ' + stage)
             return rows
@@ -87,7 +89,7 @@ def privileged_migrate_level1_read_index(engine):
 
     return _privileged_migrate_quote_read_index(
         engine, table='st_quote_event_v2', index=LEVEL1_TIME_INDEX,
-        columns=LEVEL1_TIME_INDEX_COLUMNS, timeout_seconds=600,
+        columns=LEVEL1_TIME_INDEX_COLUMNS, timeout_seconds=1800,
     )
 
 
