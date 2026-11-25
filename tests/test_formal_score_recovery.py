@@ -555,6 +555,23 @@ def _recommended_data_freshness(*, total=0):
     assert recovery._without_validation_body(path, original) != recovery._without_validation_body(path, with_new_required_input)
 
 
+def test_finance_seal_access_hint_reuses_score_but_selection_changes_do_not():
+    path = "server/common/pit_facts.py"
+    original = ("\n".join(f"def {name}(conn):\n    return conn.get()"
+        for name in recovery._VALIDATION_ONLY_BODIES[path]) + '''
+def _load_latest_finance_atomic_seal_evidence(engine, *, decision_at, seal_coverage_id=""):
+    hint = " FORCE INDEX (idx_pit_coverage_decision)"
+    return engine.execute("SELECT coverage_id WHERE known_at<=:decision_at ORDER BY known_at DESC", decision_at)
+''').encode()
+    normalize = lambda source: recovery._without_validation_body(path, source)
+    allowed = original.replace(b"idx_pit_coverage_decision", b"idx_pit_coverage_source_known_batch")
+    assert normalize(original) == normalize(allowed)
+    for before, after in [(b"known_at<=", b"known_at>="), (b" DESC", b" ASC"),
+                          (b"decision_at)", b"None)"),
+                          (b"idx_pit_coverage_source_known_batch", b"PRIMARY")]:
+        assert normalize(original) != normalize(allowed.replace(before, after))
+
+
 def test_pruned_previous_checkout_reuses_only_immutable_git_and_current_scorer(tmp_path, monkeypatch):
     source = tmp_path / "source"
     source.mkdir()
