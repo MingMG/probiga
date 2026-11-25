@@ -4,7 +4,7 @@ import json
 from time import monotonic
 from types import MappingProxyType
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 
 from server.common.pit_facts import normalize_decision_at
 from server.common.qmt_announcement_pit import (
@@ -37,19 +37,20 @@ def has_dated_announcement_candidate(engine,*,code,decision_at,target,window_sta
     return bool(_inventory(engine,code=code,decision_at=decision_at,target=target,window_start=window_start))
 
 
-def _reconstruction_counts(connection, *, source, batch_id, deadline):
+def _reconstruction_counts(connection, *, source, batch_id, deadline, coverage_store=None, coverage_progress=None):
+    from server.common.pit_facts import canonical_hash
     from server.common.qmt_announcement_pit import (
         _live_announcement_read_hint, _live_announcement_reply_budget,
         VALIDATION_INVENTORY_CODE_LIMIT,
     )
     from server.common.pit_source_coverage_index import PIT_SOURCE_COVERAGE_BATCH_INDEX_NAME
     index = f' FORCE INDEX ({PIT_SOURCE_COVERAGE_BATCH_INDEX_NAME})' if connection.dialect.name == 'mysql' else ''
-    counts, cursor = [], ''
+    inventory, cursor = [], ''
     while True:
-        stage = f'historical-header-inventory:{len(counts)}'
+        stage = f'historical-header-inventory:{len(inventory)}'
         hint = _live_announcement_read_hint(mysql=connection.dialect.name == 'mysql', deadline=deadline, stage=stage)
         with _live_announcement_reply_budget(connection, deadline=deadline, stage=stage):
-            rows = connection.execute(text(f'SELECT {hint}stock_code,result_count FROM st_pit_source_coverage{index} '
+            rows = connection.execute(text(f'SELECT {hint}stock_code,coverage_id FROM st_pit_source_coverage{index} '
                 "WHERE fact_kind='event' AND source=:source AND batch_id=:batch AND stock_code>:cursor "
                 'ORDER BY stock_code LIMIT :limit'),
                 {'source':source, 'batch':batch_id, 'cursor':cursor, 'limit':VALIDATION_INVENTORY_CODE_LIMIT}).tuples().all()
@@ -58,14 +59,43 @@ def _reconstruction_counts(connection, *, source, batch_id, deadline):
         codes = [row[0] for row in rows]
         if codes != sorted(set(codes)) or codes[0] <= cursor:
             raise ValueError('historical reconstruction inventory has duplicate or unordered members')
-        counts.extend(row[1] for row in rows)
-        if len(counts) > 10000:
+        inventory.extend([list(row) for row in rows])
+        if len(inventory) > 10000:
             raise ValueError('historical reconstruction inventory is out of bounds')
         cursor = codes[-1]
         if len(rows) < VALIDATION_INVENTORY_CODE_LIMIT:
             break
-    if not counts:
+    if not inventory:
         raise ValueError('historical reconstruction inventory is out of bounds')
+    # Discover IDs in the covering index before bounded primary-key row reads.
+    generation=canonical_hash({'schema':'probiga.historical-header-counts.v1','source':source,'batch':batch_id})
+    scope=canonical_hash({'generation':generation,'members':inventory})
+    primary=' FORCE INDEX (PRIMARY)' if connection.dialect.name=='mysql' else ''
+    counts=[]
+    # 128 cold rows exhausted the observed 10-second reply limit.
+    for offset in range(0,len(inventory),64):
+        selected=inventory[offset:offset+64]
+        key=canonical_hash(selected)
+        retained=coverage_store.get(generation,'historical_header_counts',key) if coverage_store is not None else None
+        fresh=retained is None
+        stage=f'historical-header-counts:{offset}'
+        hint=_live_announcement_read_hint(mysql=connection.dialect.name=='mysql',deadline=deadline,stage=stage)
+        if fresh:
+            statement=text(f'SELECT {hint}coverage_id,stock_code,result_count FROM st_pit_source_coverage{primary} '
+                "WHERE coverage_id IN :ids AND fact_kind='event' AND source=:source AND batch_id=:batch").bindparams(bindparam('ids',expanding=True))
+            with _live_announcement_reply_budget(connection,deadline=deadline,stage=stage):
+                rows=connection.execute(statement,{'ids':[row[1] for row in selected],'source':source,'batch':batch_id}).tuples().all()
+            retained={'members':selected,'rows':[list(row) for row in rows]}
+        rows=retained['rows']
+        expected={identifier:code for code,identifier in selected}
+        if (retained['members']!=selected or len(rows)!=len(selected)
+                or {row[0] for row in rows}!=set(expected)
+                or any(len(row)!=3 or row[1]!=expected.get(row[0]) or type(row[2]) is not int or row[2]<0 for row in rows)):
+            raise ValueError('historical reconstruction count membership differs')
+        values={identifier:count for identifier,_code,count in rows}
+        if fresh and coverage_store is not None:coverage_store.put(generation,'historical_header_counts',key,retained)
+        counts.extend(values[identifier] for _code,identifier in selected)
+        if coverage_progress is not None:coverage_progress(len(counts),len(inventory),scope,fresh and coverage_store is not None)
     return counts
 
 
@@ -89,7 +119,8 @@ def _read_reconstruction(engine, candidate, *, codes, decision, start, end, dead
             coverage_ids=keys,deadline=deadline,stage='historical-header-payload')
         evidence=json.loads(row['payload_json'])['watermark']['evidence']
         provenance=evidence['reconstruction_provenance']
-        counts = _reconstruction_counts(c, source=source, batch_id=batch_id, deadline=deadline)
+        counts = _reconstruction_counts(c, source=source, batch_id=batch_id, deadline=deadline,
+            coverage_store=coverage_store,coverage_progress=coverage_progress)
     material={
         'status':'COMPLETE','source':source,'primary_source':QMT_ANNOUNCEMENT_SOURCE,
         'fallback_reason':'QMT_ANNOUNCEMENT_HISTORICAL_RECONSTRUCTION_REQUIRED',
