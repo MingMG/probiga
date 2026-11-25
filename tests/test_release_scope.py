@@ -98,7 +98,8 @@ def test_windows_runtime_body_change_is_not_a_schema_change(repo, path):
     assert result["base_contract_sha256"] == result["contract_sha256"]
 
 
-def test_linux_formal_recovery_branch_preserves_windows_artifact_identity(repo):
+@pytest.mark.parametrize("include_governance", [False, True])
+def test_linux_formal_recovery_branch_preserves_windows_artifact_identity(repo, include_governance):
     path = "server/api/scheduler_runtime.py"
     head = 'REVISION = 1\n\ndef _strategy_pipeline_dependencies_ready(row, engine, now):\n    task_type = str(row.get("task_type") or "").strip()\n'
     tail = '    return validate_shared_qmt_dependencies(row)\n'
@@ -107,6 +108,9 @@ def test_linux_formal_recovery_branch_preserves_windows_artifact_identity(repo):
     branch = ('    if (task_type == "analysis_fast" and row.get("_release_analysis_recovery_requested") is True\n'
               '            and row.get("_release_analysis_research_mode") is not True):\n'
               '        return validate_frozen_formal_inputs(engine)\n')
+    if include_governance:
+        branch = branch.replace('if (task_type == "analysis_fast"', 'if (task_type == "strategy_governance_daily" or (task_type == "analysis_fast"')
+        branch = branch.replace('is not True):', 'is not True)):')
     repo.write(path, head + branch + tail)
     linux = repo.commit()
     assert repo.classify(linux, base=windows, windows_base=windows)["scope"] == "LINUX"

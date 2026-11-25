@@ -501,10 +501,13 @@ def _windows_runtime_changed(git, path, before, after):
         return False
     if path != "server/api/scheduler_runtime.py" or before is None or after is None or before.mode != after.mode:
         return True
-    # Formal recovery is Linux-owned. Keep the complete shared dependency
+    # Formal analysis and strategy governance are Linux-owned. Keep the shared
     # validator in the Windows identity except this exact unreachable branch.
-    guard = ast.parse("task_type == 'analysis_fast' and row.get('_release_analysis_recovery_requested') is True "
-                      "and row.get('_release_analysis_research_mode') is not True", mode="eval").body
+    formal_guard = "task_type == 'analysis_fast' and row.get('_release_analysis_recovery_requested') is True " \
+                   "and row.get('_release_analysis_research_mode') is not True"
+    guards = {ast.dump(ast.parse(test, mode="eval").body) for test in (
+        formal_guard, "task_type == 'strategy_governance_daily' or (" + formal_guard + ")",
+    )}
     normalized = []
     for blob in git.blobs([before.oid, after.oid]):
         try:
@@ -515,7 +518,7 @@ def _windows_runtime_changed(git, path, before, after):
             if isinstance(node, ast.FunctionDef) and node.name == "_strategy_pipeline_dependencies_ready":
                 node.body = [statement for statement in node.body if not (
                     isinstance(statement, ast.If) and not statement.orelse
-                    and ast.dump(statement.test) == ast.dump(guard)
+                    and ast.dump(statement.test) in guards
                 )]
         normalized.append(ast.dump(module))
     return normalized[0] != normalized[1]

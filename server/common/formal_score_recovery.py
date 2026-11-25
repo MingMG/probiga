@@ -728,7 +728,7 @@ def reusable_initial_source_runs(
         with (_live_announcement_reply_budget(connection, deadline=deadline, stage="formal-dispatch-history")
               if mysql else nullcontext()):
             attempts = _attempts_in_session(connection, scope["session_uid"], shard_id="main")
-        if not attempts or attempts[0]["build_sha"] == build_sha:
+        if not attempts:
             return None
         prior = attempts[0]
         builds = _compatible_recovery_builds(connection, runtime)
@@ -765,7 +765,8 @@ def reusable_initial_source_runs(
     if (set(sources) != _REQUIRED_INPUTS or generation != work["generation_sha256"]
             or float(prior["min_score"]) != 62.0 or int(prior["top_n"]) != 80):
         return None
-    return {"decision_at": cutoff, "source_runs": sources}
+    return {"decision_at": cutoff, "source_runs": sources, "publisher_run_uid": prior["run_uid"],
+            "publisher_build_sha": prior["build_sha"], "available_at": _local_decision(prior["stage_finished_at"], whole_seconds=False)}
 
 
 def recover_initial_selection(
