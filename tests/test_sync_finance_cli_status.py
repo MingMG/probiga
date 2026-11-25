@@ -964,6 +964,32 @@ def test_sealed_finance_skips_only_notices_with_proven_earlier_clocks(monkeypatc
     assert actual.codes==(['000001'] if refresh else [])
 
 
+def test_daily_new_listing_checkpoint_is_saved_before_next_source_fetch(monkeypatch,tmp_path):
+    target=date.today()
+    _stub_atomic_batch_seal(monkeypatch)
+    monkeypatch.setattr(sync_finance,'get_engine',lambda:object())
+    monkeypatch.setattr(sync_finance,'get_finance_stock_universe',lambda *_a,**_k:{'000001':target,'000002':None})
+    _install_verified_parent(monkeypatch,{'000002':_baseline('000002',window_end=target-timedelta(days=1))},target-timedelta(days=1))
+    monkeypatch.setattr(sync_finance,'fetch_finance_incremental_discovery',lambda **_k:{
+        'events':[],'changed_codes':[],'stable_content_sha256':'c'*64})
+    monkeypatch.setattr(sync_finance,'append_finance_incremental_discovery',lambda *_a,**_k:'d'*64)
+    monkeypatch.setattr(sync_finance,'append_new_listing_finance_empty_coverage',lambda *_a,**_k:'e'*64)
+    checkpoint=tmp_path/'finance.json'
+    seen=[]
+    def fetch(code):
+        seen.append(code)
+        if code=='000001':return pd.DataFrame()
+        saved=sync_finance._checkpoint_payload(checkpoint)
+        assert saved['completed_codes']==['000001']
+        assert saved['unresolved_codes']==['000002']
+        assert set(saved['completed_input_roots'])=={'000001'}
+        return _finance_frame(code)
+    monkeypatch.setattr(sync_finance,'fetch_finance',fetch)
+    monkeypatch.setattr(sync_finance,'upsert_finance',lambda *_a,**_k:1)
+    assert sync_finance.main(['--daily-incremental','--sleep','0','--checkpoint-file',str(checkpoint)])==0
+    assert seen==['000001','000002']
+
+
 def test_incremental_plan_blocks_when_discovery_unproven(
     monkeypatch,
 ):

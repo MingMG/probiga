@@ -2147,6 +2147,10 @@ def main(argv: list[str] | None = None) -> int:
                             *checkpoint_state.get("completed_codes", ()), code,
                         })
                         checkpoint_state["completed_input_roots"][code] = current_inputs[code]
+                        checkpoint_state["unresolved_codes"] = sorted(
+                            set(all_fetch_codes) - set(checkpoint_state["completed_codes"])
+                        )
+                        checkpoint_state["updated_at"] = _capture_now().isoformat()
                         _write_checkpoint(checkpoint_path, checkpoint_state)
                     continue
                 try:
