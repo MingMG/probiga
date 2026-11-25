@@ -49,6 +49,7 @@ from server.common.finance_coverage import (
     finance_disclosure_gate,
     report_period_gate_applies,
 )
+from server.common.finance_nonfiling_evidence import CNINFO_NONFILING_ISSUERS
 from server.common.hot_rank_source_contract import (
     HOT_RANK_SINA_TASK_TYPE,
     HOT_RANK_SOURCE_TASK_TYPES,
@@ -164,7 +165,6 @@ _QMT_MEMBERSHIP_VERIFICATION_SCHEMA = (
 _QMT_MEMBERSHIP_PUBLICATION_SCHEMA = (
     "probiga.qmt-membership-publication.v1"
 )
-_FINANCE_EXPECTED_UNAVAILABLE_CODES = frozenset({"002731"})
 _FINANCE_AUTHORITATIVE_SOURCES = frozenset({
     "adata.finance.core_index",
     "eastmoney.finance.mainfinadata.direct",
@@ -3339,7 +3339,7 @@ def scheduler_output_status(
                 and isinstance(unavailable_sample, Mapping)
                 and len(unavailable_sample) == unavailable
                 and set(map(str, unavailable_sample))
-                <= _FINANCE_EXPECTED_UNAVAILABLE_CODES
+                <= CNINFO_NONFILING_ISSUERS.keys()
                 and isinstance(legal_empty_sample, list)
                 and len(legal_empty_sample) <= min(legal_empty, 20)
                 and disclosure_deadline >= minimum_report
@@ -3451,7 +3451,7 @@ def scheduler_output_status(
             and isinstance(unavailable_sample, Mapping)
             and len(unavailable_sample) == unavailable
             and set(map(str, unavailable_sample))
-            <= _FINANCE_EXPECTED_UNAVAILABLE_CODES
+            <= CNINFO_NONFILING_ISSUERS.keys()
             and disclosure_deadline >= minimum_report
             and (
                 applicable == 0
