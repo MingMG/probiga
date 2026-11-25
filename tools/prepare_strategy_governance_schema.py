@@ -6290,9 +6290,8 @@ def _assert_pit_index_ddl_terminal(engine) -> None:
     with engine.connect() as connection:
         for process in connection.execute(text('SHOW FULL PROCESSLIST')).mappings():
             statement=' '.join(str(process.get('Info') or '').replace('`','').lower().split())
-            if re.match(r'alter table (?:\w+\.)?(?:st_pit_source_coverage|st_quote_event_v2)\b',statement):
-                kind = 'QUOTE' if 'st_quote_event_v2' in statement else 'PIT'
-                failure=RuntimeError(f'NATIVE_SCHEMA_PREVIOUS_{kind}_DDL_NOT_TERMINAL')
+            if re.match(r'alter table (?:\w+\.)?st_pit_source_coverage\b',statement):
+                failure=RuntimeError('NATIVE_SCHEMA_PREVIOUS_PIT_DDL_NOT_TERMINAL')
                 failure.blocking_ddl_owner={
                     'connection_id':int(process['Id']), 'elapsed_seconds':int(process['Time']),
                     'state':str(process.get('State') or '')[:120],
@@ -6319,17 +6318,10 @@ def _prepare_native_replay_schema() -> dict[str, Any]:
         if boundary.migrator_engine is None:raise RuntimeError('native job migrator unavailable')
         _assert_pit_index_ddl_terminal(boundary.migrator_engine)
         inventory_index=ensure_pit_source_coverage_date_index(boundary.migrator_engine)
-        from server.common.current_quote_schema import privileged_migrate_level1_read_index
-        print(json.dumps({'phase':'native-replay','stage':'level1_read_index','state':'RUNNING',
-                          'deadline_seconds':1800}),flush=True)
-        level1_index = privileged_migrate_level1_read_index(boundary.migrator_engine)
-        print(json.dumps({'phase':'native-replay','stage':'level1_read_index','state':'COMPLETE',
-                          'result':level1_index}),flush=True)
         try:
             detail=validate_native_job_schema(boundary.runtime_engine)
-            return {'status':'ok','phase':'native-replay',
-                    'migration_required':inventory_index['created'] or level1_index['created'],
-                    'level1_read_index':level1_index,'announcement_inventory_index':inventory_index,**detail}
+            return {'status':'ok','phase':'native-replay','migration_required':inventory_index['created'],
+                    'announcement_inventory_index':inventory_index,**detail}
         except (RuntimeError,KeyError):
             pass
         if boundary.migrator_engine is None:raise RuntimeError('native job migrator unavailable')
@@ -6349,7 +6341,7 @@ def _prepare_native_replay_schema() -> dict[str, Any]:
                 connection.execute(text("SELECT RELEASE_LOCK('probiga:native-strategy-research')"))
         return {'status':'ok','phase':'native-replay','migration_required':True,'runtime_privileges_changed':False,
                 'global_trust_changed':False,'automatic_real_order_submission':False,
-                'level1_read_index':level1_index,'announcement_inventory_index':inventory_index,**detail}
+                'announcement_inventory_index':inventory_index,**detail}
     finally:
         if locked and admin is not None:_release_lock(admin)
         _close_quietly(admin)
