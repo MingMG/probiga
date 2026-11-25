@@ -525,6 +525,7 @@ def calculate(conn):
         "server/engine/native_research_jobs.py",
         "server/engine/native_research_prepare.py",
         "tools/run_trading_v2_job_worker.py",
+        "biz/stock_finance/sync_finance.py",
         "server/common/historical_announcement_read.py",
         "deploy/production_deploy.sh",
     ):

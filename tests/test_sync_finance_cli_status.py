@@ -72,7 +72,7 @@ def test_finance_full_catalog_excludes_source_failures_but_not_database_failures
     monkeypatch.setattr(sync_finance, "fetch_finance", fetch)
     monkeypatch.setattr(sync_finance, "upsert_finance", upsert)
     monkeypatch.setattr(sync_finance, "append_finance_atomic_batch_seal", seal)
-    result = sync_finance.main(["--sleep", "0"])
+    result = sync_finance.main(["--full-baseline", "--sleep", "0"])
     report = next(json.loads(line) for line in capsys.readouterr().out.splitlines()
                   if line.startswith('{"as_of"'))
     assert report["failure_count"] == 1
@@ -177,6 +177,7 @@ def test_daily_finance_candidates_are_the_required_union(monkeypatch):
             "seal_coverage_id": "a" * 64,
             "batch_root_sha256": "b" * 64,
             "catalog_member_set_hash": "c" * 64,
+            "as_of_date": "2026-08-30",
             "provider_contract_version": (
                 sync_finance.PRIMARY_FINANCE_CONTRACT_VERSION
             ),
@@ -192,6 +193,7 @@ def test_daily_finance_candidates_are_the_required_union(monkeypatch):
         "read_frame",
         lambda *args, **kwargs: pd.DataFrame([
             {
+                "id": 1,
                 "stock_code": "000001",
                 "title": "2026年半年度报告更正公告",
                 "notice_date": "2026-08-31",
@@ -292,7 +294,7 @@ def test_finance_cli_fails_batch_when_any_stock_fails_but_keeps_processing(
     monkeypatch.setattr(sync_finance, "fetch_finance", fake_fetch)
     monkeypatch.setattr(sync_finance, "upsert_finance", fake_upsert)
 
-    assert sync_finance.main(["--sleep", "0"]) == 1
+    assert sync_finance.main(["--full-baseline", "--sleep", "0"]) == 1
     assert attempted == ["000001", "000002"]
     assert committed == ["000001"]
 
@@ -316,7 +318,7 @@ def test_finance_cli_succeeds_only_when_every_stock_finishes(monkeypatch):
         lambda engine, frame, *, stock_code, coverage_end: 1,
     )
 
-    assert sync_finance.main(["--sleep", "0"]) == 0
+    assert sync_finance.main(["--full-baseline", "--sleep", "0"]) == 0
 
 
 def test_finance_cli_rejects_empty_provider_frame_and_does_not_commit(monkeypatch):
@@ -494,7 +496,7 @@ def test_finance_limit_zero_means_the_complete_loaded_universe(monkeypatch):
         lambda engine, frame, *, stock_code, coverage_end: 1,
     )
 
-    assert sync_finance.main(["--limit", "0", "--sleep", "0"]) == 0
+    assert sync_finance.main(["--full-baseline", "--limit", "0", "--sleep", "0"]) == 0
     assert attempted == ["000001", "000002", "600000"]
 
 
@@ -617,7 +619,7 @@ def test_finance_fetch_workers_are_concurrent_but_database_writes_are_serial(
     monkeypatch.setattr(sync_finance, "fetch_finance", fake_fetch)
     monkeypatch.setattr(sync_finance, "upsert_finance", fake_upsert)
 
-    assert sync_finance.main(["--workers", "2", "--sleep", "0"]) == 0
+    assert sync_finance.main(["--full-baseline", "--workers", "2", "--sleep", "0"]) == 0
     assert maximum_active_fetches == 2
     assert committed == codes
     assert upsert_threads == [main_thread] * len(codes)
@@ -648,7 +650,7 @@ def test_finance_fetch_workers_keep_processing_after_provider_failure(monkeypatc
         ),
     )
 
-    assert sync_finance.main(["--workers", "3", "--sleep", "0"]) == 1
+    assert sync_finance.main(["--full-baseline", "--workers", "3", "--sleep", "0"]) == 1
     assert set(attempted) == {"000001", "000002", "000003"}
     assert committed == ["000001", "000003"]
 
@@ -674,6 +676,7 @@ def _baseline(code: str, *, window_end: date) -> dict:
         "coverage_id": (code[-1] or "1") * 64,
         "window_start": date(1900, 1, 1),
         "window_end": window_end,
+        "verified_parent_as_of_date": window_end,
         "known_at": datetime.combine(window_end, datetime.min.time()),
         "coverage_status": "COMPLETE",
         "result_count": 4,
@@ -683,16 +686,90 @@ def _baseline(code: str, *, window_end: date) -> dict:
     }
 
 
+def _install_verified_parent(monkeypatch, rows, as_of):
+    parent = {'as_of_date':as_of.isoformat(),'seal_coverage_id':'a'*64,'batch_root_sha256':'b'*64,
+        'provider_contract_version':sync_finance.PRIMARY_FINANCE_CONTRACT_VERSION,
+        'members':{code:{'stock_code':code,'coverage_id':row['coverage_id'],'coverage_status':'COMPLETE',
+            'known_at':row['known_at'],'covered_through_at':row['window_end'],
+            'strategy_prefix_binding':{'latest_report_date':row['latest_report_date'].isoformat()}}
+            for code,row in rows.items()}}
+    monkeypatch.setattr(sync_finance,'load_latest_finance_atomic_batch_baseline',lambda *_a,**_k:parent)
+    monkeypatch.setattr(sync_finance,'read_frame',lambda *_a,**_k:pd.DataFrame(
+        columns=['stock_code','title','notice_date','received_at']))
+    return parent
+
+
+def test_incremental_candidates_reuse_verified_parent_without_history_scan(monkeypatch):
+    from sqlalchemy import create_engine, event, text
+    from sqlalchemy.exc import OperationalError
+
+    engine = create_engine('sqlite://')
+    guard_status = 'PASS'
+    parents = {}
+    coverage = []
+    for number in range(1, 5001):
+        code = f'{number:06d}'
+        for revision in range(1, 4):
+            identifier = f'{number*10+revision:064x}'
+            coverage.append({'code':code,'id':identifier,'revision':revision,
+                'known':'2026-11-25 08:00:00' if number==1 else '2026-11-24 12:00:00',
+                'payload':json.dumps({'watermark':{'evidence':{'source_timestamp_guard':{
+                    'status':guard_status,'as_of_date':'2026-11-24'}}}})})
+            if number <= 4 and revision == 2:
+                parents[code] = {'stock_code':code,'coverage_id':identifier,'source':'adata.finance.core_index',
+                    'coverage_status':'COMPLETE','strategy_prefix_binding':{'latest_report_date':'2026-09-30'}}
+    with engine.begin() as connection:
+        connection.execute(text('''CREATE TABLE st_pit_source_coverage(coverage_id TEXT PRIMARY KEY,
+            fact_kind TEXT,stock_code TEXT,source TEXT,window_start TEXT,window_end TEXT,known_at TEXT,
+            coverage_status TEXT,result_count INT,revision_no INT,payload_json TEXT)'''))
+        connection.execute(text('CREATE INDEX idx_pit_coverage_decision ON st_pit_source_coverage(fact_kind,stock_code,known_at)'))
+        connection.execute(text('''INSERT INTO st_pit_source_coverage VALUES(:id,'finance',:code,
+            'adata.finance.core_index','1900-01-01','2026-11-24',:known,'COMPLETE',4,:revision,:payload)'''),coverage)
+        connection.execute(text('CREATE TABLE si_stock_finance(stock_code TEXT,report_date TEXT)'))
+        connection.execute(text('CREATE TABLE si_notice_eastmoney(id INTEGER PRIMARY KEY,stock_code TEXT,title TEXT,notice_date TEXT,received_at TEXT,association_validated INT)'))
+        connection.execute(text("INSERT INTO si_stock_finance VALUES('000001','2099-12-31')"))
+        connection.connection.driver_connection.create_function('JSON_UNQUOTE',1,lambda value:value)
+    monkeypatch.setattr(sync_finance, 'load_latest_finance_atomic_batch_baseline',
+        lambda *_args,**_kwargs:{'members':parents,'as_of_date':'2026-11-24','seal_coverage_id':'a'*64,'batch_root_sha256':'b'*64,
+            'provider_contract_version':sync_finance.PRIMARY_FINANCE_CONTRACT_VERSION})
+    def bound(connection, _cursor, _sql, _parameters, _context, _many):
+        used = [0]
+        def progress():
+            used[0] += 100
+            return int(used[0] > 2000)
+        connection.connection.driver_connection.set_progress_handler(progress,100)
+    def clear(connection, *_args):
+        connection.connection.driver_connection.set_progress_handler(None,0)
+    event.listen(engine,'before_cursor_execute',bound)
+    event.listen(engine,'after_cursor_execute',clear)
+    try:
+        with engine.connect() as connection:
+            try:
+                with pytest.raises(OperationalError,match='interrupted'):
+                    connection.execute(text('SELECT stock_code,COUNT(*) FROM st_pit_source_coverage GROUP BY stock_code')).all()
+            finally:
+                clear(connection)
+        actual = sync_finance.select_daily_finance_candidates(engine,
+            {code:None for code in parents},as_of=date(2026,11,25))
+        assert actual.codes == []
+        assert actual.parent_seal_coverage_id == 'a'*64
+        assert actual.parent_batch_root_sha256 == 'b'*64
+        assert actual.parent_as_of_date == date(2026,11,24)
+        assert {row['strategy_prefix_binding']['latest_report_date'] for row in parents.values()} == {'2026-09-30'}
+    finally:
+        event.remove(engine,'before_cursor_execute',bound)
+        event.remove(engine,'after_cursor_execute',clear)
+        with engine.connect() as connection:
+            clear(connection)
+        engine.dispose()
+
+
 def test_incremental_plan_fetches_only_changed_and_missing_issuers(monkeypatch):
     target = date(2026, 9, 1)
-    monkeypatch.setattr(
-        sync_finance,
-        "get_finance_incremental_baselines",
-        lambda engine, **_kwargs: {
+    _install_verified_parent(monkeypatch, {
             "000001": _baseline("000001", window_end=date(2026, 8, 31)),
             "000002": _baseline("000002", window_end=date(2026, 8, 31)),
-        },
-    )
+        },date(2026,8,31))
     discovery = {
         "events": [{
             "stock_code": "000002",
@@ -724,39 +801,96 @@ def test_incremental_plan_fetches_only_changed_and_missing_issuers(monkeypatch):
     assert plan["refresh_reasons"]["000002"] == (
         "SOURCE_NOTICE_OR_UPDATE_CHANGED"
     )
-    assert plan["refresh_reasons"]["000003"] == "MISSING_PRIMARY_COVERAGE"
+    assert plan["refresh_reasons"]["000003"] == "NEW_OR_MISSING_CATALOG_MEMBER"
     assert plan["discovery_coverage_id"] == "d" * 64
 
 
-def test_incremental_plan_falls_back_to_full_primary_when_discovery_unproven(
+def test_incremental_discovery_resumes_after_parent_seal_without_changing_source_clock(monkeypatch):
+    target = date(2026, 11, 25)
+    baseline = _baseline('000001', window_end=date(2026, 11, 3))
+    baseline['verified_parent_as_of_date'] = date(2026, 11, 24)
+    baseline['latest_report_date'] = date(2026, 9, 30)
+    parent = _install_verified_parent(monkeypatch,{'000001':baseline},date(2026,11,24))
+    windows = []
+    def discovery(**kwargs):
+        windows.append((kwargs['window_start'],kwargs['window_end']))
+        return {'events':[],'changed_codes':[]}
+    monkeypatch.setattr(sync_finance, 'fetch_finance_incremental_discovery',discovery)
+    monkeypatch.setattr(sync_finance, 'append_finance_incremental_discovery',lambda *_a,**_k:'d'*64)
+    actual = sync_finance.build_finance_incremental_plan(object(),universe={'000001':None},
+        as_of=target,disclosure_gate=sync_finance.finance_disclosure_gate(target))
+    assert actual['fetch_codes'] == [] and actual['reused_codes'] == ['000001']
+    assert windows == [(target,target)]
+    assert baseline['window_end'] == date(2026,11,3)
+    assert baseline['known_at'] == datetime(2026,11,3)
+    assert parent['members']['000001']['known_at'] == datetime(2026,11,3)
+
+
+def test_incremental_baseline_read_failure_does_not_launch_full_primary_scan(monkeypatch,capsys):
+    monkeypatch.setattr(sync_finance,'get_engine',lambda:object())
+    monkeypatch.setattr(sync_finance,'get_finance_stock_universe',lambda *_a,**_k:{'000001':None})
+    def fail_plan(*_args,**_kwargs):
+        raise TimeoutError('FINANCE_PARENT_BASELINE_METADATA_DEADLINE')
+    monkeypatch.setattr(sync_finance,'build_finance_incremental_plan',fail_plan)
+    def no_fetch(*_args,**_kwargs):
+        raise AssertionError('A failed baseline read must not trigger provider acquisition')
+    monkeypatch.setattr(sync_finance,'fetch_finance',no_fetch)
+    assert sync_finance.main(['--daily-incremental']) == 1
+    report = json.loads(capsys.readouterr().out.strip())
+    assert report['status'] == 'DATA_BLOCKED'
+    assert 'FINANCE_PARENT_BASELINE_METADATA_DEADLINE' in report['reason']
+
+
+def test_daily_finance_resumes_matching_completed_shards_without_refetch(monkeypatch,tmp_path,capsys):
+    target = date.today()
+    _stub_atomic_batch_seal(monkeypatch)
+    monkeypatch.setattr(sync_finance,'get_engine',lambda:object())
+    monkeypatch.setattr(sync_finance,'get_finance_stock_universe',lambda *_a,**_k:{'000001':None,'000002':None})
+    _install_verified_parent(monkeypatch,{code:_baseline(code,window_end=target-timedelta(days=1))
+        for code in ('000001','000002')},target-timedelta(days=1))
+    monkeypatch.setattr(sync_finance,'read_frame',lambda *_a,**_k:pd.DataFrame([
+        {'id':i,'stock_code':code,'title':'季度报告更正公告','notice_date':target}
+        for i,code in enumerate(('000001','000002'),1)]))
+    monkeypatch.setattr(sync_finance,'fetch_finance_incremental_discovery',lambda **_k:{
+        'events':[],'changed_codes':[],'stable_content_sha256':'c'*64})
+    receipts = iter(('d'*64,'e'*64))
+    monkeypatch.setattr(sync_finance,'append_finance_incremental_discovery',lambda *_a,**_k:next(receipts))
+    calls = []
+    def fetch(code):
+        calls.append(code)
+        if code=='000002' and calls.count(code)==1:
+            raise TimeoutError('stock-local source timeout')
+        return _finance_frame(code)
+    monkeypatch.setattr(sync_finance,'fetch_finance',fetch)
+    monkeypatch.setattr(sync_finance,'upsert_finance',lambda *_a,**_k:1)
+    arguments = ['--daily-incremental','--sleep','0','--checkpoint-file',str(tmp_path/'finance.json')]
+    assert sync_finance.main(arguments)==0
+    capsys.readouterr()
+    assert sync_finance.main(arguments)==0
+    report = next(json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith('{"as_of"'))
+    assert calls.count('000001')==1 and calls.count('000002')==2
+    assert report['checkpoint_resumed_code_count']==1
+    assert report['provider_fetch_code_count']==1
+
+
+def test_incremental_plan_blocks_when_discovery_unproven(
     monkeypatch,
 ):
     target = date(2026, 9, 1)
-    monkeypatch.setattr(
-        sync_finance,
-        "get_finance_incremental_baselines",
-        lambda engine, **_kwargs: {
+    _install_verified_parent(monkeypatch, {
             code: _baseline(code, window_end=date(2026, 8, 31))
             for code in ("000001", "000002")
-        },
-    )
+        },date(2026,8,31))
     monkeypatch.setattr(
         sync_finance,
         "fetch_finance_incremental_discovery",
         lambda **kwargs: (_ for _ in ()).throw(RuntimeError("provider down")),
     )
 
-    plan = sync_finance.build_finance_incremental_plan(
-        object(),
-        universe={"000001": None, "000002": None},
-        as_of=target,
-        disclosure_gate=sync_finance.finance_disclosure_gate(target),
-    )
-
-    assert plan["mode"] == "FULL_PRIMARY_FALLBACK"
-    assert plan["fetch_codes"] == ["000001", "000002"]
-    assert plan["reused_codes"] == []
-    assert "provider down" in plan["fallback_reason"]
+    with pytest.raises(RuntimeError,match='finance incremental discovery unavailable'):
+        sync_finance.build_finance_incremental_plan(object(),
+            universe={"000001":None,"000002":None},as_of=target,
+            disclosure_gate=sync_finance.finance_disclosure_gate(target))
 
 
 def test_exact_date_discovery_requires_two_stable_complete_sweeps(monkeypatch):
