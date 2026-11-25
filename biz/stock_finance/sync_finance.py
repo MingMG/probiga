@@ -144,7 +144,8 @@ class FinanceStaleResponse(RuntimeError):
 
 
 def get_engine():
-    return create_batch_engine(pool_size=5, max_overflow=10)
+    return create_batch_engine(pool_size=5, max_overflow=10, pool_timeout=5,
+        connect_args={'connect_timeout':8,'read_timeout':15,'write_timeout':10})
 
 
 def get_finance_stock_universe(
@@ -273,6 +274,7 @@ class FinanceCandidatePlan:
     parent_seal_coverage_id: str
     parent_batch_root_sha256: str
     input_root_sha256: str
+    parent_as_of_date: date
 
 
 def _checkpoint_payload(path: Path) -> dict[str, Any]:
@@ -481,10 +483,12 @@ def select_daily_finance_candidates(
     *,
     as_of: date,
     checkpoint: Mapping[str, Any] | None = None,
+    disclosure_gate: FinanceDisclosureGate | None = None,
 ) -> FinanceCandidatePlan:
     """Build the bounded union of stocks whose finance disposition changed."""
 
-    decision_at = datetime.now().replace(microsecond=0)
+    deadline = time.monotonic() + 180
+    decision_at = _capture_now()
     baseline = load_latest_finance_atomic_batch_baseline(
         engine,
         decision_at=decision_at,
@@ -497,6 +501,9 @@ def select_daily_finance_candidates(
     members = baseline.get("members")
     if not isinstance(members, Mapping):
         raise RuntimeError("DATA_BLOCKED: finance baseline members are malformed")
+    parent_as_of = coerce_optional_date(baseline.get('as_of_date'))
+    if parent_as_of is None or not 0 <= (as_of-parent_as_of).days <= FINANCE_DISCOVERY_MAX_DAYS:
+        raise RuntimeError('DATA_BLOCKED: finance parent date cannot cover the bounded discovery window')
 
     reasons: dict[str, set[str]] = {}
 
@@ -505,7 +512,7 @@ def select_daily_finance_candidates(
         if normalized in universe:
             reasons.setdefault(normalized, set()).add(reason)
 
-    gate = finance_disclosure_gate(as_of)
+    gate = disclosure_gate or finance_disclosure_gate(as_of)
     for code, listing_date in universe.items():
         member = members.get(code)
         if not isinstance(member, Mapping):
@@ -558,24 +565,42 @@ def select_daily_finance_candidates(
 
     overlap_start = as_of - timedelta(days=FINANCE_NOTICE_OVERLAP_DAYS)
     try:
-        notice_frame = read_frame(
+        inventory = read_frame(
             text(
-                "SELECT stock_code, title, notice_date, received_at "
+                "SELECT /*+ MAX_EXECUTION_TIME(8000) */ id "
                 "FROM si_notice_eastmoney "
                 "WHERE association_validated=1 "
-                "AND notice_date>=:window_start AND notice_date<=:window_end"
+                "AND notice_date>=:window_start AND notice_date<=:window_end "
+                "ORDER BY notice_date,id LIMIT 200001"
             ),
             engine,
             params={
                 "window_start": overlap_start,
                 "window_end": as_of,
             },
-        )
+        ).to_dict('records')
+        identifiers = sorted(row['id'] for row in inventory)
+        if len(identifiers)>200000 or len(identifiers)!=len(set(identifiers)):
+            raise RuntimeError('finance notice inventory exceeds its bound or has duplicate IDs')
+        notices = []
+        for offset in range(0,len(identifiers),128):
+            if time.monotonic()>=deadline:
+                raise TimeoutError('FINANCE_NOTICE_CANDIDATE_DEADLINE')
+            keys = identifiers[offset:offset+128]
+            rows = read_frame(text(
+                'SELECT /*+ MAX_EXECUTION_TIME(8000) */ id,stock_code,title,notice_date,received_at '
+                'FROM si_notice_eastmoney WHERE association_validated=1 AND id IN :ids '
+                'AND notice_date>=:window_start AND notice_date<=:window_end'
+            ).bindparams(bindparam('ids',expanding=True)),engine,
+                params={'ids':keys,'window_start':overlap_start,'window_end':as_of}).to_dict('records')
+            if len(rows)!=len(keys) or {row['id'] for row in rows}!=set(keys):
+                raise RuntimeError('finance notice candidate inventory differs')
+            notices.extend(rows)
     except Exception as exc:
         raise RuntimeError(
             "DATA_BLOCKED: finance announcement candidate source unavailable"
         ) from exc
-    for row in notice_frame.to_dict("records"):
+    for row in notices:
         if FINANCE_NOTICE_KEYWORDS.search(str(row.get("title") or "")):
             add(str(row.get("stock_code") or ""), "NEW_OR_CORRECTED_ANNOUNCEMENT")
 
@@ -610,6 +635,7 @@ def select_daily_finance_candidates(
             baseline.get("batch_root_sha256") or ""
         ),
         input_root_sha256=input_root,
+        parent_as_of_date=parent_as_of,
     )
 
 
@@ -1321,207 +1347,43 @@ def fetch_cninfo_nonfiling_evidence(
     raise RuntimeError("DATA_BLOCKED: no official PDF proves the required report is unfiled")
 
 
-def get_finance_incremental_baselines(
-    engine,
-) -> dict[str, dict[str, Any]]:
-    """Load compact latest coverage metadata without materializing payload rows."""
-
-    sources_sql = ",".join(f"'{source}'" for source in AUTHORITATIVE_FINANCE_SOURCES)
-    frame = read_frame(
-        text(
-            "WITH ranked AS ("
-            " SELECT coverage.stock_code, coverage.coverage_id,"
-            " coverage.window_start, coverage.window_end, coverage.known_at,"
-            " coverage.coverage_status, coverage.result_count,"
-            " coverage.source,"
-            " ROW_NUMBER() OVER (PARTITION BY coverage.stock_code"
-            " ORDER BY coverage.known_at DESC, coverage.revision_no DESC) AS rn"
-            " FROM st_pit_source_coverage AS coverage"
-            " WHERE coverage.fact_kind='finance'"
-            f" AND coverage.source IN ({sources_sql})"
-            ")"
-            " SELECT ranked.stock_code, ranked.coverage_id, ranked.window_start,"
-            " ranked.window_end, ranked.known_at, ranked.coverage_status,"
-            " ranked.result_count, ranked.source,"
-            " latest.latest_report_date"
-            " FROM ranked LEFT JOIN ("
-            " SELECT stock_code, MAX(report_date) AS latest_report_date"
-            " FROM si_stock_finance GROUP BY stock_code"
-            ") AS latest ON latest.stock_code=ranked.stock_code"
-            " WHERE ranked.rn=1 ORDER BY ranked.stock_code"
-        ),
-        engine,
-    )
-    rows = {
-        str(row.get("stock_code") or "").strip().zfill(6): dict(row)
-        for row in frame.to_dict("records")
-        if str(row.get("stock_code") or "").strip()
-    }
-    late_ids = [
-        str(row.get("coverage_id") or "")
-        for row in rows.values()
-        if (
-            coerce_optional_date(row.get("window_end")) is not None
-            and not pd.isna(pd.to_datetime(row.get("known_at"), errors="coerce"))
-            and pd.to_datetime(row.get("known_at"), errors="coerce").date()
-            > coerce_optional_date(row.get("window_end"))
-        )
-    ]
-    for offset in range(0, len(late_ids), 100):
-        identifiers = late_ids[offset : offset + 100]
-        if not identifiers:
-            continue
-        guard_frame = read_frame(
-            text(
-                "SELECT coverage_id,"
-                " JSON_UNQUOTE(JSON_EXTRACT(payload_json,"
-                " '$.watermark.evidence.source_timestamp_guard.status'))"
-                " AS guard_status,"
-                " JSON_UNQUOTE(JSON_EXTRACT(payload_json,"
-                " '$.watermark.evidence.source_timestamp_guard.as_of_date'))"
-                " AS guard_as_of_date"
-                " FROM st_pit_source_coverage WHERE coverage_id IN :coverage_ids"
-            ).bindparams(bindparam("coverage_ids", expanding=True)),
-            engine,
-            params={"coverage_ids": identifiers},
-        )
-        guards = {
-            str(item.get("coverage_id") or ""): dict(item)
-            for item in guard_frame.to_dict("records")
-        }
-        for row in rows.values():
-            guard = guards.get(str(row.get("coverage_id") or ""))
-            if guard:
-                row.update({
-                    "guard_status": guard.get("guard_status"),
-                    "guard_as_of_date": guard.get("guard_as_of_date"),
-                })
-    return rows
-
-
 def build_finance_incremental_plan(
     engine,
     *,
     universe: Mapping[str, date | None],
     as_of: date,
     disclosure_gate: FinanceDisclosureGate,
+    checkpoint: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Choose refresh vs immutable reuse; any uncertain proof refreshes."""
+    """Refresh the verified parent's candidate union; discover only its missing dates."""
 
-    codes = sorted(universe)
-    baselines = get_finance_incremental_baselines(engine)
-    refresh_reasons: dict[str, str] = {}
-    reusable: dict[str, dict[str, Any]] = {}
-    for code in codes:
-        row = baselines.get(code)
-        if row is None:
-            refresh_reasons[code] = "MISSING_PRIMARY_COVERAGE"
-            continue
-        coverage_id = str(row.get("coverage_id") or "")
-        window_start = coerce_optional_date(row.get("window_start"))
-        window_end = coerce_optional_date(row.get("window_end"))
-        latest_report = coerce_optional_date(row.get("latest_report_date"))
-        known_at = pd.to_datetime(row.get("known_at"), errors="coerce")
-        if (
-            not re.fullmatch(r"[0-9a-f]{64}", coverage_id)
-            or str(row.get("coverage_status") or "") != "COMPLETE"
-            or int(row.get("result_count") or 0) <= 0
-            or window_start is None
-            or window_start > date(1900, 1, 1)
-            or window_end is None
-            or window_end > as_of
-            or pd.isna(known_at)
-        ):
-            refresh_reasons[code] = "INVALID_PRIMARY_COVERAGE"
-            continue
-        if (
-            known_at.date() > window_end
-            and not (
-                str(row.get("guard_status") or "") == "PASS"
-                and str(row.get("guard_as_of_date") or "")
-                == window_end.isoformat()
-            )
-        ):
-            refresh_reasons[code] = "UNGUARDED_LATE_CAPTURE"
-            continue
-        if (
-            report_period_gate_applies(universe[code], disclosure_gate)
-            and (
-                latest_report is None
-                or latest_report < disclosure_gate.minimum_report_date
-            )
-        ):
-            refresh_reasons[code] = "STALE_REQUIRED_REPORT_PERIOD"
-            continue
-        if (as_of - window_end).days > FINANCE_DISCOVERY_MAX_DAYS:
-            refresh_reasons[code] = "EXPIRED_INCREMENTAL_BASELINE"
-            continue
-        reusable[code] = {
-            "coverage_id": coverage_id,
-            "window_end": window_end,
-        }
-
-    gap_starts = [
-        row["window_end"] + timedelta(days=1)
-        for row in reusable.values()
-        if row["window_end"] < as_of
-    ]
-    if not gap_starts:
-        return {
-            "mode": "EXACT_REUSE_AND_TARGETED_REFRESH",
-            "fetch_codes": sorted(refresh_reasons),
-            "reused_codes": sorted(reusable),
-            "refresh_reasons": refresh_reasons,
-            "discovery": {},
-            "discovery_coverage_id": "",
-            "fallback_reason": "",
-        }
-
-    discovery_start = min(gap_starts)
-    try:
-        discovery = fetch_finance_incremental_discovery(
-            window_start=discovery_start,
-            window_end=as_of,
-            universe_codes=codes,
-        )
-        discovery_coverage_id = append_finance_incremental_discovery(
-            engine,
-            discovery,
-        )
-    except Exception as exc:
-        return {
-            "mode": "FULL_PRIMARY_FALLBACK",
-            "fetch_codes": codes,
-            "reused_codes": [],
-            "refresh_reasons": {
-                code: "DISCOVERY_UNAVAILABLE" for code in codes
-            },
-            "discovery": {},
-            "discovery_coverage_id": "",
-            "fallback_reason": f"{type(exc).__name__}:{exc}",
-        }
-
-    changed_by_code: dict[str, list[date]] = {}
-    for event in discovery.get("events") or []:
-        code = str(event.get("stock_code") or "").zfill(6)
-        event_date = coerce_optional_date(event.get("query_date"))
-        if code in universe and event_date is not None:
-            changed_by_code.setdefault(code, []).append(event_date)
-    for code, baseline in reusable.items():
-        if any(
-            baseline["window_end"] < changed_date <= as_of
-            for changed_date in changed_by_code.get(code, ())
-        ):
-            refresh_reasons[code] = "SOURCE_NOTICE_OR_UPDATE_CHANGED"
-    fetch_codes = sorted(refresh_reasons)
+    candidate = select_daily_finance_candidates(engine, universe, as_of=as_of,
+        checkpoint=checkpoint, disclosure_gate=disclosure_gate)
+    reasons = {code: set(values) for code, values in candidate.reasons.items()}
+    discovery = {}
+    discovery_coverage_id = ''
+    if candidate.parent_as_of_date < as_of:
+        try:
+            discovery = fetch_finance_incremental_discovery(
+                window_start=candidate.parent_as_of_date+timedelta(days=1),
+                window_end=as_of, universe_codes=sorted(universe))
+            discovery_coverage_id = append_finance_incremental_discovery(engine, discovery)
+        except Exception as exc:
+            raise RuntimeError('DATA_BLOCKED: finance incremental discovery unavailable') from exc
+        for event in discovery.get('events') or ():
+            code = str(event.get('stock_code') or '').zfill(6)
+            changed = coerce_optional_date(event.get('query_date'))
+            if code in universe and changed is not None and candidate.parent_as_of_date < changed <= as_of:
+                reasons.setdefault(code,set()).add('SOURCE_NOTICE_OR_UPDATE_CHANGED')
+    fetch_codes = sorted(reasons)
     return {
-        "mode": "INCREMENTAL_DISCOVERY",
-        "fetch_codes": fetch_codes,
-        "reused_codes": sorted(set(codes) - set(fetch_codes)),
-        "refresh_reasons": refresh_reasons,
-        "discovery": discovery,
-        "discovery_coverage_id": discovery_coverage_id,
-        "fallback_reason": "",
+        'mode':'INCREMENTAL_DISCOVERY' if discovery_coverage_id else 'EXACT_REUSE_AND_TARGETED_REFRESH',
+        'fetch_codes':fetch_codes,
+        'reused_codes':sorted(set(universe)-set(fetch_codes)),
+        'refresh_reasons':{code:','.join(sorted(values)) for code,values in sorted(reasons.items())},
+        'discovery':discovery,
+        'discovery_coverage_id':discovery_coverage_id,
+        'fallback_reason':'',
     }
 
 
@@ -2072,6 +1934,17 @@ def main(argv: list[str] | None = None) -> int:
             print("[ERROR] DATA_BLOCKED: finance requested scope is empty")
             return 2
 
+        checkpoint_path = Path(args.checkpoint_file) if args.daily_incremental else None
+        previous_checkpoint: dict[str, Any] = {}
+        if checkpoint_path is not None:
+            try:
+                previous_checkpoint = _checkpoint_payload(checkpoint_path)
+            except Exception as exc:
+                print(json.dumps({'schema':'probiga.finance-sync-result.v2','status':'DATA_BLOCKED',
+                    'as_of':run_as_of.isoformat(),'reason':f'{type(exc).__name__}:{exc}'},
+                    ensure_ascii=False, sort_keys=True))
+                return 1
+
         full_catalog_run = bool(
             not args.code and args.offset == 0 and not args.limit
         )
@@ -2093,16 +1966,15 @@ def main(argv: list[str] | None = None) -> int:
                     disclosure_gate=disclosure_gate,
                 )
             except Exception as exc:
-                incremental_plan = {
-                    **incremental_plan,
-                    "mode": "FULL_PRIMARY_FALLBACK",
-                    "fallback_reason": f"{type(exc).__name__}:{exc}",
-                }
+                print(json.dumps({'schema':'probiga.finance-sync-result.v2','status':'DATA_BLOCKED',
+                    'as_of':run_as_of.isoformat(),
+                    'reason':f'FINANCE_INCREMENTAL_PLAN_FAILED:{type(exc).__name__}:{exc}'},
+                    ensure_ascii=False, sort_keys=True))
+                return 1
         planned_codes = list(scope_codes)
         all_fetch_codes = list(incremental_plan["fetch_codes"])
         reused_codes = list(incremental_plan["reused_codes"])
 
-        checkpoint_path: Path | None = None
         checkpoint_state: dict[str, Any] = {}
         resumed_codes: set[str] = set()
         candidate_input_root_sha256 = canonical_hash({
@@ -2121,23 +1993,6 @@ def main(argv: list[str] | None = None) -> int:
             ),
         })
         if args.daily_incremental:
-            checkpoint_path = Path(args.checkpoint_file)
-            try:
-                previous_checkpoint = _checkpoint_payload(checkpoint_path)
-            except Exception as exc:
-                print(
-                    json.dumps(
-                        {
-                            "schema": "probiga.finance-sync-result.v2",
-                            "status": "DATA_BLOCKED",
-                            "as_of": run_as_of.isoformat(),
-                            "reason": f"{type(exc).__name__}:{exc}",
-                        },
-                        ensure_ascii=False,
-                        sort_keys=True,
-                    )
-                )
-                return 1
             if (
                 str(previous_checkpoint.get("as_of") or "")
                 == run_as_of.isoformat()
