@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import logging
 import time
@@ -30,14 +30,35 @@ def read_legacy_attestations(read, params, *, database, deadline):
     """Retain hash-checked immutable evidence pages; recheck the live prices separately."""
     mysql = database.dialect.name == "mysql"
     index = " FORCE INDEX (idx_qmt_kline_attestation_row_date)" if mysql else ""
-    inventory = read(
-        "SELECT /*+ MAX_EXECUTION_TIME(5000) */ a.trade_date, a.attestation_id "
-        f"FROM qmt_kline_attestation_row a{index} "
-        "WHERE a.protocol_version=:protocol_version "
-        "AND a.trade_date BETWEEN :start_date AND :as_of_date "
-        f"AND {a_share_stock_code_sql('a.stock_code')} LIMIT 250001",
-        params, database=database,
-    )
+    inventory = []
+    day = datetime.fromisoformat(str(params["start_date"])[:10]).date()
+    ending = datetime.fromisoformat(str(params["as_of_date"])[:10]).date()
+    while day <= ending:
+        cursor = ("", "")
+        while True:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("QMT certification inventory deadline; verified pages retained")
+            rows = read(
+                "SELECT /*+ MAX_EXECUTION_TIME(5000) */ a.trade_date, a.stock_code, a.attestation_id "
+                f"FROM qmt_kline_attestation_row a{index} "
+                "WHERE a.trade_date=:inventory_day AND a.protocol_version=:protocol_version "
+                "AND a.stock_code>=:cursor_code "
+                "AND (a.stock_code>:cursor_code OR (a.stock_code=:cursor_code AND a.attestation_id>:cursor_id)) "
+                f"AND {a_share_stock_code_sql('a.stock_code')} "
+                "ORDER BY a.stock_code,a.attestation_id LIMIT 400",
+                {**params,"inventory_day":day.isoformat(),"cursor_code":cursor[0],"cursor_id":cursor[1]},
+                database=database,
+            )
+            keys = [(row["stock_code"],row["attestation_id"]) for row in rows]
+            if (keys != sorted(set(keys)) or (keys and keys[0] <= cursor)
+                    or any(str(row["trade_date"])[:10] != day.isoformat() for row in rows)):
+                raise ValueError("QMT certification inventory cursor or date differs")
+            inventory.extend(rows)
+            if len(inventory) > 250000:
+                raise ValueError("QMT certification inventory exceeds its bound")
+            if len(rows) < 400:break
+            cursor = keys[-1]
+        day += timedelta(days=1)
     ids = sorted(row["attestation_id"] for row in inventory)
     if len(ids) > 250000 or len(ids) != len(set(ids)):
         raise ValueError("QMT certification inventory exceeds its bound or contains duplicates")
@@ -68,10 +89,10 @@ def read_legacy_attestations(read, params, *, database, deadline):
     completed = 0
     for day in sorted({str(row["trade_date"])[:10] for row in inventory}):
         day_ids = sorted(row["attestation_id"] for row in inventory if str(row["trade_date"])[:10] == day)
-        for offset in range(0, len(day_ids), 512):
+        for offset in range(0, len(day_ids), 64):
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"QMT certification read deadline: {completed}/{len(ids)}; verified pages retained")
-            selected = day_ids[offset:offset + 512]
+            selected = day_ids[offset:offset + 64]
             key = canonical_digest(selected)
             retained = store.get(generation, "governance_attestation_rows", key)
             fresh = retained is None
