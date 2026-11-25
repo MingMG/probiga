@@ -605,7 +605,7 @@ def test_dynamic_strategy_key_validation_has_no_fixed_catalog_dependency():
         raise AssertionError("invalid strategy key should be rejected")
 
 
-def test_authoritative_windows_require_exact_calendar_qmt_date_set(monkeypatch):
+def test_authoritative_windows_require_exact_calendar_qmt_date_set(monkeypatch, tmp_path):
     end = date(2026, 8, 21)
     descending = [
         (end - timedelta(days=index * 2)).isoformat()
@@ -659,6 +659,18 @@ def test_authoritative_windows_require_exact_calendar_qmt_date_set(monkeypatch):
         },
     ]
     observed_sql = []
+    from server.db.formal_analysis_schema import privileged_migrate_formal_analysis_schema
+    cache_engine = create_engine("sqlite:///" + str(tmp_path / "certification.db"))
+    privileged_migrate_formal_analysis_schema(cache_engine)
+    real_attestations = governance_module.read_legacy_attestations
+    monkeypatch.setattr(
+        governance_module, "read_legacy_attestations",
+        lambda read, params, *, database, deadline: real_attestations(
+            read, params, database=cache_engine, deadline=deadline,
+        ),
+    )
+    monkeypatch.setattr(governance_module, "read_close_batches",
+                        lambda batches, read, *, deadline: ((batch, read(batch)) for batch in batches))
 
     def fake_read(sql, _params=None, *, database=None):
         observed_sql.append(sql)
@@ -689,7 +701,9 @@ def test_authoritative_windows_require_exact_calendar_qmt_date_set(monkeypatch):
                 and _params["start_date"] <= row["trade_date"]
                 <= _params["as_of_date"]]
         if "FROM qmt_kline_attestation_row a" in sql:
-            return [{
+            records = [{
+                "attestation_id": hashlib.sha256(json.dumps(row, sort_keys=True).encode()).hexdigest(),
+                "attestation_created_at": row["trade_date"] + "T15:01:00",
                 "trade_date": row["trade_date"],
                 "stock_code": row["stock_code"],
                 "run_id": "completed-v2-full-universe",
@@ -706,6 +720,8 @@ def test_authoritative_windows_require_exact_calendar_qmt_date_set(monkeypatch):
                 if row["in_completed_attestation"]
                 and _params["start_date"] <= row["trade_date"]
                 <= _params["as_of_date"]]
+            selected = {value for key, value in _params.items() if key.startswith("attestation_")}
+            return [row for row in records if not selected or row["attestation_id"] in selected]
         raise AssertionError(sql)
 
     monkeypatch.setattr(governance_module, "_db_read", fake_read)
@@ -778,13 +794,13 @@ def test_authoritative_windows_require_exact_calendar_qmt_date_set(monkeypatch):
     assert "end_date>=:start_date" in completed_sql
     attestation_sql = next(
         sql for sql in observed_sql
-        if "FROM qmt_kline_attestation_row a" in sql
+        if "FROM qmt_kline_attestation_row a" in sql and "a.source_pre_close" in sql
     )
     assert "MAX_EXECUTION_TIME(20000)" in attestation_sql
     assert "JOIN" not in attestation_sql
     assert "JSON_EXTRACT" not in attestation_sql
     assert "a.qmt_id>0" in attestation_sql
-    assert "BINARY a.attestation_id=BINARY SHA2(CONCAT_WS('|'," in (
+    assert "a.attestation_id=SHA2(CONCAT_WS('|'," in (
         attestation_sql
     )
     for bound_field in (
@@ -799,10 +815,10 @@ def test_authoritative_windows_require_exact_calendar_qmt_date_set(monkeypatch):
     ]
     attestation_queries = [
         sql for sql in observed_sql
-        if "FROM qmt_kline_attestation_row a" in sql
+        if "FROM qmt_kline_attestation_row a" in sql and "a.source_pre_close" in sql
     ]
     assert len(target_queries) == 24
-    assert len(attestation_queries) == 24
+    assert len(attestation_queries) == 120
 
     # An authentic 120-session proof must leave no raw row owned by a
     # completed worker result, even if a Future keeps that result alive.

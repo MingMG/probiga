@@ -4,6 +4,8 @@ from __future__ import annotations
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime
+import json
+import logging
 import time
 from typing import Any
 
@@ -20,6 +22,80 @@ from server.common.qmt_datadir_daily_coverage import (
     load_daily_native_evidence,
 )
 from server.common.qmt_datadir_result import PROVIDER
+from server.common.formal_analysis_store import FormalAnalysisStore
+from server.common.qmt_stock_catalog import a_share_stock_code_sql
+
+
+def read_legacy_attestations(read, params, *, database, deadline):
+    """Retain hash-checked immutable evidence pages; recheck the live prices separately."""
+    mysql = database.dialect.name == "mysql"
+    index = " FORCE INDEX (idx_qmt_kline_attestation_row_date)" if mysql else ""
+    inventory = read(
+        "SELECT /*+ MAX_EXECUTION_TIME(5000) */ a.trade_date, a.attestation_id "
+        f"FROM qmt_kline_attestation_row a{index} "
+        "WHERE a.protocol_version=:protocol_version "
+        "AND a.trade_date BETWEEN :start_date AND :as_of_date "
+        f"AND {a_share_stock_code_sql('a.stock_code')} LIMIT 250001",
+        params, database=database,
+    )
+    ids = sorted(row["attestation_id"] for row in inventory)
+    if len(ids) > 250000 or len(ids) != len(set(ids)):
+        raise ValueError("QMT certification inventory exceeds its bound or contains duplicates")
+    # The ID commits to the certified prices. Cache their original context too;
+    # availability is filtered for each consumer, never advanced to the copy time.
+    primary = " FORCE INDEX (PRIMARY)" if mysql else ""
+    binary = "BINARY " if mysql else ""
+    raw_sql = (
+        "SELECT /*+ MAX_EXECUTION_TIME(20000) */ "
+        "a.attestation_id, a.created_at AS attestation_created_at, a.trade_date, a.stock_code, a.run_id, "
+        "a.source_pre_close, a.attested_open, a.attested_close, a.attested_high, "
+        "a.attested_low, a.attested_volume, a.attested_amount "
+        f"FROM qmt_kline_attestation_row a{primary} "
+        "WHERE a.protocol_version=:protocol_version "
+        f"AND {binary}a.protocol_version={binary}:protocol_version AND a.qmt_id>0 "
+        f"AND {binary}a.source_pre_close_origin={binary}'NATIVE_QMT' "
+        f"AND {binary}a.attestation_id={binary}SHA2(CONCAT_WS('|', "
+        "a.protocol_version, a.target_id, a.qmt_id, a.source_data_version, a.source_pre_close, "
+        "a.attested_open, a.attested_close, a.attested_high, a.attested_low, "
+        "a.attested_volume, a.attested_amount), 256) "
+        f"AND {a_share_stock_code_sql('a.stock_code')} "
+        "AND a.trade_date BETWEEN :start_date AND :as_of_date"
+    )
+    generation = canonical_digest({"schema": "probiga.governance-attestation-pages.v1",
+                                   "sql": raw_sql, "protocol": params["protocol_version"]})
+    store = FormalAnalysisStore(database)
+    result = []
+    completed = 0
+    for day in sorted({str(row["trade_date"])[:10] for row in inventory}):
+        day_ids = sorted(row["attestation_id"] for row in inventory if str(row["trade_date"])[:10] == day)
+        for offset in range(0, len(day_ids), 512):
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"QMT certification read deadline: {completed}/{len(ids)}; verified pages retained")
+            selected = day_ids[offset:offset + 512]
+            key = canonical_digest(selected)
+            retained = store.get(generation, "governance_attestation_rows", key)
+            fresh = retained is None
+            if fresh:
+                placeholders = ",".join(f":attestation_{i}" for i in range(len(selected)))
+                rows = read(raw_sql + f" AND a.attestation_id IN ({placeholders})",
+                            {**params, "start_date": day, "as_of_date": day,
+                             **{f"attestation_{i}": value for i, value in enumerate(selected)}}, database=database)
+                retained = json.loads(json.dumps({"ids": selected, "rows": rows}, default=str))
+            observed = [row["attestation_id"] for row in retained["rows"]]
+            if (retained["ids"] != selected or len(observed) != len(set(observed))
+                    or not set(observed) <= set(selected)
+                    or any(str(row["trade_date"])[:10] != day for row in retained["rows"])):
+                raise ValueError("QMT certification primary-key scope differs")
+            if fresh:
+                store.put(generation, "governance_attestation_rows", key, retained)
+            result.extend(row for row in retained["rows"]
+                          if datetime.fromisoformat(row["attestation_created_at"]) <= params["decision_known_at"])
+            completed += len(selected)
+            logging.getLogger(__name__).info(
+                "QMT certification checkpoint day=%s completed=%s total=%s last_progress_at=%s",
+                day, completed, len(ids), datetime.now(),
+            )
+    return result
 
 
 @dataclass(frozen=True)

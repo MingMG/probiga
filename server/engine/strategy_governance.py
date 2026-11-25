@@ -74,6 +74,7 @@ from server.engine.governance_daily_market import (
     datadir_manifest_days,
     load_native_datadir_close,
     read_close_batches,
+    read_legacy_attestations,
 )
 from server.engine.strategy_execution_adapters import (
     batch_dynamic_shadow_ledger_readiness,
@@ -7258,26 +7259,8 @@ def _authoritative_session_windows_with_proof(
                 "AND k.trade_date BETWEEN :start_date AND :as_of_date",
                 params, database=market_engine,
             )
-            attestations = _db_read(
-                "SELECT /*+ MAX_EXECUTION_TIME(20000) */ "
-                "a.trade_date, a.stock_code, a.run_id, "
-                "a.source_pre_close, a.attested_open, a.attested_close, "
-                "a.attested_high, a.attested_low, a.attested_volume, "
-                "a.attested_amount "
-                "FROM qmt_kline_attestation_row a FORCE INDEX (idx_qmt_kline_attestation_row_date) "
-                "WHERE a.protocol_version=:protocol_version "
-                "AND BINARY a.protocol_version=BINARY :protocol_version "
-                "AND a.qmt_id>0 "
-                "AND a.created_at<=:decision_known_at "
-                "AND BINARY a.source_pre_close_origin=BINARY 'NATIVE_QMT' "
-                "AND BINARY a.attestation_id=BINARY SHA2(CONCAT_WS('|', "
-                "a.protocol_version, a.target_id, a.qmt_id, "
-                "a.source_data_version, a.source_pre_close, "
-                "a.attested_open, a.attested_close, a.attested_high, "
-                "a.attested_low, a.attested_volume, a.attested_amount), 256) "
-                f"AND {a_share_stock_code_sql('a.stock_code')} "
-                "AND a.trade_date BETWEEN :start_date AND :as_of_date",
-                params, database=market_engine,
+            attestations = read_legacy_attestations(
+                _db_read, params, database=market_engine, deadline=phase_deadline,
             )
             return collapse_legacy(batch, targets, attestations)
 
