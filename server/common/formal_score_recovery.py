@@ -36,6 +36,7 @@ from server.common.daily_delivery_control import (
 )
 from server.common.formal_analysis_store import FormalAnalysisStore
 from server.common.formal_score_publication import (
+    FORMAL_SCORE_BLOCKED_SCHEMA,
     FORMAL_SCORE_WORK_SCHEMA,
     FormalScoreContractError,
     load_initial_selection,
@@ -103,10 +104,11 @@ _VALIDATION_ONLY_BODIES = {
         "_bind_historical_event_snapshot", "_read_historical_chain_metadata", "_read_historical_later_scopes",
     ),
     "server/api/routers/hot_data.py": ("_recommended_stocks_v2", "_recommended_data_freshness"),
+    "server/api/routers/trading_v3.py": ("_analysis_data_block_reason",),
     "server/api/scheduler_runtime.py": (
         "_terminal_snapshot", "_daily_result_recovery_target",
         "_daily_delivery_runtime_health", "_build_daily_result_delivery_receipt",
-        "_strategy_pipeline_dependencies_ready",
+        "_strategy_pipeline_dependencies_ready", "_release_build_catchup_allowed",
     ),
     "server/engine/strategy_center.py": ("_dynamic_execution_signals",),
     "server/engine/strategy_shadow_trials.py": ("native_trial_candidate_batch",),
@@ -471,8 +473,27 @@ def _verify_terminal_publication(
         raise FormalScoreContractError("formal recovery completed publication could not be verified") from exc
 
 
-def _successful_child_failed_publication(record: Mapping[str, Any]) -> bool:
-    return record["stage_status"] == "FAILED" and record["audit_status"] == "failed" and record["exit_code"] == 0
+def _sealed_unpublished_score(record: Mapping[str, Any], trade_date: str) -> bool:
+    if record["stage_status"] == "BLOCKED" and record["audit_status"] == "blocked" and record["exit_code"] == 2:
+        from server.common.scheduler_validation import _single_nested_machine_payload
+
+        blocker = _single_nested_machine_payload(record["output"], schema=FORMAL_SCORE_BLOCKED_SCHEMA)
+        work = _single_nested_machine_payload(record["output"], schema=FORMAL_SCORE_WORK_SCHEMA)
+        score = work.get("score_snapshot") if work else None
+        return bool(
+            record["score_status"] == "error" and blocker and blocker.get("trade_date") == trade_date
+            and blocker.get("reason_code") == "FORMAL_SCORE_INPUTS_INCOMPLETE"
+            and blocker.get("retryable") is False and work and work.get("recommendation_count") == 0
+            and isinstance(score, Mapping) and type(score.get("data_blocked_count")) is int
+            and score["data_blocked_count"] > 0
+        )
+    return record["stage_status"] == "FAILED" and record["audit_status"] == "failed" and (
+        record["exit_code"] == 0 or (
+            record["exit_code"] is None and
+            "DAILY_DELIVERY_FINALIZATION_FAILED: validated analysis pool activation/terminal audit failed"
+            in (record["output"] or "").splitlines()
+        )
+    )
 
 
 def _expired_takeover(record: Mapping[str, Any], newer: Mapping[str, Any]) -> bool:
@@ -622,7 +643,7 @@ def _candidate(
             "stage_finished_at", "finished_at",
         )):
             raise FormalScoreContractError("formal recovery prior attempt is not earlier")
-        if published or _successful_child_failed_publication(prior):
+        if published or _sealed_unpublished_score(prior, trade_date):
             break
         if not _abandoned_without_publication(prior, newer):
             return None
@@ -659,7 +680,7 @@ def _candidate(
         original_published = _published_terminal(original_record, {origin_build}, trade_date)
         original_failed = (
             _unpublished_terminal(original_record, {origin_build}, trade_date)
-            and _successful_child_failed_publication(original_record)
+            and _sealed_unpublished_score(original_record, trade_date)
         )
         if original_record["stage_id"] >= prior["stage_id"] or not (original_published or original_failed):
             raise FormalScoreContractError("formal recovery original scheduler audit is unavailable")

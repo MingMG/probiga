@@ -42,6 +42,9 @@ from server.api.routers.hot_data import (
 from server.common.batch_db import create_batch_engine
 from server.common.authoritative_market_clock import PRODUCTION_TIMEZONE
 from server.common.config import get_wecom_webhook
+from server.common.formal_score_publication import (
+    FORMAL_SCORE_WORK_SCHEMA, FormalScoreContractError, formal_score_blocked,
+)
 from server.common.analysis_pool_receipt import (
     publication_is_complete_empty,
     publication_receipt_is_valid,
@@ -51,6 +54,10 @@ from tools.repair_recommendation_data import repair_target_data
 
 
 _DIAGNOSTIC_STREAM = None
+
+
+class FormalScoreInputsIncomplete(FormalScoreContractError):
+    reason_code = "FORMAL_SCORE_INPUTS_INCOMPLETE"
 
 
 def _analysis_diagnostics_root() -> Path | None:
@@ -725,8 +732,6 @@ def main() -> int:
         publication_receipt = getattr(stats, "publication_receipt", None)
         prepared_publication = getattr(stats, "prepared_publication", None)
         if durable_initial:
-            from server.common.formal_score_publication import FORMAL_SCORE_WORK_SCHEMA, FormalScoreContractError
-
             if (
                 not isinstance(prepared_publication, dict)
                 or prepared_publication.get("schema") != FORMAL_SCORE_WORK_SCHEMA
@@ -741,7 +746,7 @@ def main() -> int:
                 raise FormalScoreContractError("scheduled analysis did not seal its exact score result")
             blocked_count = prepared_publication["score_snapshot"]["data_blocked_count"]
             if stats.recommendation_count == 0 and blocked_count:
-                raise FormalScoreContractError(
+                raise FormalScoreInputsIncomplete(
                     f"{stats.trade_date} 已封存 {stats.analysis_count} 只股票的评分，"
                     f"其中 {blocked_count} 只缺少截点前的有效财务或公告证据，"
                     "无法验证零只入选的正式结果。"
@@ -826,11 +831,18 @@ def main() -> int:
             )
         return 0
     except Exception as exc:
+        blocker = None
+        audit_error = str(exc)
+        if production and args.pool_decision_phase == "INITIAL":
+            blocker = formal_score_blocked(exc)
+            if isinstance(exc, FormalScoreInputsIncomplete):
+                blocker["reason_code"] = exc.reason_code
+                audit_error = f"DATA_BLOCKED:{exc.reason_code}; {exc}"
         try:
             _recommended_run_history_finish(run_uid, status="error", payload={
                 "trade_date": target_trade_date,
                 "message": "盘前预演失败",
-                "error": str(exc)[:500],
+                "error": audit_error[:500],
             })
         except Exception as finish_exc:
             raise RuntimeError(
@@ -838,13 +850,11 @@ def main() -> int:
                 f"original={type(exc).__name__}: {exc}; "
                 f"terminal_audit={type(finish_exc).__name__}: {finish_exc}"
             ) from exc
-        if production and args.pool_decision_phase == "INITIAL":
-            from server.common.formal_score_publication import formal_score_blocked
-
-            blocker = formal_score_blocked(exc)
-            if blocker is not None:
-                print(json.dumps(blocker, ensure_ascii=False))
-                return 2
+        if blocker is not None:
+            if isinstance(exc, FormalScoreInputsIncomplete):
+                print(json.dumps(prepared_publication, ensure_ascii=False, separators=(",", ":")))
+            print(json.dumps({**blocker, "trade_date": target_trade_date}, ensure_ascii=False))
+            return 2
         raise
 
 

@@ -144,6 +144,35 @@ def _recover(engine, run_uid=FIRST_RETRY):
     )
 
 
+def test_reuses_sealed_score_after_validated_finalization_rejection(archived):
+    engine, original = archived
+    with engine.begin() as connection:
+        connection.execute(text("""
+            UPDATE st_scheduled_task_history SET exit_code=NULL,output=:output
+            WHERE run_uid=:uid
+        """), {"uid": ORIGINAL_RUN, "output": json.dumps(original) +
+                "\nDAILY_DELIVERY_FINALIZATION_FAILED: validated analysis pool activation/terminal audit failed"})
+    recovered = _recover(engine)["reference"]
+    assert recovered["selection_sha256"] == original["selection_sha256"]
+    assert recovered["decision_at"] == CUTOFF
+
+
+def test_incomplete_terminal_requires_bound_blocked_score_reference():
+    blocker = {
+        "schema": "probiga.formal-initial-score-blocked.v1", "trade_date": TARGET,
+        "reason_code": "FORMAL_SCORE_INPUTS_INCOMPLETE", "retryable": False,
+    }
+    score = {
+        "schema": "probiga.formal-initial-score-reference.v1", "recommendation_count": 0,
+        "score_snapshot": {"data_blocked_count": 528},
+    }
+    record = {"stage_status": "BLOCKED", "audit_status": "blocked", "exit_code": 2, "score_status": "error"}
+    output = json.dumps(score) + "\n" + json.dumps(blocker)
+    assert recovery._sealed_unpublished_score({**record, "output": output}, TARGET)
+    assert not recovery._sealed_unpublished_score({**record, "output": json.dumps(blocker)}, TARGET)
+    assert not recovery._sealed_unpublished_score({**record, "output": output}, "2026-11-16")
+
+
 def test_rebind_older_cutoff_same_immutable_selection_with_fractional_audit_times(archived, monkeypatch):
     engine, original = archived
     monkeypatch.setattr(FormalAnalysisStore, "load_artifacts", lambda *_: pytest.fail("recovery reloaded score rows"))

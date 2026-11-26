@@ -124,6 +124,26 @@ def test_linux_formal_recovery_branch_preserves_windows_artifact_identity(repo, 
         assert result["windows_runtime_changed_paths"] == [path]
 
 
+def test_linux_formal_target_rollover_preserves_windows_artifact_identity(repo):
+    path = "server/api/scheduler_runtime.py"
+    head = 'REVISION = 1\n\ndef _release_build_catchup_allowed(row, *, now):\n    if explicitly_terminal and not retryable_block:\n'
+    tail = '        return False\n    return True\n'
+    repo.write(path, head + tail)
+    windows = repo.commit()
+    rollover = (
+        '        if task_type == "analysis_fast":\n'
+        '            targets = _scheduler_output_target_dates(terminal_output)\n'
+        '            return len(targets) == 1 and next(iter(targets)) < expected_target\n'
+    )
+    repo.write(path, head + rollover + tail)
+    linux = repo.commit()
+    assert repo.classify(linux, base=windows, windows_base=windows)["scope"] == "LINUX"
+    repo.write(path, head + rollover.replace("analysis_fast", "qmt_announcement_pit") + tail)
+    result = repo.classify(repo.commit(), base=linux, windows_base=windows)
+    assert result["scope"] == "COORDINATED"
+    assert result["windows_runtime_changed_paths"] == [path]
+
+
 def _missed_windows_runtime_release(
     repo, path="server/common/qmt_datadir_minute_coverage.py",
 ):

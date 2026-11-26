@@ -2586,6 +2586,9 @@ def _release_build_catchup_allowed(row: dict, *, now: datetime) -> bool:
             # Explicit policy blocks and lawful no-data receipts are terminal.
             # Older blocked history rows predate the retryable field, so keep
             # their bounded retry behavior instead of stranding a release.
+            if task_type == "analysis_fast":
+                targets = _scheduler_output_target_dates(terminal_output)
+                return len(targets) == 1 and next(iter(targets)) < expected_target
             return False
     retry_reference = _coerce_datetime(
         row.get("_release_terminal_finished_at")
