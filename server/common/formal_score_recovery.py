@@ -51,6 +51,7 @@ _PERMITTED_VALIDATION_FILES = frozenset({
     "deploy/production_deploy.sh",
     "server/common/formal_score_recovery.py",
     "server/common/formal_score_source_evidence.py",
+    "server/common/formal_analysis_prefetch.py",
     "server/common/scheduler_validation.py",
     "server/engine/strategy_governance.py",
     "server/engine/strategy_governance_orchestrator.py",
@@ -99,6 +100,7 @@ _REQUIRED_INPUTS = frozenset({
 _SHA40 = re.compile(r"[0-9a-f]{40}")
 _RUN_UID = re.compile(r"[0-9a-f]{32}")
 _VALIDATION_ONLY_BODIES = {
+    "server/common/formal_analysis_store.py": (),
     # Historical reconstruction IO does not change a frozen score's formula or inputs.
     "server/common/pit_facts.py": (
         "_bind_historical_event_snapshot", "_read_historical_chain_metadata", "_read_historical_later_scopes",
@@ -219,6 +221,20 @@ def _scorer_source(root: Path, relative: str) -> bytes:
 
 def _without_validation_body(path: str, source: bytes) -> str:
     tree = ast.parse(source, filename=path)
+    if path == "server/common/formal_analysis_store.py":
+        # Only the native worker enters the optional immutable read scope.
+        prefetch = [ast.dump(node) for node in ast.parse('''
+from server.common.formal_analysis_prefetch import read_prefetched_checkpoint
+prefetched = read_prefetched_checkpoint(self._bind, generation, stage, key)
+if prefetched is not None:
+    return prefetched
+''').body]
+        store = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'FormalAnalysisStore')
+        reader = next(node for node in store.body if isinstance(node, ast.FunctionDef) and node.name == 'get')
+        for offset in range(len(reader.body) - len(prefetch) + 1):
+            if [ast.dump(node) for node in reader.body[offset:offset + len(prefetch)]] == prefetch:
+                del reader.body[offset:offset + len(prefetch)]
+                break
     if path == "server/common/pit_facts.py":
         # Physical read batching retains the same members and validation rules.
         for node in tree.body:

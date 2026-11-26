@@ -2,7 +2,7 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 
 import pytest
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.exc import OperationalError
 
 from server.common.formal_analysis_store import (
@@ -95,6 +95,29 @@ def test_bulk_checkpoint_read_enforces_combined_decoded_byte_budget(engine,monke
     assert store.get_many(GENERATION,'metadata',['A'])=={'A':{'v':'a'*50}}
     with pytest.raises(FormalAnalysisArtifactIntegrityError,match='byte limit'):
         store.get_many(GENERATION,'metadata',['A','B'])
+
+
+def test_replay_finance_prefix_in_batches_and_keep_new_writes_visible(engine):
+    from server.common.formal_analysis_prefetch import prefetch_checkpoint_reads
+
+    store = FormalAnalysisStore(engine)
+    stage = 'finance_issuer_facts'
+    saved = {f'batch-{index:03}': {'rows': [index]} for index in range(273)}
+    for offset in range(0, len(saved), 128):
+        store.put_many(GENERATION, stage, dict(list(saved.items())[offset:offset + 128]))
+    store.put(OTHER_GENERATION, stage, 'batch-000', {'rows': [999]})
+    reads = []
+    event.listen(engine, 'before_cursor_execute', lambda *args: reads.append(args[2]))
+    with prefetch_checkpoint_reads(store, engine, GENERATION, stage):
+        step_store = FormalAnalysisStore(engine)
+        assert {key: step_store.get(GENERATION, stage, key) for key in saved} == saved
+        assert len(reads) < 60
+        step_store.get(GENERATION, stage, 'batch-000')['rows'].append(3)
+        assert step_store.get(GENERATION, stage, 'batch-000') == {'rows': [0]}
+        assert step_store.get(OTHER_GENERATION, stage, 'batch-000') == {'rows': [999]}
+        assert step_store.get(GENERATION, stage, 'next') is None
+        store.put(GENERATION, stage, 'next', {'rows': [273]})
+        assert step_store.get(GENERATION, stage, 'next') == {'rows': [273]}
 
 
 def test_competing_frozen_cutoffs_converge_to_one_durable_value(engine):

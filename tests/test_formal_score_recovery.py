@@ -649,6 +649,9 @@ def _build_daily_result_delivery_receipt(conn):
 def _strategy_pipeline_dependencies_ready(conn):
     return conn.dependencies()
 
+def _release_build_catchup_allowed(conn):
+    return conn.catchup()
+
 def calculate(conn):
     return conn.score()
 """
