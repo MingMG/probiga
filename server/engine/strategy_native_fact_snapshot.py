@@ -1,10 +1,10 @@
 """Reuse verified, immutable historical source selections across worker steps."""
-import hashlib
 from pathlib import Path
 from types import MappingProxyType
 
 from server.common import pit_facts as pit
 from server.common.formal_analysis_store import FormalAnalysisStore
+from server.common.formal_source_identity import frozen_source_sha256
 from server.common.qmt_announcement_pit import HistoricalAnnouncementSelection, _assert_pit_fact_schema_prepared
 
 # Identity of the original v1 wire format; transport batching does not change it.
@@ -15,7 +15,7 @@ def snapshot_identity(*, day, decision, identity_hash, finance_seal, codes):
     from server.common import historical_announcement_read, pit_sealed_finance_read
     return pit.canonical_hash({'schema':'probiga.native-fact-selection.v1', 'day':day,
         'decision':str(decision), 'identity':identity_hash, 'finance_seal':finance_seal,
-        'codes':sorted(codes), 'readers':{Path(m.__file__).name:hashlib.sha256(Path(m.__file__).read_bytes()).hexdigest()
+        'codes':sorted(codes), 'readers':{Path(m.__file__).name:frozen_source_sha256(Path(m.__file__))
             for m in (pit,historical_announcement_read,pit_sealed_finance_read)},
         'codec':WIRE_FORMAT_ID,'cutoff_policy':'INDEPENDENT_VERIFIED_FRONTIERS_V1'})
 

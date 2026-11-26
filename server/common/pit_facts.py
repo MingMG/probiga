@@ -21,6 +21,7 @@ from itertools import groupby
 import json
 import logging
 import math
+import os
 from pathlib import Path
 import re
 from time import monotonic
@@ -42,6 +43,7 @@ from server.common.finance_nonfiling_evidence import (
     EVIDENCE_SCHEMA as FINANCE_NONFILING_BODY_SCHEMA,
     validate_document_body_evidence,
 )
+from server.common.formal_source_identity import frozen_source_sha256
 
 if TYPE_CHECKING:
     from server.common.daily_delivery_control import FrozenInitialAnnouncement, FrozenPremarketAnnouncement
@@ -6129,7 +6131,7 @@ def _bind_historical_event_snapshot(
         'schema': 'probiga.historical-event-coverage-blocks.v1',
         'receipt': receipt, 'decision': decision, 'frontier': frontier,
         'window_start': window_start, 'window_end': window_end,
-        'reader_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        'reader_sha256': frozen_source_sha256(Path(__file__)),
     }) if coverage_store is not None else None
     with engine.connect() as connection:
         mysql = connection.dialect.name == "mysql"
@@ -7636,8 +7638,16 @@ def _query_bound_event_revisions(
     bindings_by_code: Mapping[str, tuple[Mapping[str, str], ...]],
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
     """Resolve only identities committed to the exact validated coverage receipt."""
+    with engine.connect() as connection:
+        return _read_bound_event_revisions(connection, selection, bindings_by_code)
+
+
+def _read_bound_event_revisions(connection, selection, bindings_by_code):
+    from server.common.bounded_read import read_id_batches
     from server.common.qmt_announcement_pit import (
-        LIVE_ANNOUNCEMENT_BATCH_VALIDATION_BUDGET_SECONDS, _live_announcement_reply_budget,
+        LIVE_ANNOUNCEMENT_BATCH_VALIDATION_BUDGET_SECONDS,
+        LIVE_ANNOUNCEMENT_BATCH_REPLY_DEADLINE, LIVE_ANNOUNCEMENT_BATCH_REPLY_FAILED,
+        QMTAnnouncementBlocked, _live_announcement_reply_budget,
     )
 
     deadline = monotonic() + LIVE_ANNOUNCEMENT_BATCH_VALIDATION_BUDGET_SECONDS
@@ -7656,49 +7666,66 @@ def _query_bound_event_revisions(
         "known": _row_datetime(selection.batch["received_at"]),
         "source": selection.batch["source"],
     }
-    with engine.connect() as connection:
-        bound_statement = text(f"""
+    size = int(os.getenv("PROBIGA_ANNOUNCEMENT_REVISION_QUERY_BATCH_SIZE", "160"))
+    limit = COMMON_FACT_CUTOFF_QUERY_CODE_LIMIT
+    if not 1 <= size <= limit:
+        raise ValueError("PROBIGA_ANNOUNCEMENT_REVISION_QUERY_BATCH_SIZE out of range")
+
+    def retryable(error):
+        return isinstance(error, QMTAnnouncementBlocked) and error.reason_code in (
+            LIVE_ANNOUNCEMENT_BATCH_REPLY_DEADLINE, LIVE_ANNOUNCEMENT_BATCH_REPLY_FAILED,
+        )
+
+    def fetch(statement, ids, stage):
+        def read(batch):
+            if getattr(connection, "invalidated", False):
+                connection.rollback()
+            with _live_announcement_reply_budget(connection, deadline=deadline, stage=stage):
+                return connection.execute(statement, {**params, "ids": batch}).mappings().all()
+
+        return read_id_batches(ids, read, size=size, deadline=deadline, retryable=retryable,
+                               logger=logger, stage=stage)
+
+    bound_statement = text(f"""
             SELECT /*+ MAX_EXECUTION_TIME(15000) */ revision_id,content_hash,identity_hash,
                    stock_code,event_date,published_at,revision_no
             FROM {EVENT_REVISION_TABLE}
             WHERE revision_id IN :ids AND source=:source
               AND known_at<=:known AND received_at<=:known
-        """).bindparams(bindparam("ids", expanding=True))
-        ids = sorted(expected)
-        limit = COMMON_FACT_CUTOFF_QUERY_CODE_LIMIT
-        for offset in range(0, len(ids), limit):
-            requested = ids[offset:offset + limit]
-            with _live_announcement_reply_budget(connection, deadline=deadline, stage="signed-announcement-bound-revisions"):
-                observed = connection.execute(
-                    bound_statement, {**params, "ids": requested},
-                ).mappings().all()
-            if {item["revision_id"] for item in observed} != set(requested):
-                raise ValueError("signed announcement bound revision is missing")
-            for row in observed:
-                if (row["stock_code"], row["content_hash"]) != expected[row["revision_id"]]:
-                    raise ValueError("signed announcement bound content differs")
-                day = (
-                    _row_datetime(row["published_at"]).date()
-                    if row["published_at"] is not None else _date_value(row["event_date"], required=True)
-                )
-                if selection.window_start <= day <= selection.window_end:
-                    identity = row["identity_hash"]
-                    if identity in selected:
-                        raise ValueError("signed announcement identity has conflicting bindings")
-                    selected[identity] = row["revision_id"], int(row["revision_no"])
-        history_statement = text(f"""
+    """).bindparams(bindparam("ids", expanding=True))
+    ids = sorted(expected)
+    for offset in range(0, len(ids), limit):
+        requested = ids[offset:offset + limit]
+        observed = fetch(bound_statement, requested, "signed-announcement-bound-revisions")
+        if len(observed) != len(requested) or {item["revision_id"] for item in observed} != set(requested):
+            raise ValueError("signed announcement bound revision is missing")
+        for row in observed:
+            if (row["stock_code"], row["content_hash"]) != expected[row["revision_id"]]:
+                raise ValueError("signed announcement bound content differs")
+            day = (
+                _row_datetime(row["published_at"]).date()
+                if row["published_at"] is not None else _date_value(row["event_date"], required=True)
+            )
+            if selection.window_start <= day <= selection.window_end:
+                identity = row["identity_hash"]
+                if identity in selected:
+                    raise ValueError("signed announcement identity has conflicting bindings")
+                selected[identity] = row["revision_id"], int(row["revision_no"])
+    history_statement = text(f"""
             SELECT /*+ MAX_EXECUTION_TIME(15000) */ * FROM {EVENT_REVISION_TABLE}
             WHERE identity_hash IN :ids AND source=:source
               AND known_at<=:known AND received_at<=:known
             ORDER BY stock_code,identity_hash,revision_no
-        """).bindparams(bindparam("ids", expanding=True))
-        identities = sorted(selected)
-        for offset in range(0, len(identities), limit):
-            requested = identities[offset:offset + limit]
-            with _live_announcement_reply_budget(connection, deadline=deadline, stage="signed-announcement-bound-history"):
-                for row in connection.execute(history_statement, {**params, "ids": requested}).mappings():
-                    if row["revision_no"] <= selected[row["identity_hash"]][1]:
-                        histories.append(dict(row))
+    """).bindparams(bindparam("ids", expanding=True))
+    identities = sorted(selected)
+    for offset in range(0, len(identities), limit):
+        requested = identities[offset:offset + limit]
+        rows = fetch(history_statement, requested, "signed-announcement-bound-history")
+        # Preserve the frozen logical page order across configurable transport batches.
+        rows.sort(key=lambda row: (row["stock_code"], row["identity_hash"], row["revision_no"]))
+        for row in rows:
+            if row["revision_no"] <= selected[row["identity_hash"]][1]:
+                histories.append(dict(row))
     if set(selected) != {row["identity_hash"] for row in histories}:
         raise ValueError("signed announcement bound revision history is missing")
     return histories, {identity: binding[0] for identity, binding in selected.items()}
