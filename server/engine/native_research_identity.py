@@ -6,6 +6,7 @@ from pathlib import Path
 import platform
 
 from server.common.analysis_pool_receipt import canonical_sha256
+from server.common.formal_source_identity import frozen_source_sha256
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -44,7 +45,7 @@ def producer_identity(family="immutable_v3_sleeve"):
             'server/common/daily_delivery_control.py','server/common/analysis_pool_receipt.py',
             'server/common/versioned_strategy_config.py','server/engine/market_state_v2.py',
             'server/engine/strategy_price_backtest.py')
-    return {relative: hashlib.sha256((ROOT / relative).read_bytes()).hexdigest() for relative in files}
+    return {relative: frozen_source_sha256(ROOT / relative) for relative in files}
 
 
 def feature_algorithm_identity(algorithm):

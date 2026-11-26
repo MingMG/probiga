@@ -1,11 +1,11 @@
 """Materialize the exact validated event scope with durable issuer checkpoints."""
 from dataclasses import asdict
-from hashlib import sha256
 import json
 from pathlib import Path
 from time import monotonic
 
 from server.common import pit_facts as pit
+from server.common.formal_source_identity import frozen_source_sha256
 
 ISSUER_BATCH_SIZE = 400
 
@@ -36,8 +36,8 @@ def load_sealed_event_facts(engine, *, selection, codes, formal_store, read_prog
         'window_start':proof.window_start, 'window_end':proof.window_end, 'batch':dict(proof.batch),
         'members':{code:proof.members[code][0]['coverage_id'] for code in requested},
         'bindings':selection.signed_historical_bindings,
-        'reader_sha256':sha256(Path(pit.__file__).read_bytes()).hexdigest(),
-        'materializer_sha256':sha256(Path(__file__).read_bytes()).hexdigest(),
+        'reader_sha256':frozen_source_sha256(Path(pit.__file__)),
+        'materializer_sha256':frozen_source_sha256(Path(__file__)),
     })
     fields = ('facts','coverage_by_code','status_by_code','reason_by_code')
     merged = {field:{} for field in fields}
