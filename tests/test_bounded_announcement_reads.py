@@ -42,6 +42,19 @@ def test_timeout_exhaustion_never_returns_incomplete_results():
                         logger=logging.getLogger(__name__), stage="revision")
 
 
+def test_single_id_timeout_logs_the_exact_failed_id(caplog):
+    def fetch(batch):
+        assert batch == ["revision-17"]
+        raise TimeoutError("server reply timeout")
+
+    with pytest.raises(TimeoutError, match="server reply timeout"):
+        read_id_batches(["revision-17"], fetch, deadline=monotonic() + 5,
+                        retryable=lambda exc: isinstance(exc, TimeoutError),
+                        logger=logging.getLogger(__name__), stage="revision")
+    assert "revision batch=1" in caplog.text and "failed_ids=['revision-17']" in caplog.text
+    assert "outcome=split" not in caplog.text
+
+
 def test_frozen_checkpoint_identity_requires_exact_transport_source(tmp_path):
     root = Path(__file__).resolve().parents[1]
     path = root / "server/common/pit_facts.py"

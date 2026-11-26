@@ -19,8 +19,12 @@ _EQUIVALENT = {
         "18e4073cb6bebd005fa52ee9627c55177fd41053f63d09b1d3530e6afd927745",
         "716a80cdfb892a48512f180cae70df8486fae6a8c72e23a8096105f3b404f5c3",
     ),
+    "strategy_price_backtest.py": (
+        "a05997f078b78edd49e3b02d5905ec955a0116beee5bb3d27bb6979c5267c07b",
+        "9980a368af8efb32c762a05a025c9a82477b9b6997cbaff2956fd014b55a403d",
+    ),
 }
-_BOUNDED_READ_SHA256 = "8c6deed0e7e1ae758588f938b72a712c884e8ee3983259851046297e81a1617c"
+_BOUNDED_READ_SHA256 = "bef61e9791760bbc7c12bf49481755ac7af39a0cc0c95db961f7253e15c2c98c"
 
 
 def _source_sha256(path: Path) -> str:
@@ -35,4 +39,7 @@ def frozen_source_sha256(path: Path) -> str:
         if observed == new and transport == _BOUNDED_READ_SHA256:
             return frozen
         return sha256((observed + transport).encode("ascii")).hexdigest()
+    if path.name == "strategy_price_backtest.py" and observed == new:
+        transport = _source_sha256(Path(__file__).with_name("bounded_read.py"))
+        return frozen if transport == _BOUNDED_READ_SHA256 else sha256((observed + transport).encode("ascii")).hexdigest()
     return frozen if observed == new else observed

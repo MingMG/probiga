@@ -5,10 +5,14 @@ from __future__ import annotations
 import json
 import faulthandler
 import logging
+from logging.handlers import QueueHandler
 import os
+from queue import Empty, Full, Queue
 import re
 import sys
+from contextlib import contextmanager
 from pathlib import Path
+from threading import Thread
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -17,6 +21,56 @@ if str(ROOT) not in sys.path:
 from server.common.batch_db import create_batch_engine
 from server.trading_v2.job_worker import run_one_job
 from tools.env_config import load_project_env
+
+
+@contextmanager
+def worker_timing_logs():
+    records = Queue(maxsize=2048)
+    stream = logging.StreamHandler()
+    stream.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    logger = logging.getLogger("server.native_replay.timing")
+
+    class TimingQueue(QueueHandler):
+        dropped = 0
+
+        def enqueue(self, record):
+            try:
+                self.queue.put_nowait(record)
+            except Full:
+                self.dropped += 1
+
+    handler = TimingQueue(records)
+    previous_level, previous_propagate = logger.level, logger.propagate
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    logger.addHandler(handler)
+
+    def drain():
+        while (record := records.get()) is not None:
+            stream.handle(record)
+
+    thread = Thread(target=drain, name="native-replay-timing", daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
+        logger.propagate = previous_propagate
+        try:
+            records.put_nowait(None)
+        except Full:
+            try:
+                records.get_nowait()
+                handler.dropped += 1
+            except Empty:
+                pass
+            records.put_nowait(None)
+        thread.join(timeout=1)
+        if handler.dropped or thread.is_alive():
+            logging.getLogger(__name__).warning(
+                "Native worker timing log drain incomplete: dropped=%d pending=%d",
+                handler.dropped, records.qsize())
 
 
 def run_with_diagnostics(engine):
@@ -42,11 +96,11 @@ def run_with_diagnostics(engine):
 def main() -> int:
     load_project_env()
     logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    logging.getLogger("server.common.pit_facts").setLevel(logging.INFO)
     engine = create_batch_engine(pool_timeout=5,
         connect_args={'connect_timeout': 8, 'read_timeout': 15, 'write_timeout': 10})
     try:
-        result = run_with_diagnostics(engine)
+        with worker_timing_logs():
+            result = run_with_diagnostics(engine)
         if result["status"] == "idle" or result.get('job_type')=='NATIVE_REPLAY':
             from server.engine.strategy_execution_adapters import bootstrap_strategy_execution_adapter_registry
             from server.engine.autonomous_strategy_research import research_tick

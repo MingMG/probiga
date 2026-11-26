@@ -19,6 +19,7 @@ ENTITY = 'NATIVE_REPLAY'
 SCHEMA = 'probiga.native-strategy-research.v1'
 LOCK = 'probiga:native-strategy-research'
 logger=logging.getLogger(__name__)
+timing = logging.getLogger("server.native_replay.timing")
 
 
 class NativeStepDeadline(BaseException):
@@ -491,6 +492,7 @@ def _step(connection,state,owner,*,feature_budget=None):
     deadline=time.monotonic()+100
     while time.monotonic()<deadline and state['phase']!='FINISHED':
         before=state['completed_units']
+        failed_reconciliation = None
         if state['phase']=='PLAN':
             if state['cursor']>=len(state['sessions']):
                 _finish_plan(state)
@@ -532,6 +534,7 @@ def _step(connection,state,owner,*,feature_budget=None):
                 feature_deadline=feature_budget() if feature_budget is not None else time.monotonic()+900
                 _begin_unit(connection,state,owner,'FEATURE '+day)
                 if 'features' not in state['day_inputs'][day]:
+                    started = time.perf_counter()
                     _prepare_trees(dataset,store,state['plans'][day],*state['day_inputs'][day]['ready'].values(),
                         *(state['bars'][target]['tree'] for target in state['feature_windows'][day]))
                     from server.engine.native_research_jobs import feature_input_progress
@@ -542,6 +545,7 @@ def _step(connection,state,owner,*,feature_budget=None):
                     generation=_feature_generation(state,day)
                     store.put(generation,'native_feature_handoff','complete',{'input_identity':generation,
                         'tree':tree,'references':dataset.tree_references(tree)})
+                    timing.info("feature-preparation day=%s elapsed=%.3fs", day, time.perf_counter() - started)
                     state['completed_units']+=1
                 state['cursor']+=1
         elif state['phase']=='SIGNALS':
@@ -552,37 +556,49 @@ def _step(connection,state,owner,*,feature_budget=None):
             else:
                 day=days[state['cursor']]
                 _begin_unit(connection,state,owner,'SIGNAL '+day)
+                started = time.perf_counter()
                 _prepare_trees(dataset,store,state['plans'][day])
                 plan=dataset.get_tree(state['plans'][day])
                 if manifest:
                     from server.engine.native_research_math import evaluate_manifest_signals
+                    timing.info("signal-handoff day=%s elapsed=%.3fs", day, time.perf_counter() - started)
                     value=evaluate_manifest_signals(plan,state['strategies'],day=day)
+                    value['candidate_universe_count'] = len(plan['identities'])
                 else:
                     inputs=state['day_inputs'][day]
                     _prepare_trees(dataset,store,inputs['features'],inputs['selection'])
                     features=dataset.get_tree(inputs['features']);selection=dataset.get_tree(inputs['selection'])
+                    timing.info("signal-handoff day=%s elapsed=%.3fs", day, time.perf_counter() - started)
                     value=evaluate_native_signals(features,state['strategies'],config=state['config'],day=day,
                         signal_clock=selection['signal_clock'],allocation_policy=state['allocation_policy'],identities=plan['identity_rows'])
                     value.update(identity=plan['identity'],finance_scope_exclusions=plan['excluded'],
+                        candidate_universe_count=len(plan['eligible']),
                         finance_seal_coverage_id=plan['finance_seal'],fact_cutoff=str(selection['fact_clock']),
                         source_cutoff_at=selection['cutoff']['source_cutoff_at'],
                         universe_identity_exclusion_count=max(0,features['market_features']['qmt_daily_input_window']['latest_daily_truth']['attested_row_count']-len(plan['identity_rows'])))
                 state['signal_parts'][day]=_put(dataset,store,state,day+':signals',value)
                 state['cursor']+=1;state['completed_units']+=1
         elif state['phase']=='REPLAY':
-            if state['cursor']<len(state['strategies']):
-                _begin_unit(connection,state,owner,'REPLAY '+state['strategies'][state['cursor']]['strategy_key'])
-            if state['cursor']<len(state['strategies']):
-                _prepare_trees(dataset,store,*state['signal_parts'].values(),
-                    *(state['bars'][target]['tree'] for target in state['execution_input_sessions']))
-            _report_one(state,dataset)
+            if state.get('pending_report') is not None:
+                _begin_unit(connection,state,owner,'RECONCILE '+state['pending_report']['strategy_key'])
+                failed_reconciliation = _reconcile_report(state,dataset,store)
+            else:
+                if state['cursor']<len(state['strategies']):
+                    _begin_unit(connection,state,owner,'REPLAY '+state['strategies'][state['cursor']]['strategy_key'])
+                    _prepare_trees(dataset,store,*state['signal_parts'].values(),
+                        *(state['bars'][target]['tree'] for target in state['execution_input_sessions']))
+                _report_one(state,dataset,store=store)
         else:raise ValueError('unknown native stage: '+state['phase'])
         if state['completed_units']>before:state['last_progress_at']=str(now_shanghai())
         _progress(state)
         _save(connection,state,owner)
+        if failed_reconciliation:
+            key, checks = failed_reconciliation
+            logger.error("Native replay reconciliation blocked publication: run=%s strategy=%s checks=%s",
+                         state['run_id'], key, checks)
 
 
-def _report_one(state,dataset):
+def _report_one(state,dataset,*,store=None):
     from server.engine.strategy_native_replay import replay_native
     index=state['cursor']
     if index>=len(state['strategies']):
@@ -606,7 +622,9 @@ def _report_one(state,dataset):
     available=sum(usable(part) for part in parts.values())
     fully_covered=lambda part:usable(part) and not part.get('missing_feature_stocks',{}).get(key,0) and not part.get('finance_scope_exclusions') and not part.get('universe_identity_exclusion_count',0)
     complete=sum(fully_covered(part) for part in parts.values())
-    if not available:report.update(status='BLOCKED',net_return_pct=None,verified_input_subset_return_pct=None,nav=[])
+    if not available:
+        report.update(status='BLOCKED',net_return_pct=None,verified_input_subset_return_pct=None,nav=[])
+        report.pop('ledger')
     # A single comparison base excludes strategy algorithms and their signal outputs.
     base={'prices':{day:{'proof':part['proof'],'scope':part['scope']} for day,part in state['bars'].items()},
           'non_price_sources':state.get('base_data_by_day',{}),
@@ -616,7 +634,7 @@ def _report_one(state,dataset):
     evaluation_set={day:part.get('evaluation_security_sets',{}).get(key,[])
                     for day,part in parts.items() if part['status']=='COMPLETE'}
     base['actual_evaluation_security_sets']=evaluation_set
-    validation={'status':report['status'],'report':report,'sessions':state.get('performance_sessions',state['sessions']),
+    validation={'status':report['status'],'sessions':state.get('performance_sessions',state['sessions']),
         'evaluation_sessions':state['sessions'],'source_gaps':gaps,
         'replay_run_id':state['run_id'],'completed_units':state['total_units'],'total_units':state['total_units'],
         'available_feature_sessions':available,'required_sessions':len(state['sessions']),
@@ -633,8 +651,67 @@ def _report_one(state,dataset):
         validation['data_requirements']=requirements
         if requirements['input_mode']!=requirements['experiment_input_mode']:
             validation['reason']='当前实验为已收盘日线；该策略需要盘中金额异常、VWAP、成交概率和点差，日线不能替代。'
+    if available:
+        validation['signal_counts'] = {
+            day: {'evaluated_stocks': len(evaluation_set[day]) if day in evaluation_set else None,
+                  'signaled_stocks': len({signal['stock_code'] for signal in part['signals'].get(key, [])})
+                    if day in evaluation_set else None,
+                  'candidate_universe_count': part.get('candidate_universe_count')}
+            for day, part in parts.items()
+        }
+        raw = _put(dataset,store,state,'replay-ledger:'+key,report)
+        state['pending_report'] = {'strategy_key': key, 'tree': raw, 'validation': validation}
+        return
+    validation['report'] = report
     proposal['validation']=validation;state['reports'][key]=validation
     state['cursor']+=1;state['completed_units']+=1
+
+
+def _reconcile_report(state,dataset,store):
+    from server.engine.strategy_native_reporting import native_report_metrics, reconcile_native
+
+    pending = state['pending_report']
+    key, tree = pending['strategy_key'], pending['tree']
+    _prepare_trees(dataset,store,tree)
+    raw = dataset.get_tree(tree)
+    prices = {}
+    for row in raw['ledger']:
+        day = row['trade_date']
+        codes = {item['stock_code'] for item in row['fills'] + row['marks']}
+        if not codes or day not in state['bars']:
+            continue
+        price_tree = state['bars'][day]['tree']
+        _prepare_trees(dataset,store,price_tree)
+        for bar in dataset.get_tree(price_tree):
+            if bar['stock_code'] in codes:
+                prices[day,bar['stock_code']] = {'open': float(bar['open']), 'close': float(bar['close'])}
+    receipt = reconcile_native(raw, prices)
+    validation = pending['validation']
+    signal_counts = validation.pop('signal_counts')
+    validation['reconciliation'] = {**receipt, 'raw_evidence': tree}
+    if receipt['status'] == 'PASSED':
+        validation['report'] = {name: value for name, value in raw.items() if name != 'ledger'}
+        validation['report'].update(native_report_metrics(raw,receipt,signal_counts))
+        if validation['evaluation_sessions'] == [
+                '2026-11-16', '2026-11-17', '2026-11-18', '2026-11-19', '2026-11-20']:
+            validation['report']['window_notes'] = [
+                '本轮为五个交易日的管道验证，不构成策略有效性结论。夏普、回撤和盈亏比仅作口径演示。',
+                '本轮参考候选上限为 4,750 只，实际评估数以逐日信号回执为准。',
+                '北交所 356 只因历史行业映射缺失未进入候选池；历史映射补齐后可参加候选资格检查。',
+                '公告空结果原批抽查 20/73。同口径另补查科创板 1 只、北交所 3 只，四个板块合计 24 只，未发现静默失败。',
+                '本区间适用 0.05% 卖出印花税。五日窗口无法量化幸存者偏差。',
+            ]
+            validation['report']['long_window_note'] = (
+                '长窗口预查的 485 个交易日中，16 天同时具备行业与财务前置回执。公告和行情待核验。')
+    else:
+        validation.update(status='BLOCKED', reason='净值对账未通过，正式报告暂停发布。')
+    state['proposals'][state['cursor']]['validation'] = validation
+    state['reports'][key] = validation
+    state.pop('pending_report')
+    state['cursor'] += 1
+    state['completed_units'] += 1
+    if receipt['status'] == 'FAILED':
+        return key, sorted({row['check'] for row in receipt['differences']})
 
 
 def submit_native_experiments(engine):

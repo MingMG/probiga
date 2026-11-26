@@ -85,6 +85,16 @@
         if(x){const r=x.summary;
             if(r.kind==='NATIVE_SHADOW_RETROSPECTIVE'&&r.status==='FAILED')h+='<button type="button" data-qsw-retry="'+esc(r.result_id)+'"'+(s.resultLoading?' disabled':'')+'>从断点重试</button>';
             h+='<article class="qsw-result-detail"><h4>'+esc(r.strategy_name||r.strategy_key||r.reported_strategy_key||'历史报告')+' · 交易明细与证据</h4><p>'+esc(r.strategy_version)+' · '+esc(r.reason)+'</p><p>账户累计收益 '+metric(resultReturn(r),'%')+'；账户净盈利 '+metric(resultProfit(r),'元')+'；已平仓交易净盈利 '+metric(r.closed_trade_net_pnl_cny,'元')+'。费用属于原回测假设，真实成交另行验证。</p>';
+            (x.window_notes||[]).forEach(note=>{h+='<p>'+esc(note)+'</p>';});
+            if(x.reconciliation?.status==='FAILED')h+='<p class="qsw-error">逐日对账失败，正式报告暂停发布。差异项 '+esc(x.reconciliation.differences.length)+'。</p>';
+            if(x.daily_replay?.length){
+                h+='<h5>逐日净值与信号、成交</h5><div class="qsw-result-scroll"><table><thead><tr><th>交易日</th><th>候选上限</th><th>实际评估</th><th>信号股票</th><th>成交笔数（买 / 卖）</th><th>现金</th><th>持仓市值</th><th>费用</th><th>净值</th></tr></thead><tbody>'+x.daily_replay.map(d=>'<tr><td>'+esc(d.trade_date)+'</td><td>'+metric(d.candidate_universe_count)+'</td><td>'+metric(d.evaluated_stocks)+'</td><td>'+metric(d.signaled_stocks)+'</td><td>'+metric(d.filled_orders)+'（'+metric(d.buy_fills)+' / '+metric(d.sell_fills)+'）</td><td>'+metric(d.cash_cny)+'</td><td>'+metric(d.holdings_cny)+'</td><td>'+metric(d.fees_cny)+'</td><td>'+metric(d.nav_cny)+'</td></tr>').join('')+'</tbody></table></div>';
+                const m=x.replay_metrics, lock=x.one_price_unfilled;
+                h+='<p>逐日对账通过，金额精度 0.01 元。日收益夏普 '+metric(m.annualized_sharpe)+'，最大回撤 '+metric(m.max_drawdown_pct,'%')+'，盈亏比 '+metric(m.win_loss_ratio)+'。</p><p>一字涨停未买入 '+metric(lock.buy)+' 笔，一字跌停未卖出 '+metric(lock.sell)+' 笔。</p>';
+                const reasons=Object.entries(x.unfilled_by_reason||{});
+                if(reasons.length)h+='<h5>未成交原因</h5><ul>'+reasons.map(([reason,count])=>'<li>'+esc(({LOCKED_LIMIT_UP:'一字涨停',LOCKED_LIMIT_DOWN:'一字跌停',SUSPENDED_OR_ZERO_TURNOVER:'停牌或成交额为零'})[reason]||reason)+' '+metric(count)+' 笔</li>').join('')+'</ul>';
+                Object.values(x.replay_notes||{}).forEach(note=>{h+='<p>'+esc(note)+'</p>';});
+            }
             if(r.available_feature_sessions!=null)h+='<p>历史冻结特征 '+esc(r.available_feature_sessions)+' / '+esc(r.required_sessions)+' 日。'+esc((x.missing_feature_dates||[]).length)+' 日缺失；'+esc((x.partial_feature_dates||[]).length)+' 日部分可用，'+esc(r.complete_feature_sessions??'未知')+' 日完整。</p><details data-qsw-key="missing-'+esc(r.result_id)+'"><summary>缺失交易日</summary><p>'+esc((x.missing_feature_dates||[]).join('、')||'无')+'</p><p>部分可用：'+esc((x.partial_feature_dates||[]).join('、')||'无')+'</p></details>';
             if(r.kind==='NATIVE_SHADOW_RETROSPECTIVE'&&r.evaluation_sessions?.length&&r.experiment_status!=='RUNNING'){
                 const days=r.evaluation_sessions,draft=s.experimentDraft?.resultId===r.result_id?s.experimentDraft.values:{};
@@ -104,6 +114,7 @@
             if(x.trade_count!=null)h+='<p>交易 '+esc(x.offset+(x.trades.length?1:0))+'—'+esc(x.offset+x.trades.length)+' / '+esc(x.trade_count)+' 笔 '+(x.offset>0?'<button type="button" data-qsw-result="'+esc(r.result_id)+'" data-qsw-offset="'+Math.max(0,x.offset-x.limit)+'">上一页</button>':'')+' '+(x.offset+x.limit<x.trade_count?'<button type="button" data-qsw-result="'+esc(r.result_id)+'" data-qsw-offset="'+(x.offset+x.limit)+'">下一页</button>':'')+'</p>';
             if(x.dispositions?.length)h+='<details data-qsw-key="dispositions"><summary>未成交与证据缺口（最多展示前100项）</summary><ul>'+x.dispositions.map(t=>'<li>'+esc([t.stock_code,t.trade_date,t.status,t.reason].filter(Boolean).join(' · '))+'</li>').join('')+'</ul></details>';
             if(x.source_gaps?.length)h+='<details data-qsw-key="native-source-gaps"><summary>历史来源缺口（'+esc(x.source_gaps.length)+'项）</summary><ul>'+x.source_gaps.map(g=>'<li>'+esc(g.trade_date+' · '+g.reason)+'</li>').join('')+'</ul></details>';
+            if(x.long_window_note)h+='<p>'+esc(x.long_window_note)+'</p>';
             h+='</article>';
         }
         return h+'</section>';

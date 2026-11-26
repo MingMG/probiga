@@ -393,7 +393,7 @@ def test_historical_identity_bounded_primary_reads_and_verified_reuse():
             result, proof = _identity_rows(c, day)
             assert len(result) == 600 and proof['sha256'] == digest
             assert result['000001']['short_name'] == '证券1'
-            assert sum('WHERE id IN' in q for q in reads) == 3
+            assert sum('WHERE id IN' in q for q in reads) == 4
             reads.clear()
             assert _identity_rows(c, day) == (result, proof)
             assert reads == []
