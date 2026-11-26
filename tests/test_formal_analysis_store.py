@@ -97,8 +97,10 @@ def test_bulk_checkpoint_read_enforces_combined_decoded_byte_budget(engine,monke
         store.get_many(GENERATION,'metadata',['A','B'])
 
 
-def test_replay_finance_prefix_in_batches_and_keep_new_writes_visible(engine):
+def test_replay_finance_prefix_in_batches_and_keep_new_writes_visible(engine, tmp_path):
+    from time import monotonic
     from server.common.formal_analysis_prefetch import prefetch_checkpoint_reads
+    from server.engine.native_research_dataset import PreparedDataset
 
     store = FormalAnalysisStore(engine)
     stage = 'finance_issuer_facts'
@@ -108,7 +110,9 @@ def test_replay_finance_prefix_in_batches_and_keep_new_writes_visible(engine):
     store.put(OTHER_GENERATION, stage, 'batch-000', {'rows': [999]})
     reads = []
     event.listen(engine, 'before_cursor_execute', lambda *args: reads.append(args[2]))
-    with prefetch_checkpoint_reads(store, engine, GENERATION, stage):
+    dataset = PreparedDataset(tmp_path/'blocks')
+    options = {'dataset': dataset, 'deadline': monotonic()+45, 'progress': lambda *_: None}
+    with prefetch_checkpoint_reads(store, engine, GENERATION, stage, **options):
         step_store = FormalAnalysisStore(engine)
         assert {key: step_store.get(GENERATION, stage, key) for key in saved} == saved
         assert len(reads) < 60
@@ -118,6 +122,39 @@ def test_replay_finance_prefix_in_batches_and_keep_new_writes_visible(engine):
         assert step_store.get(GENERATION, stage, 'next') is None
         store.put(GENERATION, stage, 'next', {'rows': [273]})
         assert step_store.get(GENERATION, stage, 'next') == {'rows': [273]}
+    reads.clear()
+    with prefetch_checkpoint_reads(store, engine, GENERATION, stage, **options):
+        assert step_store.get(GENERATION, stage, 'batch-000') == {'rows': [0]}
+        assert len(reads) == 2  # Membership directory + newly committed artifact.
+
+
+def test_finance_refill_resumes_exact_verified_blocks_after_disconnect(engine, tmp_path, monkeypatch):
+    from time import monotonic
+    from server.common.formal_analysis_prefetch import CheckpointPrefetchDeferred, prefetch_checkpoint_reads
+    from server.engine.native_research_dataset import PreparedDataset
+
+    store = FormalAnalysisStore(engine)
+    dataset = PreparedDataset(tmp_path/'blocks')
+    stage = 'finance_issuer_facts'
+    payloads = {f'k{index:02}': {'rows': [index]} for index in range(16)}
+    members = store.put_many(GENERATION, stage, payloads)
+    load = store.load_artifacts
+    called = []
+
+    def interrupted(digests):
+        called.append(digests)
+        if len(called) == 2:
+            raise OperationalError('SELECT', {}, Exception(2013, 'connection lost'))
+        return load(digests)
+
+    monkeypatch.setattr(store, 'load_artifacts', interrupted)
+    options = {'dataset': dataset, 'deadline': monotonic()+45, 'progress': lambda *_: None}
+    with pytest.raises(CheckpointPrefetchDeferred):
+        with prefetch_checkpoint_reads(store, engine, GENERATION, stage, **options):
+            pytest.fail('interrupted restore reached scoring')
+    with prefetch_checkpoint_reads(store, engine, GENERATION, stage, **options):
+        assert {key: store.get(GENERATION, stage, key) for key in members} == payloads
+    assert called[1] == called[2] and not set(called[0]) & set(called[2])
 
 
 def test_competing_frozen_cutoffs_converge_to_one_durable_value(engine):

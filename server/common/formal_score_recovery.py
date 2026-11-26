@@ -52,6 +52,7 @@ _PERMITTED_VALIDATION_FILES = frozenset({
     "server/common/formal_score_recovery.py",
     "server/common/formal_score_source_evidence.py",
     "server/common/formal_analysis_prefetch.py",
+    "server/engine/native_research_dataset.py",
     "server/common/scheduler_validation.py",
     "server/engine/strategy_governance.py",
     "server/engine/strategy_governance_orchestrator.py",

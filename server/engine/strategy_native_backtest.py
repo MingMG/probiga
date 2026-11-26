@@ -378,6 +378,7 @@ def _retained_context(state,day,plan,dataset,store):
 def _prepare_day(connection,state,owner,dataset,store,day):
     from contextlib import nullcontext
     from server.common.formal_analysis_prefetch import prefetch_checkpoint_reads
+    from server.engine.native_research_jobs import _source_progress
     from server.engine import native_research_prepare as prepare
     from server.trading_v3.daily_features import prepare_feature_identity_context
     inputs=state['day_inputs'].setdefault(day,{})
@@ -392,8 +393,12 @@ def _prepare_day(connection,state,owner,dataset,store,day):
         _begin_unit(connection,state,owner,'PREPARE '+stage+' '+day)
         inputs=state['day_inputs'][day]
         if stage!='selection':_prepare_trees(dataset,store,inputs['selection'])
-        reads = (prefetch_checkpoint_reads(store, connection.engine, plan['snapshot_generation'], 'finance_issuer_facts')
-                 if stage == 'finance' else nullcontext())
+        reads = nullcontext()
+        if stage == 'finance':
+            cache_deadline = time.monotonic() + 45
+            reads = prefetch_checkpoint_reads(store, connection.engine, plan['snapshot_generation'],
+                'finance_issuer_facts', dataset=dataset, deadline=cache_deadline,
+                progress=_source_progress(connection, state, owner, day, 'finance_checkpoint_cache', deadline=cache_deadline))
         with reads:
             value=(function(connection,state,owner,plan) if stage=='selection' else
                    function(connection,state,owner,plan,dataset.get_tree(inputs['selection'])))
@@ -679,6 +684,7 @@ def _native_tick(engine):
     """Consume the typed queue only; audit-directory scans never select work."""
     from server.engine.native_research_jobs import claim, CLAIM_SECONDS
     from server.engine.native_research_prepare import PrepareYield
+    from server.common.formal_analysis_prefetch import CheckpointPrefetchDeferred
     from server.engine.native_research_dataset import PreparedDataset,PreparedInputMissing
     state=None;previous_handler=None;attempt_started=time.monotonic()
     with engine.connect() as connection:
@@ -711,7 +717,7 @@ def _native_tick(engine):
             if state is None:return {'status':'FAILED','reason':f'{type(exc).__name__}: {exc}'}
             connection.rollback();_restore_failure_lock(connection)
             state.update(reason=_failure_reason(state,exc))
-            if isinstance(exc,(PrepareYield,PreparedInputMissing)):
+            if isinstance(exc,(PrepareYield,PreparedInputMissing,CheckpointPrefetchDeferred)):
                 state['status']='RUNNING'
                 _save(connection,state,owner,yield_job=True)
             else:
