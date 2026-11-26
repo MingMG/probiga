@@ -183,11 +183,13 @@ def _research(run, proposal, *, native=False):
         "input_exclusion_count": report.get("input_exclusion_count"), "replay_run_id": validation.get("replay_run_id"),
         "reused_input_sessions": validation.get("reused_input_sessions", 0),
         "completed_trades": report.get("completed_trade_count"), "max_drawdown_pct": _drawdown(nav) if eligible else None,
+        "reconciliation_status": (validation.get("reconciliation") or {}).get("status") if native else None,
         "closed_trade_net_pnl_cny": sum(_number(t["net_pnl_cny"]) for t in trades)
             if trades and all(_number(t.get("net_pnl_cny")) is not None for t in trades) else None,
         "win_rate_pct": sum(_number(t["net_pnl_cny"]) > 0 for t in trades) / len(trades) * 100
             if eligible and trades and all(_number(t.get("net_pnl_cny")) is not None for t in trades) else None,
-        "estimated_fees_cny": sum(float(t["estimated_fee_cny"]) for t in trades)
+        "estimated_fees_cny": round(sum(day["fees_cny"] for day in report["daily"]), 2)
+            if native and report.get("daily") else sum(float(t["estimated_fee_cny"]) for t in trades)
             if eligible and trades and all(_number(t.get("estimated_fee_cny")) is not None for t in trades) else None,
         "rank_eligible": eligible, "cohort_id": canonical_json_hash(cohort) if eligible else None,
         "cohort": cohort, "integrity_verified": True, "identity_verified": True,
@@ -322,8 +324,16 @@ def read_performance_detail(engine, result_id, *, offset=0, limit=50):
             raise KeyError(result_id)
         row, report = _research(runs[0], proposal,native=result_id.startswith("native:")), (proposal.get("validation") or {}).get("report") or {}
         trades = report.get("trades") or []
+        reconciliation = (proposal.get("validation") or {}).get("reconciliation") or {}
         return {"summary": row, "trades": trades[offset:offset + limit], "trade_count": len(trades),
                 "offset": offset, "limit": limit, "nav": report.get("nav") or [],
+                "daily_replay": report.get("daily") or [], "replay_metrics": report.get("metrics"),
+                "unfilled_by_reason": report.get("unfilled_by_reason"),
+                "one_price_unfilled": report.get("one_price_unfilled"),
+                "replay_notes": report.get("notes"), "window_notes": report.get("window_notes") or [],
+                "long_window_note": report.get("long_window_note"),
+                "reconciliation": {key: reconciliation[key] for key in ("status", "currency_precision_cny", "differences")
+                                   if key in reconciliation} or None,
                 "dispositions": (report.get("dispositions") or [])[:100], "fees": report.get("fees"),
                 "disposition_count": len(report.get("dispositions") or []),
                 "source_gaps": (proposal.get("validation") or {}).get("source_gaps") or [],

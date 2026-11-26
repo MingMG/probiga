@@ -1,13 +1,18 @@
 """Deterministic native research over prepared inputs, without acquisition."""
 from datetime import timedelta
 import json
+import logging
+from time import perf_counter
 
 from server.engine.native_signal_math import _v3_signal
 from server.trading_v3.engine import TradingV3Engine
 from server.trading_v3.regime import classify_regime_probabilities
 
+timing = logging.getLogger("server.native_replay.timing")
+
 
 def evaluate_native_signals(dataset, strategies, *, config, day, signal_clock, allocation_policy,identities):
+    started = perf_counter()
     market = classify_regime_probabilities(dataset['market_features'], config=config)
     if market.quality_status != 'PASS':
         return {'status': 'BLOCKED', 'reason': '市场状态输入不足：' + ';'.join(market.evidence),
@@ -50,10 +55,15 @@ def evaluate_native_signals(dataset, strategies, *, config, day, signal_clock, a
                 'allocation_multiplier': multiplier if allocation_policy == 'ADAPTIVE_REGIME' else 1.0,
                 'risk_asset_cap': market.risk_asset_cap if allocation_policy == 'ADAPTIVE_REGIME' else 1.0,
             })
+    timing.info("signal-score day=%s family=v3 stocks=%d elapsed=%.3fs",
+                day, len(dataset['stocks']), perf_counter() - started)
+    started = perf_counter()
     for rows in selected.values():
         rows.sort(key=lambda row: (-row['effective_score'], row['stock_code']))
         for rank, row in enumerate(rows, 1):
             row['rank'] = rank
+    timing.info("candidate-sort day=%s family=v3 candidates=%d elapsed=%.3fs",
+                day, sum(map(len, selected.values())), perf_counter() - started)
     return {
         'status': 'COMPLETE', 'signals': selected, 'scored_stocks': scored,
         'missing_feature_stocks': missing, 'missing_features_by_stock': missing_details,
@@ -71,6 +81,7 @@ def evaluate_manifest_signals(prepared, strategies, *, day):
     identities,market,uid=prepared['identities'],prepared['market'],prepared['source_run_uid']
     selected={};evaluated={};missing={}
     for strategy in (s for s in strategies if s['source_kind']=='immutable_manifest'):
+        started = perf_counter()
         key=strategy['strategy_key'];picked=[]
         evaluated[key]=[];missing[key]=0
         for row in prepared['scored_rows']:
@@ -87,8 +98,13 @@ def evaluate_manifest_signals(prepared, strategies, *, day):
                 member=identities.get(candidate['stock_code'],{})
                 picked.append({**candidate,'stock_name':member.get('short_name',''),'industry':member.get('industry_name'),
                     'signal_known_at':prepared['signal_clock'], 'source_run_uid':uid})
+        timing.info("signal-score day=%s strategy=%s stocks=%d elapsed=%.3fs",
+                    day, key, len(prepared['scored_rows']), perf_counter() - started)
+        started = perf_counter()
         picked.sort(key=lambda r:(-r['effective_score'],r['stock_code']))
         for rank,row in enumerate(picked):row['rank']=rank+1
+        timing.info("candidate-sort day=%s strategy=%s candidates=%d elapsed=%.3fs",
+                    day, key, len(picked), perf_counter() - started)
         selected[key]=picked
     return {'status':'COMPLETE','signals':selected,'source_run_uid':uid,
         'source_sha256':prepared['source_sha256'],'identity':prepared['identity'],

@@ -1,9 +1,13 @@
 """Account replay of frozen native SHADOW execution contracts; never orders."""
 from datetime import date, datetime
+import logging
+from time import perf_counter
 
 from server.common.pit_execution_guard import daily_bar_execution_disposition
 from server.engine.shadow_trial_policy import frozen_shadow_execution_contract, shadow_initial_stop, shadow_exit_reason
 from server.common.research_execution_math import _stock_rule, _execution_fee_with_impact
+
+timing = logging.getLogger("server.native_replay.timing")
 
 
 def replay_native(strategy, signals, bars, sessions, *, evaluation_start, source_gaps,
@@ -21,6 +25,8 @@ def replay_native(strategy, signals, bars, sessions, *, evaluation_start, source
     policy = strategy['parameters']['shadow_execution_policy']
     cash, initial = 250000., 250000.
     entries, held, trades, nav, dispositions = {}, {}, [], [], []
+    ledger = []
+    industry_seconds, industry_checks = 0., 0
     invalid = False
     for signal in signals:
         known = datetime.fromisoformat(signal['signal_known_at'])
@@ -31,6 +37,7 @@ def replay_native(strategy, signals, bars, sessions, *, evaluation_start, source
             dispositions.append({'stock_code': signal['stock_code'], 'status': 'RIGHT_CENSORED', 'reason': '窗口内没有决策后的交易日'})
     for index, day in enumerate(sessions):
         opening_cash = cash
+        fills, marks = [], []
         for code in list(held):
             p = held[code]
             row = prices.get((day, code))
@@ -53,6 +60,8 @@ def replay_native(strategy, signals, bars, sessions, *, evaluation_start, source
             fee, impact = _execution_fee_with_impact(value, account=account, sell=True,
                 participation_rate=value/float(row['amount']), maximum_participation_rate=.01)
             cash += value-fee
+            fills.append({'stock_code': code, 'side': 'SELL', 'quantity': p['quantity'], 'price': price,
+                'fee_cny': fee, 'participation_rate': value/float(row['amount'])})
             pnl = None if p.get('unknown') else value-fee-p['entry_value']-p['entry_fee']
             trades.append({'stock_code': code, 'stock_name': p['stock_name'],
                 'entry_at': p['entry_day']+' 09:30:00', 'exit_at': day+' 09:30:00',
@@ -95,7 +104,10 @@ def replay_native(strategy, signals, bars, sessions, *, evaluation_start, source
             except ValueError:
                 exclude('开盘价与冻结保护止损冲突', 'KNOWN_UNFILLED')
                 continue
+            started = perf_counter()
             industry_value = sum(p['entry_value'] for p in held.values() if p['industry']==s['industry'])
+            industry_seconds += perf_counter() - started
+            industry_checks += 1
             multiplier = float(s['allocation_multiplier']) if allocation_policy == 'ADAPTIVE_REGIME' else 1.0
             cap = float(s['risk_asset_cap']) if allocation_policy == 'ADAPTIVE_REGIME' else 1.0
             if not 0 <= multiplier <= 100 or not 0 <= cap <= 1:
@@ -119,6 +131,8 @@ def replay_native(strategy, signals, bars, sessions, *, evaluation_start, source
                 continue
             cash -= value+fee
             opening_cash -= value+fee
+            fills.append({'stock_code': code, 'side': 'BUY', 'quantity': quantity, 'price': price,
+                'fee_cny': fee, 'participation_rate': value/(sum(amounts)/20)})
             held[code] = {**s, 'quantity': quantity, 'entry_day': day, 'entry_index': index,
                 'entry_price': price, 'entry_value': value, 'entry_fee': fee, 'entry_impact': impact,
                 'contract': contract, 'stop': stop, 'exit_pending': '', 'instrument_rule_version': instrument['rule_version']}
@@ -130,7 +144,9 @@ def replay_native(strategy, signals, bars, sessions, *, evaluation_start, source
                 p['unknown'] = True
                 dispositions.append({'stock_code': code, 'trade_date': day, 'status': 'DATA_BLOCKED', 'reason': '持仓估值缺少行情'})
                 continue
-            value += p['quantity']*float(row['close'])
+            close = float(row['close'])
+            value += p['quantity']*close
+            marks.append({'stock_code': code, 'quantity': p['quantity'], 'close': close})
             reason = shadow_exit_reason(p['contract'], holding_sessions=index-p['entry_index']+1,
                 session_low=float(row['low']), protective_stop=p['stop'])
             if reason:
@@ -141,12 +157,16 @@ def replay_native(strategy, signals, bars, sessions, *, evaluation_start, source
             previous = nav[-1]['nav_cny'] if nav else initial
             nav.append({'trade_date': day, 'nav_cny': None if invalid else cash+value,
                 'return_pct': ((cash+value)/previous-1)*100 if not invalid and previous else None})
+            ledger.append({'trade_date': day, 'cash_cny': cash, 'holdings_cny': value,
+                           'fills': fills, 'marks': marks})
+    timing.info("industry-limit strategy=%s checks=%d elapsed=%.3fs",
+                strategy['strategy_key'], industry_checks, industry_seconds)
     excluded = sum(d['status']=='DATA_BLOCKED' for d in dispositions)
     partial = bool(source_gaps or excluded)
     result = (cash+value)/initial*100-100 if not invalid else None
     return {'status': 'BLOCKED' if invalid else 'PARTIAL' if partial else 'COMPLETE',
         'initial_cash_cny': initial, 'execution_mode': 'MODELED_DAILY_BAR',
-        'execution_policy': policy, 'trades': trades, 'nav': nav, 'dispositions': dispositions,
+        'execution_policy': policy, 'trades': trades, 'nav': nav, 'dispositions': dispositions, 'ledger': ledger,
         'completed_trade_count': len(trades), 'open_position_count': len(held),
         'input_exclusion_count': excluded, 'net_return_pct': result if not partial and not invalid else None,
         'verified_input_subset_return_pct': result if not invalid and trades else None,

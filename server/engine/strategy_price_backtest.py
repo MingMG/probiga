@@ -9,14 +9,19 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 import hashlib
 import json
+import logging
+import os
 from pathlib import Path
 import time
 
 import pandas as pd
 from sqlalchemy import bindparam, text
+from sqlalchemy.exc import DBAPIError
 
 from server.common.analysis_pool_receipt import canonical_sha256
 from server.common.authoritative_market_clock import PRODUCTION_TIMEZONE
+from server.common.batch_db import _transient_db_errno
+from server.common.bounded_read import read_id_batches
 from server.common.strategy_daily_input_window import daily_input_catalog_join
 from server.engine.strategy_rule_backtest import _partitions, partition_key, PART_ENTITY
 from server.engine.strategy_rule_language import feature_frame, select_rule_rows
@@ -27,6 +32,16 @@ PRICE_FIELDS = frozenset({"change_pct", "previous_change_pct", "pct_5", "pct_20"
     "close_location_value", "relative_change_pct", "relative_20d_pct", "market_change_pct",
     "market_breadth_pct", "market_return_20d_pct"})
 BAR_COLUMNS = ("stock_code", "trade_date", "open", "high", "low", "close", "pre_close", "volume", "amount")
+logger = logging.getLogger(__name__)
+
+
+def _read_frozen_ids(ids, fetch, *, deadline, stage):
+    size = int(os.getenv("PROBIGA_NATIVE_DB_QUERY_BATCH_SIZE", "160"))
+    if not 1 <= size <= 256:
+        raise ValueError("PROBIGA_NATIVE_DB_QUERY_BATCH_SIZE out of range")
+    return read_id_batches(ids, fetch, size=size, deadline=deadline, logger=logger, stage=stage,
+        retryable=lambda exc: isinstance(exc, DBAPIError) and not exc.connection_invalidated
+            and _transient_db_errno(exc) in (1969, 3024))
 
 
 def _now():
@@ -39,8 +54,9 @@ def supports_price_rule(rule):
 
 
 def replay_contract():
+    from server.common.formal_source_identity import frozen_source_sha256
     from server.engine import strategy_rule_replay
-    return canonical_sha256({"price_research": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+    return canonical_sha256({"price_research": frozen_source_sha256(Path(__file__)),
         "execution": hashlib.sha256(Path(strategy_rule_replay.__file__).read_bytes()).hexdigest(),
         "pandas": pd.__version__, "scope": "RETROSPECTIVE_VERIFIED_INPUTS"})
 
@@ -350,12 +366,8 @@ def _read_bars(connection, days, inputs, cutoff):
             raise ValueError('历史行情候选目录超过60000行或主键重复')
         for day in chunk:
             ids = [r['id'] for r in directory if str(r['trade_date'])[:10] == day]
-            selected = []
             # Even a cold single-day secondary-index payload range exceeded 12s.
-            for start in range(0, len(ids), 256):
-                if time.monotonic() >= deadline:
-                    raise TimeoutError('历史行情主键读取超过600秒总时限')
-                group = ids[start:start + 256]
+            def fetch(group):
                 batch = connection.execute(text("""SELECT /*+ MAX_EXECUTION_TIME(12000) */
                     k.id,SUBSTR(k.stock_code,1,6) stock_code,k.trade_date,k.`open`,k.high,k.low,k.`close`,k.pre_close,k.volume,k.amount
                     FROM sm_stock_kline k """ + primary + """ WHERE k.id IN :ids
@@ -364,8 +376,9 @@ def _read_bars(connection, days, inputs, cutoff):
                     {'ids': group, 'day': day, 'cutoff': cutoff}).mappings().all()
                 if len(batch) != len({r['id'] for r in batch}) or not {r['id'] for r in batch} <= set(group):
                     raise ValueError(day + ' 历史行情主键正文重复或范围不一致')
-                selected.extend({key: r[key] for key in BAR_COLUMNS} for r in batch
-                                if str(r['trade_date'])[:10] == day and r['stock_code'] in allowed[day])
+                return [{key: r[key] for key in BAR_COLUMNS} for r in batch
+                        if str(r['trade_date'])[:10] == day and r['stock_code'] in allowed[day]]
+            selected = _read_frozen_ids(ids, fetch, deadline=deadline, stage="native-price-bodies:" + day)
             _validate_bar_day(selected, day, expected[day], scopes[day], allowed[day])
             store.put(generation, 'price_daily_bars', keys[day], {'rows': _bar_checkpoint(selected)})
             rows.extend(selected)
@@ -424,17 +437,14 @@ def _identity_rows(connection, day):
         ORDER BY industry_code,stock_code LIMIT 60001"""), {'day': day}).scalars())
     if len(ids) > 60000 or len(ids) != int(run['industry_relation_count']):
         raise ValueError(day + ' 证券身份快照目录覆盖不一致或超过60000行')
-    raw = []
-    for offset in range(0, len(ids), 256):
-        if time.monotonic() >= deadline:
-            raise TimeoutError(day + ' 证券身份快照读取超过120秒总时限')
-        batch = ids[offset:offset + 256]
+    def fetch(batch):
         records = [dict(r) for r in connection.execute(text("""SELECT /*+ MAX_EXECUTION_TIME(12000) */ *
             FROM qmt_industry_member_snapshot WHERE id IN :ids""").bindparams(bindparam('ids', expanding=True)),
             {'ids': batch}).mappings()]
         if len(records) != len(batch) or {r['id'] for r in records} != set(batch):
             raise ValueError(day + ' 证券身份快照正文缺失或重复')
-        raw.extend(records)
+        return records
+    raw = _read_frozen_ids(ids, fetch, deadline=deadline, stage="native-industry-bodies:" + day)
     if (len(raw) != int(run["industry_relation_count"]) or
             len({r["industry_code"] for r in raw}) != int(run["industry_count"]) or
             _membership_snapshot_hash(raw, member_type="industry") != run["industry_hash"] or

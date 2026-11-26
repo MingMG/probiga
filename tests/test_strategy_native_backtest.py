@@ -36,6 +36,51 @@ def test_native_uses_frozen_one_percent_risk_t1_stop_and_real_fees():
     assert report['net_return_pct']<0 and report['real_order_authority'] is False
 
 
+@pytest.mark.parametrize("corrupt_fee", [False, True])
+def test_persisted_replay_requires_cash_positions_and_every_fill_to_reconcile(tmp_path, corrupt_fee):
+    from server.common.formal_analysis_store import FormalAnalysisStore
+    from server.db.formal_analysis_schema import privileged_migrate_formal_analysis_schema
+    from server.engine.native_research_dataset import PreparedDataset
+
+    days, bars, strategy, signal = fixture()
+    locked_buy = {**bars[21], "stock_code": "000002", "open": 11., "close": 11., "low": 11., "high": 11.}
+    bars[21].update(low=9.6)
+    bars[22].update(open=9., close=9., low=9., high=9.)
+    raw = replay_native(strategy, [signal, {**signal, "stock_code": "000002"}], [*bars, locked_buy],
+                        days[:23], evaluation_start=days[20], source_gaps=[])
+    assert raw["open_position_count"] == 1 and raw["trades"] == []
+    assert raw["ledger"][1]["fills"][0]["fee_cny"] > 0
+    if corrupt_fee:
+        raw["ledger"][1]["fills"][0]["fee_cny"] += 1
+
+    engine = create_engine("sqlite://")
+    privileged_migrate_formal_analysis_schema(engine)
+    store = FormalAnalysisStore(engine)
+    dataset = PreparedDataset(tmp_path / "writer")
+    state = {"run_id": "f" * 64, "cursor": 0, "completed_units": 0, "reports": {}, "bars": {},
+             "proposals": [{"validation": {"status": "RUNNING"}}], "prepared_references": {}}
+    tree = native._put(dataset, store, state, "replay-ledger:native", raw)
+    for day in days[20:23]:
+        state["bars"][day] = {"tree": native._put(dataset, store, state, "bar:" + day,
+                                                  [bar for bar in bars if bar["trade_date"] == day])}
+    state["pending_report"] = {"strategy_key": "native", "tree": tree,
+        "validation": {"status": raw["status"], "evaluation_sessions": days[20:23],
+                       "signal_counts": {days[20]: {"evaluated_stocks": 3, "signaled_stocks": 2}}}}
+    assert "report" not in state["proposals"][0]["validation"]
+    native._reconcile_report(state, PreparedDataset(tmp_path / "fresh-reader"), store)
+    validation = state["proposals"][0]["validation"]
+    assert validation["reconciliation"]["raw_evidence"] == tree
+    if corrupt_fee:
+        assert validation["status"] == "BLOCKED" and "report" not in validation
+        assert {row["check"] for row in validation["reconciliation"]["differences"]} >= {"CASH", "NAV", "FILL_FEE"}
+    else:
+        report = validation["report"]
+        assert validation["reconciliation"]["status"] == "PASSED"
+        assert report["daily"][0]["evaluated_stocks"] == 3 and report["daily"][0]["signaled_stocks"] == 2
+        assert report["daily"][1]["buy_fills"] == 1 and report["daily"][1]["fees_cny"] > 0
+        assert report["one_price_unfilled"] == {"buy": 1, "sell": 1}
+
+
 def test_missing_data_keeps_full_return_unknown_and_nav_gap_blocks_ranking():
     days,bars,strategy,signal=fixture()
     r=replay_native(strategy,[signal],bars,days,evaluation_start=days[20],source_gaps=[{'trade_date':days[0]}])
@@ -214,7 +259,7 @@ def test_native_journal_reads_latest_heads_without_sorting_historical_bodies():
             from sqlalchemy.exc import OperationalError
             raise OperationalError(sql,params,Exception(3024,'observed native journal history deadline'))
         if 'payload_json' in sql:
-            assert 'created_at=' in sql, 'historical bodies sorted before limiting to the latest journal head'
+            assert 'audit_id=' in sql and 'ORDER BY' not in sql, 'read only the verified journal head body'
     event.listen(engine,'before_cursor_execute',cold_history)
     with engine.connect() as c:
         assert native.read_runs(c)[0]['checkpoint_sequence']==3

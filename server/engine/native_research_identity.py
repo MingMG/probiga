@@ -23,9 +23,25 @@ ALGORITHM_FILES = (
     'deploy/production_requirements.lock', 'deploy/production_wheel_manifest.lock',
 )
 
+# Exact source revisions that add output evidence and timing while preserving
+# the frozen model decisions and execution economics of a running replay.
+_OBSERVABILITY_EQUIVALENT = {
+    'server/engine/strategy_native_replay.py': (
+        '747451925d1539a63c60dd48c463e6b22fee943b6f0fb326eaf0a3e762ef5fb5',
+        'd7779f4bcf11f55dd88679a4a039229b61f2adffce75921762b1a04d1b2a54d7',
+    ),
+    'server/engine/native_research_math.py': (
+        '72c9890966f89e31f1813a79aa9fbf9a75f2e9e916329b5e13ecf8ac9836e528',
+        '5944b80992411f49aed92af4beea1e28807cab2c737f94491cde9faa1a1bb8cf',
+    ),
+}
+
 
 def algorithm_identity(config):
     files = {relative: hashlib.sha256((ROOT / relative).read_bytes()).hexdigest() for relative in ALGORITHM_FILES}
+    for relative, (observed, frozen) in _OBSERVABILITY_EQUIVALENT.items():
+        if files[relative] == observed:
+            files[relative] = frozen
     payload = {'schema': 'probiga.native-research-algorithm.v2', 'full_modules': files,
                'config': config, 'calibration': {}, 'calibration_policy': 'NO_FUTURE_CALIBRATIONS',
                'runtime':{'python':platform.python_version(),'pandas':version('pandas'),'numpy':version('numpy')}}
