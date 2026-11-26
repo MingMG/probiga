@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import os
 import sys
 import uuid
@@ -87,6 +88,54 @@ def _production_env():
         "PROBIGA_BUILD_COMMIT_SHA": BUILD_SHA,
         "PROBIGA_SCHEDULER_TASK_TYPE": "analysis_fast",
     }
+
+
+@pytest.mark.parametrize("data_blocked", [0, 528])
+def test_formal_initial_runner_distinguishes_verified_empty_from_missing_inputs(
+    monkeypatch, capsys, data_blocked,
+):
+    from server.common.scheduler_validation import scheduler_output_status
+
+    target = "2026-11-25"
+    for key, value in _production_env().items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(sys, "argv", [
+        "run_ai_recommendation_premarket.py", "--date", target,
+        "--pool-decision-phase", "INITIAL", "--json",
+    ])
+    monkeypatch.setattr(premarket, "create_batch_engine", lambda: object())
+    monkeypatch.setattr(premarket, "_wait_for_db", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(premarket, "_resolve_target_trade_date", lambda *_args, **_kwargs: target)
+    monkeypatch.setattr(premarket, "_recommended_run_history_start", lambda **_: UID)
+    monkeypatch.setattr(premarket, "_start_analysis_stack_diagnostics", lambda _: None)
+    monkeypatch.setattr(
+        "server.common.formal_score_recovery.recover_initial_selection", lambda *_args, **_kwargs: None,
+    )
+    finished = []
+    monkeypatch.setattr(premarket, "_recommended_run_history_finish", lambda _run, **values: finished.append(values))
+    reference = {
+        "schema": "probiga.formal-initial-score-reference.v1", "run_uid": UID,
+        "build_sha": BUILD_SHA, "trade_date": target, "analysis_count": 5573,
+        "recommendation_count": 0, "executable_count": 0,
+        "score_snapshot": {"data_blocked_count": data_blocked},
+    }
+    monkeypatch.setattr(premarket, "run_batch", lambda **_: SimpleNamespace(
+        trade_date=target, analysis_count=5573, recommendation_count=0, executable_count=0,
+        market_mood_score=4.9, flow_date=target, hot_date="", prepared_publication=reference,
+    ))
+
+    exit_code = premarket.main()
+    output = capsys.readouterr().out
+    if data_blocked:
+        assert exit_code == 2
+        result = json.loads(output)
+        assert result["retryable"] is False and "528" in result["error_detail"]
+        assert finished[0]["status"] == "error"
+        assert scheduler_output_status({"task_type": "analysis_fast"}, output, return_code=exit_code) == "blocked"
+    else:
+        assert exit_code == 0
+        assert json.loads(output.splitlines()[0]) == reference
+        assert finished == []
 
 
 def test_scheduled_recommendation_uses_scheduler_uid_for_both_ledgers() -> None:
