@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import faulthandler
+import logging
 import os
 import re
 import sys
@@ -40,6 +41,8 @@ def run_with_diagnostics(engine):
 
 def main() -> int:
     load_project_env()
+    logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    logging.getLogger("server.common.pit_facts").setLevel(logging.INFO)
     engine = create_batch_engine(pool_timeout=5,
         connect_args={'connect_timeout': 8, 'read_timeout': 15, 'write_timeout': 10})
     try:
