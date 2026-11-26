@@ -739,6 +739,13 @@ def main() -> int:
                 or publication_receipt is not None
             ):
                 raise FormalScoreContractError("scheduled analysis did not seal its exact score result")
+            blocked_count = prepared_publication["score_snapshot"]["data_blocked_count"]
+            if stats.recommendation_count == 0 and blocked_count:
+                raise FormalScoreContractError(
+                    f"{stats.trade_date} 已封存 {stats.analysis_count} 只股票的评分，"
+                    f"其中 {blocked_count} 只缺少截点前的有效财务或公告证据，"
+                    "无法验证零只入选的正式结果。"
+                )
         elif bound_run_uid:
             has_receipt = isinstance(publication_receipt, dict)
             executable_count = int(
