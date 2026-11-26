@@ -205,6 +205,32 @@ class PreparedDataset:
             raise ValueError('prepared input schema differs')
         return decode(payload['value'])
 
+    def read_formal_artifact(self, digest):
+        """Read exact formal JSON bytes via the same content-addressed cache."""
+        path = self._path(digest)
+        try:
+            size = path.stat().st_size
+            if not 0 < size <= MAX_BLOCK_BYTES:
+                return None
+            raw = self._verified_bytes({'sha256':digest, 'bytes':size, 'schema':SCHEMA})
+        except (FileNotFoundError, PreparedInputMissing):
+            return None
+        return json.loads(raw, object_pairs_hook=_json_object,
+                          parse_float=_json_float, parse_constant=_json_constant)
+
+    def retain_formal_artifacts(self, payloads):
+        if not payloads:
+            return
+        blocks = {}
+        for digest, payload in payloads.items():
+            raw = _bytes(payload)
+            if hashlib.sha256(raw).hexdigest() != digest:
+                raise ValueError('formal prepared content differs: ' + digest)
+            blocks[digest] = raw
+        self._space(sum(map(len, blocks.values())), next(iter(blocks)))
+        for digest, raw in blocks.items():
+            self._atomic(self._path(digest), raw)
+
     def prepare(self, formal_store, references):
         """Restore exact blocks only; no selection by date, version or latest."""
         missing = []
