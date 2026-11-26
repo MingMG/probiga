@@ -188,7 +188,8 @@ def _research(run, proposal, *, native=False):
             if trades and all(_number(t.get("net_pnl_cny")) is not None for t in trades) else None,
         "win_rate_pct": sum(_number(t["net_pnl_cny"]) > 0 for t in trades) / len(trades) * 100
             if eligible and trades and all(_number(t.get("net_pnl_cny")) is not None for t in trades) else None,
-        "estimated_fees_cny": sum(float(t["estimated_fee_cny"]) for t in trades)
+        "estimated_fees_cny": round(sum(day["fees_cny"] for day in report["daily"]), 2)
+            if native and report.get("daily") else sum(float(t["estimated_fee_cny"]) for t in trades)
             if eligible and trades and all(_number(t.get("estimated_fee_cny")) is not None for t in trades) else None,
         "rank_eligible": eligible, "cohort_id": canonical_json_hash(cohort) if eligible else None,
         "cohort": cohort, "integrity_verified": True, "identity_verified": True,

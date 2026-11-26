@@ -84,8 +84,9 @@
         const x=s.resultDetail;
         if(x){const r=x.summary;
             if(r.kind==='NATIVE_SHADOW_RETROSPECTIVE'&&r.status==='FAILED')h+='<button type="button" data-qsw-retry="'+esc(r.result_id)+'"'+(s.resultLoading?' disabled':'')+'>从断点重试</button>';
-            h+='<article class="qsw-result-detail"><h4>'+esc(r.strategy_name||r.strategy_key||r.reported_strategy_key||'历史报告')+' · 交易明细与证据</h4><p>'+esc(r.strategy_version)+' · '+esc(r.reason)+'</p><p>账户累计收益 '+metric(resultReturn(r),'%')+'；账户净盈利 '+metric(resultProfit(r),'元')+'；已平仓交易净盈利 '+metric(r.closed_trade_net_pnl_cny,'元')+'。费用属于原回测假设，真实成交另行验证。</p>';
+            h+='<article class="qsw-result-detail"><h4>'+esc(r.strategy_name||r.strategy_key||r.reported_strategy_key||'历史报告')+(x.window_notes?.length?' · 五日管道验证':' · 交易明细与证据')+'</h4>';
             (x.window_notes||[]).forEach(note=>{h+='<p>'+esc(note)+'</p>';});
+            h+='<p>'+esc(r.strategy_version)+' · '+esc(r.reason)+'</p><p>账户累计收益 '+metric(resultReturn(r),'%')+'；账户净盈利 '+metric(resultProfit(r),'元')+'；已平仓交易净盈利 '+metric(r.closed_trade_net_pnl_cny,'元')+'。费用属于原回测假设，真实成交另行验证。</p>';
             if(x.reconciliation?.status==='FAILED')h+='<p class="qsw-error">逐日对账失败，正式报告暂停发布。差异项 '+esc(x.reconciliation.differences.length)+'。</p>';
             if(x.daily_replay?.length){
                 h+='<h5>逐日净值与信号、成交</h5><div class="qsw-result-scroll"><table><thead><tr><th>交易日</th><th>候选上限</th><th>实际评估</th><th>信号股票</th><th>成交笔数（买 / 卖）</th><th>现金</th><th>持仓市值</th><th>费用</th><th>净值</th></tr></thead><tbody>'+x.daily_replay.map(d=>'<tr><td>'+esc(d.trade_date)+'</td><td>'+metric(d.candidate_universe_count)+'</td><td>'+metric(d.evaluated_stocks)+'</td><td>'+metric(d.signaled_stocks)+'</td><td>'+metric(d.filled_orders)+'（'+metric(d.buy_fills)+' / '+metric(d.sell_fills)+'）</td><td>'+metric(d.cash_cny)+'</td><td>'+metric(d.holdings_cny)+'</td><td>'+metric(d.fees_cny)+'</td><td>'+metric(d.nav_cny)+'</td></tr>').join('')+'</tbody></table></div>';
