@@ -376,6 +376,8 @@ def _retained_context(state,day,plan,dataset,store):
 
 
 def _prepare_day(connection,state,owner,dataset,store,day):
+    from contextlib import nullcontext
+    from server.common.formal_analysis_prefetch import prefetch_checkpoint_reads
     from server.engine import native_research_prepare as prepare
     from server.trading_v3.daily_features import prepare_feature_identity_context
     inputs=state['day_inputs'].setdefault(day,{})
@@ -390,8 +392,11 @@ def _prepare_day(connection,state,owner,dataset,store,day):
         _begin_unit(connection,state,owner,'PREPARE '+stage+' '+day)
         inputs=state['day_inputs'][day]
         if stage!='selection':_prepare_trees(dataset,store,inputs['selection'])
-        value=(function(connection,state,owner,plan) if stage=='selection' else
-               function(connection,state,owner,plan,dataset.get_tree(inputs['selection'])))
+        reads = (prefetch_checkpoint_reads(store, connection.engine, plan['snapshot_generation'], 'finance_issuer_facts')
+                 if stage == 'finance' else nullcontext())
+        with reads:
+            value=(function(connection,state,owner,plan) if stage=='selection' else
+                   function(connection,state,owner,plan,dataset.get_tree(inputs['selection'])))
         inputs=state['day_inputs'][day]
         inputs[stage]=_put(dataset,store,state,day+':'+stage,value)
         state['completed_units']+=1

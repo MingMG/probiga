@@ -282,6 +282,11 @@ class FormalAnalysisStore:
         generation = _identity(generation_sha256, _SHA256, "generation digest")
         stage = _identity(stage, _STAGE, "stage")
         key = _identity(key, _KEY, "checkpoint key")
+        from server.common.formal_analysis_prefetch import read_prefetched_checkpoint
+
+        prefetched = read_prefetched_checkpoint(self._bind, generation, stage, key)
+        if prefetched is not None:
+            return prefetched
         with self._connection() as connection:
             return self._get_member(connection, generation, stage, key)
 
