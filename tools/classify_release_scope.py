@@ -508,6 +508,11 @@ def _windows_runtime_changed(git, path, before, after):
     guards = {ast.dump(ast.parse(test, mode="eval").body) for test in (
         formal_guard, "task_type == 'strategy_governance_daily' or (" + formal_guard + ")",
     )}
+    formal_rollover = ast.dump(ast.parse('''
+if task_type == "analysis_fast":
+    targets = _scheduler_output_target_dates(terminal_output)
+    return len(targets) == 1 and next(iter(targets)) < expected_target
+''').body[0])
     normalized = []
     for blob in git.blobs([before.oid, after.oid]):
         try:
@@ -520,6 +525,13 @@ def _windows_runtime_changed(git, path, before, after):
                     isinstance(statement, ast.If) and not statement.orelse
                     and ast.dump(statement.test) in guards
                 )]
+            if isinstance(node, ast.FunctionDef) and node.name == "_release_build_catchup_allowed":
+                for branch in ast.walk(node):
+                    if isinstance(branch, ast.If):
+                        branch.body[:] = [
+                            statement for statement in branch.body
+                            if not isinstance(statement, ast.If) or ast.dump(statement) != formal_rollover
+                        ]
         normalized.append(ast.dump(module))
     return normalized[0] != normalized[1]
 

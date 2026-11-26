@@ -172,8 +172,11 @@ def _analysis_data_block_reason(error: Any) -> tuple[str, str] | None:
     rendered = " ".join(str(error or "").split())
     upper = rendered.upper()
     if upper.startswith("DATA_BLOCKED:"):
-        reason_code = upper.split(":", 1)[1].split(";", 1)[0].strip()
+        code, _, detail = rendered.split(":", 1)[1].partition(";")
+        reason_code = code.strip().upper()
         if reason_code:
+            if reason_code == "FORMAL_SCORE_INPUTS_INCOMPLETE" and detail.strip():
+                return reason_code, detail.strip()
             return (
                 reason_code,
                 _ANALYSIS_DATA_BLOCK_REASONS.get(

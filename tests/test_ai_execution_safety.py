@@ -94,6 +94,7 @@ def _production_env():
 def test_formal_initial_runner_distinguishes_verified_empty_from_missing_inputs(
     monkeypatch, capsys, data_blocked,
 ):
+    from server.api.routers.trading_v3 import _analysis_data_block_reason
     from server.common.scheduler_validation import scheduler_output_status
 
     target = "2026-11-25"
@@ -128,9 +129,14 @@ def test_formal_initial_runner_distinguishes_verified_empty_from_missing_inputs(
     output = capsys.readouterr().out
     if data_blocked:
         assert exit_code == 2
-        result = json.loads(output)
+        sealed, result = map(json.loads, output.splitlines())
+        assert sealed == reference
         assert result["retryable"] is False and "528" in result["error_detail"]
+        assert result["trade_date"] == target
         assert finished[0]["status"] == "error"
+        assert _analysis_data_block_reason(finished[0]["payload"]["error"]) == (
+            result["reason_code"], result["error_detail"],
+        )
         assert scheduler_output_status({"task_type": "analysis_fast"}, output, return_code=exit_code) == "blocked"
     else:
         assert exit_code == 0

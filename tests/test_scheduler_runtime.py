@@ -5068,6 +5068,22 @@ def test_release_catchup_retries_failed_and_blocked_rows_after_bounded_backoff()
         assert scheduler_runtime._release_build_catchup_allowed(blocked, now=now)
 
 
+def test_formal_terminal_block_only_suppresses_its_own_release_target(monkeypatch):
+    build_sha = "a" * 40
+    now = datetime(2026, 11, 27, 2)
+    monkeypatch.setattr(scheduler_runtime, "_scheduler_build_commit_sha", lambda: build_sha)
+    row = _release_terminal_row("analysis_fast", task_id=37, build_sha=build_sha, status="blocked")
+    row.update(_release_expected_target_required=True, _release_expected_target_available=True,
+        _release_expected_target_date="2026-11-25", _release_terminal_output=json.dumps({
+            "schema": "probiga.formal-initial-score-blocked.v1", "trade_date": "2026-11-25",
+            "status": "blocked", "retryable": False,
+        }))
+    assert not scheduler_runtime._release_build_catchup_allowed(row, now=now)
+    assert scheduler_runtime._release_build_catchup_allowed(
+        {**row, "_release_expected_target_date": "2026-11-26"}, now=now,
+    )
+
+
 def test_release_catchup_dependency_graph_is_acyclic_and_never_holds_worker_lane():
     graph = readiness_contract.RELEASE_DATA_CATCHUP_DEPENDENCIES
     nodes = readiness_contract.RELEASE_DATA_CATCHUP_TASK_TYPES
