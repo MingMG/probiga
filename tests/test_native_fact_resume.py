@@ -11,6 +11,39 @@ from server.engine import native_research_jobs as jobs
 from tests.test_native_research_jobs import queue,experiment
 
 
+@pytest.mark.parametrize('retained_units',[1,2])
+def test_slow_seal_validation_does_not_reject_retained_finance_prefix(monkeypatch,retained_units):
+    from server.common import pit_facts as pit
+    from tests.test_pit_finance_event_facts import _sealed_common_cutoff_case
+    engine,options=_sealed_common_cutoff_case()
+    privileged_migrate_formal_analysis_schema(engine)
+    monkeypatch.setattr(pit,'FINANCE_ATOMIC_BATCH_QUERY_CODE_LIMIT',1)
+    monkeypatch.setattr(native,'_save',lambda *_args,**_kwargs:None)
+    store=FormalAnalysisStore(engine)
+    expected=pit.resolve_common_fact_cutoff(engine,**options)
+    state={}
+    callback=jobs._source_progress(None,state,None,'2026-08-25','finance_coverage',deadline=float('inf'))
+    def retain(done,total,scope,fresh):
+        callback(done,total,scope,fresh)
+        if done==retained_units:raise jobs.PrepareYield('retained source prefix')
+    with pytest.raises(jobs.PrepareYield):
+        pit.resolve_common_fact_cutoff(engine,**options,finance_coverage_store=store,finance_coverage_progress=retain)
+    clock=[0.]
+    read_seal=pit._load_latest_finance_atomic_seal_evidence
+    def slow_seal(*args,**kwargs):
+        value=read_seal(*args,**kwargs)
+        clock[0]+=146
+        return value
+    monkeypatch.setattr(pit,'_load_latest_finance_atomic_seal_evidence',slow_seal)
+    monkeypatch.setattr(jobs.time,'monotonic',lambda:clock[0])
+    callback=jobs._source_progress(None,state,None,'2026-08-25','finance_coverage',deadline=90)
+    try:
+        actual=pit.resolve_common_fact_cutoff(engine,**options,finance_coverage_store=store,finance_coverage_progress=callback)
+        assert actual==expected
+        assert state['source_progress']['completed']==state['source_progress']['total']==2
+    finally:engine.dispose()
+
+
 def test_source_no_progress_is_not_swallowed_as_a_blocked_day(queue, tmp_path, monkeypatch):
     from server.common import pit_facts as pit
     from server.common import historical_announcement_read as history
