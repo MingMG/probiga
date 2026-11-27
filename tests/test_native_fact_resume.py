@@ -34,7 +34,7 @@ def test_source_no_progress_is_not_swallowed_as_a_blocked_day(queue, tmp_path, m
             'finance_observation_at': '2026-09-07 23:59:59', 'snapshot_generation': 'e' * 64,
             'identity': {'status': 'VERIFIED'}}
 
-    def selection_step(connection, state, owner, *, feature_budget=None):
+    def selection_step(connection, state, owner, *, prepare_budget=None):
         result = prepare.prepare_selection(connection, state, owner, plan)
         state['incorrect_data_gap'] = result
         state['completed_units'] += 6
@@ -119,7 +119,7 @@ def test_source_budget_yields_durable_progress_and_stops_when_the_prefix_does_no
     monkeypatch.setattr(identity,'algorithm_identity',lambda _config:{'sha256':'math'})
     state=experiment()
     with queue.begin() as connection:jobs.enqueue(connection,state)
-    def bounded(connection,state,owner,*,feature_budget=None):
+    def bounded(connection,state,owner,*,prepare_budget=None):
         FormalAnalysisStore(queue).put('e'*64,'native_source_part','verified-prefix',{'members':['000001']})
         callback=jobs._source_progress(connection,state,owner,'2026-09-07',stage,deadline=-1)
         callback(100,400,'fixed-source',True)

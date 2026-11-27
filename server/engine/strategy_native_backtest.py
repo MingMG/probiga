@@ -376,7 +376,7 @@ def _retained_context(state,day,plan,dataset,store):
     return record
 
 
-def _prepare_day(connection,state,owner,dataset,store,day):
+def _prepare_day(connection,state,owner,dataset,store,day,*,prepare_budget=None):
     from contextlib import nullcontext
     from server.common.formal_analysis_prefetch import prefetch_checkpoint_reads
     from server.engine.native_research_jobs import _source_progress
@@ -412,6 +412,7 @@ def _prepare_day(connection,state,owner,dataset,store,day):
         _save(connection,state,owner)
         return
     if 'context' not in inputs:
+        if prepare_budget is not None:prepare_budget()
         _begin_unit(connection,state,owner,'PREPARE context '+day)
         retained=_retained_context(state,day,plan,dataset,store)
         if retained is not None:
@@ -472,7 +473,7 @@ def _progress(state):
             replay_run_id=state['run_id'],reason=state.get('current_unit') or state['phase'])
 
 
-def _step(connection,state,owner,*,feature_budget=None):
+def _step(connection,state,owner,*,prepare_budget=None):
     from server.common.formal_analysis_store import FormalAnalysisStore
     from server.engine.native_research_dataset import PreparedDataset
     from server.engine.native_research_prepare import plan_v3_day
@@ -525,13 +526,13 @@ def _step(connection,state,owner,*,feature_budget=None):
             else:
                 day=days[state['cursor']]
                 if day in state['signal_parts'] or state['day_inputs'].get(day,{}).get('ready'):state['cursor']+=1
-                else:_prepare_day(connection,state,owner,dataset,store,day)
+                else:_prepare_day(connection,state,owner,dataset,store,day,prepare_budget=prepare_budget)
         elif state['phase']=='FEATURES':
             days=[day for day in state['sessions'] if day in state['feature_windows'] and day not in state['signal_parts']]
             if state['cursor']>=len(days):state.update(phase='SIGNALS',cursor=0)
             else:
                 day=days[state['cursor']]
-                feature_deadline=feature_budget() if feature_budget is not None else time.monotonic()+900
+                feature_deadline=prepare_budget() if prepare_budget is not None else time.monotonic()+900
                 _begin_unit(connection,state,owner,'FEATURE '+day)
                 if 'features' not in state['day_inputs'][day]:
                     started = time.perf_counter()
@@ -745,13 +746,13 @@ def native_tick(engine):
         bounded.dispose()
 
 
-def _feature_compute_deadline(attempt_started, *, arm_timer):
-    # A verified 70-day market frame exceeded 300s while still decoding and
-    # normalizing. Give this atomic CPU unit a finite 15-minute attempt budget.
+def _atomic_prepare_deadline(attempt_started, *, arm_timer):
+    # Context preparation and feature calculation both decode the verified
+    # 70-day frame. Include source reads and durable writes in their 15-minute budget.
     deadline = attempt_started + 900
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        raise NativeStepDeadline('NATIVE_FEATURE_ATTEMPT_DEADLINE')
+        raise NativeStepDeadline('NATIVE_PREPARE_ATTEMPT_DEADLINE')
     if arm_timer:
         signal.setitimer(signal.ITIMER_REAL, remaining)
     return deadline
@@ -785,7 +786,7 @@ def _native_tick(engine):
                 raise ValueError('冻结数据转换版本已变化；未完成输入须按新转换身份登记，不能混用或错标版本')
             if previous_handler is not None:
                 signal.setitimer(signal.ITIMER_REAL,max(.001,300-(time.monotonic()-attempt_started)))
-            _step(connection,state,owner,feature_budget=lambda: _feature_compute_deadline(
+            _step(connection,state,owner,prepare_budget=lambda: _atomic_prepare_deadline(
                 attempt_started,arm_timer=previous_handler is not None))
             if state['phase']!='FINISHED':_save(connection,state,owner,yield_job=True)
             return {key:state.get(key) for key in ('status','job_id','run_id','phase','completed_units','total_units','current_unit','reason')}

@@ -222,18 +222,18 @@ def test_claim_database_stall_rolls_back_before_job_or_head_publication(queue,mo
         assert state['checkpoint_sequence']==1 and state['status']=='NOT_STARTED'
 
 
-def test_feature_budget_uses_original_attempt_start_and_remains_bounded(monkeypatch):
+def test_prepare_budget_uses_original_attempt_start_and_remains_bounded(monkeypatch):
     timers=[]
     monkeypatch.setattr(native.signal,'setitimer',lambda _kind,seconds:timers.append(seconds),raising=False)
     monkeypatch.setattr(native.signal,'ITIMER_REAL',0,raising=False)
     monkeypatch.setattr(native.time,'monotonic',lambda:400)
-    assert native._feature_compute_deadline(100,arm_timer=True)==1000
+    assert native._atomic_prepare_deadline(100,arm_timer=True)==1000
     monkeypatch.setattr(native.time,'monotonic',lambda:700)
-    assert native._feature_compute_deadline(100,arm_timer=True)==1000
+    assert native._atomic_prepare_deadline(100,arm_timer=True)==1000
     assert timers==[600,300]
     monkeypatch.setattr(native.time,'monotonic',lambda:1000)
-    with pytest.raises(native.NativeStepDeadline,match='FEATURE_ATTEMPT_DEADLINE'):
-        native._feature_compute_deadline(100,arm_timer=False)
+    with pytest.raises(native.NativeStepDeadline,match='PREPARE_ATTEMPT_DEADLINE'):
+        native._atomic_prepare_deadline(100,arm_timer=False)
 
 
 def test_feature_decode_progress_only_counts_successful_day_reads_per_attempt(monkeypatch):

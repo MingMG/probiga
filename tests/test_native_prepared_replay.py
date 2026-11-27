@@ -96,11 +96,11 @@ def test_ready_inputs_produce_fills_reports_and_reuse_features_across_allocation
     local,store=storage.PreparedDataset(tmp_path),FormalAnalysisStore(queue)
     baseline=prepared_experiment(queue,local,store,monkeypatch,'FIXED_SHADOW')
     budgets=[]
-    original_budget=native._feature_compute_deadline
+    original_budget=native._atomic_prepare_deadline
     def budget(started,*,arm_timer):
         budgets.append(started)
         return original_budget(started,arm_timer=arm_timer)
-    monkeypatch.setattr(native,'_feature_compute_deadline',budget)
+    monkeypatch.setattr(native,'_atomic_prepare_deadline',budget)
     result=native.native_tick(queue)
     with queue.connect() as connection:
         first=native.read_runs(connection,run_id=baseline['run_id'])[0]
@@ -181,6 +181,44 @@ def test_verified_ready_context_reuses_exact_inputs_when_live_context_is_unavail
     assert restored['day_inputs'][target]['context']==source['day_inputs'][target]['context']
     assert restored['day_inputs'][target]['ready']==source['day_inputs'][target]['ready']
     assert restored['reused_feature_sessions']==1
+
+
+def test_context_can_persist_after_the_previous_300_second_attempt_limit(queue,tmp_path,monkeypatch):
+    from server.trading_v3 import daily_features
+    privileged_migrate_formal_analysis_schema(queue)
+    monkeypatch.setenv('PROBIGA_NATIVE_DATASET_ROOT',str(tmp_path))
+    local,store=storage.PreparedDataset(tmp_path),FormalAnalysisStore(queue)
+    state=prepared_experiment(queue,local,store,monkeypatch,'FIXED_SHADOW',omit_context=True)
+    target=state['sessions'][0]
+    context=next(value for reference in state['prepared_references'].values()
+        if isinstance(value:=local.get(reference),dict) and 'market_context' in value)
+    clock=[100.]
+    alarm=[400.]
+    monkeypatch.setattr(native.time,'monotonic',lambda:clock[0])
+    monkeypatch.setattr(native.signal,'setitimer',lambda *_args:None,raising=False)
+    original_budget=native._atomic_prepare_deadline
+    def budget(started,*,arm_timer):
+        alarm[0]=original_budget(started,arm_timer=False)
+        return alarm[0]
+    monkeypatch.setattr(native,'_atomic_prepare_deadline',budget)
+    original=native._frame
+    def slow_frame(*args):
+        value=original(*args)
+        clock[0]+=310
+        return value
+    def source(_engine,**kwargs):
+        if clock[0]>=alarm[0]:raise native.NativeStepDeadline('NATIVE_ATTEMPT_DEADLINE')
+        return deepcopy(context)
+    monkeypatch.setattr(native,'_frame',slow_frame)
+    monkeypatch.setattr(daily_features,'prepare_feature_identity_context',source)
+    result=native.native_tick(queue)
+    assert result['status']=='RUNNING',result
+    with queue.connect() as connection:
+        saved=native.read_runs(connection,run_id=state['run_id'])[0]
+    assert saved['completed_units']==state['completed_units']+1
+    assert local.get_tree(saved['day_inputs'][target]['context'])==context
+    for key in ('selection','finance','events'):
+        assert saved['day_inputs'][target][key]==state['day_inputs'][target][key]
 
 
 def ready_context_source(queue,tmp_path,monkeypatch):
