@@ -102,6 +102,35 @@ def test_unexpected_runtime_source_failure_is_not_a_missing_dataset(queue, monke
         prepare.prepare_selection(connection, experiment(), None, plan)
 
 
+def test_explicit_recovery_renews_one_retry_without_resetting_progress_or_idempotence(queue,tmp_path,monkeypatch):
+    from server.engine import strategy_native_control as control, native_research_identity as identity
+    from tests.test_native_research_jobs import start
+    monkeypatch.setenv('PROBIGA_NATIVE_DATASET_ROOT',str(tmp_path))
+    monkeypatch.setattr(native,'_contract',lambda:'math')
+    monkeypatch.setattr(identity,'algorithm_identity',lambda _config:{'sha256':'math'})
+    state,owner=start(queue)
+    unit='PREPARE selection 2026-11-19'
+    prefix={'dataset':'event_metadata','completed':128,'total':15223}
+    state.update(status='FAILED',current_unit=unit,source_progress=prefix,source_error_retries={unit:1})
+    with queue.connect() as connection:jobs.checkpoint(connection,state,owner)
+    result_id='native:'+state['run_id']+':'+('d'*64)
+    request=control.request_retry(queue,result_id,'7'*32)
+    def disconnected(*_args,**_kwargs):
+        raise RuntimeError('历史事实读取失败：QMT_ANNOUNCEMENT_LIVE_BATCH_REPLY_FAILED:signed-historical-native')
+    monkeypatch.setattr(native,'_step',disconnected)
+    assert native.native_tick(queue)['status']=='RUNNING'
+    assert control.request_retry(queue,result_id,'7'*32)==request
+    with queue.connect() as connection:
+        saved=native.read_runs(connection,state['run_id'])[0]
+        assert saved['source_error_retries']=={unit:1}
+        for key in ('requested_at','price_cutoff','source_progress','job_id'):
+            assert saved[key]==state[key]
+        assert connection.execute(text('SELECT COUNT(*) FROM st_job_v2')).scalar()==1
+    later=jobs.now_shanghai()+timedelta(seconds=61)
+    monkeypatch.setattr(jobs,'now_shanghai',lambda:later)
+    assert native.native_tick(queue)['status']=='FAILED'
+
+
 @pytest.mark.parametrize('reason',[
     'PIT_FINANCE_ATOMIC_BATCH_INVALID:OperationalError:errno=2013:stage=finance_seal_history',
     'QMT_ANNOUNCEMENT_LIVE_BATCH_REPLY_DEADLINE:signed-historical-directory:800:0',

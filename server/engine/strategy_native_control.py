@@ -68,6 +68,7 @@ def request_retry(engine,result_id,request_uid):
                         finished_at=NULL,error_code=NULL,error_message=NULL WHERE job_id=:id AND status='FAILED'
                         AND scheduler_run_uid IS NULL'''),{'id':state['job_id'],'now':now_shanghai()})
                     if changed.rowcount!=1:raise ValueError('原生恢复请求CAS失败')
+                    state.get('source_error_retries',{}).pop(state.get('current_unit',state['phase']),None)
                     state.update(status='RUNNING',reason='按原断点恢复；原冻结时间未改变',
                         deadline_at=str(now_shanghai()+RETRY_EXECUTION_BUDGET),checkpoint_sequence=state['checkpoint_sequence']+1)
                     for proposal in state['proposals']:
