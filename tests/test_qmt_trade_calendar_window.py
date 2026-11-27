@@ -280,3 +280,18 @@ def test_governance_catchup_does_not_replace_corrupt_known_receipt(
         """))
     with pytest.raises(ValueError):
         _governance_load(calendar_db, monkeypatch, target="2026-08-31", window=window)
+
+
+def test_calendar_timeout_preserves_complete_source_and_cached_receipt(calendar_db,caplog):
+    from sqlalchemy import event
+    from sqlalchemy.exc import OperationalError
+    manifest,sessions=_insert(calendar_db)
+    failed=[]
+    def timeout(_c,_cursor,sql,params,_context,_many):
+        if 'FROM qmt_trade_calendar_session' in sql and not failed:
+            failed.append(True)
+            raise OperationalError(sql,params,Exception(3024,'statement exceeded time'))
+    event.listen(calendar_db,'before_cursor_execute',timeout)
+    receipt=_load(calendar_db)
+    assert receipt.sessions==sessions and receipt.manifest_hash==canonical_digest(manifest)
+    assert 'errno=3024' in caplog.text

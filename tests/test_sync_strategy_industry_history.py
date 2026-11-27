@@ -554,3 +554,22 @@ def test_duplicate_l1_membership_for_one_stock_is_integrity_error():
         IndustrySnapshotIntegrityError, match="重复或不完整"
     ):
         capture_industry_history(engine, trade_date=TARGET)
+
+
+def test_industry_context_retries_timeout_without_losing_full_snapshot_hash(caplog):
+    from sqlalchemy import event
+    from sqlalchemy.exc import OperationalError
+    from server.engine.strategy_industry_history import _exact_snapshot_contract
+    engine=_engine()
+    original=[_row(f'{i:06d}','801780','银行') for i in range(1,322)]
+    expected=_publish(engine,original)
+    failed=[]
+    def timeout(_c,_cursor,sql,params,_context,_many):
+        if 'FROM qmt_industry_member_snapshot' in sql and not failed:
+            failed.append(True)
+            raise OperationalError(sql,params,Exception(3024,'statement exceeded time'))
+    event.listen(engine,'before_cursor_execute',timeout)
+    run,rows=_exact_snapshot_contract(engine,trade_date=TARGET)
+    assert run['industry_hash']==expected and rows==original
+    assert 'errno=3024' in caplog.text
+    engine.dispose()

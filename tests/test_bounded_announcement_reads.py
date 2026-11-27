@@ -73,3 +73,28 @@ def test_concept_transport_preserves_frozen_input_identity_only_for_reviewed_byt
     edited = tmp_path / path.name
     edited.write_bytes(path.read_bytes() + b'\n# unrelated edit\n')
     assert frozen_source_sha256(edited) != frozen
+
+
+def test_keyset_timeout_shrinks_page_and_never_repeats_completed_rows():
+    from server.common.bounded_read import read_keyset_pages
+    values=list(range(321))
+    observed=[]
+    def fetch(cursor,size):
+        observed.append((cursor,size))
+        if cursor is None and size==160:
+            raise TimeoutError('slow first page')
+        start=0 if cursor is None else cursor+1
+        return values[start:start+size]
+    assert read_keyset_pages(fetch,key=lambda value:value,deadline=monotonic()+5,
+        retryable=lambda exc:isinstance(exc,TimeoutError),logger=logging.getLogger(__name__),
+        stage='metadata',max_rows=321)==values
+    assert observed[:2]==[(None,160),(None,80)]
+    assert [cursor for cursor,_ in observed[2:]]==[79,159,239,319]
+
+
+@pytest.mark.parametrize('page',[[1,1],list(range(161))])
+def test_keyset_rejects_duplicate_or_oversized_response(page):
+    from server.common.bounded_read import read_keyset_pages
+    with pytest.raises(ValueError):
+        read_keyset_pages(lambda *_:page,key=lambda value:value,deadline=monotonic()+5,
+            retryable=lambda _:False,logger=logging.getLogger(__name__),stage='metadata',max_rows=400)

@@ -28,7 +28,7 @@ _EQUIVALENT = {
         "9980a368af8efb32c762a05a025c9a82477b9b6997cbaff2956fd014b55a403d",
     ),
 }
-_BOUNDED_READ_SHA256 = "bef61e9791760bbc7c12bf49481755ac7af39a0cc0c95db961f7253e15c2c98c"
+_BOUNDED_READ_SHA256 = "6cedb9abadc5550d72a1e56e1c9c8dd6314f1024094e31be91f942a1abfcc067"
 
 
 def _source_sha256(path: Path) -> str:

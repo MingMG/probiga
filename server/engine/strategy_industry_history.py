@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import time
 import re
 from contextlib import nullcontext
 from datetime import date, datetime, timedelta
@@ -12,6 +14,8 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
+from server.common.bounded_read import read_keyset_pages
+from server.common.batch_db import _transient_db_errno
 
 from integrations.bigqmt.reference import PROVIDER_ID
 
@@ -196,14 +200,15 @@ def _exact_snapshot_contract(
     engine, *, trade_date: str, source: str = PROVIDER_ID,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     target = date.fromisoformat(str(trade_date)[:10]).isoformat()
+    deadline = time.monotonic() + 120
     with (engine.connect() if hasattr(engine, "connect") else nullcontext(engine)) as connection:
         runs = [dict(row) for row in connection.execute(text("""
-            SELECT snapshot_date, source, quality_status, capture_mode,
+            SELECT /*+ MAX_EXECUTION_TIME(4000) */ snapshot_date, source, quality_status, capture_mode,
                    industry_count, industry_relation_count, industry_hash,
                    captured_at
             FROM qmt_membership_snapshot_run
             WHERE snapshot_date=:trade_date AND source=:source
-            ORDER BY captured_at, source
+            ORDER BY captured_at, source LIMIT 2
         """), {
             "trade_date": target,
             "source": source,
@@ -217,17 +222,33 @@ def _exact_snapshot_contract(
                 f"{target}存在重复QMT行业快照运行记录"
             )
         run = runs[0]
-        rows = [dict(row) for row in connection.execute(text("""
-            SELECT snapshot_date, source, industry_code, industry_name,
-                   industry_type, stock_code, short_name, quality_status,
-                   captured_at
-            FROM qmt_industry_member_snapshot
-            WHERE snapshot_date=:trade_date AND source=:source
-            ORDER BY industry_code, stock_code
-        """), {
-            "trade_date": target,
-            "source": source,
-        }).mappings().all()]
+        expected_count = int(run.get('industry_relation_count') or 0)
+        def fetch(cursor, size):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('industry snapshot read deadline')
+            scope = '' if cursor is None else ''' AND (industry_code>:industry
+                OR (industry_code=:industry AND stock_code>:stock))'''
+            parameters = {'trade_date':target,'source':source}
+            if cursor is not None:
+                parameters.update(industry=cursor[0],stock=cursor[1])
+            index = ' FORCE INDEX (uk_qmt_industry_member_snapshot)' if connection.dialect.name=='mysql' else ''
+            return [dict(row) for row in connection.execute(text(f'''
+                SELECT /*+ MAX_EXECUTION_TIME({max(1,min(12000,int(remaining*1000)))}) */
+                    snapshot_date,source,industry_code,industry_name,industry_type,stock_code,
+                    short_name,quality_status,captured_at FROM qmt_industry_member_snapshot{index}
+                    WHERE snapshot_date=:trade_date AND source=:source {scope}
+                    ORDER BY industry_code,stock_code LIMIT {size}'''),parameters).mappings()]
+        try:
+            rows = read_keyset_pages(fetch,key=lambda row:(row['industry_code'],row['stock_code']),
+                deadline=deadline, max_rows=max(1,expected_count+1),
+                retryable=lambda exc: not getattr(exc,'connection_invalidated',False)
+                    and _transient_db_errno(exc) in (1205,1969,3024),
+                logger=logging.getLogger(__name__),stage='context-industry-members')
+        except ValueError as exc:
+            raise IndustrySnapshotIntegrityError(str(exc)) from exc
+
+
 
     if str(run.get("quality_status") or "") != QMT_VALIDATED:
         raise IndustrySnapshotNotReady(

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import logging
+from time import monotonic
 import re
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -9,6 +11,8 @@ from typing import Any, Iterable, Mapping
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
+from server.common.bounded_read import read_keyset_pages
+from server.common.batch_db import _transient_db_errno
 
 from server.common.legacy_table_surface import validate_required_table_surface
 from server.common.qmt_attestation_contract import canonical_digest
@@ -649,6 +653,11 @@ def _insert_trade_calendar_receipt(
     return {**manifest, "manifest_hash": manifest_hash}
 
 
+def _calendar_read_retryable(exc):
+    return (not getattr(exc,'connection_invalidated',False)
+            and _transient_db_errno(exc) in (1205,1969,3024))
+
+
 def load_trade_calendar_receipt(
     connection: Any,
     *,
@@ -656,7 +665,9 @@ def load_trade_calendar_receipt(
     end_date: str,
     decision_known_at: Any,
     batch_id: str | None = None,
+    deadline: float | None = None,
 ) -> QmtTradeCalendarReceipt:
+    deadline = monotonic() + 120 if deadline is None else deadline
     start = _iso_date(start_date)
     end = _iso_date(end_date)
     decision_time = _known_at(decision_known_at)
@@ -665,6 +676,8 @@ def load_trade_calendar_receipt(
         cached = cache[str(batch_id)]
         if cached.known_at <= decision_time and cached.start_date <= start <= end <= cached.end_date:
             return cached
+    if monotonic() >= deadline:
+        raise TimeoutError('calendar receipt lookup deadline')
     params: dict[str, Any] = {
         "start_date": start,
         "end_date": end,
@@ -680,7 +693,7 @@ def load_trade_calendar_receipt(
         params["batch_id"] = str(batch_id)
         order = ""
     row = connection.execute(text(f"""
-        SELECT batch_id, source_batch_id, known_at, start_date, end_date,
+        SELECT /*+ MAX_EXECUTION_TIME(4000) */ batch_id, source_batch_id, known_at, start_date, end_date,
                status, session_count, session_set_hash, manifest_json,
                manifest_hash
         FROM qmt_trade_calendar_batch
@@ -689,16 +702,23 @@ def load_trade_calendar_receipt(
     """), params).mappings().one_or_none()
     if row is None:
         raise RuntimeError("no immutable QMT calendar receipt covers target range")
-    session_rows = connection.execute(text("""
-        SELECT trade_date
-        FROM qmt_trade_calendar_session
-        WHERE batch_id=:batch_id
-        ORDER BY trade_date
-    """), {"batch_id": str(row["batch_id"])}).fetchall()
+    def fetch_sessions(cursor, size):
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise TimeoutError('calendar sessions read deadline')
+        scope = '' if cursor is None else ' AND trade_date>:cursor'
+        return connection.execute(text(f'''
+            SELECT /*+ MAX_EXECUTION_TIME({max(1,min(12000,int(remaining*1000)))}) */ trade_date
+            FROM qmt_trade_calendar_session WHERE batch_id=:batch_id {scope}
+            ORDER BY trade_date LIMIT {size}'''),
+            {'batch_id':str(row['batch_id']),'cursor':cursor}).mappings().all()
+    session_rows = read_keyset_pages(fetch_sessions,key=lambda item:item['trade_date'],
+        deadline=deadline,max_rows=max(1,int(row['session_count'])+1),
+        retryable=_calendar_read_retryable,logger=logging.getLogger(__name__),stage='calendar-sessions')
     verified = validate_calendar_manifest(
         row["manifest_json"],
         row=dict(row),
-        sessions=[item[0] for item in session_rows],
+        sessions=[item["trade_date"] for item in session_rows],
     )
     if batch_id is not None:
         cache[str(batch_id)] = verified
@@ -722,8 +742,7 @@ def load_trade_calendar_window_receipt(
     combine receipts or use sessions known only after the decision cutoff.
     """
 
-    from time import monotonic
-
+    deadline = monotonic() + 120 if deadline is None else deadline
     end = _iso_date(end_date)
     decision_time = _known_at(decision_known_at)
     if type(required_sessions) is not int or required_sessions < 1:
@@ -732,16 +751,24 @@ def load_trade_calendar_window_receipt(
         raise ValueError("calendar window ends after the decision date")
     if deadline is not None and monotonic() >= deadline:
         raise TimeoutError("QMT calendar window lookup deadline exhausted")
-    candidates = connection.execute(text("""
-        SELECT batch_id, start_date
-        FROM qmt_trade_calendar_batch
-        WHERE status='COMPLETE' AND start_date<=:end_date
-          AND end_date>=:end_date AND known_at<=:decision_known_at
-        ORDER BY known_at DESC, batch_id DESC
-    """), {
-        "end_date": end,
-        "decision_known_at": decision_time,
-    }).mappings().all()
+    def fetch_candidates(cursor, size):
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise TimeoutError('calendar candidates read deadline')
+        scope = '' if cursor is None else ''' AND (known_at<:known
+            OR (known_at=:known AND batch_id<:batch))'''
+        parameters={'end_date':end,'decision_known_at':decision_time}
+        if cursor is not None:
+            parameters.update(known=cursor[0],batch=cursor[1])
+        return connection.execute(text(f'''
+            SELECT /*+ MAX_EXECUTION_TIME({max(1,min(4000,int(remaining*1000)))}) */
+                batch_id,start_date,known_at FROM qmt_trade_calendar_batch
+            WHERE status='COMPLETE' AND start_date<=:end_date AND end_date>=:end_date
+                AND known_at<=:decision_known_at {scope}
+            ORDER BY known_at DESC,batch_id DESC LIMIT {size}'''),parameters).mappings().all()
+    candidates = read_keyset_pages(fetch_candidates,key=lambda item:(str(item['known_at']),item['batch_id']),
+        deadline=deadline,max_rows=100000,retryable=_calendar_read_retryable,
+        logger=logging.getLogger(__name__),stage='calendar-candidates')
     for candidate in candidates:
         if deadline is not None and monotonic() >= deadline:
             raise TimeoutError("QMT calendar window verification deadline exhausted")
@@ -753,6 +780,7 @@ def load_trade_calendar_window_receipt(
             end_date=end,
             decision_known_at=decision_time,
             batch_id=str(candidate["batch_id"]),
+            deadline=deadline,
         )
         sessions = receipt.sessions_between(receipt.start_date, end)
         if deadline is not None and monotonic() >= deadline:
