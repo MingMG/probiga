@@ -64,12 +64,24 @@ def test_completed_live_proof_is_reused_before_resuming_ancestry_budget(monkeypa
         return jobs._source_progress(None,state,None,'2026-08-25','event_coverage',
             deadline=clock[0]+90,checkpoint_interval=0)
     with pytest.raises(jobs.PrepareYield):
+        history._bind_dated_live_selection(engine,proof,
+            {code:row for code,(row,_head) in expected[0].members.items()},codes=list(catalog.codes),
+            decision=options['decision_at'],start=options['window_start'],end=options['window_end'],
+            deadline=history.monotonic()+90,coverage_store=store,
+            coverage_progress=jobs._source_progress(None,state,None,'2026-08-25','event_coverage',
+                deadline=-1,checkpoint_interval=0))
+    prior_cursors={key:value['completed'] for key,value in state['source_cursors'].items()}
+    with pytest.raises(jobs.PrepareYield):
+        callback=progress()
         history.validate_dated_announcement_batch(engine,**options,coverage_store=store,
-            capture_historical_selection=lambda _value:None,coverage_progress=progress())
+            capture_historical_selection=lambda _value:None,coverage_progress=callback,metadata_progress=callback)
     assert state['source_progress']['completed']==1
+    assert state['source_progress']['scope'].startswith('dated-live-validation:')
+    assert all(state['source_cursors'][key]['completed']==value for key,value in prior_cursors.items())
     selected=[]
+    callback=progress()
     actual=history.validate_dated_announcement_batch(engine,**options,coverage_store=store,
-        capture_historical_selection=selected.append,coverage_progress=progress())
+        capture_historical_selection=selected.append,coverage_progress=callback,metadata_progress=callback)
     assert actual==proof and state['source_progress']['completed']==2
     assert len(validations)==1
     assert pit._json_safe(selected[0].members)==pit._json_safe(expected[0].members)

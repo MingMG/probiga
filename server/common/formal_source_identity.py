@@ -8,7 +8,7 @@ from pathlib import Path
 # contract. Any other bytes receive a new identity and cannot resume that input.
 _EQUIVALENT = {
     "historical_announcement_read.py": (
-        "5a48ec634c34047426823154cbbe0804337408b4d08bd70e1fb11eb22f92f152",
+        "91f22822ee9adeb7ac0dfca04b2b48d52523a4cf7592bddac70a1f134488947d",
         "6da2e215759ddbd06a66727b138eeeda6a200454fa29b8136ab88321e07c6941",
     ),
     "daily_features.py": (

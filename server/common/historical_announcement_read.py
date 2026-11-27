@@ -250,7 +250,7 @@ def _bind_dated_live_selection(engine, proof, bound_members, *, codes, decision,
 
 
 def _validated_live_batch(engine, candidate, *, requested, decision, start, end, source, deadline,
-        include_members, coverage_store):
+        include_members, coverage_store, progress):
     from pathlib import Path
     from server.common import pit_facts as pit, qmt_announcement_pit as announcement
     from server.common.formal_source_identity import frozen_source_sha256, _source_sha256
@@ -258,6 +258,7 @@ def _validated_live_batch(engine, candidate, *, requested, decision, start, end,
     generation=pit.canonical_hash({'schema':'probiga.dated-live-batch-validation.v1',
         'candidate':candidate,'codes':requested,'decision':decision,'start':start,'end':end,
         'reader':frozen_source_sha256(Path(__file__)),'validator':_source_sha256(Path(announcement.__file__))})
+    progress_scope='dated-live-validation:'+generation
     keys=[str(offset) for offset in range(0,len(requested),400)]
     retained=None
     if coverage_store is not None:
@@ -278,7 +279,8 @@ def _validated_live_batch(engine, candidate, *, requested, decision, start, end,
             chunks=coverage_store.put_many(generation,'dated_live_batch_members',{
                 key:{code:members[code] for code in requested[int(key):int(key)+400]} for key in keys})
             coverage_store.put(generation,'dated_live_batch_proof','complete',{'proof':proof,'chunks':chunks})
-        return proof,members
+            if progress:progress(1,2,progress_scope,True)
+        return proof,members,progress_scope
     if (type(retained) is not dict or set(retained)!={'proof','chunks'}
             or type(retained['chunks']) is not dict or type(retained['proof']) is not dict
             or set(retained['chunks'])!=set(keys)):
@@ -298,7 +300,8 @@ def _validated_live_batch(engine, candidate, *, requested, decision, start, end,
             or proof.get('batch_id')!=candidate['batch_id']
             or normalize_decision_at(proof['fact_cutoff_at'])!=normalize_decision_at(candidate['covered_through_at'])):
         raise ValueError('dated announcement cached proof identity differs')
-    return proof,members
+    if progress:progress(1,2,progress_scope,False)
+    return proof,members,progress_scope
 
 
 def validate_dated_announcement_batch(engine,*,codes,decision_at,window_start,window_end,expected_trade_date,
@@ -315,9 +318,10 @@ def validate_dated_announcement_batch(engine,*,codes,decision_at,window_start,wi
         for candidate in candidates:
             if candidate['watermark_kind']!='QUERY_CUTOFF':continue
             try:
-                proof,bound=_validated_live_batch(engine,candidate,requested=requested,decision=decision,
+                proof,bound,validation_scope=_validated_live_batch(engine,candidate,requested=requested,decision=decision,
                     start=start,end=end,source=source,deadline=deadline,
-                    include_members=capture_historical_selection is not None,coverage_store=coverage_store)
+                    include_members=capture_historical_selection is not None,coverage_store=coverage_store,
+                    progress=metadata_progress)
             except QMTAnnouncementBlocked as error:
                 if error.reason_code=='QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND':
                     if error.detail!='no-common-batch':invalid.append(error)
@@ -330,6 +334,8 @@ def validate_dated_announcement_batch(engine,*,codes,decision_at,window_start,wi
                 capture_historical_selection(_bind_dated_live_selection(engine,proof,bound,codes=requested,
                     decision=decision,start=start,end=end,deadline=deadline,coverage_store=coverage_store,
                     coverage_progress=coverage_progress,event_progress=event_progress,metadata_progress=metadata_progress))
+            if coverage_store is not None and metadata_progress:
+                metadata_progress(2,2,validation_scope,False)
             if capture_live_reuse is not None:capture_live_reuse()
             return proof
         if invalid:raise invalid[-1]
