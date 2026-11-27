@@ -12,6 +12,7 @@ from datetime import datetime, time
 from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 import json
+import logging
 import re
 from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
@@ -671,16 +672,25 @@ def _legacy_attempt_bars(engine, receipt_json: str) -> dict:
     return indexed
 
 
+def _display_codes(codes):
+    requested = set(codes)
+    if not all(isinstance(code, str) and re.fullmatch(r"[0-9]{6}", code) for code in requested):
+        raise ValueError("daily bar lookup requires six-digit stock codes")
+    return requested
+
+
 def read_verified_attempt_bars(engine, trade_date: str, codes: Sequence[str], *,
                                decision_known_at: datetime | str) -> dict[str, dict]:
     """Read only proven native trades from a partial day as of its durable receipt."""
-    requested = set(codes)
-    if not all(isinstance(code, str) and re.fullmatch(r"[0-9]{6}", code) for code in requested):
-        raise ValueError("daily attempt lookup requires six-digit stock codes")
+    requested = _display_codes(codes)
     if not requested:
         return {}
     day = str(trade_date)
     receipt = load_receipt(engine, dataset=ATTEMPT_DATASET, trade_date=day)
+    return _verified_attempt_selection(engine, day, requested, decision_known_at, receipt)
+
+
+def _verified_attempt_selection(engine, day, requested, decision_known_at, receipt):
     if not receipt or receipt["status"] != "BLOCKED" or not receipt["finished_at"]:
         return {}
     known_at = _stamp(receipt["finished_at"])
@@ -725,6 +735,107 @@ def read_verified_attempt_bars(engine, trade_date: str, codes: Sequence[str], *,
             raise ValueError("daily attempt native bar differs: " + code)
         result[code] = {**row, "known_at": known_at.isoformat(" "), "data_source": PROVIDER}
     return result
+
+
+def read_verified_daily_display_bars(engine, trade_date: str, codes: Sequence[str], *,
+                                     decision_known_at: datetime | str) -> dict[str, dict]:
+    """Read exact native closes from the published ledger or the still-open attempt."""
+    requested = _display_codes(codes)
+    if not requested:
+        return {}
+    day, cutoff = str(trade_date), _stamp(decision_known_at)
+    with _scope(engine) as connection:
+        receipt = load_receipt(connection, dataset="stock_daily", trade_date=day)
+        if receipt is not None:
+            return _verified_published_selection(connection, day, requested, cutoff, receipt)
+        attempt = load_receipt(connection, dataset=ATTEMPT_DATASET, trade_date=day)
+    return _verified_attempt_selection(engine, day, requested, cutoff, attempt)
+
+
+def _verified_published_selection(connection, day, requested, cutoff, receipt):
+    detail = receipt["detail"]
+    digest = detail.get("full_market_manifest_hash")
+    if (receipt["status"] != "COMPLETE" or not receipt["finished_at"] or not receipt["run_id"] or not receipt["source_root"]
+            or not _SHA256.fullmatch(str(digest)) or detail.get("coverage") != 1.0
+            or not _SHA256.fullmatch(str(detail.get("row_hash")))
+            or not _SHA256.fullmatch(str(receipt["content_sha256"]))):
+        raise ValueError("daily display completion receipt differs")
+    known_at = _stamp(receipt["finished_at"])
+    if known_at > cutoff:
+        return {}
+    manifest = connection.execute(text(f"""
+        SELECT captured_at,created_at,expected_entity_count,entity_count,expected_traded_count,
+               actual_traded_count,no_trade_count,bar_count,reason_count
+        FROM {MANIFEST_TABLE} WHERE manifest_hash=:digest AND dataset='stock_daily' AND period='1d'
+          AND trade_date=:day AND schema_version=:schema AND provider=:provider
+          AND status='EXACT' AND strategy_eligible=1 AND run_id=:run_id AND source_batch_id=:run_id
+    """), {"digest": digest, "day": day, "schema": SCHEMA, "provider": PROVIDER,
+           "run_id": receipt["run_id"]}).mappings().one_or_none()
+    rows = receipt["row_count"]
+    close_time = datetime.combine(datetime.fromisoformat(day).date(), time(15))
+    if (manifest is None or manifest["reason_count"] != 0
+            or not close_time <= _stamp(manifest["captured_at"]) <= _stamp(manifest["created_at"]) <= known_at
+            or not (manifest["entity_count"] == manifest["expected_entity_count"]
+                    == detail.get("eligible_code_count") == rows + manifest["no_trade_count"])
+            or not (rows == receipt["code_count"] == detail.get("readback_rows") == detail.get("readback_codes")
+                    == manifest["bar_count"] == manifest["actual_traded_count"] == manifest["expected_traded_count"])):
+        raise ValueError("daily display manifest or completion counts differ")
+
+    lookup = text(f"""
+        SELECT e.stock_code,e.expected_state,e.classification,e.bar_count,e.row_hash,e.source_row_hash,
+               k.trade_date,k.open,k.close,k.high,k.low,k.volume,k.amount,k.pre_close,
+               k.data_source,k.quality_status,k.permission_status,k.received_at
+        FROM {ENTITY_TABLE} e LEFT JOIN sm_stock_kline k
+          ON k.stock_code=e.stock_code AND k.trade_date=:day AND k.k_type=1 AND k.adjust_type=0
+        WHERE e.manifest_hash=:digest AND e.stock_code IN :codes
+    """).bindparams(bindparam("codes", expanding=True))
+    result, errors, seen = {}, {}, set()
+    ordered = sorted(requested)
+    for offset in range(0, len(ordered), 64):
+        for item in connection.execute(lookup, {"day": day, "digest": digest,
+                                       "codes": ordered[offset:offset+64]}).mappings():
+            code = item["stock_code"]
+            if code in seen:
+                result.pop(code, None)
+                errors[code] = "duplicate published bar"
+                continue
+            seen.add(code)
+            try:
+                bar = _published_display_bar(item, day, close_time, known_at)
+            except (ValueError, TypeError, ArithmeticError) as exc:
+                errors[code] = str(exc)
+            else:
+                if bar is not None:
+                    result[code] = bar
+    if errors:
+        logging.getLogger(__name__).warning("Invalid daily display securities on %s: %s", day, errors)
+    return result
+
+
+def _published_display_bar(item, day, close_time, known_at):
+    classification = item["classification"]
+    if item["expected_state"] != classification:
+        raise ValueError("entity state differs")
+    if classification in {"NO_TRADE", "NOT_LISTED", "DELISTED"}:
+        if item["bar_count"] or item["trade_date"] is not None:
+            raise ValueError("absence conflicts with stored bar")
+        return None
+    if (classification != "TRADED" or item["bar_count"] != 1 or str(item["trade_date"]) != day
+            or item["permission_status"] != "SUPPORTED" or not close_time <= _stamp(item["received_at"]) <= known_at):
+        raise ValueError("trade identity or availability differs")
+    bar = canonical_bar(item)
+    if Decimal(bar["volume"]) <= 0 or Decimal(bar["amount"]) <= 0:
+        raise ValueError("trade has no volume or amount")
+    entity = {"stock_code": item["stock_code"], "classification": classification, "evidence": bar}
+    if canonical_digest(bar) != item["source_row_hash"] or canonical_digest(entity) != item["row_hash"]:
+        raise ValueError("published bar digest differs")
+    # The display contract identifies native QMT trades. Historical public
+    # replacements have their own source and product.
+    if (item["data_source"], item["quality_status"]) == (SINA_PROVIDER, SINA_QUALITY):
+        return None
+    if (item["data_source"], item["quality_status"]) != (PROVIDER, "VERIFIED"):
+        raise ValueError("native trade source differs")
+    return {**bar, "known_at": known_at.isoformat(" "), "data_source": PROVIDER}
 
 
 def load_daily_manifest(engine, day: str, *, decision_known_at: datetime | str,

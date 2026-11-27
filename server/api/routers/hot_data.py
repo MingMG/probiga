@@ -34,7 +34,7 @@ from server.common.minute_data import (
 from server.common.adata_release import ensure_adata_import_path
 from server.common.analysis_pool_receipt import read_persisted_pool_manifest
 from server.common.formal_analysis_store import FormalAnalysisStoreError
-from server.common.qmt_datadir_daily_coverage import read_verified_attempt_bars
+from server.common.qmt_datadir_daily_coverage import read_verified_daily_display_bars
 from server.common.batch_db import quote_identifier, write_frame
 from server.common.config import get_api_cache_config, get_settings
 from server.common.recommended_run_history_schema import (
@@ -4324,8 +4324,8 @@ def _attach_verified_display_bars(rows: list[dict], trade_date: str) -> None:
     if not missing:
         return
     try:
-        bars = read_verified_attempt_bars(get_engine(), trade_date, list(missing),
-                                          decision_known_at=datetime.now(timezone(timedelta(hours=8))))
+        bars = read_verified_daily_display_bars(get_engine(), trade_date, list(missing),
+                                               decision_known_at=datetime.now(timezone(timedelta(hours=8))))
         display = {}
         for code, bar in bars.items():
             close, previous = Decimal(bar["close"]), Decimal(bar["pre_close"])
