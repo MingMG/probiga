@@ -284,8 +284,8 @@ def _source_progress(connection, state, owner, day, stage, *, deadline, checkpoi
             last_saved = time.monotonic()
         if time.monotonic() >= deadline and done < total:
             if done<=starting.get(key,0):
-                # Replay verified prefixes under the attempt's hard deadline before judging new work.
-                if fresh is False:return
+                # Replay retained/observed prefixes under the attempt's hard deadline before judging new writes.
+                if fresh is not True:return
                 raise NativeStepDeadline('PREPARE_NO_PROGRESS:'+stage)
             raise PrepareYield('来源断点已保存：' + stage)
     return progress

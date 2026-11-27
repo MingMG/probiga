@@ -122,6 +122,35 @@ def test_completed_live_proof_is_reused_before_resuming_ancestry_budget(monkeypa
     engine.dispose()
 
 
+def test_cached_live_binding_replays_plain_progress_after_slow_preparation(monkeypatch):
+    from server.common.formal_analysis_store import FormalAnalysisStore
+    from server.db.formal_analysis_schema import privileged_migrate_formal_analysis_schema
+    from server.engine import native_research_jobs as jobs, strategy_native_backtest as native
+    engine=_engine();catalog=_install_catalog(engine,_catalog(('000001','000001.SZ'),('000002','000002.SZ')))
+    publish(engine,catalog,datetime(2026,8,25,18,20))
+    privileged_migrate_formal_analysis_schema(engine)
+    monkeypatch.setattr(announcements,'VALIDATION_INVENTORY_CODE_LIMIT',1)
+    monkeypatch.setattr(native,'_save',lambda *_args,**_kwargs:None)
+    options=dict(codes=catalog.codes,decision_at=datetime(2026,8,27),window_start=date(2026,8,5),
+        window_end=date(2026,8,25),expected_trade_date='2026-08-25',coverage_store=FormalAnalysisStore(engine))
+    state={}
+    callback=jobs._source_progress(None,state,None,'2026-08-25','event_selection',deadline=float('inf'))
+    def retain(done,total):
+        callback(done,total)
+        if done==1:raise jobs.PrepareYield('retained binding')
+    with pytest.raises(jobs.PrepareYield):
+        history.validate_dated_announcement_batch(engine,**options,event_progress=retain,capture_historical_selection=lambda _value:None)
+    clock=[0.]
+    monkeypatch.setattr(jobs.time,'monotonic',lambda:clock[0])
+    callback=jobs._source_progress(None,state,None,'2026-08-25','event_selection',deadline=90)
+    clock[0]=146  # Finance validation precedes this observational progress callback.
+    captured=[]
+    proof=history.validate_dated_announcement_batch(engine,**options,event_progress=callback,capture_historical_selection=captured.append)
+    assert proof['status']=='COMPLETE' and set(captured[0].members)==set(catalog.codes)
+    assert state['source_progress']['completed']==state['source_progress']['total']==2
+    engine.dispose()
+
+
 def test_full_market_snapshot_reads_fourteen_chunks_with_bounded_artifact_batches():
     # Synthetic identifiers exercise the transport limit; no prices or profits are generated.
     from types import MappingProxyType
