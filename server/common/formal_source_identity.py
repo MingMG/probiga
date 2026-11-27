@@ -7,6 +7,10 @@ from pathlib import Path
 # Exact transport-only revisions proved equivalent to the existing frozen input
 # contract. Any other bytes receive a new identity and cannot resume that input.
 _EQUIVALENT = {
+    "historical_announcement_read.py": (
+        "5a48ec634c34047426823154cbbe0804337408b4d08bd70e1fb11eb22f92f152",
+        "6da2e215759ddbd06a66727b138eeeda6a200454fa29b8136ab88321e07c6941",
+    ),
     "daily_features.py": (
         "7f79d5b2773f6e6e2bf5da8d051c7b5e5c9f438fadf2a9a2d2c86637d15280bf",
         "2778aecde7730763b9e6decf07ff3785e43b515865f7e1f7e67633902863e3a2",

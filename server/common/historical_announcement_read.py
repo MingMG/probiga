@@ -190,6 +190,7 @@ def _bind_dated_live_selection(engine, proof, bound_members, *, codes, decision,
     from hashlib import sha256
     from pathlib import Path
     from server.common import pit_facts as pit
+    from server.common.formal_source_identity import frozen_source_sha256
     from server.common.qmt_announcement_pit import (
         VALIDATION_INVENTORY_CODE_LIMIT, _assert_pit_fact_schema_prepared,
         _live_announcement_reply_budget,
@@ -202,7 +203,7 @@ def _bind_dated_live_selection(engine, proof, bound_members, *, codes, decision,
     source=proof['source'];batch=proof['batch_id']
     generation=pit.canonical_hash({'schema':'probiga.dated-live-event-selection.v1',
         'batch':proof,'codes':codes,'decision':decision,'start':start,'end':end,
-        'reader':sha256(Path(__file__).read_bytes()).hexdigest(),
+        'reader':frozen_source_sha256(Path(__file__)),
         'rules':sha256(Path(pit.__file__).read_bytes()).hexdigest()})
     members={}
     with engine.connect() as c:
@@ -213,7 +214,7 @@ def _bind_dated_live_selection(engine, proof, bound_members, *, codes, decision,
             for offset in range(0,len(codes),VALIDATION_INVENTORY_CODE_LIMIT):
                 group=codes[offset:offset+VALIDATION_INVENTORY_CODE_LIMIT]
                 key=pit.canonical_hash({'codes':group})
-                expected={code:pit._json_safe(bound_members[code][0]) for code in group}
+                expected={code:pit._json_safe(bound_members[code]) for code in group}
                 retained=coverage_store.get(generation,'dated_live_event_coverage',key) if coverage_store else None
                 fresh=retained is None
                 if fresh:
@@ -248,6 +249,58 @@ def _bind_dated_live_selection(engine, proof, bound_members, *, codes, decision,
     return pit._LiveEventSelection(engine,decision,start,end,MappingProxyType(dict(proof)),MappingProxyType(members))
 
 
+def _validated_live_batch(engine, candidate, *, requested, decision, start, end, source, deadline,
+        include_members, coverage_store):
+    from pathlib import Path
+    from server.common import pit_facts as pit, qmt_announcement_pit as announcement
+    from server.common.formal_source_identity import frozen_source_sha256, _source_sha256
+
+    generation=pit.canonical_hash({'schema':'probiga.dated-live-batch-validation.v1',
+        'candidate':candidate,'codes':requested,'decision':decision,'start':start,'end':end,
+        'reader':frozen_source_sha256(Path(__file__)),'validator':_source_sha256(Path(announcement.__file__))})
+    keys=[str(offset) for offset in range(0,len(requested),400)]
+    retained=None
+    if coverage_store is not None:
+        announcement._assert_pit_fact_schema_prepared(engine)
+        retained=coverage_store.get(generation,'dated_live_batch_proof','complete')
+    if retained is None:
+        bound=[]
+        capture=include_members or coverage_store is not None
+        proof=validate_complete_qmt_announcement_batch(engine,codes=requested,decision_at=decision,
+            window_start=start,window_end=end,source=source,
+            fact_cutoff_at=candidate['covered_through_at'],_required_batch_id=candidate['batch_id'],
+            _deadline_monotonic=deadline,_capture_bound_members=bound.append if capture else None)
+        if capture and (len(bound)!=1 or set(bound[0])!=set(requested)):
+            raise ValueError('dated announcement validated capture differs')
+        members=pit._json_safe({code:row for code,(row,_bindings) in bound[0].items()}) if capture else {}
+        if coverage_store is not None:
+            # A complete proof is reusable before ancestry binding yields its next partition.
+            chunks=coverage_store.put_many(generation,'dated_live_batch_members',{
+                key:{code:members[code] for code in requested[int(key):int(key)+400]} for key in keys})
+            coverage_store.put(generation,'dated_live_batch_proof','complete',{'proof':proof,'chunks':chunks})
+        return proof,members
+    if (type(retained) is not dict or set(retained)!={'proof','chunks'}
+            or type(retained['chunks']) is not dict or type(retained['proof']) is not dict
+            or set(retained['chunks'])!=set(keys)):
+        raise ValueError('dated announcement cached proof framing differs')
+    identities=[retained['chunks'][key] for key in keys]
+    artifacts={}
+    for offset in range(0,len(identities),8):
+        artifacts.update(coverage_store.load_artifacts(identities[offset:offset+8]))
+    members={}
+    for key in keys:
+        part=artifacts[retained['chunks'][key]]
+        if type(part) is not dict or set(part)!=set(requested[int(key):int(key)+400]):
+            raise ValueError('dated announcement cached proof members differ')
+        members.update(part)
+    proof=retained['proof']
+    if (proof.get('status')!='COMPLETE' or proof.get('source')!=source
+            or proof.get('batch_id')!=candidate['batch_id']
+            or normalize_decision_at(proof['fact_cutoff_at'])!=normalize_decision_at(candidate['covered_through_at'])):
+        raise ValueError('dated announcement cached proof identity differs')
+    return proof,members
+
+
 def validate_dated_announcement_batch(engine,*,codes,decision_at,window_start,window_end,expected_trade_date,
         capture_historical_selection=None,capture_live_reuse=None,event_progress=None,
         coverage_store=None,coverage_progress=None,metadata_progress=None):
@@ -261,13 +314,10 @@ def validate_dated_announcement_batch(engine,*,codes,decision_at,window_start,wi
         invalid=[]
         for candidate in candidates:
             if candidate['watermark_kind']!='QUERY_CUTOFF':continue
-            bound=[]
             try:
-                proof=validate_complete_qmt_announcement_batch(engine,codes=requested,decision_at=decision,
-                    window_start=start,window_end=end,source=source,
-                    fact_cutoff_at=candidate['covered_through_at'],_required_batch_id=candidate['batch_id'],
-                    _deadline_monotonic=deadline,
-                    _capture_bound_members=bound.append if capture_historical_selection is not None else None)
+                proof,bound=_validated_live_batch(engine,candidate,requested=requested,decision=decision,
+                    start=start,end=end,source=source,deadline=deadline,
+                    include_members=capture_historical_selection is not None,coverage_store=coverage_store)
             except QMTAnnouncementBlocked as error:
                 if error.reason_code=='QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND':
                     if error.detail!='no-common-batch':invalid.append(error)
@@ -277,8 +327,7 @@ def validate_dated_announcement_batch(engine,*,codes,decision_at,window_start,wi
             if normalize_decision_at(proof['fact_cutoff_at']).date()!=target:
                 raise ValueError('historical announcement validated cutoff differs from target')
             if capture_historical_selection is not None:
-                if len(bound)!=1:raise ValueError('dated announcement validated capture differs')
-                capture_historical_selection(_bind_dated_live_selection(engine,proof,bound[0],codes=requested,
+                capture_historical_selection(_bind_dated_live_selection(engine,proof,bound,codes=requested,
                     decision=decision,start=start,end=end,deadline=deadline,coverage_store=coverage_store,
                     coverage_progress=coverage_progress,event_progress=event_progress,metadata_progress=metadata_progress))
             if capture_live_reuse is not None:capture_live_reuse()

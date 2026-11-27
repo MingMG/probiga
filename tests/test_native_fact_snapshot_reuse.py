@@ -34,6 +34,48 @@ def test_historical_batch_selection_does_not_load_a_later_window():
         target=date(2026,8,24),window_start=date(2026,8,4))
 
 
+def test_completed_live_proof_is_reused_before_resuming_ancestry_budget(monkeypatch):
+    from server.common.formal_analysis_store import FormalAnalysisStore
+    from server.db.formal_analysis_schema import privileged_migrate_formal_analysis_schema
+    from server.engine import native_research_jobs as jobs, strategy_native_backtest as native
+    engine=_engine()
+    catalog=_install_catalog(engine,_catalog(('000001','000001.SZ'),('000002','000002.SZ')))
+    publish(engine,catalog,datetime(2026,8,25,18,20))
+    privileged_migrate_formal_analysis_schema(engine)
+    options=dict(codes=catalog.codes,decision_at=datetime(2026,8,27),window_start=date(2026,8,5),
+        window_end=date(2026,8,25),expected_trade_date='2026-08-25')
+    expected=[]
+    proof=history.validate_dated_announcement_batch(engine,**options,capture_historical_selection=expected.append)
+    clock=[0.]
+    validations=[]
+    validate=history.validate_complete_qmt_announcement_batch
+    def expensive_validation(*args,**kwargs):
+        value=validate(*args,**kwargs)
+        clock[0]+=146  # Production full-batch validation exceeded the 90-second source slice.
+        validations.append(value)
+        return value
+    monkeypatch.setattr(history,'validate_complete_qmt_announcement_batch',expensive_validation)
+    monkeypatch.setattr(jobs.time,'monotonic',lambda:clock[0])
+    monkeypatch.setattr(native,'_save',lambda *_args,**_kwargs:None)
+    monkeypatch.setattr(announcements,'VALIDATION_INVENTORY_CODE_LIMIT',1)
+    state={}
+    store=FormalAnalysisStore(engine)
+    def progress():
+        return jobs._source_progress(None,state,None,'2026-08-25','event_coverage',
+            deadline=clock[0]+90,checkpoint_interval=0)
+    with pytest.raises(jobs.PrepareYield):
+        history.validate_dated_announcement_batch(engine,**options,coverage_store=store,
+            capture_historical_selection=lambda _value:None,coverage_progress=progress())
+    assert state['source_progress']['completed']==1
+    selected=[]
+    actual=history.validate_dated_announcement_batch(engine,**options,coverage_store=store,
+        capture_historical_selection=selected.append,coverage_progress=progress())
+    assert actual==proof and state['source_progress']['completed']==2
+    assert len(validations)==1
+    assert pit._json_safe(selected[0].members)==pit._json_safe(expected[0].members)
+    engine.dispose()
+
+
 def test_full_market_snapshot_reads_fourteen_chunks_with_bounded_artifact_batches():
     # Synthetic identifiers exercise the transport limit; no prices or profits are generated.
     from types import MappingProxyType
