@@ -628,3 +628,56 @@ def test_authorized_fallback_rejects_corrupt_previous_session_hash():
     assert evidence["status"] == PIT_DATA_BLOCKED
     assert evidence["reason"] == "PIT_INDUSTRY_SNAPSHOT_PROVENANCE_INVALID"
     assert evidence.get("previous_session_fallback") is not True
+
+
+def test_concept_retry_resumes_bounded_reads_without_aggregate_or_losing_members(caplog):
+    from sqlalchemy import event
+    from sqlalchemy.exc import OperationalError
+    engine = _concept_reader_engine()
+    with engine.begin() as c:
+        c.execute(text('UPDATE qmt_membership_snapshot_run SET concept_relation_count=321'))
+        c.execute(text('''INSERT INTO qmt_concept_member_snapshot
+            (snapshot_date,source,stock_code,concept_code,concept_name,short_name,quality_status,captured_at)
+            VALUES ('2026-08-11',:source,:code,'A','人工智能','name',
+                    'QMT_VALIDATED','2026-08-11 18:00:00')'''),
+            [{'source':PROVIDER_ID,'code':f'{i:06d}'} for i in range(2,322)])
+    failed = set()
+    sizes = []
+    def interrupt(_c, _cursor, sql, params, _context, _many):
+        if 'FROM qmt_concept_member_snapshot' not in sql:
+            return
+        assert 'COUNT(*)' not in sql
+        if 'WHERE id IN' in sql:
+            sizes.append(len(params))
+            kind = 'members'
+        else:
+            assert 'LIMIT 2048' in sql
+            kind = 'directory'
+        if kind not in failed:
+            failed.add(kind)
+            raise OperationalError(sql, params, Exception(3024, 'maximum execution time exceeded'))
+    event.listen(engine, 'before_cursor_execute', interrupt)
+    try:
+        rows, snapshot = _load_theme_memberships(engine, as_of=date(2026,8,11),
+            decision_at=datetime(2026,8,11,20), codes=[f'{i:06d}' for i in range(1,322)], industries={})
+        assert snapshot == date(2026,8,11) and len(rows) == 321
+        assert failed == {'directory','members'}
+        assert sizes == [160,80,80,160,1]
+        assert 'errno=3024' in caplog.text and 'rows_expected=321' in caplog.text
+        assert 'outcome=split' in caplog.text
+    finally:
+        engine.dispose()
+
+
+def test_concept_coverage_checks_unrequested_members():
+    engine = _concept_reader_engine()
+    with engine.begin() as c:
+        c.execute(text('UPDATE qmt_membership_snapshot_run SET concept_relation_count=2'))
+        c.execute(text('''INSERT INTO qmt_concept_member_snapshot
+            (snapshot_date,source,stock_code,concept_code,concept_name,short_name,quality_status,captured_at)
+            VALUES ('2026-08-11',:source,'000002','A','人工智能','name',
+                    'QMT_VALIDATED','2026-08-11 19:00:00')'''), {'source':PROVIDER_ID})
+    rows, snapshot = _load_theme_memberships(engine, as_of=date(2026,8,11),
+        decision_at=datetime(2026,8,11,20), codes=['000001'], industries={})
+    assert rows == {} and snapshot is None
+    engine.dispose()

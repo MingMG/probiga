@@ -13,6 +13,8 @@ from typing import Any, Iterable
 import pandas as pd
 from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Engine
+from server.common.batch_db import _transient_db_errno
+from server.common.bounded_read import read_id_batches
 
 from integrations.bigqmt.membership_snapshot import _canonical_hash as _membership_hash
 from integrations.bigqmt.reference import PROVIDER_ID
@@ -418,7 +420,9 @@ def _load_theme_memberships(
             )
     as_of_exclusive = datetime.combine(as_of + timedelta(days=1), datetime.min.time())
     cutoff = normalize_decision_at(decision_at) if decision_at is not None else as_of_exclusive
-    deadline = time.monotonic() + 120
+    started = time.monotonic()
+    deadline = started + 120
+    expected_relations = None
     stage = 'RUN'
     try:
         with engine.connect() as connection:
@@ -468,80 +472,110 @@ def _load_theme_memberships(
             if captured_at.date() != snapshot_date or not source_close <= captured_at <= cutoff:
                 return dict(result), None
             verify_prior = snapshot_date != as_of and not allow_research_last_known
-            stage = 'COVERAGE'
-            relation_evidence = connection.execute(
-                text(
-                    """
-                    SELECT /*+ MAX_EXECUTION_TIME(12000) */ COUNT(*) AS relation_count,
-                           MIN(captured_at) AS first_captured_at,
-                           MAX(captured_at) AS last_captured_at
-                    FROM qmt_concept_member_snapshot
-                    WHERE snapshot_date = :snapshot_date
-                      AND source = :source
-                      AND quality_status = 'QMT_VALIDATED'
-                    """
-                ),
-                {
-                    "snapshot_date": snapshot_date,
-                    "source": source,
-                },
-            ).mappings().one()
-            actual_relations = int(
-                relation_evidence.get("relation_count") or 0
-            )
-            first_captured_at = relation_evidence.get("first_captured_at")
-            last_captured_at = relation_evidence.get("last_captured_at")
-            if (
-                expected_relations <= 0
-                or actual_relations != expected_relations
-                or first_captured_at is None or last_captured_at is None
-                or normalize_decision_at(first_captured_at) != normalize_decision_at(captured_at)
-                or normalize_decision_at(last_captured_at) != normalize_decision_at(captured_at)
-            ):
+            if expected_relations <= 0:
                 return dict(result), None
-            stage = 'DIRECTORY'
             if expected_relations > 600000:
                 raise ValueError('concept snapshot exceeds 600000 relations')
+            stage = 'DIRECTORY'
             directory_index = (' FORCE INDEX (uk_qmt_concept_member_snapshot)'
                                if connection.dialect.name == 'mysql' else '')
-            directory = connection.execute(text('''SELECT /*+ MAX_EXECUTION_TIME(12000) */ id,stock_code
-                FROM qmt_concept_member_snapshot''' + directory_index + '''
-                WHERE snapshot_date=:day AND source=:source
-                ORDER BY concept_code,stock_code LIMIT 600001'''),
-                {'day':snapshot_date,'source':source}).mappings().all()
-            ids = [row['id'] for row in directory]
-            if len(ids)>600000 or len(ids)<expected_relations or len(ids)!=len(set(ids)):
-                raise ValueError('concept snapshot directory coverage differs')
-            requested = set(codes)
-            selected = [row['id'] for row in directory if verify_prior or row['stock_code'] in requested]
-            directory_codes = {row['id']:row['stock_code'] for row in directory}
-            primary = ' FORCE INDEX (PRIMARY)' if connection.dialect.name == 'mysql' else ''
-            statement_sql = '''SELECT /*+ MAX_EXECUTION_TIME({timeout_ms}) */ id,snapshot_date,source,
-                stock_code,concept_code,concept_name,short_name,quality_status,captured_at
-                FROM qmt_concept_member_snapshot''' + primary + ' WHERE id IN :ids'
-            rows = []
-            stage = 'MEMBERS'
-            for offset in range(0,len(selected),256):
+
+            def retryable(exc):
+                return _transient_db_errno(exc) in (1205, 1213, 1969, 2003, 2006, 2013, 3024)
+
+            def query(sql, parameters, target=None):
+                target = connection if target is None else target
                 remaining = deadline - time.monotonic()
-                if remaining<=0:
+                if remaining <= 0:
                     raise TimeoutError('concept snapshot read exceeded 120 seconds')
-                batch=selected[offset:offset+256]
-                statement = text(statement_sql.format(timeout_ms=max(1,min(12000,int(remaining*1000))))).bindparams(
-                    bindparam('ids',expanding=True))
-                records=connection.execute(statement,{'ids':batch}).mappings().all()
-                if len(records)!=len(batch) or {row['id'] for row in records}!=set(batch):
+                attempt_started = time.monotonic()
+                try:
+                    return target.execute(text(sql.format(
+                        timeout_ms=max(1, min(12000, int(remaining * 1000))))), parameters).mappings().all()
+                except Exception as exc:
+                    logger.error('concept snapshot read failed: date=%s stage=%s rows_expected=%s '
+                                 'error_type=%s errno=%s error_msg=%s elapsed=%.3fs',
+                                 snapshot_date, stage, expected_relations, type(exc).__name__,
+                                 _transient_db_errno(exc), str(getattr(exc, 'orig', exc))[:500],
+                                 time.monotonic() - attempt_started)
+                    target.rollback()
+                    raise
+
+            directory = []
+            last_concept = last_stock = ''
+            while True:
+                sql = '''SELECT /*+ MAX_EXECUTION_TIME({timeout_ms}) */ id,stock_code,concept_code
+                    FROM qmt_concept_member_snapshot''' + directory_index + '''
+                    WHERE snapshot_date=:day AND source=:source
+                    AND (concept_code>:concept OR (concept_code=:concept AND stock_code>:stock))
+                    ORDER BY concept_code,stock_code LIMIT 2048'''
+                parameters = {'day': snapshot_date, 'source': source,
+                              'concept': last_concept, 'stock': last_stock}
+                page_started = time.monotonic()
+                for attempt in range(3):
+                    try:
+                        page = query(sql, parameters)
+                        break
+                    except Exception as exc:
+                        if attempt == 2 or not retryable(exc):
+                            raise
+                logging.getLogger('server.native_replay.timing').info(
+                    'concept-snapshot-directory batch=2048 elapsed=%.3fs rows=%d',
+                    time.monotonic() - page_started, len(page))
+                directory.extend(page)
+                if len(directory) > 600000:
+                    raise ValueError('concept snapshot exceeds 600000 relations')
+                if len(page) < 2048:
+                    break
+                last_concept, last_stock = page[-1]['concept_code'], page[-1]['stock_code']
+            ids = [row['id'] for row in directory]
+            if len(ids) < expected_relations or len(ids) != len(set(ids)):
+                raise ValueError('concept snapshot directory coverage differs')
+            directory_codes = {row['id']: row['stock_code'] for row in directory}
+            primary = ' FORCE INDEX (PRIMARY)' if connection.dialect.name == 'mysql' else ''
+            stage = 'MEMBERS'
+
+            def fetch(batch, target=None):
+                sql = '''SELECT /*+ MAX_EXECUTION_TIME({timeout_ms}) */ id,snapshot_date,source,
+                    stock_code,concept_code,concept_name,short_name,quality_status,captured_at
+                    FROM qmt_concept_member_snapshot''' + primary + ' WHERE id IN (' + ','.join(
+                        ':id' + str(index) for index in range(len(batch))) + ')'
+                records = query(sql, {'id' + str(index): value for index, value in enumerate(batch)}, target)
+                if len(records) != len(batch) or {row['id'] for row in records} != set(batch):
                     raise ValueError('concept snapshot member IDs differ')
-                for row in records:
-                    if str(row['snapshot_date'])[:10]!=snapshot_date.isoformat() or row['source']!=source:
-                        raise ValueError('concept snapshot member scope differs')
-                    if row['stock_code']!=directory_codes[row['id']]:
-                        raise ValueError('concept snapshot member security differs')
-                    if row['quality_status']=='QMT_VALIDATED':
-                        if normalize_decision_at(row['captured_at'])!=captured_at:
-                            raise ValueError('concept snapshot member clock differs')
-                        rows.append(row)
-            if time.monotonic()>=deadline:
-                raise TimeoutError('concept snapshot read exceeded 120 seconds')
+                return records
+
+            def read_members(part, target):
+                return read_id_batches(part, lambda batch: fetch(batch, target), deadline=deadline,
+                    retryable=retryable, logger=logger, stage='concept-snapshot-members', size=160)
+
+            if connection.dialect.name == 'mysql' and len(ids) > 160:
+                from concurrent.futures import ThreadPoolExecutor
+                def worker(part):
+                    with engine.connect() as target:
+                        return read_members(part, target)
+                # Two readers bound round trips without exhausting the scheduler's pool.
+                middle = ((len(ids) + 319) // 320) * 160
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    futures = [pool.submit(worker, part) for part in (ids[:middle], ids[middle:])]
+                    records = [row for future in futures for row in future.result()]
+            else:
+                records = read_members(ids, connection)
+            rows = []
+            for row in records:
+                if str(row['snapshot_date'])[:10] != snapshot_date.isoformat() or row['source'] != source:
+                    raise ValueError('concept snapshot member scope differs')
+                if row['stock_code'] != directory_codes[row['id']]:
+                    raise ValueError('concept snapshot member security differs')
+                if row['quality_status'] == 'QMT_VALIDATED':
+                    if normalize_decision_at(row['captured_at']) != captured_at:
+                        return dict(result), None
+                    rows.append(row)
+            if len(rows) != expected_relations:
+                return dict(result), None
+            if not verify_prior:
+                requested = set(codes)
+                rows = [row for row in rows if row['stock_code'] in requested]
             rows.sort(key=lambda row:(row['stock_code'],row['concept_code']))
             if verify_prior:
                 identities = [
@@ -558,7 +592,13 @@ def _load_theme_memberships(
                 requested = set(codes)
                 rows = [row for row in rows if row["stock_code"] in requested]
     except Exception as exc:
-        raise RuntimeError('QMT_CONCEPT_SNAPSHOT_READ_FAILED:' + stage + ':' + type(exc).__name__) from exc
+        errno = _transient_db_errno(exc)
+        logger.error('concept snapshot failed: date=%s stage=%s rows_expected=%s '
+                     'error_type=%s errno=%s error_msg=%s elapsed=%.3fs',
+                     as_of, stage, expected_relations, type(exc).__name__, errno,
+                     str(getattr(exc, 'orig', exc))[:500], time.monotonic() - started)
+        raise RuntimeError('QMT_CONCEPT_SNAPSHOT_READ_FAILED:' + stage + ':' +
+                           type(exc).__name__ + ':errno=' + str(errno)) from exc
     recorded_at = captured_at
     if recorded_at.tzinfo is None or recorded_at.utcoffset() is None:
         recorded_at = recorded_at.replace(tzinfo=MARKET_TIMEZONE)

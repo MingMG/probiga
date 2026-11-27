@@ -63,3 +63,13 @@ def test_frozen_checkpoint_identity_requires_exact_transport_source(tmp_path):
     edited = tmp_path / path.name
     edited.write_bytes(path.read_bytes() + b"\n# unrelated change\n")
     assert frozen_source_sha256(edited) != prior
+
+
+def test_concept_transport_preserves_frozen_input_identity_only_for_reviewed_bytes(tmp_path):
+    from server.common.formal_source_identity import _source_sha256
+    path = Path(__file__).resolve().parents[1] / 'server/trading_v3/daily_features.py'
+    frozen = '2778aecde7730763b9e6decf07ff3785e43b515865f7e1f7e67633902863e3a2'
+    assert frozen_source_sha256(path) == frozen
+    edited = tmp_path / path.name
+    edited.write_bytes(path.read_bytes() + b'\n# unrelated edit\n')
+    assert frozen_source_sha256(edited) != frozen

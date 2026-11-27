@@ -277,3 +277,24 @@ def test_feature_decode_progress_only_counts_successful_day_reads_per_attempt(mo
     with pytest.raises(native.NativeStepDeadline,match='FEATURE_ATTEMPT_DEADLINE'):
         expired.get_tree(first)
     assert state['completed_units']==101
+
+
+def test_context_retry_keeps_completed_days_and_source_references(queue, monkeypatch):
+    state, owner = start(queue)
+    day = '2026-11-18'
+    state.update(status='FAILED', phase='PREPARE_DAYS', current_unit='PREPARE context '+day,
+                 completed_units=81, total_units=105,
+                 day_inputs={day:{key:{'sha256':key+'-verified'} for key in ('selection','finance','events')}},
+                 source_progress={'dataset':'event_facts','completed':4750,'total':4750})
+    with queue.connect() as connection:
+        jobs.checkpoint(connection,state,owner)
+    monkeypatch.setattr(native,'_contract',lambda:'math')
+    request=control.request_retry(queue,'native:'+state['run_id']+':'+('d'*64),'8'*32)
+    assert request['target_run_id']==state['run_id']
+    with queue.connect() as connection:
+        saved=native.read_runs(connection,state['run_id'])[0]
+        for key in ('phase','current_unit','completed_units','total_units','day_inputs',
+                    'source_progress','requested_at','price_cutoff','producer_identity'):
+            assert saved[key]==state[key]
+        assert saved['job_id']==state['job_id']
+        assert connection.execute(text('SELECT COUNT(*) FROM st_job_v2')).scalar()==1

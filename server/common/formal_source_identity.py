@@ -7,6 +7,10 @@ from pathlib import Path
 # Exact transport-only revisions proved equivalent to the existing frozen input
 # contract. Any other bytes receive a new identity and cannot resume that input.
 _EQUIVALENT = {
+    "daily_features.py": (
+        "7f79d5b2773f6e6e2bf5da8d051c7b5e5c9f438fadf2a9a2d2c86637d15280bf",
+        "2778aecde7730763b9e6decf07ff3785e43b515865f7e1f7e67633902863e3a2",
+    ),
     "pit_facts.py": (
         "aeaf9ae3d31145a4e19fb8b86202b1f16d492ca0fe6512b52a0300a847493256",
         "9cc2a928536be3f6ed84e9bd2f16e947129fc5a4d78d85b9c5a06b417c88a4b8",
@@ -34,7 +38,7 @@ def _source_sha256(path: Path) -> str:
 def frozen_source_sha256(path: Path) -> str:
     observed = _source_sha256(path)
     new, frozen = _EQUIVALENT.get(path.name, ("", ""))
-    if path.name == "pit_facts.py":
+    if path.name in ("pit_facts.py", "daily_features.py"):
         transport = _source_sha256(Path(__file__).with_name("bounded_read.py"))
         if observed == new and transport == _BOUNDED_READ_SHA256:
             return frozen
