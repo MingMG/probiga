@@ -8,8 +8,9 @@ from starlette.responses import JSONResponse
 from integrations.qmt.datadir_import import Universe, UniverseMember
 from server.api.routers import hot_data
 from server.common import qmt_datadir_daily_coverage as coverage
+from server.common.qmt_history_coverage import coverage_table_ddl_statements
 from server.db.formal_analysis_schema import privileged_migrate_formal_analysis_schema
-from tests.test_qmt_datadir_daily_coverage import CUTOFF, DAY, IPO, SUSPENDED, TRADED, authorities, bar, snapshot
+from tests.test_qmt_datadir_daily_coverage import CUTOFF, DAY, IPO, SUSPENDED, TRADED, authorities, bar, listing, snapshot
 from tests.test_qmt_datadir_import import _epoch, _record, _write
 from tools import import_qmt_datadir_daily as daily
 
@@ -28,12 +29,47 @@ def test_stock_detail_serializes_missing_event_evidence_as_null(monkeypatch, sto
     assert JSONResponse(jsonable_encoder({"analysis_snapshot": snapshot})).status_code == 200
 
 
-def test_partial_daily_bar_reaches_stock_detail_and_portfolio_only_after_persistence(monkeypatch, tmp_path):
+def _promote_daily(engine, *, full, harvested, root, finished):
+    day = full["trade_date"]
+    with engine.begin() as connection:
+        connection.connection.driver_connection.create_function("current_timestamp", 0, lambda: finished)
+        connection.execute(text("""INSERT INTO sm_stock_kline
+            (stock_code,trade_time,trade_date,open,close,high,low,volume,amount,pre_close,
+             data_source,k_type,adjust_type,quality_status,permission_status,`change`,change_pct,
+             qmt_code,source_time,received_at,batch_id,data_version)
+            VALUES (:stock_code,:event_at,:trade_date,:open,:close,:high,:low,:volume,:amount,:pre_close,
+                    'qmt_datadir',1,0,'VERIFIED','SUPPORTED',:change,:change_pct,:symbol,:event_at,:known,:batch,'qmt_datadir_v1')
+        """), [{**{k: str(v) for k, v in row.items()}, "symbol": row["stock_code"] + ".SH",
+                "event_at": day + " 15:00:00", "known": finished, "batch": full["run_id"]}
+               for row in daily._harvested_daily_rows(harvested)])
+        fingerprint = daily._completion_fingerprint(connection, day=day, proof=full)
+        coverage.insert_manifest(connection, full)
+        daily.write_receipt(connection, dataset="stock_daily", session=datetime.fromisoformat(day).date(),
+                            root=str(root), status="COMPLETE", run_id=full["run_id"],
+                            row_count=fingerprint["row_count"], code_count=fingerprint["code_count"],
+                            content_sha256=harvested["digest"], finished=True,
+                            detail={"full_market_manifest_hash": full["manifest_hash"], "row_hash": fingerprint["row_hash"],
+                                    "coverage": 1.0, "eligible_code_count": len(full["entities"]),
+                                    "readback_rows": fingerprint["row_count"], "readback_codes": fingerprint["code_count"]})
+        connection.execute(text("DELETE FROM qmt_datadir_import_partition WHERE dataset=:attempt AND trade_date=:day"),
+                           {"attempt": daily.ATTEMPT_DATASET, "day": day})
+
+
+def test_daily_close_reaches_stock_detail_and_holdings_through_exact_publication(monkeypatch, tmp_path, caplog):
     known_at = DAY + " 20:01:00"
     engine = create_engine("sqlite://")
-    event.listen(engine, "connect", lambda db, _: db.create_function("NOW", 0, lambda: known_at))
     privileged_migrate_formal_analysis_schema(engine)
     with engine.begin() as connection:
+        connection.connection.driver_connection.create_function("NOW", 0, lambda: known_at)
+        for ddl in coverage_table_ddl_statements():
+            # Keep the published column/PK/FK definitions, omit MySQL secondary-index syntax.
+            connection.exec_driver_sql(ddl.split(",\n            KEY ", 1)[0] + ")")
+        connection.exec_driver_sql("""CREATE TABLE sm_stock_kline (
+            stock_code TEXT,trade_time TEXT,trade_date TEXT,open REAL,close REAL,high REAL,low REAL,
+            volume REAL,amount REAL,pre_close REAL,data_source TEXT,k_type INT,adjust_type INT,
+            quality_status TEXT,permission_status TEXT,`change` REAL,change_pct REAL,qmt_code TEXT,
+            source_time TEXT,received_at TEXT,batch_id TEXT,data_version TEXT,
+            PRIMARY KEY(stock_code,trade_date,k_type,adjust_type))""")
         connection.execute(text("""CREATE TABLE qmt_datadir_import_partition (
             dataset TEXT,trade_date DATE,source_root TEXT,status TEXT,code_count INT,row_count INT,
             content_sha256 TEXT,run_id TEXT,started_at TEXT,finished_at TEXT,detail_json TEXT,
@@ -41,11 +77,15 @@ def test_partial_daily_bar_reaches_stock_detail_and_portfolio_only_after_persist
     monkeypatch.setattr(daily, "_daily_transaction", lambda db: db.begin())
     catalog, calendar = authorities()
     day = datetime.fromisoformat(DAY).date()
-    symbol = TRADED + ".SH"
-    universe = Universe({symbol: UniverseMember(symbol, "SH", TRADED)}, {symbol: (DAY, None)})
+    other = "600001"
+    eligible = [*catalog.eligible_codes(DAY), other]
+    catalog.eligible_codes = lambda target: sorted(eligible)
+    members = {code+".SH": UniverseMember(code+".SH", "SH", code) for code in (TRADED, other)}
+    universe = Universe(members, {symbol: (DAY, None) for symbol in members})
     record = _record("15:00", 10000, 11000, 10000, 11000, 1, 1100, 10000)
     record[0] = _epoch("15:00", day)
-    _write(tmp_path / "SH" / daily.DAILY_PERIOD / (TRADED + ".DAT"), [record])
+    for code in (TRADED, other):
+        _write(tmp_path / "SH" / daily.DAILY_PERIOD / (code + ".DAT"), [record])
     harvested = daily._harvest(tmp_path, universe, day, isolate_invalid=True)
     proof = coverage.build_manifest(catalog=catalog, calendar=calendar, day=DAY,
                                     rows=daily._harvested_daily_rows(harvested),
@@ -86,6 +126,38 @@ def test_partial_daily_bar_reaches_stock_detail_and_portfolio_only_after_persist
     hot_data._attach_verified_display_bars(rows, DAY)
     assert rows[0]["verified_daily_bar"] == observed and rows[0]["cur_price"] == 8
     assert all("verified_daily_bar" not in row for row in rows[1:])
+
+    full = coverage.build_manifest(catalog=catalog, calendar=calendar, day=DAY, rows=daily._harvested_daily_rows(harvested),
+                                   run_id="daily-display-exact", captured_at=DAY + " 20:02:00",
+                                   snapshot=snapshot(), listings=listing())
+    known_at = DAY + " 20:03:00"
+    _promote_daily(engine, full=full, harvested=harvested, root=tmp_path, finished=known_at)
+    assert daily.load_receipt(engine, dataset=daily.ATTEMPT_DATASET, trade_date=DAY) is None
+    Clock.moment = DAY + " 20:02:59"
+    assert "verified_daily_bar" not in hot_data.stock_detail(TRADED)
+    Clock.moment = known_at
+    queries = []
+    event.listen(engine, "before_cursor_execute", lambda _, __, sql, *args: queries.append(sql.lower()))
+    exact = hot_data.stock_detail(TRADED)
+    assert exact["verified_daily_bar"] == {**observed, "known_at": known_at}
+    assert exact["market"] == old["market"] and exact["analysis_trade_date"] == old["analysis_trade_date"]
+    holdings = [position(code, "", pnl=0) for code in (TRADED, IPO, SUSPENDED[0])]
+    hot_data._attach_verified_display_bars(holdings, DAY)
+    assert holdings[0]["verified_daily_bar"] == exact["verified_daily_bar"]
+    assert all(row["pnl"] == 0 and row["cur_price"] == 8 for row in holdings)
+    assert all("verified_daily_bar" not in row for row in holdings[1:])
+    assert not any("order by stock_code" in sql and "stock_code in" not in sql for sql in queries)
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE sm_stock_kline SET amount=amount+1 WHERE stock_code=:c"), {"c": other})
+    pair = [position(code, "") for code in (other, TRADED)]
+    hot_data._attach_verified_display_bars(pair, DAY)
+    assert "verified_daily_bar" not in pair[0] and pair[1]["verified_daily_bar"] == exact["verified_daily_bar"]
+    assert other in caplog.text
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE qmt_datadir_import_partition SET run_id='mismatched' WHERE dataset='stock_daily'"))
+    batch = [position(code, "") for code in (TRADED, other)]
+    hot_data._attach_verified_display_bars(batch, DAY)
+    assert all("verified_daily_bar" not in row and row["cur_price"] == 8 for row in batch)
     closed = position(TRADED, DAY, quote_status="closed", quote_snapshot_at=DAY + " 15:00:00")
     monkeypatch.setattr(hot_data, "get_engine", lambda: pytest.fail("unexpected read"))
     hot_data._attach_verified_display_bars([closed], DAY)
@@ -100,7 +172,7 @@ def test_corrupt_optional_evidence_preserves_stock_detail_and_holdings(monkeypat
         raise error
 
     monkeypatch.setattr(hot_data, "get_engine", object)
-    monkeypatch.setattr(hot_data, "read_verified_attempt_bars", corrupt)
+    monkeypatch.setattr(hot_data, "read_verified_daily_display_bars", corrupt)
     records = []
     monkeypatch.setattr(hot_data, "_record_fallback", lambda stage, exc: records.append((stage, exc)))
     cached = {"stock_code": TRADED, "market": {"price": 8}, "quote_trade_date": "2026-10-30",
