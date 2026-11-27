@@ -124,7 +124,7 @@ def test_missing_security_requires_replayable_listing_source_not_ipo_price():
         manifest(listings=bad)
 
 
-def database(monkeypatch):
+def database(monkeypatch, *, listings=None):
     catalog, calendar = authorities()
     engine = create_engine("sqlite+pysqlite:///:memory:")
     columns = "manifest_hash schema_version dataset period provider trade_date status strategy_eligible run_id catalog_batch_id catalog_manifest_hash calendar_batch_id calendar_manifest_hash source_batch_id grid_profile expected_entity_count entity_count expected_traded_count actual_traded_count no_trade_count bar_count expected_entity_set_hash expected_traded_set_hash actual_traded_set_hash no_trade_set_hash entity_root_hash reason_count captured_at manifest_json created_at".split()
@@ -133,7 +133,7 @@ def database(monkeypatch):
         connection.execute(text("CREATE TABLE qmt_history_coverage_entity (manifest_hash TEXT,stock_code TEXT,expected_state TEXT,classification TEXT,bar_count INTEGER,time_set_hash TEXT,first_time TEXT,last_time TEXT,source_row_hash TEXT,row_hash TEXT,created_at TEXT,PRIMARY KEY(manifest_hash,stock_code))"))
         connection.execute(text("CREATE TABLE sm_stock_kline (stock_code TEXT,trade_date TEXT,open REAL,close REAL,high REAL,low REAL,volume REAL,amount REAL,pre_close REAL,data_source TEXT,k_type INTEGER,adjust_type INTEGER,quality_status TEXT,permission_status TEXT)"))
         connection.execute(text("INSERT INTO sm_stock_kline VALUES (:stock_code,:trade_date,:open,:close,:high,:low,:volume,:amount,:pre_close,'qmt_datadir',1,0,'VERIFIED','SUPPORTED')"), bar())
-        coverage.insert_manifest(connection, manifest())
+        coverage.insert_manifest(connection, manifest(listings=listings or listing()))
     monkeypatch.setattr(coverage, "load_stock_catalog", lambda *args, **kwargs: catalog)
     monkeypatch.setattr(coverage, "load_trade_calendar_receipt", lambda *args, **kwargs: calendar)
     return engine
@@ -853,6 +853,38 @@ def test_official_listing_snapshot_is_reused_until_its_listing_date(monkeypatch)
     retained = coverage.retained_listing_evidence(engine, [IPO], target_date=DAY, decision_known_at=CUTOFF)
     assert retained[IPO]["listing_date"] == "2026-11-03"
     assert coverage.retained_listing_evidence(engine, [IPO], target_date="2026-11-03", decision_known_at=datetime(2026, 11, 3, 20)) == {}
+    engine.dispose()
+
+
+def test_prelisting_issuance_survives_daily_and_minute_readback_without_an_invented_listing_date(monkeypatch):
+    from server.common.official_listing_evidence import ISSUANCE_SCHEMA
+    from server.common.qmt_datadir_minute_coverage import trade_scope
+    from tools.crawl_minute_kline import verified_no_trade_codes
+
+    document = (
+        "示例股份有限公司首次公开发行股票并在创业板上市发行公告。"
+        "发行人股票简称为“示例”，股票代码为“001381”，该简称和代码同时用于本次发行。"
+        "确保其资金账户在2026年11月3日（T+2日）日终有足额的新股认购资金。"
+    )
+    evidence = {
+        "schema": ISSUANCE_SCHEMA, "stock_code": IPO, "not_listed_through": "2026-11-03",
+        "publication_date": DAY, "captured_at": DAY + "T19:50:00+08:00", "announcement_id": "1225646928",
+        "source_url": "https://static.cninfo.com.cn/finalpage/2026-11-02/1225646928.PDF",
+        "source_text": document, "source_text_sha256": hashlib.sha256(document.encode()).hexdigest(),
+        "official_document_sha256": "e" * 64,
+    }
+    engine = database(monkeypatch, listings={IPO: evidence})
+    catalog, _ = authorities()
+    assert trade_scope(engine, DAY, decision_known_at=CUTOFF)["codes"] == (TRADED,)
+    absent, _ = verified_no_trade_codes(engine, catalog, trade_date=DAY, decision_known_at=CUTOFF)
+    assert absent == set((*SUSPENDED, IPO))
+    for day, expected in (("2026-11-01", False), (DAY, True), ("2026-11-03", True), ("2026-11-04", False)):
+        result = coverage.retained_listing_evidence(engine, [IPO], target_date=day,
+                                                    decision_known_at=CUTOFF, include_issuance=True)
+        assert bool(result) is expected
+        if expected:
+            assert result[IPO]["not_listed_through"] == "2026-11-03" and "listing_date" not in result[IPO]
+    assert not coverage.retained_listing_evidence(engine, [IPO], target_date=DAY, decision_known_at=CUTOFF)
     engine.dispose()
 
 

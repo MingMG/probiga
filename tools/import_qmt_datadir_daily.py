@@ -25,6 +25,7 @@ if str(ROOT) not in sys.path:
 from integrations.qmt.datadir import (  # noqa: E402
     CST,
     DAILY_PERIOD,
+    DatadirError,
     WORD_TIME,
     iter_daily_rows,
     load_dat,
@@ -33,6 +34,7 @@ from integrations.qmt.datadir import (  # noqa: E402
 from integrations.qmt.datadir_import import (  # noqa: E402
     load_universe,
     new_run_id,
+    write_receipt,
 )
 from server.common.authoritative_market_clock import (  # noqa: E402
     authoritative_closed_trade_date,
@@ -162,35 +164,81 @@ def _short_names(engine) -> dict[str, str]:
     }
 
 
-def _harvest(root: Path, universe, session: dt.date, *, deadline=None) -> dict:
+_DAILY_ROW_FIELDS = ("stock_code", "trade_time", "trade_date", "open", "close", "high", "low",
+                     "volume", "amount", "pre_close", "change", "change_pct")
+
+
+def _harvest(root: Path, universe, session: dt.date, *, deadline=None, isolate_invalid=False, retained_loader=None) -> dict:
     rows = []
+    cached = None
+    records = {}
+    reused_codes = 0
     codes = set()
+    invalid = {}
     digest = hashlib.sha256()
     for member in universe.ordered():
         if deadline is not None and time.monotonic() >= deadline:
             raise TimeoutError(f"historical daily DAT harvest deadline exceeded for {session}")
-        dat = load_dat(root, member.market, DAILY_PERIOD, member.code)
+        try:
+            dat = load_dat(root, member.market, DAILY_PERIOD, member.code)
+        except (DatadirError, OSError) as exc:
+            if not isolate_invalid:
+                raise
+            invalid[member.code] = str(exc)[:240]
+            continue
         if dat is None:
             continue
         selected = session_slice(dat.records, session)
         if not len(selected):
             continue
+        if isolate_invalid and len(selected) != 1:
+            invalid[member.code] = f"duplicate target-day native bars: {len(selected)}"
+            continue
+        raw = selected.tobytes()
+        if cached is None:
+            cached = retained_loader() if retained_loader is not None else {}
+        prior = cached.get(member.qmt_code)
+        record_hash = hashlib.sha256(raw).hexdigest() if isolate_invalid else None
+        if prior and prior["record_sha256"] == record_hash:
+            values = prior["values"]
+            decoded = [(member.code, dt.datetime.combine(session, dt.time()), session,
+                        *(Decimal(value) for value in values))]
+            reused_codes += 1
+        else:
+            decoded = [row for _, row in iter_daily_rows(replace(dat, records=selected), [session])]
+        if isolate_invalid:
+            volume, amount = decoded[0][7:9]
+            if volume == amount == 0:
+                # QMT can repeat prices for an inactive security. The native
+                # bar itself supplies no reason for the absence of trading.
+                continue
+            if volume == 0 or amount == 0:
+                invalid[member.code] = "native daily volume and amount disagree"
+                continue
+            try:
+                canonical_bar(dict(zip(_DAILY_ROW_FIELDS, decoded[0])))
+            except (ValueError, ArithmeticError) as exc:
+                invalid[member.code] = str(exc)[:240]
+                continue
+            records[member.qmt_code] = {"record_sha256": record_hash,
+                                         "values": [str(value) for value in decoded[0][3:]]}
         digest.update(member.qmt_code.encode("ascii"))
-        digest.update(selected.tobytes())
-        for _, row in iter_daily_rows(replace(dat, records=selected), [session]):
+        digest.update(raw)
+        for row in decoded:
             rows.append(row)
             codes.add(row[0])
     return {
         "rows": rows,
         "codes": codes,
         "digest": digest.hexdigest(),
+        "invalid_codes": invalid,
+        "native_records": records,
+        "reused_codes": reused_codes,
     }
 
 
 def _harvested_daily_rows(harvested):
-    fields = ("stock_code", "trade_time", "trade_date", "open", "close", "high", "low",
-              "volume", "amount", "pre_close", "change", "change_pct")
-    return [dict(zip(fields, row)) for row in harvested["rows"]]
+    return [dict(zip(_DAILY_ROW_FIELDS, row)) for row in harvested["rows"]]
 
 
 def _completion_fingerprint(engine, *, day, proof):
@@ -242,8 +290,83 @@ def _reusable_partition(engine, *, session, harvested):
     return proof
 
 
+ATTEMPT_DATASET = "stock_daily_attempt"
+
+
+def _retained_native_records(engine, *, day, source_root):
+    from server.common.formal_analysis_store import FormalAnalysisStore
+
+    receipt = load_receipt(engine, dataset=ATTEMPT_DATASET, trade_date=day)
+    if receipt is None or receipt["source_root"] != str(source_root):
+        return {}
+    return FormalAnalysisStore(engine).load_artifact(receipt["detail"]["native_records_sha256"])
+
+
+def _retained_daily_attempt(engine, *, day, catalog, source_root):
+    from server.common.formal_analysis_store import FormalAnalysisStore
+
+    receipt = load_receipt(engine, dataset=ATTEMPT_DATASET, trade_date=day)
+    completion = load_receipt(engine, dataset=DATASET, trade_date=day)
+    previous = ((receipt or {}).get("run_id"), (completion or {}).get("run_id"))
+    if receipt is None:
+        return previous, {}
+    detail = receipt["detail"]
+    if (receipt["source_root"] != str(source_root)
+            or detail["catalog_member_set_hash"] != catalog.member_set_hash):
+        return previous, {}
+    # A bar always wins over an earlier no-bar observation. Reload only the
+    # unresolved partition's verified lifecycle facts, not the market's bars.
+    hashes = detail["no_bar_artifacts"]
+    store = FormalAnalysisStore(engine)
+    keys = list(hashes)
+    facts = {}
+    for offset in range(0, len(keys), 8):
+        codes = keys[offset:offset + 8]
+        payloads = store.load_artifacts([hashes[code] for code in codes])
+        for code in codes:
+            item = payloads[hashes[code]]
+            if item["stock_code"] != code or item["classification"] not in {"NOT_LISTED", "NO_TRADE", "DELISTED"}:
+                raise ValueError("daily checkpoint security identity differs: " + code)
+            facts[code] = item
+    return previous, facts
+
+
+def _save_daily_attempt(engine, *, proof, source_root, harvested, previous_run):
+    from server.common.formal_analysis_store import FormalAnalysisStore
+
+    day = proof["trade_date"]
+    rows = [item["evidence"] for item in proof["entities"] if item["classification"] == "TRADED"]
+    no_bar = {item["stock_code"]: item for item in proof["entities"] if item["classification"] != "TRADED"}
+    generation = proof["manifest_hash"]
+    with _daily_transaction(engine) as connection:
+        current = load_receipt(connection, dataset=ATTEMPT_DATASET, trade_date=day)
+        complete = load_receipt(connection, dataset=DATASET, trade_date=day)
+        if ((current or {}).get("run_id"), (complete or {}).get("run_id")) != previous_run:
+            raise RuntimeError("daily coverage checkpoint advanced during source read: " + day)
+        store = FormalAnalysisStore(connection)
+        hashes = store.put_many(generation, "daily_attempt", {"bars": rows, "native": harvested["native_records"]})
+        evidence = {}
+        for offset in range(0, len(no_bar), 32):
+            codes = list(no_bar)[offset:offset+32]
+            evidence.update(store.put_many(generation, "daily_attempt", {code: no_bar[code] for code in codes}))
+        detail = {key: proof[key] for key in ("captured_at", "catalog_batch_id", "catalog_manifest_hash",
+                  "catalog_member_set_hash", "calendar_batch_id", "calendar_manifest_hash", "unresolved_codes")}
+        detail.update(schema="probiga.qmt-daily-attempt.v1", strategy_eligible=False,
+                      eligible_code_count=len(proof["entities"]) + len(proof["unresolved_codes"]),
+                      bars_artifact_sha256=hashes["bars"], no_bar_artifacts=evidence, manifest_hash=generation,
+                      native_records_sha256=hashes["native"], reused_native_code_count=harvested["reused_codes"])
+        write_receipt(connection, dataset=ATTEMPT_DATASET, session=dt.date.fromisoformat(day),
+                      root=str(source_root), status="BLOCKED", run_id=proof["run_id"],
+                      row_count=len(rows), code_count=len(rows), content_sha256=harvested["digest"],
+                      detail=detail, finished=True)
+        checked = load_receipt(connection, dataset=ATTEMPT_DATASET, trade_date=day)
+        if not checked or checked["detail"] != detail or checked["run_id"] != proof["run_id"]:
+            raise ValueError("daily attempt receipt readback differs: " + day)
+
+
 def _coverage_manifest(engine, *, session, harvested, run_id, historical_documents=None,
-                       historical_public_bars=None, previous_session="", archive_native_evidence=False):
+                       historical_public_bars=None, previous_session="", archive_native_evidence=False,
+                       attempt_root=None, save_partial=False):
     """Account for every catalog security before touching the live partition."""
     cutoff = dt.datetime.now(CST).replace(tzinfo=None, microsecond=0)
     day = session.isoformat()
@@ -298,48 +421,94 @@ def _coverage_manifest(engine, *, session, harvested, run_id, historical_documen
             native_content_sha256=harvested["digest"] if archive_native_evidence else "",
         )
         return validate_manifest(manifest, catalog=catalog, calendar=calendar) if archive_native_evidence else manifest
+    from server.common.official_listing_evidence import (
+        MAX_CODES, OfficialListingEvidenceError, load_official_listing_evidence,
+    )
+    allow_partial = attempt_root is not None
+    invalid = dict(harvested.get("invalid_codes", {}))
+    prior_run, retained = (None, None), {}
+    pending = dict(invalid)
+    if allow_partial and missing:
+        # Check every common boundary before making bounded issuer requests or
+        # creating a checkpoint. Invalid source scope cannot become no-trade.
+        if (calendar.sessions_between(day, day) != [day] or
+                cutoff < dt.datetime.combine(session, dt.time(15, 35))):
+            raise ValueError("daily target is not an authoritative closed session")
+        actual = {row["stock_code"] for row in rows}
+        expected = set(catalog.eligible_codes(day))
+        if (not expected or actual != harvested["codes"] or len(actual) != len(rows)
+                or not actual <= expected or not set(invalid) <= expected - actual
+                or any(str(row["trade_date"])[:10] != day for row in rows)):
+            raise ValueError("daily checkpoint source differs from independent catalog or target date")
+        prior_run, retained = _retained_daily_attempt(engine, day=day, catalog=catalog, source_root=attempt_root)
+        retained = {k: v for k, v in retained.items() if k in expected - actual - invalid.keys()}
     snapshot = {}
     unresolved = []
-    delisting_documents = {}
-    if missing:
+    delisting_documents, listings, suspensions = {}, {}, {}
+    errors = []
+    investigate = [code for code in missing if code not in retained and code not in invalid]
+    if investigate:
         from integrations.bigqmt.spool import read_snapshot
         try:
             snapshot = read_snapshot("full", max_age_seconds=None)
         except (OSError, ValueError):
             snapshot = {}
-        # Catalog reads may take time while the native snapshot keeps polling.
-        # Bind the observation to the time it was actually read, not the
-        # earlier instant at which the database authority lookup began.
         cutoff = dt.datetime.now(CST).replace(tzinfo=None, microsecond=0)
-        for code in missing:
+        for code in investigate:
             try:
                 suspension_evidence(snapshot, code, day, cutoff)
             except (ValueError, KeyError, TypeError, OverflowError):
                 unresolved.append(code)
+    if allow_partial and len(unresolved) > MAX_CODES:
+        pending.update(dict.fromkeys(unresolved, "COMMON_DAILY_SOURCE_GAP"))
+        unresolved = []
     if unresolved:
         expirations = sorted(set(unresolved).intersection(
             str(member["stock_code"]) for member in catalog.members if member.get("expire_date") == day
         ))
-        if expirations:
-            delisting_documents = load_daily_delisting_documents(expirations, target_date=day)
-            unresolved = sorted(set(unresolved) - set(delisting_documents))
-    listings = {}
+        try:
+            for offset in range(0, len(expirations), 20):
+                delisting_documents.update(load_daily_delisting_documents(expirations[offset:offset+20], target_date=day))
+        except RuntimeError as exc:
+            if not allow_partial or not str(exc).startswith("historical_lifecycle_document:"):
+                raise
+            errors.append(str(exc))
+        unresolved = sorted(set(unresolved) - set(delisting_documents))
     if unresolved:
         listings = retained_listing_evidence(
-            engine, unresolved, target_date=day, decision_known_at=cutoff,
+            engine, unresolved, target_date=day, decision_known_at=cutoff, include_issuance=True,
         )
         unresolved = sorted(set(unresolved) - set(listings))
     if unresolved:
-        from server.common.official_listing_evidence import load_official_listing_evidence
-        listings.update(load_official_listing_evidence(
-            unresolved, target_date=day, deadline_seconds=20,
-        ))
+        try:
+            listings.update(load_official_listing_evidence(
+                unresolved, target_date=day, deadline_seconds=20, include_issuance=True,
+            ))
+        except OfficialListingEvidenceError as exc:
+            if not allow_partial:
+                raise
+            errors.append(str(exc))
         unresolved = sorted(set(unresolved) - set(listings))
-    suspensions = load_daily_suspension_documents(unresolved, target_date=day) if unresolved else {}
+    try:
+        for offset in range(0, len(unresolved), 20):
+            suspensions.update(load_daily_suspension_documents(unresolved[offset:offset+20], target_date=day))
+    except RuntimeError as exc:
+        if not allow_partial or not str(exc).startswith("historical_lifecycle_document:"):
+            raise
+        errors.append(str(exc))
+    if errors:
+        pending.update(dict.fromkeys(set(unresolved) - suspensions.keys(), "; ".join(errors)[:200]))
     cutoff = dt.datetime.now(CST).replace(tzinfo=None, microsecond=0)
-    return build_manifest(catalog=catalog, calendar=calendar, day=day, rows=rows,
-                          run_id=run_id, captured_at=cutoff, snapshot=snapshot, listings=listings,
-                          daily_suspension_documents=suspensions, daily_delisting_documents=delisting_documents)
+    proof = build_manifest(catalog=catalog, calendar=calendar, day=day, rows=rows,
+                           run_id=run_id, captured_at=cutoff, snapshot=snapshot, listings=listings,
+                           daily_suspension_documents=suspensions, daily_delisting_documents=delisting_documents,
+                           allow_partial=allow_partial, unresolved_codes=pending, retained_no_bar=retained)
+    if proof.get("status") == "PARTIAL" and save_partial:
+        _save_daily_attempt(engine, proof=proof, source_root=attempt_root,
+                            harvested=harvested, previous_run=prior_run)
+    elif retained and proof["status"] == "EXACT":
+        validate_manifest(proof, catalog=catalog, calendar=calendar)
+    return proof
 
 
 @contextmanager
@@ -670,6 +839,7 @@ def _publish(
             or (
                 not historical and (
                     entity["classification"] == "DELISTED"
+                    or (entity["classification"] == "NOT_LISTED" and "not_listed_through" in entity["evidence"])
                     or str((entity["evidence"].get("native_tick") or {}).get("_probiga_observed_at") or "")[:10]
                     > session.isoformat()
                 )
@@ -900,6 +1070,8 @@ def _publish(
         if load_daily_manifest(connection, session.isoformat(), decision_known_at=readback_at,
                                manifest_hash=coverage_manifest["manifest_hash"]) is None:
             raise ValueError("daily immutable proof readback failed before completion")
+        connection.execute(text(f"DELETE FROM {RECEIPT_TABLE} WHERE dataset=:dataset AND trade_date=:day"),
+                           {"dataset": ATTEMPT_DATASET, "day": session})
     result = {
         "row_count": expected_rows,
         "code_count": len(covered_codes),
@@ -1039,8 +1211,12 @@ def main(argv: list[str] | None = None) -> int:
                 "sources": sources,
             })
             continue
-        harvested = _harvest(root, universe, session, deadline=deadline)
-        reused = None if args.archive_native_evidence else _reusable_partition(engine, session=session, harvested=harvested)
+        def retained_loader():
+            return _retained_native_records(engine, day=session.isoformat(), source_root=root)
+
+        harvested = _harvest(root, universe, session, deadline=deadline or time.monotonic() + 300,
+                             isolate_invalid=not repair, retained_loader=None if repair else retained_loader)
+        reused = None if args.archive_native_evidence or harvested.get("invalid_codes") else _reusable_partition(engine, session=session, harvested=harvested)
         if reused is not None:
             results.append({"session": session.isoformat(), "status": "REUSED",
                             "run_id": reused["run_id"], "manifest_hash": reused["manifest_hash"]})
@@ -1074,11 +1250,16 @@ def main(argv: list[str] | None = None) -> int:
                 f"target={session.isoformat()} expected_codes={eligible} exact_codes=0"
             )
             unavailable[session] = reason
-            results.append({"session": session.isoformat(), "status": "BLOCKED", "reason": reason})
+            invalid = harvested.get("invalid_codes", {})
+            if invalid:
+                reason += f" invalid_native_codes={len(invalid)}"
+                unavailable[session] = reason
+            results.append({"session": session.isoformat(), "status": "BLOCKED", "reason": reason,
+                            "invalid_codes": invalid})
             continue
         run_id = new_run_id()
         coverage_manifest = None
-        if exact_repair or (historical_documents is None and sources == [SOURCE]):
+        if exact_repair or (not harvested.get("invalid_codes") and historical_documents is None and sources == [SOURCE]):
             coverage_manifest = _exact_amount_repair_manifest(engine, session=session, harvested=harvested,
                                                               run_id=run_id, required=exact_repair,
                                                               post_close_code=args.repair_native_post_close_code, source_root=root)
@@ -1088,7 +1269,14 @@ def main(argv: list[str] | None = None) -> int:
                 historical_documents=historical_documents,
                 historical_public_bars=public, previous_session=previous_day,
                 archive_native_evidence=args.archive_native_evidence,
+                attempt_root=None if repair else root, save_partial=args.apply and not repair,
             )
+        if coverage_manifest.get("status") == "PARTIAL":
+            gaps = coverage_manifest["unresolved_codes"]
+            unavailable[session] = f"QMT_DAILY_COVERAGE_INCOMPLETE target={session} unresolved={len(gaps)}"
+            results.append({"session": session.isoformat(), "status": "BLOCKED", "unresolved_codes": gaps,
+                            "verified_code_count": len(coverage_manifest["entities"]), "run_id": run_id})
+            continue
         if args.archive_native_evidence:
             if time.monotonic() >= deadline:
                 raise TimeoutError("historical native evidence deadline exceeded before publication")
@@ -1169,6 +1357,12 @@ def main(argv: list[str] | None = None) -> int:
             reason=next(iter(unavailable.values())),
             build_sha=_build_sha(),
         )
+        if any("unresolved_codes" in row for row in results) or len(sessions) > 1:
+            task_result["session_results"] = results
+            task_result["sessions"] = [session.isoformat() for session in sessions]
+            task_result["target_trade_date"] = sessions[0].isoformat() if len(sessions) == 1 else ""
+            task_result.pop("receipt_id")
+            task_result["receipt_id"] = canonical_digest(task_result)
         print(json.dumps(task_result, ensure_ascii=False, separators=(",", ":")))
         return 3
     task_result = _task_result(engine, sessions=sessions)

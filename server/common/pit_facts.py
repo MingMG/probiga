@@ -6161,7 +6161,8 @@ def _bind_historical_event_snapshot(
         reconciliation = authority["reconciliation"]
         additions = reconciliation["added_to_prior"]
         delisted = reconciliation.get("official_delisted_entities", [])
-        if additions or delisted:
+        prelisting = reconciliation.get("official_prelisting_entities", [])
+        if additions or delisted or prelisting:
             from server.common.qmt_datadir_daily_coverage import load_daily_manifest
 
             with _live_announcement_reply_budget(connection, deadline=deadline, stage="signed-historical-native"):
@@ -6174,6 +6175,8 @@ def _bind_historical_event_snapshot(
                 raise ValueError("historical announcement added listing native trade proof differs")
             if any(entities.get(item["stock_code"]) != item for item in delisted):
                 raise ValueError("historical announcement effective-day delisting proof differs from the daily manifest")
+            if any(entities.get(item["stock_code"]) != item for item in prelisting):
+                raise ValueError("historical announcement pre-listing proof differs from the daily manifest")
 
         stage = "signed-historical-inventory"
         hint = _live_announcement_read_hint(mysql=mysql, deadline=deadline, stage=stage)

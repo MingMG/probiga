@@ -441,13 +441,13 @@ def test_historical_reconstruction_reconciles_official_effective_day_delisting(
 
     target = date(2026, 11, 13)
     zone = ZoneInfo("Asia/Shanghai")
-    traded, delisted, no_trade = "000001", "002731", "600519"
+    traded, delisted, prelisting, no_trade = "000001", "002731", "301661", "600519"
     catalog = AnnouncementCatalog(
         batch_id="catalog-historical-20261113",
         manifest_hash="a" * 64,
         member_set_hash="b" * 64,
-        codes=(traded, delisted, no_trade),
-        qmt_by_code={traded: "000001.SZ", delisted: "002731.SZ", no_trade: "600519.SH"},
+        codes=(traded, delisted, prelisting, no_trade),
+        qmt_by_code={traded: "000001.SZ", delisted: "002731.SZ", prelisting: "301661.SZ", no_trade: "600519.SH"},
     )
     published = datetime.combine(target, time.min, tzinfo=zone)
     observed = published + timedelta(days=1, hours=21)
@@ -475,6 +475,25 @@ def test_historical_reconstruction_reconciles_official_effective_day_delisting(
         return {**core, "row_hash": pit_canonical_hash(core)}
 
     entity = delisting_entity(document)
+    from server.common.official_listing_evidence import ISSUANCE_SCHEMA
+    from server.common.qmt_datadir_daily_coverage import listing_evidence
+
+    issuance_text = (
+        "示例股份有限公司首次公开发行股票并在创业板上市发行公告。"
+        "发行人股票简称为“示例”，股票代码为“301661”，该简称和代码同时用于本次发行。"
+        "确保其资金账户在2026年11月16日（T+2日）日终有足额的新股认购资金。"
+    )
+    issuance = {
+        "schema": ISSUANCE_SCHEMA, "stock_code": prelisting, "not_listed_through": "2026-11-16",
+        "publication_date": target.isoformat(), "captured_at": observed.isoformat(),
+        "announcement_id": "1225669889",
+        "source_url": "https://static.cninfo.com.cn/finalpage/2026-11-13/1225669889.PDF",
+        "source_text": issuance_text, "source_text_sha256": sha256(issuance_text.encode()).hexdigest(),
+        "official_document_sha256": "e" * 64,
+    }
+    prelisting_entity = {"stock_code": prelisting, "classification": "NOT_LISTED",
+                         "evidence": listing_evidence(issuance, prelisting, target.isoformat(), cutoff=started)}
+    prelisting_entity["row_hash"] = pit_canonical_hash(prelisting_entity)
     daily_manifest_hash = "e" * 64
     authority = _historical_authority_v3(catalog, target)
     authority["qmt_daily_truth"].update(
@@ -482,7 +501,8 @@ def test_historical_reconstruction_reconciles_official_effective_day_delisting(
         truth_hash=daily_manifest_hash,
     )
     authority["qmt_daily_truth_sha256"] = pit_canonical_hash(authority["qmt_daily_truth"])
-    authority["reconciliation"].update(attested_daily_count=1, official_delisted_entities=[entity])
+    authority["reconciliation"].update(attested_daily_count=1, official_delisted_entities=[entity],
+                                       official_prelisting_entities=[prelisting_entity])
     authority["reconciliation_sha256"] = pit_canonical_hash(authority["reconciliation"])
 
     def context(candidate: dict) -> HistoricalReconstructionContext:
@@ -505,7 +525,8 @@ def test_historical_reconstruction_reconciles_official_effective_day_delisting(
         master = _master(*catalog.codes)
         client = _Client(
             masters=[master, master],
-            rows_by_code={traded: [_row_on_date(traded, 0, target)], delisted: [], no_trade: []},
+            rows_by_code={traded: [_row_on_date(traded, 0, target)], prelisting: [_row_on_date(prelisting, 1, target)],
+                          delisted: [], no_trade: []},
         )
         provider = CninfoMarketAnnouncementProvider(
             client=client, minimum_request_interval=0, now_fn=lambda: started + timedelta(seconds=10),
@@ -525,7 +546,7 @@ def test_historical_reconstruction_reconciles_official_effective_day_delisting(
 
     engine, result = capture(authority, "native")
     assert validate_task_result(result, 0) == "complete"
-    assert result["coverage_count"] == 3
+    assert result["coverage_count"] == 4
     assert result["reconstruction_provenance"]["authority"]["reconciliation"]["official_delisted_entities"] == [entity]
 
     stored_catalog = SimpleNamespace(
@@ -545,7 +566,7 @@ def test_historical_reconstruction_reconciles_official_effective_day_delisting(
         assert decision_known_at == reconstructed
         assert manifest_hash == daily_manifest_hash
         assert verify_rows is False
-        return {"entities": [entity]}
+        return {"entities": [entity, prelisting_entity]}
 
     monkeypatch.setattr(
         "server.common.qmt_datadir_daily_coverage.load_daily_manifest", load_exact_manifest,

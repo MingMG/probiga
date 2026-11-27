@@ -71,6 +71,26 @@ def _write(path: Path, records) -> Path:
     return path
 
 
+def test_daily_harvest_preserves_valid_neighbours_and_distinguishes_bad_rows_from_absence(tmp_path):
+    codes = ("600001", "600002", "600003", "600004", "600005")
+    members = {code + ".SH": UniverseMember(code + ".SH", "SH", code) for code in codes}
+    universe = Universe(members, {symbol: ("2020-01-01", None) for symbol in members})
+    path = tmp_path / "SH" / DAILY_PERIOD
+    good = _record("00:00", 10000, 10200, 9800, 10100, 100, 100000, 9900)
+    bad_range = _record("00:00", 10000, 9000, 9800, 10100, 100, 100000, 9900)
+    _write(path / "600001.DAT", [good])
+    (path / "600002.DAT").write_bytes(DAT_HEADER + b"x")
+    _write(path / "600003.DAT", [good, good])
+    _write(path / "600004.DAT", [bad_range])
+    harvested = daily_import._harvest(tmp_path, universe, SESSION, isolate_invalid=True)
+    assert harvested["codes"] == {"600001"}
+    assert set(harvested["invalid_codes"]) == {"600002", "600003", "600004"}
+    assert len(harvested["rows"]) == 1
+    # Reading the same malformed source as a historical correction still fails.
+    with pytest.raises(DatadirError):
+        daily_import._harvest(tmp_path, universe, SESSION)
+
+
 def test_stale_whole_market_dat_blocks_daily_import_before_listing_lookup(tmp_path, monkeypatch, capsys):
     target = SESSION + dt.timedelta(days=1)
     members = {

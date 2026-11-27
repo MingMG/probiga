@@ -636,17 +636,17 @@ def _validate_historical_daily_scope(
     authority_codes: set[str],
     attested_daily_count: int,
     no_trade_codes: list[str],
-    delisted_entities: Sequence[dict],
+    lifecycle_entities: Sequence[dict],
 ) -> set[str]:
     suspended = set(no_trade_codes)
-    delisted_codes = [entity["stock_code"] for entity in delisted_entities]
-    delisted = set(delisted_codes)
-    no_bar_codes = suspended | delisted
+    lifecycle_codes = [entity["stock_code"] for entity in lifecycle_entities]
+    lifecycle = set(lifecycle_codes)
+    no_bar_codes = suspended | lifecycle
     if (
         not authority_codes
-        or delisted_codes != sorted(delisted)
-        or any(entity["classification"] != "DELISTED" for entity in delisted_entities)
-        or suspended & delisted
+        or lifecycle_codes != sorted(lifecycle)
+        or any(entity["classification"] not in {"NOT_LISTED", "DELISTED"} for entity in lifecycle_entities)
+        or suspended & lifecycle
         or no_bar_codes - authority_codes
         or attested_daily_count + len(no_bar_codes) != len(authority_codes)
     ):
@@ -663,7 +663,7 @@ def _build_historical_catalog_reconciliation(
     prior_catalog,
     attested_daily_count: int,
     no_trade_codes: list[str],
-    delisted_entities: Sequence[dict] = (),
+    lifecycle_entities: Sequence[dict] = (),
     added_evidence: Mapping | None = None,
 ) -> tuple[list[str], dict]:
     """Explain every catalog difference against the target-day authority."""
@@ -673,7 +673,7 @@ def _build_historical_catalog_reconciliation(
     prior_codes = prior_catalog.eligible_codes(target)
     normalized_no_trade = sorted(set(no_trade_codes))
     no_bar_codes = _validate_historical_daily_scope(
-        set(authority_codes), attested_daily_count, normalized_no_trade, delisted_entities,
+        set(authority_codes), attested_daily_count, normalized_no_trade, lifecycle_entities,
     )
     authority_members = {
         str(item["stock_code"]).zfill(6): dict(item)
@@ -719,6 +719,11 @@ def _build_historical_catalog_reconciliation(
                           "reason": "OFFICIAL_TARGET_DAY_LISTING_WITH_NATIVE_TRADE",
                           "list_date": target, "listing_disclosure": proof["listing_disclosure"],
                           "native_daily_entity": proof["native_daily_entity"]})
+    lifecycle_proof = {}
+    for classification, key in (("NOT_LISTED", "official_prelisting_entities"), ("DELISTED", "official_delisted_entities")):
+        entities = [item for item in lifecycle_entities if item["classification"] == classification]
+        if entities:
+            lifecycle_proof[key] = entities
     return authority_codes, {
         "schema": "probiga.qmt-announcement-catalog-reconciliation.v2",
         "target_trade_date": target,
@@ -732,7 +737,7 @@ def _build_historical_catalog_reconciliation(
         "native_no_trade_count": len(normalized_no_trade),
         "native_no_trade_codes": normalized_no_trade,
         "native_no_trade_codes_sha256": canonical_hash(normalized_no_trade),
-        **({"official_delisted_entities": list(delisted_entities)} if delisted_entities else {}),
+        **lifecycle_proof,
         "excluded_from_prior": exclusions,
         "added_to_prior": additions,
     }
@@ -780,20 +785,14 @@ def _load_datadir_reconstruction_scope(
         raise QMTAnnouncementBlocked(
             "QMT_ANNOUNCEMENT_RECONSTRUCTION_NATIVE_SUSPENSION_SCOPE_UNSUPPORTED"
         )
-    if any(entity["classification"] == "NOT_LISTED" for entity in entities):
-        # The v3 reconciliation seal accounts for native no-trade stocks
-        # separately. A listing exclusion cannot be represented as suspension.
-        raise QMTAnnouncementBlocked(
-            "QMT_ANNOUNCEMENT_RECONSTRUCTION_LISTING_SCOPE_UNSUPPORTED"
-        )
     no_trade = [
         entity["stock_code"] for entity in entities
         if entity["classification"] == "NO_TRADE"
     ]
-    delisted = [entity for entity in entities if entity["classification"] == "DELISTED"]
+    lifecycle = [entity for entity in entities if entity["classification"] in {"NOT_LISTED", "DELISTED"}]
     additions = {entity["stock_code"]: entity for entity in entities
                  if entity["stock_code"] in added_codes and entity["classification"] == "TRADED"}
-    return no_trade, delisted, additions
+    return no_trade, lifecycle, additions
 
 
 def _load_historical_reconstruction_authority(
@@ -834,9 +833,9 @@ def _load_historical_reconstruction_authority(
             authority_codes = authority_catalog.eligible_codes(target.isoformat())
             added_codes = set(authority_codes) - set(prior_catalog.eligible_codes(target.isoformat()))
             traded_additions = {}
-            delisted_entities = []
+            lifecycle_entities = []
             if truth.provider == QMT_DATADIR_PROVIDER:
-                no_trade_codes, delisted_entities, traded_additions = _load_datadir_reconstruction_scope(
+                no_trade_codes, lifecycle_entities, traded_additions = _load_datadir_reconstruction_scope(
                     connection, target_date=target.isoformat(), decision=decision,
                     truth=truth, added_codes=added_codes,
                 )
@@ -880,10 +879,9 @@ def _load_historical_reconstruction_authority(
             "QMT_ANNOUNCEMENT_RECONSTRUCTION_DAILY_AUTHORITY_DIFFERS"
         )
     authority_code_set = set(authority_codes)
-    # Securities with delisting evidence on the target day remain in the issuer
-    # announcement scope because the catalog includes the effective expiry day.
+    # A missing trading bar never excludes an issuer's announcements.
     _validate_historical_daily_scope(
-        authority_code_set, truth.attested_row_count, no_trade_codes, delisted_entities,
+        authority_code_set, truth.attested_row_count, no_trade_codes, lifecycle_entities,
     )
     qmt_by_code = {
         str(item["stock_code"]).zfill(6): str(item["qmt_code"]).upper()
@@ -926,7 +924,7 @@ def _load_historical_reconstruction_authority(
         prior_catalog=prior_catalog,
         attested_daily_count=truth.attested_row_count,
         no_trade_codes=no_trade_codes,
-        delisted_entities=delisted_entities,
+        lifecycle_entities=lifecycle_entities,
         added_evidence=added_evidence,
     )
     reconciliation_sha = canonical_hash(reconciled)
@@ -948,11 +946,13 @@ def _load_historical_reconstruction_authority(
         "reconciliation": reconciled,
         "reconciliation_sha256": reconciliation_sha,
     }
-    if added_codes and not _reconstruction_authority_matches(
+    if (added_codes or lifecycle_entities) and not _reconstruction_authority_matches(
         authority, target_trade_date=target, catalog=catalog,
         known_at=_shanghai_naive(datetime.now(PRODUCTION_TIMEZONE)),
     ):
-        raise QMTAnnouncementBlocked("QMT_ANNOUNCEMENT_RECONSTRUCTION_CATALOG_DIFF_UNEXPLAINED", sorted(added_codes)[0])
+        if added_codes:
+            raise QMTAnnouncementBlocked("QMT_ANNOUNCEMENT_RECONSTRUCTION_CATALOG_DIFF_UNEXPLAINED", sorted(added_codes)[0])
+        raise QMTAnnouncementBlocked("QMT_ANNOUNCEMENT_RECONSTRUCTION_DAILY_AUTHORITY_DIFFERS")
     return catalog, authority
 
 

@@ -23,6 +23,71 @@ def evidence():
                 official_document_sha256="a" * 64, publication_date="2026-11-02")
 
 
+def issuance_evidence():
+    # The 301661 issue notice puts the payment obligation on p4 and security
+    # identity on p9. Its subscription-result notice does not print the code.
+    body = ("首次公开发行股票并在创业板上市发行公告\n发行人股票简称为“猎奇智能”，股票代码为“301661”。"
+            "确保其资 金账户在2026 年11 月 30 日（T+2 日）日终有足额的新股认购资金。")
+    return dict(schema=source.ISSUANCE_SCHEMA, stock_code="301661", not_listed_through="2026-11-30",
+                source_url="https://static.cninfo.com.cn/finalpage/2026-11-25/1225685486.PDF",
+                source_text=body, source_text_sha256=sha256(body.encode()).hexdigest(), official_document_sha256="e"*64,
+                publication_date="2026-11-25", announcement_id="1225685486", captured_at="2026-11-27T17:00:00+08:00")
+
+
+def test_issue_period_covers_lottery_day_and_payment_day_without_inventing_listing_date():
+    item = issuance_evidence()
+    for day in ("2026-11-27", "2026-11-30"):
+        result = source.validate_official_listing_evidence(item, stock_code="301661", target_date=day)
+        assert result == item and "listing_date" not in result
+    for day in ("2026-11-24", "2026-12-01"):
+        with pytest.raises(ValueError):
+            source.validate_official_listing_evidence(item, stock_code="301661", target_date=day)
+
+
+@pytest.mark.parametrize("field,replacement", [
+    ("not_listed_through", "2026-12-15"), ("announcement_id", "901"), ("listing_date", "2026-12-02"),
+    ("source_text", "首次公开发行股票并在创业板上市网上申购情况及中签率公告。公司简称猎奇智能。"
+                    "确保其资金账户在2026年11月30日（T+2日）日终有足额的新股认购资金。"),
+    ("source_text", "首次公开发行股票并在创业板上市发行公告，股票代码为“301661”。公告日2026年11月30日。"),
+    ("captured_at", "2026-11-27T17:00:00"), ("captured_at", "2026-11-24T14:00:00+08:00"),
+])
+def test_issue_date_bound_rejects_unproven_identity_scope_and_dates(field, replacement):
+    item = {**issuance_evidence(), field: replacement}
+    item["source_text_sha256"] = sha256(item["source_text"].encode()).hexdigest()
+    with pytest.raises(ValueError):
+        source.validate_official_listing_evidence(item, stock_code="301661", target_date="2026-11-27")
+
+
+@pytest.mark.parametrize(("code", "name", "org", "title", "body", "through"), [
+    ("301661", "猎奇智能", "9900063694", "首次公开发行股票并在创业板上市发行公告",
+     issuance_evidence()["source_text"], "2026-11-30"),
+    ("688845", "傲拓科技", "gfbj0834876", "傲拓科技首次公开发行股票并在科创板上市发行公告",
+     "傲拓科技首次公开发行股票并在科创板上市发行公告，股票代码为“688845”。"
+     "获配后在2026年11月25日（T+2日）缴纳认购资金。", "2026-11-25"),
+    ("920319", "天广实", "nssc1000840", "向不特定合格投资者公开发行股票并在北京证券交易所上市发行公告",
+     "向不特定合格投资者公开发行股票并在北京证券交易所上市发行公告，证券代码为“920319”。"
+     "本次发行网下、网上申购时间为2026年11月25日（T日）的9:15-11:30。", "2026-11-25"),
+])
+def test_exact_issue_disclosure_discovery_on_each_market(monkeypatch, code, name, org, title, body, through):
+    row = dict(secCode=code, secName=name, orgId=org, announcementTime=1795536000000, announcementTitle=title,
+               announcementId="1225685486", adjunctUrl="finalpage/2026-11-25/1225685486.PDF")
+
+    def fetch(_session, method, url, **kw):
+        if url.endswith("_stock.json"):
+            return json.dumps({"stockList": [dict(code=code, category="A股", orgId=org)]}).encode()
+        if method == "POST":
+            assert kw["data"]["stock"] == f"{code},{org}"
+            return json.dumps({"announcements": [row], "hasMore": False}).encode()
+        return b"%PDF-fixture"
+
+    monkeypatch.setattr(source, "_fetch", fetch)
+    monkeypatch.setattr(source, "_issuance_document_text", lambda data: body)
+    same_market_unknown = code[:-1] + "0"
+    result = source._load_in_process([code, same_market_unknown], target_date="2026-11-25", include_issuance=True)
+    assert set(result) == {code}
+    assert result[code]["not_listed_through"] == through and "listing_date" not in result[code]
+
+
 def test_live_failure_prelisting_date_survives_pdf_whitespace():
     assert source.listing_date_from_text(disclosure(day="2026 年 11 月 3\n日"), stock_code="001381") == "2026-11-03"
     assert source.listing_date_from_text(disclosure()+"\n3、首次公开发行后总股本：468,980,000股", stock_code="001381") == "2026-11-03"
