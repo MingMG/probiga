@@ -378,3 +378,39 @@ def test_actual_posix_originals_are_kept_and_links_are_rejected(tmp_path):
     assert check().returncode != 0
     assert external.read_bytes() == b"external original"
     assert {name: ((run / name).stat().st_ino, (run / name).read_bytes()) for name in original} == original
+
+
+@pytest.mark.parametrize('suffix', ['-journal','-wal','-shm'])
+@pytest.mark.parametrize('when', ['initial','final'])
+def test_migration_allows_only_known_sqlite_sidecars_to_disappear(suffix, when):
+    model = _PosixModel()
+    name = 'sector-heatmap-v1.sqlite3'+suffix
+    model.file('/jobs/'+name)
+    original = model.lstat
+    calls = 0
+    def disappear(path, *, dir_fd=None):
+        nonlocal calls
+        if path == name:
+            calls += 1
+            if calls == (1 if when=='initial' else 2):
+                model.nodes.pop('/jobs/'+name)
+        return original(path, dir_fd=dir_fd)
+    model.lstat = disappear
+    _run(model, 'migrate_probiga_job_log_legacy_modes')
+    assert not model.handles
+    assert all(path == '/jobs/.probiga-deploy-write-probe' for _,path in model.mutations)
+
+
+@pytest.mark.parametrize('name',['sector-heatmap-v1.sqlite3','unknown.sqlite3-journal','run.log'])
+def test_migration_rejects_disappearing_stable_files(name):
+    model = _PosixModel()
+    model.file('/jobs/'+name)
+    original = model.lstat
+    def disappear(path, *, dir_fd=None):
+        if path == name:
+            model.nodes.pop('/jobs/'+name, None)
+        return original(path, dir_fd=dir_fd)
+    model.lstat = disappear
+    with pytest.raises(FileNotFoundError):
+        _run(model, 'migrate_probiga_job_log_legacy_modes')
+    assert not model.handles

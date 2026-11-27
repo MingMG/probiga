@@ -1232,10 +1232,16 @@ try:
     ):
         raise SystemExit("unsafe detached job log root")
 
+    transient_names = {"sector-heatmap-v1.sqlite3" + suffix for suffix in ("-journal", "-wal", "-shm")}
     names = set(os.listdir(directory_fd))
     identities = {}
     for name in names:
-        metadata = os.lstat(name, dir_fd=directory_fd)
+        try:
+            metadata = os.lstat(name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            if name in transient_names:
+                continue  # API-owned SQLite sidecars remain live during scheduler quiescence.
+            raise
         require_file(
             metadata,
             modes={0o600, 0o644} if name in legacy_names else {0o600},
@@ -1275,10 +1281,16 @@ try:
         os.close(probe)
         os.unlink(probe_name, dir_fd=directory_fd)
 
-    if set(os.listdir(directory_fd)) != names:
+    final_names = set(os.listdir(directory_fd))
+    if final_names - transient_names != names - transient_names:
         raise SystemExit("detached job log tree changed during migration")
-    for name in names:
-        observed = os.lstat(name, dir_fd=directory_fd)
+    for name in final_names:
+        try:
+            observed = os.lstat(name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            if name in transient_names:
+                continue
+            raise
         require_file(observed, modes={0o600}, name=name)
     os.fsync(directory_fd)
 finally:
