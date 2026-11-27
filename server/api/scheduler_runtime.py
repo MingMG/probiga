@@ -139,6 +139,7 @@ from server.common.strategy_governance_mode import (
 )
 from server.common.scheduler_validation import (
     notice_history_repair_progress_receipt,
+    retryable_qmt_daily_partial,
     scheduler_output_status,
     validate_scheduler_task_result,
 )
@@ -979,6 +980,8 @@ def _retryable_blocked_marker(value: object) -> str:
 def _task_status_is_retryable(row: dict) -> bool:
     status = str(row.get("last_run_status") or "").strip().lower()
     task_type = str(row.get("task_type") or "").strip()
+    if status == "blocked" and task_type == "qmt_stock_daily_canonical" and row.get("_qmt_daily_partial_retryable") is True:
+        return True
     if status == "degraded" and task_type in PRIOR_SESSION_PUBLIC_MINUTE_TASK_TYPES:
         # Partial public minute data remains useful, but its missing securities
         # still need the existing checkpointed collector and retry backoff.
@@ -4261,6 +4264,7 @@ def _attach_daily_recovery_targets(
         row["_dependency_recovery_due"] = False
         row["_scheduler_target_block_reason"] = ""
         row["_qmt_daily_finality_recovery_due"] = False
+        row.pop("_qmt_daily_partial_retryable", None)
         row.pop("_qmt_daily_truth_ready", None)
     if not selected:
         return True
@@ -4335,6 +4339,11 @@ def _attach_daily_recovery_targets(
             row["_scheduler_target_available"] = True
             row["_scheduler_historical_recovery"] = parsed_target < current.date()
     for row in ingestion_rows:
+        if (row["task_type"] == "qmt_stock_daily_canonical" and row.get("enabled") == 1
+                and row.get("_scheduler_target_available") is True and row.get("last_run_status") == "blocked"):
+            target = row["_scheduler_target_trade_date"]
+            if 0 <= (current.date() - date.fromisoformat(target)).days <= DAILY_RESULT_RECOVERY_MAX_AGE_DAYS:
+                row["_qmt_daily_partial_retryable"] = retryable_qmt_daily_partial(row.get("last_run_output"), target=target)
         if (
             row.get("task_type") == "qmt_announcement_pit"
             and _scheduler_executor_role("standalone") == SCHEDULER_OWNER_WINDOWS_QMT

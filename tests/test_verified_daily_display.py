@@ -1,7 +1,9 @@
 from datetime import datetime
 
 import pytest
+from fastapi.encoders import jsonable_encoder
 from sqlalchemy import create_engine, event, text
+from starlette.responses import JSONResponse
 
 from integrations.qmt.datadir_import import Universe, UniverseMember
 from server.api.routers import hot_data
@@ -10,6 +12,20 @@ from server.db.formal_analysis_schema import privileged_migrate_formal_analysis_
 from tests.test_qmt_datadir_daily_coverage import CUTOFF, DAY, IPO, SUSPENDED, TRADED, authorities, bar, snapshot
 from tests.test_qmt_datadir_import import _epoch, _record, _write
 from tools import import_qmt_datadir_daily as daily
+
+
+@pytest.mark.parametrize("stored", [
+    '{"event_coverage_id":NaN,"event_coverage_response_hash":NaN,"evidence":[0,"published"]}',
+    {"event_coverage_id": float("nan"), "event_coverage_response_hash": float("nan"), "evidence": [0, "published"]},
+])
+def test_stock_detail_serializes_missing_event_evidence_as_null(monkeypatch, stored):
+    monkeypatch.setattr(hot_data, "_table_columns", lambda *args: set())
+    monkeypatch.setattr(hot_data, "_read_sql", lambda *args: [{"event_risk_detail": stored}])
+    snapshot = hot_data._load_latest_analysis_snapshot(TRADED, trade_date=DAY)
+    assert snapshot["event_risk_detail"] == {
+        "event_coverage_id": None, "event_coverage_response_hash": None, "evidence": [0, "published"],
+    }
+    assert JSONResponse(jsonable_encoder({"analysis_snapshot": snapshot})).status_code == 200
 
 
 def test_partial_daily_bar_reaches_stock_detail_and_portfolio_only_after_persistence(monkeypatch, tmp_path):

@@ -4609,9 +4609,11 @@ def _parse_snapshot_json_fields(row: dict | None, json_fields: tuple[str, ...]) 
         value = parsed.get(field)
         if isinstance(value, str) and value:
             try:
-                parsed[field] = json.loads(value)
-            except Exception as exc:
+                value = json.loads(value)
+            except ValueError as exc:
                 _record_fallback('_parse_snapshot_json_fields:3165', exc)
+        if field in parsed:
+            parsed[field] = _json_safe_value(value)
     for field in ("analysis_date", "flow_trade_date", "hot_trade_date", "last_news_time"):
         if parsed.get(field) is not None:
             parsed[field] = str(parsed[field])
