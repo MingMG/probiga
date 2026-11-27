@@ -377,6 +377,7 @@ def _retained_context(state,day,plan,dataset,store):
 
 
 def _prepare_day(connection,state,owner,dataset,store,day,*,prepare_budget=None):
+    if prepare_budget is not None:prepare_budget()
     from contextlib import nullcontext
     from server.common.formal_analysis_prefetch import prefetch_checkpoint_reads
     from server.engine.native_research_jobs import _source_progress
@@ -412,7 +413,6 @@ def _prepare_day(connection,state,owner,dataset,store,day,*,prepare_budget=None)
         _save(connection,state,owner)
         return
     if 'context' not in inputs:
-        if prepare_budget is not None:prepare_budget()
         _begin_unit(connection,state,owner,'PREPARE context '+day)
         retained=_retained_context(state,day,plan,dataset,store)
         if retained is not None:
@@ -747,8 +747,8 @@ def native_tick(engine):
 
 
 def _atomic_prepare_deadline(attempt_started, *, arm_timer):
-    # Context preparation and feature calculation both decode the verified
-    # 70-day frame. Include source reads and durable writes in their 15-minute budget.
+    # Preparation includes the announcement validator's existing 15-minute
+    # budget as well as verified input decoding and durable writes.
     deadline = attempt_started + 900
     remaining = deadline - time.monotonic()
     if remaining <= 0:

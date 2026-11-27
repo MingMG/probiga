@@ -183,7 +183,8 @@ def test_verified_ready_context_reuses_exact_inputs_when_live_context_is_unavail
     assert restored['reused_feature_sessions']==1
 
 
-def test_context_can_persist_after_the_previous_300_second_attempt_limit(queue,tmp_path,monkeypatch):
+@pytest.mark.parametrize('stage',['context','selection'])
+def test_atomic_prepare_can_persist_after_the_previous_300_second_attempt_limit(queue,tmp_path,monkeypatch,stage):
     from server.trading_v3 import daily_features
     privileged_migrate_formal_analysis_schema(queue)
     monkeypatch.setenv('PROBIGA_NATIVE_DATASET_ROOT',str(tmp_path))
@@ -192,6 +193,13 @@ def test_context_can_persist_after_the_previous_300_second_attempt_limit(queue,t
     target=state['sessions'][0]
     context=next(value for reference in state['prepared_references'].values()
         if isinstance(value:=local.get(reference),dict) and 'market_context' in value)
+    value=context
+    if stage=='selection':
+        with queue.connect() as connection:state=native.read_runs(connection,run_id=state['run_id'])[0]
+        value=local.get_tree(state['day_inputs'][target].pop('selection'))
+        state['completed_units']-=1
+        state['checkpoint_sequence']+=1
+        with queue.begin() as connection:native._append_state(connection,state)
     clock=[100.]
     alarm=[400.]
     monkeypatch.setattr(native.time,'monotonic',lambda:clock[0])
@@ -208,17 +216,23 @@ def test_context_can_persist_after_the_previous_300_second_attempt_limit(queue,t
         return value
     def source(_engine,**kwargs):
         if clock[0]>=alarm[0]:raise native.NativeStepDeadline('NATIVE_ATTEMPT_DEADLINE')
-        return deepcopy(context)
+        return deepcopy(value)
     monkeypatch.setattr(native,'_frame',slow_frame)
     monkeypatch.setattr(daily_features,'prepare_feature_identity_context',source)
+    if stage=='selection':
+        from server.engine import native_research_prepare as prepare
+        def slow_selection(*_args):
+            clock[0]+=310
+            return source(None)
+        monkeypatch.setattr(prepare,'prepare_selection',slow_selection)
     result=native.native_tick(queue)
     assert result['status']=='RUNNING',result
     with queue.connect() as connection:
         saved=native.read_runs(connection,run_id=state['run_id'])[0]
     assert saved['completed_units']==state['completed_units']+1
-    assert local.get_tree(saved['day_inputs'][target]['context'])==context
-    for key in ('selection','finance','events'):
-        assert saved['day_inputs'][target][key]==state['day_inputs'][target][key]
+    assert local.get_tree(saved['day_inputs'][target][stage])==value
+    for key,reference in state['day_inputs'][target].items():
+        assert saved['day_inputs'][target][key]==reference
 
 
 def ready_context_source(queue,tmp_path,monkeypatch):

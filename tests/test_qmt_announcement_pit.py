@@ -2057,7 +2057,7 @@ def test_database_validator_proves_global_root_and_exact_catalog_binding():
 @pytest.mark.parametrize(
     "inventory_damage", [
         None, "extra-below", "extra-gap", "extra-above", "duplicate", "missing",
-        "inventory-timeout", "deadline", "byte-limit", "size-mismatch",
+        "inventory-timeout", "candidate-timeout", "deadline", "byte-limit", "size-mismatch",
     ],
 )
 def test_live_batch_validates_full_inventory_with_bounded_compressed_primary_key_reads(
@@ -2115,7 +2115,7 @@ def test_live_batch_validates_full_inventory_with_bounded_compressed_primary_key
             window_start=start, window_end=cutoff.date(), catalog=catalog, results=results,
         )
     options = dict(
-        codes=catalog.codes if inventory_damage is None else [catalog.codes[-1]],
+        codes=catalog.codes if inventory_damage in (None,"candidate-timeout") else [catalog.codes[-1]],
         decision_at=received, fact_cutoff_at=cutoff,
         window_start=start, window_end=cutoff.date(), source=source,
     )
@@ -2180,11 +2180,15 @@ def test_live_batch_validates_full_inventory_with_bounded_compressed_primary_key
     elapsed = [0.0]
     if inventory_damage == "deadline":
         monkeypatch.setattr("server.common.qmt_announcement_pit.monotonic", lambda: elapsed[0])
+        monkeypatch.setattr("server.common.bounded_read.monotonic", lambda: elapsed[0])
 
     def record(connection, _cursor, sql, parameters, context, _many):
         if f"FROM {SOURCE_COVERAGE_TABLE}" in sql:
             bindings = context.compiled_parameters[0]
             reads.append((connection.get_transaction(), sql, bindings, context.execution_options))
+            if (inventory_damage == "candidate-timeout" and "batch_id, stock_code, known_at" in sql
+                    and sum(key.startswith("codes_") for key in bindings)>10):
+                raise OperationalError(sql, parameters, Exception(3024, "execution deadline"))
             if (
                 inventory_damage == "inventory-timeout" and "coverage_id, stock_code" in sql
                 and bindings.get("lower_code") == catalog.codes[20]
@@ -2222,10 +2226,16 @@ def test_live_batch_validates_full_inventory_with_bounded_compressed_primary_key
         [value for key, value in params.items() if key.startswith("codes_")]
         for _, sql, params, _ in reads if "batch_id, stock_code, known_at" in sql
     ]
-    assert discovery == (
-        [list(catalog.codes[offset:offset + 20]) for offset in (0, 20, 40)]
-        if inventory_damage is None else [[catalog.codes[-1]]]
-    )
+    if inventory_damage == "candidate-timeout":
+        assert [len(group) for group in discovery] == [20,10,10,20,10,10,5]
+        assert [code for group in discovery if len(group)<=10 for code in group] == list(catalog.codes)
+        assert all("MAX_EXECUTION_TIME(4000)" in sql for _,sql,_,_ in reads
+            if "batch_id, stock_code, known_at" in sql)
+    else:
+        assert discovery == (
+            [list(catalog.codes[offset:offset + 20]) for offset in (0, 20, 40)]
+            if inventory_damage is None else [[catalog.codes[-1]]]
+        )
     inventory = [(sql, params) for _, sql, params, _ in reads if "coverage_id, stock_code" in sql]
     inventory_ranges = [
         (None, catalog.codes[20], 21), (catalog.codes[20], catalog.codes[40], 21),
@@ -2272,7 +2282,7 @@ def test_live_batch_validates_full_inventory_with_bounded_compressed_primary_key
         assert max(map(len, payload_id_chunks)) <= 2
         assert all(len(chunk) == 1 or sum(raw_sizes[key] for key in chunk) <= byte_limit for chunk in payload_id_chunks)
     else:
-        expected_chunks = {None: [1, 40, 5], "deadline": [1, 40], "size-mismatch": [1, 40]}
+        expected_chunks = {None: [1, 40, 5], "candidate-timeout": [1,40,5], "deadline": [1, 40], "size-mismatch": [1, 40]}
         expected_chunks.update(dict.fromkeys(inventory_failures, [1]))
         assert list(map(len, payload_id_chunks)) == expected_chunks[inventory_damage]
     assert all(

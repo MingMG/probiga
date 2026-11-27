@@ -2220,12 +2220,13 @@ def _live_announcement_payload_evidence(row: Mapping[str, Any]) -> tuple[dict, d
     return payload, evidence
 
 
-def _live_announcement_read_hint(*, mysql: bool, deadline: float, stage: str) -> str:
+def _live_announcement_read_hint(*, mysql: bool, deadline: float, stage: str,
+        query_timeout_ms: int = LIVE_ANNOUNCEMENT_BATCH_QUERY_TIMEOUT_MS) -> str:
     remaining_ms = int((deadline - monotonic()) * 1_000)
     if remaining_ms <= 0:
         raise QMTAnnouncementBlocked(LIVE_ANNOUNCEMENT_BATCH_VALIDATION_DEADLINE, stage)
     return (
-        f"/*+ MAX_EXECUTION_TIME({min(remaining_ms, LIVE_ANNOUNCEMENT_BATCH_QUERY_TIMEOUT_MS)}) */ "
+        f"/*+ MAX_EXECUTION_TIME({min(remaining_ms, query_timeout_ms, LIVE_ANNOUNCEMENT_BATCH_QUERY_TIMEOUT_MS)}) */ "
         if mysql else ""
     )
 
@@ -2537,11 +2538,13 @@ def validate_complete_qmt_announcement_batch(
                         connection = connection.execution_options(isolation_level="REPEATABLE READ")
             by_batch: dict[str, dict[str, datetime]] = {}
             candidate_filter = " AND batch_id=:required_batch_id" if required_batch else ""
-            code_limit = VALIDATION_INVENTORY_CODE_LIMIT if mysql else len(requested_codes)
-            for offset in range(0, len(requested_codes), code_limit):
-                stage = f"candidate-discovery:{offset}" if mysql else "candidate-discovery"
+            from server.common.bounded_read import read_id_batches
+            from server.common.batch_db import _transient_db_errno
+
+            def fetch_candidates(group):
+                stage = f"candidate-discovery:{group[0]}" if mysql else "candidate-discovery"
                 timeout_hint = _live_announcement_read_hint(
-                    mysql=mysql, deadline=deadline, stage=stage,
+                    mysql=mysql, deadline=deadline, stage=stage, query_timeout_ms=4000,
                 )
                 statement = text(
                     f"SELECT {timeout_hint}batch_id, stock_code, known_at FROM st_pit_source_coverage "
@@ -2554,7 +2557,7 @@ def validate_complete_qmt_announcement_batch(
                 ).bindparams(bindparam("codes", expanding=True)).execution_options(stream_results=True)
                 parameters = {
                     "source": source_name,
-                    "codes": requested_codes[offset:offset + code_limit],
+                    "codes": group,
                     "decision_at": decision,
                     "window_start": start,
                     "window_end": end,
@@ -2563,12 +2566,24 @@ def validate_complete_qmt_announcement_batch(
                     parameters["required_batch_id"] = required_batch
                 with _live_announcement_reply_budget(connection, deadline=deadline, stage=stage):
                     with connection.execute(statement, parameters) as rows:
-                        for batch_id, code, known_at in rows.tuples():
-                            members = by_batch.setdefault(str(batch_id or ""), {})
-                            stock_code = str(code or "").zfill(6)
-                            known = _dt(known_at)
-                            if stock_code not in members or known > members[stock_code]:
-                                members[stock_code] = known
+                        return rows.tuples().all()
+
+            try:
+                candidates_rows = read_id_batches(requested_codes, fetch_candidates,
+                    deadline=deadline, size=min(160, VALIDATION_INVENTORY_CODE_LIMIT),
+                    retryable=lambda exc: not getattr(connection,'invalidated',False) and (
+                        _transient_db_errno(exc) in (1969,3024) or isinstance(exc,QMTAnnouncementBlocked)
+                        and exc.reason_code==LIVE_ANNOUNCEMENT_BATCH_REPLY_DEADLINE),
+                    logger=logger, stage='announcement-live-candidates')
+            except TimeoutError as exc:
+                raise QMTAnnouncementBlocked(LIVE_ANNOUNCEMENT_BATCH_VALIDATION_DEADLINE,
+                    'candidate-discovery') from exc
+            for batch_id, code, known_at in candidates_rows:
+                members = by_batch.setdefault(str(batch_id or ""), {})
+                stock_code = str(code or "").zfill(6)
+                known = _dt(known_at)
+                if stock_code not in members or known > members[stock_code]:
+                    members[stock_code] = known
             _live_announcement_read_hint(mysql=False, deadline=deadline, stage="candidate-discovery")
             requested_set = set(requested_codes)
             candidates = [
