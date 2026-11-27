@@ -10,6 +10,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from datetime import datetime, time
 from decimal import Decimal, InvalidOperation
+from functools import lru_cache
 import json
 import re
 from typing import Any, Mapping, Sequence
@@ -17,7 +18,9 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import bindparam, text
 
+from server.common.formal_analysis_store import FormalAnalysisStore
 from server.common.qmt_attestation_contract import canonical_digest
+from server.common.qmt_datadir_result import load_receipt
 from server.common.official_historical_daily_evidence import (
     DAILY_SUSPENSION_KIND,
     historical_daily_evidence,
@@ -34,6 +37,7 @@ from server.common.qmt_trade_calendar import load_trade_calendar_receipt
 
 SCHEMA = "probiga.qmt-datadir-daily-coverage.v1"
 PROVIDER = "qmt_datadir"
+ATTEMPT_DATASET = "stock_daily_attempt"
 NATIVE_EVIDENCE_DATASET = "stock_daily_native_evidence"
 CHINA = ZoneInfo("Asia/Shanghai")
 MANIFEST_TABLE = "qmt_history_coverage_manifest"
@@ -43,6 +47,7 @@ NATIVE_AMOUNT_WORD = 2 ** 32
 ENTITY_INSERT_BATCH_SIZE = 64
 _MAX_NATIVE_PUBLIC_REPLACEMENTS = 32
 _SHA256 = re.compile(r"[a-f0-9]{64}")
+_NATIVE_BAR_FIELDS = ("open", "close", "high", "low", "volume", "amount", "pre_close")
 
 
 def _scope(engine):
@@ -126,9 +131,8 @@ def listing_evidence(value: Mapping[str, Any], code: str, day: str, *, cutoff: d
 
 
 def canonical_bar(row: Mapping[str, Any]) -> dict:
-    fields = ("open", "close", "high", "low", "volume", "amount", "pre_close")
     result = {"stock_code": str(row["stock_code"]), "trade_date": str(row["trade_date"])[:10]}
-    for field in fields:
+    for field in _NATIVE_BAR_FIELDS:
         value = Decimal(str(row[field]))
         if not value.is_finite() or value < 0 or (field not in {"volume", "amount"} and value <= 0):
             raise ValueError("invalid native daily field: " + field)
@@ -606,6 +610,121 @@ def load_daily_manifest_completion(engine, day: str, *, manifest: Mapping[str, A
     with _scope(engine) as connection:
         receipt, _ = _daily_manifest_completion(connection, day, manifest)
     return receipt if _stamp(receipt["finished_at"]) <= _stamp(decision_known_at) else None
+
+
+def verify_attempt_native_records(rows, native, *, day: str) -> None:
+    from integrations.qmt.backend import to_qmt_symbol
+
+    if not isinstance(native, dict) or len(rows) != len(native):
+        raise ValueError("daily attempt native record inventory differs")
+    for row in rows:
+        code = row["stock_code"]
+        record = native.get(to_qmt_symbol(code)) or {}
+        values = record.get("values")
+        if (not _SHA256.fullmatch(str(record.get("record_sha256"))) or not isinstance(values, list)
+                or len(values) != 9):
+            raise ValueError("daily attempt native DAT record is invalid: " + code)
+        native_bar = {"stock_code": code, "trade_date": day, **dict(zip(_NATIVE_BAR_FIELDS, values))}
+        if canonical_bar(native_bar) != row:
+            raise ValueError("daily attempt bar differs from native DAT record: " + code)
+
+
+@lru_cache(maxsize=2)
+def _legacy_attempt_bars(engine, receipt_json: str) -> dict:
+    """Index the original market-wide artifact once per immutable receipt."""
+    receipt = json.loads(receipt_json)
+    detail = receipt["detail"]
+    generation = detail["manifest_hash"]
+    store = FormalAnalysisStore(engine)
+    members = store.get_many(generation, "daily_attempt", ["bars", "native"])
+    rows = members.get("bars")
+    if not isinstance(rows, list) or canonical_digest(rows) != detail["bars_artifact_sha256"]:
+        raise ValueError("daily attempt legacy bar digest differs")
+    native = members.get("native")
+    if canonical_digest(native) != detail["native_records_sha256"]:
+        raise ValueError("daily attempt legacy native digest differs")
+    verify_attempt_native_records(rows, native, day=receipt["trade_date"])
+    entities = []
+    indexed = {}
+    for row in rows:
+        code = row["stock_code"]
+        core = {"stock_code": code, "classification": "TRADED", "evidence": row}
+        entities.append({**core, "row_hash": canonical_digest(core)})
+        indexed[code] = row
+    no_bar = detail["no_bar_artifacts"]
+    keys = sorted(no_bar)
+    for start in range(0, len(keys), 32):
+        batch = keys[start:start + 32]
+        facts = store.get_many(generation, "daily_attempt", batch)
+        for code in batch:
+            fact = facts.get(code)
+            if not fact or fact["stock_code"] != code or canonical_digest(fact) != no_bar[code]:
+                raise ValueError("daily attempt legacy absence digest differs")
+            entities.append(fact)
+    proof = {k: detail[k] for k in ("captured_at", "catalog_batch_id", "catalog_manifest_hash",
+             "catalog_member_set_hash", "calendar_batch_id", "calendar_manifest_hash", "unresolved_codes")}
+    proof.update(schema=SCHEMA, dataset=ATTEMPT_DATASET, provider=PROVIDER, trade_date=receipt["trade_date"],
+                 run_id=receipt["run_id"], status="PARTIAL", strategy_eligible=False,
+                 entities=sorted(entities, key=lambda item: item["stock_code"]))
+    if len(indexed) != len(rows) or len(rows) != receipt["row_count"] or canonical_digest(proof) != generation:
+        raise ValueError("daily attempt legacy publication seal differs")
+    return indexed
+
+
+def read_verified_attempt_bars(engine, trade_date: str, codes: Sequence[str], *,
+                               decision_known_at: datetime | str) -> dict[str, dict]:
+    """Read only proven native trades from a partial day as of its durable receipt."""
+    requested = set(codes)
+    if not all(isinstance(code, str) and re.fullmatch(r"[0-9]{6}", code) for code in requested):
+        raise ValueError("daily attempt lookup requires six-digit stock codes")
+    if not requested:
+        return {}
+    day = str(trade_date)
+    receipt = load_receipt(engine, dataset=ATTEMPT_DATASET, trade_date=day)
+    if not receipt or receipt["status"] != "BLOCKED" or not receipt["finished_at"]:
+        return {}
+    known_at = _stamp(receipt["finished_at"])
+    if known_at > _stamp(decision_known_at):
+        return {}
+    detail = receipt["detail"]
+    closed = datetime.combine(datetime.fromisoformat(day).date(), time(15, 35))
+    if (str(receipt["trade_date"]) != day or detail.get("strategy_eligible") is not False
+            or receipt["row_count"] != receipt["code_count"] or not receipt["source_root"]
+            or not _SHA256.fullmatch(str(receipt["content_sha256"]))
+            or not closed <= _stamp(detail["captured_at"]) <= known_at):
+        raise ValueError("daily attempt receipt identity or time differs")
+    requested.difference_update(detail["unresolved_codes"], detail["no_bar_artifacts"])
+    if not requested:
+        return {}
+    if detail["schema"] == "probiga.qmt-daily-attempt.v1":
+        rows = _legacy_attempt_bars(engine, json.dumps(receipt, sort_keys=True, default=str))
+    elif detail["schema"] == "probiga.qmt-daily-attempt.v2":
+        generation = detail["manifest_hash"]
+        store = FormalAnalysisStore(engine)
+        if store.get(generation, "daily_attempt", "receipt") != canonical_digest(receipt):
+            raise ValueError("daily attempt receipt seal differs")
+        groups = detail["bar_group_artifacts"]
+        keys = sorted({"bars." + code[:4] for code in requested} & groups.keys())
+        rows = {}
+        for start in range(0, len(keys), 32):
+            batch = keys[start:start + 32]
+            payloads = store.get_many(generation, "daily_attempt", batch)
+            for key in batch:
+                payload = payloads.get(key)
+                if (not isinstance(payload, dict) or canonical_digest(payload) != groups[key]
+                        or any("bars." + code[:4] != key for code in payload)):
+                    raise ValueError("daily attempt bar group seal differs")
+                rows.update(payload)
+    else:
+        raise ValueError("daily attempt schema differs")
+    result = {}
+    for code in requested & rows.keys():
+        row = rows[code]
+        if (row["stock_code"] != code or row["trade_date"] != day or canonical_bar(row) != row
+                or Decimal(row["volume"]) <= 0 or Decimal(row["amount"]) <= 0):
+            raise ValueError("daily attempt native bar differs: " + code)
+        result[code] = {**row, "known_at": known_at.isoformat(" "), "data_source": PROVIDER}
+    return result
 
 
 def load_daily_manifest(engine, day: str, *, decision_known_at: datetime | str,

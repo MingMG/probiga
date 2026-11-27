@@ -1,5 +1,6 @@
 from datetime import datetime
 from hashlib import sha256
+from types import SimpleNamespace
 
 import pytest
 
@@ -22,6 +23,30 @@ def _document(code, publication, number, text):
 
 def _proof(documents, code, day="2026-10-22", cutoff=CUTOFF):
     return historical_daily_evidence(documents, stock_code=code, day=day, cutoff=cutoff)[0]
+
+
+def test_risk_warning_removal_summary_omits_full_day_halt(monkeypatch):
+    from server.common import official_historical_daily_evidence as source
+    from server.common.announcement_provider import CninfoMarketAnnouncementProvider
+
+    day, code = "2026-11-27", "600381"
+    cutoff = datetime.fromisoformat("2026-11-27T21:00:00+08:00")
+    body = "本公司股票将于2026年11月27日停牌一天，自2026年11月30日起复牌交易。"
+    doc = _document(code, day, 1225690996, body)
+    doc["observed_at"] = cutoff.isoformat()
+    row = {"title": "青海春天撤销退市风险警示及其他风险警示的公告", "detail_url": doc["source_url"],
+           "announcementTime": 1795708800000, "announcement_id": "1225690996", "source_row_hash": "e"*64}
+    monkeypatch.setattr(CninfoMarketAnnouncementProvider, "fetch", lambda *_a, **_k: SimpleNamespace(rows=[row]))
+    monkeypatch.setattr(source, "_read_document", lambda *_a, **_k: doc)
+
+    def prove():
+        documents = source._read_daily_documents([code], day, 10)
+        return source.official_daily_suspension_evidence(documents[code], stock_code=code, day=day, cutoff=cutoff)
+
+    assert prove()["kind"] == source.DAILY_SUSPENSION_KIND
+    doc.update(_document(code, day, 1225690996, "公司申请撤销退市风险警示。"), observed_at=cutoff.isoformat())
+    with pytest.raises(ValueError, match="full-day suspension is unproven"):
+        prove()
 
 
 def test_voluntary_delisting_suspension_has_two_effective_endpoints():

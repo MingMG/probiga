@@ -297,7 +297,10 @@ def _read_daily_documents(codes: list[str], target_date: str, timeout_seconds: f
                 if delisting:
                     matches = [row for row in inventory.rows if "终止上市" in row["title"] and "摘牌" in row["title"]]
                 else:
-                    matches = [row for row in inventory.rows if "停牌" in row["title"] or "复牌" in row["title"]]
+                    # CNINFO can shorten a risk-warning removal title by omitting
+                    # the halt. Only the indexed PDF can prove a full-day halt.
+                    matches = [row for row in inventory.rows if any(term in row["title"] for term in
+                               ("停牌", "复牌", "撤销退市风险警示", "撤销其他风险警示"))]
                 if not 1 <= len(matches) <= 4:
                     continue
                 documents = []
