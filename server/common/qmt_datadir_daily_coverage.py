@@ -15,7 +15,7 @@ import re
 from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 
 from server.common.qmt_attestation_contract import canonical_digest
 from server.common.official_historical_daily_evidence import (
@@ -114,12 +114,15 @@ def _official_suspension_with_native_tick(
     return {**official, **_snapshot_evidence(snapshot, raw, generated)}
 
 
-def listing_evidence(value: Mapping[str, Any], code: str, day: str) -> dict:
+def listing_evidence(value: Mapping[str, Any], code: str, day: str, *, cutoff: datetime) -> dict:
     """Validate a preserved exchange/issuer disclosure; never infer from no bars."""
-    from server.common.official_listing_evidence import validate_official_listing_evidence
-    result = validate_official_listing_evidence(value, stock_code=code, target_date=day)
-    return {**result, "kind": "EXCHANGE_LISTING_DISCLOSURE", "stock_code": code,
-            "target_date": day}
+    from server.common.official_listing_evidence import ISSUANCE_SCHEMA, validate_official_listing_evidence
+    source = {k: v for k, v in value.items() if k not in {"kind", "target_date"}}
+    result = validate_official_listing_evidence(source, stock_code=code, target_date=day)
+    if result.get("captured_at") is not None and _stamp(result["captured_at"]) > cutoff:
+        raise ValueError("official pre-listing evidence was not yet observed: " + code)
+    kind = "IPO_ISSUANCE_DISCLOSURE" if result["schema"] == ISSUANCE_SCHEMA else "EXCHANGE_LISTING_DISCLOSURE"
+    return {**result, "kind": kind, "stock_code": code, "target_date": day}
 
 
 def canonical_bar(row: Mapping[str, Any]) -> dict:
@@ -237,6 +240,35 @@ def _delisting_evidence(catalog, documents: list[dict], *, code: str, day: str, 
     return official_daily_delisting_evidence(documents, stock_code=code, day=day, cutoff=cutoff)
 
 
+def _no_bar_fact(code, *, catalog, day, captured, snapshot, listings, suspensions, delistings,
+                 historical_documents, historical_suspensions):
+    if code in historical_suspensions:
+        kind = "NO_TRADE"
+        evidence = validate_suspension_evidence(
+            historical_suspensions[code], stock_code=code, day=day,
+            cutoff=captured.replace(tzinfo=CHINA),
+        )
+    elif historical_documents is not None:
+        try:
+            kind, evidence = historical_daily_evidence(historical_documents[code], stock_code=code,
+                                                       day=day, cutoff=captured)
+        except ValueError as exc:
+            raise ValueError(f"historical daily lifecycle {day} {code}: {exc}") from exc
+    elif code in (listings or {}):
+        kind, evidence = "NOT_LISTED", listing_evidence(listings[code], code, day, cutoff=captured)
+    elif code in delistings:
+        kind = "DELISTED"
+        evidence = _delisting_evidence(catalog, delistings[code], code=code, day=day, cutoff=captured)
+    elif code in suspensions:
+        kind = "NO_TRADE"
+        evidence = _official_suspension_with_native_tick(
+            snapshot or {}, suspensions[code], code, day, captured,
+        )
+    else:
+        kind, evidence = "NO_TRADE", suspension_evidence(snapshot or {}, code, day, captured)
+    return kind, evidence
+
+
 def build_manifest(*, catalog, calendar, day: str, rows: Sequence[Mapping[str, Any]],
                    run_id: str, captured_at: datetime, snapshot: Mapping[str, Any] | None = None,
                    listings: Mapping[str, Any] | None = None,
@@ -245,7 +277,8 @@ def build_manifest(*, catalog, calendar, day: str, rows: Sequence[Mapping[str, A
                    historical_documents: Mapping[str, list[dict]] | None = None,
                    historical_suspensions: Mapping[str, dict] | None = None,
                    historical_public_bars: Mapping[str, dict] | None = None,
-                   previous_session: str = "", native_content_sha256: str = "") -> dict:
+                   previous_session: str = "", native_content_sha256: str = "",
+                   allow_partial: bool = False, unresolved_codes=None, retained_no_bar=None) -> dict:
     captured = _stamp(captured_at).replace(microsecond=0)
     if captured < datetime.combine(datetime.fromisoformat(day).date(), time(15, 35)):
         raise ValueError("daily source is not final")
@@ -281,34 +314,32 @@ def build_manifest(*, catalog, calendar, day: str, rows: Sequence[Mapping[str, A
         for code, evidence in public.items():
             if verify_public_bar(evidence, stock_code=code, day=day, previous_day=previous_session, cutoff=captured) != by_code[code]:
                 raise ValueError("historical public source bar differs from exact publication")
+    pending = dict(unresolved_codes or {})
+    retained = set(retained_no_bar or {})
+    if (pending or retained) and (not allow_partial or historical or not (
+            set(pending) | retained) <= set(expected) - by_code.keys() or set(pending) & retained):
+        raise ValueError("daily checkpoint scope conflicts with catalog or traded bars")
     entities = []
     for code in expected:
         if code in by_code:
             kind, evidence = "TRADED", by_code[code]
-        elif code in historical_suspensions:
-            kind = "NO_TRADE"
-            evidence = validate_suspension_evidence(
-                historical_suspensions[code], stock_code=code, day=day,
-                cutoff=captured.replace(tzinfo=CHINA),
-            )
-        elif historical_documents is not None:
-            try:
-                kind, evidence = historical_daily_evidence(historical_documents[code], stock_code=code,
-                                                           day=day, cutoff=captured)
-            except ValueError as exc:
-                raise ValueError(f"historical daily lifecycle {day} {code}: {exc}") from exc
-        elif code in (listings or {}):
-            kind, evidence = "NOT_LISTED", listing_evidence(listings[code], code, day)
-        elif code in delistings:
-            kind = "DELISTED"
-            evidence = _delisting_evidence(catalog, delistings[code], code=code, day=day, cutoff=captured)
-        elif code in suspensions:
-            kind = "NO_TRADE"
-            evidence = _official_suspension_with_native_tick(
-                snapshot or {}, suspensions[code], code, day, captured,
-            )
+        elif code in (retained_no_bar or {}):
+            entities.append(retained_no_bar[code])
+            continue
+        elif allow_partial and code in pending:
+            continue
         else:
-            kind, evidence = "NO_TRADE", suspension_evidence(snapshot or {}, code, day, captured)
+            try:
+                kind, evidence = _no_bar_fact(
+                    code, catalog=catalog, day=day, captured=captured, snapshot=snapshot,
+                    listings=listings, suspensions=suspensions, delistings=delistings,
+                    historical_documents=historical_documents, historical_suspensions=historical_suspensions,
+                )
+            except (KeyError, ValueError, TypeError, OverflowError) as exc:
+                if not allow_partial:
+                    raise
+                pending[code] = f"NO_VERIFIED_DAILY_STATUS: {exc}"[:200]
+                continue
         core = {"stock_code": code, "classification": kind, "evidence": evidence}
         entities.append({**core, "row_hash": canonical_digest(core)})
     core = {"schema": SCHEMA, "dataset": "stock_daily", "provider": PROVIDER,
@@ -318,6 +349,9 @@ def build_manifest(*, catalog, calendar, day: str, rows: Sequence[Mapping[str, A
             "catalog_member_set_hash": catalog.member_set_hash,
             "calendar_batch_id": calendar.batch_id, "calendar_manifest_hash": calendar.manifest_hash,
             "entities": entities}
+    if pending:
+        core.update(status="PARTIAL", strategy_eligible=False, dataset="stock_daily_attempt",
+                    unresolved_codes=dict(sorted(pending.items())))
     if historical:
         core["historical_reconstruction"] = True
     if public:
@@ -408,7 +442,8 @@ def validate_manifest(manifest: Mapping[str, Any], *, catalog, calendar) -> dict
             if classification != entity["classification"] or proof != entity["evidence"]:
                 raise ValueError("historical daily lifecycle evidence differs")
         elif entity["classification"] == "NOT_LISTED":
-            proof = listing_evidence(entity["evidence"], entity["stock_code"], original["trade_date"])
+            proof = listing_evidence(entity["evidence"], entity["stock_code"], original["trade_date"],
+                                     cutoff=_stamp(original["captured_at"]))
             if proof != entity["evidence"]:
                 raise ValueError("daily listing evidence differs")
         elif entity["classification"] == "DELISTED":
@@ -447,6 +482,10 @@ def validate_manifest(manifest: Mapping[str, Any], *, catalog, calendar) -> dict
 
 def insert_manifest(connection, manifest: dict) -> None:
     """Append one immutable proof in the same transaction as its daily rows."""
+    if (manifest.get("status") != "EXACT" or manifest.get("strategy_eligible") is not True
+            or manifest.get("dataset") not in {"stock_daily", NATIVE_EVIDENCE_DATASET}
+            or manifest.get("unresolved_codes")):
+        raise ValueError("incomplete daily coverage cannot be published")
     created_at = connection.execute(text("SELECT CURRENT_TIMESTAMP")).scalar_one()
     entities = manifest["entities"]
     traded = [entity["stock_code"] for entity in entities if entity["classification"] == "TRADED"]
@@ -699,31 +738,64 @@ def _load_daily_manifest(engine, day: str, *, decision_known_at: datetime | str,
 
 
 def retained_listing_evidence(engine, codes: Sequence[str], *, target_date: str,
-                              decision_known_at: datetime) -> dict[str, dict]:
-    """Reuse immutable official documents through their proven listing date."""
+                              decision_known_at: datetime, include_issuance: bool = False) -> dict[str, dict]:
+    """Reuse each official document only inside the pre-listing interval it proves."""
     requested = set(codes)
+    if not requested:
+        return {}
     result = {}
     with _scope(engine) as connection:
-        rows = connection.execute(text(
-            f"SELECT manifest_hash,manifest_json FROM {MANIFEST_TABLE} "
+        hashes = connection.execute(text(
+            f"SELECT manifest_hash FROM {MANIFEST_TABLE} "
             "WHERE schema_version=:schema AND provider=:provider AND dataset='stock_daily' "
             "AND status='EXACT' AND captured_at<=:cutoff ORDER BY captured_at DESC LIMIT 40"
-        ), {"schema": SCHEMA, "provider": PROVIDER, "cutoff": _stamp(decision_known_at)}).mappings()
-        for row in rows:
-            manifest = json.loads(str(row["manifest_json"]))
+        ), {"schema": SCHEMA, "provider": PROVIDER, "cutoff": _stamp(decision_known_at)}).scalars().all()
+        if not hashes:
+            return {}
+        lookup = text(
+            f"SELECT manifest_hash,stock_code,row_hash FROM {ENTITY_TABLE} "
+            "WHERE manifest_hash IN :hashes AND stock_code IN :codes AND classification='NOT_LISTED'"
+        ).bindparams(bindparam("hashes", expanding=True), bindparam("codes", expanding=True))
+        matches = {}
+        ordered_codes = sorted(requested)
+        for start in range(0, len(ordered_codes), 64):
+            rows = connection.execute(lookup, {"hashes": hashes, "codes": ordered_codes[start:start + 64]})
+            for manifest_hash, code, row_hash in rows:
+                matches.setdefault(manifest_hash, {})[code] = row_hash
+        for manifest_hash in hashes:
+            candidates = matches.get(manifest_hash, {}).keys() - result.keys()
+            if not candidates:
+                continue
+            payload = connection.execute(text(
+                f"SELECT manifest_json FROM {MANIFEST_TABLE} WHERE manifest_hash=:hash"
+            ), {"hash": manifest_hash}).scalar_one()
+            manifest = json.loads(str(payload))
             supplied = manifest.pop("manifest_hash", None)
-            if supplied != row["manifest_hash"] or supplied != canonical_digest(manifest):
+            if supplied != manifest_hash or supplied != canonical_digest(manifest):
                 raise ValueError("retained listing publication seal differs")
             for entity in manifest["entities"]:
                 code = entity["stock_code"]
-                if code not in requested or code in result or entity["classification"] != "NOT_LISTED":
+                if code not in candidates:
                     continue
+                candidates.remove(code)
                 core = {key: entity[key] for key in ("stock_code", "classification", "evidence")}
-                if entity["row_hash"] != canonical_digest(core):
+                if (entity["classification"] != "NOT_LISTED" or entity["row_hash"] != matches[manifest_hash][code]
+                        or entity["row_hash"] != canonical_digest(core)):
                     raise ValueError("retained official listing entity seal differs")
-                if str(entity["evidence"]["listing_date"]) <= target_date:
+                proof = listing_evidence(entity["evidence"], code, manifest["trade_date"],
+                                         cutoff=_stamp(manifest["captured_at"]))
+                if proof != entity["evidence"]:
+                    raise ValueError("retained pre-listing disclosure differs")
+                if target_date < proof["publication_date"]:
                     continue
-                result[code] = listing_evidence(entity["evidence"], code, target_date)
+                if "listing_date" in proof:
+                    if target_date >= proof["listing_date"]:
+                        continue
+                elif not include_issuance or target_date > proof["not_listed_through"]:
+                    continue
+                result[code] = listing_evidence(proof, code, target_date, cutoff=_stamp(decision_known_at))
+            if candidates:
+                raise ValueError("retained official listing entity absent from publication")
             if set(result) == requested:
                 break
     return result

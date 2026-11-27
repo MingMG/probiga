@@ -225,7 +225,7 @@ def test_historical_catalog_allows_exact_native_traded_bse_listing_with_official
 
 
 @pytest.mark.parametrize("daily_evidence", [
-    "legacy", "datadir", "mismatched_receipt", "late_receipt", "not_listed", "delisted",
+    "legacy", "datadir", "mismatched_receipt", "late_receipt", "unproven_prelisting", "not_listed", "delisted",
 ])
 def test_historical_authority_loader_emits_v3_without_membership(
     monkeypatch, daily_evidence,
@@ -243,6 +243,21 @@ def test_historical_authority_loader_emits_v3_without_membership(
 
     target = date(2026, 9, 3)
     members = [("000001", "1991-04-03"), ("000002", "1991-01-29")]
+    prelisting_entity = None
+    if daily_evidence == "not_listed":
+        from server.common.official_listing_evidence import SCHEMA
+        from server.common.qmt_datadir_daily_coverage import listing_evidence
+
+        code = "301661"
+        members.append((code, target.isoformat()))
+        body = "证券代码：301661。首次公开发行股票并在创业板上市之上市公告书。股票将于2026年9月7日在深圳证券交易所上市。"
+        proof = {"schema": SCHEMA, "stock_code": code, "source_text": body,
+                 "source_url": "https://static.cninfo.com.cn/finalpage/2026-09-03/1225646928.PDF",
+                 "source_text_sha256": sha256(body.encode()).hexdigest(), "official_document_sha256": "f" * 64,
+                 "listing_date": "2026-09-07", "publication_date": target.isoformat(), "captured_at": "2026-09-03 18:30:00"}
+        prelisting_entity = {"stock_code": code, "classification": "NOT_LISTED",
+                             "evidence": listing_evidence(proof, code, target.isoformat(), cutoff=datetime(2026, 9, 5, 12))}
+        prelisting_entity["row_hash"] = canonical_digest(prelisting_entity)
     delisted_entity = None
     if daily_evidence == "delisted":
         code = "002731"
@@ -313,8 +328,9 @@ def test_historical_authority_loader_emits_v3_without_membership(
                 "entities": [
                     {"stock_code": "000001", "classification": "TRADED"},
                     {"stock_code": "000002", "classification": (
-                        "NOT_LISTED" if daily_evidence == "not_listed" else "NO_TRADE"
+                        "NOT_LISTED" if daily_evidence == "unproven_prelisting" else "NO_TRADE"
                     )},
+                    *([prelisting_entity] if prelisting_entity else []),
                     *([delisted_entity] if delisted_entity else []),
                 ],
             }
@@ -363,12 +379,12 @@ def test_historical_authority_loader_emits_v3_without_membership(
     )
 
     args = {"target_trade_date": target, "decision_known_at": datetime(2026, 9, 5, 13, 0)}
-    if daily_evidence in {"mismatched_receipt", "late_receipt", "not_listed"}:
+    if daily_evidence in {"mismatched_receipt", "late_receipt", "unproven_prelisting"}:
         with pytest.raises(QMTAnnouncementBlocked) as exc:
             announcement_tool._load_historical_reconstruction_authority(engine, **args)
         assert exc.value.reason_code == (
-            "QMT_ANNOUNCEMENT_RECONSTRUCTION_LISTING_SCOPE_UNSUPPORTED"
-            if daily_evidence == "not_listed" else
+            "QMT_ANNOUNCEMENT_RECONSTRUCTION_DAILY_AUTHORITY_DIFFERS"
+            if daily_evidence == "unproven_prelisting" else
             "QMT_ANNOUNCEMENT_RECONSTRUCTION_DATADIR_PUBLICATION_DIFFERS"
         )
         return
@@ -390,6 +406,9 @@ def test_historical_authority_loader_emits_v3_without_membership(
     assert "membership_snapshot" not in authority
     assert "membership_snapshot_sha256" not in authority
     assert authority["reconciliation"]["native_no_trade_codes"] == ["000002"]
+    if prelisting_entity:
+        assert authority["reconciliation"]["official_prelisting_entities"] == [prelisting_entity]
+        assert prelisting_entity["stock_code"] in catalog.codes
     if delisted_entity:
         assert authority["reconciliation"]["official_delisted_entities"] == [delisted_entity]
         assert catalog.qmt_by_code[delisted_entity["stock_code"]] == "002731.SZ"
