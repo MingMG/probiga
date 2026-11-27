@@ -6,6 +6,9 @@ import json
 import pytest
 
 from server.api import scheduler_runtime as runtime
+from server.common.qmt_attestation_contract import canonical_digest
+from server.common.qmt_datadir_result import build_unavailable_result
+from tools.qmt_host_ownership_contract import QMT_STOCK_DAILY_CANONICAL_TASK
 
 
 def _stages(*, task_type, status, target, upstream_finished, downstream_started):
@@ -126,3 +129,69 @@ def test_unready_or_wrong_target_input_does_not_reopen_success(upstream_patch):
 
     assert downstream.get("_dependency_recovery_due") is not True
     assert _dispatch_gates(downstream, now=now) == (False, False)
+
+
+def _partial_daily_attempt(target="2026-11-27"):
+    payload = build_unavailable_result(dataset="stock_daily", sessions=[target], build_sha="3"*40,
+                                       reason=f"QMT_DAILY_COVERAGE_INCOMPLETE target={target} unresolved=2")
+    payload["session_results"] = [{
+        "session": target, "status": "BLOCKED", "run_id": "qdd_20261127234017_b9c89d5a",
+        "verified_code_count": 5580,
+        "unresolved_codes": dict.fromkeys(("301661", "600381"), "OFFICIAL_LISTING_EVIDENCE_FAILED: stage=worker"),
+    }]
+    return payload
+
+
+def _daily_row(monkeypatch, now, payload, *, finished, target="2026-11-27", corrupt=False, enabled=1):
+    payload.pop("receipt_id", None)
+    payload["receipt_id"] = "a"*64 if corrupt else canonical_digest(payload)
+    out = json.dumps(payload)
+    row = {**QMT_STOCK_DAILY_CANONICAL_TASK, "enabled": enabled, "last_run_status": "blocked",
+           "last_triggered_at": finished - timedelta(seconds=52), "last_run_at": finished - timedelta(seconds=52),
+           "last_run_duration": 52, "last_run_output": out + "\n---MACHINE-RECEIPTS---\n" + out}
+    monkeypatch.setattr(runtime, "authoritative_closed_trade_date", lambda *a, **kw: target)
+    runtime._attach_daily_recovery_targets(None, [row], now=now)
+    return row
+
+
+@pytest.mark.parametrize(("finished", "now", "expected"), [
+    ("2026-11-27 16:10:09", "2026-11-27 16:25:08", False),
+    ("2026-11-27 16:10:09", "2026-11-27 16:25:09", True),
+    ("2026-11-27 23:55:00", "2026-11-28 00:08:00", False),
+    ("2026-11-27 23:40:56", "2026-11-28 00:08:00", True),
+])
+def test_ordinary_daily_partial_resumes_through_existing_backoff(monkeypatch, finished, now, expected):
+    from server.common.scheduler_args import build_scheduler_task_args
+
+    monkeypatch.setattr(runtime, "CRON_RETRY_INTERVAL_MINUTES", 15)
+    now = datetime.fromisoformat(now)
+    row = _daily_row(monkeypatch, now, _partial_daily_attempt(), finished=datetime.fromisoformat(finished))
+    assert _dispatch_gates(row, now=now) == (expected, expected)
+    assert build_scheduler_task_args(row, row["script_path"], row["_scheduler_target_trade_date"])[-4:] == [
+        "--start", "2026-11-27", "--end", "2026-11-27",
+    ]
+
+
+@pytest.mark.parametrize("case", ["tampered", "other_day", "other_task", "other_provider", "nonretryable",
+                                  "zero_build", "no_checkpoint", "wrong_inner_day", "no_gaps", "disabled", "expired"])
+def test_daily_partial_rejects_unrelated_or_unverified_receipts(monkeypatch, case):
+    now = datetime(2026, 11, 28, 0, 8) if case != "expired" else datetime(2026, 12, 6, 0, 8)
+    payload = _partial_daily_attempt(target="2026-11-26" if case == "other_day" else "2026-11-27")
+    if case == "other_task":
+        payload["task_type"] = "qmt_stock_minute_canonical"
+        payload["dataset"] = "stock_minute"
+    if case == "other_provider":
+        payload["provider"] = "another"
+    if case == "nonretryable":
+        payload["retryable"] = False
+    if case == "zero_build":
+        payload["build_sha"] = "0"*40
+    if case == "no_checkpoint":
+        del payload["session_results"]
+    if case == "wrong_inner_day":
+        payload["session_results"][0]["session"] = "2026-11-26"
+    if case == "no_gaps":
+        payload["session_results"][0]["unresolved_codes"] = {}
+    row = _daily_row(monkeypatch, now, payload, finished=datetime(2026, 11, 27, 23, 40, 56),
+                     corrupt=case == "tampered", enabled=int(case != "disabled"))
+    assert not runtime._task_status_is_retryable(row)

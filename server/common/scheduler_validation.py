@@ -940,6 +940,37 @@ def _qmt_datadir_payload(output: str | None) -> Mapping[str, Any] | None:
     )
 
 
+def retryable_qmt_daily_partial(output: str | None, *, target: str) -> bool:
+    """Recognize the single ordinary daily import checkpoint for this session."""
+    from server.common.qmt_datadir_result import validate_task_result
+
+    payload = _qmt_datadir_payload(output)
+    if not payload:
+        return False
+    build_sha = str(payload.get("build_sha") or "")
+    if (payload.get("task_type") != "qmt_stock_daily_canonical" or payload.get("dataset") != "stock_daily"
+            or payload.get("provider") != "qmt_datadir" or payload.get("sessions") != [target]
+            or payload.get("target_trade_date") != target or payload.get("partitions") != []
+            or payload.get("execution") != {"source_kind": "local_qmt_datadir", "network_accessed": False}
+            or not _is_hex(build_sha, 40) or build_sha == "0" * 40):
+        return False
+    if validate_task_result("qmt_stock_daily_canonical", payload, return_code=3, expected_build_sha=build_sha) != "blocked":
+        return False
+    sessions = payload.get("session_results")
+    if not isinstance(sessions, list) or len(sessions) != 1 or not isinstance(sessions[0], dict):
+        return False
+    partial = sessions[0]
+    unresolved = partial.get("unresolved_codes")
+    return bool(partial.get("session") == target and partial.get("status") == "BLOCKED"
+                and re.fullmatch(r"qdd_[0-9]{14}_[a-f0-9]{8}", str(partial.get("run_id") or ""))
+                and type(partial.get("verified_code_count")) is int and partial["verified_code_count"] > 0
+                and isinstance(unresolved, dict) and unresolved
+                and all(re.fullmatch(r"[0-9]{6}", code) and isinstance(reason, str) and reason.strip()
+                        for code, reason in unresolved.items())
+                and payload.get("reason_code") ==
+                f"QMT_DAILY_COVERAGE_INCOMPLETE target={target} unresolved={len(unresolved)}")
+
+
 def _qmt_datadir_output_status(
     task_type: str,
     output: str | None,
