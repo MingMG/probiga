@@ -640,6 +640,7 @@ class HotDataDetailHelperTest(unittest.TestCase):
              patch("server.api.routers.hot_data._cache_set") as cache_set_mock, \
              patch("server.api.routers.hot_data._portfolio_market_mode", return_value="post_close"), \
              patch("server.api.routers.hot_data._stock_detail_portfolio_context", return_value={}), \
+             patch("server.api.routers.hot_data._attach_verified_display_bars"), \
              patch("server.api.routers.hot_data._load_stock_detail_payload", return_value=payload) as payload_mock, \
              patch("server.api.routers.hot_data._load_latest_analysis_snapshot", return_value=snapshot) as snapshot_mock, \
              patch("server.api.routers.hot_data._load_latest_recommendation_snapshot", return_value={"final_trade_score": 77.0, "ai_score": 70.0}) as rec_mock, \

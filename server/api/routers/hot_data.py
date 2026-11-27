@@ -33,6 +33,8 @@ from server.common.minute_data import (
 )
 from server.common.adata_release import ensure_adata_import_path
 from server.common.analysis_pool_receipt import read_persisted_pool_manifest
+from server.common.formal_analysis_store import FormalAnalysisStoreError
+from server.common.qmt_datadir_daily_coverage import read_verified_attempt_bars
 from server.common.batch_db import quote_identifier, write_frame
 from server.common.config import get_api_cache_config, get_settings
 from server.common.recommended_run_history_schema import (
@@ -4301,6 +4303,48 @@ def _stock_detail_staleness(result: dict) -> dict:
     return output
 
 
+def _attach_verified_display_bars(rows: list[dict], trade_date: str) -> None:
+    """Expose exact closed bars separately from portfolio and strategy inputs."""
+    if not trade_date:
+        return
+    missing = {}
+    for row in rows:
+        code = str(row.get("stock_code") or "")
+        quote_date = str(row.get("quote_trade_date") or "")[:10]
+        if not re.fullmatch(r"[0-9]{6}", code) or quote_date > trade_date:
+            continue
+        price = (row.get("market") or {}).get("price", row.get("cur_price"))
+        observed = _stock_detail_quote_timestamp(row.get("quote_snapshot_at"))
+        if not (
+            quote_date == trade_date and (_as_float(price) or 0) > 0
+            and (observed is None or observed >= _stock_detail_quote_timestamp(trade_date + " 15:00:00"))
+            and str(row.get("quote_status") or "") not in {"missing", "stale", "previous_close"}
+        ):
+            missing[code] = row
+    if not missing:
+        return
+    try:
+        bars = read_verified_attempt_bars(get_engine(), trade_date, list(missing),
+                                          decision_known_at=datetime.now(timezone(timedelta(hours=8))))
+        display = {}
+        for code, bar in bars.items():
+            close, previous = Decimal(bar["close"]), Decimal(bar["pre_close"])
+            display[code] = {**bar, "change_pct": float(round((close / previous - 1) * 100, 4))}
+    except (SQLAlchemyError, FormalAnalysisStoreError, ValueError, KeyError, TypeError, ArithmeticError) as exc:
+        _record_fallback("verified_daily_display", exc)
+        return
+    for code, bar in display.items():
+        missing[code]["verified_daily_bar"] = bar
+
+
+def _stock_detail_display(result: dict, mode: str) -> dict:
+    if mode != "post_close":
+        return result
+    display = dict(result)
+    _attach_verified_display_bars([display], str(result.get("requested_trade_date") or "")[:10])
+    return display
+
+
 @router.get("/hot-data/stock-detail")
 def stock_detail(stock_code: str = Query()):
     """个股详情：7大模块投资决策数据"""
@@ -4313,9 +4357,10 @@ def stock_detail(stock_code: str = Query()):
         ttl_seconds=_trading_live_ttl_seconds(60, intraday_seconds=12),
     )
     if cached is not None:
-        return _stock_detail_staleness(
+        result = _stock_detail_staleness(
             _apply_stock_detail_portfolio_context(cached, portfolio_context)
         )
+        return _stock_detail_display(result, mode)
     try:
         try:
             payload = _load_stock_detail_payload(code, mode=mode, light=True)
@@ -4419,7 +4464,7 @@ def stock_detail(stock_code: str = Query()):
         result = _stock_detail_staleness(result)
         if not result.get("error"):
             _cache_set(cache_key, result)
-        return result
+        return _stock_detail_display(result, mode)
     except Exception as e:
         return {"stock_code": stock_code, "error": str(e)}
 
@@ -7566,6 +7611,9 @@ def _build_portfolio_snapshot(*, force_live: bool = False) -> dict:
     ]
     tech_risk_signal["exposed_holdings"] = exposed_holdings
     tech_risk_signal["exposed_holding_count"] = len(exposed_holdings)
+
+    if portfolio_mode == "post_close":
+        _attach_verified_display_bars(rows, close_trade_date)
 
     return {
         "data": rows,

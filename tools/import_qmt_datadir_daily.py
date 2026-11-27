@@ -64,6 +64,7 @@ from server.common.qmt_datadir_result import (  # noqa: E402
     persisted_fingerprint,
 )
 from server.common.qmt_datadir_daily_coverage import (  # noqa: E402
+    ATTEMPT_DATASET,
     NATIVE_AMOUNT_WORD,
     NATIVE_EVIDENCE_DATASET,
     build_manifest,
@@ -80,6 +81,7 @@ from server.common.qmt_datadir_daily_coverage import (  # noqa: E402
     suspension_evidence,
     validate_manifest,
     validate_native_revision,
+    verify_attempt_native_records,
 )
 from server.common.qmt_post_close_block_evidence import (  # noqa: E402
     KIND as POST_CLOSE_KIND,
@@ -290,9 +292,6 @@ def _reusable_partition(engine, *, session, harvested):
     return proof
 
 
-ATTEMPT_DATASET = "stock_daily_attempt"
-
-
 def _retained_native_records(engine, *, day, source_root):
     from server.common.formal_analysis_store import FormalAnalysisStore
 
@@ -336,7 +335,12 @@ def _save_daily_attempt(engine, *, proof, source_root, harvested, previous_run):
 
     day = proof["trade_date"]
     rows = [item["evidence"] for item in proof["entities"] if item["classification"] == "TRADED"]
+    verify_attempt_native_records(rows, harvested["native_records"], day=day)
     no_bar = {item["stock_code"]: item for item in proof["entities"] if item["classification"] != "TRADED"}
+    groups = {}
+    for row in rows:
+        code = row["stock_code"]
+        groups.setdefault("bars." + code[:4], {})[code] = row
     generation = proof["manifest_hash"]
     with _daily_transaction(engine) as connection:
         current = load_receipt(connection, dataset=ATTEMPT_DATASET, trade_date=day)
@@ -344,17 +348,22 @@ def _save_daily_attempt(engine, *, proof, source_root, harvested, previous_run):
         if ((current or {}).get("run_id"), (complete or {}).get("run_id")) != previous_run:
             raise RuntimeError("daily coverage checkpoint advanced during source read: " + day)
         store = FormalAnalysisStore(connection)
-        hashes = store.put_many(generation, "daily_attempt", {"bars": rows, "native": harvested["native_records"]})
+        native_hash = store.put(generation, "daily_attempt", "native", harvested["native_records"])
+        bar_groups = {}
+        keys = sorted(groups)
+        for start in range(0, len(keys), 32):
+            batch = {key: groups[key] for key in keys[start:start + 32]}
+            bar_groups.update(store.put_many(generation, "daily_attempt", batch))
         evidence = {}
         for offset in range(0, len(no_bar), 32):
             codes = list(no_bar)[offset:offset+32]
             evidence.update(store.put_many(generation, "daily_attempt", {code: no_bar[code] for code in codes}))
         detail = {key: proof[key] for key in ("captured_at", "catalog_batch_id", "catalog_manifest_hash",
                   "catalog_member_set_hash", "calendar_batch_id", "calendar_manifest_hash", "unresolved_codes")}
-        detail.update(schema="probiga.qmt-daily-attempt.v1", strategy_eligible=False,
+        detail.update(schema="probiga.qmt-daily-attempt.v2", strategy_eligible=False,
                       eligible_code_count=len(proof["entities"]) + len(proof["unresolved_codes"]),
-                      bars_artifact_sha256=hashes["bars"], no_bar_artifacts=evidence, manifest_hash=generation,
-                      native_records_sha256=hashes["native"], reused_native_code_count=harvested["reused_codes"])
+                      bar_group_artifacts=bar_groups, no_bar_artifacts=evidence, manifest_hash=generation,
+                      native_records_sha256=native_hash, reused_native_code_count=harvested["reused_codes"])
         write_receipt(connection, dataset=ATTEMPT_DATASET, session=dt.date.fromisoformat(day),
                       root=str(source_root), status="BLOCKED", run_id=proof["run_id"],
                       row_count=len(rows), code_count=len(rows), content_sha256=harvested["digest"],
@@ -362,6 +371,7 @@ def _save_daily_attempt(engine, *, proof, source_root, harvested, previous_run):
         checked = load_receipt(connection, dataset=ATTEMPT_DATASET, trade_date=day)
         if not checked or checked["detail"] != detail or checked["run_id"] != proof["run_id"]:
             raise ValueError("daily attempt receipt readback differs: " + day)
+        store.put(generation, "daily_attempt", "receipt", canonical_digest(checked))
 
 
 def _coverage_manifest(engine, *, session, harvested, run_id, historical_documents=None,

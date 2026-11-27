@@ -1396,6 +1396,7 @@
         if (detail.data_mode_label || detail.mode) chips.push({ label: '行情模式', value: detail.data_mode_label || detail.mode });
         if (referenceDate) chips.push({ label: '推荐数据截至', value: referenceDate });
         if (quoteDate) chips.push({ label: '行情快照', value: quoteDate });
+        if (detail.verified_daily_bar) chips.push({ label: 'QMT 个股日线核验时间', value: escHtml(detail.verified_daily_bar.known_at) });
         if (flowDate && flowDate !== quoteDate) chips.push({ label: '资金流日期', value: flowDate });
         if (analysisDate) chips.push({ label: '分析日期', value: analysisDate });
 
@@ -7360,6 +7361,7 @@
                 var ageText = age != null ? (' ' + Math.round(Number(age)) + 's') : '';
                 if (status === 'fresh') return '实时' + ageText;
                 if (status === 'closed') return '收盘';
+                if (status === 'verified_daily_bar') return '已核验个股收盘 ' + r.quote_trade_date;
                 if (status === 'previous_close') return '上一收盘';
                 if (status === 'stale') return '滞后' + ageText;
                 return '缺失';
@@ -7369,6 +7371,7 @@
                 if (!s) return '来源未标注';
                 if (s === 'gj_qmt') return '国金QMT';
                 if (s === 'daily_kline') return '日线收盘';
+                if (s === 'qmt_datadir') return '国金QMT本地日线';
                 if (s === 'qmt_close_table') return '国金QMT收盘';
                 if (s === 'qmt_close_archive') return '国金QMT收盘档案';
                 if (s === 'current_close_table') return '收盘行情快照';
@@ -7389,6 +7392,14 @@
                 if (s.indexOf('market_snapshot:') === 0) return s.slice(16) + '行情';
                 if (s.indexOf('qmt') >= 0 || s.indexOf('QMT') >= 0) return s.replace(/qmt/ig, '国金QMT');
                 return s;
+            }
+            function pfDisplayQuote(r) {
+                var bar = r.verified_daily_bar;
+                if (!bar) return r;
+                return Object.assign({}, r, {
+                    cur_price: bar.close, change_pct: bar.change_pct, quote_source: bar.data_source,
+                    quote_status: 'verified_daily_bar', quote_snapshot_at: bar.known_at, quote_trade_date: bar.trade_date
+                });
             }
             function pfDataMoment(r) {
                 r = r || {};
@@ -7613,9 +7624,10 @@
                 var row = document.getElementById('pf-tr-' + r.stock_code);
                 if (!row) return;
                 pfRegisterWatchRow(r);
-                var pr = pfNumberOrNull(r.cur_price);
+                var quote = pfDisplayQuote(r);
+                var pr = pfNumberOrNull(quote.cur_price);
                 var cp = pfNumberOrNull(r.cost_price);
-                var chg = pfNumberOrNull(r.change_pct);
+                var chg = pfNumberOrNull(quote.change_pct);
                 var profit = pfNumberOrNull(r.profit);
                 var profitPct = pfNumberOrNull(r.profit_pct);
                 var shares = pfNumberOrNull(r.shares);
@@ -7655,8 +7667,8 @@
                     pctEl.className = 'pf-profit-pct ' + (isHolding && hasProfitPct ? pctCls : 'c-gray');
                 }
                 if (flowEl) flowEl.innerHTML = pfFlowCell(r);
-                pfSetDataMomentCell(snapEl, r);
-                if (srcEl) srcEl.textContent = pfQuoteSourceText(r.quote_source) + ' / ' + pfQuoteStatusText(r);
+                pfSetDataMomentCell(snapEl, quote);
+                if (srcEl) srcEl.textContent = pfQuoteSourceText(quote.quote_source) + ' / ' + pfQuoteStatusText(quote);
                 if (watchEl) watchEl.innerHTML = pfWatchCell(r);
             }
             window.pfUpdatePortfolioRow = pfUpdateRow;
@@ -7734,9 +7746,10 @@
                     '</tr></thead><tbody>';
                 res.data.forEach(function(r, idx){
                     pfRegisterWatchRow(r);
-                    var pr = pfNumberOrNull(r.cur_price);
+                    var quote = pfDisplayQuote(r);
+                    var pr = pfNumberOrNull(quote.cur_price);
                     var cp = pfNumberOrNull(r.cost_price);
-                    var chg = pfNumberOrNull(r.change_pct);
+                    var chg = pfNumberOrNull(quote.change_pct);
                     var profit = pfNumberOrNull(r.profit);
                     var profitPct = pfNumberOrNull(r.profit_pct);
                     var shares = pfNumberOrNull(r.shares);
@@ -7752,7 +7765,7 @@
                     var pctTxt = isHolding && hasProfitPct ? (profitPct>=0?'+':'')+profitPct.toFixed(2)+'%' : '-';
                     var pfClsRow = isHolding ? pfCls : 'c-gray';
                     var pctClsRow = isHolding && hasProfitPct ? pctCls : 'c-gray';
-                    var dataMoment = pfDataMoment(r);
+                    var dataMoment = pfDataMoment(quote);
                     html += '<tr id=\"pf-tr-'+r.stock_code+'\" draggable=\"true\" data-code=\"'+r.stock_code+'\" data-holding=\"'+(isHolding?'1':'0')+'\" data-today-status=\"'+(r.today_position_status||'')+'\" style=\"cursor:grab;'+rowBg+'\">' +
                         '<td class=\"pf-row-number\">'+(idx + 1)+'</td>' +
                         '<td style=\"text-align:center;color:#555;font-size:14px;cursor:grab\" class=\"pf-drag-handle\">⠿</td>' +
@@ -7768,7 +7781,7 @@
                         '<td class=\"pf-main-flow\">'+pfFlowCell(r)+'</td>' +
                         '<td class=\"pf-watch-advice\">'+pfWatchCell(r)+'</td>' +
                         '<td class=\"pf-snapshot-at\" title=\"'+escAttr(dataMoment.title)+'\">'+dataMoment.html+'</td>' +
-                        '<td class=\"pf-quote-source\" style=\"font-size:11px;color:#666\">'+pfQuoteSourceText(r.quote_source)+' / '+pfQuoteStatusText(r)+'</td>' +
+                        '<td class=\"pf-quote-source\" style=\"font-size:11px;color:#666\">'+pfQuoteSourceText(quote.quote_source)+' / '+pfQuoteStatusText(quote)+'</td>' +
                         '<td class=\"pf-actions pf-sticky pf-sticky-action\"><button onclick=\"event.stopPropagation();pfTransact(\''+r.stock_code+'\',\''+r.display_name+'\','+(cp == null ? 0 : cp)+','+(shares == null ? 0 : shares)+')\" style=\"padding:2px 8px;border:none;border-radius:4px;background:#388e3c;color:#fff;cursor:pointer;font-size:11px\">💰</button>' +
                         '<button onclick=\"event.stopPropagation();pfRemove(\''+r.stock_code+'\')\" style=\"padding:2px 8px;border:none;border-radius:4px;background:#c62828;color:#fff;cursor:pointer;font-size:11px;margin-left:2px\">✕</button></td>' +
                         '<td class=\"pf-sticky pf-sticky-analysis\"><button onclick=\"event.stopPropagation();pfAnalyze(\''+r.stock_code+'\',\''+r.display_name+'\')\" style=\"padding:4px 12px;border:none;border-radius:4px;background:#1a73e8;color:#fff;cursor:pointer;font-size:11px\">🤖 分析</button></td>' +
@@ -8797,6 +8810,10 @@
 
     function renderStockDetail(body, d) {
         var m = d.market || {};
+        var bar = d.verified_daily_bar;
+        if (bar) {
+            m = Object.assign({}, bar, {price: bar.close});
+        }
         var cap = d.capital || {};
         var fin = d.finance || {};
         var val = d.valuation || {};
@@ -8822,7 +8839,9 @@
         h += '</div>';
 
         // ── 持仓信息（如有） ──
-        h += buildStockDetailMeta(d, analysisMeta);
+        h += buildStockDetailMeta(bar ? Object.assign({}, d, {
+            quote_trade_date: bar.trade_date, quote_is_stale: false, data_mode_label: '盘后 · QMT已核验个股日线'
+        }) : d, analysisMeta);
         if (/^\d{6}$/.test(String(d.stock_code || ''))) h += '<p class="stock-context-actions"><a href="/?tab=ai-stock&stock_code=' + d.stock_code + '&question=' + encodeURIComponent('请核对 ' + d.stock_code + ' 的当前市场事实、支持与反对证据以及失效条件，区分数据与观点。') + '">带着这只股票继续问答 ↗</a><span>仅预填问题，由你确认发送</span></p>';
         if (d.holding && d.holding.shares > 0) {
             var hd = d.holding;
@@ -8888,7 +8907,7 @@
             h += '<div style="background:linear-gradient(135deg,#1a1a2e,#16213e);border-radius:10px;padding:16px;margin-bottom:16px;color:#fff">';
             h += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">';
             h += '<span style="font-size:12px;color:#aaa">分析日期 ' + (analysisMeta.date || d.analysis_trade_date || d.date || '') + '</span>';
-            h += '<span style="font-size:14px;color:#ddd">行情日期 ' + (d.quote_trade_date || d.date || '-') + ' | 现价 ' + (m.price || '-') + ' ' + pct(m.change_pct) + '</span>';
+            h += '<span style="font-size:14px;color:#ddd">行情日期 ' + (bar ? bar.trade_date : d.quote_trade_date || d.date || '-') + ' | 现价 ' + (m.price || '-') + ' ' + pct(m.change_pct) + '</span>';
             h += '</div>';
             h += '<div style="font-size:14px;color:#ddd;line-height:1.8;white-space:pre-wrap">' + localizeMachineText(ai.conclusion) + '</div>';
             if (analysisMeta.action) {
