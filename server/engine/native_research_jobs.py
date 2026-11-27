@@ -293,6 +293,10 @@ def _source_progress(connection, state, owner, day, stage, *, deadline, checkpoi
         if previous and previous['total']!=total:raise ValueError('PREPARE_PROGRESS_TOTAL_DIFFERS:'+stage)
         advanced = done > previous.get('completed',0)
         if advanced:
+            # The sealed finance reader has committed this issuer chunk. A later
+            # chunk gets its own retry. Replaying the saved prefix cannot renew it.
+            if stage == 'finance_facts' and state.get('current_unit') == 'PREPARE finance ' + day:
+                state.get('source_error_retries', {}).pop(state['current_unit'], None)
             state['source_progress'] = {'trade_date': day, 'dataset': stage, 'scope': scope,
                 'completed': done, 'total': total, 'last_progress_at': str(now_shanghai()), 'fresh_source_write': fresh}
             cursors[key]=dict(state['source_progress'])

@@ -102,6 +102,61 @@ def test_unexpected_runtime_source_failure_is_not_a_missing_dataset(queue, monke
         prepare.prepare_selection(connection, experiment(), None, plan)
 
 
+def test_disconnected_finance_read_retries_each_verified_partition_once(queue, tmp_path, monkeypatch):
+    from sqlalchemy import event
+    from sqlalchemy.exc import OperationalError
+    from pymysql.err import OperationalError as MySQLError
+    from server.common import pit_facts as pit
+    from server.common.pit_sealed_finance_read import load_sealed_finance_facts
+    from server.engine import native_research_identity as identity
+    from tests.test_pit_finance_event_facts import _sealed_common_cutoff_case
+
+    source, options = _sealed_common_cutoff_case()
+    selection = []
+    pit.resolve_common_fact_cutoff(source, **options, capture_finance_selection=selection.append)
+    seal = selection[0]
+    day = seal.as_of_date.isoformat()
+    unit = 'PREPARE finance ' + day
+    generation = 'e' * 64
+    privileged_migrate_formal_analysis_schema(queue)
+    store = FormalAnalysisStore(queue)
+    monkeypatch.setenv('PROBIGA_NATIVE_DATASET_ROOT', str(tmp_path))
+    monkeypatch.setattr(identity, 'algorithm_identity', lambda _config: {'sha256': 'math'})
+    monkeypatch.setattr(pit, 'FINANCE_ATOMIC_BATCH_QUERY_CODE_LIMIT', 1)
+    state = experiment()
+    state.update(phase='PREPARE_DAYS', current_unit=unit, source_error_retries={unit: 1})
+    with queue.begin() as connection:
+        jobs.enqueue(connection, state)
+
+    def disconnect(_connection, _cursor, statement, parameters, _context, _many):
+        if 'coverage_id IN' in statement and seal.members['002731']['coverage_id'] in parameters:
+            raise OperationalError(statement, parameters, MySQLError(2013, 'Lost connection during query'))
+
+    def read(connection, state, owner, **_kwargs):
+        load_sealed_finance_facts(source, selection=seal, codes=options['codes'], as_of_date=seal.as_of_date,
+            decision_at=seal.decision_at, fact_cutoff_at=seal.fact_cutoff_at, formal_store=store,
+            formal_generation_sha256=generation,
+            read_progress=jobs._source_progress(connection, state, owner, day, 'finance_facts', deadline=float('inf')))
+
+    monkeypatch.setattr(native, '_step', read)
+    event.listen(source, 'before_cursor_execute', disconnect)
+    try:
+        assert native.native_tick(queue)['status'] == 'RUNNING'
+        artifacts = store.list_members(generation, 'finance_issuer_facts')
+        assert len(artifacts) == 1
+        later = jobs.now_shanghai() + timedelta(seconds=61)
+        monkeypatch.setattr(jobs, 'now_shanghai', lambda: later)
+        assert native.native_tick(queue)['status'] == 'FAILED'
+        assert store.list_members(generation, 'finance_issuer_facts') == artifacts
+        with queue.connect() as connection:
+            saved = native.read_runs(connection)[0]
+            assert saved['source_progress']['completed'] == 1 and saved['source_error_retries'][unit] == 1
+            assert saved['requested_at'] == state['requested_at']
+    finally:
+        event.remove(source, 'before_cursor_execute', disconnect)
+        source.dispose()
+
+
 def test_explicit_recovery_renews_one_retry_without_resetting_progress_or_idempotence(queue,tmp_path,monkeypatch):
     from server.engine import strategy_native_control as control, native_research_identity as identity
     from tests.test_native_research_jobs import start
