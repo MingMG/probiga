@@ -34,6 +34,40 @@ def test_historical_batch_selection_does_not_load_a_later_window():
         target=date(2026,8,24),window_start=date(2026,8,4))
 
 
+@pytest.mark.parametrize('errno',[3024,2013,1142])
+@pytest.mark.parametrize('boundary',['inventory','proof_cache'])
+def test_dated_database_fault_preserves_diagnostics_and_retry_classification(monkeypatch,caplog,errno,boundary):
+    from sqlalchemy import event
+    from sqlalchemy.exc import OperationalError
+    from server.common.formal_analysis_store import FormalAnalysisStore
+    from server.db.formal_analysis_schema import privileged_migrate_formal_analysis_schema,MEMBER_TABLE
+    from server.engine import strategy_native_backtest as native
+    engine=_engine();catalog=_install_catalog(engine,_catalog(('000001','000001.SZ')))
+    publish(engine,catalog,datetime(2026,8,25,18,20))
+    privileged_migrate_formal_analysis_schema(engine)
+    options=dict(codes=catalog.codes,decision_at=datetime(2026,8,27),window_start=date(2026,8,5),
+        window_end=date(2026,8,25),expected_trade_date='2026-08-25',coverage_store=FormalAnalysisStore(engine))
+    faults=[]
+    def fail_once(_c,_cursor,statement,parameters,_context,_many):
+        matches=("WHERE fact_kind='event' AND stock_code=" in statement if boundary=='inventory' else MEMBER_TABLE in statement)
+        if matches and not faults:
+            faults.append(statement)
+            raise OperationalError(statement,parameters,Exception(errno,'observed database read failure'))
+    event.listen(engine,'before_cursor_execute',fail_once)
+    try:
+        expected_error=announcements.QMTAnnouncementBlocked if errno in (3024,2013) else OperationalError
+        with pytest.raises(expected_error) as failure:
+            history.validate_dated_announcement_batch(engine,**options)
+        reason=pit._announcement_batch_read_reason(failure.value)
+        assert native._transient_source_error(RuntimeError('历史事实读取失败：'+reason))==(errno in (3024,2013))
+        assert any(str(errno) in record.message and '2026-08-25' in record.message for record in caplog.records)
+        assert len(faults)==1
+        assert history.validate_dated_announcement_batch(engine,**options)['status']=='COMPLETE'
+    finally:
+        event.remove(engine,'before_cursor_execute',fail_once)
+        engine.dispose()
+
+
 def test_completed_live_proof_is_reused_before_resuming_ancestry_budget(monkeypatch):
     from server.common.formal_analysis_store import FormalAnalysisStore
     from server.db.formal_analysis_schema import privileged_migrate_formal_analysis_schema

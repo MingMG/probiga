@@ -1,10 +1,12 @@
 """Date-bound research reads through the existing audited announcement validators."""
 from datetime import date,datetime,timedelta
 import json
+import logging
 from time import monotonic
 from types import MappingProxyType
 
 from sqlalchemy import bindparam, text
+from sqlalchemy.exc import OperationalError
 
 from server.common.pit_facts import normalize_decision_at
 from server.common.qmt_announcement_pit import (
@@ -311,38 +313,57 @@ def validate_dated_announcement_batch(engine,*,codes,decision_at,window_start,wi
     target=date.fromisoformat(str(expected_trade_date)[:10]);start=date.fromisoformat(str(window_start)[:10])
     end=date.fromisoformat(str(window_end)[:10]);decision=normalize_decision_at(decision_at)
     if not requested or target!=end:raise ValueError('historical announcement target scope differs')
-    deadline=monotonic()+LIVE_ANNOUNCEMENT_BATCH_VALIDATION_BUDGET_SECONDS
-    for source in (QMT_ANNOUNCEMENT_SOURCE,CNINFO_ANNOUNCEMENT_SOURCE,EASTMONEY_ANNOUNCEMENT_SOURCE):
-        candidates=_inventory(engine,code=requested[0],decision_at=decision,target=target,window_start=start,source=source)
-        invalid=[]
-        for candidate in candidates:
-            if candidate['watermark_kind']!='QUERY_CUTOFF':continue
-            try:
-                proof,bound,validation_scope=_validated_live_batch(engine,candidate,requested=requested,decision=decision,
-                    start=start,end=end,source=source,deadline=deadline,
-                    include_members=capture_historical_selection is not None,coverage_store=coverage_store,
-                    progress=metadata_progress)
-            except QMTAnnouncementBlocked as error:
-                if error.reason_code=='QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND':
-                    if error.detail!='no-common-batch':invalid.append(error)
-                    continue
-                if error.reason_code=='QMT_ANNOUNCEMENT_FULL_MARKET_ALL_EMPTY_UNPROVEN':continue
-                raise
-            if normalize_decision_at(proof['fact_cutoff_at']).date()!=target:
-                raise ValueError('historical announcement validated cutoff differs from target')
-            if capture_historical_selection is not None:
-                capture_historical_selection(_bind_dated_live_selection(engine,proof,bound,codes=requested,
-                    decision=decision,start=start,end=end,deadline=deadline,coverage_store=coverage_store,
-                    coverage_progress=coverage_progress,event_progress=event_progress,metadata_progress=metadata_progress))
-            if coverage_store is not None and metadata_progress:
-                metadata_progress(2,2,validation_scope,False)
-            if capture_live_reuse is not None:capture_live_reuse()
-            return proof
-        if invalid:raise invalid[-1]
-        if source==CNINFO_ANNOUNCEMENT_SOURCE:
+    started=monotonic()
+    deadline=started+LIVE_ANNOUNCEMENT_BATCH_VALIDATION_BUDGET_SECONDS
+    try:
+        for source in (QMT_ANNOUNCEMENT_SOURCE,CNINFO_ANNOUNCEMENT_SOURCE,EASTMONEY_ANNOUNCEMENT_SOURCE):
+            stage='inventory'
+            candidates=_inventory(engine,code=requested[0],decision_at=decision,target=target,window_start=start,source=source)
+            invalid=[]
             for candidate in candidates:
-                if candidate['watermark_kind']=='HISTORICAL_RECONSTRUCTION':
-                    return _read_reconstruction(engine,candidate,codes=requested,decision=decision,start=start,end=end,
-                        deadline=deadline,capture_historical_selection=capture_historical_selection,event_progress=event_progress,
-                        coverage_store=coverage_store,coverage_progress=coverage_progress,metadata_progress=metadata_progress)
-    raise QMTAnnouncementBlocked('QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND','no-common-batch')
+                if candidate['watermark_kind']!='QUERY_CUTOFF':continue
+                try:
+                    stage='live-proof'
+                    proof,bound,validation_scope=_validated_live_batch(engine,candidate,requested=requested,decision=decision,
+                        start=start,end=end,source=source,deadline=deadline,
+                        include_members=capture_historical_selection is not None,coverage_store=coverage_store,
+                        progress=metadata_progress)
+                except QMTAnnouncementBlocked as error:
+                    if error.reason_code=='QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND':
+                        if error.detail!='no-common-batch':invalid.append(error)
+                        continue
+                    if error.reason_code=='QMT_ANNOUNCEMENT_FULL_MARKET_ALL_EMPTY_UNPROVEN':continue
+                    raise
+                if normalize_decision_at(proof['fact_cutoff_at']).date()!=target:
+                    raise ValueError('historical announcement validated cutoff differs from target')
+                if capture_historical_selection is not None:
+                    stage='live-binding'
+                    capture_historical_selection(_bind_dated_live_selection(engine,proof,bound,codes=requested,
+                        decision=decision,start=start,end=end,deadline=deadline,coverage_store=coverage_store,
+                        coverage_progress=coverage_progress,event_progress=event_progress,metadata_progress=metadata_progress))
+                if coverage_store is not None and metadata_progress:
+                    metadata_progress(2,2,validation_scope,False)
+                if capture_live_reuse is not None:capture_live_reuse()
+                return proof
+            if invalid:raise invalid[-1]
+            if source==CNINFO_ANNOUNCEMENT_SOURCE:
+                for candidate in candidates:
+                    if candidate['watermark_kind']=='HISTORICAL_RECONSTRUCTION':
+                        stage='reconstruction'
+                        return _read_reconstruction(engine,candidate,codes=requested,decision=decision,start=start,end=end,
+                            deadline=deadline,capture_historical_selection=capture_historical_selection,event_progress=event_progress,
+                            coverage_store=coverage_store,coverage_progress=coverage_progress,metadata_progress=metadata_progress)
+        raise QMTAnnouncementBlocked('QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND','no-common-batch')
+    except OperationalError as error:
+        from server.common.batch_db import _transient_db_errno
+        errno=_transient_db_errno(error)
+        logging.getLogger(__name__).error(
+            'dated-announcement-read date=%s source=%s stage=%s codes=%d elapsed=%.3fs error_type=%s errno=%s error=%s sql=%s',
+            target,source,stage,len(requested),monotonic()-started,type(error).__name__,errno,
+            str(error.orig)[:500],str(error.statement)[:500])
+        if errno in (1969,3024):
+            reason='QMT_ANNOUNCEMENT_LIVE_BATCH_REPLY_DEADLINE'
+        elif errno in (1205,1213,2003,2006,2013):
+            reason='QMT_ANNOUNCEMENT_LIVE_BATCH_REPLY_FAILED'
+        else:raise
+        raise QMTAnnouncementBlocked(reason,'signed-historical-native') from error
