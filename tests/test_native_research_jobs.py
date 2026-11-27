@@ -155,6 +155,40 @@ def test_queue_cas_failure_rolls_back_the_entire_publication(queue):
         assert connection.execute(text("SELECT COUNT(*) FROM st_strategy_governance_audit WHERE entity_type='AUTO_REPLAY_PART'")).scalar()==0
 
 
+@pytest.mark.parametrize('errors,expected_status,expected_attempts', [
+    ([1205], 'PENDING', 2), ([1205, 1205], 'RUNNING', 2), ([1142], 'RUNNING', 1)])
+def test_finance_yield_under_scheduler_lease_contention(queue, errors, expected_status, expected_attempts):
+    from pymysql.err import OperationalError as MySQLError
+    from sqlalchemy.exc import OperationalError
+
+    state, owner = start(queue)
+    state.update(current_unit='PREPARE finance 2026-11-19', source_progress={'completed': 590, 'total': 4750})
+    attempts = 0
+
+    def contend(_connection, _cursor, statement, parameters, _context, _many):
+        nonlocal attempts
+        if statement.startswith('SELECT * FROM st_job_v2 WHERE job_id='):
+            attempts += 1
+        if statement.startswith('SELECT * FROM st_scheduled_task_history WHERE run_uid=') and attempts <= len(errors):
+            raise OperationalError(statement, parameters, MySQLError(errors[attempts - 1], 'lease read failed'))
+
+    event.listen(queue, 'before_cursor_execute', contend)
+    try:
+        with queue.connect() as connection:
+            if expected_status == 'PENDING':
+                jobs.checkpoint(connection, state, owner, yield_job=True)
+                assert native.read_runs(connection)[0]['source_progress']['completed'] == 590
+                assert state['checkpoint_sequence'] == 3 and state['owner'] is None
+            else:
+                with pytest.raises(OperationalError):
+                    jobs.checkpoint(connection, state, owner, yield_job=True)
+                assert native.read_runs(connection)[0]['checkpoint_sequence'] == state['checkpoint_sequence'] == 2
+            assert connection.execute(text('SELECT status FROM st_job_v2')).scalar_one() == expected_status
+    finally:
+        event.remove(queue, 'before_cursor_execute', contend)
+    assert attempts == expected_attempts
+
+
 def test_terminal_result_and_job_commit_together_and_retry_is_idempotent(queue,monkeypatch):
     state,owner=start(queue)
     state.update(status='FAILED',reason='bounded source failure')

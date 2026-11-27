@@ -5,6 +5,7 @@ from copy import deepcopy
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 import json
+import logging
 import os
 import socket
 import time
@@ -12,6 +13,7 @@ import threading
 import uuid
 
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 
 from server.common.analysis_pool_receipt import canonical_sha256
 from server.common.market_dashboard_worker import process_identity
@@ -20,6 +22,7 @@ from server.engine.autonomous_strategy_research import now_shanghai
 
 JOB_TYPE = 'NATIVE_REPLAY'
 CLAIM_SECONDS = 20
+logger = logging.getLogger(__name__)
 
 
 @contextmanager
@@ -222,7 +225,24 @@ def _append_locked(connection, state, live, events=(), *, release=False):
 def checkpoint(connection, state, live, events=(), *, yield_job=False):
     """Fence queue, lease and exact head before publishing any partition reference."""
     connection.rollback()
-    candidate = None
+    events = tuple(events)
+    try:
+        candidate = _commit_checkpoint(connection, state, live, events, yield_job)
+    except OperationalError as exc:
+        from server.common.batch_db import _transient_db_errno
+        errno = _transient_db_errno(exc)
+        if exc.connection_invalidated or not exc.statement or errno not in (1205, 1213):
+            raise
+        # The failed statement's transaction has rolled back. Recheck every fence
+        # on the original named-lock connection before publishing the same work.
+        logger.warning('Native checkpoint lock retry job=%s unit=%s sequence=%s errno=%s',
+                       state['job_id'], state.get('current_unit'), state['checkpoint_sequence'], errno)
+        candidate = _commit_checkpoint(connection, state, live, events, yield_job)
+    state.clear()
+    state.update(candidate)
+
+
+def _commit_checkpoint(connection, state, live, events, yield_job):
     with connection.begin():
         job = connection.execute(text('SELECT * FROM st_job_v2 WHERE job_id=:id' + _locked(connection)),
                                  {'id': state['job_id']}).mappings().one()
@@ -251,9 +271,7 @@ def checkpoint(connection, state, live, events=(), *, yield_job=False):
              'id': state['job_id'], 'expected': live['scheduler_run_uid']})
         if changed.rowcount != 1:
             raise RuntimeError('native queue publication CAS lost')
-        candidate = _append_locked(connection, state, live, events, release=yield_job or terminal)
-    state.clear()
-    state.update(candidate)
+        return _append_locked(connection, state, live, events, release=yield_job or terminal)
 
 
 class PrepareYield(BaseException):
