@@ -18,6 +18,7 @@ import re
 import threading
 import time
 import uuid
+from bisect import bisect_right
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
@@ -7022,6 +7023,14 @@ def _authoritative_maturity_sessions(
     return result
 
 
+def _sealed_governance_attestations(engine) -> bool:
+    if os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip().lower() != "production":
+        return False
+    with engine.connect() as connection:
+        validate_privileged_trigger_migration_seal(connection)
+    return True
+
+
 def _authoritative_session_windows_with_proof(
     as_of_date: str, *, decision_known_at: datetime | str | None = None,
 ) -> tuple[dict[int, dict[str, Any]], dict[str, Any]]:
@@ -7248,7 +7257,9 @@ def _authoritative_session_windows_with_proof(
                 summaries[day] = summarize_day(day, target_rows, batch_ids, data_versions, latest_received_at)
             return summaries
 
-        def read_legacy(batch: list[str]):
+        sealed_attestations = len(native_days) < len(session_days) and _sealed_governance_attestations(market_engine)
+
+        def read_legacy(batch: list[str], original_times):
             params = {
                 "start_date": batch[0],
                 "as_of_date": batch[-1],
@@ -7271,13 +7282,15 @@ def _authoritative_session_windows_with_proof(
             )
             attestations = read_legacy_attestations(
                 _db_read, params, database=market_engine, deadline=phase_deadline,
+                sealed_attestations=sealed_attestations, original_times=original_times,
             )
             return collapse_legacy(batch, targets, attestations)
 
         # Only the daily membership in the validated calendar determines a
         # day's row proof. Each rolling window still binds its entire receipt.
         generation = _digest({
-            "rule": "probiga.governance-close-day.v1",
+            "rule": "probiga.governance-close-day.v2",
+            "sealed_attestations": sealed_attestations,
             "legacy_protocol": QMT_PRECLOSE_ATTESTATION_PROTOCOL,
             "native_protocol": DATADIR_COVERAGE_SCHEMA,
             "calendar_provider": calendar_receipt.source_provider,
@@ -7300,6 +7313,7 @@ def _authoritative_session_windows_with_proof(
                     versions = daily_close_source_versions(
                         connection, batch, native_days=native_days, cutoff=cutoff,
                         protocol=QMT_PRECLOSE_ATTESTATION_PROTOCOL, deadline=phase_deadline,
+                        sealed_attestations=sealed_attestations,
                     )
                     keys = {}
                     for day in batch:
@@ -7311,26 +7325,47 @@ def _authoritative_session_windows_with_proof(
                             "calendar_session": day, "source_version": versions[day],
                             "completed_manifests": runs,
                         })
-                    retained = store.get_many(generation, stage, list(keys.values()))
+                    # Under the append-only seal, an unchanged inventory can
+                    # contain rows on both sides of a historical cutoff. Bind
+                    # proofs to exactly the visible prefix of original times.
+                    sealed_keys = [key for day, key in keys.items() if sealed_attestations and day not in native_days]
+                    timing_stage = "governance_close_times"
+                    timelines = store.get_many(generation, timing_stage, sealed_keys)
+                    def visible_key(key, times):
+                        return key + ":" + str(bisect_right(times, cutoff.isoformat()))
+
+                    proof_keys = {
+                        day: visible_key(key, timelines[key]) if key in timelines else key
+                        for day, key in keys.items() if key not in sealed_keys or key in timelines
+                    }
+                    retained = store.get_many(generation, stage, list(proof_keys.values()))
                     results = {}
                     for day, key in keys.items():
                         if time.monotonic() >= phase_deadline:
                             raise TimeoutError(f"QMT 收盘证据读取超时：{day}")
-                        summary = retained.get(key)
+                        proof_key = proof_keys.get(day)
+                        summary = retained.get(proof_key)
                         reused = summary is not None
                         if reused:
                             if normalize_decision_at(summary[0]["latest_received_at"]) > cutoff:
                                 raise ValueError(f"{day} 的 QMT 行情到达时间晚于决策截止")
                         else:
-                            summary = (read_native(connection, day) if day in native_days
-                                       else read_legacy([day])[day])
-                            store.put(generation, stage, key, list(summary))
+                            if day in native_days:
+                                summary = read_native(connection, day)
+                            else:
+                                original_times = set() if key in sealed_keys and key not in timelines else None
+                                summary = read_legacy([day], original_times)[day]
+                                if original_times is not None:
+                                    times = sorted(original_times)
+                                    store.put(generation, timing_stage, key, times)
+                                    proof_key = visible_key(key, times)
+                            store.put(generation, stage, proof_key, list(summary))
                         results[day] = tuple(summary)
                         with progress_lock:
                             completed_days += 1
                             logging.getLogger(__name__).info(
                                 "QMT close day=%s completed=%d/%d reused=%s checkpoint=%s last_progress_at=%s",
-                                day, completed_days, len(session_days), reused, key, datetime.now(),
+                                day, completed_days, len(session_days), reused, proof_key, datetime.now(),
                             )
                     return results
 

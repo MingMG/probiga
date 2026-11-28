@@ -726,12 +726,15 @@ def test_authoritative_windows_require_exact_calendar_qmt_date_set(monkeypatch, 
                 if row["in_completed_attestation"]
                 and _params["start_date"] <= row["trade_date"]
                 <= _params["as_of_date"]]
+            if "id0" in _params:
+                selected = {value for key, value in _params.items() if re.fullmatch(r"id\d+", key)}
+                return [row for row in records if row["attestation_id"] in selected]
             cursor = (_params["code"], _params["row_id"])
             return sorted(
                 (row for row in records if row["trade_date"] == _params["day"]
                  and (row["stock_code"], row["attestation_id"]) > cursor),
                 key=lambda row: (row["stock_code"], row["attestation_id"]),
-            )[:2048]
+            )[:8192]
         raise AssertionError(sql)
 
     monkeypatch.setattr(governance_module, "_db_read", fake_read)
@@ -806,7 +809,7 @@ def test_authoritative_windows_require_exact_calendar_qmt_date_set(monkeypatch, 
         sql for sql in observed_sql
         if "FROM qmt_kline_attestation_row a" in sql and "a.source_pre_close" in sql
     )
-    assert "MAX_EXECUTION_TIME(10000)" in attestation_sql
+    assert "MAX_EXECUTION_TIME(12000)" in attestation_sql
     assert "JOIN" not in attestation_sql
     assert "JSON_EXTRACT" not in attestation_sql
     assert "a.qmt_id>0" in attestation_sql

@@ -1,11 +1,14 @@
 from datetime import datetime
+from decimal import Decimal
 import hashlib
 import json
+import sqlite3
 from types import SimpleNamespace
 import time
 
 import pytest
 from sqlalchemy import create_engine, event, text
+from sqlalchemy.exc import IntegrityError
 
 from server.db.formal_analysis_schema import privileged_migrate_formal_analysis_schema
 from server.engine import governance_daily_market as market
@@ -13,7 +16,11 @@ from server.engine import governance_daily_market as market
 
 @pytest.fixture
 def evidence(tmp_path):
-    engine = create_engine("sqlite:///" + str(tmp_path / "evidence.db"))
+    # MySQL drivers return DECIMAL as Decimal. Keeping the physical bytes as
+    # SQLite TEXT lets the test distinguish amounts below double precision.
+    sqlite3.register_converter("DECIMALTEXT", lambda raw: Decimal(raw.decode("ascii")))
+    engine = create_engine("sqlite:///" + str(tmp_path / "evidence.db"),
+                           connect_args={"detect_types": sqlite3.PARSE_DECLTYPES})
 
     @event.listens_for(engine, "connect")
     def functions(db, _):
@@ -28,7 +35,7 @@ def evidence(tmp_path):
             protocol_version TEXT, target_id INT, qmt_id INT, run_id TEXT,
             source_data_version TEXT, source_pre_close_origin TEXT, created_at TEXT,
             source_pre_close TEXT, attested_open TEXT, attested_close TEXT,
-            attested_high TEXT, attested_low TEXT, attested_volume TEXT, attested_amount TEXT)"""))
+            attested_high TEXT, attested_low TEXT, attested_volume TEXT, attested_amount DECIMALTEXT)"""))
         c.execute(text("CREATE INDEX dated ON qmt_kline_attestation_row(trade_date,protocol_version,stock_code,attestation_id)"))
         c.execute(text("""INSERT INTO qmt_kline_attestation_row VALUES
             (:id,'2026-06-01',:code,:protocol,:target,:target,'completed',
@@ -49,40 +56,50 @@ def _read_rows(sql, params, *, database):
         return [dict(row) for row in conn.execute(text(sql), params).mappings()]
 
 
-def test_exact_pages_split_a_repeated_code_without_losing_distinct_attestations(evidence):
+def _seal_rows(engine):
+    with engine.begin() as conn:
+        for operation in ("UPDATE", "DELETE"):
+            conn.exec_driver_sql(f"""CREATE TRIGGER sealed_attestation_{operation} BEFORE {operation}
+                ON qmt_kline_attestation_row BEGIN SELECT RAISE(ABORT, 'append only'); END""")
+    with pytest.raises(IntegrityError, match="append only"):
+        with engine.begin() as conn:
+            conn.exec_driver_sql("UPDATE qmt_kline_attestation_row SET run_id='changed'")
+
+
+def test_verified_pages_resume_for_same_security_and_preserve_original_times(evidence, monkeypatch):
     engine, params = evidence
     with engine.begin() as conn:
         conn.execute(text("UPDATE qmt_kline_attestation_row SET stock_code='000001'"))
-    pages = []
+    _seal_rows(engine)
+    fetched = []
+    now = [0]
+    monkeypatch.setattr(market.time, "monotonic", lambda: now[0])
 
     def read(sql, args, *, database):
         rows = _read_rows(sql, args, database=database)
-        pages.append(len(rows))
+        if "attestation_id in" in sql.lower():
+            assert 0 < len(rows) <= 64
+            fetched.extend(row["attestation_id"] for row in rows)
+            if len(fetched) == 128:
+                now[0] = 2
         return rows
 
-    rows = market.read_legacy_attestations(read, params, database=engine, deadline=time.monotonic() + 10)
-    assert pages == [2048, 553]
-    ids = [row["attestation_id"] for row in rows]
-    assert len(ids) == len(set(ids)) == 2601
-    assert ids == sorted(ids)
+    with pytest.raises(TimeoutError):
+        market.read_legacy_attestations(read, params, database=engine, deadline=1, sealed_attestations=True)
+    engine.dispose()
+    original_times = set()
+    rows = market.read_legacy_attestations(read, params, database=engine, deadline=3,
+                                          sealed_attestations=True, original_times=original_times)
+    ids = {row["attestation_id"] for row in rows}
+    assert len(ids) == len(rows) == len(fetched) == len(set(fetched)) == 2601
+    assert original_times == {"2026-06-01T15:00:00", "2026-06-02T15:00:00"}
+    fetched.clear()
+    original_times.clear()
     earlier = {**params, "decision_known_at": datetime(2026, 6, 1, 23, 59, 59)}
-    visible = market.read_legacy_attestations(read, earlier, database=engine, deadline=time.monotonic() + 10)
-    assert len(visible) == 2600
-    assert all(row["attestation_created_at"] <= "2026-06-01 23:59:59" for row in visible)
-
-
-def test_expired_page_budget_names_incomplete_date(evidence, monkeypatch):
-    engine, params = evidence
-    clock = [0]
-    monkeypatch.setattr(market.time, "monotonic", lambda: clock[0])
-
-    def read(sql, args, *, database):
-        rows = _read_rows(sql, args, database=database)
-        clock[0] = 2
-        return rows
-
-    with pytest.raises(TimeoutError, match="2026-06-01"):
-        market.read_legacy_attestations(read, params, database=engine, deadline=1)
+    visible = market.read_legacy_attestations(read, earlier, database=engine, deadline=3,
+                                             sealed_attestations=True, original_times=original_times)
+    assert len(visible) == 2600 and not fetched
+    assert original_times == {"2026-06-01T15:00:00", "2026-06-02T15:00:00"}
 
 
 def test_invalid_hash_and_non_native_origin_are_not_admitted(evidence):
@@ -111,7 +128,7 @@ def governance_window(evidence, monkeypatch):
         conn.execute(text("DELETE FROM qmt_kline_attestation_row"))
         conn.execute(text("""CREATE TABLE sm_stock_kline (
             stock_code TEXT, trade_date TEXT, k_type INT, adjust_type INT,
-            pre_close TEXT, open TEXT, close TEXT, high TEXT, low TEXT, volume INT, amount TEXT,
+            pre_close TEXT, open TEXT, close TEXT, high TEXT, low TEXT, volume INT, amount DECIMALTEXT,
             batch_id TEXT, data_version TEXT, received_at TEXT, source_time TEXT,
             data_source TEXT, quality_status TEXT, permission_status TEXT)"""))
         conn.execute(text("""CREATE TABLE qmt_kline_attestation_run (
@@ -234,6 +251,17 @@ def test_interrupted_window_resumes_after_last_committed_day(governance_window, 
     assert windows[3]["sessions"] == [first, second, third]
 
 
+def _append_extra_security(conn, day, run, created):
+    conn.execute(text("""INSERT INTO qmt_kline_attestation_row
+            SELECT SHA2(CONCAT_WS('|', protocol_version,99,99,source_data_version,
+                                   source_pre_close,attested_open,attested_close,attested_high,
+                                   attested_low,attested_volume,attested_amount),256),
+                   trade_date, '000003', protocol_version, 99, 99, :run, source_data_version,
+                   source_pre_close_origin,:created,source_pre_close,attested_open,attested_close,
+                   attested_high,attested_low,attested_volume,attested_amount
+            FROM qmt_kline_attestation_row WHERE trade_date=:day AND stock_code='000001'"""), {"day": day, "run": run, "created": created})
+
+
 def test_new_completed_attestation_version_is_checked_per_security(governance_window):
     case = governance_window
     _, changed, end, _ = case.days
@@ -246,14 +274,7 @@ def test_new_completed_attestation_version_is_checked_per_security(governance_wi
         c.execute(text("""INSERT INTO qmt_kline_attestation_run
             SELECT 'revised', start_date, end_date, tolerance_json, finished_at, provider, status
             FROM qmt_kline_attestation_run WHERE run_id=:day"""), {"day": changed})
-        c.execute(text("""INSERT INTO qmt_kline_attestation_row
-            SELECT SHA2(CONCAT_WS('|', protocol_version,99,99,source_data_version,
-                                   source_pre_close,attested_open,attested_close,attested_high,
-                                   attested_low,attested_volume,attested_amount),256),
-                   trade_date, '000003', protocol_version, 99, 99, 'revised', source_data_version,
-                   source_pre_close_origin,created_at,source_pre_close,attested_open,attested_close,
-                   attested_high,attested_low,attested_volume,attested_amount
-            FROM qmt_kline_attestation_row WHERE trade_date=:day AND stock_code='000001'"""), {"day": changed})
+        _append_extra_security(c, changed, "revised", changed + " 15:03:00")
     with pytest.raises(ValueError, match=changed):
         case.prove(end)
     assert case.reads == [changed]
@@ -270,3 +291,81 @@ def test_changed_attestation_owner_invalidates_retained_proof_without_price_chan
     with pytest.raises(ValueError, match=changed):
         case.prove(end)
     assert case.reads == [changed]
+
+
+def test_exact_decimal_revision_below_binary_float_precision_is_rejected(governance_window):
+    case = governance_window
+    _, changed, end, _ = case.days
+    original, revised = "1000000000000.000001", "1000000000000.000002"
+    assert Decimal(original) != Decimal(revised) and float(original) == float(revised)
+    scope = " WHERE trade_date=:day AND stock_code='000001'"
+    with case.engine.begin() as conn:
+        conn.execute(text("UPDATE sm_stock_kline SET amount=:amount" + scope), {"day": changed, "amount": original})
+        conn.execute(text("""UPDATE qmt_kline_attestation_row SET attested_amount=:amount,
+            attestation_id=SHA2(CONCAT_WS('|',protocol_version,target_id,qmt_id,source_data_version,
+                source_pre_close,attested_open,attested_close,attested_high,attested_low,attested_volume,:amount),256)"""
+            + scope), {"day": changed, "amount": original})
+    assert case.prove(end)[1]["sessions"][1]["exact_attestation_stock_count"] == 2
+    case.reads.clear()
+    with case.engine.begin() as conn:
+        conn.execute(text("UPDATE sm_stock_kline SET amount=:amount" + scope), {"day": changed, "amount": revised})
+    with pytest.raises(ValueError, match=changed):
+        case.prove(end)
+    assert case.reads == [changed]
+
+def test_sealed_day_reused_within_interval_until_another_security_arrives(governance_window, monkeypatch):
+    from server.engine import strategy_governance as governance
+
+    case = governance_window
+    end = case.days[2]
+    with case.engine.begin() as conn:
+        _append_extra_security(conn, end, end, end + " 17:00:00")
+    _seal_rows(case.engine)
+    monkeypatch.setattr(governance, "_sealed_governance_attestations", lambda *_a, **_kw: True)
+    prior = case.prove(end, decision_known_at=end + " 16:00:00")
+    case.reads.clear()
+    assert case.prove(end, decision_known_at=end + " 16:59:59") == prior
+    assert case.reads == []
+    # No write is needed to cross this boundary. The new code's attestation
+    # must invalidate the two-stock proof even with unchanged market/ID hashes.
+    with pytest.raises(ValueError, match=end):
+        case.prove(end, decision_known_at=end + " 17:00:00")
+    assert case.reads == [end]
+    case.reads.clear()
+    assert case.prove(end, decision_known_at=end + " 16:45:00") == prior
+    assert case.reads == []
+
+
+def test_sealed_v1_page_recovers_exact_scale_or_rereads_ambiguous_decimal(evidence, monkeypatch):
+    import re
+    from server.common.formal_analysis_store import FormalAnalysisStore
+
+    engine, params = evidence
+    amounts = {"000001": "4294967295.999999", "000002": "1000000000000.000002"}
+    with engine.begin() as conn:
+        conn.exec_driver_sql("DELETE FROM qmt_kline_attestation_row WHERE target_id > 2")
+        for code, amount in amounts.items():
+            conn.execute(text("""UPDATE qmt_kline_attestation_row SET attested_amount=:amount,
+                attestation_id=SHA2(CONCAT_WS('|',protocol_version,target_id,qmt_id,source_data_version,
+                    source_pre_close,attested_open,attested_close,attested_high,attested_low,attested_volume,:amount),256)
+                WHERE stock_code=:code"""), {"amount": amount, "code": code})
+    exact = market.read_legacy_attestations(_read_rows, params, database=engine, deadline=time.monotonic() + 10)
+    ids = sorted(row["attestation_id"] for row in exact)
+    old_rows = [{**row, **{field: float(row[field]) for field in market._PRICE_FIELDS}} for row in exact]
+    FormalAnalysisStore(engine).put(market._V1_MYSQL_PAGE_GENERATION, "governance_attestation_rows",
+                                    market.canonical_digest(ids), {"ids": ids, "rows": old_rows})
+    _seal_rows(engine)
+    monkeypatch.setattr(engine.dialect, "name", "mysql")
+    fetched = []
+
+    def mysql_read(sql, args, *, database):
+        sql = re.sub(r" FORCE INDEX \([^)]+\)", "", sql).replace("BINARY ", "")
+        rows = _read_rows(sql, args, database=database)
+        if "attestation_id in" in sql.lower():
+            fetched.extend(row["stock_code"] for row in rows)
+        return rows
+
+    restored = market.read_legacy_attestations(mysql_read, params, database=engine, sealed_attestations=True,
+                                              deadline=time.monotonic() + 10)
+    assert fetched == ["000002"]
+    assert {row["stock_code"]: row["attested_amount"] for row in restored} == amounts
