@@ -4,6 +4,7 @@ from __future__ import annotations
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from decimal import Decimal
 import json
 import time
 from typing import Any
@@ -12,7 +13,8 @@ from sqlalchemy import bindparam, text
 from sqlalchemy.exc import DBAPIError
 
 from server.common.pit_facts import normalize_decision_at
-from server.common.qmt_attestation_contract import DAILY_PROOF_INDEX, canonical_digest
+from server.common.formal_analysis_store import FormalAnalysisStore
+from server.common.qmt_attestation_contract import canonical_digest
 from server.common.qmt_datadir_daily_coverage import (
     ENTITY_TABLE,
     MANIFEST_TABLE,
@@ -75,7 +77,8 @@ def _partition_hashes(connection, *, source, fields, condition, params):
     return {day: canonical_digest(sorted(leaves)) for day, leaves in grouped.items()}
 
 
-def daily_close_source_versions(connection, days, *, native_days, cutoff, protocol, deadline=None):
+def daily_close_source_versions(connection, days, *, native_days, cutoff, protocol, deadline=None,
+                                sealed_attestations=False):
     """Bind the exact inputs visible to this decision using database-side daily digests."""
     params = {"days": sorted(days), "cutoff": cutoff, "protocol": protocol,
               "schema": DATADIR_COVERAGE_SCHEMA, "archive": NATIVE_EVIDENCE_DATASET, "provider": PROVIDER,
@@ -129,13 +132,20 @@ def daily_close_source_versions(connection, days, *, native_days, cutoff, protoc
         market.update(_partition_hashes(connection, source=market_source, fields=market_fields,
                                       condition="s.k_type=1 AND s.adjust_type=0 AND " + code_filter,
                                       params={**params, "days": selected}))
+    # With the physical append-only contract validated by the caller, one ID
+    # identifies the entire immutable row including its original availability.
+    # Include future rows here; the proof's visibility interval handles cutoff.
+    attestation_fields = "s.stock_code,s.attestation_id"
+    attestation_filter = "s.protocol_version=:protocol AND " + a_share_stock_code_sql("s.stock_code")
+    if not sealed_attestations:
+        attestation_fields += (",s.run_id,s.created_at,s.source_pre_close_origin,s.protocol_version,"
+                               "s.target_id,s.qmt_id,s.source_data_version,s.source_pre_close,s.attested_open,"
+                               "s.attested_close,s.attested_high,s.attested_low,s.attested_volume,s.attested_amount")
+        attestation_filter += " AND s.created_at<=:cutoff"
     attestation = _partition_hashes(
         connection, source="qmt_kline_attestation_row s" + (
-            f" FORCE INDEX({DAILY_PROOF_INDEX})" if mysql else ""),
-        fields=("s.stock_code,s.attestation_id,s.run_id,s.created_at,s.source_pre_close_origin,"
-                "s.protocol_version,s.target_id,s.qmt_id,s.source_data_version,s.source_pre_close,"
-                "s.attested_open,s.attested_close,s.attested_high,s.attested_low,s.attested_volume,s.attested_amount"),
-        condition=("s.protocol_version=:protocol AND s.created_at<=:cutoff AND " + a_share_stock_code_sql("s.stock_code")),
+            " FORCE INDEX(idx_qmt_kline_attestation_row_date)" if mysql else ""),
+        fields=attestation_fields, condition=attestation_filter,
         params={**params, "days": legacy},
     )
     return {day: canonical_digest([day, market.get(day), attestation.get(day), headers.get(day),
@@ -166,19 +176,46 @@ def _native_completion_versions(connection, params):
     return by_day
 
 
-def read_legacy_attestations(read, params, *, database, deadline):
-    """Read current hash-verified rows on the date-covering index in bounded pages."""
+# Content generation of the previously published MySQL V2 row-page query.
+# Only its SQL-hash-checked rows on the sealed append-only ledger may be used.
+_V1_MYSQL_PAGE_GENERATION = "a59003969924bac9428bc7316a7b36cde159cc504dcb8d233fe10f56b69b813c"
+_PRICE_FIELDS = ("source_pre_close", "attested_open", "attested_close", "attested_high",
+                 "attested_low", "attested_volume", "attested_amount")
+
+
+def _legacy_exact_page_rows(page):
+    rows, reread = [], []
+    for original in page["rows"]:
+        row = dict(original)
+        for field in _PRICE_FIELDS:
+            value = row[field]
+            if type(value) is float:
+                # The old reader converted DECIMAL(...,6) to binary64. Below
+                # 2**33 its rounding error is strictly less than half a unit
+                # at scale 6, so rounding the exact float recovers the SQL value.
+                if not abs(value) < 2 ** 33:
+                    reread.append(row["attestation_id"])
+                    break
+                row[field] = str(Decimal.from_float(value).quantize(Decimal("0.000001")))
+        else:
+            rows.append(row)
+    return rows, reread
+
+
+def read_legacy_attestations(read, params, *, database, deadline, sealed_attestations=False, original_times=None):
+    """Resolve exact immutable evidence pages and filter on original availability."""
     mysql = database.dialect.name == "mysql"
-    index = f" FORCE INDEX ({DAILY_PROOF_INDEX})" if mysql else ""
+    index = " FORCE INDEX (idx_qmt_kline_attestation_row_date)" if mysql else ""
+    primary = " FORCE INDEX (PRIMARY)" if mysql else ""
     binary = "BINARY " if mysql else ""
     sql = (
-        "SELECT /*+ MAX_EXECUTION_TIME(10000) */ "
+        "SELECT /*+ MAX_EXECUTION_TIME(12000) */ "
         "a.attestation_id, a.created_at AS attestation_created_at, a.trade_date, a.stock_code, a.run_id, "
         "CAST(a.source_pre_close AS CHAR) AS source_pre_close, CAST(a.attested_open AS CHAR) AS attested_open, "
         "CAST(a.attested_close AS CHAR) AS attested_close, CAST(a.attested_high AS CHAR) AS attested_high, "
         "CAST(a.attested_low AS CHAR) AS attested_low, CAST(a.attested_volume AS CHAR) AS attested_volume, "
         "CAST(a.attested_amount AS CHAR) AS attested_amount "
-        f"FROM qmt_kline_attestation_row a{index} "
+        f"FROM qmt_kline_attestation_row a{primary} "
         "WHERE a.trade_date=:day AND a.protocol_version=:protocol_version "
         f"AND {binary}a.protocol_version={binary}:protocol_version AND a.qmt_id>0 "
         f"AND {binary}a.source_pre_close_origin={binary}'NATIVE_QMT' "
@@ -187,28 +224,108 @@ def read_legacy_attestations(read, params, *, database, deadline):
         "a.attested_open, a.attested_close, a.attested_high, a.attested_low, "
         "a.attested_volume, a.attested_amount), 256) "
         f"AND {a_share_stock_code_sql('a.stock_code')} "
-        "AND a.created_at<=:decision_known_at "
-        "AND a.stock_code>=:code AND (a.stock_code>:code OR a.attestation_id>:row_id) "
-        "ORDER BY a.stock_code,a.attestation_id LIMIT 2048"
     )
+    page_stage = "governance_attestation_rows"
+    generation = canonical_digest({"schema": "probiga.governance-attestation-pages.v2",
+                                   "sql": sql, "protocol": params["protocol_version"]})
+    store = FormalAnalysisStore(database) if sealed_attestations else None
+    old_pages_allowed = bool(store and mysql and params["protocol_version"] == "QMT_DAILY_UNADJUSTED_PRECLOSE_V2")
+
+    def exact_rows(day, ids):
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"QMT certification read deadline: {day} after {ids[0]}")
+        binds = {f"id{i}": value for i, value in enumerate(ids)}
+        placeholders = ",".join(":" + name for name in binds)
+        return read(sql + f" AND a.attestation_id IN ({placeholders})",
+                    {**params, "day": day, **binds}, database=database)
+
     result = []
     day = datetime.fromisoformat(str(params["start_date"])[:10]).date()
     ending = datetime.fromisoformat(str(params["as_of_date"])[:10]).date()
     while day <= ending:
+        selected_day = day.isoformat()
         code, row_id = "", ""
+        inventory = {}
         while True:
             if time.monotonic() >= deadline:
-                raise TimeoutError(f"QMT certification read deadline: {day} after {code}")
-            page = read(sql, {**params, "day": day.isoformat(), "code": code, "row_id": row_id}, database=database)
-            result.extend(page)
-            if len(result) > 250000:
-                raise ValueError("QMT certification inventory exceeds its bound")
-            if len(page) < 2048:
+                raise TimeoutError(f"QMT certification inventory deadline: {selected_day}")
+            rows = read(
+                "SELECT /*+ MAX_EXECUTION_TIME(5000) */ a.stock_code,a.attestation_id "
+                f"FROM qmt_kline_attestation_row a{index} WHERE a.trade_date=:day "
+                "AND a.protocol_version=:protocol_version AND a.stock_code>=:code "
+                "AND (a.stock_code>:code OR a.attestation_id>:row_id) "
+                f"AND {a_share_stock_code_sql('a.stock_code')} "
+                "ORDER BY a.stock_code,a.attestation_id LIMIT 8192",
+                {**params, "day": selected_day, "code": code, "row_id": row_id}, database=database,
+            )
+            for row in rows:
+                if row["attestation_id"] in inventory:
+                    raise ValueError(f"QMT certification inventory repeats a primary key: {selected_day}")
+                inventory[row["attestation_id"]] = row["stock_code"]
+            if len(inventory) > 250000:
+                raise ValueError(f"QMT certification inventory exceeds its bound: {selected_day}")
+            if len(rows) < 8192:
                 break
-            next_key = page[-1]["stock_code"], page[-1]["attestation_id"]
+            next_key = rows[-1]["stock_code"], rows[-1]["attestation_id"]
             if next_key <= (code, row_id):
-                raise ValueError("QMT certification cursor did not advance")
+                raise ValueError(f"QMT certification cursor did not advance: {selected_day}")
             code, row_id = next_key
+
+        ids = sorted(inventory)
+        for offset in range(0, len(ids), 2048):
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"QMT certification read deadline: {selected_day} {offset}/{len(ids)}")
+            pages = {canonical_digest(ids[i:i + 64]): ids[i:i + 64]
+                     for i in range(offset, min(offset + 2048, len(ids)), 64)}
+            retained = store.get_many(generation, page_stage, list(pages)) if store else {}
+            old = (store.get_many(_V1_MYSQL_PAGE_GENERATION, page_stage, [k for k in pages if k not in retained])
+                   if old_pages_allowed and len(retained) < len(pages) else {})
+            recovered = {key: _legacy_exact_page_rows(page) for key, page in old.items()}
+            ambiguous = sorted(row_id for _, missing in recovered.values() for row_id in missing)
+            corrected = {}
+            for pos in range(0, len(ambiguous), 64):
+                requested = ambiguous[pos:pos + 64]
+                fetched = {row["attestation_id"]: row for row in exact_rows(selected_day, requested)}
+                if fetched.keys() != set(requested):
+                    raise ValueError(f"QMT immutable certification page changed: {selected_day}")
+                corrected.update(fetched)
+            pending = {}
+            try:
+                for key, selected in pages.items():
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"QMT certification read deadline: {selected_day} after {selected[0]}")
+                    page = retained.get(key) or old.get(key)
+                    if page is not None and page["ids"] != selected:
+                        raise ValueError(f"QMT certification page identity differs: {selected_day}")
+                    if key in retained:
+                        rows, missing = page["rows"], []
+                    elif page is not None:
+                        rows, missing = recovered[key]
+                        if missing:
+                            rows = sorted([*rows, *(corrected[value] for value in missing)],
+                                          key=lambda row: row["attestation_id"])
+                    else:
+                        rows = sorted(exact_rows(selected_day, selected), key=lambda row: row["attestation_id"])
+                        missing = selected
+                    row_ids = [row["attestation_id"] for row in rows]
+                    if (len(set(row_ids)) != len(row_ids) or not set(row_ids) <= set(selected)
+                            or any(str(row["trade_date"])[:10] != selected_day
+                                   or row["stock_code"] != inventory[row["attestation_id"]] for row in rows)):
+                        raise ValueError(f"QMT certification primary-key scope differs: {selected_day}")
+                    if store and missing:
+                        pending[key] = {"ids": selected, "rows": rows}
+                    for row in rows:
+                        available = normalize_decision_at(row["attestation_created_at"])
+                        if original_times is not None:
+                            original_times.add(available.isoformat())
+                        if available <= params["decision_known_at"]:
+                            result.append(row)
+                    if len(pending) == 8:
+                        ready, pending = pending, {}
+                        store.put_many(generation, page_stage, ready)
+            finally:
+                if pending:
+                    store.put_many(generation, page_stage, pending)
         day += timedelta(days=1)
     return result
 

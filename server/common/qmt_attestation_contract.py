@@ -93,15 +93,6 @@ QMT_ATTESTATION_COLUMN_SPECS = MappingProxyType({
     ),
 })
 
-DAILY_PROOF_INDEX = "idx_qmt_attestation_daily_proof"
-DAILY_PROOF_INDEX_COLUMNS = (
-    "trade_date", "protocol_version", "stock_code", "created_at", "run_id",
-    "source_pre_close_origin", "target_id", "qmt_id", "source_data_version",
-    "source_pre_close", "attested_open", "attested_close", "attested_high",
-    "attested_low", "attested_volume", "attested_amount",
-)
-
-
 # Index fields are: uniqueness (0 means unique), then the ordered columns.
 QMT_ATTESTATION_INDEX_SPECS = MappingProxyType({
     "qmt_kline_attestation_schema_migration": MappingProxyType({
@@ -133,7 +124,6 @@ QMT_ATTESTATION_INDEX_SPECS = MappingProxyType({
             ("trade_date", "protocol_version", "stock_code"),
         ),
         "idx_qmt_kline_attestation_row_run": (1, ("run_id",)),
-        DAILY_PROOF_INDEX: (1, DAILY_PROOF_INDEX_COLUMNS),
     }),
 })
 
