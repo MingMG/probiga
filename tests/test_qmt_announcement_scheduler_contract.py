@@ -727,6 +727,28 @@ def test_checkpoint_root_rejects_relative_and_descendant_symlink(
         _checkpoint_root(str(root))
 
 
+def test_historical_checkpoint_ignores_unrelated_access_denial(monkeypatch, tmp_path):
+    monkeypatch.delenv("PROBIGA_DEPLOYMENT_MODE", raising=False)
+    target = datetime(2026, 11, 3).date()
+    old = tmp_path / "cninfo-ann-20260901"
+    selected = tmp_path / "cninfo-ann-reconstruction-scope-20261103-abc"
+    old.mkdir()
+    selected.mkdir()
+    original = os.scandir
+    denied = {old}
+
+    def scandir(path):
+        if Path(path) in denied:
+            raise PermissionError(str(path))
+        return original(path)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    assert _checkpoint_root(str(tmp_path), target) == tmp_path
+    denied.add(selected)
+    with pytest.raises(Exception, match="PermissionError"):
+        _checkpoint_root(str(tmp_path), target)
+
+
 def test_production_checkpoint_root_is_frozen_and_must_preexist(
     monkeypatch, tmp_path
 ):

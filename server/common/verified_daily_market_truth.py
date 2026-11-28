@@ -57,6 +57,10 @@ class VerifiedDailyMarketBlocked(RuntimeError):
     """A free-source partition is missing, incomplete, or unsafe to consume."""
 
 
+class DailyPriceSourceUnavailable(VerifiedDailyMarketBlocked):
+    """The requested session has no eligible price source at the frozen cutoff."""
+
+
 def _date(value: Any) -> str:
     raw = str(value or "").strip()
     try:
@@ -496,7 +500,11 @@ def load_retained_qmt_daily_market_truth(
             target_date=day,
             codes=expected_codes,
         )
-        if not rows or any(
+        if not rows:
+            raise DailyPriceSourceUnavailable(
+                f"{day} 缺少截止 {cutoff} 可用于回放的留存 QMT 日线"
+            )
+        if any(
             str(row.get("quality_status") or "")
             not in {"", "RAW", "PASS", "VERIFIED", "QMT_ATTESTED"}
             for row in rows
