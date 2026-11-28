@@ -17,7 +17,7 @@ _LEVEL1_RECEIPT_INDEX = 'idx_qmt_realtime_level1_continuity'
 _LEVEL1_RECEIPT_COLUMNS = ('capture_mode', 'quality_status', 'source_generated_at', 'published_at')
 
 
-def _privileged_migrate_quote_read_index(engine, *, table, index, columns, timeout_seconds):
+def privileged_migrate_read_index(engine, *, table, index, columns, timeout_seconds):
     """Add the online physical read index without changing collector contracts.
 
     The release/admin caller owns the bounded connection establishment. A
@@ -55,14 +55,13 @@ def _privileged_migrate_quote_read_index(engine, *, table, index, columns, timeo
 
         def inspect():
             rows = execute('''SELECT /*+ MAX_EXECUTION_TIME(4000) */
-                NON_UNIQUE,SEQ_IN_INDEX,COLUMN_NAME,SUB_PART,INDEX_TYPE,COLLATION,IS_VISIBLE,EXPRESSION
-                FROM information_schema.STATISTICS
+                * FROM information_schema.STATISTICS
                 WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=:table_name AND INDEX_NAME=:index_name
                 ORDER BY SEQ_IN_INDEX''', {'table_name': table, 'index_name': index},
                 stage='index metadata').mappings().all()
             actual = [(int(row['NON_UNIQUE']), int(row['SEQ_IN_INDEX']), row['COLUMN_NAME'],
                        row['SUB_PART'], row['INDEX_TYPE'], row['COLLATION'],
-                       row['IS_VISIBLE'], row['EXPRESSION']) for row in rows]
+                       row.get('IS_VISIBLE', 'YES'), row.get('EXPRESSION')) for row in rows]
             expected = [(1, index, column, None, 'BTREE', 'A', 'YES', None)
                         for index, column in enumerate(columns, 1)]
             if rows and actual != expected:
@@ -90,7 +89,7 @@ def _privileged_migrate_quote_read_index(engine, *, table, index, columns, timeo
 
 
 def privileged_migrate_live_quote_receipt_read_index(engine):
-    return _privileged_migrate_quote_read_index(
+    return privileged_migrate_read_index(
         engine, table=_LIVE_RECEIPT_TABLE, index=_LIVE_RECEIPT_INDEX,
         columns=_LIVE_RECEIPT_COLUMNS, timeout_seconds=180,
     )
@@ -99,14 +98,14 @@ def privileged_migrate_live_quote_receipt_read_index(engine):
 def privileged_migrate_level1_read_index(engine):
     from server.trading_v2.quotes import LEVEL1_TIME_INDEX, LEVEL1_TIME_INDEX_COLUMNS
 
-    return _privileged_migrate_quote_read_index(
+    return privileged_migrate_read_index(
         engine, table='st_quote_event_v2', index=LEVEL1_TIME_INDEX,
         columns=LEVEL1_TIME_INDEX_COLUMNS, timeout_seconds=1800,
     )
 
 
 def privileged_migrate_level1_receipt_read_index(engine):
-    return _privileged_migrate_quote_read_index(
+    return privileged_migrate_read_index(
         engine, table=_LIVE_RECEIPT_TABLE, index=_LEVEL1_RECEIPT_INDEX,
         columns=_LEVEL1_RECEIPT_COLUMNS, timeout_seconds=180,
     )
