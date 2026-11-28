@@ -737,6 +737,9 @@ def submit_native_experiments(engine):
                 for policy in policies:
                     submitted.append(enqueue(connection,_start(connection,group,days,published,source_hash,
                         allocation_policy=policy)))
+        if any(item['strategy_key']=='short_term' for item in strategies):
+            from server.engine.native_opening_research import enqueue_opening
+            submitted.append(enqueue_opening(connection, strategies, days))
         return {'status':'COMPLETE','jobs':submitted,'business_started':False}
 
 

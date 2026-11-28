@@ -17,6 +17,15 @@ ENTITY='NATIVE_REPLAY_RETRY'
 RETRY_EXECUTION_BUDGET=timedelta(hours=24)
 
 
+def _experiment_strategies(connection, state):
+    from server.engine.native_opening_research import is_opening, opening_strategy
+    strategies = native._strategies(connection)
+    if is_opening(state['strategies']):
+        return [opening_strategy(strategies)]
+    family = state['strategies'][0]['source_kind']
+    return [item for item in strategies if item['source_kind']==family]
+
+
 def read_requests(c,request_uid=None):
     rows=c.execute(text("""SELECT /*+ MAX_EXECUTION_TIME(4000) */ a.payload_json,a.after_json,a.audit_hash
         FROM st_strategy_governance_audit a JOIN (SELECT entity_key,MAX(action) last_action
@@ -83,8 +92,7 @@ def request_retry(engine,result_id,request_uid):
                             {'uid':previous['scheduler_run_uid']}).scalar()
                         if history in (None,'running') or not _absent(previous):
                             raise ValueError('旧回测进程尚未证明退出，保持原断点')
-                    family=state['strategies'][0]['source_kind']
-                    strategies=[item for item in native._strategies(connection) if item['source_kind']==family]
+                    strategies=_experiment_strategies(connection,state)
                     if [(s['strategy_key'],s['version_hash']) for s in strategies]!=[(s['strategy_key'],s['version_hash']) for s in state['strategies']]:
                         raise ValueError('策略登记版本已变化，不能替换原研究规则')
                     candidate=native._start(connection,strategies,state['sessions'],state['published'],state['source_hash'],frozen=state)
@@ -159,7 +167,7 @@ def request_experiment(engine,result_id,request_uid,*,evaluation_start,evaluatio
         family=source['strategies'][0]['source_kind']
         if allocation_policy=='ADAPTIVE_REGIME' and family!='immutable_v3_sleeve':
             raise ValueError('该策略族不提供市场状态调节入场实验')
-        strategies=[item for item in native._strategies(connection) if item['source_kind']==family]
+        strategies=_experiment_strategies(connection,source)
         check_deadline('STRATEGY')
         if [(s['strategy_key'],s['version_hash']) for s in strategies]!=[(s['strategy_key'],s['version_hash']) for s in source['strategies']]:
             raise ValueError('策略登记版本已变化，不能替换原实验规则')
