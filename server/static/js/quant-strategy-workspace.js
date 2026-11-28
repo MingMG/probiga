@@ -20,6 +20,7 @@
             const v=p.validation||{}, reg=p.registration||{}, report=v.report||{};
             h+='<details class="qsw-research-proposal" data-qsw-key="research-'+esc(p.rule_hash)+'"><summary>'+esc(p.name)+' · '+esc(researchStates[v.status]||v.status)+' · '+esc(reg.status==='COMPLETE'?'已登记影子观察':'待登记')+'</summary>';
             h+='<p>'+esc(p.thesis)+'</p><p>适用：'+esc(p.applicability)+'；失效：'+esc(p.invalidations)+'</p>';
+            if((p.research_sources||[]).length)h+='<p>论文借鉴形成的新假设，尚非论文独立复现：'+p.research_sources.map(s=>'<a href="'+esc(s.source_url)+'" target="_blank" rel="noopener noreferrer">'+esc(s.title)+'（'+esc(s.source_published_date)+'）</a>').join('；')+'</p>';
             h+='<p>市场条件（同时满足）：'+esc(conditionsText(p.rule.market_all))+'</p><p>入场条件（同时满足）：'+esc(conditionsText(p.rule.entry_all))+'；择一条件：'+esc(conditionsText(p.rule.entry_any))+'</p>';
             h+='<p>持有上限 '+esc(p.rule.holding_days)+' 个交易日，保护止损 '+esc(p.rule.stop_loss_pct)+'%。具体成交仍受下一交易日、涨跌停、流动性及组合约束。</p>';
             h+='<p>历史研究：'+esc(v.reason||((v.completed_units!=null)?'已校验 '+v.completed_units+' / '+v.total_units+' 个分区':'等待验证'))+'</p>';

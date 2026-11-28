@@ -16,6 +16,11 @@ from server.engine.strategy_rule_language import RULE_SCHEMA, feature_frame, fea
 from server.engine.strategy_rule_replay import replay_rule
 
 
+@pytest.fixture(autouse=True)
+def no_external_literature(monkeypatch):
+    monkeypatch.setattr(research, "load_quant_research_candidates", lambda *_a, **_k: {"candidates": []})
+
+
 @pytest.fixture
 def rule():
     return {"schema": RULE_SCHEMA, "market_all": [{"field": "market_breadth_pct", "op": "lte", "value": 50}],
@@ -458,7 +463,7 @@ def test_model_result_reuses_one_durable_request_after_caller_restart(rule, raw_
     packet = {"trade_date": "2026-11-20", "decision_known_at": "2026-11-21 20:00:00",
               "feature_catalog": feature_catalog(rows, market), "market": market, "previous_research": []}
     response = {"summary": "仅为确定性单元测试响应", "proposals": [{"name": "测试规则", "thesis": "测试假设",
-        "applicability": "测试弱市", "invalidations": "测试条件失效", "rule": rule}]}
+        "applicability": "测试弱市", "invalidations": "测试条件失效", "source_candidate_ids": [], "rule": rule}]}
     request_id, failures = str(uuid4()), []
     def test_provider():
         try:
@@ -550,3 +555,42 @@ def test_schema_diagnostic_retains_errno_without_sql_or_credentials():
     assert report["checks"]["source"]["database_errno"] == 2013
     assert report["status"] == "MIGRATION_REQUIRED"
     assert "private" not in json.dumps(report) and "secret" not in json.dumps(report)
+
+
+def test_literature_cutoff_and_latest_batch_are_frozen_in_experiment_identity(monkeypatch, raw_rows):
+    base = {'candidate_id': 'a'*64, 'source_published_date': '2026-11-23',
+            'batch_published_at': '2026-11-27 04:00:00', 'qmt_feasibility': 'ADAPTATION_REQUIRED', 'priority': 1}
+    older = {**base, 'candidate_id': 'b'*64, 'batch_published_at': '2026-11-20 04:00:00'}
+    later = {**base, 'candidate_id': 'c'*64, 'batch_published_at': '2026-11-27 19:00:00'}
+    unpublished = {**base, 'candidate_id': 'd'*64, 'source_published_date': '2026-11-28'}
+    monkeypatch.setattr(research, 'load_quant_research_candidates', lambda *_a, **_k: {
+        'candidates': [older, later, unpublished, base]})
+    frozen = research._research_candidates(None, '2026-11-27 18:00:00')
+    assert frozen == [base]
+    rows, market = feature_frame(raw_rows, '2026-11-20')
+    original = research.research_input_identity(rows, market, '2026-11-20')
+    applied = research.research_input_identity(rows, market, '2026-11-20', research_candidates=frozen)
+    assert original != applied
+    assert applied == research.research_input_identity(list(reversed(rows)), market, '2026-11-20', research_candidates=frozen)
+
+
+def test_generated_hypothesis_retains_frozen_paper_and_rejects_invented_citation(rule, raw_rows, monkeypatch):
+    from types import SimpleNamespace
+    from biz.review import market_decision
+    rows, market = feature_frame(raw_rows, '2026-11-20')
+    paper = {'candidate_id': 'a'*64, 'title': 'Frozen research', 'source_url': 'https://example.org/paper',
+             'reproducibility_status': 'NOT_REPRODUCED', 'performance_metrics': {'sharpe': 'unavailable'}}
+    packet = {'feature_catalog': feature_catalog(rows, market), 'research_candidates': [paper]}
+    output = {'summary': '新假设', 'proposals': [{'name': '新假设', 'thesis': '只借鉴机制', 'applicability': '弱市',
+        'invalidations': '需独立样本外验证', 'source_candidate_ids': [paper['candidate_id']], 'rule': rule}]}
+    monkeypatch.setattr(market_decision, '_call_codex', lambda *_a, **_k: SimpleNamespace(
+        raw_response=json.dumps(output), provider_receipt={'test': True}))
+    result = research.generate_proposals(packet, engine=None, request_id='test')
+    proposed = result['proposals'][0]
+    assert proposed['research_sources'] == [paper]
+    assert proposed['literature_application'] == 'ADAPTED_HYPOTHESIS'
+    assert proposed['validation'] == {'status': 'NOT_STARTED'}
+    assert proposed['research_sources'][0]['reproducibility_status'] == 'NOT_REPRODUCED'
+    output['proposals'][0]['source_candidate_ids'] = ['b'*64]
+    with pytest.raises(ValueError, match='未冻结'):
+        research.generate_proposals(packet, engine=None, request_id='test')
