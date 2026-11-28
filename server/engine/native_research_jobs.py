@@ -278,7 +278,7 @@ class PrepareYield(BaseException):
     """A committed source partition reached this attempt's time budget."""
 
 
-def _source_progress(connection, state, owner, day, stage, *, deadline, checkpoint_interval=5):
+def _source_progress(connection, state, owner, day, stage, *, deadline, checkpoint_interval=45):
     from server.engine.strategy_native_backtest import NativeStepDeadline, _save
     from server.common.analysis_pool_receipt import canonical_sha256
     last_saved = time.monotonic()
@@ -301,10 +301,13 @@ def _source_progress(connection, state, owner, day, stage, *, deadline, checkpoi
                 'completed': done, 'total': total, 'last_progress_at': str(now_shanghai()), 'fresh_source_write': fresh}
             cursors[key]=dict(state['source_progress'])
             state['last_progress_at'] = str(now_shanghai())
-        if advanced and (time.monotonic() - last_saved >= checkpoint_interval or done == total):
+        if advanced and (time.monotonic() - last_saved >= checkpoint_interval
+                or (done == total and fresh is not False and stage not in ('event_metadata', 'event_selection'))):
             _save(connection, state, owner)
             last_saved = time.monotonic()
         if time.monotonic() >= deadline and done < total:
+            if fresh is False or stage == 'event_selection':
+                return
             if done<=starting.get(key,0):
                 # Replay retained/observed prefixes under the attempt's hard deadline before judging new writes.
                 if fresh is not True:return
@@ -342,4 +345,4 @@ def feature_input_progress(connection, state, owner, dataset, day, *, deadline):
 
 
 def source_deadline():
-    return time.monotonic()+90
+    return time.monotonic()+300
