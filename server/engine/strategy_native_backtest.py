@@ -10,6 +10,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
 from server.common.analysis_pool_receipt import canonical_sha256
+from server.common.verified_daily_market_truth import DailyPriceSourceUnavailable
 from server.engine.native_feature_math import _features, _frame, _assert_read_succeeded
 from server.engine.autonomous_strategy_research import now_shanghai
 from server.engine.strategy_rule_backtest import _partitions, partition_key, PART_ENTITY
@@ -80,7 +81,13 @@ def _inventory(c,day):
             "WHERE fact_kind=:kind AND coverage_status='COMPLETE' "+extra+
             " ORDER BY known_at DESC,coverage_id DESC LIMIT 1"),{'kind':kind,'anchor':anchor}).mappings().first()
         seals[kind]=dict(row) if row else None
-    identity=json.loads(json.dumps({'published':published,'membership':members,'seals':seals},default=str))
+    from server.common.qmt_datadir_result import RECEIPT_TABLE
+    price_receipts=c.execute(text(f"""SELECT trade_date,run_id,content_sha256,finished_at
+        FROM {RECEIPT_TABLE} WHERE dataset='stock_daily' AND status='COMPLETE'
+        AND trade_date BETWEEN :start AND :end AND finished_at<=:clock ORDER BY trade_date"""),
+        {'start':days[0],'end':days[-1],'clock':now_shanghai()}).mappings()
+    identity=json.loads(json.dumps({'published':published,'membership':members,'seals':seals,
+        'price_receipts':[dict(row) for row in price_receipts]},default=str))
     return days,published,canonical_sha256(identity)
 
 
@@ -806,9 +813,9 @@ def _native_tick(engine):
                     state.update(status='RUNNING',retry_after=str(now_shanghai()+timedelta(minutes=1)))
                     _save(connection,state,owner,yield_job=True)
                 else:
-                    state['status']='FAILED'
+                    state['status']='BLOCKED' if isinstance(exc,DailyPriceSourceUnavailable) else 'FAILED'
                     for proposal in state['proposals']:
-                        if proposal['strategy_key'] not in state['reports']:proposal['validation'].update(status='FAILED',reason=state['reason'])
+                        if proposal['strategy_key'] not in state['reports']:proposal['validation'].update(status=state['status'],reason=state['reason'])
                     _save(connection,state,owner)
             return {'status':state['status'],'job_id':state['job_id'],'run_id':state['run_id'],
                 'phase':state['phase'],'reason':state['reason'],'completed_units':state['completed_units'],'total_units':state['total_units']}

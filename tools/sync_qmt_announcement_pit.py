@@ -473,7 +473,7 @@ def _manual_research_build_sha(expected_build_sha: str) -> str:
     return expected
 
 
-def _checkpoint_root(value: str) -> Path:
+def _checkpoint_root(value: str, historical_target: date | None = None) -> Path:
     """Return one writable, non-link checkpoint root without code-tree escape."""
 
     raw = str(value or "").strip()
@@ -557,10 +557,16 @@ def _checkpoint_root(value: str) -> Path:
             "QMT_ANNOUNCEMENT_CHECKPOINT_ROOT_INVALID", type(exc).__name__
         ) from exc
 
+    prefix = (f"cninfo-ann-reconstruction-scope-{historical_target:%Y%m%d}-"
+              if historical_target is not None else None)
     for current, directories, files in os.walk(
         absolute, followlinks=False, onerror=walk_error
     ):
         current_path = Path(current)
+        if prefix and current_path == absolute:
+            # The historical reader opens only a content-bound batch for this day.
+            directories[:] = [name for name in directories if name.startswith(prefix)]
+            files = [name for name in files if name.startswith(prefix)]
         try:
             current_path.resolve(strict=True).relative_to(absolute)
         except (OSError, ValueError) as exc:
@@ -570,7 +576,8 @@ def _checkpoint_root(value: str) -> Path:
             ) from exc
         for name in [*directories, *files]:
             entry = current_path / name
-            if entry.is_symlink():
+            if entry.is_symlink() or (os.name == "nt" and
+                    entry.lstat().st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT):
                 raise QMTAnnouncementBlocked(
                     "QMT_ANNOUNCEMENT_CHECKPOINT_ROOT_INVALID",
                     "checkpoint-tree-contains-symlink",
@@ -2362,7 +2369,7 @@ def main(argv: list[str] | None = None, *, premarket_source: bool = False) -> in
                     decision_known_at=observed,
                     execution_origin=execution_origin,
                 )
-                checkpoint_dir = _checkpoint_root(args.checkpoint_dir)
+                checkpoint_dir = _checkpoint_root(args.checkpoint_dir, target)
                 fallback = _fallback_announcement_adapter("cninfo")
                 if os.name == "nt" and _is_production() and not manual_research:
                     progress = MinuteImportProgress(

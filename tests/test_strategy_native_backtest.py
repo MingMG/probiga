@@ -11,6 +11,31 @@ from server.engine.shadow_trial_policy import SHADOW_EXECUTION_POLICY
 from server.api.strategy_performance import _research,rank_results
 
 
+def test_inventory_changes_only_after_daily_publication(monkeypatch):
+    from server.engine import autonomous_strategy_research as research
+
+    day = '2026-11-27'
+    monkeypatch.setattr(research, '_historical_inventory', lambda *_: ([day], {}))
+    engine = create_engine('sqlite://')
+    with engine.begin() as connection:
+        for ddl in (
+            'qmt_membership_snapshot_run(snapshot_date,industry_hash,captured_at,quality_status,source)',
+            'qmt_industry_member_snapshot(stock_code,snapshot_date,source)',
+            'st_pit_source_coverage(coverage_id,known_at,fact_kind,coverage_status,stock_code,source)',
+            'qmt_datadir_import_partition(dataset,status,trade_date,run_id,content_sha256,finished_at)',
+        ):
+            connection.execute(text('CREATE TABLE ' + ddl))
+        monkeypatch.setattr(native, 'now_shanghai', lambda: datetime(2026, 11, 27, 23, 51, 20))
+        prior = native._inventory(connection, day)
+        connection.execute(text("""INSERT INTO qmt_datadir_import_partition VALUES
+            ('stock_daily','COMPLETE','2026-11-27','qdd_20261128','digest','2026-11-28 00:28:31')"""))
+        assert native._inventory(connection, day) == prior
+        monkeypatch.setattr(native, 'now_shanghai', lambda: datetime(2026, 11, 28, 0, 29))
+        after = native._inventory(connection, day)
+        assert prior[:2] == after[:2] and prior[2] != after[2]
+        assert native._inventory(connection, day) == after
+
+
 def fixture():
     days=[str(d.date()) for d in pd.bdate_range('2026-07-01',periods=30)]
     bars=[{'stock_code':'000001','trade_date':d,'open':10.,'close':10.,'pre_close':10.,
