@@ -263,3 +263,34 @@ def test_untyped_legacy_audits_are_history_and_never_an_execution_queue(queue,mo
     monkeypatch.setattr(native,'_inventory',lambda *_:pytest.fail('audit scans recreated a job'))
     monkeypatch.setattr(native,'_step',lambda *_:pytest.fail('untyped audit was executed'))
     assert native.native_tick(queue)=={'status':'idle'}
+
+
+def test_cached_event_metadata_and_observational_selection_do_not_yield_or_spam_saves(monkeypatch):
+    clock = [100.0]
+    saves = []
+    monkeypatch.setattr(jobs.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(native, '_save', lambda *_a, **_k: saves.append(clock[0]))
+    assert jobs.source_deadline() == 400.0
+
+    state = {}
+    meta = jobs._source_progress(None, state, None, '2026-11-18', 'event_metadata', deadline=120.0)
+    sel = jobs._source_progress(None, state, None, '2026-11-18', 'event_selection', deadline=120.0)
+    cov = jobs._source_progress(None, state, None, '2026-11-18', 'event_coverage', deadline=120.0)
+
+    # Cached metadata sub-blocks within checkpoint_interval must not trigger audit saves.
+    clock[0] = 110.0
+    meta(128, 1360, 'sub-block-1', False)
+    meta(1360, 1360, 'sub-block-1', False)
+    assert saves == []
+
+    # Past deadline, cached metadata and pre-commit observational event_selection must
+    # not yield before coverage_store.put commits event_coverage (fresh=True).
+    clock[0] = 125.0
+    meta(1152, 1360, 'sub-block-2', False)
+    sel(1520, 5580, '', None)
+    assert saves == []
+
+    with pytest.raises(jobs.PrepareYield, match='event_coverage'):
+        cov(1520, 5580, 'cov-gen', True)
+    assert state['source_progress']['dataset'] == 'event_coverage'
+    assert state['source_progress']['completed'] == 1520
