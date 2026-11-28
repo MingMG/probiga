@@ -410,3 +410,47 @@ def test_opening_replay_uses_published_clock_and_bound_market(monkeypatch):
     assert result['status']=='COMPLETE' and result['signal_clock']==next_day+' 08:49:24'
     row['model_version']='ai-rec-v3-ext-v3'
     assert native_original_prepare.prepare_original_day(None,state,day)['status']=='BLOCKED'
+
+
+def test_manifest_plan_arms_prepare_budget_and_yields_after_one_published_day(tmp_path, monkeypatch):
+    from server.db.formal_analysis_schema import privileged_migrate_formal_analysis_schema
+    from server.engine import native_original_prepare, native_research_dataset
+
+    engine = create_engine('sqlite://')
+    privileged_migrate_formal_analysis_schema(engine)
+    with engine.begin() as conn:
+        conn.execute(text("CREATE TABLE st_job_v2 (job_type TEXT, status TEXT, result_ref TEXT)"))
+    Dataset = native_research_dataset.PreparedDataset
+    monkeypatch.setattr(native_research_dataset, 'PreparedDataset', lambda *a, **kw: Dataset(tmp_path / 'ds'))
+    monkeypatch.setattr(native, '_begin_unit', lambda *a, **kw: None)
+    saved = []
+    monkeypatch.setattr(native, '_save', lambda c, s, o, **kw: saved.append((s['cursor'], dict(s['plan_summary']))))
+    prepared = []
+
+    def fake_prepare(conn, state, day):
+        prepared.append(day)
+        if not state['published'].get(day):
+            return {'status': 'BLOCKED', 'reason': '缺少完整冻结评分及市场上下文批次', 'signals': {}}
+        return {'status': 'COMPLETE', 'source_sha256': 's' * 64, 'source_run_uid': 'r' * 32,
+                'identities': {}, 'identity': {'status': 'VERIFIED'}, 'fixed_market_context': {}}
+
+    monkeypatch.setattr(native_original_prepare, 'prepare_original_day', fake_prepare)
+    budgets = []
+    state = {
+        'run_id': 'e' * 64, 'phase': 'PLAN', 'cursor': 0, 'completed_units': 1, 'total_units': 4,
+        'input_index': {'status': 'VERIFIED'}, 'prepared_references': {}, 'plans': {},
+        'signal_parts': {}, 'base_data_by_day': {}, 'plan_summary': {}, 'reports': {},
+        'sessions': ['2026-11-12', '2026-11-13', '2026-11-16'],
+        'published': {'2026-11-13': 'u1', '2026-11-16': 'u2'},
+        'strategies': [{'strategy_key': 'short_term', 'source_kind': 'immutable_manifest'}],
+        'proposals': [{'strategy_key': 'short_term', 'validation': {'status': 'RUNNING'}}],
+    }
+    with engine.connect() as conn:
+        native._step(conn, state, {'pid': 1}, prepare_budget=lambda: budgets.append(state['cursor']))
+        assert prepared == ['2026-11-12', '2026-11-13']
+        assert budgets == [1]
+        assert state['cursor'] == 2 and '2026-11-16' not in state['plan_summary']
+        native._step(conn, state, {'pid': 1}, prepare_budget=lambda: budgets.append(state['cursor']))
+        assert prepared == ['2026-11-12', '2026-11-13', '2026-11-16']
+        assert budgets == [1, 2]
+        assert state['cursor'] == 3 and state['plan_summary']['2026-11-16']['status'] == 'COMPLETE'
