@@ -7061,7 +7061,7 @@ def _authoritative_session_windows_with_proof(
             "PROBIGA_GOVERNANCE_QMT_WINDOW_BATCH_DAYS", "5"
         ))))
         phase_timeout = max(60, min(900, int(os.environ.get(
-            "PROBIGA_GOVERNANCE_QMT_WINDOW_TIMEOUT_SECONDS", "300"
+            "PROBIGA_GOVERNANCE_QMT_WINDOW_TIMEOUT_SECONDS", "900"
         ))))
         phase_deadline = time.monotonic() + phase_timeout
         logging.getLogger(__name__).info(

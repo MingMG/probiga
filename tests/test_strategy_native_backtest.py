@@ -373,16 +373,38 @@ def test_opening_replay_binds_last_completed_batch_before_open():
 
 
 def test_opening_research_is_an_independent_simulation_version():
-    from server.engine.native_opening_research import is_opening, opening_strategy
-    base = {'strategy_key':'short_term', 'strategy_name':'短线多因子', 'source_kind':'immutable_manifest',
-            'current_version':'stock_strategy_v2.4.0:short_term', 'evaluator_type':'manifest_score_adapter',
-            'version_hash':'original', 'parameters':{}, 'evaluator_config':{
-                'score_field':'short_term_score', 'model_version':'ai-rec-v3-ext-v3'}}
-    simulation = opening_strategy([base])
-    assert is_opening([simulation]) and not is_opening([base])
-    assert simulation['version_hash'] != base['version_hash']
-    assert simulation['evaluator_config']['model_version'] == 'ai-rec-v3-tactical-v4'
-    assert base['evaluator_config']['model_version'] == 'ai-rec-v3-ext-v3'
+    from server.engine.native_opening_research import OPENING_STRATEGIES, is_opening, opening_strategy
+    from server.engine.strategy_native_control import _experiment_strategies
+    from server.engine import strategy_native_backtest as native
+    bases = [
+        {'strategy_key': key, 'strategy_name': name.replace('（开盘模拟）', ''), 'source_kind': 'immutable_manifest',
+         'current_version': f'stock_strategy_v2.4.0:{key}', 'evaluator_type': 'manifest_score_adapter',
+         'version_hash': f'original-{key}', 'parameters': {}, 'evaluator_config': {
+             'score_field': score_field, 'model_version': 'ai-rec-v3-ext-v3'}}
+        for key, score_field, name in OPENING_STRATEGIES
+    ]
+    seen_hashes = set()
+    for base in bases:
+        simulation = opening_strategy(bases, base['strategy_key'])
+        assert is_opening([simulation]) and not is_opening([base])
+        assert simulation['version_hash'] != base['version_hash']
+        assert simulation['version_hash'] not in seen_hashes
+        seen_hashes.add(simulation['version_hash'])
+        assert simulation['current_version'] == base['current_version'] + ':tactical-v4-open-v1'
+        assert simulation['evaluator_config']['model_version'] == 'ai-rec-v3-tactical-v4'
+        assert base['evaluator_config']['model_version'] == 'ai-rec-v3-ext-v3'
+    # Default call remains backward-compatible for short_term.
+    assert opening_strategy(bases)['strategy_key'] == 'short_term'
+    # Control-plane resolution preserves each strategy's exact opening identity.
+    old_strategies = native._strategies
+    try:
+        native._strategies = lambda _c: bases
+        for base in bases:
+            sim = opening_strategy(bases, base['strategy_key'])
+            resolved = _experiment_strategies(None, {'strategies': [sim]})
+            assert resolved == [sim]
+    finally:
+        native._strategies = old_strategies
 
 
 def test_opening_replay_uses_published_clock_and_bound_market(monkeypatch):

@@ -21,7 +21,7 @@ def _experiment_strategies(connection, state):
     from server.engine.native_opening_research import is_opening, opening_strategy
     strategies = native._strategies(connection)
     if is_opening(state['strategies']):
-        return [opening_strategy(strategies)]
+        return [opening_strategy(strategies, state['strategies'][0]['strategy_key'])]
     family = state['strategies'][0]['source_kind']
     return [item for item in strategies if item['source_kind']==family]
 
