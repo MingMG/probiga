@@ -5798,3 +5798,28 @@ def test_cutover_diagnostics_do_not_change_strict_preflight_payload():
         "restore_fresh_admin_verified", "runtime_trust_off_verified",
         "runtime_privileges_changed", "automatic_real_order_submission",
     }
+
+
+def test_native_replay_prepare_installs_governance_proof_index_with_existing_queue(monkeypatch):
+    from server.common import native_job_schema, pit_source_coverage_index
+    from tools import attest_qmt_daily_kline
+
+    runtime, migrator, admin = MagicMock(), MagicMock(), MagicMock()
+    runtime.connect.return_value.__enter__.return_value.execute.return_value.scalar.return_value = None
+    boundary = SimpleNamespace(runtime_engine=runtime, migrator_engine=migrator)
+    monkeypatch.setattr(schema, "load_project_env", lambda: None)
+    monkeypatch.setattr(schema, "_open_boundary", lambda **_kwargs: boundary)
+    monkeypatch.setattr(schema, "_connect_admin", lambda _boundary: admin)
+    monkeypatch.setattr(schema, "_acquire_lock", lambda _admin: True)
+    monkeypatch.setattr(schema, "_release_lock", lambda _admin: None)
+    monkeypatch.setattr(schema, "_assert_pit_index_ddl_terminal", lambda _engine: None)
+    monkeypatch.setattr(native_job_schema, "validate_native_job_schema", lambda _engine: {})
+    monkeypatch.setattr(pit_source_coverage_index, "ensure_pit_source_coverage_date_index",
+                        lambda _engine: {"created": False})
+    proof_index = MagicMock(side_effect=[{"created": True}, {"created": False}])
+    monkeypatch.setattr(attest_qmt_daily_kline, "ensure_daily_proof_index", proof_index)
+
+    assert schema._prepare_native_replay_schema()["migration_required"] is True
+    assert schema._prepare_native_replay_schema()["migration_required"] is False
+    assert proof_index.call_args_list == [call(migrator), call(migrator)]
+    runtime.begin.assert_not_called()

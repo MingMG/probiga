@@ -640,6 +640,7 @@ def test_authoritative_windows_require_exact_calendar_qmt_date_set(monkeypatch, 
     completed_run_rows = [
         {
             "run_id": "completed-v2-full-universe",
+            "finished_at": descending[0] + " 15:30:00",
             "start_date": descending[-1],
             "end_date": descending[0],
             "tolerance_json": json.dumps(valid_tolerance),
@@ -662,13 +663,18 @@ def test_authoritative_windows_require_exact_calendar_qmt_date_set(monkeypatch, 
     from server.db.formal_analysis_schema import privileged_migrate_formal_analysis_schema
     cache_engine = create_engine("sqlite:///" + str(tmp_path / "certification.db"))
     privileged_migrate_formal_analysis_schema(cache_engine)
-    real_attestations = governance_module.read_legacy_attestations
-    monkeypatch.setattr(
-        governance_module, "read_legacy_attestations",
-        lambda read, params, *, database, deadline: real_attestations(
-            read, params, database=cache_engine, deadline=deadline,
-        ),
-    )
+    monkeypatch.setattr(governance_module, "get_engine", lambda: cache_engine)
+
+    def source_versions(_connection, days, *, native_days, **kwargs):
+        return {
+            day: governance_module._digest({
+                "rows": [row for row in universe_rows if row["trade_date"] == day],
+                "native": day in native_days,
+            })
+            for day in days
+        }
+
+    monkeypatch.setattr(governance_module, "daily_close_source_versions", source_versions)
     monkeypatch.setattr(governance_module, "read_close_batches",
                         lambda batches, read, *, deadline: ((batch, read(batch)) for batch in batches))
 
@@ -720,19 +726,15 @@ def test_authoritative_windows_require_exact_calendar_qmt_date_set(monkeypatch, 
                 if row["in_completed_attestation"]
                 and _params["start_date"] <= row["trade_date"]
                 <= _params["as_of_date"]]
-            selected = {value for key, value in _params.items() if key.startswith("attestation_")}
-            if "inventory_day" in _params:
-                cursor=(_params["cursor_code"],_params["cursor_id"])
-                return sorted(
-                    [row for row in records if row["trade_date"]==_params["inventory_day"]
-                     and (row["stock_code"],row["attestation_id"])>cursor],
-                    key=lambda row:(row["stock_code"],row["attestation_id"]),
-                )[:400]
-            return [row for row in records if not selected or row["attestation_id"] in selected]
+            cursor = (_params["code"], _params["row_id"])
+            return sorted(
+                (row for row in records if row["trade_date"] == _params["day"]
+                 and (row["stock_code"], row["attestation_id"]) > cursor),
+                key=lambda row: (row["stock_code"], row["attestation_id"]),
+            )[:2048]
         raise AssertionError(sql)
 
     monkeypatch.setattr(governance_module, "_db_read", fake_read)
-    monkeypatch.setattr(governance_module, "current_bound_sql_connection", lambda: SimpleNamespace(engine=object()))
     monkeypatch.setattr(governance_module, "datadir_manifest_days", lambda *_args, **_kwargs: set())
     calendar_cutoffs = []
 
@@ -742,6 +744,7 @@ def test_authoritative_windows_require_exact_calendar_qmt_date_set(monkeypatch, 
         sessions = tuple(sorted(descending))
         receipt = SimpleNamespace(
             batch_id="exact-calendar",
+            source_provider="GUOJIN_QMT",
             source_batch_id="1" * 64,
             known_at=f"{end_date} 15:01:00",
             start_date=sessions[0],
@@ -795,15 +798,15 @@ def test_authoritative_windows_require_exact_calendar_qmt_date_set(monkeypatch, 
         sql for sql in observed_sql
         if "FROM qmt_kline_attestation_run" in sql
     )
-    assert "BINARY status=BINARY 'COMPLETED'" in completed_sql
-    assert "BINARY provider=BINARY 'gj_big_qmt_inner'" in completed_sql
+    assert "status='COMPLETED'" in completed_sql
+    assert "provider='gj_big_qmt_inner'" in completed_sql
     assert "start_date<=:as_of_date" in completed_sql
     assert "end_date>=:start_date" in completed_sql
     attestation_sql = next(
         sql for sql in observed_sql
         if "FROM qmt_kline_attestation_row a" in sql and "a.source_pre_close" in sql
     )
-    assert "MAX_EXECUTION_TIME(20000)" in attestation_sql
+    assert "MAX_EXECUTION_TIME(10000)" in attestation_sql
     assert "JOIN" not in attestation_sql
     assert "JSON_EXTRACT" not in attestation_sql
     assert "a.qmt_id>0" in attestation_sql
@@ -824,7 +827,7 @@ def test_authoritative_windows_require_exact_calendar_qmt_date_set(monkeypatch, 
         sql for sql in observed_sql
         if "FROM qmt_kline_attestation_row a" in sql and "a.source_pre_close" in sql
     ]
-    assert len(target_queries) == 24
+    assert len(target_queries) == len(descending)
     assert len(attestation_queries) == 120
 
     # An authentic 120-session proof must leave no raw row owned by a
@@ -852,6 +855,11 @@ def test_authoritative_windows_require_exact_calendar_qmt_date_set(monkeypatch, 
             yield batch, result
 
     with monkeypatch.context() as tracked:
+        # Simulate a new input revision so the memory check observes exact reads.
+        tracked.setattr(governance_module, "daily_close_source_versions", lambda *a, **kw: {
+            day: governance_module._digest(["revised", version])
+            for day, version in source_versions(*a, **kw).items()
+        })
         tracked.setattr(governance_module, "_db_read", tracked_read)
         tracked.setattr(governance_module, "read_close_batches", observe_completed_batches)
         assert governance_module._authoritative_session_windows_with_proof(
@@ -898,18 +906,12 @@ def test_authoritative_windows_require_exact_calendar_qmt_date_set(monkeypatch, 
         REAL_AUTHORITATIVE_SESSION_WINDOWS(descending[0])
     universe_rows.extend(removed_rows)
 
-    from contextlib import nullcontext
     from tools.check_strategy_governance_health import _reused_qmt_row_attestation_binding_check
 
     completed_run_rows[0]["tolerance_json"] = json.dumps(missing_manifest)
-    fake_engine = SimpleNamespace(connect=lambda: nullcontext(object()))
-    monkeypatch.setattr(
-        governance_module, "current_bound_sql_connection",
-        lambda: SimpleNamespace(engine=fake_engine),
-    )
     monkeypatch.setattr(
         governance_module, "datadir_manifest_days",
-        lambda *_args, **_kwargs: {removed_day},
+        lambda _connection, days, **_kwargs: {removed_day}.intersection(days),
     )
     native_hash = "9" * 64
     monkeypatch.setattr(

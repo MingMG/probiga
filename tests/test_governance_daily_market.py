@@ -97,3 +97,55 @@ def test_archival_native_partition_does_not_read_public_canonical_rows(close_par
     assert verified.rows[0]["pre_close"] == "9.000000"
     assert verified.rows[0]["received_at"] == COMPLETED
     assert verified.rows[0]["source_time"] == f"{DAY}T15:00:00"
+
+
+def test_native_replacement_predecessor_crossing_cutoff_changes_reusable_proof(close_partition, monkeypatch):
+    import json
+
+    from server.common import qmt_datadir_daily_coverage as coverage
+
+    conn, original, receipt = close_partition
+    original.update(dataset="stock_daily")
+    prior = {
+        **receipt, "dataset": "stock_daily", "trade_date": DAY,
+        "detail": {**receipt["detail"], "full_market_manifest_hash": original["manifest_hash"]},
+    }
+    replacement_hash = "f" * 64
+    replaced_at = "2026-11-16 15:00:00"
+    link = {
+        "trade_date": DAY, "native_record_sha256": "b" * 64, "prior_run_id": prior["run_id"],
+        "prior_manifest_hash": original["manifest_hash"], "prior_completion_sha256": market.canonical_digest(prior),
+        "observed_at": replaced_at,
+    }
+    conn.exec_driver_sql("""CREATE TABLE qmt_datadir_import_partition (
+        dataset TEXT, trade_date TEXT, source_root TEXT, status TEXT, code_count INT, row_count INT,
+        content_sha256 TEXT, run_id TEXT, started_at TEXT, finished_at TEXT, detail_json TEXT)""")
+    conn.execute(text("""INSERT INTO qmt_datadir_import_partition VALUES
+        ('stock_daily',:day,'DAT','COMPLETE',1,1,:source,'replacement',:observed,:observed,:detail)"""), {
+        "day": DAY, "source": link["native_record_sha256"], "observed": replaced_at,
+        "detail": json.dumps({"full_market_manifest_hash": replacement_hash, "prior_completion": prior}),
+    })
+    conn.exec_driver_sql("""CREATE TABLE qmt_history_coverage_manifest (
+        trade_date TEXT,run_id TEXT,manifest_hash TEXT,manifest_json TEXT,schema_version TEXT,
+        dataset TEXT,provider TEXT,status TEXT,strategy_eligible INT)""")
+    conn.execute(text("""INSERT INTO qmt_history_coverage_manifest VALUES
+        (:day,'replacement',:hash,:body,:schema,'stock_daily',:provider,'EXACT',1)"""), {
+        "day": DAY, "hash": replacement_hash, "body": json.dumps({"native_public_replacement": link}),
+        "schema": market.DATADIR_COVERAGE_SCHEMA, "provider": market.PROVIDER,
+    })
+    monkeypatch.setattr(market, "load_daily_manifest_completion", coverage.load_daily_manifest_completion)
+    early = datetime.fromisoformat("2026-11-15T11:50:00")
+    late = datetime.fromisoformat("2026-11-15T12:00:00")
+    later = datetime.fromisoformat("2026-11-15T13:00:00")
+
+    def receipt_version(cutoff):
+        return market._native_completion_versions(conn, {
+            "days": [DAY], "archive": market.NATIVE_EVIDENCE_DATASET, "cutoff": cutoff,
+        })[DAY]
+
+    # The market rows and manifests are unchanged and the latest receipt is
+    # future at all three cutoffs. Only the preceding completion becomes known.
+    assert market.load_native_datadir_close(conn, DAY, cutoff=late).completed_at == datetime.fromisoformat(COMPLETED)
+    with pytest.raises(ValueError, match="完成回执"):
+        market.load_native_datadir_close(conn, DAY, cutoff=early)
+    assert receipt_version(early) != receipt_version(late) == receipt_version(later)

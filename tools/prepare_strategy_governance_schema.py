@@ -6318,10 +6318,12 @@ def _prepare_native_replay_schema() -> dict[str, Any]:
         if boundary.migrator_engine is None:raise RuntimeError('native job migrator unavailable')
         _assert_pit_index_ddl_terminal(boundary.migrator_engine)
         inventory_index=ensure_pit_source_coverage_date_index(boundary.migrator_engine)
+        from tools.attest_qmt_daily_kline import ensure_daily_proof_index
+        proof_index = ensure_daily_proof_index(boundary.migrator_engine)
         try:
             detail=validate_native_job_schema(boundary.runtime_engine)
-            return {'status':'ok','phase':'native-replay','migration_required':inventory_index['created'],
-                    'announcement_inventory_index':inventory_index,**detail}
+            return {'status':'ok','phase':'native-replay','migration_required':inventory_index['created'] or proof_index['created'],
+                    'announcement_inventory_index':inventory_index,'governance_close_index':proof_index,**detail}
         except (RuntimeError,KeyError):
             pass
         if boundary.migrator_engine is None:raise RuntimeError('native job migrator unavailable')
@@ -6341,7 +6343,7 @@ def _prepare_native_replay_schema() -> dict[str, Any]:
                 connection.execute(text("SELECT RELEASE_LOCK('probiga:native-strategy-research')"))
         return {'status':'ok','phase':'native-replay','migration_required':True,'runtime_privileges_changed':False,
                 'global_trust_changed':False,'automatic_real_order_submission':False,
-                'announcement_inventory_index':inventory_index,**detail}
+                'announcement_inventory_index':inventory_index,'governance_close_index':proof_index,**detail}
     finally:
         if locked and admin is not None:_release_lock(admin)
         _close_quietly(admin)

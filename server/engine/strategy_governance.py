@@ -30,6 +30,7 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from server.api.routers._engine import get_engine
 from server.common.canonical_json import validate_canonical_json
+from server.common.formal_analysis_store import FormalAnalysisStore
 from server.common.governance_safety import assert_real_order_authority_closed
 from server.common.authoritative_market_clock import (
     authoritative_closed_trade_date,
@@ -71,6 +72,7 @@ from server.trading_v3.forward_evidence import (
 )
 from server.engine.governance_daily_market import (
     DATADIR_COVERAGE_SCHEMA,
+    daily_close_source_versions,
     datadir_manifest_days,
     load_native_datadir_close,
     read_close_batches,
@@ -7053,15 +7055,20 @@ def _authoritative_session_windows_with_proof(
             "PROBIGA_GOVERNANCE_QMT_WINDOW_TIMEOUT_SECONDS", "300"
         ))))
         phase_deadline = time.monotonic() + phase_timeout
+        logging.getLogger(__name__).info(
+            "QMT close window as_of=%s cutoff=%s total=%d timeout_seconds=%d batch_days=%d",
+            as_of_date, cutoff, len(session_days), phase_timeout, batch_size,
+        )
         bound_connection = current_bound_sql_connection()
         market_engine = bound_connection.engine if bound_connection is not None else get_engine()
         with (nullcontext(bound_connection) if bound_connection is not None else market_engine.connect()) as connection:
             native_days = datadir_manifest_days(connection, session_days, cutoff=cutoff)
+        binary = "BINARY " if market_engine.dialect.name == "mysql" else ""
         completed_run_rows = _db_read(
-            "SELECT run_id, start_date, end_date, tolerance_json "
+            "SELECT run_id, start_date, end_date, tolerance_json, finished_at "
             "FROM qmt_kline_attestation_run "
-            "WHERE BINARY status=BINARY 'COMPLETED' "
-            "AND BINARY provider=BINARY 'gj_big_qmt_inner' "
+            f"WHERE {binary}status={binary}'COMPLETED' "
+            f"AND {binary}provider={binary}'gj_big_qmt_inner' "
             "AND start_date<=:as_of_date AND end_date>=:start_date "
             "AND finished_at<=:decision_known_at "
             "ORDER BY finished_at DESC, run_id",
@@ -7075,6 +7082,7 @@ def _authoritative_session_windows_with_proof(
         if not native_days <= expected_days:
             raise ValueError("交易日历与QMT逐行认证日期集合不一致")
         manifests_by_day: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
+        run_finished = {}
         for run_row in completed_run_rows:
             run_id = str(run_row.get("run_id") or "").strip()
             if not run_id:
@@ -7087,6 +7095,7 @@ def _authoritative_session_windows_with_proof(
                 )
             except (TypeError, ValueError):
                 continue
+            run_finished[run_id] = str(run_row["finished_at"])
             for day in expected_days.intersection(daily_manifest):
                 manifests_by_day[day][run_id] = daily_manifest[day]
         del completed_run_rows
@@ -7141,9 +7150,8 @@ def _authoritative_session_windows_with_proof(
                 **native_binding,
             })
 
-        def read_native(day: str):
-            with market_engine.connect() as connection:
-                native = load_native_datadir_close(connection, day, cutoff=cutoff)
+        def read_native(connection, day: str):
+            native = load_native_datadir_close(connection, day, cutoff=cutoff)
             codes = {str(row["stock_code"]).strip() for row in native.rows}
             if len(codes) != len(native.rows):
                 raise ValueError(f"{day} 的 QMT DAT 股票代码重复")
@@ -7249,8 +7257,10 @@ def _authoritative_session_windows_with_proof(
             }
             targets = _db_read(
                 "SELECT /*+ MAX_EXECUTION_TIME(20000) */ "
-                "k.trade_date, k.stock_code, k.pre_close, k.`open`, "
-                "k.`close`, k.high, k.low, k.volume, k.amount, "
+                "k.trade_date, k.stock_code, CAST(k.pre_close AS CHAR) AS pre_close, "
+                "CAST(k.`open` AS CHAR) AS `open`, CAST(k.`close` AS CHAR) AS `close`, "
+                "CAST(k.high AS CHAR) AS high, CAST(k.low AS CHAR) AS low, "
+                "CAST(k.volume AS CHAR) AS volume, CAST(k.amount AS CHAR) AS amount, "
                 "k.batch_id, k.data_version, k.received_at, k.source_time, "
                 "k.data_source, k.quality_status, k.permission_status "
                 "FROM sm_stock_kline k "
@@ -7264,13 +7274,72 @@ def _authoritative_session_windows_with_proof(
             )
             return collapse_legacy(batch, targets, attestations)
 
-        daily_summaries = dict(read_close_batches(sorted(native_days), read_native, deadline=phase_deadline))
-        legacy_days = [day for day in session_days if day not in native_days]
-        batches = [legacy_days[offset:offset + batch_size] for offset in range(0, len(legacy_days), batch_size)]
-        for _, summaries in read_close_batches(batches, read_legacy, deadline=phase_deadline):
+        # Only the daily membership in the validated calendar determines a
+        # day's row proof. Each rolling window still binds its entire receipt.
+        generation = _digest({
+            "rule": "probiga.governance-close-day.v1",
+            "legacy_protocol": QMT_PRECLOSE_ATTESTATION_PROTOCOL,
+            "native_protocol": DATADIR_COVERAGE_SCHEMA,
+            "calendar_provider": calendar_receipt.source_provider,
+        })
+        stage = "governance_close_day"
+        store = FormalAnalysisStore(market_engine)
+        completed_days = 0
+        progress_lock = threading.Lock()
+
+        def verify_days(batch):
+            nonlocal completed_days
+            with market_engine.connect() as connection:
+                if connection.dialect.name == "mysql":
+                    connection = connection.execution_options(isolation_level="REPEATABLE READ")
+                # The identity probe and the exact read must see the same
+                # market revision. Checkpoints commit outside this snapshot.
+                with bind_sql_connection(connection):
+                    if datadir_manifest_days(connection, batch, cutoff=cutoff) != native_days.intersection(batch):
+                        raise ValueError("QMT 收盘核验期间逐日来源发生修订")
+                    versions = daily_close_source_versions(
+                        connection, batch, native_days=native_days, cutoff=cutoff,
+                        protocol=QMT_PRECLOSE_ATTESTATION_PROTOCOL, deadline=phase_deadline,
+                    )
+                    keys = {}
+                    for day in batch:
+                        runs = {} if day in native_days else {
+                            run: (manifest, run_finished[run])
+                            for run, manifest in manifests_by_day[day].items()
+                        }
+                        keys[day] = day + ":" + _digest({
+                            "calendar_session": day, "source_version": versions[day],
+                            "completed_manifests": runs,
+                        })
+                    retained = store.get_many(generation, stage, list(keys.values()))
+                    results = {}
+                    for day, key in keys.items():
+                        if time.monotonic() >= phase_deadline:
+                            raise TimeoutError(f"QMT 收盘证据读取超时：{day}")
+                        summary = retained.get(key)
+                        reused = summary is not None
+                        if reused:
+                            if normalize_decision_at(summary[0]["latest_received_at"]) > cutoff:
+                                raise ValueError(f"{day} 的 QMT 行情到达时间晚于决策截止")
+                        else:
+                            summary = (read_native(connection, day) if day in native_days
+                                       else read_legacy([day])[day])
+                            store.put(generation, stage, key, list(summary))
+                        results[day] = tuple(summary)
+                        with progress_lock:
+                            completed_days += 1
+                            logging.getLogger(__name__).info(
+                                "QMT close day=%s completed=%d/%d reused=%s checkpoint=%s last_progress_at=%s",
+                                day, completed_days, len(session_days), reused, key, datetime.now(),
+                            )
+                    return results
+
+        batches = [session_days[i:i + batch_size] for i in range(0, len(session_days), batch_size)]
+        daily_summaries = {}
+        for _, summaries in read_close_batches(batches, verify_days, deadline=phase_deadline):
             daily_summaries.update(summaries)
     except TimeoutError as exc:
-        raise ValueError(str(exc)) from exc
+        raise ValueError(f"{exc}（总时限 {phase_timeout} 秒，已核验交易日可续用）") from exc
     except ValueError:
         raise
     except Exception as exc:

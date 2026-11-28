@@ -41,6 +41,8 @@ from server.common.batch_db import (
 )
 from server.common.qmt_attestation_contract import (
     AMOUNT_REL_TOLERANCE,
+    DAILY_PROOF_INDEX,
+    DAILY_PROOF_INDEX_COLUMNS,
     ATTESTATION_PROTOCOL_VERSION,
     EXPECTED_STOCK_SET_SCHEMA,
     PRICE_TOLERANCE,
@@ -245,6 +247,7 @@ _ATTESTATION_INDEX_CONTRACTS: dict[
             ("trade_date", "protocol_version", "stock_code"),
         ),
         "idx_qmt_kline_attestation_row_run": (1, ("run_id",)),
+        DAILY_PROOF_INDEX: (1, DAILY_PROOF_INDEX_COLUMNS),
     },
 }
 
@@ -1243,7 +1246,7 @@ def attestation_table_ddl_statements() -> tuple[str, ...]:
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
           COLLATE=utf8mb4_unicode_ci
         """,
-        """
+        f"""
         CREATE TABLE IF NOT EXISTS qmt_kline_attestation_row (
             attestation_id CHAR(64) NOT NULL PRIMARY KEY,
             run_id VARCHAR(64) NOT NULL,
@@ -1266,7 +1269,8 @@ def attestation_table_ddl_statements() -> tuple[str, ...]:
                 (target_id, protocol_version, source_data_version),
             KEY idx_qmt_kline_attestation_row_date
                 (trade_date, protocol_version, stock_code),
-            KEY idx_qmt_kline_attestation_row_run (run_id)
+            KEY idx_qmt_kline_attestation_row_run (run_id),
+            KEY {DAILY_PROOF_INDEX} ({",".join(DAILY_PROOF_INDEX_COLUMNS)})
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
           COLLATE=utf8mb4_unicode_ci
         """,
@@ -1278,6 +1282,15 @@ def attestation_table_ddl_statements() -> tuple[str, ...]:
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
           COLLATE=utf8mb4_unicode_ci
         """,
+    )
+
+
+def ensure_daily_proof_index(engine: Engine) -> dict[str, Any]:
+    from server.common.current_quote_schema import privileged_migrate_read_index
+
+    return privileged_migrate_read_index(
+        engine, table="qmt_kline_attestation_row", index=DAILY_PROOF_INDEX,
+        columns=DAILY_PROOF_INDEX_COLUMNS, timeout_seconds=1800,
     )
 
 
@@ -1303,6 +1316,7 @@ def privileged_migrate_attestation_tables(
         for statement in attestation_table_ddl_statements():
             connection.execute(text(statement))
         _privileged_migrate_tolerance_json_mediumtext(connection)
+    ensure_daily_proof_index(engine)
     detail = validate_attestation_schema(
         engine,
         require_current_manifests=not allow_legacy_manifest_candidates,
