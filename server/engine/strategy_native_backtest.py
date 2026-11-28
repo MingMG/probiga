@@ -501,6 +501,7 @@ def _step(connection,state,owner,*,prepare_budget=None):
     while time.monotonic()<deadline and state['phase']!='FINISHED':
         before=state['completed_units']
         failed_reconciliation = None
+        published_manifest = False
         if state['phase']=='PLAN':
             if state['cursor']>=len(state['sessions']):
                 _finish_plan(state)
@@ -508,6 +509,9 @@ def _step(connection,state,owner,*,prepare_budget=None):
                 day=state['sessions'][state['cursor']]
                 _begin_unit(connection,state,owner,'PLAN '+day)
                 if state['strategies'][0]['source_kind']=='immutable_manifest':
+                    published_manifest=bool(state['published'].get(day))
+                    if published_manifest and prepare_budget is not None:
+                        prepare_budget()
                     from server.engine.native_original_prepare import prepare_original_day
                     value=prepare_original_day(connection,state,day)
                 else:value=plan_v3_day(connection,state,day)
@@ -604,6 +608,8 @@ def _step(connection,state,owner,*,prepare_budget=None):
             key, checks = failed_reconciliation
             logger.error("Native replay reconciliation blocked publication: run=%s strategy=%s checks=%s",
                          state['run_id'], key, checks)
+        if published_manifest:
+            break
 
 
 def _report_one(state,dataset,*,store=None):
