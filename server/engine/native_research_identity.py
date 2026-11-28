@@ -59,7 +59,7 @@ def producer_identity(family="immutable_v3_sleeve"):
     if family=='immutable_manifest':
         files=('server/engine/native_original_prepare.py','server/engine/strategy_center.py',
             'server/common/daily_delivery_control.py','server/common/analysis_pool_receipt.py',
-            'server/common/versioned_strategy_config.py','server/engine/market_state_v2.py',
+            'server/common/versioned_strategy_config.py','server/engine/market_state_v2.py','server/engine/native_opening_research.py',
             'server/engine/strategy_price_backtest.py')
     return {relative: frozen_source_sha256(ROOT / relative) for relative in files}
 
@@ -74,8 +74,9 @@ def feature_algorithm_identity(algorithm):
 
 def request_identity(*, strategies, sessions, published, source_hash, requested_at,
                      price_cutoff, algorithm, account, allocation_policy, producer,execution_end_date):
+    from server.engine.native_opening_research import is_opening
     payload = {'schema': 'probiga.native-experiment-request.v2',
-        'experiment_kind': 'CURRENT_FROZEN_RULES_RETROSPECTIVE' if strategies[0]['source_kind'] == 'immutable_v3_sleeve'
+        'experiment_kind': 'CURRENT_FROZEN_RULES_RETROSPECTIVE' if strategies[0]['source_kind'] == 'immutable_v3_sleeve' or is_opening(strategies)
             else 'ORIGINAL_HISTORICAL_DECISIONS',
         'strategies': strategies, 'evaluation_sessions': sessions, 'published': published,
         'source_hash': source_hash, 'requested_at': requested_at, 'price_cutoff': price_cutoff,

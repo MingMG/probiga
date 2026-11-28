@@ -355,3 +355,58 @@ def test_original_signals_evaluate_only_historical_scored_identified_securities(
     assert result['missing_feature_stocks'][key]==2
     assert result['signals'][key][0]['industry']=='银行'
     assert result['signals'][key][0]['signal_known_at']==prepared['signal_clock']
+
+
+def test_opening_replay_binds_last_completed_batch_before_open():
+    from server.engine.native_opening_research import select_before_open
+    days = ['2026-11-24', '2026-11-25']
+    decision = '2026-11-25 08:09:51'
+    def publication(id_, uid, at, finished):
+        return dict(id=id_, trade_date=days[0], output_dataset_id=uid, decision_at=decision,
+                    published_at=at, finished_at=finished)
+    valid = publication(3, 'premarket', '2026-11-25 08:49:24', '2026-11-25 08:49:25')
+    late = publication(4, 'afternoon', '2026-11-25 15:14:56', '2026-11-25 15:14:57')
+    unfinished = publication(5, 'unfinished', '2026-11-25 09:29:59', '2026-11-25 09:30:00')
+    earlier = publication(2, 'earlier', '2026-11-25 08:15:00', '2026-11-25 08:15:01')
+    assert select_before_open(days, [late, earlier, unfinished, valid]) == {days[0]: 'premarket'}
+    assert select_before_open(days[:1], [valid]) == {}
+
+
+def test_opening_research_is_an_independent_simulation_version():
+    from server.engine.native_opening_research import is_opening, opening_strategy
+    base = {'strategy_key':'short_term', 'strategy_name':'短线多因子', 'source_kind':'immutable_manifest',
+            'current_version':'stock_strategy_v2.4.0:short_term', 'evaluator_type':'manifest_score_adapter',
+            'version_hash':'original', 'parameters':{}, 'evaluator_config':{
+                'score_field':'short_term_score', 'model_version':'ai-rec-v3-ext-v3'}}
+    simulation = opening_strategy([base])
+    assert is_opening([simulation]) and not is_opening([base])
+    assert simulation['version_hash'] != base['version_hash']
+    assert simulation['evaluator_config']['model_version'] == 'ai-rec-v3-tactical-v4'
+    assert base['evaluator_config']['model_version'] == 'ai-rec-v3-ext-v3'
+
+
+def test_opening_replay_uses_published_clock_and_bound_market(monkeypatch):
+    from server.common import analysis_pool_receipt, daily_delivery_control
+    from server.engine import native_original_prepare, strategy_center
+    from server.engine.native_opening_research import OPENING_POLICY
+    day, next_day = '2026-11-24', '2026-11-25'
+    decision, published = next_day+'T08:09:51', next_day+'T08:49:24'
+    conf = {'publication_policy':OPENING_POLICY, 'market_state_config_hash':'frozen',
+            'score_field':'short_term_score', 'model_version':'ai-rec-v3-tactical-v4'}
+    row = {'stock_code':'000001','short_term_score':71,'model_version':conf['model_version']}
+    state = {'strategies':[{'source_kind':'immutable_manifest','evaluator_config':conf}],
+             'calendar':[day,next_day], 'published':{day:'before-open'}, 'requested_at':'2026-11-28 12:00:00'}
+    def publication(c, target, *, run_uid, decision_at):
+        assert run_uid == 'before-open' and str(decision_at) == next_day+' 09:29:59.999999'
+        return {'score_snapshot':{}, 'published_at':published, 'score_snapshot_sha256':'original'}
+    monkeypatch.setattr(daily_delivery_control, 'load_published_analysis_receipt', publication)
+    monkeypatch.setattr(analysis_pool_receipt,'read_score_snapshot_header',lambda *a,**kw:{'decision_at':decision})
+    monkeypatch.setattr(analysis_pool_receipt,'decode_score_snapshot',lambda *a,**kw:{
+        'fixed_market_context':{'market_state_config_hash':'frozen'}, 'scored_rows':[row]})
+    monkeypatch.setattr(strategy_center,'_fixed_market_snapshot',lambda *a:{'market_state':'high_range'})
+    monkeypatch.setattr(native_original_prepare,'_identity_rows',lambda *a:(
+        {'000001':{'industry_name':'银行'}}, {'status':'VERIFIED','captured_at':day+' 16:00:00'}))
+    result = native_original_prepare.prepare_original_day(None,state,day)
+    assert result['status']=='COMPLETE' and result['signal_clock']==next_day+' 08:49:24'
+    row['model_version']='ai-rec-v3-ext-v3'
+    assert native_original_prepare.prepare_original_day(None,state,day)['status']=='BLOCKED'
